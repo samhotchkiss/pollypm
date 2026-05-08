@@ -1,0 +1,1258 @@
+openapi: 3.1.0
+info:
+  title: PollyPM Web API
+  version: 0.1.0
+  summary: HTTP API that lets a separate frontend drive PollyPM.
+  description: |
+    The PollyPM Web API exposes the same surface the TUI cockpit drives:
+    project drilldown, plan review, task triage, inbox replies, and a
+    realtime activity feed.
+
+    See [`docs/web-api-spec.md`](../web-api-spec.md) for the design
+    rationale, auth model, SSE semantics, and out-of-scope decisions.
+
+    The API is single-user / personal-use. There is no multi-tenant
+    auth in v1.
+  contact:
+    name: PollyPM project
+    url: https://github.com/swhmm/pollypm/issues
+  license:
+    name: See repository LICENSE
+    url: https://github.com/swhmm/pollypm/blob/main/LICENSE
+
+servers:
+  - url: http://{host}:{port}/api/v1
+    description: Local pm serve instance (loopback by default)
+    variables:
+      host:
+        default: 127.0.0.1
+        description: Host pm serve is bound to.
+      port:
+        default: "8765"
+        description: Port pm serve is listening on.
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Health
+    description: Liveness and diagnostic endpoints.
+  - name: Projects
+    description: Registered project state and project-level actions.
+  - name: Tasks
+    description: Task list and task-level actions.
+  - name: Plans
+    description: Structured plan body for review.
+  - name: Inbox
+    description: Inbox items and threads.
+  - name: Events
+    description: Realtime audit-log stream.
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      operationId: getHealth
+      summary: Liveness + version info
+      description: Public endpoint; does not require authentication.
+      security: []
+      responses:
+        "200":
+          description: Server is alive.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                ok:
+                  value:
+                    status: ok
+                    version: 0.1.0
+                    schema_version: 1
+                    started_at: "2026-05-07T12:00:00Z"
+
+  /doctor:
+    get:
+      tags: [Health]
+      operationId: getDoctor
+      summary: Structured pm doctor output
+      description: |
+        Mirrors the structured JSON output of `pm doctor` (PR #1347).
+        Returns each check with status (ok / warn / fail), an actor
+        message, and an optional remediation hint.
+      responses:
+        "200":
+          description: Doctor results (200 even when checks fail; consult `overall`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DoctorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: List registered projects
+      parameters:
+        - in: query
+          name: tracked
+          schema: { type: boolean }
+          description: When true, returns only `tracked=true` projects.
+      responses:
+        "200":
+          description: All registered projects with derived state.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+    post:
+      tags: [Projects]
+      operationId: registerProject
+      summary: Register a new project
+      description: Mirrors `pm add-project`. Idempotent on `path`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterProjectRequest"
+            examples:
+              minimal:
+                value:
+                  path: /Users/me/dev/myrepo
+              full:
+                value:
+                  path: /Users/me/dev/myrepo
+                  name: My Project
+                  slug: myproj
+                  tracked: true
+      responses:
+        "201":
+          description: Project registered (or returned if already present at path).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /projects/{key}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: Project drilldown
+      description: |
+        Returns project state + recent activity + top tasks +
+        pending plan-review (if any). One round trip is enough to
+        render the cockpit's project drilldown.
+      responses:
+        "200":
+          description: Project drilldown payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectDrilldown"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /projects/{key}/plan:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    get:
+      tags: [Plans]
+      operationId: getProjectPlan
+      summary: Structured plan body for the active plan-review task
+      description: |
+        Returns the structured plan for the project's active
+        `plan_review` task — the one currently sitting at
+        `status=review` on the `user_approval` node. Mirrors PR #1408's
+        structured output (summary, judgment calls, body,
+        critic synthesis).
+      parameters:
+        - in: query
+          name: version
+          schema: { type: integer, minimum: 1 }
+          description: |
+            Optional plan version. Defaults to the latest. Older
+            versions are returned for diff / history rendering.
+      responses:
+        "200":
+          description: Structured plan body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Plan"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: No plan in review for this project.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+    post:
+      tags: [Projects]
+      operationId: kickoffPlan
+      summary: Kick off pm project plan (initial or replan)
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanRequest"
+            examples:
+              initial:
+                value:
+                  kind: initial
+              replan:
+                value:
+                  kind: replan
+                  reason: "Approach pivoted; rescoping for the new target."
+      responses:
+        "202":
+          description: Plan kickoff accepted. Subscribe to SSE for progress.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PlanKickoffAccepted"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /projects/{key}/chat:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Projects]
+      operationId: sendProjectChat
+      summary: Send a chat message to the project's PM persona
+      description: |
+        Replicates the cockpit chat surface. Returns immediately with a
+        thread ID; the PM persona's reply lands as audit events on the
+        SSE stream and as inbox messages on the thread.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatRequest"
+      responses:
+        "202":
+          description: Message accepted; persona reply lands asynchronously.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatAccepted"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /projects/{key}/tasks:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    get:
+      tags: [Tasks]
+      operationId: listProjectTasks
+      summary: List tasks for a project
+      parameters:
+        - in: query
+          name: status
+          schema:
+            $ref: "#/components/schemas/TaskStatus"
+          description: Filter by `work_status`.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: Opaque cursor from a previous response's `next_cursor`.
+      responses:
+        "200":
+          description: Page of tasks.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /tasks/{project}/{n}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    get:
+      tags: [Tasks]
+      operationId: getTask
+      summary: Task detail
+      description: |
+        Full task record — status, current node, executions,
+        transitions, plan content (when this task is a plan task).
+      responses:
+        "200":
+          description: Task detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /tasks/{project}/{n}/approve:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: approveTask
+      summary: Approve plan or code review
+      description: |
+        Approves the current review-node execution. The `kind` field
+        on the request body discriminates plan-review vs
+        code-review approvals; absent it, the API approves whichever
+        review is active.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ApproveRequest"
+      responses:
+        "200":
+          description: Approval recorded.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /tasks/{project}/{n}/reject:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: rejectTask
+      summary: Reject plan or code review with a reason
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RejectRequest"
+            examples:
+              plan:
+                value:
+                  kind: plan
+                  reason: "Scope is too broad — split into 3 tasks first."
+      responses:
+        "200":
+          description: Rejection recorded; task transitions to `rework`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /tasks/{project}/{n}/queue:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: queueTask
+      summary: Queue a draft task for execution
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Task transitioned `draft` → `queued`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /inbox:
+    get:
+      tags: [Inbox]
+      operationId: listInbox
+      summary: List inbox items
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+        - in: query
+          name: type
+          schema:
+            $ref: "#/components/schemas/InboxItemType"
+        - in: query
+          name: state
+          schema:
+            $ref: "#/components/schemas/InboxItemState"
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+      responses:
+        "200":
+          description: Page of inbox items.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboxListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /inbox/{id}:
+    parameters:
+      - $ref: "#/components/parameters/InboxId"
+    get:
+      tags: [Inbox]
+      operationId: getInboxItem
+      summary: Inbox item detail with full thread messages
+      responses:
+        "200":
+          description: Inbox item detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboxItemDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /inbox/{id}/reply:
+    parameters:
+      - $ref: "#/components/parameters/InboxId"
+    post:
+      tags: [Inbox]
+      operationId: replyInbox
+      summary: Reply to a thread
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboxReplyRequest"
+      responses:
+        "201":
+          description: Reply appended to the thread.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InboxMessage"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /inbox/{id}/archive:
+    parameters:
+      - $ref: "#/components/parameters/InboxId"
+    post:
+      tags: [Inbox]
+      operationId: archiveInbox
+      summary: Archive (close) an inbox item
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      responses:
+        "200":
+          description: Item moved to `closed/`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /events:
+    get:
+      tags: [Events]
+      operationId: streamEvents
+      summary: Server-Sent Events stream of audit-log events
+      description: |
+        Returns a `text/event-stream`. Each SSE message has:
+        - `event: audit`
+        - `id: <ts>` (the audit event timestamp; clients use this as
+          `Last-Event-ID` on reconnect)
+        - `data: <json>` matching the `Event` schema below.
+
+        Server emits `: keep-alive` comment lines every 15 seconds.
+
+        ### Filtering
+        - `project=<key>` — only events for this project
+        - `event=<glob>` — wildcard match on event name (e.g.
+          `task.*`, `watchdog.*`).
+
+        ### Reconnect
+        - Browsers automatically send `Last-Event-ID` after a drop;
+          the server replays from that point and tails.
+        - For an explicit cold start, pass `?since=<ISO-8601>`.
+        - With neither, the server only tails (no replay).
+      parameters:
+        - in: query
+          name: since
+          schema:
+            type: string
+            format: date-time
+          description: ISO-8601 timestamp; replay events with `ts > since`.
+        - in: query
+          name: project
+          schema: { type: string }
+        - in: query
+          name: event
+          schema: { type: string }
+          description: Wildcard pattern matched against `event` field.
+        - in: header
+          name: Last-Event-ID
+          schema: { type: string }
+          description: Reconnect cursor; takes precedence over `since`.
+      responses:
+        "200":
+          description: SSE stream.
+          content:
+            text/event-stream:
+              schema:
+                type: string
+                description: |
+                  Stream of newline-delimited SSE messages. The `data:`
+                  field of each message is an `Event` JSON object.
+              examples:
+                stream:
+                  summary: Two audit events
+                  value: |
+                    event: audit
+                    id: 2026-05-07T12:01:33.022Z
+                    data: {"schema":1,"ts":"2026-05-07T12:01:33.022Z","project":"pollypm","event":"task.status_changed","subject":"pollypm/142","actor":"pm","status":"done","metadata":{}}
+
+                    event: audit
+                    id: 2026-05-07T12:01:34.110Z
+                    data: {"schema":1,"ts":"2026-05-07T12:01:34.110Z","project":"pollypm","event":"plan.version_incremented","subject":"pollypm/144","actor":"architect","status":"ok","metadata":{"version":2}}
+
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: opaque
+      description: |
+        Token from `~/.pollypm/api-token`. Generated on first
+        `pm serve` startup; rotated via `pm api regen-token`.
+
+  parameters:
+    ProjectKey:
+      in: path
+      name: key
+      required: true
+      schema: { type: string }
+      description: Project key (slug).
+    ProjectKey2:
+      in: path
+      name: project
+      required: true
+      schema: { type: string }
+      description: Project key (slug).
+    TaskNumber:
+      in: path
+      name: n
+      required: true
+      schema: { type: integer, minimum: 1 }
+      description: Task number within the project (per-project sequence).
+    InboxId:
+      in: path
+      name: id
+      required: true
+      schema: { type: string }
+      description: Inbox item identifier.
+    IdempotencyKey:
+      in: header
+      name: Idempotency-Key
+      required: false
+      schema: { type: string, maxLength: 128 }
+      description: |
+        Optional client-supplied key. Server caches the response for
+        24h and replays it on retry with the same key.
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid bearer token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+          examples:
+            missing:
+              value:
+                error:
+                  code: unauthorized
+                  message: Bearer token required
+    InvalidRequest:
+      description: Malformed body or query parameters.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ValidationError:
+      description: Body shape valid but values failed validation.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ValidationErrorResponse"
+    NotFound:
+      description: Resource does not exist.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    Conflict:
+      description: Concurrent write conflict; state changed between read and write.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+
+  schemas:
+    # ---- Common -----------------------------------------------------
+    ErrorBody:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: Stable snake_case error code.
+        message: { type: string }
+        hint: { type: string }
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          $ref: "#/components/schemas/ErrorBody"
+    ValidationErrorDetail:
+      type: object
+      required: [field, message]
+      properties:
+        field: { type: string }
+        message: { type: string }
+    ValidationErrorResponse:
+      allOf:
+        - $ref: "#/components/schemas/ErrorResponse"
+        - type: object
+          properties:
+            details:
+              type: array
+              items:
+                $ref: "#/components/schemas/ValidationErrorDetail"
+
+    ActionResult:
+      type: object
+      required: [ok]
+      properties:
+        ok: { type: boolean }
+        message: { type: string }
+
+    # ---- Health -----------------------------------------------------
+    HealthResponse:
+      type: object
+      required: [status, version, schema_version, started_at]
+      properties:
+        status:
+          type: string
+          enum: [ok, degraded]
+        version:
+          type: string
+          description: PollyPM package version.
+        schema_version:
+          type: integer
+          description: Audit-log / DB schema version.
+        started_at:
+          type: string
+          format: date-time
+
+    DoctorCheck:
+      type: object
+      required: [name, status, message]
+      properties:
+        name: { type: string }
+        status:
+          type: string
+          enum: [ok, warn, fail]
+        message: { type: string }
+        hint: { type: string }
+    DoctorResponse:
+      type: object
+      required: [overall, checks]
+      properties:
+        overall:
+          type: string
+          enum: [ok, warn, fail]
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DoctorCheck"
+
+    # ---- Projects ---------------------------------------------------
+    ProjectKind:
+      type: string
+      enum: [git, polyglot, monorepo, unknown]
+      description: Detected project kind. Extends with new values; clients should treat unknown values as `unknown`.
+
+    ProjectGlyph:
+      type: string
+      enum: [green, amber, red, paused, unknown]
+      description: Stop-light signal derived from the briefing.
+
+    TaskCounts:
+      type: object
+      additionalProperties:
+        type: integer
+      description: Map of TaskStatus value -> count.
+      example:
+        draft: 3
+        queued: 1
+        in_progress: 2
+        review: 1
+        done: 42
+
+    Project:
+      type: object
+      required: [key, name, path, tracked, kind, glyph, task_counts, open_inbox_count, pending_plan_review]
+      properties:
+        key: { type: string }
+        name: { type: string }
+        path: { type: string, description: Filesystem path (server-local). }
+        tracked: { type: boolean }
+        kind:
+          $ref: "#/components/schemas/ProjectKind"
+        persona_name: { type: string }
+        state:
+          type: string
+          description: Briefing-derived high-level state label.
+        glyph:
+          $ref: "#/components/schemas/ProjectGlyph"
+        task_counts:
+          $ref: "#/components/schemas/TaskCounts"
+        open_inbox_count: { type: integer }
+        pending_plan_review: { type: boolean }
+
+    ProjectActivityEntry:
+      type: object
+      required: [ts, event, subject, actor]
+      properties:
+        ts: { type: string, format: date-time }
+        event: { type: string }
+        subject: { type: string }
+        actor: { type: string }
+        status: { type: string }
+        summary: { type: string }
+
+    ProjectDrilldown:
+      allOf:
+        - $ref: "#/components/schemas/Project"
+        - type: object
+          required: [recent_activity, top_tasks]
+          properties:
+            recent_activity:
+              type: array
+              items:
+                $ref: "#/components/schemas/ProjectActivityEntry"
+            top_tasks:
+              type: array
+              items:
+                $ref: "#/components/schemas/TaskSummary"
+            plan_review:
+              $ref: "#/components/schemas/Plan"
+
+    RegisterProjectRequest:
+      type: object
+      required: [path]
+      properties:
+        path:
+          type: string
+          description: Absolute filesystem path to the project repository.
+        name:
+          type: string
+          description: Display name. Defaults to repo directory name.
+        slug:
+          type: string
+          description: |
+            Optional canonical slug. Must match
+            `slugify_project_key()` rules; rejected with
+            `validation_error` otherwise.
+        tracked:
+          type: boolean
+          default: true
+
+    PlanRequest:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [initial, replan]
+          default: initial
+        reason:
+          type: string
+          description: Required when `kind=replan`.
+    PlanKickoffAccepted:
+      type: object
+      required: [task_id, status]
+      properties:
+        task_id: { type: string, description: "Plan task id (project/N)." }
+        status:
+          type: string
+          enum: [accepted]
+
+    ChatRequest:
+      type: object
+      required: [message]
+      properties:
+        message: { type: string }
+        thread_id:
+          type: string
+          description: Continue an existing thread when present.
+    ChatAccepted:
+      type: object
+      required: [thread_id, status]
+      properties:
+        thread_id: { type: string }
+        status:
+          type: string
+          enum: [accepted]
+
+    # ---- Tasks ------------------------------------------------------
+    TaskStatus:
+      type: string
+      enum:
+        - draft
+        - queued
+        - in_progress
+        - rework
+        - blocked
+        - on_hold
+        - review
+        - done
+        - cancelled
+
+    TaskType:
+      type: string
+      enum: [epic, task, subtask, bug, spike]
+
+    TaskPriority:
+      type: string
+      enum: [critical, high, normal, low]
+
+    TaskSummary:
+      type: object
+      required: [task_id, project, task_number, title, work_status, type, priority]
+      properties:
+        task_id: { type: string }
+        project: { type: string }
+        task_number: { type: integer }
+        title: { type: string }
+        work_status:
+          $ref: "#/components/schemas/TaskStatus"
+        type:
+          $ref: "#/components/schemas/TaskType"
+        priority:
+          $ref: "#/components/schemas/TaskPriority"
+        assignee: { type: string }
+        current_node_id: { type: string }
+        plan_version: { type: integer }
+        updated_at: { type: string, format: date-time }
+
+    Transition:
+      type: object
+      required: [from_state, to_state, actor, timestamp]
+      properties:
+        from_state: { type: string }
+        to_state: { type: string }
+        actor: { type: string }
+        timestamp: { type: string, format: date-time }
+        reason: { type: string }
+
+    Artifact:
+      type: object
+      required: [kind, description]
+      properties:
+        kind:
+          type: string
+          enum: [commit, file_change, action, note]
+        description: { type: string }
+        ref: { type: string }
+        path: { type: string }
+        external_ref: { type: string }
+
+    WorkOutput:
+      type: object
+      required: [type, summary]
+      properties:
+        type:
+          type: string
+          enum: [code_change, action, document, mixed]
+        summary: { type: string }
+        artifacts:
+          type: array
+          items:
+            $ref: "#/components/schemas/Artifact"
+
+    FlowNodeExecution:
+      type: object
+      required: [task_id, node_id, visit, status]
+      properties:
+        task_id: { type: string }
+        node_id: { type: string }
+        visit: { type: integer }
+        status:
+          type: string
+          enum: [pending, active, blocked, completed, abandoned]
+        decision:
+          type: string
+          enum: [approved, rejected]
+        decision_reason: { type: string }
+        started_at: { type: string, format: date-time }
+        completed_at: { type: string, format: date-time }
+        work_output:
+          $ref: "#/components/schemas/WorkOutput"
+
+    ContextEntry:
+      type: object
+      required: [actor, timestamp, text, entry_type]
+      properties:
+        actor: { type: string }
+        timestamp: { type: string, format: date-time }
+        text: { type: string }
+        entry_type:
+          type: string
+          enum: [note, reply, read]
+
+    TaskRelationships:
+      type: object
+      properties:
+        parent: { type: string, description: "Parent task id (project/N) or null." }
+        children:
+          type: array
+          items: { type: string }
+        blocks:
+          type: array
+          items: { type: string }
+        blocked_by:
+          type: array
+          items: { type: string }
+        relates_to:
+          type: array
+          items: { type: string }
+        supersedes: { type: string }
+        superseded_by: { type: string }
+
+    TaskDetail:
+      allOf:
+        - $ref: "#/components/schemas/TaskSummary"
+        - type: object
+          required: [description, transitions, executions, relationships]
+          properties:
+            description: { type: string }
+            acceptance_criteria: { type: string }
+            constraints: { type: string }
+            labels:
+              type: array
+              items: { type: string }
+            relevant_files:
+              type: array
+              items: { type: string }
+            relationships:
+              $ref: "#/components/schemas/TaskRelationships"
+            flow_template_id: { type: string }
+            flow_template_version: { type: integer }
+            requires_human_review: { type: boolean }
+            predecessor_task_id: { type: string }
+            transitions:
+              type: array
+              items:
+                $ref: "#/components/schemas/Transition"
+            executions:
+              type: array
+              items:
+                $ref: "#/components/schemas/FlowNodeExecution"
+            context:
+              type: array
+              items:
+                $ref: "#/components/schemas/ContextEntry"
+            external_refs:
+              type: object
+              additionalProperties: { type: string }
+            total_input_tokens: { type: integer }
+            total_output_tokens: { type: integer }
+            session_count: { type: integer }
+            created_at: { type: string, format: date-time }
+            created_by: { type: string }
+            plan:
+              $ref: "#/components/schemas/Plan"
+              description: Populated only when this task is a plan task at review.
+
+    TaskListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/TaskSummary"
+        next_cursor:
+          type: string
+          description: Absent when no more pages.
+
+    ApproveRequest:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [plan, code_review, auto]
+          default: auto
+          description: |
+            `auto` (default) approves whichever review is active.
+            `plan` and `code_review` are explicit and reject with
+            `invalid_state` if that review type is not active.
+        note:
+          type: string
+          description: Optional approval note recorded on the execution.
+
+    RejectRequest:
+      type: object
+      required: [reason]
+      properties:
+        kind:
+          type: string
+          enum: [plan, code_review, auto]
+          default: auto
+        reason:
+          type: string
+          minLength: 1
+
+    # ---- Plan -------------------------------------------------------
+    PlanJudgmentCall:
+      type: object
+      required: [point]
+      properties:
+        point:
+          type: string
+          description: One judgment-call bullet from the architect.
+
+    Plan:
+      type: object
+      required: [task_id, version, summary, judgment_calls, body, created_at]
+      properties:
+        task_id: { type: string }
+        version: { type: integer, minimum: 1 }
+        predecessor_task_id: { type: string }
+        summary: { type: string }
+        judgment_calls:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlanJudgmentCall"
+        body:
+          type: string
+          description: Full plan markdown.
+        critic_synthesis:
+          type: string
+          description: Architect critic notes; nullable.
+        created_at: { type: string, format: date-time }
+
+    # ---- Inbox ------------------------------------------------------
+    InboxItemType:
+      type: string
+      description: |
+        Open enumeration. Known values include `message`,
+        `plan_review`, `blocking_question`, `alert`. Clients should
+        treat unknown values as `message`.
+      enum:
+        - message
+        - plan_review
+        - blocking_question
+        - alert
+
+    InboxItemState:
+      type: string
+      enum:
+        - open
+        - threaded
+        - waiting-on-pa
+        - waiting-on-pm
+        - resolved
+        - closed
+
+    InboxOwner:
+      type: string
+      enum: [pm, pa, worker, operator]
+
+    InboxItem:
+      type: object
+      required: [id, project, type, state, subject, owner, created_at, updated_at]
+      properties:
+        id: { type: string }
+        project: { type: string }
+        type:
+          $ref: "#/components/schemas/InboxItemType"
+        state:
+          $ref: "#/components/schemas/InboxItemState"
+        subject: { type: string }
+        preview: { type: string, description: Short preview of the body. }
+        owner:
+          $ref: "#/components/schemas/InboxOwner"
+        thread_id: { type: string }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Sidecar fields. For `plan_review` items this includes
+            `task_id`, `judgment_calls` (string array), and a plan
+            preview.
+
+    InboxMessage:
+      type: object
+      required: [id, sender, timestamp, body]
+      properties:
+        id: { type: string }
+        sender:
+          type: string
+          description: "`operator`, `pm`, `pa`, or worker session name."
+        timestamp: { type: string, format: date-time }
+        body: { type: string }
+
+    InboxItemDetail:
+      allOf:
+        - $ref: "#/components/schemas/InboxItem"
+        - type: object
+          required: [messages]
+          properties:
+            messages:
+              type: array
+              items:
+                $ref: "#/components/schemas/InboxMessage"
+
+    InboxListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboxItem"
+        next_cursor: { type: string }
+
+    InboxReplyRequest:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          minLength: 1
+
+    # ---- Events -----------------------------------------------------
+    Event:
+      type: object
+      required: [schema, ts, project, event, subject, actor, status]
+      properties:
+        schema:
+          type: integer
+          description: Audit-log schema version (currently 1).
+        ts:
+          type: string
+          format: date-time
+        project: { type: string }
+        event:
+          type: string
+          description: |
+            Stable `noun.verb` event name. Examples: `task.created`,
+            `task.status_changed`, `plan.version_incremented`,
+            `plan.successor_created`, `worker.session_reaped`,
+            `watchdog.escalation_dispatched`, `socket.reaped`,
+            `work_db.opened`.
+        subject:
+          type: string
+          description: Resource id the event is about (e.g. `pollypm/142`).
+        actor: { type: string }
+        status: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+      example:
+        schema: 1
+        ts: "2026-05-07T12:01:33.022Z"
+        project: pollypm
+        event: task.status_changed
+        subject: pollypm/142
+        actor: pm
+        status: done
+        metadata: {}

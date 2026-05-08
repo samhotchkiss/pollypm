@@ -13,7 +13,8 @@ Contract:
 
 from __future__ import annotations
 
-from functools import partial
+import functools
+import inspect
 import json
 import os
 import re
@@ -205,11 +206,37 @@ def _hold_review_tasks_for_notify(
 
 
 def _bind_session_command(callback, helpers):
-    bound = partial(callback, helpers)
-    bound.__name__ = callback.__name__
-    bound.__doc__ = callback.__doc__
-    bound.__module__ = callback.__module__
-    return bound
+    """Bind ``helpers`` as the first arg of ``callback`` while preserving the
+    inspectable signature Typer needs.
+
+    Typer's command-registration path calls :func:`typing.get_type_hints` on
+    the registered callable. ``functools.partial`` objects don't satisfy
+    ``get_type_hints``'s "module/class/method/function" check (Python 3.13's
+    typing.py raises ``TypeError`` on them), so we build a real wrapper
+    function whose signature drops the bound first parameter — Typer then
+    sees a normal function with the user-facing options/arguments only.
+    """
+    sig = inspect.signature(callback)
+    parameters = list(sig.parameters.values())
+    if not parameters:
+        bound_param_name = None
+        new_sig = sig
+    else:
+        bound_param_name = parameters[0].name
+        new_sig = sig.replace(parameters=parameters[1:])
+
+    @functools.wraps(callback)
+    def wrapper(*args, **kwargs):
+        return callback(helpers, *args, **kwargs)
+
+    wrapper.__signature__ = new_sig
+    if bound_param_name is not None:
+        wrapper.__annotations__ = {
+            name: annotation
+            for name, annotation in callback.__annotations__.items()
+            if name != bound_param_name
+        }
+    return wrapper
 
 
 def launch(

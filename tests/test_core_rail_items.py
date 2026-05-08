@@ -166,7 +166,7 @@ def test_pm_chat_label_matches_project_session_persona(
     )
     monkeypatch.setattr(
         core_rail_items_plugin,
-        "_active_task_numbers",
+        "active_task_numbers",
         lambda project, *, config=None: [],
     )
     ctx = RailContext(
@@ -210,7 +210,7 @@ def test_pm_chat_label_uses_project_pm_fallback(monkeypatch, tmp_path: Path) -> 
     )
     monkeypatch.setattr(
         core_rail_items_plugin,
-        "_active_task_numbers",
+        "active_task_numbers",
         lambda project, *, config=None: [],
     )
     ctx = RailContext(
@@ -790,7 +790,7 @@ def test_active_task_numbers_excludes_terminal_and_review_tasks(
     active claim and are doing work) surface as worker rows.
     """
     import sqlite3
-    from pollypm.plugins_builtin.core_rail_items.plugin import _active_task_numbers
+    from pollypm.plugins_builtin.core_rail_items.plugin import active_task_numbers
     from pollypm.models import KnownProject, ProjectKind
 
     project_root = tmp_path / "demo"
@@ -835,7 +835,7 @@ def test_active_task_numbers_excludes_terminal_and_review_tasks(
         kind=ProjectKind.GIT, tracked=True,
     )
 
-    assert _active_task_numbers(project) == [3, 4]
+    assert active_task_numbers(project) == [3, 4]
 
 
 def test_active_task_numbers_handles_missing_db_gracefully(
@@ -843,11 +843,11 @@ def test_active_task_numbers_handles_missing_db_gracefully(
 ) -> None:
     """A project without a ``state.db`` (e.g. fresh / never-touched)
     must not raise; the rail just shows no per-task rows."""
-    from pollypm.plugins_builtin.core_rail_items.plugin import _active_task_numbers
+    from pollypm.plugins_builtin.core_rail_items.plugin import active_task_numbers
     from pollypm.models import KnownProject, ProjectKind
 
     project = KnownProject(
         key="empty", path=tmp_path / "empty", name="Empty",
         kind=ProjectKind.GIT, tracked=True,
     )
-    assert _active_task_numbers(project) == []
+    assert active_task_numbers(project) == []

@@ -64,3 +64,22 @@ def test_prepend_role_banner_missing_role_returns_body_unchanged() -> None:
     body = "short prompt"
     assert prepend_role_banner(body, session_name="x", role="") == body
     assert prepend_role_banner(body, session_name="", role="worker") == body
+
+
+def test_render_role_banner_worker_includes_execute_dont_ask_line() -> None:
+    """Workers default to checking in for a "nod" between outline and execute,
+    which silently stalls tasks. The banner counters that bias for workers
+    only — architects/reviewers should NOT carry "execute, don't ask"
+    guidance because their job legitimately includes asking."""
+    text = render_role_banner("task-coffeeboardnm-1", "worker")
+
+    assert "execute" in text.lower()
+    assert "don't pause to ask" in text.lower() or "don't ask" in text.lower()
+
+
+def test_render_role_banner_non_worker_omits_execute_dont_ask_line() -> None:
+    for role in ("architect", "reviewer", "operator-pm", "heartbeat-supervisor"):
+        text = render_role_banner(f"{role}_test", role)
+        assert "execute. don't pause to ask" not in text.lower(), (
+            f"role={role} unexpectedly carries the worker-only execute-don't-ask line"
+        )

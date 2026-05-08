@@ -1342,6 +1342,8 @@ class SessionManager:
             f"  - file_change: `{{\"kind\": \"file_change\", \"path\": \"...\", \"description\": \"...\"}}`\n"
             f"  - action: `{{\"kind\": \"action\", \"description\": \"...\"}}`\n\n"
             f"## Rules\n\n"
+            f"- Execute, don't ask permission. The spec is the green light — "
+            f"build it. Don't pause for a \"nod\" between outline and execution.\n"
             f"- Stay focused on this task only\n"
             f"- Commit your work before signaling done\n"
             f"- The quality bar is high — test before shipping\n"

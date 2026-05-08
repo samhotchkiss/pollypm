@@ -2166,62 +2166,62 @@ def test_clean_hold_reason_without_title_map_keeps_legacy_behavior() -> None:
     ) == "Waiting on operator: polly_remote/12 to land"
 
 
-def test_strip_action_subject_prefix_also_strips_alert_routing_tag() -> None:
+def test_strip_routing_tag_prefix_also_strips_alert_routing_tag() -> None:
     """Alerts emit subjects with an ``[Alert]`` tier prefix from the
     supervisor — same routing-tag pattern as ``[Action]``. The strip
     helper must drop both so the activity feed Message column doesn't
     render ``[Alert] Additional work remains —`` with the bracketed
     routing label leading the prose.
     """
-    from pollypm.cockpit_ui import _strip_action_subject_prefix
+    from pollypm.notify_task import strip_routing_tag_prefix
 
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "[Alert] Additional work remains — open inbox to triage"
     ) == "Additional work remains — open inbox to triage"
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "[ALERT] disk filling"
     ) == "disk filling"
     # No tag → unchanged.
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "Calculator CLI E2E complete"
     ) == "Calculator CLI E2E complete"
 
 
-def test_strip_action_subject_prefix_drops_routing_tag() -> None:
+def test_strip_routing_tag_prefix_drops_routing_tag() -> None:
     """The ``[Action]`` prefix is a tier/recipient routing label added
     by the notify CLI; it must not survive into user-facing subject
     rendering. The inbox list rail already strips it for action-bucket
     rows, and the detail pane mirrors the same strip — exercise the
     helper directly so both call sites stay in sync.
     """
-    from pollypm.cockpit_ui import _strip_action_subject_prefix
+    from pollypm.notify_task import strip_routing_tag_prefix
 
     # Standard form: "[Action] <subject>"
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "[Action] N-RC1 review (polly_remote/12): code solid"
     ) == "N-RC1 review (polly_remote/12): code solid"
 
     # Case-insensitive prefix match.
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "[ACTION] hold this thing"
     ) == "hold this thing"
 
     # Strips trailing punctuation/separators glued to the prefix so
     # the rendered subject doesn't lead with stray ":" or "-".
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "[Action]: do the thing"
     ) == "do the thing"
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "[Action] — escalation"
     ) == "escalation"
 
     # No prefix → unchanged.
-    assert _strip_action_subject_prefix(
+    assert strip_routing_tag_prefix(
         "Plan ready for review: booktalk"
     ) == "Plan ready for review: booktalk"
 
     # Empty / falsy → unchanged.
-    assert _strip_action_subject_prefix("") == ""
+    assert strip_routing_tag_prefix("") == ""
 
 
 def test_stuck_alert_covers_action_dedupes_user_waiting_alerts() -> None:

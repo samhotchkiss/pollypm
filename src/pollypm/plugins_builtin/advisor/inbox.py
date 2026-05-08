@@ -28,10 +28,9 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 from pollypm.atomic_io import atomic_write_text
-from pollypm.plugins_builtin.advisor.handlers.assess import AdvisorDecision
 
 
 logger = logging.getLogger(__name__)
@@ -40,6 +39,21 @@ logger = logging.getLogger(__name__)
 INSIGHTS_DIRNAME = "advisor_insights"
 INSIGHT_KIND = "advisor_insight"
 DEFAULT_AUTO_CLOSE_DAYS = 7
+
+
+class AdvisorDecisionLike(Protocol):
+    """Structural input accepted by ``emit_insight``.
+
+    Keeping this local avoids a runtime import back into the assess handler,
+    which calls this module only when a session emits an insight.
+    """
+
+    emit: bool
+    topic: str | None
+    severity: str | None
+    summary: str
+    details: str
+    suggestion: str
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +166,7 @@ def emit_insight(
     base_dir: Path,
     *,
     project: str,
-    decision: AdvisorDecision,
+    decision: AdvisorDecisionLike,
     task_id: str = "",
     commits_reviewed: list[str] | None = None,
     now_utc: datetime | None = None,

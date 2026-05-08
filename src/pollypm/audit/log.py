@@ -63,6 +63,13 @@ EVENT_WORKER_THREAD_LEAKED = "worker.thread_leaked"
 # ``cockpit-<pid>.sock`` whose owning PID is no longer alive. Lets
 # operators forensically count leak rates without scraping logs.
 EVENT_SOCKET_REAPED = "socket.reaped"
+# #1432 — emitted by ``rail_daemon_reaper`` when supervisor bootstrap
+# kills a stale ``pollypm.rail_daemon`` process from a prior boot.
+# Carries ``role`` (always ``"rail"`` today, leaves room for a future
+# ``"work"`` daemon), ``pid``, ``age_s``, and ``reason`` so operators
+# can quantify how often the field machine is accumulating sibling
+# daemons without scraping ``rail_daemon.log``.
+EVENT_DAEMON_REAPED = "daemon.reaped"
 # #1398 — plan task evolution. ``plan.version_incremented`` fires when
 # a plan task is refined in place (same task_id, version bump);
 # ``plan.successor_created`` fires when a replan creates a new task

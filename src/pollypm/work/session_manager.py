@@ -501,7 +501,7 @@ class SessionManager:
             # archival reads ambient env (legacy behaviour).
             return legacy_cmd, "claude", agent_name, None, None
 
-        from pollypm.models import SessionConfig
+        from pollypm.models import ProviderKind, SessionConfig
         from pollypm.onboarding import default_session_args
         from pollypm.providers import get_provider
         from pollypm.runtimes import get_runtime
@@ -564,6 +564,20 @@ class SessionManager:
                 routed_assignment.source,
             )
 
+        session_args = default_session_args(
+            session_provider,
+            open_permissions=config.pollypm.open_permissions_by_default,
+            role="worker",
+            model=session_model,
+        )
+        if session_provider is ProviderKind.CODEX:
+            # Per-task workers run from ``.pollypm/worktrees/<task>``.
+            # Codex's workspace-write sandbox otherwise allows that
+            # worktree but rejects the parent project state directory
+            # that ``pm task done`` must update (#1437).
+            project_state_dir = (self._project_path / ".pollypm").resolve()
+            session_args = [*session_args, "--add-dir", str(project_state_dir)]
+
         session = SessionConfig(
             name=window_name,
             role="worker",
@@ -572,12 +586,7 @@ class SessionManager:
             cwd=worktree_path,
             project=project,
             window_name=window_name,
-            args=default_session_args(
-                session_provider,
-                open_permissions=config.pollypm.open_permissions_by_default,
-                role="worker",
-                model=session_model,
-            ),
+            args=session_args,
         )
         provider = get_provider(session_provider, root_dir=config.project.root_dir)
         runtime = get_runtime(account.runtime, root_dir=config.project.root_dir)

@@ -836,6 +836,8 @@ class TestProvisionWorker:
             "never",
             "--model",
             "gpt-5.4",
+            "--add-dir",
+            str((tmp_project / ".pollypm").resolve()),
         ]
 
     def test_provision_worker_aborts_when_prompt_write_fails(

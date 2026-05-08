@@ -47,6 +47,7 @@ def _isolate_audit_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path
     """Redirect the central-tail root so tests never touch ~/.pollypm/."""
     audit_home = tmp_path / "audit-home"
     monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+    monkeypatch.delenv("POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT", raising=False)
     return audit_home
 
 
@@ -610,5 +611,34 @@ def test_workservice_open_per_project_log_when_project_path_supplied(
         opens = [r for r in rows if r["event"] == EVENT_WORK_DB_OPENED]
         assert len(opens) == 1
         assert opens[0]["metadata"]["project_path"] == str(project_root)
+    finally:
+        svc.close()
+
+
+def test_workservice_open_audit_can_be_disabled_for_pytest_isolation(
+    tmp_path: Path,
+    _isolate_audit_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pytest's global guard suppresses the DB-open breadcrumb entirely.
+
+    The central tail is already redirected during tests, but the per-project
+    audit log intentionally ignores that redirect. Suppressing only this
+    high-frequency lifecycle event keeps broad test sweeps out of a real
+    workspace's ``.pollypm/audit.jsonl``.
+    """
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    monkeypatch.setenv("POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT", "1")
+
+    project_root = tmp_path / "proj"
+    (project_root / ".pollypm").mkdir(parents=True)
+    db_path = tmp_path / "disabled.db"
+
+    svc = SQLiteWorkService(db_path=db_path, project_path=project_root)
+    try:
+        records = _read_central_records(_isolate_audit_home)
+        assert [r for r in records if r["event"] == EVENT_WORK_DB_OPENED] == []
+        assert not (project_root / ".pollypm" / "audit.jsonl").exists()
     finally:
         svc.close()

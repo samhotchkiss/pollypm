@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import subprocess
 from datetime import UTC, datetime
@@ -29,6 +30,13 @@ from pathlib import Path
 from typing import Any, Protocol
 
 logger = logging.getLogger(__name__)
+
+_DISABLE_WORK_DB_OPENED_AUDIT_ENV = "POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT"
+
+
+def _work_db_opened_audit_disabled() -> bool:
+    value = os.environ.get(_DISABLE_WORK_DB_OPENED_AUDIT_ENV, "")
+    return value.strip().lower() not in {"", "0", "false", "no", "off"}
 
 
 # #894 — register the work_service module as an emitter that routes
@@ -742,31 +750,32 @@ class SQLiteWorkService:
         # broad try/except so audit infra failure cannot block work-
         # service init — matches the pattern used at the other audit
         # callsites in this module.
-        try:
-            from pollypm.audit import emit as _audit_emit
-            from pollypm.audit.log import EVENT_WORK_DB_OPENED
+        if not _work_db_opened_audit_disabled():
+            try:
+                from pollypm.audit import emit as _audit_emit
+                from pollypm.audit.log import EVENT_WORK_DB_OPENED
 
-            # ``emit()`` skips the central tail when ``project`` is
-            # empty (no project file to address), so use a synthetic
-            # workspace-level key. Keeps these rows out of any real
-            # project's central file while still landing them on disk
-            # for ``pm doctor`` / heartbeat to grep.
-            _audit_emit(
-                event=EVENT_WORK_DB_OPENED,
-                project="_workspace",
-                subject=str(db_path),
-                actor="system",
-                metadata={
-                    "had_messages_table_pre_open": _had_messages_table_pre_open,
-                    "tables_created": not _had_work_tables_pre_open,
-                    "project_path": (
-                        str(project_path) if project_path is not None else None
-                    ),
-                },
-                project_path=project_path,
-            )
-        except Exception:  # noqa: BLE001 — audit must never break init
-            pass
+                # ``emit()`` skips the central tail when ``project`` is
+                # empty (no project file to address), so use a synthetic
+                # workspace-level key. Keeps these rows out of any real
+                # project's central file while still landing them on disk
+                # for ``pm doctor`` / heartbeat to grep.
+                _audit_emit(
+                    event=EVENT_WORK_DB_OPENED,
+                    project="_workspace",
+                    subject=str(db_path),
+                    actor="system",
+                    metadata={
+                        "had_messages_table_pre_open": _had_messages_table_pre_open,
+                        "tables_created": not _had_work_tables_pre_open,
+                        "project_path": (
+                            str(project_path) if project_path is not None else None
+                        ),
+                    },
+                    project_path=project_path,
+                )
+            except Exception:  # noqa: BLE001 — audit must never break init
+                pass
         self._flush_task_delete_audit_outbox()
         self._gate_registry = GateRegistry(project_path=project_path)
         self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}

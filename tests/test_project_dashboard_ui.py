@@ -4472,6 +4472,198 @@ def test_plan_body_with_enforce_plan_true_uses_default_nudge(dashboard_app) -> N
     assert "Plan not required" not in body
 
 
+# ---------------------------------------------------------------------------
+# #1518 — Plan section recognizes a done plan-shaped task in the work
+# service so the dashboard stops reading "No plan yet" forever for projects
+# whose plan completed via a non-plan_project flow (coffeeboardnm, live
+# witness 2026-05-08). Heuristic re-uses
+# ``plan_review_emit.task_is_eligible_for_backstop`` — do NOT duplicate.
+# ---------------------------------------------------------------------------
+
+
+def test_plan_body_renders_done_plan_task_summary_when_no_file(
+    dashboard_app,
+) -> None:
+    """A done plan-shaped task (no plan file) replaces 'No plan yet' (#1518)."""
+    from types import SimpleNamespace
+
+    summary = {
+        "task_id": "coffeeboardnm/1",
+        "task_number": 1,
+        "project": "coffeeboardnm",
+        "title": "Plan the visual explainer POC",
+        "summary": "Outline the deliverable and the build steps.",
+        "deliverable_url": "https://example.com/reports/index.html",
+        "updated_at": "2026-05-08T12:00:00",
+    }
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        plan_path=None,
+        plan_sections=[],
+        plan_aux_files=[],
+        plan_explainer=None,
+        enforce_plan=True,
+        plan_task_summary=summary,
+    )
+    body = dashboard_app._render_plan_body(fake_data)
+    assert "No plan yet" not in body
+    assert "coffeeboardnm/1" in body
+    assert "Plan the visual explainer POC" in body
+    assert "Outline the deliverable" in body
+    assert "https://example.com/reports/index.html" in body
+
+
+def test_plan_body_prefers_file_but_mentions_done_plan_task(
+    dashboard_app, tmp_path,
+) -> None:
+    """When a plan file AND a done plan task exist, prefer the file but
+    still surface the task ID below the TOC so the user can navigate to
+    the source (#1518)."""
+    from types import SimpleNamespace
+
+    plan_path = tmp_path / "docs" / "plan" / "plan.md"
+    plan_path.parent.mkdir(parents=True)
+    plan_path.write_text("# Plan\n\n## One\n")
+    summary = {
+        "task_id": "coffeeboardnm/1",
+        "task_number": 1,
+        "project": "coffeeboardnm",
+        "title": "Plan the visual explainer POC",
+        "summary": "Outline the deliverable and the build steps.",
+        "deliverable_url": "https://example.com/reports/index.html",
+        "updated_at": "2026-05-08T12:00:00",
+    }
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        plan_path=plan_path,
+        plan_sections=["One"],
+        plan_aux_files=[],
+        plan_explainer=None,
+        enforce_plan=True,
+        plan_task_summary=summary,
+    )
+    body = dashboard_app._render_plan_body(fake_data)
+    # H2 outline still drives the primary surface.
+    assert "One" in body
+    # Task ID is surfaced as a footer note.
+    assert "coffeeboardnm/1" in body
+    assert "Plan task done" in body
+    # Empty-state copy must NOT be present — we have a plan file.
+    assert "No plan yet" not in body
+
+
+def test_plan_body_keeps_no_plan_yet_when_no_file_and_no_task(
+    dashboard_app,
+) -> None:
+    """No plan file AND no plan-shaped task → original empty-state copy (#1518)."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        plan_path=None,
+        plan_sections=[],
+        plan_aux_files=[],
+        plan_explainer=None,
+        enforce_plan=True,
+        plan_task_summary=None,
+    )
+    body = dashboard_app._render_plan_body(fake_data)
+    assert "No plan yet" in body
+    assert "PM will draft one" in body
+
+
+def test_dashboard_done_plan_task_reads_from_work_service(tmp_path: Path) -> None:
+    """Integration: seed a done poc-plan task on standard flow; the
+    helper finds it via the work service (#1518)."""
+    project_path = tmp_path / "coffeeboardnm"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    db_path = project_path / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    from pollypm.work.models import (
+        Artifact, ArtifactKind, OutputType, WorkOutput,
+    )
+    with SQLiteWorkService(
+        db_path=db_path, project_path=project_path,
+    ) as svc:
+        svc._auto_merge_approved_task_branch = lambda _t, **_kw: None
+        task = svc.create(
+            title="Plan the explainer",
+            description=(
+                "First paragraph describing the plan.\n\n"
+                "Second paragraph that should not appear."
+            ),
+            type="task",
+            project="coffeeboardnm",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+            labels=["visual-explainer", "research", "poc-plan"],
+        )
+        svc.queue(task.task_id, "polly")
+        svc.claim(task.task_id, "worker")
+        svc.node_done(
+            task.task_id, "worker",
+            WorkOutput(
+                type=OutputType.CODE_CHANGE,
+                summary="Plan ready",
+                artifacts=[
+                    Artifact(
+                        kind=ArtifactKind.COMMIT,
+                        description="plan",
+                        ref="cafef00d0000",
+                    ),
+                ],
+            ),
+        )
+        svc.approve(task.task_id, "russell")
+
+    # Build a minimal config the helper accepts. Rely on the same
+    # loader the cockpit uses so the alias resolution path matches prod.
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        "[project]\n"
+        f'tmux_session = "pollypm-test"\n'
+        f'workspace_root = "{tmp_path}"\n'
+        "\n"
+        "[projects.coffeeboardnm]\n"
+        'key = "coffeeboardnm"\n'
+        'name = "coffeeboardnm"\n'
+        f'path = "{project_path}"\n'
+    )
+    from pollypm.config import load_config
+    config = load_config(config_path)
+
+    from pollypm.cockpit_ui import _dashboard_done_plan_task
+
+    result = _dashboard_done_plan_task(
+        config, "coffeeboardnm", project_path,
+    )
+    assert result is not None
+    assert result["task_id"] == "coffeeboardnm/1"
+    assert result["title"] == "Plan the explainer"
+    # Only the first paragraph should be surfaced.
+    assert "First paragraph" in result["summary"]
+    assert "Second paragraph" not in result["summary"]
+
+
+def test_dashboard_done_plan_task_returns_none_without_db(tmp_path: Path) -> None:
+    """No state.db → helper returns None (file-only fallback) — does NOT crash (#1518)."""
+    from types import SimpleNamespace
+
+    project_path = tmp_path / "ghost"
+    project_path.mkdir()
+    config = SimpleNamespace(
+        project=SimpleNamespace(workspace_root=tmp_path),
+        projects={"ghost": SimpleNamespace(path=project_path, name="ghost")},
+    )
+    from pollypm.cockpit_ui import _dashboard_done_plan_task
+
+    result = _dashboard_done_plan_task(config, "ghost", project_path)
+    assert result is None
+
+
 def test_action_hint_uses_per_card_form_when_two_cards_visible() -> None:
     """Footer hint must match the live key bindings.
 

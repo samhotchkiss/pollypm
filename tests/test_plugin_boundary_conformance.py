@@ -92,6 +92,20 @@ def test_transition_query_plugin_handlers_do_not_open_sqlite_directly() -> None:
     assert offenders == []
 
 
+def test_work_task_query_callers_do_not_open_sqlite_directly() -> None:
+    """Issue #1376: UI/plugin callers route work-task reads via facades."""
+    rels = (
+        "src/pollypm/dashboard_data.py",
+        "src/pollypm/plugins_builtin/project_planning/cli/project.py",
+    )
+    offenders: list[str] = []
+    for rel in rels:
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        if "sqlite3.connect" in text or "import sqlite3" in text:
+            offenders.append(rel)
+    assert offenders == []
+
+
 def test_scanner_recognizes_private_symbol() -> None:
     """Scanner detects ``from X import _foo`` correctly."""
     # Synthetic test using the public `_split_imports` indirectly.

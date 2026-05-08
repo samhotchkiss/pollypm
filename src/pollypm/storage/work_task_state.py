@@ -135,6 +135,37 @@ def task_numbers_with_statuses(
     return []
 
 
+def has_work_task_rows(
+    db_path: Path,
+    *,
+    project_key: str | None = None,
+) -> bool:
+    """Return whether ``work_tasks`` has rows, optionally scoped by project."""
+    conn = _connect_readonly(db_path)
+    if conn is None:
+        return False
+    try:
+        try:
+            has_table = conn.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type='table' AND name='work_tasks' LIMIT 1"
+            ).fetchone()
+            if has_table is None:
+                return False
+            if project_key:
+                row = conn.execute(
+                    "SELECT 1 FROM work_tasks WHERE project = ? LIMIT 1",
+                    (project_key,),
+                ).fetchone()
+            else:
+                row = conn.execute("SELECT 1 FROM work_tasks LIMIT 1").fetchone()
+            return row is not None
+        except sqlite3.Error:
+            return False
+    finally:
+        conn.close()
+
+
 def project_activity_probe(
     *,
     project_key: str,

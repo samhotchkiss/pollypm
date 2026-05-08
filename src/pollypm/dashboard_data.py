@@ -592,38 +592,12 @@ def _user_waiting_task_ids_across_projects(
     """Return ``project/N`` ids for every task in a user-waiting state
     across every tracked project.
 
-    Reads each project's ``state.db`` directly (read-only sqlite) so
-    we don't pay the work-service hydration cost just to filter
-    alerts. Used to suppress ``stuck_on_task:<id>`` alerts that are
-    already covered by the project's user-waiting status.
+    Used to suppress ``stuck_on_task:<id>`` alerts that are already
+    covered by the project's user-waiting status.
     """
-    import sqlite3 as _sqlite3
+    from pollypm.work.task_state import user_waiting_task_ids
 
-    out: set[str] = set()
-    for project_key, project in getattr(config, "projects", {}).items():
-        # Same tracked-only invariant as _count_inbox_tasks (cycle 86)
-        # and _pending_inbox_section (cycle 85).
-        if not getattr(project, "tracked", False):
-            continue
-        db_path = project.path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            continue
-        try:
-            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                rows = conn.execute(
-                    "SELECT task_number FROM work_tasks "
-                    "WHERE project = ? "
-                    "AND work_status IN ('blocked','on_hold','waiting_on_user')",
-                    (project_key,),
-                ).fetchall()
-            finally:
-                conn.close()
-        except (_sqlite3.Error, OSError):
-            continue
-        for (number,) in rows:
-            out.add(f"{project_key}/{number}")
-    return frozenset(out)
+    return user_waiting_task_ids(config)
 
 
 def _stuck_alert_already_user_waiting(

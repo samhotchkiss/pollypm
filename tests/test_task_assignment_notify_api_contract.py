@@ -1,18 +1,16 @@
-"""Public-API contract tests for ``task_assignment_notify`` (#939).
+"""Task-assignment notification boundary contract tests (#939 / #1365).
 
-The plugin's :mod:`task_assignment_notify.api` module is the
-sanctioned cross-boundary surface — both peer plugins (e.g.
-``core_recurring``) and core runtime modules (work transitions,
-cockpit rendering, heartbeat recovery) route through it instead of
-reaching into :mod:`task_assignment_notify.handlers.sweep` or
-:mod:`task_assignment_notify.resolver` directly.
+The shared :mod:`pollypm.task_assignment_notify` module is the sanctioned
+cross-boundary surface. Core runtime modules and peer plugins route through
+it instead of importing :mod:`task_assignment_notify.handlers.sweep`,
+:mod:`task_assignment_notify.resolver`, or the plugin compatibility
+``api`` module directly.
 
 Two shapes are pinned here:
 
-1. **API completeness** — every symbol that core / peer plugins
-   currently need is callable through ``api`` and resolves to the
-   underlying private implementation. Removing a public name (or
-   silently changing what it points at) must fail this test.
+1. **API completeness** — every symbol that runtime callers currently
+   need is callable through the shared module and the plugin
+   compatibility API.
 
 2. **Boundary enforcement** — no file under ``src/pollypm/`` outside
    the plugin itself imports from
@@ -23,19 +21,21 @@ plugin-to-plugin private imports; this test extends that contract
 to the core-to-plugin direction the issue (#939) flagged. The work
 layer is stricter after #1364: it must not import this plugin at all,
 and non-plugin runtime modules route task-assignment notifications
-through the core event bus after #1363.
+through the core event bus after #1363. Peer plugins route through the
+shared module after #1365.
 """
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
 import pytest
 
+from pollypm import task_assignment_notify as shared_api
 from pollypm.plugins_builtin.task_assignment_notify import api
 from pollypm.plugins_builtin.task_assignment_notify import resolver
-from pollypm.plugins_builtin.task_assignment_notify.handlers import sweep
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -45,35 +45,41 @@ PLUGIN_ROOT = (
 )
 
 
-# Every public symbol the plugin must expose, paired with the
-# underlying private implementation it must trampoline to. New core
-# callers must extend this list rather than imports from internals.
+# Every public symbol the shared module and compatibility API must expose.
 _PUBLIC_SURFACE: tuple[tuple[str, object, str], ...] = (
-    ("DEDUPE_WINDOW_SECONDS", resolver, "DEDUPE_WINDOW_SECONDS"),
-    ("RECENT_SWEEPER_PING_SECONDS", sweep, "RECENT_SWEEPER_PING_SECONDS"),
+    ("DEDUPE_WINDOW_SECONDS", shared_api, "DEDUPE_WINDOW_SECONDS"),
+    (
+        "RECENT_SWEEPER_PING_SECONDS",
+        shared_api,
+        "RECENT_SWEEPER_PING_SECONDS",
+    ),
     (
         "SWEEPER_PING_CONTEXT_ENTRY_TYPE",
-        sweep,
+        shared_api,
         "SWEEPER_PING_CONTEXT_ENTRY_TYPE",
     ),
-    ("load_runtime_services", resolver, "load_runtime_services"),
-    ("notify", resolver, "notify"),
+    ("load_runtime_services", shared_api, "load_runtime_services"),
+    ("notify", shared_api, "notify"),
     (
         "clear_alerts_for_cancelled_task",
-        resolver,
+        shared_api,
         "clear_alerts_for_cancelled_task",
     ),
     (
         "clear_no_session_alert_for_task",
-        resolver,
+        shared_api,
         "clear_no_session_alert_for_task",
     ),
-    ("auto_claim_enabled_for_project", sweep, "_auto_claim_enabled_for_project"),
-    ("build_event_for_task", sweep, "_build_event_for_task"),
-    ("close_quietly", sweep, "_close_quietly"),
-    ("open_project_work_service", sweep, "_open_project_work_service"),
-    ("record_sweeper_ping", sweep, "_record_sweeper_ping"),
-    ("recover_dead_claims", sweep, "_recover_dead_claims"),
+    (
+        "auto_claim_enabled_for_project",
+        shared_api,
+        "auto_claim_enabled_for_project",
+    ),
+    ("build_event_for_task", shared_api, "build_event_for_task"),
+    ("close_quietly", shared_api, "close_quietly"),
+    ("open_project_work_service", shared_api, "open_project_work_service"),
+    ("record_sweeper_ping", shared_api, "record_sweeper_ping"),
+    ("recover_dead_claims", shared_api, "recover_dead_claims"),
 )
 
 
@@ -85,25 +91,22 @@ _PUBLIC_SURFACE: tuple[tuple[str, object, str], ...] = (
 def test_public_surface_is_complete(
     public_name: str, source_module: object, source_name: str,
 ) -> None:
-    """Each name listed in the contract is reachable through ``api``
-    and the underlying private symbol still exists.
+    """Each name is reachable through ``api`` and the shared module.
 
     A failure means either:
 
     * the public surface lost a name a core module relies on, or
-    * the plugin renamed/removed an internal symbol without updating
-      the trampoline.
+    * the plugin compatibility API drifted from the shared surface.
 
-    Either way, fix the surface first — core must not be patched to
-    chase the plugin's internals."""
+    Either way, fix the shared surface first — core must not be patched
+    to chase the plugin's internals."""
     assert hasattr(api, public_name), (
         f"task_assignment_notify.api is missing public name "
         f"{public_name!r}"
     )
     assert hasattr(source_module, source_name), (
-        f"backing implementation {source_module.__name__}.{source_name} "
-        f"is missing — promote the new name into api.py instead of "
-        f"removing it"
+        f"shared implementation {source_module.__name__}.{source_name} "
+        f"is missing"
     )
 
 
@@ -127,18 +130,14 @@ def test_public_surface_listed_in_all() -> None:
 
 
 def test_trampolines_resolve_at_call_time(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The trampoline pattern (api.py docstring) requires that
-    monkeypatching the source module propagates through the public
-    surface. Pin the behaviour so refactors don't accidentally cache
-    the bound function at import time."""
+    """The compatibility API resolves shared functions at call time."""
+    assert resolver is shared_api
     sentinel = object()
 
     def fake_load_runtime_services(*_a: object, **_k: object) -> object:
         return sentinel
 
-    monkeypatch.setattr(
-        resolver, "load_runtime_services", fake_load_runtime_services,
-    )
+    monkeypatch.setattr(shared_api, "load_runtime_services", fake_load_runtime_services)
     assert api.load_runtime_services() is sentinel
 
 
@@ -172,8 +171,8 @@ def _is_inside_plugin(path: Path) -> bool:
 
 def test_no_core_or_peer_imports_from_plugin_internals() -> None:
     """Anything outside ``task_assignment_notify`` must import via
-    the ``api`` module. This catches both peer plugins (which
-    :mod:`tests.test_plugin_boundary_conformance` already covers) and
+    the shared module. This catches both peer plugins (which
+    :mod:`tests.test_plugin_boundary_conformance` also covers) and
     core runtime modules (the gap #939 cited).
 
     A failure means a caller — most likely something under
@@ -193,7 +192,7 @@ def test_no_core_or_peer_imports_from_plugin_internals() -> None:
             offenders.append(f"{rel}:{line_no}: {match.group(0)}")
     assert offenders == [], (
         "Core / peer modules must import task_assignment_notify "
-        "symbols from its public ``api`` module, not from "
+        "symbols from ``pollypm.task_assignment_notify``, not from "
         "``handlers.*`` / ``resolver``. Offenders:\n  - "
         + "\n  - ".join(offenders)
     )
@@ -225,17 +224,42 @@ def test_work_layer_does_not_import_task_assignment_notify_plugin() -> None:
     )
 
 
-def test_peer_plugin_callers_use_public_api() -> None:
-    """Peer plugins that still call notifier-owned helpers use ``api``."""
+def _imports_task_assignment_notify_plugin(source_file: Path) -> bool:
+    module = "pollypm.plugins_builtin.task_assignment_notify"
+    tree = ast.parse(source_file.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module:
+            if node.module == module or node.module.startswith(f"{module}."):
+                return True
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == module or alias.name.startswith(f"{module}."):
+                    return True
+    return False
+
+
+def test_non_plugin_sources_do_not_import_task_assignment_notify_plugin() -> None:
+    """Core and peer plugins use the shared module, not this plugin package."""
+    offenders: list[str] = []
+    for source_file in _iter_source_files():
+        if _is_inside_plugin(source_file):
+            continue
+        if _imports_task_assignment_notify_plugin(source_file):
+            offenders.append(source_file.relative_to(REPO_ROOT).as_posix())
+    assert offenders == []
+
+
+def test_peer_plugin_callers_use_shared_surface() -> None:
+    """Peer plugins that still call notifier-owned helpers use shared code."""
     targets = (
         SRC_ROOT / "plugins_builtin" / "core_recurring" / "sweeps.py",
     )
     for target in targets:
         text = target.read_text(encoding="utf-8")
         assert (
-            "pollypm.plugins_builtin.task_assignment_notify.api"
+            "pollypm.task_assignment_notify"
             in text
         ), (
             f"{target.relative_to(REPO_ROOT).as_posix()} should import "
-            f"from task_assignment_notify.api (#939)"
+            f"from pollypm.task_assignment_notify (#1365)"
         )

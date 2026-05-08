@@ -12332,7 +12332,15 @@ def _dashboard_task_blocker_body_with_kind(task: object) -> tuple[str, str]:
 
 
 def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
-    """Return task DBs that can hold work for a registered project."""
+    """Return task DBs that can hold work for a registered project.
+
+    Order (#1004): workspace-root canonical DB first, per-project
+    ``<project>/.pollypm/state.db`` as a legacy fallback. Must mirror
+    :meth:`pollypm.cockpit_tasks.PollyTasksApp._candidate_dbs` —
+    a divergence here surfaces as split-brain rendering between the
+    dashboard (which unions across DBs) and the Tasks pane (which
+    picks the first DB with matching rows).
+    """
     candidates: list[Path] = []
 
     def _add(path: object) -> None:
@@ -12343,12 +12351,12 @@ def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
         if candidate not in candidates and candidate.exists():
             candidates.append(candidate)
 
-    _add(project_path / ".pollypm" / "state.db")
-
     project_settings = getattr(config, "project", None)
     workspace_root = getattr(project_settings, "workspace_root", None)
     if workspace_root is not None:
         _add(Path(workspace_root) / ".pollypm" / "state.db")
+
+    _add(project_path / ".pollypm" / "state.db")
 
     state_db = getattr(project_settings, "state_db", None)
     if state_db is not None:

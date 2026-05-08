@@ -72,11 +72,17 @@ class ProjectStateRollup:
     sort_rank: int
     actionable_key: str | None = None
     reason: str = ""
-    # #1390 — Count of tasks where status=review AND a human is the
-    # assignee/actor (e.g. user_approval node). The rail uses this to
-    # render a prominent "needs your decision" affordance — savethenovel
-    # had a plan parked at user_approval for hours without any
-    # rail-level signal because the GREEN dot reads as "fine, moving".
+    # #1390 / #1426 — Count of tasks on this project that are parked
+    # in a "needs a decision before progress" state. The rail uses
+    # this to render a prominent "needs your decision" affordance.
+    #
+    # Originally (#1390) only ``status=review`` + assignee=human
+    # counted; #1426 widened to also fire on:
+    #   * any ``status=review`` task (reviewer-actor decisions stall
+    #     the project until acted on; not just human-actor).
+    #   * any ``status=on_hold`` task (parked, regardless of
+    #     assignee — savethenovel/11 sat in on_hold for 1+ hour
+    #     with no rail signal even though a real wedge existed).
     approvals_pending: int = 0
 
 
@@ -131,7 +137,7 @@ def rollup_project_state(
         if not _is_terminal(task) and _status(task) not in _INACTIVE_STATUSES
     ]
     approvals_pending = sum(
-        1 for task in active_tasks if _is_human_review(task)
+        1 for task in active_tasks if _is_decision_pending(task)
     )
     if not active_tasks:
         return _rollup(ProjectRailState.NONE, project_key=project_key)
@@ -255,27 +261,29 @@ def _is_waiting_on_user(task: object) -> bool:
     return _status(task) in _WAITING_STATUSES
 
 
-def _is_human_review(task: object) -> bool:
-    """Return True for tasks parked at a human-decision review node.
+def _is_decision_pending(task: object) -> bool:
+    """Return True for tasks parked in a "needs a decision" state.
 
-    Scoped narrower than ``_is_user_review``: only counts tasks where
-    ``status=='review'`` AND a human is named as the actor/assignee
-    (or the node id explicitly marks a user/approval touchpoint).
-    Drives the rail's ``(N approvals)`` affordance — see #1390.
+    Drives the rail's ``▶ <project> (N⚠)`` affordance.
+
+    Originally (#1390) only ``status=='review'`` + a human actor
+    counted, but the savethenovel/11 wedge (#1426) showed two real
+    holes in that scope:
+
+    * A reviewer (russell, architect) parking a task at ``review``
+      with a non-human actor still stalls the project until the
+      reviewer acts. The rail must surface those, not just human
+      decisions.
+    * A task in ``on_hold`` is by definition awaiting a decision
+      before it can move — savethenovel/11 sat there for 1+ hour
+      with no rail signal even though a real wedge existed.
+
+    Both cases are "needs a decision before progress" and roll up
+    into a single count so the 22-char rail row stays within the
+    label budget from #1396.
     """
-    if _status(task) != "review":
-        return False
-    owner = str(getattr(task, "owner", "") or "").lower()
-    actor = str(getattr(task, "actor_type", "") or "").lower()
-    assignee = str(getattr(task, "assignee", "") or "").lower()
-    if owner in {"human", "user", "operator", "operator-pm"}:
-        return True
-    if actor == "human":
-        return True
-    if assignee == "human":
-        return True
-    node_id = _node_id(task)
-    return any(marker in node_id for marker in _USER_NODE_MARKERS)
+    status = _status(task)
+    return status in {"review", "on_hold"}
 
 
 def _is_user_review(task: object) -> bool:

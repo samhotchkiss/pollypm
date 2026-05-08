@@ -6,7 +6,12 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from pollypm.plugins_builtin.core_agent_profiles.profiles import StaticPromptProfile, heartbeat_prompt, polly_prompt, worker_prompt
+from pollypm.agent_profiles.defaults import (
+    StaticPromptProfile,
+    heartbeat_prompt,
+    polly_prompt,
+    worker_prompt,
+)
 from pollypm.itsalive import build_deploy_instructions, sweep_pending_deploys
 from pollypm.plugin_api.v1 import Capability, HookContext, JobHandlerAPI, PluginAPI, PollyPMPlugin, RosterAPI
 

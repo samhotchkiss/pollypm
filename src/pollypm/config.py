@@ -90,13 +90,13 @@ def _normalize_session_prompt(session_name: str, prompt: str | None) -> str | No
 
 
 def _heartbeat_prompt() -> str:
-    from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt
+    from pollypm.agent_profiles.defaults import heartbeat_prompt
 
     return heartbeat_prompt()
 
 
 def _polly_prompt() -> str:
-    from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt
+    from pollypm.agent_profiles.defaults import polly_prompt
 
     return polly_prompt()
 

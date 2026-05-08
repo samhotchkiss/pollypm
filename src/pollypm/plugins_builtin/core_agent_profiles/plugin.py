@@ -1,5 +1,5 @@
 from pollypm.plugin_api.v1 import Capability, PollyPMPlugin
-from pollypm.plugins_builtin.core_agent_profiles.profiles import (
+from pollypm.agent_profiles.defaults import (
     StaticPromptProfile,
     heartbeat_prompt,
     polly_prompt,

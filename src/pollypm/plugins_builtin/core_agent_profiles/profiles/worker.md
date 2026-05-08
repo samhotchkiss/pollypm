@@ -16,7 +16,7 @@ YAML frontmatter above encodes the default provider policy:
   wins), workers write (Codex wins).
 
 The full worker prompt lives in
-``plugins_builtin/core_agent_profiles/profiles.py`` (``worker_prompt``).
+``pollypm.agent_profiles.defaults`` (``worker_prompt``).
 That Python source is the source of truth for worker behaviour; this
 Markdown file is the provider-policy declaration only, matching the
 planner personas' shape so `pm plugins show` can surface the policy

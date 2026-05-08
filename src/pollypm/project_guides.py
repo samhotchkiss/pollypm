@@ -188,7 +188,7 @@ def built_in_guide_text(role: str) -> str:
             raise RuntimeError("Could not locate the built-in architect guide.")
         return path.read_text(encoding="utf-8")
     if normalized == "reviewer":
-        from pollypm.plugins_builtin.core_agent_profiles.profiles import reviewer_prompt
+        from pollypm.agent_profiles.defaults import reviewer_prompt
 
         return reviewer_prompt()
     if normalized == "worker":
@@ -204,7 +204,7 @@ def built_in_guide_source_path(role: str) -> Path | None:
     if normalized == "architect":
         return Path(__file__).resolve().parent / "plugins_builtin" / "project_planning" / "profiles" / "architect.md"
     if normalized == "reviewer":
-        return Path(__file__).resolve().parent / "plugins_builtin" / "core_agent_profiles" / "profiles.py"
+        return Path(__file__).resolve().parent / "agent_profiles" / "defaults.py"
     if normalized == "worker":
         # Prefer the repo copy (editable install / in-tree dev) so
         # forks of the doc surface during dev cycles. In a packaged

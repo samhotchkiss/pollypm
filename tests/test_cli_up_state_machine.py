@@ -10,10 +10,12 @@ existing supervisor calls without disturbing legacy behavior.
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 from typer.testing import CliRunner
 
 from pollypm import cli
+from pollypm.launch_state import LaunchAction
 
 
 # ---------------------------------------------------------------------------
@@ -79,6 +81,44 @@ def test_probe_builder_swallows_tmux_errors() -> None:
     probe = cli._build_launch_probe(_FakeSupervisor())
     assert probe.main_session_alive is False
     assert probe.closet_session_alive is False
+
+
+# ---------------------------------------------------------------------------
+# Foreground rail ownership
+# ---------------------------------------------------------------------------
+
+
+def test_pm_up_does_not_start_foreground_workers_when_daemon_planned(
+    monkeypatch,
+) -> None:
+    """#1431: ``pm up`` must not run a second cadence worker pool in
+    the foreground when the launch plan is about to spawn the daemon.
+    """
+    monkeypatch.setattr(cli, "_rail_daemon_live", lambda: False)
+    plan = SimpleNamespace(actions=(LaunchAction.START_RAIL_DAEMON,))
+
+    assert cli._start_foreground_core_rail_workers(plan) is False
+
+
+def test_pm_up_does_not_start_foreground_workers_when_daemon_live(
+    monkeypatch,
+) -> None:
+    """#1431: attaching to an existing cockpit with a live daemon must
+    leave job draining to that daemon, not the foreground ``pm up``.
+    """
+    monkeypatch.setattr(cli, "_rail_daemon_live", lambda: True)
+    plan = SimpleNamespace(actions=(LaunchAction.SCHEDULE_HEARTBEAT,))
+
+    assert cli._start_foreground_core_rail_workers(plan) is False
+
+
+def test_pm_up_starts_foreground_workers_only_without_daemon(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(cli, "_rail_daemon_live", lambda: False)
+    plan = SimpleNamespace(actions=(LaunchAction.SCHEDULE_HEARTBEAT,))
+
+    assert cli._start_foreground_core_rail_workers(plan) is True
 
 
 # ---------------------------------------------------------------------------

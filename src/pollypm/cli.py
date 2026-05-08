@@ -914,7 +914,9 @@ def up(
     # to ensure_layout for layout scaffolding only; the executor below
     # owns ensure_heartbeat_schedule via the SCHEDULE_HEARTBEAT action.
     if hasattr(supervisor, "core_rail"):
-        supervisor.core_rail.start()
+        supervisor.core_rail.start(
+            start_workers=_start_foreground_core_rail_workers(plan),
+        )
     else:  # pragma: no cover - back-compat for mocked Supervisors in tests
         supervisor.ensure_layout()
     if all(hasattr(supervisor.config, field) for field in ("project", "accounts", "projects")) and hasattr(
@@ -969,6 +971,32 @@ def up(
 
     if result.exit_code is not None:
         raise typer.Exit(code=result.exit_code)
+
+
+def _start_foreground_core_rail_workers(plan) -> bool:
+    """Return True when ``pm up`` should run job workers in-process.
+
+    #1431: ``pm up`` attaches the user to tmux and may stay alive for
+    hours. If it starts a full HeartbeatRail while a headless daemon is
+    also running (or about to be spawned by the launch plan), the two
+    worker pools race on the same ``work_jobs`` table. During rolling
+    upgrades that lets an older foreground process claim jobs enqueued
+    by a newer roster and fail them as "No handler registered" before
+    the daemon can run them.
+    """
+    try:
+        from pollypm.launch_state import LaunchAction
+
+        if LaunchAction.START_RAIL_DAEMON in getattr(plan, "actions", ()):
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if _rail_daemon_live():
+            return False
+    except Exception:  # noqa: BLE001
+        pass
+    return True
 
 
 def _rail_daemon_pid_path() -> Path:

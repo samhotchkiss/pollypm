@@ -482,6 +482,19 @@ def _task_counts(
     return counts
 
 
+# Statuses the cockpit Tasks pane treats as "Active": a worker is doing
+# the work right now, a reviewer is pending on it, or the task is
+# unambiguously claimable. Issue #1513: the predicate used to be ``not
+# in {done, cancelled}`` which lumped parked/gated rows (draft, on_hold,
+# blocked, plan-gated queued) into Active and the user saw walls of
+# untouched tasks under "what's actually moving". The fix narrows
+# Active to the in-flight set and routes the parked rows to the Blocked
+# bucket via the synthetic ``waiting_on_plan`` overlay (cockpit_tasks.py:382).
+_ACTIVE_STATUSES: frozenset[str] = frozenset(
+    {"in_progress", "rework", "review", "queued"}
+)
+
+
 def _task_matches_status(
     task,
     status_filter: str,
@@ -492,7 +505,12 @@ def _task_matches_status(
     if status_filter == "all":
         return True
     if status_filter == "active":
-        return status not in {"done", "cancelled"}
+        # Plan-gated queued rows surface as the synthetic
+        # ``waiting_on_plan`` status above and so already fail this
+        # check. ``BLOCKED`` (set by the service when ``blocked_by``
+        # has a non-terminal blocker — see work/models.py) is also
+        # excluded here so blocked-by tasks never count as Active.
+        return status in _ACTIVE_STATUSES
     if status_filter == "review":
         return status == "review"
     if status_filter == "blocked":

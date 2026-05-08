@@ -743,7 +743,11 @@ class SQLiteWorkService:
             _had_messages_table_pre_open = "messages" in _names
             _had_work_tables_pre_open = "work_tasks" in _names
         except Exception:  # noqa: BLE001 — diagnostic only
-            pass
+            logger.debug(
+                "work DB pre-open table probe failed for %s",
+                db_path,
+                exc_info=True,
+            )
         create_work_tables(self._conn)
         # Emit AFTER stamping so ``tables_created`` reflects whether
         # ``create_work_tables`` actually had work to do. Wrapped in a
@@ -775,7 +779,11 @@ class SQLiteWorkService:
                     project_path=project_path,
                 )
             except Exception:  # noqa: BLE001 — audit must never break init
-                pass
+                logger.debug(
+                    "work DB opened audit emit failed for %s",
+                    db_path,
+                    exc_info=True,
+                )
         self._flush_task_delete_audit_outbox()
         self._gate_registry = GateRegistry(project_path=project_path)
         self._flow_cache: dict[tuple[str, int], FlowTemplate] = {}
@@ -1600,7 +1608,12 @@ class SQLiteWorkService:
                 project_path=self._project_path,
             )
         except Exception:  # noqa: BLE001 — audit must never break transitions
-            pass
+            logger.debug(
+                "task status audit emit failed for %s/%s",
+                project,
+                task_number,
+                exc_info=True,
+            )
 
     @staticmethod
     def _gate_skip_reason(results: list[GateResult]) -> str | None:
@@ -1634,7 +1647,13 @@ class SQLiteWorkService:
                 task.flow_template_id,
                 task.flow_template_version,
             )
-        except Exception:
+        except Exception:  # noqa: BLE001 — owner derivation falls back to assignee
+            logger.debug(
+                "owner derivation flow load failed for %s/%s",
+                task.project,
+                task.task_number,
+                exc_info=True,
+            )
             return task.assignee
 
         node = flow.nodes.get(task.current_node_id)
@@ -1773,7 +1792,11 @@ class SQLiteWorkService:
                 project_path=self._project_path,
             )
         except Exception:  # noqa: BLE001 — audit must never break the bump
-            pass
+            logger.debug(
+                "plan version audit emit failed for %s",
+                task_id,
+                exc_info=True,
+            )
 
         return self.get(task_id)
 
@@ -3153,8 +3176,12 @@ class SQLiteWorkService:
             )
             if key is not None:
                 return config.projects[key].path
-        except Exception:
-            pass
+        except Exception:  # noqa: BLE001 — config lookup is best-effort
+            logger.debug(
+                "project path config lookup failed for %s",
+                project,
+                exc_info=True,
+            )
 
         # Fallback: if it looks like a path, use it; otherwise stick with
         # the service's bound project_path.
@@ -3824,8 +3851,13 @@ class SQLiteWorkService:
             try:
                 tmpl = resolve_flow(name, project_path)
                 templates.append(tmpl)
-            except Exception:
-                pass
+            except Exception:  # noqa: BLE001 — skip invalid flow templates
+                logger.debug(
+                    "skipping unavailable flow template %s at %s",
+                    name,
+                    path,
+                    exc_info=True,
+                )
         return templates
 
     def get_flow(self, name: str, project: str | None = None) -> FlowTemplate:

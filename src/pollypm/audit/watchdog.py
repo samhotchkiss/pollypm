@@ -92,6 +92,7 @@ __all__ = [
     "RULE_TASK_ON_HOLD_STALE",
     "RULE_DUPLICATE_ADVISOR_TASKS",
     "RULE_PLAN_REVIEW_MISSING",
+    "RULE_LEGACY_DB_SHADOW",
     "ON_HOLD_HUMAN_NEEDED_TAG",
     "ON_HOLD_ARCHITECT_TAG",
     "scan_events",
@@ -151,6 +152,19 @@ RULE_DUPLICATE_ADVISOR_TASKS = "duplicate_advisor_tasks"
 # uses; idempotent because both call sites probe the messages table for
 # an existing plan_review row before writing.
 RULE_PLAN_REVIEW_MISSING = "plan_review_missing"
+# #1519 — legacy per-project DB shadows the canonical workspace DB. A
+# project has rows in BOTH ``<workspace_root>/.pollypm/state.db`` AND
+# ``<project>/.pollypm/state.db``; the dashboard's pipeline counts used
+# to union them, double-counting any legacy rows. The read-path fix
+# (#1519 Part A) prefers canonical, but the legacy file still wins
+# whenever canonical is empty for the project — which is exactly the
+# coffeeboardnm shape (1 canonical queued + 5 stale legacy queued).
+# This detector finds the divergence so the cadence handler can drain
+# the legacy DB via ``migrate_legacy_per_project_dbs`` (idempotent —
+# rows already in canonical are skipped, source is archived to
+# ``state.db.legacy-1004`` only after every row was either copied or
+# matched).
+RULE_LEGACY_DB_SHADOW = "legacy_db_shadow"
 
 # Reason-string tags reviewers use to hint the watchdog routing. The
 # default (no tag) is architect-actionable. ``ON_HOLD_HUMAN_NEEDED_TAG``
@@ -1520,6 +1534,88 @@ def _detect_plan_review_missing(
 
 
 # ---------------------------------------------------------------------------
+# Legacy-DB shadow detector (#1519)
+# ---------------------------------------------------------------------------
+
+
+def _detect_legacy_db_shadow(
+    *,
+    legacy_db_shadows: Sequence[Any] | None = None,
+) -> list[Finding]:
+    """Rule (#1519): a project has rows in BOTH canonical and legacy DBs.
+
+    Pre-#1004 the per-project ``<project>/.pollypm/state.db`` was the
+    primary task store; #1004 collapsed the resolver to the workspace
+    root. ``migrate_legacy_per_project_dbs`` exists to drain leftover
+    files but only runs if invoked explicitly. The savethenovel /
+    coffeeboardnm post-mortem (#1519) showed the dashboard pipeline
+    surfacing 6 queued (1 canonical + 5 stale legacy advisor_review
+    rows) because the read path unioned both DBs. The read-path fix
+    (Part A) prefers canonical, but the divergence itself is still a
+    bug — operator data is split across two files and any tool that
+    reads only one is wrong. This detector finds the wedge so the
+    cadence handler can drain the legacy DB.
+
+    Pure detector — no I/O. The cadence handler probes the filesystem
+    + sqlite for each project and passes a list of ``LegacyDbShadow``-
+    shaped objects (``project_key``, ``project_path``, ``canonical_db``,
+    ``legacy_db``, ``legacy_row_count``, ``canonical_row_count``).
+    The detector emits one finding per shadowed project. The action
+    path (``migrate_legacy_per_project_dbs``) is idempotent: rows
+    already in canonical are skipped by ``(project, task_number)``,
+    the legacy file is archived to ``state.db.legacy-1004`` only after
+    every row was either copied or matched. ``None`` disables the rule.
+    """
+    findings: list[Finding] = []
+    if not legacy_db_shadows:
+        return findings
+    for shadow in legacy_db_shadows:
+        project_key = getattr(shadow, "project_key", "") or ""
+        legacy_db = getattr(shadow, "legacy_db", None)
+        canonical_db = getattr(shadow, "canonical_db", None)
+        legacy_rows = int(getattr(shadow, "legacy_row_count", 0) or 0)
+        canonical_rows = int(
+            getattr(shadow, "canonical_row_count", 0) or 0,
+        )
+        if not project_key or legacy_db is None or canonical_db is None:
+            continue
+        if legacy_rows <= 0 or canonical_rows <= 0:
+            # A pure-canonical or pure-legacy project isn't a shadow —
+            # the read-path fallback already routes it correctly.
+            continue
+        legacy_path_str = str(legacy_db)
+        canonical_path_str = str(canonical_db)
+        findings.append(Finding(
+            rule=RULE_LEGACY_DB_SHADOW,
+            project=project_key,
+            subject=legacy_path_str,
+            message=(
+                f"Project {project_key} has rows in BOTH the canonical "
+                f"workspace DB ({canonical_path_str}: {canonical_rows} "
+                f"row(s)) AND its legacy per-project DB "
+                f"({legacy_path_str}: {legacy_rows} row(s)). The "
+                f"dashboard's pre-#1519 union read produced inflated "
+                f"counts; auto-migration drains the legacy file."
+            ),
+            recommendation=(
+                f"Cadence handler will run "
+                f"``migrate_legacy_per_project_dbs`` for {project_key} "
+                f"— idempotent, archives legacy file to "
+                f"``state.db.legacy-1004`` after a successful drain."
+            ),
+            metadata={
+                "project_key": project_key,
+                "canonical_db": canonical_path_str,
+                "legacy_db": legacy_path_str,
+                "canonical_row_count": canonical_rows,
+                "legacy_row_count": legacy_rows,
+                "detected_via": "state",
+            },
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Public API — scan_events / scan_project
 # ---------------------------------------------------------------------------
 
@@ -1534,6 +1630,7 @@ def scan_events(
     project: str = "",
     done_plan_tasks: Sequence[Any] | None = None,
     plan_review_present: Any = None,
+    legacy_db_shadows: Sequence[Any] | None = None,
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
 
@@ -1566,6 +1663,13 @@ def scan_events(
             that returns True iff a ``plan_review`` message already exists
             in the messages table for that task. ``None`` disables the
             ``plan_review_missing`` rule.
+        legacy_db_shadows: per-project shadow descriptors for the
+            ``legacy_db_shadow`` rule (#1519). Each entry must expose
+            ``project_key``, ``project_path``, ``canonical_db``,
+            ``legacy_db``, ``canonical_row_count``, ``legacy_row_count``.
+            The cadence handler builds this list by probing the
+            workspace + per-project state.db files for each known
+            project. ``None`` disables the rule.
     """
     if config is None:
         config = WatchdogConfig()
@@ -1616,6 +1720,12 @@ def scan_events(
         done_plan_tasks=done_plan_tasks,
         plan_review_present=plan_review_present,
     ))
+    # #1519 — legacy DB shadows the canonical workspace DB. State-only
+    # detector; the cadence handler probes the filesystem + sqlite for
+    # the row counts and passes them in so this function stays pure.
+    findings.extend(_detect_legacy_db_shadow(
+        legacy_db_shadows=legacy_db_shadows,
+    ))
     return findings
 
 
@@ -1629,6 +1739,7 @@ def scan_project(
     storage_window_names: Sequence[str] | None = None,
     done_plan_tasks: Sequence[Any] | None = None,
     plan_review_present: Any = None,
+    legacy_db_shadows: Sequence[Any] | None = None,
 ) -> list[Finding]:
     """Read audit events for ``project`` and scan them.
 
@@ -1640,8 +1751,10 @@ def scan_project(
     ``open_tasks`` and ``storage_window_names`` are pass-through inputs
     for the auto-unstick rules (#1414); ``done_plan_tasks`` +
     ``plan_review_present`` are pass-through for the plan_review_missing
-    rule (#1511). When omitted those rules become no-ops, which is the
-    right default for callers that only have audit events on hand.
+    rule (#1511); ``legacy_db_shadows`` is pass-through for the
+    legacy_db_shadow rule (#1519). When omitted those rules become
+    no-ops, which is the right default for callers that only have
+    audit events on hand.
     """
     from pollypm.audit.log import read_events
 
@@ -1669,6 +1782,7 @@ def scan_project(
         project=project,
         done_plan_tasks=done_plan_tasks,
         plan_review_present=plan_review_present,
+        legacy_db_shadows=legacy_db_shadows,
     )
 
 

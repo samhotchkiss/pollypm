@@ -631,6 +631,139 @@ def test_dashboard_reads_workspace_root_tasks_when_project_db_missing(tmp_path: 
     ]
 
 
+def test_dashboard_prefers_canonical_when_legacy_db_shadows_it(tmp_path: Path) -> None:
+    """#1519 — when both canonical and legacy per-project DBs hold rows
+    for the same project, ``_dashboard_gather_tasks`` must read ONLY
+    canonical (mirroring ``cockpit_tasks._get_svc`` "first DB with
+    matching rows"), NOT union both. Pre-#1519 the dashboard summed
+    canonical + legacy producing inflated counts (the coffeeboardnm
+    pipeline read 6 queued where canonical had 1 and legacy 5).
+    """
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    # Canonical workspace DB: 2 queued tasks (the source of truth).
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=workspace_db, project_path=tmp_path) as svc:
+        for i in range(2):
+            t = svc.create(
+                title=f"Canonical queued #{i}",
+                description="canonical seed",
+                type="task",
+                project="demo",
+                flow_template="standard",
+                roles={"worker": "worker", "reviewer": "reviewer"},
+                priority="normal",
+                created_by="polly",
+            )
+            svc.queue(t.task_id, "polly")
+
+    # Legacy per-project DB: 5 stale queued rows (the "shadow" the
+    # pre-#1519 read path used to fold into the count).
+    legacy_db = project_path / ".pollypm" / "state.db"
+    legacy_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(db_path=legacy_db, project_path=project_path) as svc:
+        for i in range(5):
+            t = svc.create(
+                title=f"Legacy stale queued #{i}",
+                description="legacy seed",
+                type="task",
+                project="demo",
+                flow_template="standard",
+                roles={"worker": "worker", "reviewer": "reviewer"},
+                priority="normal",
+                created_by="polly",
+            )
+            svc.queue(t.task_id, "polly")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+    from pollypm.cockpit_ui import _gather_project_dashboard
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    data = _gather_project_dashboard(config_path, "demo")
+
+    assert data is not None
+    # Only canonical's 2 queued are surfaced; legacy's 5 are ignored.
+    assert data.task_counts.get("queued") == 2
+    titles = {row["title"] for row in data.task_buckets.get("queued", [])}
+    assert titles == {"Canonical queued #0", "Canonical queued #1"}
+    # No legacy title leaked through.
+    assert not any("Legacy stale" in t for t in titles)
+    # Source DB on every row should be the canonical workspace DB.
+    for row in data.task_buckets.get("queued", []):
+        assert row["source_db"] == str(workspace_db)
+
+
+def test_dashboard_falls_back_to_legacy_when_canonical_empty(tmp_path: Path) -> None:
+    """#1519 — when canonical has NO rows for the project but the legacy
+    per-project DB does, ``_dashboard_gather_tasks`` must fall back to
+    the legacy DB. Otherwise unmigrated projects render as empty even
+    when their stored work is fully visible to the work-service.
+    """
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    # Canonical DB exists but has zero rows for "demo".
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    # Touch it so ``_dashboard_task_db_paths`` includes it as a
+    # candidate. A row for a different project keeps the file
+    # well-formed without populating the demo project.
+    with SQLiteWorkService(db_path=workspace_db, project_path=tmp_path) as svc:
+        other = svc.create(
+            title="unrelated other-project task",
+            description="seed",
+            type="task",
+            project="other-project",
+            flow_template="standard",
+            roles={"worker": "worker", "reviewer": "reviewer"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(other.task_id, "polly")
+
+    # Legacy per-project DB carries the project's only rows.
+    legacy_db = project_path / ".pollypm" / "state.db"
+    legacy_db.parent.mkdir(parents=True, exist_ok=True)
+    expected_titles = set()
+    with SQLiteWorkService(db_path=legacy_db, project_path=project_path) as svc:
+        for i in range(5):
+            title = f"Legacy queued #{i}"
+            expected_titles.add(title)
+            t = svc.create(
+                title=title,
+                description="legacy seed",
+                type="task",
+                project="demo",
+                flow_template="standard",
+                roles={"worker": "worker", "reviewer": "reviewer"},
+                priority="normal",
+                created_by="polly",
+            )
+            svc.queue(t.task_id, "polly")
+
+    from pollypm import cockpit_ui as _cockpit_ui
+    from pollypm.cockpit_ui import _gather_project_dashboard
+
+    _cockpit_ui._PROJECT_DASHBOARD_TASK_CACHE.clear()
+    data = _gather_project_dashboard(config_path, "demo")
+
+    assert data is not None
+    # All 5 legacy rows surface — read-path fell back to the legacy DB
+    # because canonical had no matching rows for the project.
+    assert data.task_counts.get("queued") == 5
+    titles = {row["title"] for row in data.task_buckets.get("queued", [])}
+    assert titles == expected_titles
+    # source_db should point at the legacy file.
+    for row in data.task_buckets.get("queued", []):
+        assert row["source_db"] == str(legacy_db)
+
+
 def _run(coro) -> None:
     asyncio.run(coro)
 

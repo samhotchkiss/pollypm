@@ -2781,3 +2781,282 @@ def test_duplicate_advisor_cleanup_cancels_all_but_newest(
     assert queued == 1
     assert cancelled == 4
 
+
+# ---------------------------------------------------------------------------
+# Rule (#1519): legacy DB shadows canonical
+# ---------------------------------------------------------------------------
+
+
+class _Shadow:
+    """Stand-in for the cadence handler's ``_LegacyDbShadow`` dataclass.
+
+    The detector duck-types every attribute via ``getattr`` so any
+    object with the right field set works. Tests prefer this lightweight
+    shape over importing the cadence-handler dataclass to keep the unit
+    tests pure.
+    """
+
+    def __init__(
+        self,
+        *,
+        project_key: str,
+        canonical_db: Path,
+        legacy_db: Path,
+        canonical_row_count: int,
+        legacy_row_count: int,
+        project_path: Path | None = None,
+    ) -> None:
+        self.project_key = project_key
+        self.project_path = project_path or Path("/tmp/proj")
+        self.canonical_db = canonical_db
+        self.legacy_db = legacy_db
+        self.canonical_row_count = canonical_row_count
+        self.legacy_row_count = legacy_row_count
+
+
+def test_legacy_db_shadow_fires_when_both_dbs_have_rows(now: datetime) -> None:
+    """#1519 — finding fires when canonical AND legacy both carry rows."""
+    from pollypm.audit.watchdog import RULE_LEGACY_DB_SHADOW
+
+    shadows = [_Shadow(
+        project_key="coffeeboardnm",
+        canonical_db=Path("/dev/.pollypm/state.db"),
+        legacy_db=Path("/dev/coffeeboardnm/.pollypm/state.db"),
+        canonical_row_count=1,
+        legacy_row_count=5,
+    )]
+    findings = scan_events([], now=now, legacy_db_shadows=shadows)
+    matched = [f for f in findings if f.rule == RULE_LEGACY_DB_SHADOW]
+    assert len(matched) == 1
+    f = matched[0]
+    assert f.project == "coffeeboardnm"
+    assert f.subject == "/dev/coffeeboardnm/.pollypm/state.db"
+    assert f.metadata["canonical_row_count"] == 1
+    assert f.metadata["legacy_row_count"] == 5
+    assert f.metadata["canonical_db"] == "/dev/.pollypm/state.db"
+    assert f.metadata["legacy_db"] == "/dev/coffeeboardnm/.pollypm/state.db"
+
+
+def test_legacy_db_shadow_silent_when_canonical_empty(now: datetime) -> None:
+    """Pure-legacy projects don't fire — Part A's read fallback already
+    routes them correctly. Migrating proactively would be a behaviour
+    change orthogonal to the bug; this rule is scoped to actual
+    divergence (rows on both sides).
+    """
+    from pollypm.audit.watchdog import RULE_LEGACY_DB_SHADOW
+
+    shadows = [_Shadow(
+        project_key="demo",
+        canonical_db=Path("/dev/.pollypm/state.db"),
+        legacy_db=Path("/dev/demo/.pollypm/state.db"),
+        canonical_row_count=0,
+        legacy_row_count=5,
+    )]
+    findings = scan_events([], now=now, legacy_db_shadows=shadows)
+    assert not any(f.rule == RULE_LEGACY_DB_SHADOW for f in findings)
+
+
+def test_legacy_db_shadow_silent_when_legacy_empty(now: datetime) -> None:
+    """Legacy file with no rows for the project is not a shadow."""
+    from pollypm.audit.watchdog import RULE_LEGACY_DB_SHADOW
+
+    shadows = [_Shadow(
+        project_key="demo",
+        canonical_db=Path("/dev/.pollypm/state.db"),
+        legacy_db=Path("/dev/demo/.pollypm/state.db"),
+        canonical_row_count=3,
+        legacy_row_count=0,
+    )]
+    findings = scan_events([], now=now, legacy_db_shadows=shadows)
+    assert not any(f.rule == RULE_LEGACY_DB_SHADOW for f in findings)
+
+
+def test_legacy_db_shadow_noop_when_input_none(now: datetime) -> None:
+    """``legacy_db_shadows=None`` (the default) disables the rule."""
+    from pollypm.audit.watchdog import RULE_LEGACY_DB_SHADOW
+
+    findings = scan_events([], now=now)
+    assert not any(f.rule == RULE_LEGACY_DB_SHADOW for f in findings)
+
+
+def test_legacy_db_shadow_self_heal_drains_legacy_db(tmp_path: Path) -> None:
+    """#1519 — cadence self-heal calls ``migrate_one`` and archives the
+    legacy DB. After the heal, the legacy file has been renamed to
+    ``state.db.legacy-1004`` and the canonical DB carries the merged
+    rows. A re-run is a no-op (the source is gone).
+    """
+    import sqlite3
+    from pollypm.audit.watchdog import (
+        Finding,
+        RULE_LEGACY_DB_SHADOW,
+    )
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _self_heal_legacy_db_shadow,
+    )
+
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    canonical_db = workspace_root / ".pollypm" / "state.db"
+    legacy_db = project_path / ".pollypm" / "state.db"
+    canonical_db.parent.mkdir(parents=True, exist_ok=True)
+    legacy_db.parent.mkdir(parents=True, exist_ok=True)
+
+    # Minimal schema that matches what migrate_one looks for.
+    for db in (canonical_db, legacy_db):
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE work_tasks ("
+            "project TEXT NOT NULL, task_number INTEGER NOT NULL, "
+            "title TEXT NOT NULL DEFAULT '', work_status TEXT NOT NULL DEFAULT 'queued', "
+            "PRIMARY KEY (project, task_number))"
+        )
+        conn.commit()
+        conn.close()
+
+    # Canonical: 1 row. Legacy: 5 rows under different task_numbers so
+    # the migration copies them in.
+    canon = sqlite3.connect(canonical_db)
+    canon.execute(
+        "INSERT INTO work_tasks (project, task_number, title) VALUES (?, ?, ?)",
+        ("demo", 100, "canonical row"),
+    )
+    canon.commit()
+    canon.close()
+
+    legacy = sqlite3.connect(legacy_db)
+    for n in range(5):
+        legacy.execute(
+            "INSERT INTO work_tasks (project, task_number, title) VALUES (?, ?, ?)",
+            ("demo", 200 + n, f"legacy stale row {n}"),
+        )
+    legacy.commit()
+    legacy.close()
+
+    finding = Finding(
+        rule=RULE_LEGACY_DB_SHADOW,
+        project="demo",
+        subject=str(legacy_db),
+        message="legacy shadows canonical",
+        recommendation="auto-migrate",
+        metadata={
+            "project_key": "demo",
+            "canonical_db": str(canonical_db),
+            "legacy_db": str(legacy_db),
+            "canonical_row_count": 1,
+            "legacy_row_count": 5,
+        },
+    )
+
+    counters = _self_heal_legacy_db_shadow(
+        finding,
+        project_key="demo",
+        project_path=project_path,
+    )
+    assert counters == {"migrated": 1, "failed": 0}
+
+    # Legacy file has been archived (migrate_one renames after a clean
+    # copy). The original path no longer exists.
+    assert not legacy_db.exists()
+    archived = legacy_db.with_suffix(legacy_db.suffix + ".legacy-1004")
+    assert archived.exists()
+
+    # Canonical now carries 1 + 5 = 6 demo rows.
+    with sqlite3.connect(canonical_db) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM work_tasks WHERE project = 'demo'"
+        ).fetchone()[0]
+    assert count == 6
+
+    # Idempotency — running again is a clean no-op (source gone).
+    counters_redux = _self_heal_legacy_db_shadow(
+        finding,
+        project_key="demo",
+        project_path=project_path,
+    )
+    # ``migrate_one`` returns ``skipped_reason='no_per_project_db'`` — that
+    # counts as success for our purposes (nothing to do, no errors).
+    assert counters_redux == {"migrated": 1, "failed": 0}
+
+
+def test_legacy_db_shadow_gather_skips_workspace_self(tmp_path: Path) -> None:
+    """``_gather_legacy_db_shadows`` must skip a project whose ``path``
+    *is* the workspace root — its "legacy" file IS the canonical one.
+    """
+    from types import SimpleNamespace
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _gather_legacy_db_shadows,
+    )
+
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    canonical_db = workspace_root / ".pollypm" / "state.db"
+    canonical_db.parent.mkdir(parents=True, exist_ok=True)
+    canonical_db.touch()
+
+    services = SimpleNamespace(
+        config=SimpleNamespace(
+            project=SimpleNamespace(workspace_root=str(workspace_root)),
+        ),
+        known_projects=(
+            SimpleNamespace(key="ws", path=workspace_root),
+        ),
+    )
+
+    shadows = _gather_legacy_db_shadows(services=services)
+    # Workspace-root project is filtered out — no shadow to migrate.
+    assert shadows == []
+
+
+def test_legacy_db_shadow_gather_finds_shadowed_project(tmp_path: Path) -> None:
+    """``_gather_legacy_db_shadows`` must return a descriptor for a
+    project whose canonical AND legacy DBs both carry rows.
+    """
+    import sqlite3
+    from types import SimpleNamespace
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _gather_legacy_db_shadows,
+    )
+
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    canonical_db = workspace_root / ".pollypm" / "state.db"
+    legacy_db = project_path / ".pollypm" / "state.db"
+    canonical_db.parent.mkdir(parents=True, exist_ok=True)
+    legacy_db.parent.mkdir(parents=True, exist_ok=True)
+
+    for db, count in ((canonical_db, 2), (legacy_db, 5)):
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "CREATE TABLE work_tasks ("
+            "project TEXT NOT NULL, task_number INTEGER NOT NULL, "
+            "PRIMARY KEY (project, task_number))"
+        )
+        for n in range(count):
+            conn.execute(
+                "INSERT INTO work_tasks (project, task_number) VALUES (?, ?)",
+                ("demo", (1000 if db is canonical_db else 2000) + n),
+            )
+        conn.commit()
+        conn.close()
+
+    services = SimpleNamespace(
+        config=SimpleNamespace(
+            project=SimpleNamespace(workspace_root=str(workspace_root)),
+        ),
+        known_projects=(
+            SimpleNamespace(key="demo", path=project_path),
+        ),
+    )
+
+    shadows = _gather_legacy_db_shadows(services=services)
+    assert len(shadows) == 1
+    s = shadows[0]
+    assert s.project_key == "demo"
+    assert s.canonical_row_count == 2
+    assert s.legacy_row_count == 5
+    assert s.canonical_db == canonical_db
+    assert s.legacy_db == legacy_db

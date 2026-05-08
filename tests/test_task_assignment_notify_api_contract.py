@@ -20,7 +20,8 @@ Two shapes are pinned here:
    ``task_assignment_notify.resolver``. The companion
    :mod:`tests.test_plugin_boundary_conformance` only catches
    plugin-to-plugin private imports; this test extends that contract
-   to the core-to-plugin direction the issue (#939) flagged.
+   to the core-to-plugin direction the issue (#939) flagged. The work
+   layer is stricter after #1364: it must not import this plugin at all.
 """
 
 from __future__ import annotations
@@ -196,15 +197,41 @@ def test_no_core_or_peer_imports_from_plugin_internals() -> None:
     )
 
 
-def test_known_core_callers_use_public_api() -> None:
-    """Spot-check that the three core callers cited in #939 import
+_FORBIDDEN_WORK_PLUGIN_IMPORT_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"from\s+pollypm\.plugins_builtin\.task_assignment_notify(?:\.|\s)"
+    r"|import\s+pollypm\.plugins_builtin\.task_assignment_notify(?:\.|\s|$)"
+    r")",
+    re.MULTILINE,
+)
+
+
+def test_work_layer_does_not_import_task_assignment_notify_plugin() -> None:
+    """``pollypm.work`` publishes neutral events instead of calling this
+    plugin directly (#1364)."""
+    offenders: list[str] = []
+    for source_file in (SRC_ROOT / "work").rglob("*.py"):
+        text = source_file.read_text(encoding="utf-8")
+        for match in _FORBIDDEN_WORK_PLUGIN_IMPORT_PATTERN.finditer(text):
+            line_no = text[: match.start()].count("\n") + 1
+            rel = source_file.relative_to(REPO_ROOT).as_posix()
+            offenders.append(f"{rel}:{line_no}: {match.group(0)}")
+    assert offenders == [], (
+        "pollypm.work must not import task_assignment_notify directly. "
+        "Publish a work-layer event and let the plugin subscribe instead. "
+        "Offenders:\n  - " + "\n  - ".join(offenders)
+    )
+
+
+def test_known_non_work_callers_use_public_api() -> None:
+    """Spot-check that the non-work runtime callers cited in #939 import
     from ``api`` specifically — guards against a future refactor
     that leaves the boundary technically clean (no private import)
     but routes through some other ad-hoc shim."""
     targets = (
-        SRC_ROOT / "work" / "service_transition_manager.py",
         SRC_ROOT / "cockpit_tasks.py",
         SRC_ROOT / "heartbeats" / "local.py",
+        SRC_ROOT / "plugins_builtin" / "core_recurring" / "sweeps.py",
     )
     for target in targets:
         text = target.read_text(encoding="utf-8")

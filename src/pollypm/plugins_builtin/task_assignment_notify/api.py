@@ -15,11 +15,6 @@ here keep their published shape.
 
 Core runtime callers route through the same surface (#939):
 
-* ``pollypm.work.service_transition_manager`` — uses
-  :func:`clear_alerts_for_cancelled_task` from the cancel path so
-  the alert hygiene fix from #927 doesn't pin core to a private
-  resolver symbol; and :func:`clear_no_session_alert_for_task`
-  from the approve path for the same reason (#953).
 * ``pollypm.heartbeats.local`` — uses :func:`build_event_for_task`,
   :func:`load_runtime_services`, :func:`notify`, and
   :data:`DEDUPE_WINDOW_SECONDS` to fire resume pings without

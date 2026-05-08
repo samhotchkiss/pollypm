@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Callable
 
 from pollypm.review_notify import notify_requires_review_hold
 from pollypm.task_review_summary import store_review_plain_summary
+from pollypm.work import task_assignment_alerts
 from pollypm.work.gates import evaluate_gates, has_hard_failure
 from pollypm.work.models import (
     ActorType,
@@ -693,32 +694,23 @@ class WorkTransitionManager:
         )
 
     def _clear_assignment_alerts_after_cancel(self, task: Task) -> None:
-        """Clear no_session alerts referencing a just-cancelled task.
+        """Publish cleanup for no_session alerts on a just-cancelled task.
 
-        Defers to ``task_assignment_notify.resolver.clear_alerts_for_cancelled_task``
-        — kept as a deferred import so the work module stays importable
-        without the plugin runtime (tests, contrib doubles). Any error
-        is swallowed.
+        The task_assignment_notify plugin owns these alert families. The
+        work service publishes a neutral cleanup event and the plugin
+        handles it when loaded; without that subscriber this is a no-op.
 
         Per-project ``(worker-<project>, no_session)`` is only cleared
         when no other active task on the project still routes to that
         role. We compute the "other active" map here against the work
-        service so the resolver helper stays generic.
+        service so the subscriber doesn't need to reach back into the
+        transition manager.
 
         We resolve the alert store from the unified Store registry and
-        pass it in, so the helper doesn't need to spin up a second
+        pass it in, so the subscriber doesn't need to spin up a second
         work-service connection against the same SQLite file while our
         caller's cancel transaction is still in flight.
         """
-        try:
-            # #939: route through the plugin's public API rather than
-            # importing from ``resolver`` directly. Keeps core decoupled
-            # from the plugin's internal module layout.
-            from pollypm.plugins_builtin.task_assignment_notify.api import (
-                clear_alerts_for_cancelled_task,
-            )
-        except Exception:  # noqa: BLE001
-            return
         try:
             roles = tuple((task.roles or {}).keys()) or ("worker",)
         except Exception:  # noqa: BLE001
@@ -760,18 +752,19 @@ class WorkTransitionManager:
                         break
                 if active_map[role]:
                     break
-        store = self._resolve_alert_store()
         try:
-            clear_alerts_for_cancelled_task(
-                task_id=task.task_id,
-                project=task.project,
-                role_names=roles,
-                has_other_active_for_role=active_map,
-                store=store,
+            task_assignment_alerts.dispatch(
+                task_assignment_alerts.CancelledTaskAssignmentAlertsEvent(
+                    task_id=task.task_id,
+                    project=task.project,
+                    role_names=roles,
+                    has_other_active_for_role=active_map,
+                    store=self._resolve_alert_store(),
+                )
             )
         except Exception:  # noqa: BLE001
             logger.debug(
-                "clear_alerts_for_cancelled_task failed for %s",
+                "assignment alert cleanup dispatch failed for %s",
                 task.task_id,
                 exc_info=True,
             )
@@ -848,35 +841,25 @@ class WorkTransitionManager:
             )
 
     def _clear_no_session_alert_after_approve(self, task: Task) -> None:
-        """Clear the per-task no_session alert after an approve transition.
+        """Publish cleanup for a per-task no_session alert after approve.
 
-        Defers to ``task_assignment_notify.api.clear_no_session_alert_for_task``
-        — narrower than the cancel cleanup (#927): only the per-task
-        ``no_session_for_assignment:<task_id>`` alert is cleared. The
-        project-level ``worker-<project>/no_session`` alert is left
-        alone, because the just-approved task may now route to a new
-        role on the same project, or other active siblings may still
-        need the role.
-
-        Routed through the plugin's public API surface so core stays
-        decoupled from the plugin's internal module layout (#939).
-        Any error is swallowed.
+        This is narrower than the cancel cleanup (#927): only the
+        per-task ``no_session_for_assignment:<task_id>`` alert is stale.
+        The project-level ``worker-<project>/no_session`` alert is left
+        alone, because the just-approved task may now route to a new role
+        on the same project, or other active siblings may still need the
+        role.
         """
         try:
-            from pollypm.plugins_builtin.task_assignment_notify.api import (
-                clear_no_session_alert_for_task,
-            )
-        except Exception:  # noqa: BLE001
-            return
-        store = self._resolve_alert_store()
-        try:
-            clear_no_session_alert_for_task(
-                task_id=task.task_id,
-                store=store,
+            task_assignment_alerts.dispatch(
+                task_assignment_alerts.ClearNoSessionAlertForTaskEvent(
+                    task_id=task.task_id,
+                    store=self._resolve_alert_store(),
+                )
             )
         except Exception:  # noqa: BLE001
             logger.debug(
-                "clear_no_session_alert_for_task failed for %s",
+                "no_session alert cleanup dispatch failed for %s",
                 task.task_id,
                 exc_info=True,
             )

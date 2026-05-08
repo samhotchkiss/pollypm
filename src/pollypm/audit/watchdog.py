@@ -91,6 +91,7 @@ __all__ = [
     "RULE_WORKER_SESSION_DEAD_LOOP",
     "RULE_TASK_ON_HOLD_STALE",
     "RULE_DUPLICATE_ADVISOR_TASKS",
+    "RULE_PLAN_REVIEW_MISSING",
     "ON_HOLD_HUMAN_NEEDED_TAG",
     "ON_HOLD_ARCHITECT_TAG",
     "scan_events",
@@ -142,6 +143,14 @@ RULE_TASK_ON_HOLD_STALE = "task_on_hold_stale"
 # created one. This rule is the detector — the cleanup runs from the
 # cadence handler which holds a work-service handle.
 RULE_DUPLICATE_ADVISOR_TASKS = "duplicate_advisor_tasks"
+# #1511 — plan-review coverage gap. A plan-shaped task (label: ``poc-plan``
+# / ``plan`` / ``project-plan``) reached ``done`` outside the
+# ``plan_project`` flow, so the architect's reflection node (#1399) never
+# fired and no ``plan_review`` inbox card was emitted. The watchdog
+# backfills the missing card via the same code path the post-done hook
+# uses; idempotent because both call sites probe the messages table for
+# an existing plan_review row before writing.
+RULE_PLAN_REVIEW_MISSING = "plan_review_missing"
 
 # Reason-string tags reviewers use to hint the watchdog routing. The
 # default (no tag) is architect-actionable. ``ON_HOLD_HUMAN_NEEDED_TAG``
@@ -232,6 +241,11 @@ class WatchdogConfig:
     # same task within ``dead_loop_window_seconds`` count as a loop.
     dead_loop_threshold: int = 3
     dead_loop_window_seconds: int = 600
+    # #1511 — plan_review_missing: how far back to look for plan-shaped
+    # ``done`` tasks when scanning for a missing plan_review row. 14 days
+    # is wide enough to catch plans the user genuinely hasn't reviewed
+    # yet without re-firing forever on long-since-abandoned drafts.
+    plan_review_lookback_seconds: int = 14 * 24 * 60 * 60
 
 
 @dataclass(slots=True, frozen=True)
@@ -1409,6 +1423,103 @@ def _detect_duplicate_advisor_tasks(
 
 
 # ---------------------------------------------------------------------------
+# Plan-review missing detector (#1511)
+# ---------------------------------------------------------------------------
+
+
+def _detect_plan_review_missing(
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+    done_plan_tasks: Sequence[Any] | None = None,
+    plan_review_present: Any = None,
+) -> list[Finding]:
+    """Rule 9 (#1511): plan-shaped done task with no ``plan_review`` row.
+
+    The architect's reflection node (#1399) only fires inside the
+    ``plan_project`` flow. Plan-shaped tasks built on the ``standard``
+    flow (or any other) reach ``done`` with no ``plan_review`` inbox
+    card, so the cockpit's 2-line approval surface stays silent. This
+    detector finds those stranded tasks and emits a finding so the
+    cadence handler can backfill the missing card via the same emit
+    path :mod:`pollypm.work.plan_review_emit` uses on the post-done
+    hook (Part A of the #1511 fix).
+
+    Inputs are passed in by the scan caller so this function stays
+    pure / unit-testable:
+
+    * ``done_plan_tasks`` — already filtered to ``work_status=done`` +
+      plan-shaped labels + non-plan_project flow + ``created_at`` within
+      ``plan_review_lookback_seconds``. The cadence handler builds this
+      list via ``svc.list_tasks(work_status='done', project=...)`` +
+      :func:`pollypm.work.plan_review_emit.task_is_eligible_for_backstop`.
+    * ``plan_review_present`` — a callable taking ``(project,
+      plan_task_id)`` and returning True if a plan_review message
+      already exists. Tests pass a ``set``-backed lambda; production
+      passes :func:`pollypm.work.plan_review_emit.already_has_plan_review_message`.
+
+    Both inputs default to None — the detector then no-ops, which is
+    the right default when the caller can't enumerate done tasks /
+    probe the messages table.
+    """
+    findings: list[Finding] = []
+    if not done_plan_tasks:
+        return findings
+    if plan_review_present is None:
+        return findings
+    cutoff = now - timedelta(seconds=config.plan_review_lookback_seconds)
+    for task in done_plan_tasks:
+        project = getattr(task, "project", "") or ""
+        task_number = getattr(task, "task_number", None)
+        if not project or task_number is None:
+            continue
+        plan_task_id = f"{project}/{task_number}"
+        created_at = getattr(task, "created_at", None)
+        if isinstance(created_at, datetime):
+            ts = created_at if created_at.tzinfo is not None else created_at.replace(
+                tzinfo=timezone.utc,
+            )
+            if ts < cutoff:
+                continue
+        try:
+            already_present = bool(plan_review_present(project, plan_task_id))
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "plan_review_missing: probe failed for %s",
+                plan_task_id, exc_info=True,
+            )
+            continue
+        if already_present:
+            continue
+        labels = list(getattr(task, "labels", None) or [])
+        flow_id = getattr(task, "flow_template_id", "") or ""
+        findings.append(Finding(
+            rule=RULE_PLAN_REVIEW_MISSING,
+            project=project,
+            subject=plan_task_id,
+            message=(
+                f"Plan-shaped task {plan_task_id} (flow={flow_id or '?'}) "
+                f"reached done with no plan_review inbox card."
+            ),
+            recommendation=(
+                f"Backfill via plan_review_emit.emit_plan_review_for_task "
+                f"so the cockpit approval surface renders for {plan_task_id}."
+            ),
+            metadata={
+                "plan_task_id": plan_task_id,
+                "flow_template_id": flow_id,
+                "labels": labels,
+                "created_at": (
+                    created_at.isoformat() if isinstance(created_at, datetime)
+                    else None
+                ),
+                "detected_via": "state",
+            },
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Public API — scan_events / scan_project
 # ---------------------------------------------------------------------------
 
@@ -1421,6 +1532,8 @@ def scan_events(
     open_tasks: Sequence[Any] | None = None,
     storage_window_names: Sequence[str] | None = None,
     project: str = "",
+    done_plan_tasks: Sequence[Any] | None = None,
+    plan_review_present: Any = None,
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
 
@@ -1445,6 +1558,14 @@ def scan_events(
             pure function.
         project: project key — only used by ``role_session_missing``
             when the open_task rows don't carry it.
+        done_plan_tasks: completed plan-shaped tasks for the
+            ``plan_review_missing`` rule (#1511). Passed in by the
+            cadence handler so the detector stays pure. ``None`` disables
+            the rule (the right default for unit tests).
+        plan_review_present: callable ``(project, plan_task_id) -> bool``
+            that returns True iff a ``plan_review`` message already exists
+            in the messages table for that task. ``None`` disables the
+            ``plan_review_missing`` rule.
     """
     if config is None:
         config = WatchdogConfig()
@@ -1489,6 +1610,12 @@ def scan_events(
     # ``open_tasks`` alone (it's a write-time invariant violation, not
     # a temporal pattern).
     findings.extend(_detect_duplicate_advisor_tasks(open_tasks=open_tasks))
+    findings.extend(_detect_plan_review_missing(
+        now=now,
+        config=config,
+        done_plan_tasks=done_plan_tasks,
+        plan_review_present=plan_review_present,
+    ))
     return findings
 
 
@@ -1500,6 +1627,8 @@ def scan_project(
     config: WatchdogConfig | None = None,
     open_tasks: Sequence[Any] | None = None,
     storage_window_names: Sequence[str] | None = None,
+    done_plan_tasks: Sequence[Any] | None = None,
+    plan_review_present: Any = None,
 ) -> list[Finding]:
     """Read audit events for ``project`` and scan them.
 
@@ -1509,9 +1638,10 @@ def scan_project(
     source-preference rules).
 
     ``open_tasks`` and ``storage_window_names`` are pass-through inputs
-    for the auto-unstick rules (#1414); when omitted those rules become
-    no-ops, which is the right default for callers that only have audit
-    events on hand.
+    for the auto-unstick rules (#1414); ``done_plan_tasks`` +
+    ``plan_review_present`` are pass-through for the plan_review_missing
+    rule (#1511). When omitted those rules become no-ops, which is the
+    right default for callers that only have audit events on hand.
     """
     from pollypm.audit.log import read_events
 
@@ -1537,6 +1667,8 @@ def scan_project(
         open_tasks=open_tasks,
         storage_window_names=storage_window_names,
         project=project,
+        done_plan_tasks=done_plan_tasks,
+        plan_review_present=plan_review_present,
     )
 
 
@@ -1831,6 +1963,33 @@ def format_unstick_brief(finding: Finding) -> str:
             "(b) reassign the task to a role that IS present, "
             "(c) escalate to user via `pm notify` if the spawn failure is "
             "persistent (config / auth / quota)."
+        )
+    elif finding.rule == RULE_PLAN_REVIEW_MISSING:
+        plan_task_id = meta.get("plan_task_id") or subject
+        flow_id = meta.get("flow_template_id") or "<unknown>"
+        labels = meta.get("labels") or []
+        created_at = meta.get("created_at")
+        lines.append("Stuck for: plan_review never emitted")
+        lines.append("Observed evidence:")
+        lines.append(
+            f"- Plan-shaped task {plan_task_id} reached done on flow={flow_id}"
+        )
+        if labels:
+            label_preview = ", ".join(str(label) for label in labels[:6])
+            lines.append(f"- Labels: {label_preview}")
+        if created_at:
+            lines.append(f"- Created at: {created_at}")
+        lines.append(
+            "- The cockpit's plan_review approval card needs a "
+            "messages-table row with labels=[plan_review, "
+            f"plan_task:{plan_task_id}] but none exists."
+        )
+        lines.append("")
+        lines.append(
+            "Your job: the watchdog will backfill the plan_review row on "
+            "this tick via plan_review_emit.emit_plan_review_for_task. "
+            "No manual action required unless the backfill itself fails "
+            "in the cadence logs."
         )
     elif finding.rule == RULE_WORKER_SESSION_DEAD_LOOP:
         reap_count = meta.get("reap_count") or "?"

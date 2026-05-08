@@ -324,6 +324,10 @@ def _latest_backlog_created_at(work_service: Any, project_key: str) -> float | N
     excluded so the planner's own task doesn't count as "backlog" for
     the purpose of the staleness check.
 
+    Terminal implementation tasks are also excluded. Done and cancelled
+    rows no longer represent active backlog, so their timestamps must
+    not make an approved plan look stale.
+
     Tasks that are **children of an approved plan_project task** are
     also excluded. These are the architect's own emit output — they
     exist *because of* the plan, so the fact that they're newer than
@@ -360,6 +364,11 @@ def _latest_backlog_created_at(work_service: Any, project_key: str) -> float | N
         if flow_id in _PLANNING_FLOWS:
             continue
         if flow_id in _NON_BACKLOG_FLOWS:
+            continue
+        status = getattr(getattr(task, "work_status", None), "value", None) or str(
+            getattr(task, "work_status", "") or ""
+        )
+        if status in {WorkStatus.DONE.value, WorkStatus.CANCELLED.value}:
             continue
         labels = set(getattr(task, "labels", None) or [])
         if labels & _NON_BACKLOG_LABELS:

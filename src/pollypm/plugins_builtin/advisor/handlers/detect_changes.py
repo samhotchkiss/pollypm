@@ -244,18 +244,23 @@ _TRANSITION_SQL = (
 def _transitions_db_path(project_path: Path) -> Path | None:
     """Resolve the read-only work-service DB path for a project.
 
-    Tries the per-project ``<project_path>/.pollypm/state.db`` first
-    (legacy / per-project layout) then walks up to the workspace-root
-    ``<ancestor>/.pollypm/state.db`` (the layout #339 collapsed onto).
-    Returns ``None`` when no state.db is reachable — callers treat that
-    as "no transitions this window," same as a missing per-project file.
-
-    See :func:`pollypm.plugins_builtin.advisor.db_paths.resolve_state_db`
-    for the canonical helper so the two probes stay in lockstep (#1037).
+    Routes through :func:`pollypm.work.db_resolver.resolve_work_db_path`
+    so the advisor reads the same canonical workspace-root state.db that
+    every other engine writes to (post-#1004 layout). The deprecated
+    per-project DB is no longer probed — see the advisor.tick spam fix
+    note in :mod:`pollypm.plugins_builtin.advisor.handlers.advisor_tick`.
+    Returns ``None`` if the resolved path doesn't exist on disk so
+    callers can treat that as "no transitions this window."
     """
-    from pollypm.plugins_builtin.advisor.db_paths import resolve_state_db
+    from pollypm.work.db_resolver import resolve_work_db_path
 
-    return resolve_state_db(project_path)
+    try:
+        db_path = resolve_work_db_path()
+    except Exception:  # noqa: BLE001
+        return None
+    if db_path is None or not db_path.exists():
+        return None
+    return db_path
 
 
 def _gather_task_transitions(

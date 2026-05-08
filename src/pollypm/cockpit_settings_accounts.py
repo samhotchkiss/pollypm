@@ -40,6 +40,14 @@ SETTINGS_ACCOUNT_ACTIONS: tuple[SettingsAccountAction, ...] = (
         label="Refresh Usage",
     ),
     SettingsAccountAction(
+        button_id="settings-account-make-controller",
+        label="Make Controller",
+    ),
+    SettingsAccountAction(
+        button_id="settings-account-reassign-sessions",
+        label="Reassign Sessions",
+    ),
+    SettingsAccountAction(
         button_id="settings-account-remove",
         label="Remove",
         variant="error",

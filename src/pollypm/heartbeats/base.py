@@ -13,6 +13,15 @@ class HeartbeatCursor:
     last_snapshot_hash: str = ""
     last_verdict: str = ""
     last_reason: str = ""
+    #: Consecutive ticks that produced no fresh transcript output for a
+    #: session that *could* legitimately be working (worker with pending
+    #: work, etc.). Reset to 0 on any tick where the classifier produced
+    #: a non-"no new transcript" reason. After ``QUIET_TICKS_FOR_FLOW_MARKER``
+    #: ticks, the heartbeat marks the session ``flow=quiet`` so ``pm
+    #: status`` distinguishes "alive but silent" from "actively working."
+    #: Generalises the per-question detection added in #1493 — see #1501
+    #: heartbeat-progress-signal.
+    quiet_tick_count: int = 0
 
 
 @dataclass(slots=True)

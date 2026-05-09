@@ -14723,6 +14723,24 @@ class PollyProjectDashboardApp(App[None]):
         "\u00b7 o editor \u00b7 p back \u00b7 q exit"
     )
     _PM_CONTEXT_REATTACH_WINDOW_SECONDS = 300.0
+    # #1539 \u2014 skeleton placeholder bars rendered into each panel body
+    # during the cold-fetch window so the panels read as "loading"
+    # rather than "loaded with nothing in them". Two dim block-glyph
+    # bars per panel are enough to look intentionally placeholdered
+    # without flashing. Replaced wholesale by ``_render`` the moment
+    # the worker thread hands data back; layout stays stable across
+    # the swap so content doesn't pop into place.
+    _SKELETON_BAR_LONG = "\u2588" * 24
+    _SKELETON_BAR_SHORT = "\u2588" * 14
+    _SKELETON_TWO_LINE = (
+        f"[#1e2730]{_SKELETON_BAR_LONG}[/]\n"
+        f"[#1e2730]{_SKELETON_BAR_SHORT}[/]"
+    )
+    _SKELETON_THREE_LINE = (
+        f"[#1e2730]{_SKELETON_BAR_LONG}[/]\n"
+        f"[#1e2730]{_SKELETON_BAR_SHORT}[/]\n"
+        f"[#1e2730]{_SKELETON_BAR_LONG}[/]"
+    )
 
     def __init__(self, config_path: Path, project_key: str) -> None:
         super().__init__()
@@ -14763,8 +14781,13 @@ class PollyProjectDashboardApp(App[None]):
             classes="proj-section-title",
             markup=True,
         )
+        # #1539 — seed each section body with skeleton bars so the
+        # cold-fetch window reads as "loading" instead of "loaded but
+        # empty". Replaced wholesale by ``_render`` once data lands.
         self.now_body = Static(
-            "", classes="proj-section-body", markup=True,
+            self._SKELETON_TWO_LINE,
+            classes="proj-section-body",
+            markup=True,
         )
         self.pipeline_title = Static(
             "[b]Task pipeline[/b]",
@@ -14772,13 +14795,17 @@ class PollyProjectDashboardApp(App[None]):
             markup=True,
         )
         self.pipeline_body = Static(
-            "", classes="proj-section-body", markup=True,
+            self._SKELETON_TWO_LINE,
+            classes="proj-section-body",
+            markup=True,
         )
         self.plan_title = Static(
             "[b]Plan[/b]", classes="proj-section-title", markup=True,
         )
         self.plan_body = Static(
-            "", classes="proj-section-body", markup=True,
+            self._SKELETON_TWO_LINE,
+            classes="proj-section-body",
+            markup=True,
         )
         self.plan_stale = Static(
             "", id="proj-plan-stale", markup=True,
@@ -14795,7 +14822,9 @@ class PollyProjectDashboardApp(App[None]):
             markup=True,
         )
         self.activity_body = Static(
-            "", classes="proj-section-body", markup=True,
+            self._SKELETON_THREE_LINE,
+            classes="proj-section-body",
+            markup=True,
         )
         self.inbox_title = Static(
             "[b]Inbox[/b]", classes="proj-section-title", markup=True,
@@ -14817,7 +14846,9 @@ class PollyProjectDashboardApp(App[None]):
         self.action_card_bodies: list[Static] = []
         self.action_card_groups: list[Vertical] = []
         self.inbox_body = Static(
-            "", classes="proj-section-body", markup=True,
+            self._SKELETON_THREE_LINE,
+            classes="proj-section-body",
+            markup=True,
         )
         self.action_control_rows: list[Horizontal] = []
         self.action_primary_buttons: list[Button] = []

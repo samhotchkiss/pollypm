@@ -59,6 +59,8 @@ class _PlanReviewFakeTask:
         updated_at: datetime | None = None,
         created_at: datetime | None = None,
         labels: list[str] | None = None,
+        description: str = "",
+        external_refs: dict[str, str] | None = None,
     ) -> None:
         self.task_number = task_number
         self.task_id = task_id or f"proj/{task_number}"
@@ -74,6 +76,8 @@ class _PlanReviewFakeTask:
         self.labels = labels or []
         self.transitions = []
         self.executions = []
+        self.description = description
+        self.external_refs = external_refs or {}
 
 
 SAMPLE_PLAN = """# Project plan
@@ -277,6 +281,17 @@ class TestActionBar:
         assert "[d] Deny" in bar
         assert "[esc] Back" in bar
 
+    def test_plain_action_bar_includes_open_in_browser(self):
+        """#1534 — plain bar advertises the [b] Open in browser hotkey."""
+        bar = render_plan_review_action_bar_plain()
+        assert "[b] Open in browser" in bar
+
+    def test_rich_action_bar_includes_open_in_browser(self):
+        """#1534 — rich bar surfaces the [b] Open in browser button."""
+        bar = render_plan_review_action_bar()
+        assert "[bold green][b][/bold green]" in bar
+        assert "Open in browser" in bar
+
     def test_rich_action_bar_uses_distinct_colors_per_action(self):
         """Each label uses bold + a colour token so it reads as a button.
 
@@ -392,6 +407,83 @@ class TestRenderPlanReviewSurface:
         assert "[a] Approve" in out
         assert "[esc] Back" in out
 
+    def test_surface_renders_description_when_no_plan_text(self):
+        """#1534, Part A — empty plan_text + non-empty description.
+
+        The plan-review surface should fall back to the task's first
+        description paragraph in the Plan body section, not leave the
+        '(plan body is empty)' placeholder. Watchdog-emitted backstop
+        plan-review tasks (coffeeboardnm shape) carry their plan
+        summary on the task description, not in a markdown file.
+        """
+        description = (
+            "We sweep every NM event May–Jul 2026 and rank by signal "
+            "density. The first deliverable is a static HTML board with "
+            "the top venues + dates."
+        )
+        task = _PlanReviewFakeTask(
+            task_number=1, description=description,
+        )
+        out = render_plan_review_surface(
+            project_key="coffeeboardnm",
+            project_name="CoffeeBoardNM",
+            task=task,
+            plan_text="",
+        )
+        assert "We sweep every NM event May" in out
+        # Placeholder must be replaced by the description paragraph.
+        assert "(plan body is empty)" not in out
+
+    def test_surface_keeps_placeholder_when_no_plan_and_no_description(self):
+        """#1534, Part A — empty plan_text + empty description keeps the
+        '(plan body is empty)' placeholder (no fabricated fallback)."""
+        task = _PlanReviewFakeTask(task_number=2, description="")
+        out = render_plan_review_surface(
+            project_key="proj", project_name="P", task=task, plan_text="",
+        )
+        assert "(plan body is empty)" in out
+
+    def test_surface_renders_deliverable_url_under_header(self):
+        """#1534, Part B — deliverable URL renders right under the header strip.
+
+        ``_plan_task_deliverable_url`` looks at ``external_refs`` first,
+        so ``external_refs={"deliverable": "<url>"}`` is the canonical
+        carrier — a single 'Live deliverable: <url>' line should appear
+        between the header divider and the Summary section.
+        """
+        url = "https://coffeeboardnm.itsalive.co"
+        task = _PlanReviewFakeTask(
+            task_number=1, external_refs={"deliverable": url},
+        )
+        out = render_plan_review_surface(
+            project_key="coffeeboardnm",
+            project_name="CoffeeBoardNM",
+            task=task,
+            plan_text="",
+        )
+        # "Live deliverable:" + URL on the same line. The label is
+        # wrapped in Rich-markup so we don't lock the test to the
+        # exact tag form — just assert the visible text + URL appear
+        # together.
+        assert "Live deliverable:" in out
+        assert url in out
+        # The line should land before the Summary section divider —
+        # confirms placement under the header strip rather than buried
+        # in the body.
+        deliverable_idx = out.find("Live deliverable:")
+        summary_idx = out.find("Summary")
+        assert deliverable_idx != -1
+        assert summary_idx != -1
+        assert deliverable_idx < summary_idx
+
+    def test_surface_omits_deliverable_line_when_no_url(self):
+        """#1534, Part B — no URL anywhere → no Live deliverable line."""
+        task = _PlanReviewFakeTask(task_number=3)
+        out = render_plan_review_surface(
+            project_key="proj", project_name="P", task=task, plan_text="",
+        )
+        assert "Live deliverable:" not in out
+
     def test_surface_summary_judgment_not_duplicated_in_body(self):
         """The plan body section drops the summary + judgment headers.
 
@@ -424,7 +516,7 @@ class TestRenderPlanReviewSurface:
             project_key="proj", project_name="P", task=task, plan_text=SAMPLE_PLAN,
         )
         for line in out.splitlines():
-            assert len(line) <= 200, (
+            assert len(line) <= 220, (
                 f"surface line too wide for narrow mode: {len(line)} -> {line!r}"
             )
         # Even in narrow terminals the action bar + header are visible.

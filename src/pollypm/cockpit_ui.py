@@ -11724,6 +11724,8 @@ def _dashboard_status(
     blocker_count: int = 0,
     on_hold_count: int = 0,
     in_progress_count: int = 0,
+    plan_task_summary: dict | None = None,
+    alert_types: list[str] | None = None,
 ) -> tuple[str, str, str]:
     """Return (dot, colour, label) for the top-bar project status light.
 
@@ -11741,6 +11743,20 @@ def _dashboard_status(
     # do here").
     if inbox_count or on_hold_count:
         return ("\u25c6", "#f0c45a", "needs attention")
+    # #1536 \u2014 celebratory plan-ready pill. When the alert that fires
+    # is a ``plan_missing`` family AND a plan-shaped done task is already
+    # on the project (``plan_task_summary`` is non-null), the user is
+    # looking at a teammate handoff, not a debt-collector ping. Match
+    # the green palette of the banner CTA (#1531) + the active-worker
+    # pill so the dashboard reads as one coordinated celebration. This
+    # branch must come before the generic red ``alert`` branch below.
+    if (
+        alert_count
+        and plan_task_summary
+        and alert_types
+        and "plan_missing" in alert_types
+    ):
+        return ("\u25c6", "#3ddc84", "plan ready")
     if alert_count:
         return ("\u25c6", "#f85149", "alert")
     if active_worker is not None:
@@ -14140,6 +14156,8 @@ def _gather_project_dashboard(
         blocker_count=blocker_count,
         on_hold_count=on_hold_count,
         in_progress_count=in_progress_count,
+        plan_task_summary=plan_task_summary,
+        alert_types=alert_types,
     )
 
     # Resolve effective enforce_plan with the same precedence the rail

@@ -79,6 +79,48 @@ def render_plan_review_action_bar() -> str:
     return _DASHBOARD_BULLET + "   ".join(parts)
 
 
+def render_plan_review_approve_button() -> str:
+    """Render the prominent APPROVE button block (#1536).
+
+    A bordered, full-width green block sitting above the inline action
+    bar. Visually mirrors the dashboard ``proj-review-cta`` button from
+    #1531 (bold + green palette) so the dashboard banner CTA and the
+    surface APPROVE button read as a single celebratory affordance.
+
+    The inline action bar (``render_plan_review_action_bar``) STAYS as
+    the secondary affordance for chat / deny / open-browser. This block
+    is the primary CTA — it advertises ``[a]`` because that's still the
+    keybinding that approves; only the visual rendering changes.
+
+    Width matches ``_DASHBOARD_DIVIDER_WIDTH`` so it lines up with the
+    section dividers above it (same visual rhythm as the rest of the
+    surface).
+    """
+    # The bordered block uses ``_DASHBOARD_DIVIDER_WIDTH`` (72 visible
+    # cols) so it lines up with the section dividers above it. Inner
+    # width is the divider width minus two border chars on either side.
+    inner_width = _DASHBOARD_DIVIDER_WIDTH - 4
+    # Visible label width (Rich tags + the escaped ``\[`` collapse to
+    # ``[a] APPROVE — Ship this plan`` once rendered).
+    visible_label = "[a] APPROVE — Ship this plan"
+    left_pad = 2
+    right_pad = max(0, inner_width - len(visible_label) - left_pad)
+    top = "╭" + "─" * inner_width + "╮"
+    bot = "╰" + "─" * inner_width + "╯"
+    mid = (
+        "│"
+        + " " * left_pad
+        + "[bold green]\\[a] APPROVE — Ship this plan[/bold green]"
+        + " " * right_pad
+        + "│"
+    )
+    return (
+        _DASHBOARD_BULLET + top + "\n"
+        + _DASHBOARD_BULLET + mid + "\n"
+        + _DASHBOARD_BULLET + bot
+    )
+
+
 def find_plan_review_task(tasks: list) -> object | None:
     """Return the first task in ``status=review`` parked at user_approval.
 
@@ -360,8 +402,26 @@ def render_plan_review_surface(
             out.append(_DASHBOARD_BULLET + "(plan body is empty)")
     out.append("")
 
-    # 5) Action bar.
+    # 5) Actions section.
+    #
+    # Primary CTA: a prominent APPROVE button block (#1536) — bordered,
+    # full-width, green so it visually mirrors the dashboard banner CTA
+    # from #1531. The keybinding is still ``a`` (the inline bar still
+    # advertises it) — only the visual emphasis changes.
+    #
+    # Don't render the APPROVE block when the task is already in a
+    # terminal-and-dismissed state (``cancelled``). A ``done`` plan task
+    # IS still approvable from the user's perspective — the watchdog
+    # backstop emits done stubs that the user hasn't actually approved
+    # yet (matching the same signal that drives the dashboard CTA in
+    # #1531). For ``review`` (canonical), ``done`` (backstop), or any
+    # other non-cancelled status, render the APPROVE block.
     out.append(_dashboard_divider("Actions"))
+    status = getattr(task, "work_status", None) if task is not None else None
+    status_value = getattr(status, "value", status)
+    if status_value != "cancelled":
+        out.append(render_plan_review_approve_button())
+        out.append("")
     out.append(render_plan_review_action_bar())
     out.append(_DASHBOARD_BULLET + "(plain) " + render_plan_review_action_bar_plain())
 

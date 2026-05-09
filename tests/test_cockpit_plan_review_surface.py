@@ -32,6 +32,7 @@ from pollypm.cockpit_sections.plan_review import (
     load_plan_text,
     render_plan_review_action_bar,
     render_plan_review_action_bar_plain,
+    render_plan_review_approve_button,
     render_plan_review_header_strip,
     render_plan_review_surface,
 )
@@ -320,6 +321,105 @@ class TestActionBar:
             assert len(line) <= 80, (
                 f"action bar line exceeds 80 cols: {len(line)} -> {line!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# APPROVE button block (#1536)
+# ---------------------------------------------------------------------------
+
+
+class TestApproveButtonBlock:
+    def test_approve_block_contains_label_and_green_bold_markup(self):
+        """#1536 — the bordered APPROVE block carries bold + green Rich
+        markup so it visually mirrors the dashboard CTA from #1531."""
+        block = render_plan_review_approve_button()
+        assert "APPROVE" in block
+        # Bold + green markup wraps the label.
+        assert "[bold green]" in block
+        assert "[/bold green]" in block
+        # The block is a multi-line bordered box.
+        assert "\n" in block
+        # Box-drawing corner characters (round corners to match the
+        # dashboard CTA visual rhythm).
+        assert "╭" in block
+        assert "╰" in block
+
+    def test_approve_block_advertises_a_keybinding(self):
+        """The button block surfaces the ``[a]`` keybinding so the user
+        knows the keyboard affordance hasn't moved (only the visual
+        emphasis changed)."""
+        block = render_plan_review_approve_button()
+        # ``\\[a]`` because Rich-markup uses ``[`` literally for tags,
+        # so the bracket is escaped.
+        assert "\\[a]" in block
+        assert "Ship this plan" in block
+
+
+class TestApproveButtonInSurface:
+    def test_surface_renders_approve_block_for_review_task(self):
+        """#1536 — a canonical review-state task surfaces the APPROVE
+        button block above the inline action bar."""
+        task = _PlanReviewFakeTask(
+            task_number=11, status="review",
+        )
+        out = render_plan_review_surface(
+            project_key="proj", project_name="P", task=task, plan_text="",
+        )
+        assert "APPROVE" in out
+        assert "╭" in out
+        # Block lands inside the Actions section (after the divider) and
+        # before the inline action bar.
+        actions_idx = out.find("Actions")
+        approve_idx = out.find("APPROVE")
+        action_bar_idx = out.find("[a] Approve")
+        assert actions_idx != -1
+        assert approve_idx != -1
+        assert action_bar_idx != -1
+        assert actions_idx < approve_idx < action_bar_idx
+
+    def test_surface_renders_approve_block_for_done_backstop_task(self):
+        """#1536 — backstop-emitted ``done`` plan-shaped tasks (the
+        coffeeboardnm/30 shape) STILL render the APPROVE block. The
+        ``done`` status here is a stub artifact, not a final state — the
+        user hasn't actually approved the plan yet."""
+        task = _PlanReviewFakeTask(
+            task_number=30, status="done",
+        )
+        out = render_plan_review_surface(
+            project_key="coffeeboardnm",
+            project_name="CoffeeBoardNM",
+            task=task,
+            plan_text="",
+        )
+        assert "APPROVE" in out
+
+    def test_surface_omits_approve_block_for_cancelled_task(self):
+        """#1536 — a cancelled task is genuinely past the approval
+        moment. Don't dangle a CTA the user can't act on."""
+        task = _PlanReviewFakeTask(
+            task_number=12, status="cancelled",
+        )
+        out = render_plan_review_surface(
+            project_key="proj", project_name="P", task=task, plan_text="",
+        )
+        assert "APPROVE" not in out
+        # Inline action bar still renders so the user has a way back.
+        assert "[a] Approve" in out
+
+    def test_surface_keeps_inline_action_bar_alongside_approve_block(self):
+        """The inline action bar is the secondary affordance for chat,
+        deny, open-browser, esc. Adding the APPROVE block must not
+        remove it."""
+        task = _PlanReviewFakeTask(task_number=11)
+        out = render_plan_review_surface(
+            project_key="proj", project_name="P", task=task, plan_text="",
+        )
+        # APPROVE block + inline bar both present.
+        assert "APPROVE" in out
+        assert "[a] Approve" in out
+        assert "[c] Chat to refine" in out
+        assert "[d] Deny" in out
+        assert "[esc] Back" in out
 
 
 # ---------------------------------------------------------------------------

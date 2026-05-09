@@ -3397,6 +3397,69 @@ def test_status_pill_uses_activity_classification() -> None:
     assert dot == "◆"
 
 
+def test_status_pill_celebrates_plan_ready_when_plan_task_summary_present() -> None:
+    """#1536 — a ``plan_missing`` alert with a non-null ``plan_task_summary``
+    means the plan is already done and waiting on review. The pill switches
+    from red ``alert`` to green ``plan ready`` so the dashboard reads as a
+    teammate handoff (matching the celebratory banner copy from #1531)."""
+    from pollypm.cockpit_ui import _dashboard_status
+
+    summary = {"task_id": "proj/1", "title": "POC plan: lipgloss CLI"}
+    dot, color, label = _dashboard_status(
+        None,
+        0,
+        1,
+        None,
+        plan_task_summary=summary,
+        alert_types=["plan_missing"],
+    )
+    assert label == "plan ready"
+    assert color == "#3ddc84"  # match the active-worker green
+    assert dot == "◆"
+
+
+def test_status_pill_falls_back_to_red_alert_without_plan_task_summary() -> None:
+    """#1536 — ``plan_missing`` family WITHOUT a ``plan_task_summary``
+    keeps the existing red ``alert`` palette. The summary signal is what
+    distinguishes a plan-ready celebration from an actual missing-plan
+    debt."""
+    from pollypm.cockpit_ui import _dashboard_status
+
+    dot, color, label = _dashboard_status(
+        None,
+        0,
+        1,
+        None,
+        plan_task_summary=None,
+        alert_types=["plan_missing"],
+    )
+    assert label == "alert"
+    assert color == "#f85149"  # the existing red alert palette
+    assert dot == "◆"
+
+
+def test_status_pill_keeps_red_alert_for_non_plan_missing_families() -> None:
+    """#1536 — only ``plan_missing`` flips green. Other alert families
+    (``recovery_limit``, ``auth_broken``, ``worker_question``, ...) stay
+    on the existing red ``alert`` path even when a ``plan_task_summary``
+    happens to be non-null on the project (e.g. an auth alert on a
+    project that already has a done plan)."""
+    from pollypm.cockpit_ui import _dashboard_status
+
+    summary = {"task_id": "proj/1", "title": "POC plan: lipgloss CLI"}
+    dot, color, label = _dashboard_status(
+        None,
+        0,
+        1,
+        None,
+        plan_task_summary=summary,
+        alert_types=["recovery_limit"],
+    )
+    assert label == "alert"
+    assert color == "#f85149"
+    assert dot == "◆"
+
+
 def test_banner_does_not_claim_in_action_for_idle_worker() -> None:
     """The banner under "Moving now" must not claim an idle worker
     is active. #990 banner read ``Moving now: architect_bikepath

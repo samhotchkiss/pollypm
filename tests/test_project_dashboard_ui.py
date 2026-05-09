@@ -1123,6 +1123,103 @@ def test_banner_action_items_still_outrank_alert() -> None:
     assert "asking a question" not in banner
 
 
+def test_banner_celebrates_when_plan_task_summary_present() -> None:
+    """#1531 — a ``plan_missing`` alert with a non-null
+    ``plan_task_summary`` reads as a teammate handing off a finished
+    plan, not as a debt collector. The banner names the deliverable,
+    advertises the keystroke that opens the plan-review surface, and
+    drops the misleading "no plan yet" framing entirely.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["plan_missing"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary={
+            "task_id": "coffeeboardnm/1",
+            "title": "POC plan: ingest every NM event May–Jul 2026",
+        },
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    assert "Plan's ready" in banner
+    assert "POC plan: ingest every NM event May–Jul 2026" in banner
+    # The keystroke advertised must be the one that actually opens the
+    # plan-review surface. "press a to review" was the trap that #1531
+    # explicitly closes — must not regress.
+    assert "→" in banner
+    assert "no plan yet" not in banner
+    # Tone: collaborative ("together") instead of debt-collector
+    # ("Waiting on you").
+    assert "together" in banner
+
+
+def test_banner_falls_through_when_plan_task_summary_absent() -> None:
+    """#1531 — without a ``plan_task_summary``, the ``plan_missing``
+    alert keeps the original "ask the PM to plan" framing — but does
+    NOT lie about a plan being absent / present, and the new copy
+    drops the redundant "Waiting on you:" prefix while keeping the
+    affordance ("press c").
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["plan_missing"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary=None,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    # Must NOT claim the plan is ready when it isn't.
+    assert "Plan's ready" not in banner
+    # Affordance: still routes to ``c`` (chat the PM to plan).
+    assert "press c" in banner
+    # Avoid the misleading "press a to review" ambiguous instruction
+    # that was the trap.
+    assert "press a to review" not in banner
+
+
+def test_banner_celebrates_with_only_task_id_when_title_missing() -> None:
+    """#1531 — degraded plan_task_summary (no title) still celebrates."""
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["plan_missing"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary={
+            "task_id": "coffeeboardnm/1",
+            "title": "",
+        },
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    assert "Plan's ready" in banner
+    # With no title, the banner falls back to the task_id so the user
+    # still gets a routable identifier.
+    assert "coffeeboardnm/1" in banner
+
+
 def test_status_yellow_when_task_is_on_hold(
     dashboard_env, dashboard_app,
 ) -> None:
@@ -5748,3 +5845,116 @@ def test_drafts_pending_panel_mounts_in_compose(tmp_path: Path) -> None:
     assert app.drafts_pending.id == "proj-drafts-pending"
     # Hidden by default (CSS class). The render path toggles it.
     assert "-hidden" in app.drafts_pending.classes
+
+
+# ---------------------------------------------------------------------------
+# #1531 — Plan-ready CTA button
+# ---------------------------------------------------------------------------
+
+
+def test_review_cta_widget_starts_hidden(tmp_path: Path) -> None:
+    """#1531 — the ``[→] Review the plan together`` CTA is hidden until
+    the gather populates ``plan_task_summary``. Without the hidden
+    default the CTA flashes for projects with no plan-shaped done task.
+    """
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    app = PollyProjectDashboardApp(config_path, "demo")
+    assert app.review_cta is not None
+    assert app.review_cta.id == "proj-review-cta"
+    assert "-hidden" in app.review_cta.classes
+
+
+def test_update_review_cta_shows_button_when_plan_task_summary_present(
+    tmp_path: Path,
+) -> None:
+    """#1531 — feeding a ``ProjectDashboardData`` with a populated
+    ``plan_task_summary`` to ``_update_review_cta`` makes the button
+    visible and renders the review-the-plan-together copy. The label
+    must include the plan title and the keystroke hint so the user
+    can click OR press ``→``.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    app = PollyProjectDashboardApp(config_path, "demo")
+    data = SimpleNamespace(
+        plan_task_summary={
+            "task_id": "coffeeboardnm/1",
+            "title": "POC plan",
+        },
+    )
+    # Drive the helper directly — avoids needing the full Pilot loop.
+    app._update_review_cta(data)
+    rendered = str(app.review_cta.render())
+    assert "Review the plan together" in rendered
+    assert "POC plan" in rendered
+    assert "→" in rendered
+    assert "-hidden" not in app.review_cta.classes
+
+
+def test_update_review_cta_hides_when_plan_task_summary_absent(
+    tmp_path: Path,
+) -> None:
+    """#1531 — without a ``plan_task_summary`` the CTA stays hidden so
+    the dashboard pane doesn't burn vertical space on a non-actionable
+    button. Mirrors the banner copy fall-through.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    app = PollyProjectDashboardApp(config_path, "demo")
+    # First populate so we can see the toggle clear it.
+    app._update_review_cta(SimpleNamespace(plan_task_summary={
+        "task_id": "x/1", "title": "t",
+    }))
+    assert "-hidden" not in app.review_cta.classes
+    # Now feed a no-plan-task case and assert the CTA hides again.
+    app._update_review_cta(SimpleNamespace(plan_task_summary=None))
+    assert "-hidden" in app.review_cta.classes
+
+
+def test_review_cta_falls_back_to_task_id_without_title(
+    tmp_path: Path,
+) -> None:
+    """#1531 — degraded summary (no title) still produces a clickable
+    button labeled with the task_id so the user has a routable handle.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    app = PollyProjectDashboardApp(config_path, "demo")
+    app._update_review_cta(SimpleNamespace(plan_task_summary={
+        "task_id": "demo/3",
+        "title": "",
+    }))
+    rendered = str(app.review_cta.render())
+    assert "demo/3" in rendered
+    assert "Review the plan together" in rendered

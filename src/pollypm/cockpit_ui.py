@@ -9798,6 +9798,16 @@ class PollyInboxApp(App[None]):
         item = self._item_for_id(task_id)
         if item is None:
             return
+        # #1531 — ``a`` on a plan_review inbox card opens the plan-review
+        # surface instead of archiving. The dashboard banner (``Plan's
+        # ready — <title>. Press → to review together``) advertises
+        # ``a``-to-review semantics; archiving on the same gesture
+        # destroys the only route into the plan-review surface that
+        # shipped in #1400/#1401. This keeps archive working for every
+        # other inbox row type — only plan_review rows redirect.
+        if _is_plan_review_task(item):
+            self._jump_to_plan_review_project(item)
+            return
         if not is_task_inbox_entry(item):
             try:
                 from pollypm.store import SQLAlchemyStore
@@ -14245,7 +14255,12 @@ def _project_dashboard_signature(
     )
 
 
-def _alert_banner_copy(alert_types: list[str], alert_count: int) -> str | None:
+def _alert_banner_copy(
+    alert_types: list[str],
+    alert_count: int,
+    *,
+    plan_task_summary: dict | None = None,
+) -> str | None:
     """Return banner copy describing the alerts waiting on the user.
 
     #1512 — replaces the generic "Polly needs to inspect a project issue"
@@ -14253,6 +14268,12 @@ def _alert_banner_copy(alert_types: list[str], alert_count: int) -> str | None:
     event; the banner names the alert family and tells the user how to
     reach the action surface (the ``a`` keybinding routes to Metrics →
     Alerts) so the dashboard never reads as a dead-end.
+
+    #1531 — when ``plan_task_summary`` is non-null on a ``plan_missing``
+    alert, the plan is already done and waiting on review. Switch the
+    copy from "Waiting on you" debt-collector framing to a celebratory
+    "Plan's ready" lead so the moment reads as a teammate handing the
+    user a finished draft.
 
     Returns ``None`` when there is nothing to show.
     """
@@ -14296,9 +14317,24 @@ def _alert_banner_copy(alert_types: list[str], alert_count: int) -> str | None:
             f"the account{other_part}"
         )
     if family == "plan_missing":
+        # #1531 — celebratory lead when a plan-shaped done task is
+        # awaiting review. The earlier "no plan yet" copy lied on
+        # exactly this case (the plan EXISTS — task #N reached done)
+        # and primed the user for a debt-collector tone instead of a
+        # teammate handoff.
+        if plan_task_summary:
+            title = (
+                str(plan_task_summary.get("title") or "").strip()
+                or str(plan_task_summary.get("task_id") or "").strip()
+                or "the plan"
+            )
+            return (
+                f"Plan's ready — {title}. Press → to review together"
+                f"{other_part}"
+            )
         return (
-            f"Waiting on you: this project has no plan yet — press a to "
-            f"review, or c to ask the PM to plan{other_part}"
+            f"This project has no plan yet — press c to ask the PM to "
+            f"plan it{other_part}"
         )
     if family == "no_session_for_assignment":
         return (
@@ -14433,6 +14469,25 @@ class PollyProjectDashboardApp(App[None]):
         border: round #8d3137;
     }
     #proj-action-bar.-hover {
+        border: round #5b8aff;
+    }
+    /* #1531 — celebratory plan-review CTA. Sits directly under the
+       banner so banner + button read as a single "Plan's ready /
+       Review the plan together" affordance. The bold-reverse styling
+       on the inner Static text mirrors the dashboard action-bar
+       button pattern; the CTA itself uses a subtle highlight border
+       so it reads as actionable without yelling for attention. */
+    #proj-review-cta {
+        margin-top: 0;
+        padding: 0 1;
+        background: #1a2e1c;
+        color: #b6f0c0;
+        border: round #2c5b32;
+    }
+    #proj-review-cta.-hidden {
+        display: none;
+    }
+    #proj-review-cta:hover {
         border: round #5b8aff;
     }
     #proj-inbox-section.-hover {
@@ -14601,6 +14656,11 @@ class PollyProjectDashboardApp(App[None]):
         # celebration flow (10s undo + persona toast). Otherwise we
         # fall through to the legacy alerts view.
         Binding("a", "approve_or_alerts", "Approve / Alerts", show=False),
+        # #1531 — ``→`` opens the plan-review surface (full plan body
+        # inline) when a plan-shaped done task is awaiting review. The
+        # banner CTA advertises this keystroke (mirrors the inbox →
+        # gesture for "drill in"); ``r`` stays bound to refresh.
+        Binding("right", "review_plan", "Review plan", show=False),
         # ``u`` rolls back a pending plan-review approval; falls
         # through to refresh when there is nothing pending (the legacy
         # ``u`` binding co-existed with ``r`` for refresh).
@@ -14644,6 +14704,18 @@ class PollyProjectDashboardApp(App[None]):
         self.topbar = Static("", id="proj-topbar", markup=True)
         self.status_line = Static("", id="proj-status", markup=True)
         self.action_bar = Static("", id="proj-action-bar", markup=True)
+        # #1531 — CTA button shown directly under the banner when a
+        # plan-shaped done task is awaiting review. Hidden by default
+        # via the ``-hidden`` class; ``_update_action_bar`` toggles it
+        # based on ``data.plan_task_summary``. Click + ``→`` keystroke
+        # both fire ``action_review_plan`` so the moment reads as a
+        # single "review the plan together" affordance.
+        self.review_cta = Static(
+            "",
+            id="proj-review-cta",
+            classes="-hidden",
+            markup=True,
+        )
         # #1290 follow-up — empty-state panel surfaces a clear
         # affordance when a project has zero ``work_tasks`` rows.
         # Hidden by default; ``_render`` toggles ``-hidden`` based
@@ -14800,6 +14872,7 @@ class PollyProjectDashboardApp(App[None]):
             yield self.topbar
             yield self.status_line
             yield self.action_bar
+            yield self.review_cta
             with VerticalScroll(id="proj-body"):
                 # #1290 follow-up — empty-state for "registered project
                 # with zero work_tasks rows" sits at the top of the body
@@ -15277,6 +15350,38 @@ class PollyProjectDashboardApp(App[None]):
         elif data.action_items or review_count or data.inbox_count or on_hold_count:
             self.action_bar.add_class("-attention")
         self.action_bar.update(f"[b]{_escape(summary)}[/b]")
+        self._update_review_cta(data)
+
+    def _update_review_cta(self, data: ProjectDashboardData) -> None:
+        """Toggle the ``→ Review the plan together`` CTA under the banner.
+
+        #1531 — when ``data.plan_task_summary`` is non-null the project
+        has a plan-shaped done task awaiting review. The banner copy
+        celebrates the moment ("Plan's ready — <title>"); the CTA below
+        gives the user a single visible button (mouse + keystroke
+        labeled) to land in the plan-review surface without hunting
+        through the inbox.
+
+        When no plan task summary exists the CTA hides so the banner
+        stays a single clean line.
+        """
+        plan_task_summary = getattr(data, "plan_task_summary", None) or None
+        if not plan_task_summary:
+            self.review_cta.add_class("-hidden")
+            self.review_cta.update("")
+            return
+        # Bracket-key advertises the keystroke; bold-reverse styling
+        # mirrors the dashboard action-bar convention so it reads as a
+        # button at-a-glance. Single line so it fits the user's wide
+        # terminal (214x50) without burning vertical space.
+        title = (
+            str(plan_task_summary.get("title") or "").strip()
+            or str(plan_task_summary.get("task_id") or "").strip()
+            or "the plan"
+        )
+        label = f"[→] Review the plan together — {title}"
+        self.review_cta.update(f"[bold reverse] {_escape(label)} [/]")
+        self.review_cta.remove_class("-hidden")
 
     def _render_project_state_banner(
         self, data: ProjectDashboardData, counts: str,
@@ -15360,6 +15465,7 @@ class PollyProjectDashboardApp(App[None]):
             specific = _alert_banner_copy(
                 getattr(data, "alert_types", []) or [],
                 int(data.alert_count),
+                plan_task_summary=getattr(data, "plan_task_summary", None),
             )
             if specific:
                 return f"{specific}{count_suffix}"
@@ -17174,6 +17280,12 @@ class PollyProjectDashboardApp(App[None]):
         event.stop()
         self._route_to_tasks()
 
+    @on(events.Click, "#proj-review-cta")
+    def on_review_cta_click(self, event: events.Click) -> None:
+        """#1531 — clicking the banner CTA opens the plan-review surface."""
+        event.stop()
+        self.action_review_plan()
+
     @on(events.Click, "#proj-plan-section")
     def on_plan_section_click(self, event: events.Click) -> None:
         event.stop()
@@ -17254,6 +17366,73 @@ class PollyProjectDashboardApp(App[None]):
             self.config_path,
             client_id="project-dashboard",
         ).jump_to_activity(self.project_key)
+
+    def action_review_plan(self) -> None:
+        """``→`` (or banner CTA click) — open the plan-review surface.
+
+        #1531 — when a plan-shaped done task is awaiting review the
+        banner advertises this keystroke. The handler:
+
+        1. If a plan_review action card is present (the ``a`` flow's
+           target), enter plan-view mode so the full plan body fills
+           the dashboard, then notify the user that ``a`` approves.
+           This matches the cockpit pane's plan-review surface from
+           #1401 — the operator reads the plan top-to-bottom and acts.
+        2. If no plan_review action card is present but a
+           ``plan_task_summary`` exists, still enter plan-view mode
+           (the user wants to review the plan; the review/approve flow
+           may not have its inbox card yet — the watchdog tick will
+           emit it).
+        3. If neither signal is present, friendly-notify so the
+           keystroke isn't silent.
+        """
+        data = self.data
+        if data is None:
+            self.notify(
+                "Dashboard data still loading…",
+                severity="information", timeout=1.5,
+            )
+            return
+        plan_task_summary = getattr(data, "plan_task_summary", None) or None
+        # Either signal is enough to flip into plan-view: the action
+        # card means the inbox emit succeeded; plan_task_summary means
+        # the plan task itself reached done. Both cases benefit from
+        # the user landing on the full plan body.
+        has_plan_review_card = any(
+            isinstance(item, dict) and item.get("is_plan_review")
+            for item in (data.action_items or [])
+        )
+        if not (plan_task_summary or has_plan_review_card):
+            self.notify(
+                "No plan ready for review yet — press p to open the "
+                "plan view.",
+                severity="information", timeout=2.5,
+            )
+            return
+        if data.plan_path is None:
+            # The plan task is done but the plan file wasn't written
+            # to the canonical location. Fall back to the approve flow
+            # directly so the user can still act.
+            if has_plan_review_card and self._approve_first_plan_review_if_present():
+                return
+            self.notify(
+                "Plan task is done but no plan file was found on "
+                "disk. Press a to approve the plan_review card or i "
+                "to open the inbox.",
+                severity="warning", timeout=3.5,
+            )
+            return
+        # Force plan-view mode on (don't toggle — the user explicitly
+        # asked for "review", and a no-op toggle from an already-open
+        # plan view would be confusing).
+        if not self._plan_view_mode:
+            self.action_open_plan()
+        if has_plan_review_card:
+            self.notify(
+                "Plan ready — press a to approve, c to chat, or "
+                "p to close this view.",
+                severity="information", timeout=4.0,
+            )
 
     def action_open_plan(self) -> None:
         """Toggle plan-view mode — plan.md takes over the body.

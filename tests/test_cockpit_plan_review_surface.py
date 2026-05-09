@@ -27,6 +27,7 @@ from pathlib import Path
 import pytest
 
 from pollypm.cockpit_sections.plan_review import (
+    find_actionable_plan_review_task,
     find_plan_review_task,
     load_plan_text,
     render_plan_review_action_bar,
@@ -49,6 +50,7 @@ class _PlanReviewFakeTask:
         self,
         *,
         task_number: int = 7,
+        task_id: str | None = None,
         status: str = "review",
         current_node_id: str | None = "user_approval",
         roles: dict[str, str] | None = None,
@@ -56,8 +58,10 @@ class _PlanReviewFakeTask:
         plan_version: int = 1,
         updated_at: datetime | None = None,
         created_at: datetime | None = None,
+        labels: list[str] | None = None,
     ) -> None:
         self.task_number = task_number
+        self.task_id = task_id or f"proj/{task_number}"
         self.work_status = WorkStatus(status)
         self.current_node_id = current_node_id
         self.roles = roles or {}
@@ -67,6 +71,7 @@ class _PlanReviewFakeTask:
         self.created_at = created_at
         self.priority = Priority.NORMAL
         self.title = "plan: review me"
+        self.labels = labels or []
         self.transitions = []
         self.executions = []
 
@@ -136,6 +141,127 @@ class TestFindPlanReviewTask:
             updated_at=datetime.now(UTC),
         )
         assert find_plan_review_task([old, new]) is new
+
+
+# ---------------------------------------------------------------------------
+# find_actionable_plan_review_task (#1531)
+# ---------------------------------------------------------------------------
+
+
+class TestFindActionablePlanReviewTask:
+    """#1531 — broader matcher that covers #1511 backstop emits.
+
+    The canonical matcher only finds ``plan_project`` tasks parked at
+    ``user_approval``. The watchdog backstop creates a ``chat``-flow
+    notify-only stub at ``status=done``, never at ``user_approval`` —
+    so projects backfilled by the watchdog were structurally
+    unreachable from the project drilldown plan-review surface.
+    """
+
+    def test_falls_back_to_canonical_when_present(self):
+        """The architect's reflection emit still wins over backstop rows."""
+        canonical = _PlanReviewFakeTask(
+            task_number=10, current_node_id="user_approval", status="review",
+        )
+        backstop = _PlanReviewFakeTask(
+            task_number=30,
+            task_id="proj/30",
+            current_node_id=None,
+            status="done",
+            labels=["plan_review", "plan_task:proj/1", "notify"],
+        )
+        result = find_actionable_plan_review_task([backstop, canonical])
+        assert result is canonical
+
+    def test_matches_backstop_chat_done_stub(self):
+        """The coffeeboardnm/30-shape: chat-flow done stub with plan_review label."""
+        plan_task = _PlanReviewFakeTask(
+            task_number=1,
+            task_id="coffeeboardnm/1",
+            status="done",
+            current_node_id=None,
+            labels=["poc-plan", "research"],
+        )
+        backstop = _PlanReviewFakeTask(
+            task_number=30,
+            task_id="coffeeboardnm/30",
+            status="done",
+            current_node_id=None,
+            labels=[
+                "plan_review",
+                "project:coffeeboardnm",
+                "plan_task:coffeeboardnm/1",
+                "notify",
+            ],
+        )
+        result = find_actionable_plan_review_task([plan_task, backstop])
+        # Resolves to the underlying plan task so the surface header
+        # reads as the plan, not the backstop notify stub.
+        assert result is plan_task
+
+    def test_returns_none_when_no_plan_review_anywhere(self):
+        regular = _PlanReviewFakeTask(
+            task_number=5,
+            status="done",
+            current_node_id=None,
+            labels=["bug", "infra"],
+        )
+        assert find_actionable_plan_review_task([regular]) is None
+
+    def test_skips_cancelled_backstop_rows(self):
+        """Cancelled plan_review rows aren't actionable — the user dismissed them."""
+        backstop = _PlanReviewFakeTask(
+            task_number=30,
+            task_id="proj/30",
+            status="cancelled",
+            current_node_id=None,
+            labels=["plan_review", "plan_task:proj/1", "notify"],
+        )
+        assert find_actionable_plan_review_task([backstop]) is None
+
+    def test_falls_back_to_backstop_when_plan_task_missing(self):
+        """When the referenced plan task is gone, return the backstop itself."""
+        backstop = _PlanReviewFakeTask(
+            task_number=30,
+            task_id="proj/30",
+            status="done",
+            current_node_id=None,
+            labels=["plan_review", "plan_task:proj/missing", "notify"],
+        )
+        # The referenced ``proj/missing`` plan task isn't in the list —
+        # the backstop itself is still a valid surface trigger.
+        result = find_actionable_plan_review_task([backstop])
+        assert result is backstop
+
+    def test_picks_most_recently_updated_backstop(self):
+        """Multiple backstop stubs — pick the freshest before resolving."""
+        plan_task = _PlanReviewFakeTask(
+            task_number=1, task_id="proj/1", status="done", current_node_id=None,
+        )
+        old = _PlanReviewFakeTask(
+            task_number=20,
+            task_id="proj/20",
+            status="done",
+            current_node_id=None,
+            labels=["plan_review", "plan_task:proj/1"],
+            updated_at=datetime.now(UTC) - timedelta(hours=5),
+        )
+        new = _PlanReviewFakeTask(
+            task_number=30,
+            task_id="proj/30",
+            status="done",
+            current_node_id=None,
+            labels=["plan_review", "plan_task:proj/1"],
+            updated_at=datetime.now(UTC),
+        )
+        result = find_actionable_plan_review_task([plan_task, old, new])
+        # Both backstops resolve to the same plan_task — winner just
+        # needs to be the freshest backstop's resolution.
+        assert result is plan_task
+
+    def test_empty_list_returns_none(self):
+        assert find_actionable_plan_review_task([]) is None
+        assert find_actionable_plan_review_task(None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -470,3 +596,111 @@ class TestOrchestratorTriggers:
         # Plan-review action bar must NOT show on the regular dashboard.
         assert "[a] Approve" not in out
         assert "[c] Chat to refine" not in out
+
+    def test_drilldown_renders_for_backstop_emit_chat_done_stub(
+        self, tmp_path: Path,
+    ):
+        """#1531 — projects whose plan-review row was emitted by the
+        #1511 watchdog backstop (chat-flow ``done`` stub at status=done,
+        NOT ``user_approval``) still render the plan-review surface.
+
+        Reproduces the coffeeboardnm/30 shape: plan task at
+        ``coffeeboardnm/1`` is on the standard flow at ``done`` with
+        plan-shaped labels; the backstop creates a chat-flow notify-
+        only stub at task #30 carrying the ``plan_review`` +
+        ``plan_task:coffeeboardnm/1`` labels. Before this fix the
+        drilldown surface NEVER triggered for such projects (the
+        canonical matcher only matched ``user_approval`` rows).
+        """
+        from pollypm.cockpit_sections.project_dashboard import (
+            _render_project_dashboard,
+        )
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        proj_path = tmp_path / "coffeeboardnm"
+        proj_path.mkdir()
+        (proj_path / ".pollypm").mkdir()
+        db_path = proj_path / ".pollypm" / "state.db"
+        with SQLiteWorkService(
+            db_path=db_path, project_path=proj_path,
+        ) as svc:
+            # Plan task — done, plan-shaped, on standard flow.
+            plan_task = svc.create(
+                title="POC plan: ingest every NM event May–Jul 2026",
+                description="plan body lives on disk",
+                type="task",
+                project="coffeeboardnm",
+                flow_template="standard",
+                roles={"worker": "polly", "reviewer": "russell"},
+                priority="normal",
+                created_by="polly",
+                labels=["poc-plan", "research"],
+            )
+            svc.queue(plan_task.task_id, "polly")
+            svc.claim(plan_task.task_id, "worker")
+            # Mark the plan task done via SQL (skip flow execution).
+            import sqlite3
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "UPDATE work_tasks SET work_status = ? "
+                    "WHERE project = ? AND task_number = ?",
+                    ("done", "coffeeboardnm", plan_task.task_number),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            # Backstop emit — chat-flow notify stub.
+            backstop_task = svc.create(
+                title="Plan ready for review: coffeeboardnm",
+                description="Plan ready for review (backstop emit).",
+                type="task",
+                project="coffeeboardnm",
+                flow_template="chat",
+                roles={"requester": "user", "operator": "audit_watchdog"},
+                priority="high",
+                created_by="audit_watchdog",
+                labels=[
+                    "plan_review",
+                    "project:coffeeboardnm",
+                    f"plan_task:{plan_task.task_id}",
+                    "notify",
+                ],
+            )
+            conn = sqlite3.connect(str(db_path))
+            try:
+                conn.execute(
+                    "UPDATE work_tasks SET work_status = ? "
+                    "WHERE project = ? AND task_number = ?",
+                    ("done", "coffeeboardnm", backstop_task.task_number),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+        plan_dir = proj_path / "docs" / "plan"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "plan.md").write_text(SAMPLE_PLAN, encoding="utf-8")
+
+        project = _OrchFakeProject(
+            key="coffeeboardnm", path=proj_path, name="CoffeeBoardNM",
+        )
+        out = _render_project_dashboard(
+            project, "coffeeboardnm",
+            tmp_path / "pollypm.toml",
+            _OrchFakeSupervisor(),
+        )
+        assert out is not None
+        # Plan-review surface renders for the BACKSTOP-emitted shape.
+        # Header references the underlying plan task (#1, NOT the
+        # backstop stub at #30) — that's the resolution behavior.
+        assert "Plan: coffeeboardnm/1" in out
+        # Surface body markers.
+        assert "Summary" in out
+        assert "Judgment calls" in out
+        assert "Plan body" in out
+        assert "[a] Approve" in out
+        # Regular dashboard sections are suppressed when the surface
+        # is active.
+        assert "You need to" not in out
+        assert "Quick actions" not in out

@@ -34,26 +34,36 @@ from typing import Any
 
 from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
+    OPERATOR_DISPATCH_THROTTLE_SECONDS,
     Finding,
     RULE_DUPLICATE_ADVISOR_TASKS,
     RULE_LEGACY_DB_SHADOW,
     RULE_PLAN_MISSING_ALERT_CHURN,
     RULE_PLAN_REVIEW_MISSING,
+    RULE_QUEUE_WITHOUT_MOTION,
+    RULE_REJECTION_LOOP,
     RULE_ROLE_SESSION_MISSING,
+    RULE_STATE_DB_MISSING,
     RULE_STUCK_DRAFT,
     RULE_TASK_ON_HOLD_STALE,
     RULE_TASK_PROGRESS_STALE,
     RULE_TASK_REVIEW_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
+    TIER_1,
+    TIER_2,
+    TIER_3,
     WATCHDOG_ALERT_TYPE,
     WatchdogConfig,
     emit_escalation_dispatched,
     emit_finding,
     emit_heartbeat_tick,
+    emit_operator_dispatched,
     format_finding_message,
     format_unstick_brief,
     scan_project,
+    tier_handoff_prompt,
     was_recently_dispatched,
+    was_recently_operator_dispatched,
     watchdog_alert_session_name,
 )
 
@@ -77,6 +87,27 @@ class _LegacyDbShadow:
 
 
 @dataclass(slots=True, frozen=True)
+class _StateDbProbe:
+    """One project's canonical-state.db presence probe (#1546 tier-1).
+
+    Used by :func:`_gather_state_db_probes` to feed the pure
+    ``state_db_missing`` detector. ``canonical_present`` reports
+    whether ``<project>/.pollypm/state.db`` exists today;
+    ``legacy_archives_present`` is True iff one or more
+    ``state.db.legacy-*`` files exist (the post-archival shape that
+    distinguishes "the canonical DB was archived away" from "this
+    project never had a DB"). The self-heal action calls
+    ``enable_tracked_project`` regardless of which shape we see — it's
+    idempotent and re-runs the scaffold step.
+    """
+
+    project_key: str
+    project_path: Path
+    canonical_present: bool
+    legacy_archives_present: bool
+
+
+@dataclass(slots=True, frozen=True)
 class _PlanMissingClear:
     """One ``alert.cleared`` event for a ``plan_missing`` alert (#1524).
 
@@ -95,6 +126,11 @@ class _PlanMissingClear:
 # Legacy forensic rules (orphan_marker, marker_leaked, etc.) already have
 # operator-actionable alerts and predate this dispatch path; we leave
 # them additive-only to keep the blast radius small.
+#
+# #1546 — ``role_session_missing`` moved out (now tier-1 self-heal,
+# spawns the missing lane). ``rejection_loop`` lands here as a tier-1
+# detector → tier-2 dispatch: the project PM receives structured
+# evidence and decides whether to retry, restructure, or escalate.
 _DISPATCHABLE_RULES: frozenset[str] = frozenset({
     # #1440 — stale drafts are architect-originated planning stalls. Alerting
     # alone leaves them parked forever; dispatch the architect to queue,
@@ -102,13 +138,23 @@ _DISPATCHABLE_RULES: frozenset[str] = frozenset({
     RULE_STUCK_DRAFT,
     RULE_TASK_REVIEW_STALE,
     RULE_TASK_PROGRESS_STALE,
-    RULE_ROLE_SESSION_MISSING,
     RULE_WORKER_SESSION_DEAD_LOOP,
     # #1424 — on_hold escalation lands in the architect's pane with the
     # reviewer's rationale folded into the brief. Default first responder
     # is the architect; only the architect calls ``pm notify`` if the
     # issue genuinely needs human judgement.
     RULE_TASK_ON_HOLD_STALE,
+    # #1546 — rejection-loop detector → tier-2 PM dispatch.
+    RULE_REJECTION_LOOP,
+})
+
+# #1546 — rules whose finding routes to the operator (tier-3) leg by
+# default. ``queue_without_motion`` is the safety-net probe; the queue
+# stalling out is a cross-cutting failure that frequently outlives a
+# tier-2 PM dispatch, so the cadence handler routes it directly to the
+# operator inbox via ``_maybe_dispatch_to_operator``.
+_OPERATOR_DISPATCHABLE_RULES: frozenset[str] = frozenset({
+    RULE_QUEUE_WITHOUT_MOTION,
 })
 
 
@@ -1057,6 +1103,523 @@ def _self_heal_duplicate_advisor_tasks(
     return counters
 
 
+# ---------------------------------------------------------------------------
+# Tier-1 healers (#1546)
+# ---------------------------------------------------------------------------
+
+
+def _self_heal_plan_review_missing(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    **_: Any,
+) -> dict[str, int]:
+    """Backfill the missing plan_review row for a plan_review_missing finding.
+
+    Wraps :func:`_backfill_plan_review_for_finding` to return the
+    counter shape every tier-1 healer emits. Idempotent because the
+    underlying ``emit_plan_review_for_task`` helper re-checks the
+    messages table before writing.
+    """
+    backfilled = _backfill_plan_review_for_finding(
+        finding,
+        project_key=project_key,
+        project_path=project_path,
+    )
+    if backfilled is not None:
+        return {"plan_review_backfilled": 1}
+    return {"plan_review_backfill_failed": 1}
+
+
+def _self_heal_legacy_db_shadow_counter(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    **_: Any,
+) -> dict[str, int]:
+    """Tier-1 registry adapter — translates the migrate counters to a
+    common counter shape so the dispatcher can sum them generically.
+    """
+    raw = _self_heal_legacy_db_shadow(
+        finding,
+        project_key=project_key,
+        project_path=project_path,
+    )
+    return {
+        "legacy_db_shadows_migrated": raw.get("migrated", 0),
+        "legacy_db_shadows_failed": raw.get("failed", 0),
+    }
+
+
+def _self_heal_duplicate_advisor_tasks_counter(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    **_: Any,
+) -> dict[str, int]:
+    """Tier-1 registry adapter — same shape as legacy-db-shadow."""
+    raw = _self_heal_duplicate_advisor_tasks(
+        finding,
+        project_key=project_key,
+        project_path=project_path,
+    )
+    return {
+        "advisor_duplicates_cancelled": raw.get("cancelled", 0),
+        "advisor_duplicates_failed": raw.get("failed", 0),
+    }
+
+
+def _self_heal_role_session_missing(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    config_path: Path | None = None,
+    **_: Any,
+) -> dict[str, int]:
+    """#1546 — spawn the missing ``<role>-<project>`` lane.
+
+    Re-uses the same plumbing ``pm worker-start`` does, but skips the
+    deprecated ``--role worker`` rejection because the watchdog is
+    auto-spawning a role lane (e.g. ``architect``, ``advisor``) on
+    behalf of a queued / in-flight task. Best-effort: any failure is
+    logged and we return a ``failed`` counter; a re-tick will retry.
+
+    Idempotent — when the existing session lookup hits a match, we no-op
+    and return ``{"worker_lane_spawned": 0}`` so the counter doesn't lie
+    about how many lanes were actually created.
+    """
+    counters = {"worker_lane_spawned": 0, "worker_lane_failed": 0}
+    role = (finding.metadata or {}).get("role") or ""
+    if not role:
+        counters["worker_lane_failed"] += 1
+        return counters
+    if role == "worker":
+        # Per-task workers are provisioned automatically by ``pm task
+        # claim``; spawning a long-running ``worker-<project>`` would
+        # leak memory (see ``pm worker-start --role worker`` for the
+        # rationale). Treat as a no-op so the cadence handler isn't
+        # blamed for a lane it can't structurally repair.
+        return counters
+    try:
+        from pollypm import cli as cli_mod
+        from pollypm.config import DEFAULT_CONFIG_PATH
+
+        # Only fall back to ``DEFAULT_CONFIG_PATH`` when the cadence
+        # handler was invoked without an explicit config path AND the
+        # default file actually exists. Tests that don't seed a config
+        # file should not have the healer accidentally try to talk to
+        # tmux on the developer's real workspace; ``config_path=None``
+        # plus a missing default is treated as "we don't know enough
+        # to safely spawn", and we increment failed without raising.
+        cfg_path = config_path
+        if cfg_path is None:
+            if DEFAULT_CONFIG_PATH.exists():
+                cfg_path = DEFAULT_CONFIG_PATH
+            else:
+                counters["worker_lane_failed"] += 1
+                return counters
+        supervisor = cli_mod._load_supervisor(cfg_path)
+        existing = next(
+            (
+                session
+                for session in supervisor.config.sessions.values()
+                if session.role == role
+                and session.project == project_key
+                and session.enabled
+            ),
+            None,
+        )
+        if existing is None:
+            session = cli_mod.create_worker_session(
+                cfg_path,
+                project_key=project_key,
+                prompt=None,
+                role=role,
+                agent_profile=None,
+            )
+        else:
+            session = existing
+        cli_mod.launch_worker_session(cfg_path, session.name)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "audit.watchdog: role-lane spawn failed for %s/%s",
+            project_key, role, exc_info=True,
+        )
+        counters["worker_lane_failed"] += 1
+        return counters
+    counters["worker_lane_spawned"] += 1
+    # Best-effort forensic event so operators can grep the audit log
+    # for spawn cadence.
+    try:
+        from pollypm.audit import emit as _audit_emit
+        from pollypm.audit.log import EVENT_WATCHDOG_WORKER_LANE_SPAWNED
+
+        _audit_emit(
+            event=EVENT_WATCHDOG_WORKER_LANE_SPAWNED,
+            project=project_key,
+            subject=finding.subject,
+            actor="audit_watchdog",
+            metadata={
+                "role": role,
+                "project": project_key,
+                "task_subject": finding.subject,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: emit worker_lane_spawned failed",
+            exc_info=True,
+        )
+    return counters
+
+
+def _self_heal_state_db_missing(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    config_path: Path | None = None,
+    **_: Any,
+) -> dict[str, int]:
+    """#1546 — re-run the tracker scaffold for projects whose canonical
+    state.db is missing.
+
+    Calls :func:`pollypm.projects.enable_tracked_project` to repair the
+    scaffold; the helper is idempotent — it re-detects project kind,
+    re-emits the issue tracker, and writes the config back.
+    """
+    counters = {
+        "state_db_repaired": 0,
+        "state_db_repair_failed": 0,
+    }
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH
+        from pollypm.projects import enable_tracked_project
+
+        cfg_path = config_path or DEFAULT_CONFIG_PATH
+        enable_tracked_project(cfg_path, project_key)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "audit.watchdog: state_db_missing repair failed for %s",
+            project_key, exc_info=True,
+        )
+        counters["state_db_repair_failed"] += 1
+        return counters
+    counters["state_db_repaired"] += 1
+    try:
+        from pollypm.audit import emit as _audit_emit
+        from pollypm.audit.log import EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED
+
+        _audit_emit(
+            event=EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED,
+            project=project_key,
+            subject=project_key,
+            actor="audit_watchdog",
+            metadata={
+                "project_key": project_key,
+                "project_path": str(project_path) if project_path else "",
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: emit project_tracked_mode_repaired failed",
+            exc_info=True,
+        )
+    return counters
+
+
+# Tier-1 healer registry — maps rule name to a ``(finding, **kwargs) ->
+# dict[str, int]`` callable. Adding a tier-1 self-heal rule means
+# writing the detector + registering the healer here. The dispatcher in
+# ``_scan_one_project`` looks up the registry in O(1) and skips the
+# old if/elif branches; behaviour for the existing 3 self-heal rules is
+# byte-identical to the pre-#1546 implementation (the registry adapters
+# wrap the original helpers and translate their counter shapes).
+_TIER1_HEALERS: dict[str, Any] = {
+    RULE_DUPLICATE_ADVISOR_TASKS: _self_heal_duplicate_advisor_tasks_counter,
+    RULE_PLAN_REVIEW_MISSING: _self_heal_plan_review_missing,
+    RULE_LEGACY_DB_SHADOW: _self_heal_legacy_db_shadow_counter,
+    # #1546 — new tier-1 entries.
+    RULE_ROLE_SESSION_MISSING: _self_heal_role_session_missing,
+    RULE_STATE_DB_MISSING: _self_heal_state_db_missing,
+}
+
+
+# ---------------------------------------------------------------------------
+# Tier-3 operator dispatch (#1546)
+# ---------------------------------------------------------------------------
+
+
+def _operator_dedup_key(rule: str, project: str, subject: str) -> str:
+    """Stable dedup key for tier-3 inbox rows.
+
+    Hash-folded so the inbox's ``--dedup-key`` collapses repeated
+    operator dispatches to a single row whose ``count`` increments.
+    Mirrors :func:`pollypm.audit.watchdog.watchdog_alert_session_name`
+    in spirit but lives on the inbox side.
+    """
+    safe_subject = (subject or "").replace("/", "_").replace(" ", "_") or "_"
+    return f"watchdog-operator:{rule}:{project}:{safe_subject}"
+
+
+def _maybe_dispatch_to_operator(
+    finding: Finding,
+    *,
+    project_path: Path | None,
+    now: datetime,
+) -> str:
+    """Tier-3 dispatch: route a finding to the operator's inbox.
+
+    Symmetric to :func:`_maybe_dispatch_to_architect` but for the
+    operator leg. Creates an inbox task via the same plumbing
+    :func:`pm notify` uses (``store.enqueue_message`` +
+    ``svc.create``), with ``roles.operator='user'`` and a structured
+    evidence-and-question body produced by
+    :func:`tier_handoff_prompt`. Uses the audit log itself as the
+    throttle source-of-truth so a heartbeat-process restart doesn't
+    reset the cooldown.
+
+    Status codes (per-project counters):
+    * ``"skipped"`` — rule isn't operator-dispatchable.
+    * ``"throttled"`` — recent matching dispatch in the audit log.
+    * ``"dispatched"`` — inbox row + audit event written.
+    * ``"send_failed"`` — emit ran, inbox write raised.
+    """
+    if finding.rule not in _OPERATOR_DISPATCHABLE_RULES:
+        return "skipped"
+    if was_recently_operator_dispatched(
+        project=finding.project,
+        finding_type=finding.rule,
+        subject=finding.subject,
+        now=now,
+        project_path=project_path,
+        throttle_seconds=OPERATOR_DISPATCH_THROTTLE_SECONDS,
+    ):
+        return "throttled"
+
+    # Build the body via the structured-evidence helper. We hand the
+    # finding's evidence dict and a single decision-shaped question;
+    # the helper refuses any solution-menu shape.
+    question = (
+        f"Project {finding.project} is wedged in a way the architect "
+        f"can't unstick. What structural change do you want to apply?"
+    )
+    try:
+        body = tier_handoff_prompt(finding.evidence or {}, question)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "audit.watchdog: tier_handoff_prompt raised for %s/%s",
+            finding.rule, finding.project, exc_info=True,
+        )
+        # Fall back to the finding message so we don't lose the dispatch.
+        body = finding.message or finding.rule
+
+    dedup_key = _operator_dedup_key(
+        finding.rule, finding.project, finding.subject,
+    )
+    subject_text = (
+        finding.message
+        or f"watchdog: {finding.rule} on {finding.project}/{finding.subject}"
+    )[:200]
+
+    # Emit the audit event BEFORE the inbox write so the throttle window
+    # is engaged even on inbox-write failure.
+    inbox_task_id: str | None = None
+    emit_operator_dispatched(
+        project=finding.project,
+        finding_type=finding.rule,
+        subject=finding.subject,
+        inbox_task_id=None,
+        dedup_key=dedup_key,
+        project_path=project_path,
+    )
+
+    try:
+        inbox_task_id = _create_operator_inbox_task(
+            project_key=finding.project,
+            project_path=project_path,
+            subject=subject_text,
+            body=body,
+            dedup_key=dedup_key,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "audit.watchdog: operator inbox write failed for %s/%s",
+            finding.rule, finding.project, exc_info=True,
+        )
+        return "send_failed"
+    if inbox_task_id is None:
+        return "send_failed"
+    # Re-emit with the inbox_task_id captured for forensics. The throttle
+    # already engaged from the first emit; the second row is the canonical
+    # record and the first is a precursor that operators can ignore.
+    emit_operator_dispatched(
+        project=finding.project,
+        finding_type=finding.rule,
+        subject=finding.subject,
+        inbox_task_id=inbox_task_id,
+        dedup_key=dedup_key,
+        project_path=project_path,
+    )
+    return "dispatched"
+
+
+def _create_operator_inbox_task(
+    *,
+    project_key: str,
+    project_path: Path | None,
+    subject: str,
+    body: str,
+    dedup_key: str,
+) -> str | None:
+    """Materialise the operator inbox task. Returns ``task_id`` on success.
+
+    Mirrors the relevant slice of :func:`pollypm.cli_features.session_runtime.notify`
+    (the immediate-priority branch) — opens the workspace SQLAlchemy
+    store, enqueues a notify message with the dedup_key, then creates
+    the work-service task with ``roles.operator='user'`` and the
+    ``notify`` label. Any failure raises and the caller logs it.
+    """
+    from pollypm.inbox_dedup import (
+        bump_dedup_message,
+        find_open_dedup_message,
+        initial_dedup_payload,
+    )
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.work import create_work_service
+    from pollypm.work.cli import _resolve_db_path
+
+    db_path = _resolve_db_path(".pollypm/state.db", project=project_key)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    payload = {
+        "actor": "audit_watchdog",
+        "project": project_key,
+        "milestone_key": None,
+        "requester": "user",
+    }
+    try:
+        existing = find_open_dedup_message(
+            store, dedup_key, recipient="user",
+        ) if dedup_key else None
+        if existing is not None:
+            message_id = bump_dedup_message(
+                store,
+                existing,
+                subject=subject,
+                body=body,
+                payload={**payload, "dedup_key": dedup_key},
+                labels=["notify", "watchdog"],
+                tier="immediate",
+            )
+        else:
+            seeded_payload = (
+                initial_dedup_payload(payload, dedup_key)
+                if dedup_key else payload
+            )
+            message_id = store.enqueue_message(
+                type="notify",
+                tier="immediate",
+                recipient="user",
+                sender="audit_watchdog",
+                subject=subject,
+                body=body,
+                scope=project_key,
+                labels=["notify", "watchdog"],
+                payload=seeded_payload,
+                state="closed",
+            )
+    finally:
+        store.close()
+
+    svc = create_work_service(
+        db_path=db_path,
+        project_path=db_path.parent.parent,
+    )
+    try:
+        task_labels = [
+            "notify",
+            "watchdog",
+            f"notify_message:{message_id}",
+        ]
+        task = svc.create(
+            title=subject,
+            description=body,
+            type="task",
+            project=project_key,
+            flow_template="chat",
+            roles={
+                "requester": "user",
+                "operator": "user",
+            },
+            priority="high",
+            created_by="audit_watchdog",
+            labels=task_labels,
+        )
+        inbox_task_id = task.task_id
+        store2 = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            store2.update_message(
+                message_id,
+                payload={**payload, "task_id": inbox_task_id},
+            )
+        finally:
+            store2.close()
+        return inbox_task_id
+    finally:
+        svc.close()
+
+
+# ---------------------------------------------------------------------------
+# State-DB-missing probe (#1546 tier-1)
+# ---------------------------------------------------------------------------
+
+
+def _gather_state_db_probes(*, services: Any) -> list[_StateDbProbe]:
+    """Probe each known project for canonical-state.db presence (#1546).
+
+    Returns one descriptor per project. The pure
+    :func:`_detect_state_db_missing` decides whether to fire; the
+    self-heal action calls :func:`enable_tracked_project` for any
+    project whose canonical DB is absent.
+    """
+    probes: list[_StateDbProbe] = []
+    known = getattr(services, "known_projects", None) or ()
+    for project in known:
+        project_key = getattr(project, "key", None) or getattr(
+            project, "name", None,
+        )
+        project_path_raw = getattr(project, "path", None)
+        if not project_key or project_path_raw is None:
+            continue
+        try:
+            project_path = Path(project_path_raw)
+        except TypeError:
+            continue
+        canonical = project_path / ".pollypm" / "state.db"
+        legacy_archives_present = False
+        try:
+            pollypm_dir = project_path / ".pollypm"
+            if pollypm_dir.exists():
+                legacy_archives_present = any(
+                    pollypm_dir.glob("state.db.legacy-*")
+                )
+        except OSError:
+            legacy_archives_present = False
+        probes.append(_StateDbProbe(
+            project_key=project_key,
+            project_path=project_path,
+            canonical_present=canonical.exists(),
+            legacy_archives_present=legacy_archives_present,
+        ))
+    return probes
+
+
 def _scan_one_project(
     *,
     project_key: str,
@@ -1068,9 +1631,11 @@ def _scan_one_project(
     storage_closet_name: str | None = None,
     legacy_db_shadows: list[_LegacyDbShadow] | None = None,
     plan_missing_clears: list[_PlanMissingClear] | None = None,
+    state_db_probes: list[_StateDbProbe] | None = None,
+    config_path: Path | None = None,
 ) -> dict[str, int]:
     """Scan one project and route every finding. Returns counters."""
-    counters = {
+    counters: dict[str, int] = {
         "findings": 0,
         "alerts_raised": 0,
         "alert_failures": 0,
@@ -1084,6 +1649,15 @@ def _scan_one_project(
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
         "plan_missing_churn_detected": 0,
+        # #1546 — new tier-1 healer counters.
+        "worker_lane_spawned": 0,
+        "worker_lane_failed": 0,
+        "state_db_repaired": 0,
+        "state_db_repair_failed": 0,
+        # #1546 — tier-3 dispatcher counters.
+        "operator_dispatches_sent": 0,
+        "operator_dispatches_throttled": 0,
+        "operator_dispatches_failed": 0,
     }
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
@@ -1108,6 +1682,12 @@ def _scan_one_project(
         c for c in (plan_missing_clears or [])
         if c.scope == expected_scope
     ]
+    # #1546 — filter the workspace-wide state-db probe list to this
+    # project's row.
+    project_state_probes: list[_StateDbProbe] = [
+        p for p in (state_db_probes or [])
+        if p.project_key == project_key
+    ]
     try:
         findings = scan_project(
             project_key,
@@ -1120,6 +1700,7 @@ def _scan_one_project(
             plan_review_present=plan_review_present,
             legacy_db_shadows=project_shadows or None,
             plan_missing_clears=project_clears or None,
+            state_db_probes=project_state_probes or None,
         )
     except Exception:  # noqa: BLE001
         logger.debug(
@@ -1144,54 +1725,33 @@ def _scan_one_project(
                 finding.rule, finding.project, finding.subject,
                 finding.message, finding.recommendation,
             )
-        # #1510 — duplicate-advisor cleanup is a self-healing action,
-        # not an architect dispatch. The fix is mechanical (cancel all
-        # but the newest), idempotent across ticks, and doesn't need a
-        # human in the loop, so we run it inline here.
-        if finding.rule == RULE_DUPLICATE_ADVISOR_TASKS:
-            heal = _self_heal_duplicate_advisor_tasks(
-                finding,
-                project_key=project_key,
-                project_path=project_path,
-            )
-            counters["advisor_duplicates_cancelled"] += heal["cancelled"]
-            counters["advisor_duplicates_failed"] += heal["failed"]
-            # Skip dispatch — this rule is auto-healed, not architect-routed.
+
+        # #1546 — tier-1 healer registry replaces the pre-#1546 if/elif
+        # branches. Each healer returns ``dict[str, int]`` of counter
+        # increments and the dispatcher folds them into the totals
+        # generically. Behaviour for existing self-heal rules is
+        # byte-identical (the registry adapters wrap the original
+        # helpers — see ``_self_heal_*_counter`` shims above).
+        healer = _TIER1_HEALERS.get(finding.rule)
+        if healer is not None:
+            try:
+                heal_counters = healer(
+                    finding,
+                    project_key=project_key,
+                    project_path=project_path,
+                    config_path=config_path,
+                ) or {}
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "audit.watchdog: tier-1 healer raised for %s",
+                    finding.rule, exc_info=True,
+                )
+                heal_counters = {}
+            for key, value in heal_counters.items():
+                counters[key] = counters.get(key, 0) + int(value)
+            # Tier-1 finishes the rule — no architect / operator dispatch.
             continue
-        # #1511 — plan_review_missing findings are self-healing: the
-        # cadence handler emits the missing inbox row via the same
-        # code path the post-done hook uses (Part A). Idempotent because
-        # ``emit_plan_review_for_task`` re-checks the messages table
-        # before writing. No architect dispatch needed; the user sees
-        # the backfilled card directly in their inbox.
-        if finding.rule == RULE_PLAN_REVIEW_MISSING:
-            backfilled = _backfill_plan_review_for_finding(
-                finding,
-                project_key=project_key,
-                project_path=project_path,
-            )
-            if backfilled is not None:
-                counters["plan_review_backfilled"] += 1
-            else:
-                counters["plan_review_backfill_failed"] += 1
-            # Skip the dispatch path for this rule — the architect has
-            # nothing to unstick; the watchdog itself just fixed it.
-            continue
-        # #1519 — legacy_db_shadow findings are self-healing: drain the
-        # legacy per-project DB into canonical via ``migrate_one``. The
-        # helper is idempotent (rows already in canonical are skipped,
-        # source archived to ``state.db.legacy-1004`` only after a clean
-        # copy), so a re-run on an already-healed workspace is a no-op.
-        # No architect dispatch — the action is mechanical.
-        if finding.rule == RULE_LEGACY_DB_SHADOW:
-            heal = _self_heal_legacy_db_shadow(
-                finding,
-                project_key=project_key,
-                project_path=project_path,
-            )
-            counters["legacy_db_shadows_migrated"] += heal["migrated"]
-            counters["legacy_db_shadows_failed"] += heal["failed"]
-            continue
+
         # #1524 — plan_missing_alert_churn is detection-only. The repair
         # is Part A (the deterministic precompute in the task-assignment
         # sweep). The finding + alert + audit-log row are the canary so
@@ -1200,6 +1760,25 @@ def _scan_one_project(
         if finding.rule == RULE_PLAN_MISSING_ALERT_CHURN:
             counters["plan_missing_churn_detected"] += 1
             continue
+
+        # #1546 — tier-3 operator dispatchable rules route to the
+        # operator inbox via ``_maybe_dispatch_to_operator``. The
+        # dispatcher returns "skipped" for non-operator rules so the
+        # architect leg below still runs for tier-2.
+        if finding.rule in _OPERATOR_DISPATCHABLE_RULES:
+            op_outcome = _maybe_dispatch_to_operator(
+                finding,
+                project_path=project_path,
+                now=now,
+            )
+            if op_outcome == "dispatched":
+                counters["operator_dispatches_sent"] += 1
+            elif op_outcome == "throttled":
+                counters["operator_dispatches_throttled"] += 1
+            elif op_outcome == "send_failed":
+                counters["operator_dispatches_failed"] += 1
+            continue
+
         # #1414 — eligible findings get an architect dispatch on top
         # of the alert. Throttle window is owned by the audit log so
         # repeat dispatches are deduped across cadence-process restarts.
@@ -1252,7 +1831,7 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
     # scanning blows up the heartbeat-tick still lands in the log.
     emit_heartbeat_tick(metadata={"cadence": AUDIT_WATCHDOG_SCHEDULE})
 
-    totals = {
+    totals: dict[str, int] = {
         "projects_scanned": 0,
         "findings": 0,
         "alerts_raised": 0,
@@ -1267,6 +1846,14 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
         "plan_missing_churn_detected": 0,
+        # #1546 — new tier-1 + tier-3 totals.
+        "worker_lane_spawned": 0,
+        "worker_lane_failed": 0,
+        "state_db_repaired": 0,
+        "state_db_repair_failed": 0,
+        "operator_dispatches_sent": 0,
+        "operator_dispatches_throttled": 0,
+        "operator_dispatches_failed": 0,
     }
 
     try:
@@ -1296,6 +1883,14 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 "audit.watchdog: plan_missing-clear probe failed", exc_info=True,
             )
             plan_missing_clears = []
+        # #1546 — probe canonical-state.db presence once per tick.
+        try:
+            state_db_probes = _gather_state_db_probes(services=services)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: state-db-probe failed", exc_info=True,
+            )
+            state_db_probes = []
         for project in services.known_projects or ():
             project_key = getattr(project, "key", None)
             if not project_key or project_key in seen_projects:
@@ -1312,10 +1907,12 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 storage_closet_name=storage_closet_name,
                 legacy_db_shadows=legacy_db_shadows,
                 plan_missing_clears=plan_missing_clears,
+                state_db_probes=state_db_probes,
+                config_path=config_path,
             )
             totals["projects_scanned"] += 1
             for k, v in partial.items():
-                totals[k] += v
+                totals[k] = totals.get(k, 0) + v
     finally:
         try:
             services.close()

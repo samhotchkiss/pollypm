@@ -739,6 +739,76 @@ def _state_db_candidates() -> list[Path]:
     return out
 
 
+def check_product_state() -> CheckResult:
+    """#1546 — surface ``workspace.product_state`` in diagnostics.
+
+    Reads the canonical workspace state.db and reports the value of
+    the ``product_state`` row. When the flag is set to ``"broken"``,
+    the check fails with the reason + forensics path so the operator
+    can drill in. ``healthy`` (no row) is the default and reports OK.
+    The check is a soft warning — the flag itself is what gates new
+    task queueing; this is just observability.
+    """
+    db_path = _workspace_state_db_path()
+    if db_path is None or not db_path.exists():
+        return _skip("product_state probe skipped (no workspace state.db)")
+    try:
+        from pollypm.storage.product_state import (
+            PRODUCT_STATE_BROKEN,
+            get_product_state,
+        )
+        from pollypm.storage.state import StateStore
+    except Exception as exc:  # noqa: BLE001
+        return _skip(f"product_state probe skipped (import failed: {exc})")
+    store: StateStore | None = None
+    try:
+        store = StateStore(db_path, readonly=True)
+        state = get_product_state(store)
+    except Exception as exc:  # noqa: BLE001
+        return _skip(f"product_state probe skipped (read failed: {exc})")
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+    if state is None:
+        return _ok("product_state=healthy (no flag set)")
+    if state.state == PRODUCT_STATE_BROKEN:
+        return _fail(
+            f"product_state=broken: {state.reason}",
+            why=(
+                "PollyPM has flagged its own product state as broken. "
+                "New task queueing is refused until the flag is "
+                f"cleared. Forensics: {state.forensics_path or '(none)'}. "
+                f"Set by: {state.set_by} at {state.set_at}."
+            ),
+            fix=(
+                "Drill into the forensics path above, address the "
+                "underlying failure, then clear the flag —\n"
+                "  python -c 'from pollypm.storage.state import "
+                "StateStore; from pollypm.storage.product_state "
+                "import clear_product_state; from pathlib import "
+                "Path; s = StateStore("
+                f"Path({str(db_path)!r})); clear_product_state(s); "
+                "s.close()'\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data={
+                "state": state.state,
+                "reason": state.reason,
+                "set_by": state.set_by,
+                "set_at": state.set_at,
+                "forensics_path": state.forensics_path,
+            },
+        )
+    return _ok(
+        f"product_state={state.state} (set_by={state.set_by})",
+        data={"state": state.state, "reason": state.reason},
+    )
+
+
 def check_state_migrations() -> CheckResult:
     latest = _latest_state_migration_version()
     if latest is None:
@@ -3781,6 +3851,8 @@ def _registered_checks() -> list[Check]:
         # Migrations
         Check("state-migrations", check_state_migrations, "migrations"),
         Check("work-migrations", check_work_migrations, "migrations"),
+        # #1546 — heartbeat-cascade product-broken flag.
+        Check("product-state", check_product_state, "install", severity="warning"),
         # Filesystem
         Check("pollypm-home-writable", check_pollypm_home_writable, "filesystem"),
         Check("pollypm-plugins-dir", check_pollypm_plugins_dir, "filesystem", severity="warning"),

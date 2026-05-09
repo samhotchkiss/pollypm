@@ -89,6 +89,29 @@ EVENT_PLAN_SUCCESSOR_CREATED = "plan.successor_created"
 # for the dedup to work.
 EVENT_WORKER_SESSION_REAPED = "worker.session_reaped"
 EVENT_WATCHDOG_ESCALATION_DISPATCHED = "watchdog.escalation_dispatched"
+# #1546 — operator-tier dispatch event. Fires when a tier-3 finding is
+# routed to the user's inbox via the ``pm notify``-shaped path. The
+# throttle window queries this event for dedup so a heartbeat-process
+# restart doesn't reset the per-rule cooldown. Symmetric to
+# ``EVENT_WATCHDOG_ESCALATION_DISPATCHED`` but for the operator leg of
+# the cascade — the leg that exists when a tier-2 architect dispatch
+# has already been tried (or is structurally unavailable) and the next
+# rung up is a human in the loop. The event metadata carries
+# ``finding_type``, ``subject``, and ``inbox_task_id`` (when the inbox
+# task creation succeeded) so forensic reads can correlate with the
+# inbox row directly.
+EVENT_WATCHDOG_OPERATOR_DISPATCHED = "watchdog.operator_dispatched"
+# #1546 — fires when the watchdog spawns a missing role lane (the
+# ``role_session_missing`` self-heal action). One event per spawned
+# lane; metadata carries ``role``, ``project``, and ``task_subject``
+# so forensic reads can confirm which queued / in-flight task drove
+# the spawn.
+EVENT_WATCHDOG_WORKER_LANE_SPAWNED = "audit.worker_lane_spawned"
+# #1546 — fires when the watchdog repairs a tracked project whose
+# canonical ``.pollypm/state.db`` is missing (only legacy archives
+# remain). Metadata carries ``project_key`` and ``project_path`` so
+# forensic reads can confirm which project was repaired.
+EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED = "audit.project_tracked_mode_repaired"
 # #1413 — emitted whenever the supervisor / on-demand path provisions a
 # project-scoped role session (e.g. reviewer-<project>) that did not
 # previously exist. The watchdog (#1414) reads this stream to surface
@@ -451,6 +474,9 @@ __all__ = [
     "EVENT_PLAN_SUCCESSOR_CREATED",
     "EVENT_WORKER_SESSION_REAPED",
     "EVENT_WATCHDOG_ESCALATION_DISPATCHED",
+    "EVENT_WATCHDOG_OPERATOR_DISPATCHED",
+    "EVENT_WATCHDOG_WORKER_LANE_SPAWNED",
+    "EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED",
     "AuditEvent",
     "central_log_path",
     "emit",

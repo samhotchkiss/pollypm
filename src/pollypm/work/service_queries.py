@@ -21,6 +21,108 @@ if TYPE_CHECKING:
     from pollypm.work.sqlite_service import SQLiteWorkService
 
 
+# #1546 — labels that bypass the product-broken gate. The watchdog's
+# operator dispatch path creates inbox tasks tagged ``watchdog`` (so
+# the cascade can still surface findings even when the workspace is
+# product-broken) and the urgent human-handoff path tags its inbox
+# rows ``urgent``. Both are out-of-band notifications, not new work
+# queueing, so the gate explicitly allows them.
+_PRODUCT_BROKEN_BYPASS_LABELS: frozenset[str] = frozenset({
+    "watchdog",
+    "urgent",
+    "notify",
+})
+
+
+# Cache for the product-broken gate. Keyed by (db_path, mtime_ns) so
+# the gate is O(1) when the file hasn't been touched since the last
+# check. Each ``create_task`` call would otherwise spend the cost of
+# opening the workspace state.db (which can be 1+ GB on long-lived
+# installs) just to read a single key-value row — observed in the
+# #1546 test run pegging an open StateStore handle for every
+# ``svc.create`` call across the full pytest suite.
+_PRODUCT_STATE_CACHE: dict[tuple[str, int], "Any | None"] = {}
+
+
+def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
+    """Raise :class:`ProductBrokenError` when workspace product_state=='broken'.
+
+    The lookup is best-effort and cached by (db_path, mtime_ns): a
+    missing config / state.db / unified store path falls through
+    silently so unit tests that exercise the work-service in isolation
+    aren't perturbed. Tasks tagged with any of the bypass labels (the
+    watchdog's own dispatch path needs to keep working) skip the gate.
+    """
+    label_set = {str(label) for label in (labels or []) if label}
+    if label_set & _PRODUCT_BROKEN_BYPASS_LABELS:
+        return
+    try:
+        from pathlib import Path
+
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+        from pollypm.storage.product_state import (
+            ProductBrokenError,
+            is_product_broken,
+        )
+        from pollypm.storage.state import StateStore
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        config = load_config(DEFAULT_CONFIG_PATH)
+    except Exception:  # noqa: BLE001
+        return
+    db_path_raw = getattr(getattr(config, "project", None), "state_db", None)
+    if db_path_raw is None:
+        return
+    try:
+        db_path = Path(db_path_raw)
+    except TypeError:
+        return
+    if not db_path.exists():
+        return
+    # mtime-keyed cache — invalidate when the DB file is rewritten so
+    # a freshly-set product_state row takes effect on the next
+    # heartbeat tick (or sooner if the writer fsyncs).
+    try:
+        mtime_ns = db_path.stat().st_mtime_ns
+    except OSError:
+        return
+    cache_key = (str(db_path), mtime_ns)
+    cached = _PRODUCT_STATE_CACHE.get(cache_key)
+    if cached is _PRODUCT_STATE_SENTINEL_HEALTHY:
+        return
+    if cached is not None and cached is not _PRODUCT_STATE_SENTINEL_HEALTHY:
+        raise ProductBrokenError(cached)
+
+    store: Any | None = None
+    try:
+        store = StateStore(db_path, readonly=True)
+        broken = is_product_broken(store)
+    except Exception:  # noqa: BLE001
+        return
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+    # Cache the result so subsequent create_task calls don't pay the
+    # StateStore open cost. Keep the cache bounded by clearing older
+    # entries whenever a new mtime lands for the same path.
+    _PRODUCT_STATE_CACHE.clear()
+    if broken is None:
+        _PRODUCT_STATE_CACHE[cache_key] = _PRODUCT_STATE_SENTINEL_HEALTHY
+        return
+    _PRODUCT_STATE_CACHE[cache_key] = broken
+    raise ProductBrokenError(broken)
+
+
+# Sentinel that distinguishes "we checked and the workspace is
+# healthy" from "no row yet" in the cache. Using ``object()`` keeps
+# it identity-comparable and avoids confusing isinstance checks.
+_PRODUCT_STATE_SENTINEL_HEALTHY = object()
+
+
 def create_task(
     service: "SQLiteWorkService",
     *,
@@ -39,6 +141,15 @@ def create_task(
     requires_human_review: bool = False,
     predecessor_task_id: str | None = None,
 ) -> Task:
+    # #1546 — product-broken gate. When the workspace state DB carries
+    # ``product_state=broken``, refuse new task queueing with a clear
+    # error pointing at the reason + forensics path. The flag is
+    # workspace-wide, not per-project, so we look it up via the
+    # canonical state DB. The lookup is best-effort — a missing
+    # state.db (e.g. tests that exercise the work-service in isolation)
+    # falls through to the normal create path so we don't break
+    # unrelated callers.
+    _enforce_product_state_gate(labels=labels)
     template = service._ensure_flow_in_db(flow_template)
 
     for role_name, role_def in template.roles.items():

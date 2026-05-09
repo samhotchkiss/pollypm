@@ -311,6 +311,18 @@ CREATE TABLE IF NOT EXISTS architect_resume_tokens (
     captured_at TEXT NOT NULL,
     last_active_at TEXT NOT NULL
 );
+
+-- #1546 — workspace_state: small key-value store for cascade flags that
+-- live above the per-project layer. Today the only writer is the
+-- product_state plumbing (the "broken" sentinel that refuses new task
+-- queueing); future heartbeat-cascade flags can park here without
+-- fanning out yet another table.
+CREATE TABLE IF NOT EXISTS workspace_state (
+    key TEXT PRIMARY KEY,
+    value_json TEXT NOT NULL,
+    set_at TEXT NOT NULL,
+    set_by TEXT NOT NULL DEFAULT 'system'
+);
 """
 
 
@@ -1150,6 +1162,70 @@ class StateStore:
     def _safe_add_column(self, table: str, column: str, typedef: str) -> None:
         if not self._column_exists(self._conn, table, column):
             self.execute(f"ALTER TABLE {table} ADD COLUMN {column} {typedef}")
+
+    # ------------------------------------------------------------------
+    # workspace_state — small key-value store for cascade-level flags (#1546)
+    # ------------------------------------------------------------------
+
+    def set_workspace_state(
+        self,
+        key: str,
+        value: dict,
+        *,
+        actor: str = "system",
+    ) -> None:
+        """Upsert one workspace_state row. ``value`` is JSON-serialisable.
+
+        ``set_at`` is stamped to ``self._now()`` and ``set_by`` records
+        the actor (``"system"`` is the default for programmatic writes;
+        callers like the watchdog pass ``"audit_watchdog"`` and the CLI
+        passes the user identity).
+        """
+        with self._lock:
+            self.execute(
+                """
+                INSERT INTO workspace_state (key, value_json, set_at, set_by)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value_json = excluded.value_json,
+                    set_at = excluded.set_at,
+                    set_by = excluded.set_by
+                """,
+                (key, json.dumps(value), self._now(), actor),
+            )
+            self.commit()
+
+    def get_workspace_state(self, key: str) -> dict | None:
+        """Return the JSON payload stored under ``key``, or ``None``.
+
+        Returns ``None`` for missing rows AND for rows whose payload
+        failed to decode — the caller treats both as "not set" and
+        falls through to the default behavior.
+        """
+        with self._lock:
+            row = self.execute(
+                "SELECT value_json FROM workspace_state WHERE key = ?",
+                (key,),
+            ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row[0])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+        return payload
+
+    def clear_workspace_state(self, key: str) -> bool:
+        """Delete the row at ``key``; return True iff a row was removed."""
+        with self._lock:
+            cur = self.execute(
+                "DELETE FROM workspace_state WHERE key = ?",
+                (key,),
+            )
+            self.commit()
+            return (cur.rowcount or 0) > 0
 
     def upsert_session(
         self,

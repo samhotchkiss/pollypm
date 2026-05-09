@@ -24,6 +24,7 @@ import asyncio
 import json
 import os
 import resource
+import webbrowser
 from collections import OrderedDict
 from pathlib import Path
 import subprocess
@@ -14661,6 +14662,14 @@ class PollyProjectDashboardApp(App[None]):
         # banner CTA advertises this keystroke (mirrors the inbox →
         # gesture for "drill in"); ``r`` stays bound to refresh.
         Binding("right", "review_plan", "Review plan", show=False),
+        # #1534 — ``b`` opens the plan task's deliverable URL in the
+        # system browser (when the resolved plan-review task carries
+        # one via ``external_refs`` / labels / description). ``o`` was
+        # already bound to ``open_editor`` for plan.md, so we use ``b``
+        # ("Browser") for the URL affordance — the surface action bar
+        # advertises the keystroke + the binding no-ops with a friendly
+        # notify when no deliverable URL is available.
+        Binding("b", "open_deliverable_url", "Open deliverable", show=False),
         # ``u`` rolls back a pending plan-review approval; falls
         # through to refresh when there is nothing pending (the legacy
         # ``u`` binding co-existed with ``r`` for refresh).
@@ -17570,6 +17579,57 @@ class PollyProjectDashboardApp(App[None]):
         import platform
         cmd = "open" if platform.system() == "Darwin" else "xdg-open"
         subprocess.run([cmd, str(path)], check=False)
+
+    def action_open_deliverable_url(self) -> None:
+        """``b`` — open the plan task's deliverable URL in the system browser.
+
+        #1534 — when the project's actionable plan-review task carries a
+        deliverable URL (via ``external_refs`` / labels / description),
+        the plan-review surface advertises ``[b] Open in browser``.
+        We resolve the URL the same way the surface does (#1518's
+        ``_plan_task_deliverable_url``) so the keystroke maps to the
+        URL the user just read on screen.
+
+        No-ops with a friendly notify when there's no plan task or no
+        URL to open — pressing ``b`` outside a plan-review context
+        shouldn't be silent.
+        """
+        url = self._resolve_plan_review_deliverable_url()
+        if not url:
+            self.notify(
+                "No deliverable URL on this plan task.",
+                severity="information", timeout=2.0,
+            )
+            return
+        try:
+            webbrowser.open(url)
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Open failed: {exc}", severity="error", timeout=3.0,
+            )
+            return
+        self.notify(
+            f"Opened {url}", severity="information", timeout=2.0,
+        )
+
+    def _resolve_plan_review_deliverable_url(self) -> str | None:
+        """Return the deliverable URL for the surfaced plan-review task.
+
+        Reads ``data.plan_task_summary["deliverable_url"]`` — already
+        extracted by :func:`_dashboard_done_plan_task` via
+        ``_plan_task_deliverable_url``. The summary is the canonical
+        carrier for plan-task deliverables on this screen so we don't
+        re-walk the work_tasks rows here.
+        """
+        data = self.data
+        if data is None:
+            return None
+        summary = getattr(data, "plan_task_summary", None) or None
+        if isinstance(summary, dict):
+            url = summary.get("deliverable_url")
+            if isinstance(url, str) and url.startswith(("http://", "https://")):
+                return url
+        return None
 
     # ── Plan-view scroll helpers (active when ``_plan_view_mode`` is on) ──
 

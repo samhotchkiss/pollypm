@@ -393,3 +393,67 @@ def test_o_opens_plan_in_editor(env, app, monkeypatch) -> None:
             assert opened, "expected _open_external to be called for plan.md"
             assert opened[-1] == plan_path
     _run(body())
+
+
+# ---------------------------------------------------------------------------
+# 9. ``b`` opens the plan-task deliverable URL in the system browser (#1534)
+# ---------------------------------------------------------------------------
+
+
+def test_b_opens_deliverable_url_in_browser(env, app, monkeypatch) -> None:
+    """#1534 — ``b`` calls ``webbrowser.open`` with the plan task's URL.
+
+    The plan-review surface advertises ``[b] Open in browser`` when the
+    surfaced task carries a ``deliverable_url`` (extracted via
+    ``_plan_task_deliverable_url`` and stored on
+    ``data.plan_task_summary``). Pressing ``b`` should call the
+    platform URL handler with that URL — no editor shell-out, no path
+    munging.
+    """
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert app.data is not None
+            # Inject a plan_task_summary with a deliverable URL —
+            # the actual gather path is exercised by other tests; here
+            # we want to assert the keybinding wiring.
+            app.data.plan_task_summary = {
+                "task_id": "demo/1",
+                "task_number": 1,
+                "project": "demo",
+                "title": "POC plan",
+                "summary": "ship the explainer",
+                "deliverable_url": "https://example.test/plan-explainer",
+                "updated_at": "2026-04-30T00:00:00+00:00",
+            }
+            opened: list[str] = []
+            monkeypatch.setattr(
+                "pollypm.cockpit_ui.webbrowser.open",
+                lambda url, *a, **kw: opened.append(url) or True,
+            )
+            await pilot.press("b")
+            await pilot.pause()
+            assert opened == ["https://example.test/plan-explainer"]
+    _run(body())
+
+
+def test_b_no_op_when_no_deliverable_url(env, app, monkeypatch) -> None:
+    """#1534 — ``b`` is a friendly no-op when no plan-task URL is present.
+
+    No plan_task_summary, or one without a deliverable_url, must not
+    crash and must not call the platform URL handler.
+    """
+    async def body() -> None:
+        async with app.run_test(size=(140, 50)) as pilot:
+            await pilot.pause()
+            assert app.data is not None
+            app.data.plan_task_summary = None
+            opened: list[str] = []
+            monkeypatch.setattr(
+                "pollypm.cockpit_ui.webbrowser.open",
+                lambda url, *a, **kw: opened.append(url) or True,
+            )
+            await pilot.press("b")
+            await pilot.pause()
+            assert opened == []
+    _run(body())

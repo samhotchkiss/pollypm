@@ -46,7 +46,7 @@ from pollypm.cockpit_sections.base import (
 # Back`` for tests + non-Rich consumers — see ``render_plan_review_action_bar_plain``.
 
 _ACTION_BAR_PLAIN = (
-    "[a] Approve   [c] Chat to refine   [d] Deny   [esc] Back"
+    "[a] Approve   [c] Chat to refine   [d] Deny   [b] Open in browser   [esc] Back"
 )
 
 # Header strip colours — keep narrow enough to render inside the
@@ -73,6 +73,7 @@ def render_plan_review_action_bar() -> str:
         "[bold green][a][/bold green] [bold]Approve[/bold]",
         "[bold cyan][c][/bold cyan] Chat to refine",
         "[bold red][d][/bold red] Deny",
+        "[bold green][b][/bold green] Open in browser",
         "[bold]\\[esc][/bold] Back",
     ]
     return _DASHBOARD_BULLET + "   ".join(parts)
@@ -284,11 +285,15 @@ def render_plan_review_surface(
     """
     # Lazy import — `_md_to_rich` lives in ``cockpit_ui`` which already
     # imports from ``cockpit_sections``; importing it at module level
-    # creates a circular dependency.
+    # creates a circular dependency. ``_plan_task_first_paragraph`` and
+    # ``_plan_task_deliverable_url`` (#1518) are reused here so the
+    # description-fallback / deliverable-URL extraction stays canonical.
     from pollypm.cockpit_ui import (
         _extract_plan_judgment_calls,
         _extract_plan_summary_block,
         _md_to_rich,
+        _plan_task_deliverable_url,
+        _plan_task_first_paragraph,
     )
 
     summary = _extract_plan_summary_block(plan_text or "")
@@ -301,6 +306,19 @@ def render_plan_review_surface(
         project_key=project_key, task=task,
     ))
     out.append(_DASHBOARD_BULLET + "─" * (_DASHBOARD_DIVIDER_WIDTH - 2))
+
+    # 1b) Live deliverable URL (#1534, Part B). Renders right under the
+    # header strip when the resolved task carries an ``external_refs`` /
+    # label / description URL — the worker shipped a real artifact and
+    # the user wants a one-glance affordance to open it. Bold + green
+    # to match the positive-action palette used by the [a] Approve
+    # button + the #1531 review CTA banner.
+    deliverable_url = _plan_task_deliverable_url(task) if task is not None else None
+    if deliverable_url:
+        out.append(
+            _DASHBOARD_BULLET
+            + f"[bold green]Live deliverable:[/bold green] {deliverable_url}"
+        )
     out.append("")
 
     # 2) Summary section.
@@ -320,14 +338,26 @@ def render_plan_review_surface(
         out.append(_DASHBOARD_BULLET + "(no judgment calls flagged)")
     out.append("")
 
-    # 4) Plan body.
+    # 4) Plan body. When the plan_text is empty BUT the resolved task
+    # carries a description (#1534, Part A) — the watchdog backstop
+    # shape where the worker's plan summary lives only on the task row
+    # — render its first paragraph as the body fallback. Otherwise
+    # keep the "(plan body is empty)" placeholder.
     out.append(_dashboard_divider("Plan body"))
     if body_rest:
         rendered = _md_to_rich(body_rest)
         for line in rendered.splitlines():
             out.append(_DASHBOARD_BULLET + line)
     else:
-        out.append(_DASHBOARD_BULLET + "(plan body is empty)")
+        description = (
+            getattr(task, "description", "") or "" if task is not None else ""
+        )
+        fallback_para = _plan_task_first_paragraph(description) if description else ""
+        if fallback_para:
+            for line in fallback_para.splitlines():
+                out.append(_DASHBOARD_BULLET + line)
+        else:
+            out.append(_DASHBOARD_BULLET + "(plan body is empty)")
     out.append("")
 
     # 5) Action bar.

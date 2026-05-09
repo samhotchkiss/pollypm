@@ -575,6 +575,51 @@ def _rail_alert_subtitle_width(*, rail_width: int = 30, indent: int = 4) -> int:
     return max(12, rail_width - indent)
 
 
+def _wrap_with_hanging_indent(
+    text: str,
+    *,
+    indent: str,
+    width: int,
+    wrap_markup: str | None = None,
+) -> list[str]:
+    """Hard-wrap ``text`` so continuation lines reuse ``indent``.
+
+    Used by the project-dashboard inbox panel (#1542) where Textual
+    soft-wrap dropped continuation lines back to column 0 — a long
+    description line under a 4-space-indented bullet had its second
+    line render at the panel edge, which read as a malformed indent.
+
+    ``indent`` is the literal whitespace prefix the first line carries
+    (e.g. ``"    "`` for 4-space description rows). ``width`` is the
+    display width budget for the wrapped lines including the indent.
+    ``wrap_markup`` optionally wraps the inner text on each line in
+    paired markup (e.g. ``"dim"`` to surround with ``[dim]…[/dim]``)
+    so a single styled paragraph keeps its style across the wrap.
+    """
+    if not text:
+        return [indent]
+    inner_width = max(8, width - len(indent))
+    words = text.split()
+    if not words:
+        return [indent]
+    open_tag = f"[{wrap_markup}]" if wrap_markup else ""
+    close_tag = f"[/{wrap_markup}]" if wrap_markup else ""
+    lines: list[str] = []
+    current = ""
+    for word in words:
+        if not current:
+            current = word
+            continue
+        if len(current) + 1 + len(word) <= inner_width:
+            current = f"{current} {word}"
+        else:
+            lines.append(f"{indent}{open_tag}{current}{close_tag}")
+            current = word
+    if current:
+        lines.append(f"{indent}{open_tag}{current}{close_tag}")
+    return lines
+
+
 class _RailListView(ListView):
     """Rail-aware ``ListView`` that survives mid-dispatch re-renders.
 
@@ -1991,7 +2036,49 @@ class PollyCockpitApp(App[None]):
             pass
 
     def _nav_items(self) -> list[CockpitItem]:
-        return [item for item in self._items if item.key != "settings"]
+        items = [item for item in self._items if item.key != "settings"]
+        return self._apply_compact_rail_if_short(items)
+
+    # #1543 — fixed-height overhead the rail consumes regardless of
+    # project count: brand wordmark (~3) + tagline + blank lines +
+    # ``-- projects --`` separator + settings row + ticker + hint
+    # footer. Worst case adds up to roughly 9 lines on a stock layout;
+    # round up to 10 to leave a one-line margin so a borderline
+    # height doesn't catch flickering between modes.
+    _RAIL_FIXED_OVERHEAD_LINES = 10
+
+    def _apply_compact_rail_if_short(
+        self, items: list[CockpitItem],
+    ) -> list[CockpitItem]:
+        """Drop the focused project's subtree when the rail can't fit
+        the full project list at the current terminal height.
+
+        Without this filter, a short terminal silently truncated the
+        bottom 11/12 projects with no scroll affordance (#1543). The
+        focused project's subtree (Dashboard / PM Chat / Tasks /
+        Settings) is the biggest space hog — collapsing it back to a
+        single project row reclaims four lines, which on a typical
+        12-project rail is enough to fit everything below the fold.
+
+        We only collapse when the projected total exceeds the
+        available height. Full-height rails keep their subtree
+        unchanged so this is a no-op in the common case.
+        """
+        try:
+            available = int(getattr(self.size, "height", 0) or 0)
+        except Exception:  # noqa: BLE001
+            available = 0
+        if available <= 0:
+            return items
+        # Each item renders as one line. Add fixed overhead for the
+        # static header / footer rows that bookend ``self.nav``.
+        projected = len(items) + self._RAIL_FIXED_OVERHEAD_LINES
+        if projected <= available:
+            return items
+        # Overflow — drop ``state == "sub"`` rows so each project
+        # collapses back to a single line. Keep top-level rows + the
+        # project rows themselves intact so navigation isn't gutted.
+        return [item for item in items if item.state != "sub"]
 
     # #1208 — guard so only one ``build_items`` worker is in flight at a
     # time. Without it, every periodic tick that finds the state mtime
@@ -3147,6 +3234,18 @@ class PollyCockpitApp(App[None]):
         self._recover_cockpit_render(force_render=False)
 
     def on_resize(self, _event: events.Resize) -> None:
+        # #1543 — re-apply the rail's compact-mode filter as soon as
+        # the new height is known. The deferred ``_recover_after_resize``
+        # path schedules a full ``build_items`` worker (1-2s on a
+        # populated install) which would otherwise leave the rail in
+        # the pre-resize layout for a noticeable beat. Re-apply the
+        # cached items synchronously first so collapse / expand of the
+        # focused project's subtree tracks the resize in real time.
+        try:
+            if self._items:
+                self._apply_built_items(list(self._items))
+        except Exception:  # noqa: BLE001
+            pass
         self.call_after_refresh(self._recover_after_resize)
 
     def on_app_focus(self, _event: events.AppFocus) -> None:
@@ -16373,6 +16472,28 @@ class PollyProjectDashboardApp(App[None]):
         lines.append(self._render_inbox_remainder(data))
         return "\n".join(line for line in lines if line)
 
+    def _inbox_text_width(self) -> int:
+        """Visible character budget for inbox-panel body text (#1542).
+
+        Used by the on-hold rendering to hard-wrap long descriptions
+        with bullet-aligned hanging indents instead of letting
+        Textual's soft-wrap drop continuation lines back to column 0.
+        Computed from the live app width minus the panel padding (4),
+        the section padding (4), and a 1-cell scrollbar gutter. Falls
+        back to a sensible 64-column budget when ``self.size`` isn't
+        yet populated (cold mount / unit tests).
+        """
+        try:
+            width = int(getattr(self.size, "width", 0) or 0)
+        except Exception:  # noqa: BLE001
+            width = 0
+        if width <= 0:
+            return 64
+        # ``proj-outer`` padding (1 2) + ``proj-section`` padding (1 2)
+        # + scrollbar (1) = 9 cells of horizontal chrome on the body.
+        budget = width - 9
+        return max(32, min(budget, 100))
+
     def _render_inbox_remainder(self, data: ProjectDashboardData) -> str:
         """Render the post-action-cards portion of the inbox section.
 
@@ -16497,7 +16618,31 @@ class PollyProjectDashboardApp(App[None]):
         elif on_hold_total:
             lines.append("[#f0c45a][b]On hold[/b][/]")
             on_hold_items = data.task_buckets.get("on_hold", [])[:2]
+            # #1542 \u2014 pre-compute the panel-text budget so continuation
+            # lines under each on-hold bullet keep the bullet-aligned
+            # indent. The previous version let Textual soft-wrap the
+            # raw string, which dropped continuation rows back to
+            # column 0 and read as a malformed indent on long
+            # descriptions (and chopped the actionable "Decide
+            # whether to approve\u2026" line mid-clause).
+            wrap_width = self._inbox_text_width()
             if on_hold_items:
+                # Lift the actionable "Decision" line *above* the
+                # description so it can never be the part overflow
+                # eats. This is the smaller of the two issue-suggested
+                # directions (the other being a "(press i for full)"
+                # hint), and it also dodges the need for an ellipsis
+                # affordance \u2014 the actionable line is now first, not
+                # last. The literal ``Decision:`` token is also what
+                # the release-invariants action-copy gate looks for
+                # when classifying on-hold-only dashboards as having
+                # usable action copy (see scripts/release_invariants
+                # ``_dashboard_body_has_action_copy``).
+                lines.append(
+                    "  [#f0c45a][b]Decision:[/b][/] [dim]approve, "
+                    "split, or provide missing access. Detail "
+                    "below.[/dim]"
+                )
                 lines.append(
                     "  [dim]These are the root holds keeping downstream "
                     "work waiting.[/dim]"
@@ -16509,20 +16654,41 @@ class PollyProjectDashboardApp(App[None]):
                     lines.append(f"  [#f0c45a]\u25c6[/#f0c45a] [b]{num_part}{title}[/b]")
                     summary = _escape(item.get("summary") or "")
                     if summary:
-                        lines.append(f"    {summary}")
-                    for idx, step in enumerate(item.get("steps") or [], start=1):
-                        lines.append(
-                            f"    [dim]{idx}.[/dim] {_escape(str(step))}"
+                        # Hard-wrap so the second + later lines still
+                        # carry the bullet-aligned 4-space indent.
+                        lines.extend(
+                            _wrap_with_hanging_indent(
+                                summary, indent="    ", width=wrap_width,
+                            )
                         )
-                lines.append(
-                    "  [dim]Decide whether to approve the scoped code "
-                    "delivery, split operational acceptance, or provide the "
-                    "missing access/credentials.[/dim]"
-                )
+                    for idx, step in enumerate(item.get("steps") or [], start=1):
+                        prefix = f"    [dim]{idx}.[/dim] "
+                        # Step rows pre-pend ``[dim]N.[/dim]``; wrap
+                        # continuation lines on a 7-char-aligned indent
+                        # so they sit under the step text rather than
+                        # under the number.
+                        step_text = _escape(str(step))
+                        wrapped = _wrap_with_hanging_indent(
+                            step_text, indent="    " + "   ",
+                            width=wrap_width,
+                        ) or [""]
+                        first, rest = wrapped[0], wrapped[1:]
+                        # Replace the leading indent on the first line
+                        # with the numbered prefix so ``1. step body``
+                        # aligns with ``2. step body`` continuation.
+                        if first:
+                            first_text = first.lstrip()
+                            lines.append(f"{prefix}{first_text}")
+                        for line in rest:
+                            lines.append(line)
             else:
-                lines.append(
-                    "  [dim]No user inbox action is requested yet. Open Tasks "
-                    "for the held work item and resume it when appropriate.[/dim]"
+                lines.extend(
+                    _wrap_with_hanging_indent(
+                        "No user inbox action is requested yet. Open Tasks "
+                        "for the held work item and resume it when "
+                        "appropriate.",
+                        indent="  ", width=wrap_width, wrap_markup="dim",
+                    )
                 )
             lines.append("")
 

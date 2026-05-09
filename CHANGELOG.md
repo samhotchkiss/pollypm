@@ -13,6 +13,17 @@ Added, Changed, and Removed.
   "N alerts" to "N needs action" so it no longer disagrees with `pm
   alerts`, which lists every open alert (including operational
   heartbeat noise the dashboard intentionally filters out). #999.
+- Project dashboard banner uses the configured PM persona (Archie,
+  Cole, ...) consistently. The "no plan yet" state reframes from the
+  red `◆ alert` framing to a soft `◇ next step` and reads
+  `Press c to plan this with <PM>`; the calm-project banner replaces
+  the syslog-style `architect_bikepath (architect) is alive but
+  standing by — no task in flight` with `<PM> is here when you need
+  them. Press c to chat or p to plan.`. The footer hides `p plan`
+  for projects with no plan on disk so the keystroke doesn't lead to
+  an empty surface. The topbar omits the `PM:` meta entirely when no
+  persona is configured (vs the old `PM: Project PM` placeholder).
+  #1540 #1541 #1542.
 
 ## [1.0.0] - 2026-04-20
 

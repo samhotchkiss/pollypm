@@ -607,6 +607,27 @@ class TestStaleAlertGuardIntact:
             "missing from _sweep_stale_alerts."
         )
 
+    def test_supervisor_sweep_stale_alerts_skips_plan_missing(self):
+        """``Supervisor._sweep_stale_alerts`` (#1526) must skip
+        ``plan_missing`` alerts. They are emitted by the task_assignment
+        sweep on the synthetic ``plan_gate-<project>`` session name,
+        which is intentionally never in the launch plan. Regressing
+        this guard re-introduces the #1524 banner flash: the heartbeat
+        closes the alert every tick and the task_assignment sweep
+        re-emits it ~30s later.
+        """
+        from pollypm import supervisor as supervisor_mod
+        import inspect
+
+        source = inspect.getsource(supervisor_mod.Supervisor._sweep_stale_alerts)
+
+        assert 'alert_type == "plan_missing"' in source, (
+            "#1526 guard for plan_missing alert_type missing from "
+            "_sweep_stale_alerts — the task_assignment sweep is the sole "
+            "owner of these alerts and must keep clearing them itself. "
+            "Without this guard the #1524 banner flash returns."
+        )
+
 
 # ---------------------------------------------------------------------------
 # #953 — approve clears the per-task no_session alert on review-exit

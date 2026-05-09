@@ -2584,9 +2584,21 @@ class Supervisor:
                 # produced a false-clean: open on the first sweep,
                 # cleared on the second even though no worker
                 # process exists. Leave them alone.
+                #
+                # #1526 — ``plan_missing`` has the same shape: the
+                # task_assignment sweep emits it on a synthetic
+                # ``plan_gate-<project>`` session that is intentionally
+                # never in the launch plan. Without this exclusion the
+                # heartbeat closes the alert on every tick and the
+                # task_assignment sweep re-emits it ~30s later, producing
+                # the #1524 banner flash that #1525's Part A precompute
+                # could not reach (the precompute fixed the *owning*
+                # sweep's clear path; this generic stale-alert sweep is
+                # the unrelated second closer).
                 if (
                     alert_type == "no_session"
                     or alert_type.startswith("no_session_for_assignment:")
+                    or alert_type == "plan_missing"
                 ):
                     continue
                 if session_name in tracked:

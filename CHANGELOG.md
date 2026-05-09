@@ -8,6 +8,12 @@ Added, Changed, and Removed.
 
 ## [Unreleased]
 
+### Added
+- Web API implementation tracker: Phase 1 (#1547), Phase 2 (#1548), and
+  Phase 3 (#1549) of the design spec landed in #1438. Phase 1 ships the
+  `pm serve` CLI, `pm api regen-token` token rotation, bearer auth, all
+  read endpoints, and the Server-Sent Events activity stream.
+
 ### Changed
 - Cockpit Home dashboard header relabels the curated alert count from
   "N alerts" to "N needs action" so it no longer disagrees with `pm

@@ -44,6 +44,11 @@ _PRODUCT_BROKEN_BYPASS_LABELS: frozenset[str] = frozenset({
 _PRODUCT_STATE_CACHE: dict[tuple[str, int], "Any | None"] = {}
 
 
+# Sentinel that distinguishes "we checked and the workspace is
+# healthy" from "no row yet" in the cache.
+_PRODUCT_STATE_SENTINEL_HEALTHY = object()
+
+
 def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
     """Raise :class:`ProductBrokenError` when workspace product_state=='broken'.
 
@@ -52,19 +57,27 @@ def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
     silently so unit tests that exercise the work-service in isolation
     aren't perturbed. Tasks tagged with any of the bypass labels (the
     watchdog's own dispatch path needs to keep working) skip the gate.
+
+    Reads the workspace_state row via raw sqlite3 (read-only URI) to
+    avoid the ``StateStore`` init cost — the gate is in the hot path
+    of every ``create_task`` call and a 1+ GB workspace state.db
+    can spend tens of ms on the schema-replay + pragma dance the
+    StateStore constructor walks. We only need a single SELECT here.
     """
     label_set = {str(label) for label in (labels or []) if label}
     if label_set & _PRODUCT_BROKEN_BYPASS_LABELS:
         return
     try:
+        import sqlite3
         from pathlib import Path
 
         from pollypm.config import DEFAULT_CONFIG_PATH, load_config
         from pollypm.storage.product_state import (
+            PRODUCT_STATE_BROKEN,
+            PRODUCT_STATE_KEY,
             ProductBrokenError,
-            is_product_broken,
+            ProductState,
         )
-        from pollypm.storage.state import StateStore
     except Exception:  # noqa: BLE001
         return
     try:
@@ -94,33 +107,70 @@ def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
     if cached is not None and cached is not _PRODUCT_STATE_SENTINEL_HEALTHY:
         raise ProductBrokenError(cached)
 
-    store: Any | None = None
+    # Direct sqlite read — cheaper than StateStore for the hot path.
+    # Read-only URI mode + immutable=1 lets us peek at a multi-GB DB
+    # without any pragma replay or schema-creation overhead.
+    raw_value: str | None = None
     try:
-        store = StateStore(db_path, readonly=True)
-        broken = is_product_broken(store)
-    except Exception:  # noqa: BLE001
-        return
-    finally:
-        if store is not None:
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001
-                pass
-    # Cache the result so subsequent create_task calls don't pay the
-    # StateStore open cost. Keep the cache bounded by clearing older
-    # entries whenever a new mtime lands for the same path.
-    _PRODUCT_STATE_CACHE.clear()
-    if broken is None:
+        conn = sqlite3.connect(
+            f"file:{db_path}?mode=ro&immutable=1", uri=True,
+        )
+    except sqlite3.Error:
+        # File exists but can't open — record sentinel-healthy so we
+        # don't keep retrying.
+        _PRODUCT_STATE_CACHE.clear()
         _PRODUCT_STATE_CACHE[cache_key] = _PRODUCT_STATE_SENTINEL_HEALTHY
         return
+    try:
+        try:
+            cur = conn.execute(
+                "SELECT value_json FROM workspace_state WHERE key = ?",
+                (PRODUCT_STATE_KEY,),
+            )
+            row = cur.fetchone()
+        except sqlite3.Error:
+            # Table missing (pre-#1546 DB layout) — treat as healthy.
+            _PRODUCT_STATE_CACHE.clear()
+            _PRODUCT_STATE_CACHE[cache_key] = _PRODUCT_STATE_SENTINEL_HEALTHY
+            return
+        if row is not None:
+            raw_value = row[0]
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
+
+    if raw_value is None:
+        _PRODUCT_STATE_CACHE.clear()
+        _PRODUCT_STATE_CACHE[cache_key] = _PRODUCT_STATE_SENTINEL_HEALTHY
+        return
+    try:
+        payload = json.loads(raw_value)
+    except (TypeError, ValueError):
+        _PRODUCT_STATE_CACHE.clear()
+        _PRODUCT_STATE_CACHE[cache_key] = _PRODUCT_STATE_SENTINEL_HEALTHY
+        return
+    if not isinstance(payload, dict):
+        _PRODUCT_STATE_CACHE.clear()
+        _PRODUCT_STATE_CACHE[cache_key] = _PRODUCT_STATE_SENTINEL_HEALTHY
+        return
+    state = payload.get("state")
+    if state != PRODUCT_STATE_BROKEN:
+        _PRODUCT_STATE_CACHE.clear()
+        _PRODUCT_STATE_CACHE[cache_key] = _PRODUCT_STATE_SENTINEL_HEALTHY
+        return
+    broken = ProductState(
+        state=str(state),
+        reason=str(payload.get("reason") or ""),
+        set_at=str(payload.get("set_at") or ""),
+        set_by=str(payload.get("set_by") or ""),
+        forensics_path=str(payload.get("forensics_path") or ""),
+        extra=dict(payload.get("extra") or {}),
+    )
+    _PRODUCT_STATE_CACHE.clear()
     _PRODUCT_STATE_CACHE[cache_key] = broken
     raise ProductBrokenError(broken)
-
-
-# Sentinel that distinguishes "we checked and the workspace is
-# healthy" from "no row yet" in the cache. Using ``object()`` keeps
-# it identity-comparable and avoids confusing isinstance checks.
-_PRODUCT_STATE_SENTINEL_HEALTHY = object()
 
 
 def create_task(

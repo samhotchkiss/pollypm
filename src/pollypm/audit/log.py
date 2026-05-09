@@ -70,6 +70,16 @@ EVENT_SOCKET_REAPED = "socket.reaped"
 # can quantify how often the field machine is accumulating sibling
 # daemons without scraping ``rail_daemon.log``.
 EVENT_DAEMON_REAPED = "daemon.reaped"
+# #1546-followup — emitted by ``rail_daemon_supervisor`` when the
+# layer-2 watchdog (cockpit periodic timer or ``pm heartbeat`` cron
+# path) detects a dead/stuck rail daemon and respawns it. Carries
+# ``role`` (``"rail"``), ``state`` (the diagnose decision label),
+# ``previous_pid``, ``last_tick_age_s``, ``revived``, ``spawn_error``,
+# and ``kill_signal``. Lets operators quantify how often the layer-2
+# supervisor catches a dead daemon — chronic revivals indicate a real
+# problem (OOM, leak, crash-loop) that needs investigation, not just
+# trust in the supervisor.
+EVENT_DAEMON_REVIVED = "daemon.revived"
 # #1398 — plan task evolution. ``plan.version_incremented`` fires when
 # a plan task is refined in place (same task_id, version bump);
 # ``plan.successor_created`` fires when a replan creates a new task
@@ -486,6 +496,8 @@ __all__ = [
     "EVENT_WATCHDOG_TIER3_DISPATCH_FAILED",
     "EVENT_WATCHDOG_WORKER_LANE_SPAWNED",
     "EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED",
+    "EVENT_DAEMON_REAPED",
+    "EVENT_DAEMON_REVIVED",
     "AuditEvent",
     "central_log_path",
     "emit",

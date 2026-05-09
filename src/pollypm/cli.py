@@ -1088,6 +1088,44 @@ def _spawn_rail_daemon(config_path: Path) -> None:
         )
 
 
+#: Module-level state for the cron-path rail-daemon liveness check.
+#: Persists across the (short-lived) ``pm heartbeat`` invocation only —
+#: cron spawns a fresh process every minute, so this never accumulates
+#: a stale value. Cockpit's analogous state lives on the App instance.
+_LAST_CRON_RAIL_REVIVAL_AT = None
+
+
+def _revive_rail_daemon_if_dead(config_path: Path) -> None:
+    """Spawn a fresh rail daemon when the existing one is dead/stuck.
+
+    Called from the ``pm heartbeat`` cron path as defense-in-depth.
+    The cockpit's periodic timer is the primary supervisor; this is
+    the second layer that fires even when the cockpit is itself dead.
+
+    Best-effort. Swallows all exceptions so a crashed liveness check
+    never breaks the heartbeat sweep that follows.
+    """
+    global _LAST_CRON_RAIL_REVIVAL_AT
+    try:
+        from pollypm.rail_daemon_supervisor import revive_if_needed
+        from pollypm.config import load_config
+
+        cfg = load_config(config_path)
+        pid_path = _rail_daemon_pid_path()
+        result = revive_if_needed(
+            config_path=config_path,
+            state_db_path=cfg.project.state_db,
+            pid_path=pid_path,
+            last_revival_at=_LAST_CRON_RAIL_REVIVAL_AT,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    if result.revived:
+        from datetime import UTC, datetime as _dt
+
+        _LAST_CRON_RAIL_REVIVAL_AT = _dt.now(UTC)
+
+
 def _spawn_phantom_client(session_name: str) -> bool:
     """Spawn a detached pty-backed ``tmux attach`` client to keep the
     cockpit's input loop alive when no real terminal is attached (#1109).

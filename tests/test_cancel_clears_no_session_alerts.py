@@ -628,6 +628,78 @@ class TestStaleAlertGuardIntact:
             "Without this guard the #1524 banner flash returns."
         )
 
+    def test_prune_sessions_skips_synthetic_alert_scopes(self, tmp_path):
+        """``StateStore.prune_sessions`` (#1528) must NOT close alerts
+        whose ``sender`` is one of the synthetic-scope alert types
+        owned by the task_assignment sweep (``plan_missing`` /
+        ``no_session`` / ``no_session_for_assignment:*``). These alerts
+        live on synthetic session scopes (``plan_gate-<project>``,
+        ``worker-<project>``, ``task_assignment``) that are
+        intentionally never in the launch plan's
+        ``valid_session_names`` — the existing prune SQL would close
+        them on every reconciliation tick, which was the third closer
+        behind the #1524 banner flash.
+        """
+        from pollypm.storage.state import StateStore
+
+        store = StateStore(tmp_path / "prune.db")
+        store.upsert_alert(
+            "plan_gate-coffeeboardnm",
+            "plan_missing",
+            "warn",
+            "no plan",
+        )
+        store.upsert_alert(
+            "task_assignment",
+            "no_session_for_assignment:coffeeboardnm/29",
+            "warn",
+            "no worker",
+        )
+        store.upsert_alert(
+            "worker-coffeeboardnm",
+            "no_session",
+            "warn",
+            "no worker session",
+        )
+        # Sanity: a non-synthetic alert we WANT pruned still gets
+        # closed when its scope isn't in valid_session_names.
+        store.upsert_alert(
+            "ghost-session",
+            "pane_dead",
+            "warn",
+            "ghost",
+        )
+
+        before = {
+            (a.session_name, a.alert_type) for a in store.open_alerts()
+        }
+        assert ("plan_gate-coffeeboardnm", "plan_missing") in before
+        assert ("ghost-session", "pane_dead") in before
+
+        # Prune to a set that excludes ALL the scopes above. Without
+        # the #1528 exclusion this would close every alert.
+        store.prune_sessions({"some-real-session"})
+
+        after = {
+            (a.session_name, a.alert_type) for a in store.open_alerts()
+        }
+        assert ("plan_gate-coffeeboardnm", "plan_missing") in after, (
+            "#1528: plan_missing alert should outlive prune_sessions"
+        )
+        assert (
+            "task_assignment",
+            "no_session_for_assignment:coffeeboardnm/29",
+        ) in after, (
+            "#1528: no_session_for_assignment:* alert should outlive "
+            "prune_sessions"
+        )
+        assert ("worker-coffeeboardnm", "no_session") in after, (
+            "#1528: no_session alert should outlive prune_sessions"
+        )
+        assert ("ghost-session", "pane_dead") not in after, (
+            "Ghost alerts on real-but-removed sessions still get pruned"
+        )
+
 
 # ---------------------------------------------------------------------------
 # #953 — approve clears the per-task no_session alert on review-exit

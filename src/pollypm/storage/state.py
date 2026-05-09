@@ -1203,6 +1203,16 @@ class StateStore:
                 f"DELETE FROM leases WHERE session_name NOT IN ({placeholders})",
                 params,
             )
+            # #1528 — synthetic alert scopes (``plan_gate-<project>``
+            # for ``plan_missing``; ``task_assignment`` /
+            # ``worker-<project>`` for ``no_session*``) intentionally are
+            # not in the launch plan's ``valid_session_names``. The
+            # task_assignment sweep is the sole owner of these alerts;
+            # closing them here on every session-prune tick was the
+            # third closer behind the #1524 banner flash, hidden behind
+            # ``_sweep_stale_alerts`` (#1526) and the post-sweep clear
+            # (#1525). Keep them open so the owning sweep can refresh
+            # or clear them on its own cadence.
             self.execute(
                 f"""
                 UPDATE messages
@@ -1210,6 +1220,8 @@ class StateStore:
                 WHERE type = 'alert'
                   AND state = 'open'
                   AND scope NOT IN ({placeholders})
+                  AND sender NOT IN ('plan_missing', 'no_session')
+                  AND sender NOT LIKE 'no_session_for_assignment:%'
                 """,
                 (now, now, *sorted(valid_session_names)),
             )
@@ -1231,11 +1243,16 @@ class StateStore:
         else:
             self.execute("DELETE FROM sessions")
             self.execute("DELETE FROM leases")
+            # #1528 — same exclusion as the populated branch above:
+            # synthetic-scope alerts owned by the task_assignment sweep
+            # must outlive a no-session-tracked tick.
             self.execute(
                 """
                 UPDATE messages
                 SET state = 'closed', closed_at = ?, updated_at = ?
                 WHERE type = 'alert' AND state = 'open'
+                  AND sender NOT IN ('plan_missing', 'no_session')
+                  AND sender NOT LIKE 'no_session_for_assignment:%'
                 """,
                 (now, now),
             )

@@ -17425,7 +17425,7 @@ class PollyProjectDashboardApp(App[None]):
             # names the task and the action bar still lets the user
             # approve / reject / chat.
             if not self._plan_view_mode:
-                self.action_open_plan()
+                self.action_open_plan(force=True)
             self.notify(
                 "Plan task is done but no markdown plan file is on "
                 "disk — opening the review surface anyway. Check the "
@@ -17446,16 +17446,23 @@ class PollyProjectDashboardApp(App[None]):
                 severity="information", timeout=4.0,
             )
 
-    def action_open_plan(self) -> None:
+    def action_open_plan(self, *, force: bool = False) -> None:
         """Toggle plan-view mode — plan.md takes over the body.
 
         When no plan exists, friendly-notify instead of flipping a mode
         with nothing to show. Project-local ``[planner].enforce_plan
         = false`` projects get a different toast that surfaces the
         explicit bypass rather than nudging as if a plan is missing.
+
+        ``force=True`` (used by ``action_review_plan`` after #1533) skips
+        the no-plan-file early-bail so a plan task that lives somewhere
+        other than the canonical markdown locations (HTML deliverable,
+        external URL, task description as plan summary) still gets the
+        plan-view surface — which now renders the task description +
+        deliverable URL when no markdown is on disk.
         """
         data = self.data
-        if data is None or data.plan_path is None:
+        if not force and (data is None or data.plan_path is None):
             if data is not None and not getattr(data, "enforce_plan", True):
                 self.notify(
                     "Plan not required for this project "
@@ -17467,6 +17474,8 @@ class PollyProjectDashboardApp(App[None]):
                     "No plan file yet for this project.",
                     severity="warning", timeout=2.0,
                 )
+            return
+        if data is None:
             return
         self._plan_view_mode = not self._plan_view_mode
         other_section_ids = (

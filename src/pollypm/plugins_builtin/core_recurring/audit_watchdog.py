@@ -1705,6 +1705,764 @@ def _create_operator_inbox_task(
 
 
 # ---------------------------------------------------------------------------
+# Tier-4 operator dispatch (#1553 broader-authority leg)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_workspace_state_db_path() -> Path | None:
+    """Return the canonical workspace state.db path or ``None`` on failure.
+
+    The tier-4 tracker needs the workspace-wide DB (not the per-project
+    one) because promotion accounting spans projects. We resolve it via
+    the same ``_resolve_db_path`` helper the tier-3 inbox writer uses,
+    asking for ``project=None`` to land on the workspace DB.
+    """
+    try:
+        from pollypm.work.cli import _resolve_db_path
+        return _resolve_db_path(".pollypm/state.db", project=None)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "tier4: workspace state.db resolve failed", exc_info=True,
+        )
+        return None
+
+
+def _build_tier4_tracker() -> Any | None:
+    """Construct a :class:`Tier4PromotionTracker` against the workspace DB."""
+    try:
+        from pollypm.audit.tier4 import Tier4PromotionTracker
+    except ImportError:  # pragma: no cover — defensive
+        return None
+    db_path = _resolve_workspace_state_db_path()
+    if db_path is None:
+        return None
+    return Tier4PromotionTracker(db_path)
+
+
+def _send_tier4_global_action_push(
+    *,
+    title: str,
+    body: str,
+) -> bool:
+    """Fire a desktop notification for a tier-4 system-scoped action.
+
+    Best-effort. Returns True iff at least one notifier accepted the
+    payload. Used by :func:`emit_tier4_global_action` so every
+    ``audit.tier4_global_action`` row is paired with a louder signal
+    to Sam (per the spec). Failure is silent — the audit row is the
+    durable signal; the desktop ping is the louder one.
+    """
+    try:
+        from pollypm.error_notifications import (
+            LinuxNotifySendNotifier,
+            MacOsDesktopNotifier,
+        )
+    except ImportError:
+        return False
+    delivered = False
+    for notifier in (MacOsDesktopNotifier(), LinuxNotifySendNotifier()):
+        try:
+            if not notifier.is_available():
+                continue
+            notifier.notify(title=title, body=body[:280])
+            delivered = True
+        except Exception:  # noqa: BLE001
+            continue
+    return delivered
+
+
+def _create_operator_tier4_inbox_task(
+    *,
+    project_key: str,
+    project_path: Path | None,
+    subject: str,
+    body: str,
+    dedup_key: str,
+) -> str | None:
+    """Materialise the tier-4 operator inbox task.
+
+    Mirrors :func:`_create_operator_inbox_task` exactly except for the
+    label set: tier-4 cards carry ``"tier4"`` so the cockpit / Polly's
+    inbox query can distinguish them. Reuses the same enqueue + create
+    plumbing so the inbox surface stays unified — only the prompt + the
+    label set differ.
+    """
+    from pollypm.inbox_dedup import (
+        bump_dedup_message,
+        find_open_dedup_message,
+        initial_dedup_payload,
+    )
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.work import create_work_service
+    from pollypm.work.cli import _resolve_db_path
+
+    db_path = _resolve_db_path(".pollypm/state.db", project=project_key)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    payload = {
+        "actor": "audit_watchdog",
+        "project": project_key,
+        "milestone_key": None,
+        "requester": "user",
+        "tier": "4",
+    }
+    try:
+        existing = find_open_dedup_message(
+            store, dedup_key, recipient="user",
+        ) if dedup_key else None
+        if existing is not None:
+            message_id = bump_dedup_message(
+                store,
+                existing,
+                subject=subject,
+                body=body,
+                payload={**payload, "dedup_key": dedup_key},
+                labels=["notify", "watchdog", "tier4"],
+                tier="immediate",
+            )
+        else:
+            seeded_payload = (
+                initial_dedup_payload(payload, dedup_key)
+                if dedup_key else payload
+            )
+            message_id = store.enqueue_message(
+                type="notify",
+                tier="immediate",
+                recipient="user",
+                sender="audit_watchdog",
+                subject=subject,
+                body=body,
+                scope=project_key,
+                labels=["notify", "watchdog", "tier4"],
+                payload=seeded_payload,
+                state="closed",
+            )
+    finally:
+        store.close()
+
+    svc = create_work_service(
+        db_path=db_path,
+        project_path=db_path.parent.parent,
+    )
+    try:
+        task_labels = [
+            "notify",
+            "watchdog",
+            "tier4",
+            f"notify_message:{message_id}",
+        ]
+        task = svc.create(
+            title=subject,
+            description=body,
+            type="task",
+            project=project_key,
+            flow_template="chat",
+            roles={
+                "requester": "user",
+                "operator": "user",
+            },
+            priority="high",
+            created_by="audit_watchdog",
+            labels=task_labels,
+        )
+        inbox_task_id = task.task_id
+        store2 = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            store2.update_message(
+                message_id,
+                payload={**payload, "task_id": inbox_task_id},
+            )
+        finally:
+            store2.close()
+        return inbox_task_id
+    finally:
+        svc.close()
+
+
+def _build_tier4_body(
+    finding: Finding,
+    *,
+    root_cause_hash_value: str,
+    promotion_path: str,
+    tracker: Any,
+    justification: str = "",
+) -> str:
+    """Compose the tier-4 dispatch body.
+
+    Layout:
+
+        TIER 4 BROADER AUTHORITY DISPATCH
+        <runtime block: hash, promotion path, budget, threshold>
+        <authority section from tier4_authority.md>
+
+        --- Finding ---
+        <tier_handoff_prompt(evidence, question)>
+
+        <self-promote justification, if any>
+
+    The handoff prompt is structured-evidence + a question (the
+    helper refuses solution-menu shapes). The authority section is
+    static markdown spliced from disk. The runtime block lets Polly
+    quote the live constants back without re-reading the spec.
+    """
+    from pollypm.agents.tier4_authority import render_tier4_authority_section
+
+    auth = render_tier4_authority_section(
+        root_cause_hash_value=root_cause_hash_value,
+        promotion_path=promotion_path,
+        budget_seconds=getattr(tracker, "tier4_budget_seconds", 7200),
+        auto_promote_threshold=getattr(tracker, "auto_promote_threshold", 3),
+        auto_promote_window_seconds=getattr(
+            tracker, "auto_promote_window_seconds", 86400,
+        ),
+    )
+    question = (
+        f"Project {finding.project} is in tier-4 broader-authority mode "
+        f"(promotion_path={promotion_path}, root_cause_hash="
+        f"{root_cause_hash_value}). What action do you take, within the "
+        f"integrity rules above?"
+    )
+    try:
+        handoff = tier_handoff_prompt(finding.evidence or {}, question)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "tier4: tier_handoff_prompt raised for %s/%s",
+            finding.rule, finding.project, exc_info=True,
+        )
+        handoff = finding.message or finding.rule
+
+    parts: list[str] = [
+        "TIER 4 BROADER AUTHORITY DISPATCH",
+        "",
+        auth,
+        "",
+        "--- Finding ---",
+        handoff,
+    ]
+    if justification:
+        parts.append("")
+        parts.append("--- Self-promote justification ---")
+        parts.append(justification.strip())
+    return "\n".join(parts)
+
+
+def _emit_tier4_promoted(
+    finding: Finding,
+    *,
+    root_cause_hash_value: str,
+    promotion_path: str,
+    project_path: Path | None,
+    justification: str = "",
+) -> None:
+    """Emit ``audit.tier4_promoted``. Best-effort; never raises."""
+    from pollypm.audit.log import EVENT_TIER4_PROMOTED
+    from pollypm.audit.log import emit as _audit_emit
+
+    try:
+        _audit_emit(
+            event=EVENT_TIER4_PROMOTED,
+            project=finding.project,
+            subject=finding.subject,
+            actor="audit_watchdog",
+            status="warn",
+            metadata={
+                "finding_type": finding.rule,
+                "subject": finding.subject,
+                "root_cause_hash": root_cause_hash_value,
+                "promotion_path": promotion_path,
+                "justification": justification,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("tier4: emit_tier4_promoted failed", exc_info=True)
+
+
+def _emit_tier4_dispatched(
+    finding: Finding,
+    *,
+    root_cause_hash_value: str,
+    promotion_path: str,
+    inbox_task_id: str | None,
+    dedup_key: str,
+    project_path: Path | None,
+) -> None:
+    """Emit ``watchdog.operator_tier4_dispatched``."""
+    from pollypm.audit.log import EVENT_WATCHDOG_OPERATOR_TIER4_DISPATCHED
+    from pollypm.audit.log import emit as _audit_emit
+
+    try:
+        _audit_emit(
+            event=EVENT_WATCHDOG_OPERATOR_TIER4_DISPATCHED,
+            project=finding.project,
+            subject=finding.subject,
+            actor="audit_watchdog",
+            status="warn",
+            metadata={
+                "finding_type": finding.rule,
+                "subject": finding.subject,
+                "root_cause_hash": root_cause_hash_value,
+                "promotion_path": promotion_path,
+                "inbox_task_id": inbox_task_id or "",
+                "dedup_key": dedup_key,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("tier4: emit_tier4_dispatched failed", exc_info=True)
+
+
+def _dispatch_to_operator_tier4(
+    finding: Finding,
+    *,
+    project_path: Path | None,
+    now: datetime,
+    promotion_path: str,
+    justification: str = "",
+    tracker: Any | None = None,
+) -> str:
+    """Tier-4 dispatch: route a finding to broader-authority Polly.
+
+    Symmetric to :func:`_maybe_dispatch_to_operator` but loads the
+    tier-4 authority section into the body and tags the inbox row
+    with ``tier4`` so Polly's inbox query can distinguish it.
+
+    Status codes (per-project counters):
+    * ``"throttled"`` — tier-4 already active for this hash; let the
+      existing run finish or budget-exhaust before re-dispatching.
+    * ``"dispatched"`` — promotion + inbox + audit all wrote.
+    * ``"send_failed"`` — promotion recorded, inbox write raised.
+
+    The caller (auto-promote branch in ``_scan_one_project`` OR the
+    self-promote CLI) decides whether to call this; it does not gate
+    on ``_OPERATOR_DISPATCHABLE_RULES`` because tier-4 dispatch is
+    promotion-driven, not rule-driven.
+    """
+    from pollypm.audit.tier4 import root_cause_hash
+
+    if tracker is None:
+        tracker = _build_tier4_tracker()
+    if tracker is None:
+        # Tracker unavailable means we can't enforce promotion / budget,
+        # which means we can't safely dispatch at tier-4. Fall back to
+        # tier-3 — the caller can detect this and re-route.
+        return "send_failed"
+
+    rch = root_cause_hash(finding)
+    existing = tracker.get(rch)
+    # Don't re-promote into an active tier-4 run. The cadence handler's
+    # budget-enforcement sweep will demote the existing run when its
+    # budget exhausts; until then, dispatch is throttled to avoid
+    # multi-promote interleaving.
+    if existing is not None and existing.tier4_active:
+        return "throttled"
+
+    # Record the promotion before the inbox write so the audit log + the
+    # tracker reflect the promotion even if the inbox write fails.
+    tracker.record_promotion(
+        finding,
+        now=now,
+        promotion_path=promotion_path,
+        justification=justification,
+    )
+    _emit_tier4_promoted(
+        finding,
+        root_cause_hash_value=rch,
+        promotion_path=promotion_path,
+        project_path=project_path,
+        justification=justification,
+    )
+
+    body = _build_tier4_body(
+        finding,
+        root_cause_hash_value=rch,
+        promotion_path=promotion_path,
+        tracker=tracker,
+        justification=justification,
+    )
+    dedup_key = f"watchdog-operator-tier4:{finding.rule}:{finding.project}:{rch}"
+    subject_text = (
+        finding.message
+        or f"watchdog tier4: {finding.rule} on {finding.project}"
+    )[:200]
+
+    inbox_task_id: str | None = None
+    _emit_tier4_dispatched(
+        finding,
+        root_cause_hash_value=rch,
+        promotion_path=promotion_path,
+        inbox_task_id=None,
+        dedup_key=dedup_key,
+        project_path=project_path,
+    )
+    try:
+        inbox_task_id = _create_operator_tier4_inbox_task(
+            project_key=finding.project,
+            project_path=project_path,
+            subject=subject_text,
+            body=body,
+            dedup_key=dedup_key,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "tier4: inbox write failed for %s/%s",
+            finding.rule, finding.project, exc_info=True,
+        )
+        return "send_failed"
+    if inbox_task_id is None:
+        return "send_failed"
+    _emit_tier4_dispatched(
+        finding,
+        root_cause_hash_value=rch,
+        promotion_path=promotion_path,
+        inbox_task_id=inbox_task_id,
+        dedup_key=dedup_key,
+        project_path=project_path,
+    )
+    return "dispatched"
+
+
+def emit_tier4_action(
+    *,
+    project: str,
+    action: str,
+    root_cause_hash_value: str,
+    actor: str = "polly",
+    metadata: dict[str, Any] | None = None,
+    project_path: Path | None = None,
+) -> None:
+    """Emit ``audit.tier4_action`` for a project-scoped tier-4 action.
+
+    Public surface — Polly calls this (via a thin CLI wrapper or
+    direct import in helpers) when she takes a project-scoped action
+    under broadened authority. Best-effort; never raises.
+    """
+    from pollypm.audit.log import EVENT_TIER4_ACTION
+    from pollypm.audit.log import emit as _audit_emit
+
+    payload = dict(metadata or {})
+    payload["action"] = action
+    payload["root_cause_hash"] = root_cause_hash_value
+    try:
+        _audit_emit(
+            event=EVENT_TIER4_ACTION,
+            project=project,
+            subject=action,
+            actor=actor,
+            status="warn",
+            metadata=payload,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("emit_tier4_action failed", exc_info=True)
+
+
+def _emit_tier4_demoted(
+    *,
+    project: str,
+    root_cause_hash_value: str,
+    reason: str,
+    project_path: Path | None = None,
+) -> None:
+    """Emit ``audit.tier4_demoted``. Best-effort."""
+    from pollypm.audit.log import EVENT_TIER4_DEMOTED
+    from pollypm.audit.log import emit as _audit_emit
+
+    try:
+        _audit_emit(
+            event=EVENT_TIER4_DEMOTED,
+            project=project,
+            subject=root_cause_hash_value,
+            actor="audit_watchdog",
+            metadata={
+                "root_cause_hash": root_cause_hash_value,
+                "reason": reason,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("emit_tier4_demoted failed", exc_info=True)
+
+
+def _emit_tier4_budget_exhausted(
+    *,
+    project: str,
+    root_cause_hash_value: str,
+    elapsed_seconds: int,
+    budget_seconds: int,
+    urgent_handoff_subject: str,
+    project_path: Path | None = None,
+) -> None:
+    """Emit ``audit.tier4_budget_exhausted``. Best-effort."""
+    from pollypm.audit.log import EVENT_TIER4_BUDGET_EXHAUSTED
+    from pollypm.audit.log import emit as _audit_emit
+
+    try:
+        _audit_emit(
+            event=EVENT_TIER4_BUDGET_EXHAUSTED,
+            project=project,
+            subject=root_cause_hash_value,
+            actor="audit_watchdog",
+            status="error",
+            metadata={
+                "root_cause_hash": root_cause_hash_value,
+                "elapsed_seconds": int(elapsed_seconds),
+                "budget_seconds": int(budget_seconds),
+                "urgent_handoff_subject": urgent_handoff_subject,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("emit_tier4_budget_exhausted failed", exc_info=True)
+
+
+def _route_tier4_to_terminal(
+    *,
+    state: Any,
+    services: Any,
+    now: datetime,
+) -> bool:
+    """Route a tier-4 row past its budget to the terminal path.
+
+    Sets ``product_state=broken`` (idempotent) and creates an urgent
+    inbox handoff via :func:`build_urgent_human_handoff`. Returns True
+    iff the urgent handoff was successfully written; the caller still
+    flips ``tier4_active=0`` regardless because the budget is up.
+
+    Mock-able via the ``services`` argument: the StateStore + the inbox
+    sink both come from there so tests can pass a stub.
+    """
+    from pollypm.audit.tier4 import TIER4_BUDGET_SECONDS
+    from pollypm.audit.watchdog import build_urgent_human_handoff
+    from pollypm.storage.product_state import set_product_state_broken
+
+    elapsed = (
+        int((now - state.tier4_entered_at).total_seconds())
+        if state.tier4_entered_at else TIER4_BUDGET_SECONDS
+    )
+    forensics_path = (
+        f"~/.pollypm/audit/{state.project or 'workspace'}.jsonl"
+    )
+    hypothesis = (
+        f"Tier-4 broader-authority Polly worked on {state.project or 'workspace'}/"
+        f"{state.rule} for {elapsed}s without resolving the finding. "
+        f"The cascade is exhausted; Sam decides the next step."
+    )
+    handoff = build_urgent_human_handoff(
+        tried=[
+            f"Tier-3 Polly dispatched for rule={state.rule}",
+            f"Auto-promoted to tier-4 (root_cause_hash={state.root_cause_hash})",
+            "Tier-4 ran for the full wall-clock budget without clearing",
+        ],
+        failed=[
+            "Tier-4 broader-authority budget exhausted before resolution",
+        ],
+        hypothesis=hypothesis,
+        forensics_path=forensics_path,
+        project=state.project,
+        subject_hint=(
+            f"Tier-4 budget exhausted on {state.project or 'workspace'}/{state.rule}"
+        ),
+    )
+    # Set product_state=broken via the workspace state store. Best-effort.
+    state_store = getattr(services, "state_store", None)
+    try:
+        if state_store is not None:
+            set_product_state_broken(
+                state_store,
+                reason=(
+                    f"Tier-4 cascade exhausted on {state.project or 'workspace'}/"
+                    f"{state.rule}"
+                ),
+                forensics_path=forensics_path,
+                set_by="audit_watchdog",
+                extra={
+                    "root_cause_hash": state.root_cause_hash,
+                    "rule": state.rule,
+                    "project": state.project,
+                    "elapsed_seconds": elapsed,
+                },
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "tier4: set_product_state_broken raised", exc_info=True,
+        )
+
+    # Drop the urgent inbox row via the same plumbing the tier-3 leg uses.
+    msg_store = getattr(services, "msg_store", None)
+    if msg_store is None:
+        return False
+    try:
+        message_id = msg_store.enqueue_message(
+            type="notify",
+            tier="immediate",
+            recipient="user",
+            sender="audit_watchdog",
+            subject=handoff.subject,
+            body=handoff.body,
+            scope=state.project or "workspace",
+            labels=list(handoff.labels) + ["tier4-terminal"],
+            payload={
+                "actor": "audit_watchdog",
+                "project": state.project,
+                "root_cause_hash": state.root_cause_hash,
+                "tier": "terminal",
+                "forensics_path": handoff.forensics_path,
+            },
+            state="closed",
+        )
+        return bool(message_id)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "tier4: urgent handoff enqueue raised", exc_info=True,
+        )
+        return False
+
+
+def _sweep_tier4_budget_and_demotion(
+    *,
+    services: Any,
+    now: datetime,
+) -> dict[str, int]:
+    """Per-tick sweep — enforce wall-clock budget on every active tier-4 row.
+
+    For each row in ``tier4_promotion_state`` with ``tier4_active=1``:
+
+    * If ``now - tier4_entered_at`` >= budget → fire the terminal path:
+      emit ``audit.tier4_budget_exhausted``, route to product-broken +
+      urgent inbox via :func:`_route_tier4_to_terminal`, then demote.
+    * Otherwise leave the row alone — the dispatch path is responsible
+      for clearing on finding-resolution; future work can add explicit
+      finding-resolved detection here.
+
+    Returns counter increments to fold into the cadence totals.
+    """
+    counters: dict[str, int] = {
+        "tier4_budget_exhausted": 0,
+        "tier4_demoted_cleared": 0,
+    }
+    tracker = _build_tier4_tracker()
+    if tracker is None:
+        return counters
+    try:
+        active_rows = tracker.list_active()
+    except Exception:  # noqa: BLE001
+        logger.debug("tier4: list_active raised", exc_info=True)
+        return counters
+    for state in active_rows:
+        try:
+            if tracker.is_budget_exhausted(state.root_cause_hash, now=now):
+                elapsed = (
+                    int((now - state.tier4_entered_at).total_seconds())
+                    if state.tier4_entered_at else 0
+                )
+                _emit_tier4_budget_exhausted(
+                    project=state.project,
+                    root_cause_hash_value=state.root_cause_hash,
+                    elapsed_seconds=elapsed,
+                    budget_seconds=tracker.tier4_budget_seconds,
+                    urgent_handoff_subject=(
+                        f"Tier-4 budget exhausted on {state.project}/{state.rule}"
+                    ),
+                )
+                _route_tier4_to_terminal(
+                    state=state, services=services, now=now,
+                )
+                tracker.clear(
+                    state.root_cause_hash,
+                    now=now,
+                    reason="budget_exhausted",
+                )
+                counters["tier4_budget_exhausted"] += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "tier4: per-row sweep raised for %s",
+                state.root_cause_hash, exc_info=True,
+            )
+    return counters
+
+
+def clear_tier4_for_finding(
+    finding: Finding,
+    *,
+    now: datetime,
+    project_path: Path | None = None,
+    reason: str = "finding_cleared",
+) -> bool:
+    """Public helper — clear tier-4 state when a finding terminally resolves.
+
+    Used by callers that observe a finding go terminal-good (the
+    project recovered). Idempotent: returns False if no row was active
+    for the finding's root_cause_hash.
+    """
+    from pollypm.audit.tier4 import root_cause_hash
+
+    tracker = _build_tier4_tracker()
+    if tracker is None:
+        return False
+    rch = root_cause_hash(finding)
+    state = tracker.get(rch)
+    if state is None or not state.tier4_active:
+        return False
+    cleared = tracker.clear(rch, now=now, reason=reason)
+    if cleared:
+        _emit_tier4_demoted(
+            project=finding.project,
+            root_cause_hash_value=rch,
+            reason=reason,
+            project_path=project_path,
+        )
+    return cleared
+
+
+def emit_tier4_global_action(
+    *,
+    action: str,
+    root_cause_hash_value: str,
+    actor: str = "polly",
+    metadata: dict[str, Any] | None = None,
+    project_path: Path | None = None,
+    project: str = "",
+    push_title: str | None = None,
+    push_body: str | None = None,
+) -> bool:
+    """Emit ``audit.tier4_global_action`` AND fire a push notification.
+
+    The "louder audit signature" the spec calls out: every
+    system-scoped action under tier-4 authority pairs the audit row
+    with a desktop notification so Sam knows the system was bounced.
+    Returns True iff at least one notifier accepted the payload (for
+    test-side assertions). Audit emit is best-effort and isolated
+    from the push.
+    """
+    from pollypm.audit.log import EVENT_TIER4_GLOBAL_ACTION
+    from pollypm.audit.log import emit as _audit_emit
+
+    payload = dict(metadata or {})
+    payload["action"] = action
+    payload["root_cause_hash"] = root_cause_hash_value
+    payload["scope"] = "system"
+    try:
+        _audit_emit(
+            event=EVENT_TIER4_GLOBAL_ACTION,
+            project=project or "",
+            subject=action,
+            actor=actor,
+            status="warn",
+            metadata=payload,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("emit_tier4_global_action: emit failed", exc_info=True)
+
+    title = push_title or f"PollyPM tier-4: {action}"
+    body = push_body or (
+        f"Tier-4 Polly invoked system-scoped action `{action}`. "
+        f"root_cause_hash={root_cause_hash_value}."
+    )
+    return _send_tier4_global_action_push(title=title, body=body)
+
+
+# ---------------------------------------------------------------------------
 # State-DB-missing probe (#1546 tier-1)
 # ---------------------------------------------------------------------------
 
@@ -1813,6 +2571,12 @@ def _scan_one_project(
         "operator_dispatches_sent": 0,
         "operator_dispatches_throttled": 0,
         "operator_dispatches_failed": 0,
+        # #1553 — tier-4 dispatcher counters.
+        "tier4_dispatches_sent": 0,
+        "tier4_dispatches_throttled": 0,
+        "tier4_dispatches_failed": 0,
+        "tier4_demoted_cleared": 0,
+        "tier4_budget_exhausted": 0,
     }
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
@@ -1920,19 +2684,67 @@ def _scan_one_project(
         # operator inbox via ``_maybe_dispatch_to_operator``. The
         # dispatcher returns "skipped" for non-operator rules so the
         # architect leg below still runs for tier-2.
+        # #1553 — auto-promote: if the same root_cause_hash has hit
+        # tier-3 K times in 24h, route to tier-4 instead. The tracker
+        # is best-effort — failures fall back to tier-3 unchanged.
         if finding.rule in _OPERATOR_DISPATCHABLE_RULES:
-            op_outcome = _maybe_dispatch_to_operator(
-                finding,
-                project_path=project_path,
-                now=now,
-                config_path=config_path,
-            )
-            if op_outcome == "dispatched":
-                counters["operator_dispatches_sent"] += 1
-            elif op_outcome == "throttled":
-                counters["operator_dispatches_throttled"] += 1
-            elif op_outcome == "send_failed":
-                counters["operator_dispatches_failed"] += 1
+            tracker = _build_tier4_tracker()
+            promoted = False
+            if tracker is not None:
+                try:
+                    if tracker.should_auto_promote(finding, now=now):
+                        outcome = _dispatch_to_operator_tier4(
+                            finding,
+                            project_path=project_path,
+                            now=now,
+                            promotion_path="watchdog",
+                            tracker=tracker,
+                        )
+                        if outcome == "dispatched":
+                            counters["tier4_dispatches_sent"] += 1
+                            promoted = True
+                        elif outcome == "throttled":
+                            counters["tier4_dispatches_throttled"] += 1
+                            # Throttled means a tier-4 run is already
+                            # active for this hash — skip the tier-3
+                            # path so we don't double-dispatch.
+                            promoted = True
+                        elif outcome == "send_failed":
+                            counters["tier4_dispatches_failed"] += 1
+                            # Fall through to tier-3 so we don't drop
+                            # the dispatch entirely.
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "tier4: auto-promote check raised for %s/%s",
+                        finding.rule, finding.project, exc_info=True,
+                    )
+
+            if not promoted:
+                # #1546 fix — thread ``config_path`` so alternate-config
+                # heartbeat runs route the inbox task to the right
+                # workspace DB (preserved across the #1553 tier-4 leg).
+                op_outcome = _maybe_dispatch_to_operator(
+                    finding,
+                    project_path=project_path,
+                    now=now,
+                    config_path=config_path,
+                )
+                if op_outcome == "dispatched":
+                    counters["operator_dispatches_sent"] += 1
+                    # #1553 — record the dispatch in the tracker so the
+                    # next time this hash appears we count it toward K.
+                    if tracker is not None:
+                        try:
+                            tracker.record_tier3_dispatch(finding, now=now)
+                        except Exception:  # noqa: BLE001
+                            logger.debug(
+                                "tier4: record_tier3_dispatch raised",
+                                exc_info=True,
+                            )
+                elif op_outcome == "throttled":
+                    counters["operator_dispatches_throttled"] += 1
+                elif op_outcome == "send_failed":
+                    counters["operator_dispatches_failed"] += 1
             continue
 
         # #1414 — eligible findings get an architect dispatch on top
@@ -2010,6 +2822,12 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "operator_dispatches_sent": 0,
         "operator_dispatches_throttled": 0,
         "operator_dispatches_failed": 0,
+        # #1553 — tier-4 totals.
+        "tier4_dispatches_sent": 0,
+        "tier4_dispatches_throttled": 0,
+        "tier4_dispatches_failed": 0,
+        "tier4_demoted_cleared": 0,
+        "tier4_budget_exhausted": 0,
     }
 
     try:
@@ -2076,6 +2894,23 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
             totals["projects_scanned"] += 1
             for k, v in partial.items():
                 totals[k] = totals.get(k, 0) + v
+
+        # #1553 — tier-4 demotion + budget-exhaustion sweep. Runs once
+        # per cadence tick AFTER per-project scans. Pure side-effects on
+        # the tier-4 tracker + audit log + product_state; idempotent
+        # across ticks because every transition is gated on tracker
+        # state. Best-effort — failure here does not break the cadence.
+        try:
+            sweep_counters = _sweep_tier4_budget_and_demotion(
+                services=services, now=now,
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "tier4: budget/demotion sweep raised", exc_info=True,
+            )
+            sweep_counters = {}
+        for k, v in sweep_counters.items():
+            totals[k] = totals.get(k, 0) + int(v)
     finally:
         try:
             services.close()

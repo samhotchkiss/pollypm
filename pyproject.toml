@@ -68,6 +68,7 @@ pollypm = [
   "defaults/demo/*",
   "defaults/demo/**/*",
   "work/flows/*.yaml",
+  "agents/*.md",
 ]
 
 [tool.pytest.ini_options]

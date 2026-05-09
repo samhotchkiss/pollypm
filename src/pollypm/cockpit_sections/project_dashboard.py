@@ -25,7 +25,7 @@ from pollypm.cockpit_sections.health import format_project_health_scorecard
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
 from pollypm.cockpit_sections.plan_review import (
-    find_plan_review_task,
+    find_actionable_plan_review_task,
     load_plan_text,
     render_plan_review_surface,
 )
@@ -130,7 +130,14 @@ def _render_project_dashboard(
     # ``user_approval``, swap the regular dashboard for the dedicated
     # plan-review surface (full plan body + visible action bar). When
     # nothing is pending, fall through to the regular dashboard below.
-    plan_review_task = find_plan_review_task(tasks)
+    #
+    # #1531 — the matcher is now ``find_actionable_plan_review_task``
+    # so projects whose plan-review row was emitted by the #1511
+    # watchdog backstop (chat-flow ``done`` stub) ALSO surface the
+    # review UI. Without this loosening the new interface was
+    # structurally unreachable for every project the watchdog
+    # backfilled.
+    plan_review_task = find_actionable_plan_review_task(tasks)
     if plan_review_task is not None:
         plan_text = load_plan_text(project.path)
         return render_plan_review_surface(

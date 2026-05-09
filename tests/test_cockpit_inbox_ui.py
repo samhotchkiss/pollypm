@@ -1594,6 +1594,100 @@ def test_archive_removes_row_and_flips_status(inbox_env, inbox_app) -> None:
     _run(body())
 
 
+def test_a_on_plan_review_row_opens_surface_does_not_archive(
+    inbox_env, inbox_app,
+) -> None:
+    """#1531 — ``a`` on a plan_review row routes to the project drilldown
+    (where the plan-review surface lives), it does NOT archive.
+
+    The dashboard banner advertises the keystroke as "press a to review";
+    the inbox keystroke must mean the same thing or the user follows the
+    instruction and loses the only route into the new plan-review
+    surface (which is exactly what #1531 reproduces in production).
+    """
+    plan_review_id = _seed_self_referential_plan_review(inbox_env["project_path"])
+
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            # Locate and select the plan_review row.
+            target_index = None
+            for i, t in enumerate(inbox_app._tasks):
+                if t.task_id == plan_review_id:
+                    target_index = i
+                    break
+            assert target_index is not None
+            inbox_app.list_view.index = target_index
+            inbox_app._selected_task_id = plan_review_id
+            inbox_app._selected_row_key = inbox_app._tasks[target_index].task_id
+
+            jump_calls: list[str] = []
+
+            def fake_jump(item):
+                jump_calls.append(getattr(item, "task_id", ""))
+
+            inbox_app._jump_to_plan_review_project = fake_jump  # type: ignore[method-assign]
+
+            inbox_app.action_archive_selected()
+            await pilot.pause()
+
+            # Surface-jump fired, archive did NOT.
+            assert jump_calls == [plan_review_id]
+            # Row is still present in the inbox tasks (not archived).
+            assert any(t.task_id == plan_review_id for t in inbox_app._tasks)
+
+            # Underlying work_status was not flipped to done by the
+            # archive path.
+            svc = inbox_app._svc_for_task(plan_review_id)
+            try:
+                task = svc.get(plan_review_id)
+            finally:
+                svc.close()
+            # The seeded plan_review row was created queue-eligible — the
+            # archive path would flip it to done. The redirect must
+            # leave the work_status untouched.
+            assert task.work_status.value != "done"
+
+    _run(body())
+
+
+def test_a_on_non_plan_review_row_still_archives(inbox_env, inbox_app) -> None:
+    """#1531 — ``a`` keeps archive semantics for every other inbox row.
+
+    Sanity check that the plan_review redirect doesn't accidentally
+    swallow the regular archive path. Without this, every inbox row
+    would lose the ability to be dismissed.
+    """
+    async def body() -> None:
+        async with inbox_app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            initial_total = len(inbox_app._tasks)
+            assert initial_total >= 1
+
+            jump_calls: list[str] = []
+
+            def fake_jump(item):
+                jump_calls.append(getattr(item, "task_id", ""))
+
+            inbox_app._jump_to_plan_review_project = fake_jump  # type: ignore[method-assign]
+
+            inbox_app.list_view.index = 0
+            await pilot.press("enter")
+            await pilot.pause()
+            target = inbox_app._selected_task_id
+            assert target is not None
+
+            await pilot.press("a")
+            await pilot.pause()
+
+            # Surface-jump did NOT fire; archive did.
+            assert jump_calls == []
+            assert len(inbox_app._tasks) == initial_total - 1
+            assert all(t.task_id != target for t in inbox_app._tasks)
+
+    _run(body())
+
+
 def test_workspace_store_notification_appears_in_inbox(inbox_env, inbox_app) -> None:
     """Workspace-root Store rows are listed alongside task-backed inbox items."""
     _seed_workspace_message(

@@ -101,6 +101,100 @@ def find_plan_review_task(tasks: list) -> object | None:
     return candidates[0]
 
 
+def _plan_task_label_ref(task) -> str | None:
+    """Extract ``plan_task:<project>/<n>`` ref from a backstop task's labels."""
+    labels = getattr(task, "labels", None) or []
+    for label in labels:
+        text = str(label or "")
+        if text.startswith("plan_task:"):
+            ref = text[len("plan_task:"):].strip()
+            if "/" in ref:
+                return ref
+    return None
+
+
+def _resolve_plan_task_for_backstop(
+    backstop_task, all_tasks: list,
+) -> object:
+    """Return the underlying plan task referenced by a backstop emit row.
+
+    The #1511 backstop creates a ``chat``-flow notify-only stub labeled
+    ``plan_review`` + ``plan_task:<project>/<n>``. The drilldown surface
+    needs the *real* plan task (the one whose plan body the user wants
+    to read) so the header strip names the right task number / persona
+    and the surface reads like the canonical #1399 reflection emit.
+
+    Falls back to the backstop task itself when the referenced plan
+    task can't be located (so the surface still renders something the
+    user can act on rather than disappearing).
+    """
+    ref = _plan_task_label_ref(backstop_task)
+    if not ref:
+        return backstop_task
+    for t in all_tasks or []:
+        if getattr(t, "task_id", None) == ref:
+            return t
+    return backstop_task
+
+
+def find_actionable_plan_review_task(tasks: list) -> object | None:
+    """Return the task that should drive the plan-review surface, or None.
+
+    #1531 — broader matcher than :func:`find_plan_review_task`. Used by
+    the drilldown render so projects whose plan-review row was emitted
+    by the #1511 watchdog backstop (chat-flow ``done`` stub, NOT
+    ``plan_project`` flow at ``user_approval``) still surface the
+    review UI. The earlier matcher only matched the canonical
+    ``plan_project`` reflection node and left every backstop-covered
+    project structurally unreachable from the dashboard.
+
+    Resolution order:
+
+    1. The canonical match (review status + user_approval node).
+       Returned as-is — that's the architect's reflection emit.
+    2. A task carrying ``plan_review`` + ``plan_task:<id>`` labels
+       whose work_status is not archived. We resolve to the *referenced*
+       plan task (so the surface header / persona / age read as the
+       plan, not the backstop notify stub), falling back to the
+       backstop task itself when the ref can't be located.
+
+    Returns ``None`` when no plan-review-shaped task is present.
+    """
+    canonical = find_plan_review_task(tasks)
+    if canonical is not None:
+        return canonical
+    # Backstop fallback: any task carrying both ``plan_review`` and a
+    # ``plan_task:<id>`` ref. Sort by updated_at so multiple stale
+    # stubs pick the freshest one.
+    #
+    # Note: ``archive_task`` flips a chat-flow row to ``done`` (no
+    # distinct archived status exists), so we can't filter dismissed
+    # rows by status alone. The cockpit inbox already filters
+    # already-handled plan_review messages via #1103's per-render
+    # phantom sweep; relying on that keeps the matcher narrow.
+    candidates: list = []
+    for t in tasks or []:
+        labels = {str(lbl or "") for lbl in (getattr(t, "labels", None) or [])}
+        if "plan_review" not in labels:
+            continue
+        if not any(lbl.startswith("plan_task:") for lbl in labels):
+            continue
+        # Skip cancelled rows — those were explicitly dismissed.
+        status = getattr(t, "work_status", None)
+        status_value = getattr(status, "value", status)
+        if status_value == "cancelled":
+            continue
+        candidates.append(t)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda t: _iso_to_dt(getattr(t, "updated_at", None)) or 0,
+        reverse=True,
+    )
+    backstop = candidates[0]
+    return _resolve_plan_task_for_backstop(backstop, tasks)
+
+
 def _resolve_architect_persona(task) -> str:
     """Pull the architect persona from the task's roles → assignee → fallback."""
     roles = getattr(task, "roles", None) or {}

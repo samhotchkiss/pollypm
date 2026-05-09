@@ -17410,16 +17410,28 @@ class PollyProjectDashboardApp(App[None]):
             )
             return
         if data.plan_path is None:
-            # The plan task is done but the plan file wasn't written
-            # to the canonical location. Fall back to the approve flow
-            # directly so the user can still act.
-            if has_plan_review_card and self._approve_first_plan_review_if_present():
-                return
+            # #1531 follow-up — the plan task is done but the plan
+            # file wasn't written to the canonical
+            # ``docs/plan/plan.md`` / ``docs/project-plan.md``
+            # locations. Workers that ship a different artifact (HTML
+            # explainer at ``reports/index.html``, an external URL,
+            # etc.) still produce a reviewable plan; we just don't
+            # have markdown to render. Open plan-view mode anyway so
+            # the user sees the task header + description + action
+            # bar instead of a dead-end notify. The surface render
+            # (``render_plan_review_surface``) handles empty plan_text
+            # gracefully — it emits "(plan body is empty)" placeholders
+            # for sections it can't fill, but the header strip still
+            # names the task and the action bar still lets the user
+            # approve / reject / chat.
+            if not self._plan_view_mode:
+                self.action_open_plan()
             self.notify(
-                "Plan task is done but no plan file was found on "
-                "disk. Press a to approve the plan_review card or i "
-                "to open the inbox.",
-                severity="warning", timeout=3.5,
+                "Plan task is done but no markdown plan file is on "
+                "disk — opening the review surface anyway. Check the "
+                "task description or deliverable URL for the plan "
+                "content.",
+                severity="information", timeout=4.5,
             )
             return
         # Force plan-view mode on (don't toggle — the user explicitly

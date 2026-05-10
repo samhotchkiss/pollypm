@@ -1392,17 +1392,26 @@ def _detect_role_session_missing(
         task_number = getattr(task, "task_number", None)
         if not task_project or task_number is None:
             continue
-        # Role resolution preference: explicit roles dict (architect /
-        # reviewer / worker) → assignee fallback. We pick the most
-        # specific role for the current state — review tasks need a
-        # reviewer; in_progress / queued tasks need a worker (or a role
-        # explicitly set on the task).
+        # Role resolution preference: explicit roles dict (advisor /
+        # architect / reviewer / worker) → assignee fallback. We pick
+        # the most specific role for the current state — review tasks
+        # need a reviewer; in_progress / queued tasks need a worker
+        # (or a role explicitly set on the task).
+        #
+        # ``advisor`` (#1546) — production advisor tasks land with
+        # ``roles={"advisor": "advisor"}`` (see
+        # ``plugins_builtin/advisor/handlers/advisor_tick.py``). The
+        # canonical lane is ``advisor-<project>``. Pre-fix this
+        # detector only walked worker/architect/reviewer, so a queued
+        # advisor task whose advisor lane wasn't running silently
+        # missed the auto-spawn — the regression #1546 was filed to
+        # close.
         roles = getattr(task, "roles", {}) or {}
         candidate_roles: list[str] = []
         if status_value == "review":
-            candidate_roles = ["reviewer", "architect", "worker"]
+            candidate_roles = ["reviewer", "architect", "worker", "advisor"]
         else:
-            candidate_roles = ["worker", "architect", "reviewer"]
+            candidate_roles = ["worker", "architect", "reviewer", "advisor"]
         role_used: str | None = None
         for role in candidate_roles:
             if role in roles and roles[role]:
@@ -2014,44 +2023,70 @@ def _detect_rejection_loop(
         executions = list(getattr(task, "executions", None) or [])
         if not executions:
             continue
-        # Group reject-shaped rows by node_id, newest first by
-        # ``completed_at`` (fall back to ``started_at`` when the row
-        # never reached completion). We deliberately accept either the
-        # ``Decision.REJECTED`` enum value OR a string-valued decision
-        # column — :class:`SQLiteWorkService` materialises Decision as
-        # the enum, but legacy / synthetic test fixtures may carry the
-        # raw string.
-        rejects_by_node: dict[str, list[Any]] = {}
+        # Group rows by node_id and walk newest→oldest; the detector
+        # fires only when the most-recent K rows at the same node are
+        # *consecutively* rejections. Any non-rejection row (approval,
+        # progress, status change) at that node resets the run — a
+        # task that bounced reject → approve → reject is not stuck in
+        # the structural-loop shape this rule flags.
+        #
+        # We accept either the ``Decision.REJECTED`` enum value OR a
+        # string-valued decision column — :class:`SQLiteWorkService`
+        # materialises Decision as the enum, but legacy / synthetic
+        # test fixtures may carry the raw string.
+        rows_by_node: dict[str, list[Any]] = {}
         for ex in executions:
-            decision = getattr(ex, "decision", None)
-            decision_value = getattr(decision, "value", decision)
-            if isinstance(decision_value, str):
-                decision_norm = decision_value.lower()
-            else:
-                decision_norm = ""
-            if decision_norm != "rejected":
-                continue
             completed = getattr(ex, "completed_at", None) or getattr(
                 ex, "started_at", None,
             )
             completed_dt = _coerce_datetime(completed)
-            if completed_dt is None or completed_dt < cutoff:
+            if completed_dt is None:
                 continue
             node_id = getattr(ex, "node_id", "") or ""
             if not node_id:
                 continue
-            rejects_by_node.setdefault(node_id, []).append(ex)
-        for node_id, rows in rejects_by_node.items():
-            if len(rows) < threshold:
-                continue
-            # Sort newest-first for deterministic evidence ordering.
-            rows.sort(
+            rows_by_node.setdefault(node_id, []).append(ex)
+
+        rejects_by_node: dict[str, list[Any]] = {}
+        for node_id, node_rows in rows_by_node.items():
+            # Sort newest-first so we can read the consecutive run
+            # off the head of the list.
+            node_rows.sort(
                 key=lambda ex: _coerce_datetime(
                     getattr(ex, "completed_at", None)
                     or getattr(ex, "started_at", None),
                 ) or now,
                 reverse=True,
             )
+            consecutive: list[Any] = []
+            for ex in node_rows:
+                decision = getattr(ex, "decision", None)
+                decision_value = getattr(decision, "value", decision)
+                decision_norm = (
+                    decision_value.lower()
+                    if isinstance(decision_value, str)
+                    else ""
+                )
+                if decision_norm != "rejected":
+                    # Run broken — anything other than a rejection at
+                    # the same node resets the consecutive counter.
+                    break
+                completed_dt = _coerce_datetime(
+                    getattr(ex, "completed_at", None)
+                    or getattr(ex, "started_at", None),
+                )
+                if completed_dt is None or completed_dt < cutoff:
+                    # The run goes back too far; older rejections
+                    # don't count toward the K-in-a-row contract.
+                    break
+                consecutive.append(ex)
+            if consecutive:
+                rejects_by_node[node_id] = consecutive
+
+        for node_id, rows in rejects_by_node.items():
+            if len(rows) < threshold:
+                continue
+            # ``rows`` is already newest-first by construction.
             recent = rows[:threshold]
             reasons = [
                 (getattr(ex, "decision_reason", None) or "").strip()
@@ -2158,6 +2193,10 @@ def _detect_state_db_missing(
         legacy_archives_present = bool(
             getattr(probe, "legacy_archives_present", False),
         )
+        canonical_db_path_raw = getattr(probe, "canonical_db_path", None)
+        canonical_db_path_str = (
+            str(canonical_db_path_raw) if canonical_db_path_raw is not None else ""
+        )
         if not project_key or canonical_present:
             continue
         path_str = str(project_path) if project_path is not None else ""
@@ -2167,29 +2206,32 @@ def _detect_state_db_missing(
             project=project_key,
             subject=project_key,
             message=(
-                f"Project {project_key} has no canonical "
-                f".pollypm/state.db" + (
-                    f" — only legacy archives remain "
-                    f"(state.db.legacy-*)."
+                f"Workspace canonical state.db is missing"
+                + (f" at {canonical_db_path_str}" if canonical_db_path_str else "")
+                + (
+                    " — only legacy archives remain (state.db.legacy-*)."
                     if legacy_archives_present else
-                    f"; the project's tracker scaffold may have been "
-                    f"removed."
+                    "; the workspace tracker scaffold may have been "
+                    "removed."
                 )
             ),
             recommendation=(
-                f"Re-run the tracker scaffold via "
-                f"``enable_tracked_project({project_key!r})`` so the "
-                f"work-service factory can re-create the canonical DB."
+                f"Re-create the workspace state.db by opening it via "
+                f"``create_work_service`` (the schema replay rebuilds "
+                f"the tables); the heartbeat self-heal does this "
+                f"automatically."
             ),
             metadata={
                 "project_key": project_key,
                 "project_path": path_str,
+                "canonical_db_path": canonical_db_path_str,
                 "legacy_archives_present": legacy_archives_present,
                 "detected_via": "state",
             },
             evidence={
                 "project_key": project_key,
                 "project_path": path_str,
+                "canonical_db_path": canonical_db_path_str,
                 "canonical_present": canonical_present,
                 "legacy_archives_present": legacy_archives_present,
             },
@@ -2329,7 +2371,12 @@ def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
     ) if last_activity_ts else None
     return [Finding(
         rule=RULE_QUEUE_WITHOUT_MOTION,
-        tier=TIER_2,
+        # #1546 — operator-level concern: a wedged queue is a
+        # cross-cutting failure that has consistently outlived
+        # tier-2 architect dispatches in the field. Routing it
+        # straight to the operator (tier-3) matches the dispatch
+        # rule registry and makes the contract honest.
+        tier=TIER_3,
         project=ctx.project_key,
         subject=ctx.project_key,
         message=(

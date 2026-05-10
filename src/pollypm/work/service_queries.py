@@ -18,6 +18,8 @@ from pollypm.work.role_validation import validate_role_assignments
 from pollypm.work.service_support import TaskNotFoundError, ValidationError, _now, _parse_task_id
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from pollypm.work.sqlite_service import SQLiteWorkService
 
 
@@ -49,20 +51,33 @@ _PRODUCT_STATE_CACHE: dict[tuple[str, int], "Any | None"] = {}
 _PRODUCT_STATE_SENTINEL_HEALTHY = object()
 
 
-def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
+def _enforce_product_state_gate(
+    *,
+    labels: list[str] | None,
+    db_path: "Path | str | None" = None,
+) -> None:
     """Raise :class:`ProductBrokenError` when workspace product_state=='broken'.
 
-    The lookup is best-effort and cached by (db_path, mtime_ns): a
-    missing config / state.db / unified store path falls through
-    silently so unit tests that exercise the work-service in isolation
-    aren't perturbed. Tasks tagged with any of the bypass labels (the
-    watchdog's own dispatch path needs to keep working) skip the gate.
+    The lookup is best-effort and cached by (db_path, main_mtime_ns,
+    wal_mtime_ns): a missing config / state.db / unified store path
+    falls through silently so unit tests that exercise the work-service
+    in isolation aren't perturbed. Tasks tagged with any of the bypass
+    labels (the watchdog's own dispatch path needs to keep working)
+    skip the gate.
 
-    Reads the workspace_state row via raw sqlite3 (read-only URI) to
-    avoid the ``StateStore`` init cost — the gate is in the hot path
-    of every ``create_task`` call and a 1+ GB workspace state.db
-    can spend tens of ms on the schema-replay + pragma dance the
-    StateStore constructor walks. We only need a single SELECT here.
+    ``db_path`` is the actual DB the calling :class:`SQLiteWorkService`
+    is bound to — threaded through from ``create_task`` so the gate
+    consults the correct workspace's flag. When omitted, falls back to
+    ``config.project.state_db`` (the legacy global default) for
+    callers outside the service boundary.
+
+    Reads ``workspace_state`` via raw sqlite3 (read-only URI, WAL-aware)
+    to avoid the ``StateStore`` init cost — the gate is in the hot path
+    of every ``create_task`` call. We deliberately do NOT pass
+    ``immutable=1`` because the workspace_state row is updated under
+    WAL and the immutable hint tells SQLite to ignore the WAL file,
+    which means a freshly-set ``product_state=broken`` row would not
+    be visible until the writer fsync'd a checkpoint.
     """
     label_set = {str(label) for label in (labels or []) if label}
     if label_set & _PRODUCT_BROKEN_BYPASS_LABELS:
@@ -71,7 +86,6 @@ def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
         import sqlite3
         from pathlib import Path
 
-        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
         from pollypm.storage.product_state import (
             PRODUCT_STATE_BROKEN,
             PRODUCT_STATE_KEY,
@@ -80,27 +94,50 @@ def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
         )
     except Exception:  # noqa: BLE001
         return
+
+    # Prefer the service's own DB path (threaded in from create_task).
+    # Fall back to the global default config only when no path was
+    # supplied — callers outside the service boundary still need a
+    # working code path.
+    resolved_db_path: "Path | None" = None
+    if db_path is not None:
+        try:
+            resolved_db_path = Path(db_path)
+        except TypeError:
+            resolved_db_path = None
+    if resolved_db_path is None:
+        try:
+            from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+            config = load_config(DEFAULT_CONFIG_PATH)
+        except Exception:  # noqa: BLE001
+            return
+        db_path_raw = getattr(getattr(config, "project", None), "state_db", None)
+        if db_path_raw is None:
+            return
+        try:
+            resolved_db_path = Path(db_path_raw)
+        except TypeError:
+            return
+    if not resolved_db_path.exists():
+        return
+    # Cache key folds in the WAL sidecar's mtime so a workspace_state
+    # row written but not yet checkpointed is visible on the next
+    # call. Pre-fix the cache only used the main-DB mtime, which
+    # WAL-friendly writes don't bump until checkpoint, leaving the
+    # gate stuck on stale state for minutes.
     try:
-        config = load_config(DEFAULT_CONFIG_PATH)
-    except Exception:  # noqa: BLE001
-        return
-    db_path_raw = getattr(getattr(config, "project", None), "state_db", None)
-    if db_path_raw is None:
-        return
-    try:
-        db_path = Path(db_path_raw)
-    except TypeError:
-        return
-    if not db_path.exists():
-        return
-    # mtime-keyed cache — invalidate when the DB file is rewritten so
-    # a freshly-set product_state row takes effect on the next
-    # heartbeat tick (or sooner if the writer fsyncs).
-    try:
-        mtime_ns = db_path.stat().st_mtime_ns
+        main_mtime_ns = resolved_db_path.stat().st_mtime_ns
     except OSError:
         return
-    cache_key = (str(db_path), mtime_ns)
+    wal_mtime_ns = 0
+    wal_path = resolved_db_path.with_name(resolved_db_path.name + "-wal")
+    try:
+        if wal_path.exists():
+            wal_mtime_ns = wal_path.stat().st_mtime_ns
+    except OSError:
+        wal_mtime_ns = 0
+    cache_key = (str(resolved_db_path), main_mtime_ns, wal_mtime_ns)
     cached = _PRODUCT_STATE_CACHE.get(cache_key)
     if cached is _PRODUCT_STATE_SENTINEL_HEALTHY:
         return
@@ -108,12 +145,12 @@ def _enforce_product_state_gate(*, labels: list[str] | None) -> None:
         raise ProductBrokenError(cached)
 
     # Direct sqlite read — cheaper than StateStore for the hot path.
-    # Read-only URI mode + immutable=1 lets us peek at a multi-GB DB
-    # without any pragma replay or schema-creation overhead.
+    # Read-only URI mode (no immutable=1; see docstring) lets the
+    # connection see WAL writes from concurrent writers.
     raw_value: str | None = None
     try:
         conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro&immutable=1", uri=True,
+            f"file:{resolved_db_path}?mode=ro", uri=True,
         )
     except sqlite3.Error:
         # File exists but can't open — record sentinel-healthy so we
@@ -199,7 +236,17 @@ def create_task(
     # state.db (e.g. tests that exercise the work-service in isolation)
     # falls through to the normal create path so we don't break
     # unrelated callers.
-    _enforce_product_state_gate(labels=labels)
+    #
+    # Pass ``self._db_path`` so the gate consults the actual DB this
+    # service is bound to, not whatever the global config happens to
+    # name. Pre-fix the gate read ``DEFAULT_CONFIG_PATH`` /
+    # ``config.project.state_db`` regardless of which workspace the
+    # service was opened against — so a broken flag in workspace A
+    # would mistakenly block workspace B (or vice versa).
+    _enforce_product_state_gate(
+        labels=labels,
+        db_path=getattr(service, "_db_path", None),
+    )
     template = service._ensure_flow_in_db(flow_template)
 
     for role_name, role_def in template.roles.items():

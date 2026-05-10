@@ -101,6 +101,14 @@ EVENT_WATCHDOG_ESCALATION_DISPATCHED = "watchdog.escalation_dispatched"
 # task creation succeeded) so forensic reads can correlate with the
 # inbox row directly.
 EVENT_WATCHDOG_OPERATOR_DISPATCHED = "watchdog.operator_dispatched"
+# #1546 — fires when the operator-dispatch leg attempted an inbox
+# write but the write raised. Carries the same ``finding_type`` /
+# ``subject`` metadata as ``EVENT_WATCHDOG_OPERATOR_DISPATCHED`` so
+# the next tick can detect the failure case and not throttle on
+# behalf of a row that never landed. Distinct event so the throttle
+# query (which only counts ``operator_dispatched`` rows) doesn't
+# accidentally suppress retries.
+EVENT_WATCHDOG_TIER3_DISPATCH_FAILED = "watchdog.tier3_dispatch_failed"
 # #1546 — fires when the watchdog spawns a missing role lane (the
 # ``role_session_missing`` self-heal action). One event per spawned
 # lane; metadata carries ``role``, ``project``, and ``task_subject``
@@ -475,6 +483,7 @@ __all__ = [
     "EVENT_WORKER_SESSION_REAPED",
     "EVENT_WATCHDOG_ESCALATION_DISPATCHED",
     "EVENT_WATCHDOG_OPERATOR_DISPATCHED",
+    "EVENT_WATCHDOG_TIER3_DISPATCH_FAILED",
     "EVENT_WATCHDOG_WORKER_LANE_SPAWNED",
     "EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED",
     "AuditEvent",

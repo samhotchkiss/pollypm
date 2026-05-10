@@ -157,7 +157,8 @@ def test_existing_rules_carry_expected_tiers(now: datetime) -> None:
         # reflects the dispatch leg (TIER_2).
         RULE_REJECTION_LOOP: TIER_2,
         RULE_STATE_DB_MISSING: TIER_1,
-        RULE_QUEUE_WITHOUT_MOTION: TIER_2,
+        # #1546 — queue stalls route directly to operator (tier-3).
+        RULE_QUEUE_WITHOUT_MOTION: TIER_3,
     }
     # Spot-check a tier-2 rule fires the expected tier.
     events = [
@@ -384,6 +385,54 @@ def test_rejection_loop_silent_when_reasons_dont_cluster(now: datetime) -> None:
     assert not any(f.rule == RULE_REJECTION_LOOP for f in findings)
 
 
+def test_rejection_loop_silent_when_approval_breaks_run(now: datetime) -> None:
+    """K consecutive rejections — an approve / non-rejection at the
+    same node resets the counter. ``reject → reject → approve →
+    reject`` is not a structural-loop shape; the worker is making
+    forward progress between bounces.
+    """
+    cfg = WatchdogConfig()
+    task = _StubTask(
+        project="demo",
+        task_number=4,
+        work_status_str="in_progress",
+        executions=[
+            # newest — most recent reject
+            _StubExecution(
+                node_id="code_review",
+                decision="rejected",
+                decision_reason="better-sqlite3 fails Node 25",
+                completed_at=now - timedelta(minutes=5),
+            ),
+            # An approval at the same node breaks the consecutive run.
+            _StubExecution(
+                node_id="code_review",
+                decision="approved",
+                decision_reason="reviewer signed off",
+                completed_at=now - timedelta(minutes=15),
+            ),
+            _StubExecution(
+                node_id="code_review",
+                decision="rejected",
+                decision_reason="rebuild failed",
+                completed_at=now - timedelta(minutes=25),
+            ),
+            _StubExecution(
+                node_id="code_review",
+                decision="rejected",
+                decision_reason="better-sqlite3 native build failed",
+                completed_at=now - timedelta(minutes=35),
+            ),
+        ],
+    )
+    findings = scan_events(
+        [], now=now, config=cfg, open_tasks=[task],
+    )
+    # Three rejections in window total, but only one is contiguous from
+    # the newest end — below threshold once we enforce consecutiveness.
+    assert not any(f.rule == RULE_REJECTION_LOOP for f in findings)
+
+
 def test_rejection_loop_silent_outside_window(now: datetime) -> None:
     cfg = WatchdogConfig()
     too_old = now - timedelta(seconds=cfg.rejection_loop_window_seconds + 60)
@@ -450,6 +499,47 @@ def test_state_db_missing_silent_when_canonical_present(
     assert not any(f.rule == RULE_STATE_DB_MISSING for f in findings)
 
 
+def test_state_db_missing_silent_for_project_without_per_project_db(
+    now: datetime, tmp_path: Path,
+) -> None:
+    """Post-workspace-root migration (#339 / #1004): a project that
+    has *no* per-project ``<project>/.pollypm/state.db`` but lives in a
+    workspace whose ``<workspace_root>/.pollypm/state.db`` is healthy
+    must NOT alert. The pre-fix probe checked the per-project path and
+    fired on every tick for healthy projects.
+    """
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _gather_state_db_probes,
+    )
+
+    # Build a fake services bundle with a registered project whose
+    # per-project state.db is absent, and a workspace-root config that
+    # points at a real-on-disk workspace DB.
+    workspace_root = tmp_path / "ws"
+    canonical_db = workspace_root / ".pollypm" / "state.db"
+    canonical_db.parent.mkdir(parents=True, exist_ok=True)
+    canonical_db.write_text("placeholder", encoding="utf-8")
+
+    project_path = tmp_path / "myproj"
+    project_path.mkdir(parents=True, exist_ok=True)
+    # Deliberately do NOT create project_path / ".pollypm" / "state.db".
+
+    from types import SimpleNamespace
+
+    proj = SimpleNamespace(key="myproj", name="myproj", path=project_path)
+    cfg = SimpleNamespace(
+        project=SimpleNamespace(workspace_root=workspace_root),
+        projects={"myproj": proj},
+    )
+    services = SimpleNamespace(known_projects=[proj], config=cfg)
+
+    probes = _gather_state_db_probes(services=services, config=cfg)
+    assert len(probes) == 1
+    assert probes[0].canonical_present is True
+    findings = scan_events([], now=now, state_db_probes=probes)
+    assert not any(f.rule == RULE_STATE_DB_MISSING for f in findings)
+
+
 # ---------------------------------------------------------------------------
 # Queue-without-motion safety-net probe
 # ---------------------------------------------------------------------------
@@ -473,7 +563,9 @@ def test_queue_without_motion_fires_when_no_recent_activity(
     matched = [f for f in findings if f.rule == RULE_QUEUE_WITHOUT_MOTION]
     assert len(matched) == 1
     f = matched[0]
-    assert f.tier == TIER_2
+    # #1546 — queue_without_motion is operator-level (tier-3) so the
+    # cadence handler dispatches directly to the operator inbox.
+    assert f.tier == TIER_3
     assert f.evidence["queued_subjects"] == ["demo/4"]
     # The probe captures threshold info for downstream prompts.
     assert f.evidence["threshold_seconds"] == 600
@@ -567,6 +659,64 @@ def test_role_session_missing_fires_for_queued_task(now: datetime) -> None:
     assert len(matched) == 1
     assert matched[0].subject == "demo/42"
     assert matched[0].tier == TIER_1
+
+
+def test_role_session_missing_fires_for_queued_advisor_task(
+    now: datetime,
+) -> None:
+    """Production advisor tasks land with ``roles={"advisor": "advisor"}``
+    (see ``advisor/handlers/advisor_tick.py``) and the canonical lane
+    is ``advisor-<project>``. The pre-#1546 detector only walked
+    worker/architect/reviewer, so a queued advisor task whose advisor
+    lane wasn't running silently missed the auto-spawn — the regression
+    #1546 was filed to close.
+    """
+    task = _StubTask(
+        project="coffeeboardnm",
+        task_number=70,
+        work_status_str="queued",
+        executions=[],
+        # Production advisor task shape — see
+        # ``plugins_builtin/advisor/handlers/advisor_tick.py:262``.
+        roles={"advisor": "advisor"},
+    )
+    findings = scan_events(
+        [],
+        now=now,
+        open_tasks=[task],
+        # Storage closet has architect-* but no advisor-* — the bug
+        # condition this test guards.
+        storage_window_names=["architect-coffeeboardnm"],
+        project="coffeeboardnm",
+    )
+    matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
+    assert len(matched) == 1
+    assert matched[0].subject == "coffeeboardnm/70"
+    assert matched[0].metadata["role"] == "advisor"
+    assert matched[0].metadata["expected_window"] == "advisor-coffeeboardnm"
+
+
+def test_role_session_missing_silent_when_advisor_lane_present(
+    now: datetime,
+) -> None:
+    """Mirror of the above: when ``advisor-<project>`` is present in
+    the storage closet the detector stays quiet.
+    """
+    task = _StubTask(
+        project="coffeeboardnm",
+        task_number=71,
+        work_status_str="queued",
+        executions=[],
+        roles={"advisor": "advisor"},
+    )
+    findings = scan_events(
+        [],
+        now=now,
+        open_tasks=[task],
+        storage_window_names=["advisor-coffeeboardnm"],
+        project="coffeeboardnm",
+    )
+    assert not any(f.rule == RULE_ROLE_SESSION_MISSING for f in findings)
 
 
 def test_role_session_missing_silent_when_window_present_for_queued(
@@ -749,7 +899,7 @@ def test_maybe_dispatch_to_operator_throttles_repeat(
 
     finding = Finding(
         rule=RULE_QUEUE_WITHOUT_MOTION,
-        tier=TIER_2,
+        tier=TIER_3,
         project="demo",
         subject="demo",
         evidence={"queued_subjects": ["demo/1"]},
@@ -764,6 +914,80 @@ def test_maybe_dispatch_to_operator_throttles_repeat(
         finding, project_path=None, now=now,
     )
     assert outcome == "throttled"
+
+
+def test_maybe_dispatch_to_operator_inbox_failure_does_not_throttle_next_tick(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the inbox write raises, the dispatcher must NOT engage
+    the operator-dispatched throttle window — otherwise the next tick
+    would suppress the retry and the failure would silently strand
+    the finding. The dispatcher emits a separate
+    ``tier3_dispatch_failed`` event for forensics instead.
+    """
+    from pollypm.audit.log import EVENT_WATCHDOG_TIER3_DISPATCH_FAILED
+    from pollypm.audit.watchdog import was_recently_operator_dispatched
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence_mod
+
+    call_count = {"n": 0}
+
+    def _stub_create_fail(**_kwargs: Any) -> str:
+        call_count["n"] += 1
+        raise RuntimeError("simulated inbox write failure")
+
+    monkeypatch.setattr(
+        cadence_mod, "_create_operator_inbox_task", _stub_create_fail,
+    )
+
+    finding = Finding(
+        rule=RULE_QUEUE_WITHOUT_MOTION,
+        tier=TIER_3,
+        project="failproj",
+        subject="failproj",
+        evidence={"queued_subjects": ["failproj/1"]},
+    )
+    outcome = cadence_mod._maybe_dispatch_to_operator(
+        finding, project_path=None, now=now,
+    )
+    assert outcome == "send_failed"
+    assert call_count["n"] == 1
+
+    # The next tick must NOT find a throttle-engaging
+    # operator_dispatched audit row.
+    assert was_recently_operator_dispatched(
+        project="failproj",
+        finding_type=RULE_QUEUE_WITHOUT_MOTION,
+        subject="failproj",
+        now=now,
+    ) is False
+
+    # A distinct tier3_dispatch_failed event recorded the attempt.
+    failed_rows = read_events(
+        "failproj", event=EVENT_WATCHDOG_TIER3_DISPATCH_FAILED,
+    )
+    assert len(failed_rows) >= 1
+    assert any(
+        (r.metadata or {}).get("finding_type") == RULE_QUEUE_WITHOUT_MOTION
+        for r in failed_rows
+    )
+
+    # Now simulate the next tick — inbox write succeeds. The retry
+    # should land cleanly because the throttle window was never
+    # engaged.
+    captured: dict[str, Any] = {}
+
+    def _stub_create_ok(**kwargs: Any) -> str:
+        captured.update(kwargs)
+        return "failproj/42"
+
+    monkeypatch.setattr(
+        cadence_mod, "_create_operator_inbox_task", _stub_create_ok,
+    )
+    outcome2 = cadence_mod._maybe_dispatch_to_operator(
+        finding, project_path=None, now=now,
+    )
+    assert outcome2 == "dispatched"
+    assert captured["project_key"] == "failproj"
 
 
 def test_maybe_dispatch_to_operator_dispatched_writes_audit_and_inbox(
@@ -785,7 +1009,7 @@ def test_maybe_dispatch_to_operator_dispatched_writes_audit_and_inbox(
 
     finding = Finding(
         rule=RULE_QUEUE_WITHOUT_MOTION,
-        tier=TIER_2,
+        tier=TIER_3,
         project="newproj",
         subject="newproj",
         message="newproj queue stalled",
@@ -989,6 +1213,81 @@ def test_product_state_set_get_clear_roundtrip(tmp_path: Path) -> None:
         store.close()
 
 
+def test_workspace_state_migration_idempotent_on_old_db(tmp_path: Path) -> None:
+    """An older DB that pre-dates #1546 must pick up the
+    ``workspace_state`` table when a fresh ``StateStore`` opens it.
+
+    Simulate an unmigrated DB by creating one without the table, then
+    open it with ``StateStore`` and assert (a) the table exists, (b)
+    ``get_workspace_state`` reads return ``None`` cleanly (no
+    ``no such table`` raised), and (c) the migration row was recorded.
+    """
+    import sqlite3
+
+    from pollypm.storage.state import StateStore
+
+    db = tmp_path / "old.db"
+    # Simulate pre-#1546 DB shape: every other table from SCHEMA except
+    # workspace_state. We create a stripped DB by hand and then open it
+    # via StateStore so the migration path fills in the new table.
+    raw = sqlite3.connect(db)
+    try:
+        raw.execute(
+            """CREATE TABLE schema_version (
+                version INTEGER PRIMARY KEY,
+                description TEXT NOT NULL,
+                applied_at TEXT NOT NULL
+            )"""
+        )
+        # Mark the DB as having gone through migration 16 (pre-#1546).
+        raw.execute(
+            "INSERT INTO schema_version (version, description, applied_at) "
+            "VALUES (?, ?, ?)",
+            (16, "pre-#1546 baseline", "2026-01-01T00:00:00+00:00"),
+        )
+        raw.commit()
+    finally:
+        raw.close()
+
+    # Open through StateStore — migration 17 should run and create the
+    # workspace_state table.
+    store = StateStore(db)
+    try:
+        # No row yet, but the table exists and the read returns None.
+        assert store.get_workspace_state("product_state") is None
+        # Direct sqlite probe confirms the table exists post-migration.
+        with sqlite3.connect(db) as probe:
+            row = probe.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='workspace_state'"
+            ).fetchone()
+        assert row is not None
+    finally:
+        store.close()
+
+
+def test_get_workspace_state_tolerates_missing_table(tmp_path: Path) -> None:
+    """Read-only / pre-#1546 DBs without the workspace_state table
+    return ``None`` from ``get_workspace_state`` rather than raising
+    ``OperationalError`` so downstream consumers (gate / doctor) treat
+    it as "no state".
+    """
+    import sqlite3
+
+    from pollypm.storage.state import StateStore
+
+    db = tmp_path / "no_table.db"
+    store = StateStore(db)
+    try:
+        # Drop the table to simulate the pre-#1546 shape on an open
+        # connection; the read should still return None cleanly.
+        store.execute("DROP TABLE IF EXISTS workspace_state")
+        store.commit()
+        assert store.get_workspace_state("product_state") is None
+    finally:
+        store.close()
+
+
 def test_product_state_refuses_empty_reason(tmp_path: Path) -> None:
     from pollypm.storage.product_state import set_product_state_broken
     from pollypm.storage.state import StateStore
@@ -1037,6 +1336,91 @@ def test_product_broken_gate_refuses_create_task(
 
     with pytest.raises(ProductBrokenError):
         _enforce_product_state_gate(labels=[])
+
+
+def test_product_broken_gate_uses_service_db_path_not_global_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate must consult the actual DB the calling service is
+    bound to, not the global ``config.project.state_db`` default.
+
+    Workspace A is broken; workspace B is healthy. Creating a task in
+    B (passing B's db_path) must succeed; creating a task in A (passing
+    A's db_path) must raise. Pre-fix both calls would consult the same
+    global default DB regardless of which workspace was active.
+    """
+    from pollypm.storage.product_state import (
+        ProductBrokenError,
+        set_product_state_broken,
+    )
+    from pollypm.storage.state import StateStore
+    from pollypm.work.service_queries import _enforce_product_state_gate
+
+    db_a = tmp_path / "ws_a.db"
+    store_a = StateStore(db_a)
+    set_product_state_broken(
+        store_a, reason="ws_a is broken", forensics_path="/tmp/a.jsonl",
+    )
+    store_a.close()
+
+    db_b = tmp_path / "ws_b.db"
+    store_b = StateStore(db_b)  # healthy: no product_state row
+    store_b.close()
+
+    # Point the global config at workspace B (healthy). If the gate
+    # fell back to the global default it would see B and let A through.
+    class _StubProject:
+        state_db = db_b
+
+    class _StubConfig:
+        project = _StubProject()
+
+    monkeypatch.setattr(
+        "pollypm.config.load_config", lambda _path: _StubConfig(),
+    )
+
+    # Workspace B (healthy) — should not raise.
+    _enforce_product_state_gate(labels=[], db_path=db_b)
+
+    # Workspace A (broken) — must raise even though the global config
+    # points at the healthy B workspace.
+    with pytest.raises(ProductBrokenError):
+        _enforce_product_state_gate(labels=[], db_path=db_a)
+
+
+def test_product_broken_gate_reflects_wal_writes_without_checkpoint(
+    tmp_path: Path,
+) -> None:
+    """The cache key must include the WAL file's mtime so a fresh
+    ``set_product_state_broken`` write becomes visible immediately —
+    pre-fix the cache keyed on the main DB's mtime only and opened with
+    ``immutable=1``, which together hid uncheckpointed WAL writes.
+    """
+    from pollypm.storage.product_state import (
+        ProductBrokenError,
+        set_product_state_broken,
+    )
+    from pollypm.storage.state import StateStore
+    from pollypm.work.service_queries import _enforce_product_state_gate
+
+    db = tmp_path / "ws.db"
+    store = StateStore(db)
+    try:
+        # First call: workspace is healthy.
+        _enforce_product_state_gate(labels=[], db_path=db)
+
+        # Flip the workspace_state row under WAL — no checkpoint.
+        set_product_state_broken(
+            store,
+            reason="just-flipped",
+            forensics_path="/tmp/x.jsonl",
+        )
+
+        # Immediate retry must observe the flip.
+        with pytest.raises(ProductBrokenError):
+            _enforce_product_state_gate(labels=[], db_path=db)
+    finally:
+        store.close()
 
 
 def test_product_broken_gate_allows_watchdog_labelled_tasks(
@@ -1101,42 +1485,47 @@ class _RecordingStore:
 def test_integration_state_db_missing_routes_to_tier1_healer(
     now: datetime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """End-to-end: a probe that says canonical-state.db is missing
-    fires the tier-1 finding and the cadence handler invokes
-    enable_tracked_project (mocked here)."""
+    """End-to-end: when the canonical workspace state.db is missing,
+    the tier-1 healer recreates it through the work-service factory.
+
+    Post-#339 / #1004 the canonical work DB is the workspace-root
+    ``<workspace_root>/.pollypm/state.db`` — not a per-project file.
+    The healer opens the path through ``create_work_service`` so the
+    schema replay materialises the missing DB.
+    """
     from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence_mod
 
-    repaired: list[str] = []
-
-    def _stub_enable_tracked_project(_cfg_path: Any, project_key: str) -> Any:
-        repaired.append(project_key)
-        return type("_T", (), {"key": project_key, "name": project_key, "path": tmp_path})()
-
-    monkeypatch.setattr(
-        "pollypm.projects.enable_tracked_project", _stub_enable_tracked_project,
-    )
+    canonical_db = tmp_path / "ws" / ".pollypm" / "state.db"
+    assert not canonical_db.exists()
 
     finding = Finding(
         rule=RULE_STATE_DB_MISSING,
         tier=TIER_1,
         project="demo",
         subject="demo",
-        metadata={"project_key": "demo", "project_path": str(tmp_path)},
-        evidence={"project_key": "demo"},
+        metadata={
+            "project_key": "demo",
+            "project_path": str(tmp_path),
+            "canonical_db_path": str(canonical_db),
+        },
+        evidence={
+            "project_key": "demo",
+            "canonical_db_path": str(canonical_db),
+        },
     )
     healer = cadence_mod._TIER1_HEALERS[RULE_STATE_DB_MISSING]
     counters = healer(
         finding, project_key="demo", project_path=tmp_path, config_path=None,
     )
     assert counters["state_db_repaired"] == 1
-    assert "demo" in repaired
-    # Idempotent.
+    assert canonical_db.exists()
+    # Idempotent — re-running on a healthy DB still reports a repair
+    # (no-op open) and doesn't blow up.
     counters2 = healer(
         finding, project_key="demo", project_path=tmp_path, config_path=None,
     )
     assert counters2["state_db_repaired"] == 1
-    # Two repair calls invoked enable_tracked_project twice (idempotent).
-    assert repaired.count("demo") == 2
+    assert canonical_db.exists()
 
 
 def test_integration_rejection_loop_dispatches_via_architect(

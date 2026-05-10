@@ -91,20 +91,27 @@ class _StateDbProbe:
     """One project's canonical-state.db presence probe (#1546 tier-1).
 
     Used by :func:`_gather_state_db_probes` to feed the pure
-    ``state_db_missing`` detector. ``canonical_present`` reports
-    whether ``<project>/.pollypm/state.db`` exists today;
+    ``state_db_missing`` detector. Post-#339 / #1004 the canonical
+    work DB is ``<workspace_root>/.pollypm/state.db`` — a single
+    workspace-scope file shared across all projects. ``canonical_present``
+    therefore reflects workspace-DB presence, not the deprecated
+    ``<project>/.pollypm/state.db`` location (a healthy project after
+    the workspace-root migration has no per-project DB and that's the
+    expected shape, so the pre-#1546 detection rule fired on every tick).
+
     ``legacy_archives_present`` is True iff one or more
-    ``state.db.legacy-*`` files exist (the post-archival shape that
-    distinguishes "the canonical DB was archived away" from "this
-    project never had a DB"). The self-heal action calls
-    ``enable_tracked_project`` regardless of which shape we see — it's
-    idempotent and re-runs the scaffold step.
+    ``<workspace_root>/.pollypm/state.db.legacy-*`` files exist (the
+    post-archival shape that distinguishes "the canonical DB was
+    archived away" from "this workspace never had a DB"). The self-heal
+    action re-creates the workspace DB by opening it through the work
+    service so the schema replay rebuilds the tables.
     """
 
     project_key: str
     project_path: Path
     canonical_present: bool
     legacy_archives_present: bool
+    canonical_db_path: Path | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -1286,30 +1293,93 @@ def _self_heal_state_db_missing(
     config_path: Path | None = None,
     **_: Any,
 ) -> dict[str, int]:
-    """#1546 — re-run the tracker scaffold for projects whose canonical
-    state.db is missing.
+    """#1546 — re-create the canonical workspace state.db when it's missing.
 
-    Calls :func:`pollypm.projects.enable_tracked_project` to repair the
-    scaffold; the helper is idempotent — it re-detects project kind,
-    re-emits the issue tracker, and writes the config back.
+    Post-workspace-root migration the canonical work DB lives at
+    ``<workspace_root>/.pollypm/state.db`` (single file shared across
+    all projects, row-level project isolation). Repair opens that DB
+    through :func:`pollypm.work.create_work_service` — the schema
+    replay in ``open_workspace_db`` + ``apply_workspace_pragmas`` runs
+    every CREATE TABLE IF NOT EXISTS, so a missing file is created and
+    populated with the canonical schema. Idempotent: opening an
+    existing healthy DB is a no-op.
+
+    Falls back to :func:`pollypm.projects.enable_tracked_project` only
+    if the resolver couldn't locate a workspace DB (degenerate config) —
+    that path re-emits the per-project issue tracker scaffold.
     """
     counters = {
         "state_db_repaired": 0,
         "state_db_repair_failed": 0,
     }
-    try:
-        from pollypm.config import DEFAULT_CONFIG_PATH
-        from pollypm.projects import enable_tracked_project
 
-        cfg_path = config_path or DEFAULT_CONFIG_PATH
-        enable_tracked_project(cfg_path, project_key)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "audit.watchdog: state_db_missing repair failed for %s",
-            project_key, exc_info=True,
-        )
-        counters["state_db_repair_failed"] += 1
-        return counters
+    # Prefer the workspace-root repair: open the canonical DB so
+    # ``open_workspace_db`` materialises it on disk.
+    canonical_db: Path | None = None
+    finding_evidence = finding.evidence or {}
+    raw_path = finding_evidence.get("canonical_db_path") or (finding.metadata or {}).get(
+        "canonical_db_path"
+    )
+    if isinstance(raw_path, str) and raw_path:
+        try:
+            canonical_db = Path(raw_path)
+        except TypeError:
+            canonical_db = None
+    if canonical_db is None:
+        try:
+            from pollypm.config import load_config
+
+            cfg_path = config_path
+            if cfg_path is None:
+                from pollypm.config import DEFAULT_CONFIG_PATH
+
+                if DEFAULT_CONFIG_PATH.exists():
+                    cfg_path = DEFAULT_CONFIG_PATH
+            cfg = load_config(cfg_path) if cfg_path else None
+            from pollypm.work.db_resolver import resolve_work_db_path
+
+            canonical_db = resolve_work_db_path(config=cfg)
+        except Exception:  # noqa: BLE001
+            canonical_db = None
+
+    repaired_via_workspace = False
+    if canonical_db is not None:
+        try:
+            canonical_db.parent.mkdir(parents=True, exist_ok=True)
+            from pollypm.work import create_work_service
+
+            svc = create_work_service(
+                db_path=canonical_db,
+                project_path=canonical_db.parent.parent,
+            )
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+            repaired_via_workspace = canonical_db.exists()
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "audit.watchdog: workspace state.db open failed at %s",
+                canonical_db, exc_info=True,
+            )
+
+    if not repaired_via_workspace:
+        # Fallback: re-run the per-project tracker scaffold so the
+        # legacy code path still has an effect even when the workspace
+        # resolver can't find a target.
+        try:
+            from pollypm.config import DEFAULT_CONFIG_PATH
+            from pollypm.projects import enable_tracked_project
+
+            cfg_path = config_path or DEFAULT_CONFIG_PATH
+            enable_tracked_project(cfg_path, project_key)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "audit.watchdog: state_db_missing repair failed for %s",
+                project_key, exc_info=True,
+            )
+            counters["state_db_repair_failed"] += 1
+            return counters
     counters["state_db_repaired"] += 1
     try:
         from pollypm.audit import emit as _audit_emit
@@ -1373,6 +1443,7 @@ def _maybe_dispatch_to_operator(
     *,
     project_path: Path | None,
     now: datetime,
+    config_path: Path | None = None,
 ) -> str:
     """Tier-3 dispatch: route a finding to the operator's inbox.
 
@@ -1428,18 +1499,14 @@ def _maybe_dispatch_to_operator(
         or f"watchdog: {finding.rule} on {finding.project}/{finding.subject}"
     )[:200]
 
-    # Emit the audit event BEFORE the inbox write so the throttle window
-    # is engaged even on inbox-write failure.
+    # #1546 — try the inbox write first and only emit the throttle /
+    # success audit on the success path. If we throttled on a failure
+    # the next tick would see the audit row, refuse to retry, and we'd
+    # ship a heartbeat that *thinks* it dispatched but actually wrote
+    # no inbox row. On failure we emit a distinct
+    # ``tier3_dispatch_failed`` event so forensic reads can see the
+    # attempt without poisoning the throttle window.
     inbox_task_id: str | None = None
-    emit_operator_dispatched(
-        project=finding.project,
-        finding_type=finding.rule,
-        subject=finding.subject,
-        inbox_task_id=None,
-        dedup_key=dedup_key,
-        project_path=project_path,
-    )
-
     try:
         inbox_task_id = _create_operator_inbox_task(
             project_key=finding.project,
@@ -1447,18 +1514,60 @@ def _maybe_dispatch_to_operator(
             subject=subject_text,
             body=body,
             dedup_key=dedup_key,
+            config_path=config_path,
         )
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "audit.watchdog: operator inbox write failed for %s/%s",
             finding.rule, finding.project, exc_info=True,
         )
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_WATCHDOG_TIER3_DISPATCH_FAILED
+
+            _audit_emit(
+                event=EVENT_WATCHDOG_TIER3_DISPATCH_FAILED,
+                project=finding.project,
+                subject=finding.subject,
+                actor="audit_watchdog",
+                metadata={
+                    "finding_type": finding.rule,
+                    "dedup_key": dedup_key,
+                    "error": type(exc).__name__,
+                },
+                project_path=project_path,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: tier3_dispatch_failed emit raised",
+                exc_info=True,
+            )
         return "send_failed"
     if inbox_task_id is None:
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_WATCHDOG_TIER3_DISPATCH_FAILED
+
+            _audit_emit(
+                event=EVENT_WATCHDOG_TIER3_DISPATCH_FAILED,
+                project=finding.project,
+                subject=finding.subject,
+                actor="audit_watchdog",
+                metadata={
+                    "finding_type": finding.rule,
+                    "dedup_key": dedup_key,
+                    "error": "inbox_task_id_none",
+                },
+                project_path=project_path,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit.watchdog: tier3_dispatch_failed emit raised",
+                exc_info=True,
+            )
         return "send_failed"
-    # Re-emit with the inbox_task_id captured for forensics. The throttle
-    # already engaged from the first emit; the second row is the canonical
-    # record and the first is a precursor that operators can ignore.
+    # Inbox write succeeded — emit the canonical operator_dispatched
+    # row that engages the throttle window for the next tick.
     emit_operator_dispatched(
         project=finding.project,
         finding_type=finding.rule,
@@ -1477,6 +1586,7 @@ def _create_operator_inbox_task(
     subject: str,
     body: str,
     dedup_key: str,
+    config_path: Path | None = None,
 ) -> str | None:
     """Materialise the operator inbox task. Returns ``task_id`` on success.
 
@@ -1485,6 +1595,13 @@ def _create_operator_inbox_task(
     store, enqueues a notify message with the dedup_key, then creates
     the work-service task with ``roles.operator='user'`` and the
     ``notify`` label. Any failure raises and the caller logs it.
+
+    ``config_path`` (#1546 fix) — threads the active cadence config so
+    alternate-config heartbeat runs route the inbox task to the right
+    workspace DB. Pre-fix this called ``_resolve_db_path`` without any
+    config and a heartbeat run with ``--config /path/to/alt.toml``
+    would write inbox rows to whichever DB ``DEFAULT_CONFIG_PATH``
+    happened to name.
     """
     from pollypm.inbox_dedup import (
         bump_dedup_message,
@@ -1493,9 +1610,21 @@ def _create_operator_inbox_task(
     )
     from pollypm.store import SQLAlchemyStore
     from pollypm.work import create_work_service
-    from pollypm.work.cli import _resolve_db_path
+    from pollypm.work.db_resolver import resolve_work_db_path
 
-    db_path = _resolve_db_path(".pollypm/state.db", project=project_key)
+    resolved_config: Any | None = None
+    if config_path is not None:
+        try:
+            from pollypm.config import load_config
+
+            resolved_config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            resolved_config = None
+    db_path = resolve_work_db_path(
+        ".pollypm/state.db",
+        project=project_key,
+        config=resolved_config,
+    )
     store = SQLAlchemyStore(f"sqlite:///{db_path}")
     payload = {
         "actor": "audit_watchdog",
@@ -1580,16 +1709,51 @@ def _create_operator_inbox_task(
 # ---------------------------------------------------------------------------
 
 
-def _gather_state_db_probes(*, services: Any) -> list[_StateDbProbe]:
+def _gather_state_db_probes(
+    *,
+    services: Any,
+    config: Any | None = None,
+) -> list[_StateDbProbe]:
     """Probe each known project for canonical-state.db presence (#1546).
 
     Returns one descriptor per project. The pure
     :func:`_detect_state_db_missing` decides whether to fire; the
-    self-heal action calls :func:`enable_tracked_project` for any
-    project whose canonical DB is absent.
+    self-heal action repairs by opening the workspace DB through the
+    work service.
+
+    Post-workspace-root migration (#339 / #1004): the canonical work
+    DB is ``<workspace_root>/.pollypm/state.db`` — a single file shared
+    across all known projects. We resolve it once per tick via
+    :func:`pollypm.work.db_resolver.resolve_work_db_path` (the same
+    source of truth ``pm task list`` and the cockpit use) so the probe
+    can't drift from the resolver.
     """
+    from pollypm.work.db_resolver import resolve_work_db_path
+
     probes: list[_StateDbProbe] = []
     known = getattr(services, "known_projects", None) or ()
+    # Resolve the canonical workspace DB path once. ``resolve_work_db_path``
+    # falls back to a cwd-relative default when no config is loadable —
+    # we still want a valid path object for the probe so the detector
+    # has something to report.
+    services_config = getattr(services, "config", None)
+    resolved_config = config if config is not None else services_config
+    try:
+        canonical_db = resolve_work_db_path(config=resolved_config)
+    except Exception:  # noqa: BLE001
+        canonical_db = None
+    canonical_present = bool(canonical_db and canonical_db.exists())
+    legacy_archives_present = False
+    if canonical_db is not None:
+        try:
+            workspace_dir = canonical_db.parent
+            if workspace_dir.exists():
+                legacy_archives_present = any(
+                    workspace_dir.glob("state.db.legacy-*")
+                )
+        except OSError:
+            legacy_archives_present = False
+
     for project in known:
         project_key = getattr(project, "key", None) or getattr(
             project, "name", None,
@@ -1601,21 +1765,12 @@ def _gather_state_db_probes(*, services: Any) -> list[_StateDbProbe]:
             project_path = Path(project_path_raw)
         except TypeError:
             continue
-        canonical = project_path / ".pollypm" / "state.db"
-        legacy_archives_present = False
-        try:
-            pollypm_dir = project_path / ".pollypm"
-            if pollypm_dir.exists():
-                legacy_archives_present = any(
-                    pollypm_dir.glob("state.db.legacy-*")
-                )
-        except OSError:
-            legacy_archives_present = False
         probes.append(_StateDbProbe(
             project_key=project_key,
             project_path=project_path,
-            canonical_present=canonical.exists(),
+            canonical_present=canonical_present,
             legacy_archives_present=legacy_archives_present,
+            canonical_db_path=canonical_db,
         ))
     return probes
 
@@ -1770,6 +1925,7 @@ def _scan_one_project(
                 finding,
                 project_path=project_path,
                 now=now,
+                config_path=config_path,
             )
             if op_outcome == "dispatched":
                 counters["operator_dispatches_sent"] += 1
@@ -1884,8 +2040,15 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
             )
             plan_missing_clears = []
         # #1546 — probe canonical-state.db presence once per tick.
+        # The probe resolves the workspace-root DB via the work-service
+        # resolver; we hand it ``services.config`` (when the runtime
+        # services bundle exposes one) so test-isolated configs route
+        # through the same source of truth.
         try:
-            state_db_probes = _gather_state_db_probes(services=services)
+            state_db_probes = _gather_state_db_probes(
+                services=services,
+                config=getattr(services, "config", None),
+            )
         except Exception:  # noqa: BLE001
             logger.debug(
                 "audit.watchdog: state-db-probe failed", exc_info=True,

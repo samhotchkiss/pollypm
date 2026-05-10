@@ -1793,6 +1793,7 @@ class CockpitRouter:
         project_path = getattr(project, "path", None)
         if not isinstance(project_path, Path):
             return [], False
+        from pollypm.notify_task import is_notify_inbox_task
         from pollypm.plan_presence import has_acceptable_plan
         from pollypm.work import create_work_service
         from pollypm.work.project_aliases import project_storage_aliases
@@ -1857,12 +1858,26 @@ class CockpitRouter:
         # Codex review (PR #1557) — "first DB with matching rows wins".
         # Mirror ``cockpit_ui._dashboard_gather_tasks``'s iteration shape:
         # walk candidates in order (canonical → legacy) and STOP as soon
-        # as one yields any task rows, only falling back to the next
-        # candidate when the current DB is empty. The earlier #1542 fix
-        # walked every candidate and unioned rows, which reintroduced
-        # the same split-brain it was trying to repair: a clean
-        # canonical workspace DB padded by stale ``on_hold`` rows still
-        # sitting in the legacy per-project DB → wrong rail glyph.
+        # as one yields any real-work rows, only falling back to the next
+        # candidate when the current DB is empty (or notify-only). The
+        # earlier #1542 fix walked every candidate and unioned rows,
+        # which reintroduced the same split-brain it was trying to
+        # repair: a clean canonical workspace DB padded by stale
+        # ``on_hold`` rows still sitting in the legacy per-project DB →
+        # wrong rail glyph.
+        #
+        # Codex re-review of PR #1557 — notify-only canonical DBs must
+        # not latch the gate. ``is_notify_inbox_task`` (rejection
+        # feedback, plan-review handoff, supervisor alerts, …) marks
+        # rows that are addressed to the user and carry no node-level
+        # transition affordance. The dashboard already filters them
+        # BEFORE deciding whether a DB has pipeline rows
+        # (cf. ``cockpit_ui._dashboard_gather_tasks`` lines ~12283 /
+        # ~12367). The rail must mirror that filter: a canonical DB
+        # holding only notify rows + a legacy DB with real paused work
+        # would otherwise have the dashboard fall back (correct
+        # ``on_hold`` glyph) while the rail stops at canonical and
+        # rolls up ``WORKING`` — mismatched glyph and dashboard.
         for db_path in candidate_db_paths:
             try:
                 work = create_work_service(
@@ -1883,6 +1898,14 @@ class CockpitRouter:
                         for task in work.list_tasks(project=alias):
                             tid = getattr(task, "task_id", None)
                             if tid and tid in seen_ids:
+                                continue
+                            # Skip notify-shaped rows BEFORE the gate /
+                            # ``seen_ids``. Mirrors the dashboard: notify
+                            # tids are intentionally NOT added to the
+                            # dedup set so a same-tid real-work row in a
+                            # later DB can still surface (defensive
+                            # against legacy/canonical drift).
+                            if is_notify_inbox_task(task):
                                 continue
                             if tid:
                                 seen_ids.add(tid)
@@ -1913,9 +1936,13 @@ class CockpitRouter:
                         close()
                     except Exception:  # noqa: BLE001
                         pass
-            # First DB with matching rows wins — break only AFTER the
-            # service is closed so the legacy candidate doesn't pad the
-            # canonical row set on the next loop iteration.
+            # First DB with matching real-work rows wins — break only
+            # AFTER the service is closed so the legacy candidate
+            # doesn't pad the canonical row set on the next loop
+            # iteration. ``db_tasks`` already excludes notify-shaped
+            # rows (see filter above), so a canonical DB holding only
+            # inbox notifications will fall through to legacy — matching
+            # the dashboard's "filtered rows only" gate.
             if db_tasks:
                 break
 

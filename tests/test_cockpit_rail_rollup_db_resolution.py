@@ -274,6 +274,93 @@ def test_rollup_first_db_with_rows_wins_no_legacy_padding(
     )
 
 
+def test_rollup_falls_through_canonical_with_only_notify_rows(
+    tmp_path: Path,
+) -> None:
+    """Codex re-review of PR #1557 — a canonical workspace-root DB
+    that holds ONLY notification-shaped rows (rejection feedback,
+    plan_review handoff, supervisor alerts) must NOT latch the
+    "first DB with rows wins" gate. The rollup must fall through to
+    the legacy per-project DB and surface its real ``on_hold`` row,
+    so the rail glyph matches the dashboard's "needs attention"
+    state instead of rolling up a green WORKING glyph from inbox
+    notifications.
+    """
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    # Canonical workspace-root DB has ONLY a notify-shaped row —
+    # ``roles.operator = "user"`` is the structural marker for "row
+    # is addressed to the human, not real work" (#1020). Mirrors what
+    # ``pm notify`` / rejection feedback / plan_review handoff write.
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(
+        db_path=workspace_db, project_path=tmp_path,
+    ) as svc:
+        # The ``chat`` flow is what real notify writers use
+        # (cf. ``cli_features/session_runtime.py::notify``); both of
+        # its roles are optional so the worker/reviewer requirement of
+        # the ``standard`` flow doesn't apply. ``operator = "user"`` is
+        # the structural marker `is_notify_inbox_task` looks for, and
+        # the ``notify`` label is the secondary backstop — set both so
+        # the test pins the contract regardless of which signal the
+        # predicate is currently relying on.
+        svc.create(
+            title="Plan ready for review: demo",
+            description="Inbox notification, not a real work task.",
+            type="task",
+            project="demo",
+            flow_template="chat",
+            roles={"operator": "user"},
+            priority="normal",
+            created_by="polly",
+            labels=["notify"],
+        )
+
+    # Legacy per-project DB has a real ``on_hold`` task.
+    legacy_db = project_path / ".pollypm" / "state.db"
+    _seed_held_task_in_db(legacy_db, project_path)
+
+    config = load_config(config_path)
+    project = config.projects["demo"]
+    router = _make_router()
+    tasks, _plan_blocked = router._project_tasks_for_rollup(
+        "demo", project, config=config,
+    )
+
+    statuses = [
+        getattr(getattr(t, "work_status", None), "value", None) for t in tasks
+    ]
+    titles = [getattr(t, "title", None) for t in tasks]
+
+    # The notify-only canonical DB must not gate-latch — fall through
+    # to the legacy DB and surface its real on_hold row.
+    assert "on_hold" in statuses, (
+        "notify-only canonical DB must fall through to legacy real "
+        f"work; got statuses={statuses} titles={titles}"
+    )
+    # And the notify row itself must be filtered out of the rollup.
+    assert "Plan ready for review: demo" not in titles, (
+        "notify-shaped row must be excluded from rollup tasks; "
+        f"got titles={titles}"
+    )
+
+    # End-to-end: the rail rollup should reflect ``on_hold`` (YELLOW)
+    # rather than a green WORKING glyph from the canonical's notify-only
+    # row count.
+    rollups = router._project_state_rollups(config, alerts=[])
+    rollup = rollups.get("demo")
+    assert rollup is not None
+    assert rollup.state is ProjectRailState.YELLOW, (
+        "paused legacy work must roll up to YELLOW even when canonical "
+        f"DB holds only notify rows; got {rollup.state}"
+    )
+
+
 def test_rollup_returns_empty_when_no_db_exists(tmp_path: Path) -> None:
     """A project with neither DB present yields no tasks (and falls
     through to ``ProjectRailState.NONE``) — same as before #1542.

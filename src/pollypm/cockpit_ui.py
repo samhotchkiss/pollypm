@@ -2180,6 +2180,23 @@ class PollyCockpitApp(App[None]):
         # the focus marker doesn't drop off when a previously-selected
         # row (e.g. an expanded project sub-row) leaves the list.
         keys = [item.key for item in nav_items]
+        # #1559 — when compact mode (#1543) drops a project's sub-rows,
+        # a selected ``project:<key>:dashboard`` (or any ``:<sub>`` row)
+        # is no longer in ``keys``. Without this normalization the
+        # fallback below picks the first selectable nav item — typically
+        # Home — which silently moves the focus marker away from the
+        # project the user is actually viewing in the right pane. Snap
+        # the selection up to the parent ``project:<key>`` row when it's
+        # still visible so the rail keeps tracking the right project.
+        if (
+            self.selected_key
+            and self.selected_key not in keys
+            and self.selected_key.startswith("project:")
+            and self.selected_key.count(":") >= 2
+        ):
+            parent_key = ":".join(self.selected_key.split(":", 2)[:2])
+            if parent_key in keys:
+                self.selected_key = parent_key
         if self.selected_key == "settings":
             selected_key = None
         elif self.selected_key in keys:

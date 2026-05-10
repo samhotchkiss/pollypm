@@ -1117,6 +1117,12 @@ def _revive_rail_daemon_if_dead(config_path: Path) -> None:
             state_db_path=cfg.project.state_db,
             pid_path=pid_path,
             last_revival_at=_LAST_CRON_RAIL_REVIVAL_AT,
+            # #1556 review: cron must NOT spawn a daemon on missing_pid
+            # — the cockpit may be hosting the rail in-process. Cron
+            # still acts on dead_process / stuck_no_tick (those imply
+            # a daemon WAS recorded and lost, which doesn't happen in
+            # cockpit-hosted mode).
+            cron=True,
         )
     except Exception:  # noqa: BLE001
         return

@@ -86,11 +86,13 @@ from __future__ import annotations
 import logging
 import os
 import signal
+import subprocess
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +207,97 @@ def _pid_is_alive(pid: int) -> bool:
     return True
 
 
+def _read_pid_command_line(pid: int) -> str | None:
+    """Return the full command line of ``pid`` as a single string.
+
+    Used by :func:`_pid_matches_daemon` to verify that a recorded PID is
+    still our rail daemon process — catching the PID-reuse hazard where
+    the original daemon died and the kernel reassigned its PID to an
+    unrelated user process. Without this check, the supervisor would
+    happily SIGTERM whatever happened to land at that number.
+
+    Strategy:
+    1. On Linux, read ``/proc/<pid>/cmdline`` directly. NUL-separated
+       argv joined with spaces. Cheapest and avoids forking ``ps``.
+    2. On macOS (no ``/proc``) or if the proc read fails, shell out to
+       ``ps -p <pid> -o args=`` — portable to both platforms and
+       returns the full argv as a single column.
+    3. Returns ``None`` on any error (caller treats unknown identity
+       as "not our daemon" and skips signaling — fail-safe).
+    """
+    if pid <= 0:
+        return None
+
+    proc_cmdline = Path(f"/proc/{pid}/cmdline")
+    try:
+        if proc_cmdline.exists():
+            raw = proc_cmdline.read_bytes()
+            if raw:
+                # cmdline is NUL-separated argv; join with space for matching.
+                return raw.replace(b"\x00", b" ").decode("utf-8", "replace").strip()
+            # Empty cmdline → kernel thread or zombie; not our daemon.
+            return None
+    except OSError:
+        # Fall through to ps fallback.
+        pass
+
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "args="],
+            capture_output=True, text=True, check=False, timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    text = (result.stdout or "").strip()
+    return text or None
+
+
+def _pid_matches_daemon(pid: int, config_path: Path | None) -> bool:
+    """True iff ``pid``'s command line looks like our rail daemon.
+
+    Matches ``pollypm.rail_daemon`` (or the path-form ``pollypm/rail_daemon``
+    in case ``ps`` reports the script path rather than the ``-m`` form)
+    in the argv. When ``config_path`` is provided AND the daemon's argv
+    carries an explicit ``--config <path>``, the path must also match —
+    a stray daemon for a different workspace must NOT be killed by this
+    supervisor.
+
+    A daemon spawned with no ``--config`` flag (using its default) still
+    matches when ``config_path`` is the workspace default — we accept
+    the absence of an explicit ``--config`` argument as compatible with
+    any config_path so old daemons predating the explicit flag still
+    register as ours.
+
+    Returns ``False`` on any read error — callers must treat that as
+    "not our daemon" and skip signaling. Better to leave a possibly-stale
+    PID file alone than to SIGTERM an innocent process.
+    """
+    cmdline = _read_pid_command_line(pid)
+    if not cmdline:
+        return False
+    # Must look like the rail_daemon entry point. Both forms appear in
+    # the wild: ``-m pollypm.rail_daemon`` (our spawn) and the eager
+    # ``python /path/to/pollypm/rail_daemon.py`` form some launchers
+    # produce on macOS.
+    if "pollypm.rail_daemon" not in cmdline and "pollypm/rail_daemon" not in cmdline:
+        return False
+    if config_path is None:
+        return True
+    # Only enforce config match when the daemon actually carries a
+    # ``--config`` flag. A daemon launched with the implicit default
+    # is compatible with any caller pointing at that same default.
+    if "--config" not in cmdline:
+        return True
+    expected = str(config_path)
+    # Conservative substring match — argv joined by spaces, paths can
+    # contain spaces, so we accept any occurrence of the resolved
+    # config path in the cmdline. A mismatched workspace's path won't
+    # appear in our daemon's argv.
+    return expected in cmdline
+
+
 def _parse_iso_age_seconds(iso_text: str | None, *, now: datetime | None = None) -> float | None:
     """Return ``now - iso_text`` in seconds, or ``None`` on parse error.
 
@@ -236,6 +329,7 @@ def diagnose_rail_daemon(
     now: datetime | None = None,
     stale_tick_seconds: float = DEFAULT_STALE_TICK_SECONDS,
     throttle_seconds: float = DEFAULT_REVIVAL_THROTTLE_SECONDS,
+    config_path: Path | None = None,
 ) -> RevivalDecision:
     """Decide whether the rail daemon needs reviving — pure function.
 
@@ -276,7 +370,9 @@ def diagnose_rail_daemon(
         if elapsed < throttle_seconds:
             # Still inspect process state so the decision carries a
             # useful diagnosis, but the state is sticky to throttled.
-            sub_state = _classify_state(pid, last_age, stale_tick_seconds)
+            sub_state = _classify_state(
+                pid, last_age, stale_tick_seconds, config_path=config_path,
+            )
             return RevivalDecision(
                 state="throttled",
                 pid=pid,
@@ -287,7 +383,9 @@ def diagnose_rail_daemon(
                 ),
             )
 
-    state = _classify_state(pid, last_age, stale_tick_seconds)
+    state = _classify_state(
+        pid, last_age, stale_tick_seconds, config_path=config_path,
+    )
     reason = _explain(state, pid, last_age, stale_tick_seconds)
     return RevivalDecision(
         state=state,
@@ -301,11 +399,27 @@ def _classify_state(
     pid: int | None,
     last_tick_age: float | None,
     stale_tick_seconds: float,
+    *,
+    config_path: Path | None = None,
 ) -> str:
-    """Map (pid, last_tick_age) → state label (no throttling concerns)."""
+    """Map (pid, last_tick_age) → state label (no throttling concerns).
+
+    PID identity is verified before any "alive but stale" classification
+    can promote a PID to a kill candidate: if the live PID's argv does
+    not look like our rail daemon (likely PID reuse after the original
+    daemon died), we classify it as ``dead_process`` so the upstream
+    supervisor SKIPS the SIGTERM step entirely. Killing the wrong PID
+    would terminate an unrelated user process — that's worse than
+    failing to revive a daemon for one extra cycle.
+    """
     if pid is None:
         return "missing_pid"
     if not _pid_is_alive(pid):
+        return "dead_process"
+    # The PID is alive — but is it OUR daemon? A PID-reuse hazard
+    # exists when the original daemon died and the kernel handed the
+    # number to an unrelated process. Verify identity via the cmdline.
+    if not _pid_matches_daemon(pid, config_path):
         return "dead_process"
     if last_tick_age is not None and last_tick_age > stale_tick_seconds:
         return "stuck_no_tick"
@@ -355,17 +469,34 @@ def _terminate_with_grace(
     *,
     grace_seconds: float = DEFAULT_SIGTERM_GRACE_SECONDS,
     sleep_fn: Callable[[float], None] = time.sleep,
+    config_path: Path | None = None,
 ) -> str:
     """SIGTERM, wait, SIGKILL if needed. Mirrors ``rail_daemon_reaper``.
 
     Returns the signal label that ultimately took, or ``"already_gone"``
-    if the process was gone before we sent anything, or ``"denied"`` if
-    we lacked permission. ``"none"`` if ``pid <= 0``.
+    if the process was gone before we sent anything, ``"denied"`` if
+    we lacked permission, ``"identity_mismatch"`` if the PID's cmdline
+    does not look like our daemon (PID-reuse hazard — refuse to
+    signal), or ``"none"`` if ``pid <= 0``.
+
+    The identity check is a SAFETY GUARD: it's possible for the original
+    daemon to die between diagnosis and termination, and for the kernel
+    to immediately reassign that PID to an unrelated process. SIGTERMing
+    that process would kill a user's editor / shell / whatever — far
+    worse than failing to revive the daemon. We re-verify identity here
+    in case the diagnose layer was bypassed or raced.
     """
     if pid <= 0:
         return "none"
     if not _pid_is_alive(pid):
         return "already_gone"
+    if not _pid_matches_daemon(pid, config_path):
+        logger.warning(
+            "rail_daemon_supervisor: refusing to signal pid=%d — cmdline "
+            "does not match our rail daemon (PID-reuse safety guard)",
+            pid,
+        )
+        return "identity_mismatch"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -384,6 +515,18 @@ def _terminate_with_grace(
             return "SIGTERM"
         sleep_fn(poll_interval)
 
+    # Re-verify identity before SIGKILL: it's possible (rare but real)
+    # that our daemon SIGTERM-exited and the PID was reused by an
+    # unrelated process within the grace window. SIGKILL is unblockable
+    # so the cost of a wrong target is permanent.
+    if not _pid_matches_daemon(pid, config_path):
+        logger.warning(
+            "rail_daemon_supervisor: pid=%d no longer matches daemon "
+            "cmdline at SIGKILL stage; treating as already_gone",
+            pid,
+        )
+        return "SIGTERM"
+
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -391,6 +534,122 @@ def _terminate_with_grace(
     except PermissionError:
         return "denied"
     return "SIGKILL"
+
+
+@contextmanager
+def _supervisor_lock(
+    pid_path: Path,
+    *,
+    timeout_seconds: float = 5.0,
+) -> Iterator[bool]:
+    """Acquire an exclusive cross-process lock around a revival critical section.
+
+    The supervisor's diagnose → kill → unlink → spawn sequence is NOT
+    atomic. Without a lock, two callers (cockpit periodic timer + cron
+    ``pm heartbeat`` + a manual ``pm up``) can race: both diagnose
+    "missing PID", one spawns successfully, and the second proceeds to
+    unlink the freshly-written PID file and spawn ANOTHER daemon. The
+    field outcome is two daemons running, both ticking the same DB —
+    exactly the contention the rail daemon's PID-file lock was meant
+    to prevent (but at the spawn-attempt layer, before the new daemon
+    even gets to claim the PID file).
+
+    Implementation: ``fcntl.flock`` (BSD-style advisory lock) on a
+    sibling lockfile ``<pid_path>.supervisor.lock``. ``flock`` is per-fd,
+    so each process gets its own contention point and the kernel
+    serializes acquisitions. Timeout via non-blocking acquire + sleep
+    polling rather than ``LOCK_EX`` blocking, so a runaway holder can't
+    pin the supervisor forever.
+
+    Yields ``True`` when the lock was acquired, ``False`` when the
+    timeout expired. Callers MUST treat ``False`` as "another supervisor
+    is active; do nothing this cycle" — re-running diagnosis after a
+    timeout would invite the same race we're trying to prevent.
+    """
+    lock_path = pid_path.with_name(pid_path.name + ".supervisor.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # If we can't even create the parent, fall through; the open
+        # below will raise and we'll yield False.
+        pass
+
+    try:
+        import fcntl  # POSIX-only; supervisor is intended for macOS / Linux.
+    except ImportError:
+        # Non-POSIX: fall back to a best-effort O_EXCL lockfile pattern.
+        yield from _supervisor_lock_oexcl(lock_path, timeout_seconds)
+        return
+
+    fd: int | None = None
+    try:
+        fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        logger.debug("supervisor lock open failed: %s", exc)
+        yield False
+        return
+
+    acquired = False
+    deadline = time.monotonic() + timeout_seconds
+    poll = 0.05
+    try:
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(poll)
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            except OSError:
+                pass
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def _supervisor_lock_oexcl(
+    lock_path: Path,
+    timeout_seconds: float,
+) -> Iterator[bool]:
+    """O_EXCL fallback for platforms without fcntl (mainly Windows).
+
+    Less robust than flock — a crashed holder leaves a stale file that
+    must time out — but the supervisor's flock path is the supported
+    one. This exists so the import doesn't blow up on hypothetical
+    non-POSIX environments.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    fd: int | None = None
+    while True:
+        try:
+            fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            break
+        except FileExistsError:
+            if time.monotonic() >= deadline:
+                yield False
+                return
+            time.sleep(0.05)
+    try:
+        yield True
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            lock_path.unlink(missing_ok=True)
+        except OSError:
+            pass
 
 
 def _emit_revival_audit(
@@ -447,6 +706,8 @@ def check_and_revive_rail_daemon(
     spawn_fn: Callable[[Path], None] | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
     emit_audit: bool = True,
+    cron: bool = False,
+    lock_timeout_seconds: float = 5.0,
 ) -> RevivalResult:
     """Diagnose the rail daemon and respawn it if it's dead / stuck.
 
@@ -475,6 +736,20 @@ def check_and_revive_rail_daemon(
         emit_audit: when ``False``, skip the ``daemon.revived`` audit
             emit (used by tests that don't want to write to the real
             audit log).
+        cron: when ``True``, the caller is the ``pm heartbeat`` cron
+            path (NOT the cockpit periodic timer). In that mode, a
+            ``missing_pid`` decision is downgraded to a no-op: the
+            cockpit may be hosting an in-process ``HeartbeatRail``
+            (which leaves no PID file by design), and spawning a
+            headless daemon now would create a second concurrent
+            ticker. Cron still acts on ``dead_process`` / ``stuck_no_tick``
+            — those mean a daemon WAS recorded but isn't running, which
+            never happens under cockpit-hosted mode.
+        lock_timeout_seconds: how long to wait for the supervisor lock
+            before giving up this cycle. The lock prevents a
+            concurrent-revival race that would otherwise spawn two
+            daemons. Default 5s — covers the SIGTERM grace + spawn
+            latency without making the caller block forever.
 
     Returns:
         :class:`RevivalResult` carrying the diagnosis, whether a spawn
@@ -487,6 +762,7 @@ def check_and_revive_rail_daemon(
         now=now,
         stale_tick_seconds=stale_tick_seconds,
         throttle_seconds=throttle_seconds,
+        config_path=config_path,
     )
 
     if not decision.needs_revival:
@@ -503,86 +779,187 @@ def check_and_revive_rail_daemon(
             kill_signal=None,
         )
 
+    # Cron-path guard: a missing PID file from cron MAY mean the cockpit
+    # is hosting the rail in-process (no headless daemon ever existed).
+    # Spawning a daemon now would race the cockpit's in-thread ticker.
+    # Cron only acts on dead_process / stuck_no_tick — those imply a
+    # daemon was recorded and lost, which doesn't happen in
+    # cockpit-hosted mode (it never writes a PID file).
+    if cron and decision.state == "missing_pid":
+        logger.debug(
+            "rail_daemon_supervisor: cron skipping missing_pid revival "
+            "(cockpit may be hosting rail in-process)",
+        )
+        return RevivalResult(
+            decision=decision,
+            revived=False,
+            spawn_error=None,
+            killed_pid=None,
+            kill_signal=None,
+        )
+
     logger.warning(
         "rail_daemon_supervisor: reviving heartbeat — %s", decision.reason,
     )
 
-    # Step 1: clean up the dead/stuck process. ``stuck_no_tick`` means
-    # the PID is alive but unresponsive; we SIGTERM it so the new
-    # daemon can claim the PID file. ``dead_process`` and
-    # ``missing_pid`` skip this entirely.
-    killed_pid: int | None = None
-    kill_signal: str | None = None
-    if decision.state == "stuck_no_tick" and decision.pid is not None:
-        kill_signal = _terminate_with_grace(decision.pid, sleep_fn=sleep_fn)
-        if kill_signal in ("SIGTERM", "SIGKILL", "already_gone"):
-            killed_pid = decision.pid
-        elif kill_signal == "denied":
-            # Couldn't kill it — bail without spawning so we don't end
-            # up with two daemons fighting for the same DB.
-            logger.warning(
-                "rail_daemon_supervisor: cannot signal pid=%d (permission "
-                "denied); skipping respawn — manual intervention required",
-                decision.pid,
+    # Wrap the kill/unlink/spawn critical section in a cross-process
+    # lock so two concurrent supervisors (cockpit + cron, or two
+    # consecutive cron ticks while a previous spawn is in flight) can't
+    # produce duplicate daemons. Without this, both callers would
+    # diagnose missing/dead, one spawns, the other unlinks the new
+    # PID file and spawns again — leaving two tickers fighting over
+    # the same DB.
+    with _supervisor_lock(pid_path, timeout_seconds=lock_timeout_seconds) as locked:
+        if not locked:
+            logger.info(
+                "rail_daemon_supervisor: another supervisor holds the lock "
+                "(%.1fs timeout); skipping this cycle",
+                lock_timeout_seconds,
             )
-            result = RevivalResult(
+            return RevivalResult(
                 decision=decision,
                 revived=False,
-                spawn_error="signal_denied",
+                spawn_error="lock_busy",
                 killed_pid=None,
-                kill_signal=kill_signal,
+                kill_signal=None,
             )
-            if emit_audit:
-                _emit_revival_audit(
-                    decision=decision,
+
+        # Re-check liveness inside the lock. Another supervisor that
+        # held the lock when we started waiting may have already
+        # spawned a fresh daemon — in that case the PID file now points
+        # at a live, healthy process and we must NOT proceed. Without
+        # this re-check we'd diagnose-stale + spawn anyway and end up
+        # with two daemons.
+        recheck = diagnose_rail_daemon(
+            pid_path=pid_path,
+            last_tick_iso=last_tick_iso,
+            # last_revival_at is intentionally None here so the recheck
+            # reflects current process state without re-applying the
+            # caller's throttle window.
+            last_revival_at=None,
+            now=now,
+            stale_tick_seconds=stale_tick_seconds,
+            throttle_seconds=throttle_seconds,
+            config_path=config_path,
+        )
+        if not recheck.needs_revival:
+            logger.info(
+                "rail_daemon_supervisor: post-lock recheck shows %s — "
+                "another supervisor must have already revived; standing down",
+                recheck.state,
+            )
+            return RevivalResult(
+                decision=recheck,
+                revived=False,
+                spawn_error=None,
+                killed_pid=None,
+                kill_signal=None,
+            )
+
+        # Use the recheck's PID (which reflects current state) for any
+        # signaling — the original ``decision.pid`` may be stale.
+        diagnosed_pid = recheck.pid
+
+        # Step 1: clean up the dead/stuck process. ``stuck_no_tick``
+        # means the PID is alive but unresponsive; SIGTERM it so the
+        # new daemon can claim the PID file. ``dead_process`` and
+        # ``missing_pid`` skip this entirely.
+        killed_pid: int | None = None
+        kill_signal: str | None = None
+        if recheck.state == "stuck_no_tick" and diagnosed_pid is not None:
+            kill_signal = _terminate_with_grace(
+                diagnosed_pid, sleep_fn=sleep_fn, config_path=config_path,
+            )
+            if kill_signal in ("SIGTERM", "SIGKILL", "already_gone"):
+                killed_pid = diagnosed_pid
+            elif kill_signal in ("denied", "identity_mismatch"):
+                # Couldn't (or refused to) kill it — bail without
+                # spawning so we don't end up with two daemons or
+                # corrupt an unrelated user process.
+                err_label = (
+                    "signal_denied" if kill_signal == "denied"
+                    else "identity_mismatch"
+                )
+                logger.warning(
+                    "rail_daemon_supervisor: skipping respawn for pid=%d "
+                    "(%s)", diagnosed_pid, err_label,
+                )
+                result = RevivalResult(
+                    decision=recheck,
                     revived=False,
-                    spawn_error="signal_denied",
+                    spawn_error=err_label,
                     killed_pid=None,
                     kill_signal=kill_signal,
                 )
-            return result
+                if emit_audit:
+                    _emit_revival_audit(
+                        decision=recheck,
+                        revived=False,
+                        spawn_error=err_label,
+                        killed_pid=None,
+                        kill_signal=kill_signal,
+                    )
+                return result
 
-    # Step 2: clear stale PID file. ``rail_daemon._claim_pid_file``
-    # already overwrites stale files but only when the stored PID is
-    # confirmed dead; for ``stuck_no_tick`` we just killed the PID, so
-    # the file we want gone may still claim "alive" between the kill
-    # and the new daemon's first os.kill probe. Belt-and-suspenders.
-    try:
-        if pid_path.exists():
-            pid_path.unlink(missing_ok=True)
-    except OSError as exc:
-        logger.warning(
-            "rail_daemon_supervisor: could not unlink %s: %s — "
-            "_claim_pid_file should still recover", pid_path, exc,
-        )
+        # Step 2: compare-and-unlink. Only unlink the PID file if it
+        # still names the PID we diagnosed (or is unreadable / empty).
+        # If a concurrent supervisor already overwrote it with a fresh
+        # daemon's PID — which we'd see as a different number — we
+        # MUST NOT clobber that file: doing so removes the freshly-
+        # spawned daemon's ownership marker and the next caller will
+        # spawn ANOTHER daemon.
+        try:
+            if pid_path.exists():
+                current_pid = _read_pid(pid_path)
+                if current_pid is None or current_pid == diagnosed_pid:
+                    pid_path.unlink(missing_ok=True)
+                else:
+                    logger.warning(
+                        "rail_daemon_supervisor: pid_path now points at "
+                        "pid=%d (was %s); a concurrent supervisor must "
+                        "have spawned — standing down",
+                        current_pid, diagnosed_pid,
+                    )
+                    return RevivalResult(
+                        decision=recheck,
+                        revived=False,
+                        spawn_error=None,
+                        killed_pid=killed_pid,
+                        kill_signal=kill_signal,
+                    )
+        except OSError as exc:
+            logger.warning(
+                "rail_daemon_supervisor: could not unlink %s: %s — "
+                "_claim_pid_file should still recover", pid_path, exc,
+            )
 
-    # Step 3: spawn the new daemon. Default to the cli helper that
-    # ``pm up`` uses; tests inject a mock.
-    spawner = spawn_fn or _default_spawn_fn()
-    spawn_error: str | None = None
-    try:
-        spawner(config_path)
-    except Exception as exc:  # noqa: BLE001
-        spawn_error = f"{type(exc).__name__}: {exc}"
-        logger.exception("rail_daemon_supervisor: spawn failed")
+        # Step 3: spawn the new daemon. Default to the cli helper that
+        # ``pm up`` uses; tests inject a mock.
+        spawner = spawn_fn or _default_spawn_fn()
+        spawn_error: str | None = None
+        try:
+            spawner(config_path)
+        except Exception as exc:  # noqa: BLE001
+            spawn_error = f"{type(exc).__name__}: {exc}"
+            logger.exception("rail_daemon_supervisor: spawn failed")
 
-    revived = spawn_error is None
-    result = RevivalResult(
-        decision=decision,
-        revived=revived,
-        spawn_error=spawn_error,
-        killed_pid=killed_pid,
-        kill_signal=kill_signal,
-    )
-    if emit_audit:
-        _emit_revival_audit(
-            decision=decision,
+        revived = spawn_error is None
+        result = RevivalResult(
+            decision=recheck,
             revived=revived,
             spawn_error=spawn_error,
             killed_pid=killed_pid,
             kill_signal=kill_signal,
         )
-    return result
+        if emit_audit:
+            _emit_revival_audit(
+                decision=recheck,
+                revived=revived,
+                spawn_error=spawn_error,
+                killed_pid=killed_pid,
+                kill_signal=kill_signal,
+            )
+        return result
 
 
 def _default_spawn_fn() -> Callable[[Path], None]:

@@ -31,7 +31,6 @@ without holding a DB handle.
 from __future__ import annotations
 
 import re
-from typing import Iterable
 
 # Task id pattern: ``<project>/<num>`` where the project is a slug
 # (alphanumeric, underscore, hyphen, dot are all allowed because the

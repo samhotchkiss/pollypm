@@ -2756,11 +2756,16 @@ class Supervisor:
         except Exception:  # noqa: BLE001
             return None
         if project is None:
-            # The task_id may carry a non-canonical project segment
-            # (display name vs slug). The work-service stores tasks
-            # under whatever the caller passed in, so the lookup will
-            # iterate every candidate DB and try the literal id below.
-            project = None
+            # PR #1560 codex-review HIGH-1 — the alert's task-id
+            # project segment is the storage form (display name /
+            # on-disk dir), which can differ from the canonical
+            # config key (``health-coach`` vs ``health_coach``).
+            # Resolve through ``project_storage_aliases`` so a
+            # legacy per-project DB at ``<project>/.pollypm/state.db``
+            # actually gets searched. Without this the lookup returns
+            # None and the alert stays stale forever even though the
+            # task is terminal.
+            project = self._resolve_project_by_alias(project_key)
 
         from pathlib import Path as _Path
 
@@ -2832,6 +2837,40 @@ class Supervisor:
                         close()
                     except Exception:  # noqa: BLE001
                         pass
+        return None
+
+    def _resolve_project_by_alias(self, project_key: str) -> object | None:
+        """Return the configured project whose storage aliases include ``project_key``.
+
+        PR #1560 codex-review HIGH-1 — projects can be configured under
+        a slug key (``health_coach``) while the work-service stores
+        task IDs using a different storage form (``health-coach``,
+        the on-disk directory or display name). When an alert's
+        task-id project segment doesn't match a config key directly,
+        consult the same alias resolver the dashboard uses
+        (``project_storage_aliases``) so we still find the project's
+        on-disk path and walk its legacy ``<project>/.pollypm/state.db``.
+
+        Returns None when no project's alias set contains ``project_key``.
+        Pure best-effort — any exception is swallowed.
+        """
+        if not project_key:
+            return None
+        try:
+            from pollypm.work.project_aliases import project_storage_aliases
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            projects = self.config.projects or {}
+        except Exception:  # noqa: BLE001
+            return None
+        for known_key, project in projects.items():
+            try:
+                aliases = project_storage_aliases(self.config, known_key)
+            except Exception:  # noqa: BLE001
+                continue
+            if project_key in aliases:
+                return project
         return None
 
     def _record_alert_cleared_task_terminal(

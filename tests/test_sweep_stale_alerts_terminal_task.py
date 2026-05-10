@@ -153,7 +153,17 @@ def _seed_task(
 def test_sweep_keeps_alert_when_underlying_task_still_open(
     tmp_path: Path,
 ) -> None:
-    """Alert + still-queued task → sweep leaves the alert alone."""
+    """Alert + still-queued task → sweep leaves the alert alone.
+
+    PR #1560 codex-review MED-1 — the assertion must positively pin
+    "alert remains open", not just "no terminal-task audit fired".
+    Using the ``plan_missing`` family keeps the existing orphan-clear
+    path (which fires on any non-tracked session) from clearing the
+    alert independently of the terminal-task path under test: the
+    #1526 skip-list excludes ``plan_missing`` from orphan-clear, so
+    a still-open alert here proves the terminal-task path itself
+    let the live task alone.
+    """
     config = _config(tmp_path)
     supervisor = Supervisor(config)
     supervisor.ensure_layout()
@@ -161,14 +171,16 @@ def test_sweep_keeps_alert_when_underlying_task_still_open(
     workspace_db = tmp_path / ".pollypm" / "state.db"
     task_id = _seed_task(workspace_db, tmp_path, terminal=False)
 
-    # Raise a stuck_on_task alert on the still-open task. Use a
-    # session_name that's not in the launch plan so the existing
-    # orphan-clear path would also fire — we want to verify the
-    # *terminal-task* path doesn't false-clear before the existing
-    # path runs.
+    # Raise a plan_missing alert that names the still-queued task.
+    # plan_missing is skip-listed in _sweep_stale_alerts (#1526) so
+    # the existing orphan-clear path won't false-pass this test.
     supervisor._msg_store.upsert_alert(
-        "worker_demo", f"stuck_on_task:{task_id}", "warn",
-        f"Task {task_id} has been stuck on operator input for 30 minutes.",
+        "plan_gate-demo", "plan_missing", "warn",
+        (
+            f"Project 'demo' has no approved plan yet — "
+            f"queued task {task_id} is waiting. "
+            f"Run `pm project plan demo` to queue planning."
+        ),
     )
 
     window_map: dict = {}
@@ -180,14 +192,16 @@ def test_sweep_keeps_alert_when_underlying_task_still_open(
     open_pairs = {
         (a.session_name, a.alert_type) for a in supervisor.open_alerts()
     }
-    # The stuck_on_task alert's underlying task is still queued —
-    # the terminal-task path must NOT clear it. (The orphan-clear path
-    # may or may not fire depending on session-tracked status; the
-    # contract this test pins is *terminal-task path lets live tasks
-    # alone*.)
-    # At minimum, the alert was either left open or cleared via the
-    # orphan path with no terminal-task audit event. The audit event
-    # check below is the precise assertion.
+    # Positive assertion: the alert is still open. The terminal-task
+    # path must NOT clear it because the underlying task is still
+    # queued (live).
+    assert ("plan_gate-demo", "plan_missing") in open_pairs, (
+        "terminal-task path must leave alerts alone while the "
+        f"underlying task is still live; open_pairs={open_pairs}"
+    )
+
+    # Independent assertion: no terminal-task audit was emitted —
+    # the alert wasn't cleared via the terminal-task path.
     audit_events = _open_terminal_audit_events(supervisor)
     assert audit_events == [], (
         "terminal-task path must not fire when the underlying task is "
@@ -347,6 +361,182 @@ def test_terminal_clear_handles_plan_missing_via_message_body(
     assert len(audit_events) == 1
     assert audit_events[0]["payload"].get("alert_type") == "plan_missing"
     assert audit_events[0]["payload"].get("task_id") == task_id
+
+
+def _alias_config(tmp_path: Path) -> tuple[PollyPMConfig, Path, str]:
+    """Build a config where the project is registered under a slug
+    config key (``health_coach``) but its on-disk directory / display
+    name uses the hyphenated alias form (``health-coach``).
+
+    The work-service stores ``project`` columns under whatever the
+    caller passes — which is the alias-form ``health-coach`` for
+    tasks created by the per-project tooling, not the underscore
+    config key. Returns ``(config, project_path, alias_project)``.
+    """
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir(parents=True, exist_ok=True)
+    project_path = tmp_path / "projects" / "health-coach"
+    project_path.mkdir(parents=True, exist_ok=True)
+
+    config_key = "health_coach"
+    alias_project = "health-coach"
+
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace_root,
+            workspace_root=workspace_root,
+            base_dir=workspace_root / ".pollypm",
+            logs_dir=workspace_root / ".pollypm/logs",
+            snapshots_dir=workspace_root / ".pollypm/snapshots",
+            state_db=workspace_root / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="claude_controller",
+            failover_enabled=False,
+            failover_accounts=[],
+        ),
+        accounts={
+            "claude_controller": AccountConfig(
+                name="claude_controller",
+                provider=ProviderKind.CLAUDE,
+                email="claude@example.com",
+                home=workspace_root / ".pollypm/homes/claude_controller",
+            ),
+        },
+        sessions={},
+        projects={
+            config_key: KnownProject(
+                key=config_key,
+                path=project_path,
+                # name carries the alias form so project_storage_aliases
+                # surfaces ``health-coach`` for the slug key.
+                name=alias_project,
+                kind=ProjectKind.FOLDER,
+            ),
+        },
+    )
+    return config, project_path, alias_project
+
+
+def test_terminal_clear_resolves_alias_named_project_in_legacy_db(
+    tmp_path: Path,
+) -> None:
+    """Regression for PR #1560 codex-review HIGH-1.
+
+    Before the fix, ``_lookup_task_status`` looked up
+    ``self.config.projects.get(<task-id project segment>)`` using the
+    literal project segment from the alert's task id. When that
+    segment is the storage-form alias (``health-coach``) but the
+    config key is the slug (``health_coach``), the lookup returned
+    None and the per-project legacy DB candidate
+    (``<project_path>/.pollypm/state.db``) was never added — so the
+    terminal task was unreachable and the stale alert stayed open
+    forever. The fix walks ``project_storage_aliases`` to recover
+    the configured project from the alias form.
+
+    Test topology:
+
+    * config key:                  ``health_coach`` (slug)
+    * project ``name`` / on-disk:  ``health-coach`` (alias)
+    * workspace_root DB:           empty / does not exist
+    * per-project legacy DB:       ``<project_path>/.pollypm/state.db``
+      with a terminal ``health-coach/N`` task
+    * alert references             ``health-coach/N``
+    """
+    config, project_path, alias_project = _alias_config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+
+    # Seed the terminal task ONLY in the per-project legacy DB, under
+    # the alias-form project. The workspace-root DB is left untouched
+    # so the only way for the lookup to find the task is via the
+    # per-project candidate path — which requires resolving the
+    # ``health-coach`` task-id segment back to the ``health_coach``
+    # config entry.
+    legacy_db = project_path / ".pollypm" / "state.db"
+    legacy_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(
+        db_path=legacy_db, project_path=project_path,
+    ) as svc:
+        svc._auto_merge_approved_task_branch = lambda _task, **_kwargs: None
+        task = svc.create(
+            title="Plan task",
+            description="A plan-shaped task.",
+            type="task",
+            project=alias_project,  # storage form, not the slug
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        task_id = task.task_id
+        assert task_id.startswith(f"{alias_project}/"), (
+            "test fixture invariant: task_id must carry the alias-form "
+            f"project segment; got {task_id}"
+        )
+        from pollypm.work.models import (
+            Artifact, ArtifactKind, OutputType, WorkOutput,
+        )
+        svc.queue(task_id, "polly")
+        svc.claim(task_id, "worker")
+        svc.node_done(
+            task_id, "worker",
+            WorkOutput(
+                type=OutputType.CODE_CHANGE,
+                summary="Built the plan",
+                artifacts=[
+                    Artifact(
+                        kind=ArtifactKind.COMMIT,
+                        description="seed",
+                        ref="deadbeef0000",
+                    ),
+                ],
+            ),
+        )
+        svc.approve(task_id, "russell")
+
+    # Pre-flight assertion: the lookup itself must resolve the
+    # alias-form project segment to ``done``. This pins the HIGH-1
+    # fix at the unit level so a future regression in
+    # ``_resolve_project_by_alias`` shows up before the integration
+    # surface masks it.
+    status = supervisor._lookup_task_status(alias_project, task_id)
+    assert status == "done", (
+        "alias-form project segment must resolve to the per-project "
+        f"legacy DB and return work_status='done'; got {status!r}"
+    )
+
+    # Integration assertion: an alert keyed on the alias-form task id
+    # must clear via the terminal-task path. Use ``plan_missing`` so
+    # the orphan-clear path is skip-listed and can't false-pass.
+    supervisor._msg_store.upsert_alert(
+        f"plan_gate-{alias_project}", "plan_missing", "warn",
+        (
+            f"Project '{alias_project}' has no approved plan yet — "
+            f"queued task {task_id} is waiting."
+        ),
+    )
+
+    window_map: dict = {}
+    name_by_window: dict = {}
+    supervisor._sweep_stale_alerts(
+        window_map=window_map, name_by_window=name_by_window,
+    )
+
+    open_pairs = {
+        (a.session_name, a.alert_type) for a in supervisor.open_alerts()
+    }
+    assert (f"plan_gate-{alias_project}", "plan_missing") not in open_pairs, (
+        "alert on alias-named project (config key differs from task-id "
+        "project segment) must clear via the terminal-task path once "
+        "the underlying task is terminal in the per-project legacy DB"
+    )
+
+    audit_events = _open_terminal_audit_events(supervisor)
+    assert len(audit_events) == 1
+    assert audit_events[0]["payload"].get("task_id") == task_id
+    assert audit_events[0]["payload"].get("task_status") == "done"
 
 
 def test_existing_skip_list_guards_remain_intact() -> None:

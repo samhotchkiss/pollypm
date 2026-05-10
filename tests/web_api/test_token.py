@@ -60,3 +60,33 @@ def test_load_token_strips_whitespace(tmp_path: Path) -> None:
     path = tmp_path / "api-token"
     path.write_text("padded-token\n", encoding="utf-8")
     assert load_token(path) == "padded-token"
+
+
+def test_pm_serve_does_not_print_existing_token(tmp_path: Path, capsys) -> None:
+    """MED-3 regression: ``pm serve`` previously printed the token
+    every startup, even when it already existed on disk. That leaks
+    the secret into terminal scrollback / log files. Confirm only a
+    location pointer is printed when ``ensure_token`` returns
+    ``generated=False``.
+    """
+    from pollypm.cli_features.web_api import (
+        _print_token_location_only,
+        _print_token_once,
+    )
+
+    # Pre-generated token simulates the second-launch case.
+    token, _ = ensure_token(tmp_path / "api-token")
+
+    # First launch: token IS printed (the operator needs the value).
+    _print_token_once(token, generated=True)
+    first = capsys.readouterr()
+    assert token in first.err
+    assert "Token" in first.err
+
+    # Subsequent launch path: only the location is surfaced. The
+    # token VALUE must not appear in the printed banner.
+    _print_token_location_only(str(tmp_path / "api-token"))
+    second = capsys.readouterr()
+    assert token not in second.err
+    assert "api-token" in second.err
+    assert "regen-token" in second.err

@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Header, Query, Request
 from fastapi.responses import StreamingResponse
 
 from pollypm.web_api.routes._deps import ConfigDep
@@ -32,6 +32,7 @@ router = APIRouter(tags=["Events"])
     },
 )
 def stream_events_endpoint(
+    request: Request,
     config: ConfigDep,
     since: Annotated[str | None, Query(description="ISO-8601 timestamp; replay events with ts > since.")] = None,
     project: Annotated[str | None, Query()] = None,
@@ -46,6 +47,10 @@ def stream_events_endpoint(
         event_glob=event,
         since=since,
         last_event_id=last_event_id,
+        # ``is_disconnected`` lets the producer bail when the
+        # client goes away — important under TestClient where
+        # ``StreamingResponse`` won't raise on its own.
+        is_disconnected=request.is_disconnected,
     )
     return StreamingResponse(
         generator,

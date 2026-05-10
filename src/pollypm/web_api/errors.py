@@ -112,6 +112,21 @@ def internal_error(message: str = "Unhandled server exception") -> APIError:
     return APIError(status_code=500, code="internal_error", message=message)
 
 
+def service_unavailable(
+    message: str = "Backing store unreachable", *, hint: str | None = None
+) -> APIError:
+    """Spec §6 ``503 service_unavailable`` — backing-store failure.
+
+    Used when the work-service / state.db raises an
+    :class:`sqlite3.OperationalError` or similar transient I/O error
+    that the API can't paper over with an empty list. Distinct from
+    ``internal_error`` (500) so clients can retry these.
+    """
+    return APIError(
+        status_code=503, code="service_unavailable", message=message, hint=hint
+    )
+
+
 # ---------------------------------------------------------------------------
 # Handlers wired into the FastAPI app
 # ---------------------------------------------------------------------------
@@ -172,6 +187,7 @@ __all__ = [
     "invalid_state",
     "invalid_token",
     "not_found",
+    "service_unavailable",
     "unauthorized",
     "validation_error",
 ]

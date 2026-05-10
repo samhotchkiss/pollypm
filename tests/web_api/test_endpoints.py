@@ -137,6 +137,35 @@ def test_get_task_detail_404_for_unknown_task(client, auth_headers) -> None:
     assert response.status_code == 404
 
 
+def test_get_task_detail_passes_through_production_entry_types(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """MED-4 regression: ``ContextEntry.entry_type`` previously was a
+    ``Literal["note","reply","read"]`` so any task carrying a real
+    production label like ``human_review_approved`` 500'd on
+    serialization. The field is now an open string — the detail
+    response should round-trip the production value verbatim."""
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(svc, project="myproj", title="Review me")
+        # ``human_review_approved`` is a real production entry_type
+        # written by SQLiteWorkService.transition() on approve.
+        svc.add_context(
+            task.task_id,
+            actor="pm",
+            text="approved by operator",
+            entry_type="human_review_approved",
+        )
+    response = client.get(
+        f"/api/v1/tasks/myproj/{task.task_number}", headers=auth_headers
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    entry_types = [c["entry_type"] for c in (body.get("context") or [])]
+    assert "human_review_approved" in entry_types
+
+
 def test_get_project_plan_404_when_no_plan(client, auth_headers) -> None:
     response = client.get("/api/v1/projects/myproj/plan", headers=auth_headers)
     assert response.status_code == 404
@@ -173,6 +202,74 @@ def test_list_inbox_returns_chat_tasks(api_config, client, auth_headers, project
 def test_get_inbox_item_404_for_unknown(client, auth_headers) -> None:
     response = client.get("/api/v1/inbox/nope%2F1", headers=auth_headers)
     assert response.status_code == 404
+
+
+def test_inbox_detail_round_trip_with_returned_id(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """HIGH-4 regression: the inbox-list response returns IDs like
+    ``myproj/1``. The detail route at ``/inbox/{id}`` must accept
+    those IDs verbatim — encoded slashes 404'd before the
+    ``{id:path}`` fix."""
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        make_task(
+            svc,
+            project="myproj",
+            title="Round-trip thread",
+            description="From the inbox list",
+            flow_template="chat",
+            roles={"requester": "user", "operator": "pm"},
+        )
+    listing = client.get("/api/v1/inbox", headers=auth_headers).json()
+    assert listing["items"], "expected at least one inbox item"
+    returned_id = listing["items"][0]["id"]
+    # The list returned ``myproj/1``-style IDs; the detail route
+    # must accept them without the client URL-encoding the slash.
+    assert "/" in returned_id
+    detail = client.get(f"/api/v1/inbox/{returned_id}", headers=auth_headers)
+    assert detail.status_code == 200, detail.text
+    body = detail.json()
+    assert body["id"] == returned_id
+
+
+def test_cors_preflight_allows_loopback_origin(client) -> None:
+    """Spec §10 has the frontend posting from a separate-origin Vite
+    dev server with ``Authorization: Bearer …``. Without CORS the
+    preflight returns 405 and the browser never sends the real
+    request. Confirm we allow loopback origins on any port."""
+    response = client.options(
+        "/api/v1/projects",
+        headers={
+            "Origin": "http://localhost:5173",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "Authorization,Content-Type",
+        },
+    )
+    assert response.status_code in {200, 204}
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:5173"
+    assert response.headers.get("access-control-allow-credentials") == "true"
+    allow_headers = response.headers.get("access-control-allow-headers", "").lower()
+    assert "authorization" in allow_headers
+
+
+def test_cors_rejects_non_loopback_origin(client) -> None:
+    """Non-loopback origins are not mirrored — the access-control
+    headers should be absent so the browser blocks the request."""
+    response = client.options(
+        "/api/v1/projects",
+        headers={
+            "Origin": "https://evil.example.com",
+            "Access-Control-Request-Method": "GET",
+            "Access-Control-Request-Headers": "Authorization",
+        },
+    )
+    # Either no allow-origin header, or one that doesn't match the
+    # attacker's origin. The CORS middleware only sets the header for
+    # origins matching ``allow_origin_regex``.
+    allow = response.headers.get("access-control-allow-origin")
+    assert allow != "https://evil.example.com"
 
 
 def test_validation_error_shape_for_bad_query(client, auth_headers) -> None:

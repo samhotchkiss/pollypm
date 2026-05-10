@@ -182,7 +182,17 @@ class ContextEntry(BaseModel):
     actor: str
     timestamp: datetime
     text: str
-    entry_type: Literal["note", "reply", "read"]
+    # ``entry_type`` is open-ended on the work-service side: writers
+    # set free-form labels like ``human_review_approved``,
+    # ``readiness_warning``, ``rollup_item``, ``proposal_accepted``,
+    # ``plan_review_approved``, etc. We don't constrain it on the API
+    # surface — clients should treat unknown values like ``"note"``.
+    # Known values produced today (non-exhaustive): ``note``, ``reply``,
+    # ``read``, ``human_review_approved``, ``plan_approved``,
+    # ``plan_review_approved``, ``plan_review_denied``,
+    # ``proposal_accepted``, ``proposal_rejected``,
+    # ``readiness_warning``, ``rollup_item``.
+    entry_type: str = "note"
 
 
 class TaskRelationships(BaseModel):

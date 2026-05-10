@@ -13,16 +13,21 @@ write paths land in Phase 2 (#1548) and stay in
 
 from __future__ import annotations
 
+import contextlib
 import logging
+import os
 import re
 from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import sqlite3
+
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
+from pollypm.web_api.errors import service_unavailable
 from pollypm.web_api.models import (
     ContextEntry as APIContextEntry,
     Event as APIEvent,
@@ -44,6 +49,65 @@ from pollypm.web_api.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Read-only work-service open
+# ---------------------------------------------------------------------------
+
+
+_DISABLE_WORK_DB_OPENED_AUDIT_ENV = "POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT"
+
+
+# Known transient backing-store error classes. Failures of these
+# types map to a typed 503 ``service_unavailable`` so the client can
+# retry. Anything outside this tuple bubbles up to the FastAPI
+# unhandled-exception handler (500 ``internal_error``) so we don't
+# silently swallow real bugs.
+_BACKING_STORE_ERRORS: tuple[type[BaseException], ...] = (
+    sqlite3.OperationalError,
+    sqlite3.DatabaseError,
+    OSError,
+)
+
+
+@contextlib.contextmanager
+def _open_work_service_readonly(
+    *, config: PollyPMConfig, project_key: str, project_path: Path | str
+):
+    """Open a work-service for read-only API consumption.
+
+    SQLiteWorkService doesn't yet have a true ``mode=ro`` URI flag —
+    its constructor calls :func:`create_work_tables` and emits a
+    ``work_db.opened`` audit row, both of which technically mutate the
+    backing store. For the Web API's read endpoints we don't want
+    every ``GET`` to write an audit row, so we toggle the existing
+    ``POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT`` opt-out env (introduced
+    upstream for tests) for the lifetime of the open.
+
+    The ``CREATE TABLE IF NOT EXISTS`` calls in the constructor stay
+    no-ops once the tables exist; we accept the first-time bootstrap
+    side effect because (a) the cockpit normally bootstraps before the
+    API server runs, and (b) without it a fresh workspace would 500
+    on every endpoint until something else opened the DB. If/when the
+    work service grows a real read-only URI flag this helper should
+    forward it; for now the audit-suppression is the only meaningful
+    side effect we can avoid.
+    """
+    from pollypm.work.factory import create_work_service
+
+    prior = os.environ.get(_DISABLE_WORK_DB_OPENED_AUDIT_ENV)
+    os.environ[_DISABLE_WORK_DB_OPENED_AUDIT_ENV] = "1"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project_path
+        ) as svc:
+            yield svc
+    finally:
+        if prior is None:
+            os.environ.pop(_DISABLE_WORK_DB_OPENED_AUDIT_ENV, None)
+        else:
+            os.environ[_DISABLE_WORK_DB_OPENED_AUDIT_ENV] = prior
 
 
 # ---------------------------------------------------------------------------
@@ -111,9 +175,9 @@ def project_drilldown(config: PollyPMConfig, key: str) -> APIProjectDrilldown | 
     top_tasks: list[APITaskSummary] = []
     plan: APIPlan | None = None
     try:
-        from pollypm.work.factory import create_work_service
-
-        with create_work_service(config=config, project_key=key, project_path=project_path) as svc:
+        with _open_work_service_readonly(
+            config=config, project_key=key, project_path=project_path
+        ) as svc:
             tasks = svc.list_tasks(project=key, limit=10)
             for task in tasks:
                 top_tasks.append(_task_to_summary(task))
@@ -137,9 +201,9 @@ def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> A
     state_label: str | None = None
 
     try:
-        from pollypm.work.factory import create_work_service
-
-        with create_work_service(config=config, project_key=key, project_path=project.path) as svc:
+        with _open_work_service_readonly(
+            config=config, project_key=key, project_path=project.path
+        ) as svc:
             try:
                 counts = svc.state_counts(project=key) or {}
             except Exception:  # noqa: BLE001
@@ -233,9 +297,9 @@ def _count_open_inbox(config: PollyPMConfig, project_key: str) -> int:
     if project is None:
         return 0
     try:
-        from pollypm.work.factory import create_work_service
-
-        with create_work_service(config=config, project_key=project_key, project_path=project.path) as svc:
+        with _open_work_service_readonly(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
             tasks = svc.list_tasks(project=project_key)
     except Exception:  # noqa: BLE001
         return 0
@@ -274,8 +338,6 @@ def list_project_tasks(
     if project is None:
         return [], None
 
-    from pollypm.work.factory import create_work_service
-
     cursor_n: int | None = None
     if cursor is not None:
         try:
@@ -283,14 +345,25 @@ def list_project_tasks(
         except ValueError:
             cursor_n = None
 
-    with create_work_service(
+    with _open_work_service_readonly(
         config=config, project_key=project_key, project_path=project.path
     ) as svc:
         try:
             tasks = svc.list_tasks(project=project_key, work_status=status)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("list_tasks failed for %s: %s", project_key, exc)
-            tasks = []
+        except _BACKING_STORE_ERRORS as exc:
+            # Spec §6 maps DB lock contention / I/O failures to 503 so
+            # the client can retry. Logging full traceback so the
+            # operator can diagnose without rerunning under DEBUG.
+            logger.warning(
+                "list_tasks: backing store error for %s: %s",
+                project_key,
+                exc,
+                exc_info=True,
+            )
+            raise service_unavailable(
+                f"Backing store unavailable for project {project_key}",
+                hint="Retry shortly; check `pm doctor` if the failure persists.",
+            ) from exc
         tasks.sort(key=lambda t: getattr(t, "task_number", 0))
         if cursor_n is not None:
             tasks = [t for t in tasks if getattr(t, "task_number", 0) > cursor_n]
@@ -308,10 +381,8 @@ def get_task_detail(
     if project is None:
         return None
 
-    from pollypm.work.factory import create_work_service
-
     task_id = f"{project_key}/{task_number}"
-    with create_work_service(
+    with _open_work_service_readonly(
         config=config, project_key=project_key, project_path=project.path
     ) as svc:
         try:
@@ -346,9 +417,7 @@ def get_active_plan(
     project = config.projects.get(project_key)
     if project is None:
         return None
-    from pollypm.work.factory import create_work_service
-
-    with create_work_service(
+    with _open_work_service_readonly(
         config=config, project_key=project_key, project_path=project.path
     ) as svc:
         plan = _active_plan_for_project(svc, project_key)
@@ -735,17 +804,26 @@ def _collect_inbox_items(
     else:
         keys = config.projects.keys()
 
-    from pollypm.work.factory import create_work_service
-
     for key in keys:
         proj = config.projects[key]
         try:
-            with create_work_service(
+            with _open_work_service_readonly(
                 config=config, project_key=key, project_path=proj.path
             ) as svc:
                 tasks = svc.list_tasks(project=key)
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("inbox: list_tasks failed for %s: %s", key, exc)
+        except _BACKING_STORE_ERRORS as exc:
+            # Backing-store failure on a single project: log loudly,
+            # skip that project but keep building the aggregate. We
+            # intentionally don't 503 the whole inbox — the dashboard
+            # would rather show 4-of-5 projects than fail open. Use
+            # ``warning`` so this is visible without DEBUG and add
+            # exc_info so the stack lands in the operator's logs.
+            logger.warning(
+                "inbox: backing store error for %s; skipping: %s",
+                key,
+                exc,
+                exc_info=True,
+            )
             continue
         for task in tasks:
             entry = _task_to_inbox_item(task)
@@ -818,11 +896,10 @@ def _load_inbox_messages(config: PollyPMConfig, item: APIInboxItem) -> list[APII
     project = config.projects.get(item.project)
     if project is None:
         return []
-    from pollypm.work.factory import create_work_service
 
     out: list[APIInboxMessage] = []
     try:
-        with create_work_service(
+        with _open_work_service_readonly(
             config=config, project_key=item.project, project_path=project.path
         ) as svc:
             entries = svc.get_context(item.id) or []

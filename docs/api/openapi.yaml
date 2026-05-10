@@ -192,8 +192,10 @@ paths:
           name: version
           schema: { type: integer, minimum: 1 }
           description: |
-            Optional plan version. Defaults to the latest. Older
-            versions are returned for diff / history rendering.
+            Optional plan version. Defaults to the active plan. Plan
+            history is not stored server-side in v1, so passing a
+            version that doesn't match the currently active plan
+            returns 404 — only the active version is fetchable.
       responses:
         "200":
           description: Structured plan body.

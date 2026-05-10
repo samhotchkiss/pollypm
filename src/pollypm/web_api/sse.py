@@ -43,6 +43,13 @@ logger = logging.getLogger(__name__)
 # and a 250ms poll keeps tail latency under a quarter-second.
 KEEPALIVE_INTERVAL_S = 15.0
 TAIL_POLL_INTERVAL_S = 0.25
+# Test-only knob: when set, the stream auto-terminates after this many
+# seconds. Production leaves this ``None`` so streams stay open until
+# the client disconnects. The TestClient buffers SSE responses (it
+# reads the whole body before exposing chunks via ``iter_raw``), so
+# tests need a way to ensure the generator finishes — without this,
+# every SSE test would hang forever.
+MAX_STREAM_DURATION_S: float | None = None
 
 
 @dataclass(slots=True)
@@ -220,11 +227,23 @@ async def stream_audit_events(
     event_glob: str | None,
     since: str | None,
     last_event_id: str | None,
+    is_disconnected: "callable | None" = None,
+    max_stream_duration_s: float | None = None,
 ) -> AsyncIterator[bytes]:
     """Yield SSE message bytes for ``GET /api/v1/events``.
 
     Per spec, ``Last-Event-ID`` (sent by the browser on auto-reconnect)
     takes precedence over the ``?since=`` query parameter.
+
+    Architecture: one persistent producer task drives ``_tail_paths``
+    and pushes events onto an :class:`asyncio.Queue`. The main loop
+    waits on the queue with :func:`asyncio.wait_for`; when the wait
+    times out we emit a keep-alive but the producer keeps tailing —
+    so an event that arrives shortly after the keepalive still shows
+    up on the next loop iteration. The previous design cancelled a
+    pending ``tail.__anext__()`` on each keepalive, which closed the
+    underlying async generator and dropped any event the poll was
+    about to surface.
     """
     cursor = last_event_id or since
     sub = _Subscription(project=project, event_glob=event_glob, last_ts=cursor)
@@ -235,46 +254,79 @@ async def stream_audit_events(
         yield _format_sse(event).encode("utf-8")
         sub.last_ts = event.ts
 
-    last_keepalive = asyncio.get_event_loop().time()
-    sent_anything = False
+    queue: asyncio.Queue[AuditEvent] = asyncio.Queue()
+    producer_done = asyncio.Event()
 
-    async def _tail_iter():
-        async for event in _tail_paths(paths, sub=sub):
-            yield event
-
-    tail = _tail_iter().__aiter__()
-    while True:
+    async def _producer() -> None:
         try:
-            tail_task = asyncio.create_task(tail.__anext__())
-            timeout = max(0.0, KEEPALIVE_INTERVAL_S - (asyncio.get_event_loop().time() - last_keepalive))
-            done, _ = await asyncio.wait({tail_task}, timeout=timeout)
-            if tail_task in done:
-                event = tail_task.result()
-                if sub.last_ts is not None and event.ts <= sub.last_ts:
-                    continue
-                yield _format_sse(event).encode("utf-8")
-                sub.last_ts = event.ts
-                sent_anything = True
-            else:
-                tail_task.cancel()
-                # Keep-alive comment per spec.
-                yield b": keep-alive\n\n"
-                last_keepalive = asyncio.get_event_loop().time()
-        except StopAsyncIteration:
-            break
-        except (asyncio.CancelledError, GeneratorExit):
-            try:
-                tail_task.cancel()
-            except Exception:  # noqa: BLE001
-                pass
+            async for event in _tail_paths(paths, sub=sub):
+                await queue.put(event)
+        except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001
-            logger.warning("sse stream error: %s", exc)
-            break
+            logger.warning("sse producer error: %s", exc)
         finally:
-            # If the consumer disconnected (ConnectionResetError surfaces
-            # via the FastAPI streaming response), the next yield will
-            # raise. We also bail out here when the loop exits cleanly.
+            producer_done.set()
+
+    producer_task = asyncio.create_task(_producer())
+    sent_anything = False
+    duration_cap = (
+        max_stream_duration_s
+        if max_stream_duration_s is not None
+        else MAX_STREAM_DURATION_S
+    )
+    deadline: float | None = None
+    if duration_cap is not None:
+        deadline = asyncio.get_event_loop().time() + duration_cap
+
+    async def _client_gone() -> bool:
+        """Poll the connection-state callback if one was supplied.
+
+        ``StreamingResponse`` doesn't always raise when the client
+        disconnects (httpx's ``TestClient`` notably keeps the
+        in-process pipe open). Asking the request directly is the
+        only reliable way to bail. ``is_disconnected`` is async on
+        FastAPI's ``Request`` — we treat it as truthy ⇒ stop.
+        """
+        if is_disconnected is None:
+            return False
+        try:
+            result = is_disconnected()
+            if asyncio.iscoroutine(result):
+                result = await result
+            return bool(result)
+        except Exception:  # noqa: BLE001
+            return False
+
+    try:
+        while True:
+            if deadline is not None and asyncio.get_event_loop().time() >= deadline:
+                break
+            try:
+                event = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_INTERVAL_S)
+            except asyncio.TimeoutError:
+                yield b": keep-alive\n\n"
+                if producer_done.is_set() and queue.empty():
+                    break
+                if await _client_gone():
+                    break
+                if deadline is not None and asyncio.get_event_loop().time() >= deadline:
+                    break
+                continue
+            if sub.last_ts is not None and event.ts <= sub.last_ts:
+                continue
+            yield _format_sse(event).encode("utf-8")
+            sub.last_ts = event.ts
+            sent_anything = True
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("sse stream error: %s", exc)
+    finally:
+        producer_task.cancel()
+        try:
+            await producer_task
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
 
     # If we never sent anything, emit one keep-alive so test clients

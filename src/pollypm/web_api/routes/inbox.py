@@ -44,7 +44,11 @@ def list_inbox_endpoint(
 
 
 @router.get(
-    "/inbox/{id}",
+    # ``{id:path}`` so an inbox ID like ``myproj/1`` (forward-slash
+    # separated, mirrors task IDs) round-trips without the client
+    # having to URL-encode the slash. The list endpoint returns those
+    # IDs verbatim, so the detail route must accept them verbatim.
+    "/inbox/{id:path}",
     response_model=InboxItemDetail,
     summary="Inbox item detail with full thread messages",
     operation_id="getInboxItem",

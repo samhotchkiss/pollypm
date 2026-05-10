@@ -61,7 +61,13 @@ def test_contract_lists_phase_1_paths() -> None:
 
 
 def test_implementation_serves_phase_1_paths(client, auth_headers) -> None:
-    response = client.get("/api/v1/openapi.json")
+    # Spec §3 lists ``/health`` as the only auth-exempt endpoint; the
+    # OpenAPI document must require the same bearer auth as the rest
+    # of the API.
+    unauth_response = client.get("/api/v1/openapi.json")
+    assert unauth_response.status_code == 401
+
+    response = client.get("/api/v1/openapi.json", headers=auth_headers)
     assert response.status_code == 200
     schema = response.json()
     paths = schema.get("paths", {})
@@ -116,7 +122,9 @@ def test_implementation_openapi_validates_as_31() -> None:
         memory=MemorySettings(backend="file"),
     )
     app = create_app(config=config, token_path=base / "tmp-token")
-    raw = TestClient(app).get("/api/v1/openapi.json").json()
+    # OpenAPI doc is now bearer-gated; pull it via the app helper
+    # directly to keep this test independent of token wiring.
+    raw = app.openapi()
     # FastAPI emits 3.1.0 by default for Pydantic v2; the validator
     # accepts 3.0 / 3.1 alike.
     assert raw.get("openapi", "").startswith("3.")

@@ -67,12 +67,32 @@ def _print_token_once(token: str, *, generated: bool) -> None:
     Stderr (not stdout) so a script piping ``pm serve`` for logs
     doesn't accidentally swallow it. Wrapped in a banner so it's
     obvious the token landed.
+
+    Only called when the token was actually generated (or rotated):
+    on subsequent ``pm serve`` runs the token already exists on disk
+    at mode 0600 and re-emitting it leaks the value into terminal
+    scrollback / log files even though the operator already has it.
     """
     label = "generated" if generated else "rotated"
     typer.echo(
         f"\n[pm serve] Bearer token {label}.\n"
         f"          Stored at ~/.pollypm/api-token (mode 0600).\n"
         f"          Token: {token}\n",
+        err=True,
+    )
+
+
+def _print_token_location_only(token_path_hint: str) -> None:
+    """Tell the operator where to find an already-existing token.
+
+    On every-startup-after-the-first we don't want to spray the
+    token across terminal scrollback. A one-line pointer to the
+    file (and the rotation command) is enough to recover from an
+    "I lost the value" situation without leaking the secret.
+    """
+    typer.echo(
+        f"[pm serve] Bearer token already provisioned at {token_path_hint}.\n"
+        f"          Re-issue with `pm api regen-token` if you've lost it.",
         err=True,
     )
 
@@ -120,16 +140,28 @@ def register_web_api_commands(app: typer.Typer) -> None:
 
         config = load_config(config_path)
         token, generated = ensure_token(token_path)
-        _print_token_once(token, generated=generated)
+        if generated:
+            _print_token_once(token, generated=generated)
+        else:
+            from pollypm.web_api.token import DEFAULT_TOKEN_PATH
+
+            _print_token_location_only(
+                str(token_path) if token_path is not None else str(DEFAULT_TOKEN_PATH)
+            )
 
         app_instance = create_app(config=config, token_path=token_path)
 
         try:
             import uvicorn
         except ImportError as exc:  # noqa: BLE001
+            # uvicorn is a core PollyPM dependency (see pyproject.toml).
+            # If the import fails the install is broken — there's no
+            # ``[server]`` extra to opt into. The earlier message that
+            # pointed at ``pollypm[server]`` was misleading.
             typer.echo(
                 f"Error: uvicorn is required to run `pm serve` ({exc}). "
-                f"Install with `pip install pollypm[server]` or `uv sync`.",
+                f"It's a core PollyPM dependency — try `uv sync` or "
+                f"`pip install --force-reinstall pollypm` to repair the env.",
                 err=True,
             )
             raise typer.Exit(code=1) from exc

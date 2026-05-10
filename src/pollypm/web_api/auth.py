@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import Header
+from fastapi import Header, Query
 
 from pollypm.web_api.errors import invalid_token, unauthorized
 from pollypm.web_api.token import load_token
@@ -72,4 +72,46 @@ def make_bearer_auth_dependency(token_path: Path | None = None):
     return _dependency
 
 
-__all__ = ["make_bearer_auth_dependency"]
+def make_sse_auth_dependency(token_path: Path | None = None):
+    """Return a FastAPI dependency for the SSE stream specifically.
+
+    The browser ``EventSource`` API cannot send custom headers, so the
+    spec (§4) lets clients pass the bearer token via ``?token=`` for
+    the SSE endpoint only. The header form is still accepted (and
+    preferred for non-browser clients); the query-string fallback is
+    a SSE-only escape hatch — do NOT reuse this for read or write
+    endpoints, since query strings end up in proxy / browser-history
+    logs.
+    """
+
+    def _dependency(
+        authorization: str | None = Header(default=None),
+        token: str | None = Query(default=None, description=(
+            "Bearer token, SSE-only fallback for browser EventSource which "
+            "cannot send Authorization headers. Prefer the Authorization "
+            "header for every other endpoint."
+        )),
+    ) -> str:
+        provided = _extract_token(authorization)
+        if provided is None:
+            # Fall back to the query-string escape hatch.
+            if token:
+                provided = token.strip() or None
+        if provided is None:
+            raise unauthorized()
+        expected = load_token(token_path)
+        if expected is None:
+            raise unauthorized(
+                "Bearer token required; run `pm serve` once or "
+                "`pm api regen-token` to provision."
+            )
+        from secrets import compare_digest
+
+        if not compare_digest(provided, expected):
+            raise invalid_token()
+        return provided
+
+    return _dependency
+
+
+__all__ = ["make_bearer_auth_dependency", "make_sse_auth_dependency"]

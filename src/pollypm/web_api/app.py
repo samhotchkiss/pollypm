@@ -17,9 +17,14 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from pollypm.config import PollyPMConfig
-from pollypm.web_api.auth import make_bearer_auth_dependency
+from pollypm.web_api.auth import (
+    make_bearer_auth_dependency,
+    make_sse_auth_dependency,
+)
 from pollypm.web_api.errors import (
     APIError,
     handle_api_error,
@@ -55,12 +60,32 @@ def create_app(
         ``~/.pollypm/api-token`` per spec §3. Tests pass a tmp path
         so the user's real token never surfaces.
     """
+    # FastAPI's default ``openapi_url`` is public, but the spec
+    # (§3) lists only ``/health`` as auth-exempt. Disable the default
+    # endpoint and serve our own auth-protected route below so the
+    # generated contract isn't reachable without a bearer token.
     app = FastAPI(
         title="PollyPM Web API",
         version="0.1.0",
         docs_url=None,  # we serve OpenAPI via the spec endpoint
         redoc_url=None,
-        openapi_url=f"{API_V1_PREFIX}/openapi.json",
+        openapi_url=None,
+    )
+
+    # CORS for the separate-repo frontend. The spec (§10) shows the
+    # browser sending ``Authorization: Bearer …`` to ``http://127.0.0.1:8765``;
+    # without CORS, every preflight returns 405 and the frontend never
+    # talks to the API. We allow loopback origins on any port (the
+    # frontend's Vite dev server picks an arbitrary port) and require
+    # credentials so the bearer header survives. This is intentionally
+    # narrow — we do NOT mirror arbitrary ``Origin`` headers.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$",
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+        allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
+        expose_headers=["Last-Event-ID"],
     )
 
     # Wire the config provider so every endpoint shares the same
@@ -78,15 +103,30 @@ def create_app(
 
     auth_dependency = make_bearer_auth_dependency(token_path)
     auth_deps = [Depends(auth_dependency)]
+    # SSE has its own auth dependency that also accepts ``?token=``
+    # (browser EventSource cannot set custom headers — see spec §4).
+    sse_auth_dependency = make_sse_auth_dependency(token_path)
+    sse_auth_deps = [Depends(sse_auth_dependency)]
 
     app.include_router(projects_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(tasks_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(inbox_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
-    app.include_router(events_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
+    app.include_router(events_routes.router, prefix=API_V1_PREFIX, dependencies=sse_auth_deps)
 
     # ``security: bearerAuth`` declared at the document level so
     # generated clients carry the correct Auth scheme.
     _attach_security_scheme(app)
+
+    # Auth-gated OpenAPI route. Codegen tooling that targets this
+    # endpoint must send the same ``Authorization: Bearer …`` header
+    # used everywhere else.
+    @app.get(
+        f"{API_V1_PREFIX}/openapi.json",
+        include_in_schema=False,
+        dependencies=auth_deps,
+    )
+    def _openapi_endpoint() -> JSONResponse:
+        return JSONResponse(app.openapi())
 
     return app
 

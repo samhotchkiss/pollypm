@@ -15216,6 +15216,20 @@ class PollyProjectDashboardApp(App[None]):
                 f"[#ff5f6d]Error loading project:[/#ff5f6d] {_escape(str(exc))}"
             )
             return
+        # Codex review (PR #1557) — adopt the canonical key after the
+        # gather. ``_gather_project_dashboard`` calls ``_resolve_project_key``
+        # to bridge a hyphenated / case-folded operator input to the
+        # registered config key, but only the returned ``data`` carried the
+        # canonical form — ``self.project_key`` stayed on the original
+        # input string. Follow-on actions (PM chat dispatch at #16978, inbox
+        # jump at #17239, task jumps) all route through ``self.project_key``,
+        # so a user landing on ``health-coach`` rendered ``health_coach``'s
+        # data but routed ``c``/``i`` through the unregistered hyphen form,
+        # which the cockpit-router then mismatched. Mirror ``data.project_key``
+        # back onto the app once the resolver has run so every downstream
+        # route uses the canonical key.
+        if self.data is not None and getattr(self.data, "project_key", None):
+            self.project_key = self.data.project_key
         # Skip the full re-paint when nothing the user can see has
         # changed. Force-refresh every Nth tick so "5m ago" age labels
         # don't freeze. Mirrors the inbox loader's #752 signature
@@ -15247,6 +15261,11 @@ class PollyProjectDashboardApp(App[None]):
     def _first_refresh_completed(self, data) -> None:
         self._first_refresh_running = False
         self.data = data
+        # Codex review (PR #1557) — see ``_refresh``: route follow-on
+        # actions (``c``/``i``/jumps) through the canonical key the
+        # gather resolved, not whatever the user typed at the rail.
+        if data is not None and getattr(data, "project_key", None):
+            self.project_key = data.project_key
         self._last_render_signature = _project_dashboard_signature(data)
         self._render()
 

@@ -1854,6 +1854,15 @@ class CockpitRouter:
         tasks: list = []
         plan_blocked = False
         used_any_db = False
+        # Codex review (PR #1557) — "first DB with matching rows wins".
+        # Mirror ``cockpit_ui._dashboard_gather_tasks``'s iteration shape:
+        # walk candidates in order (canonical → legacy) and STOP as soon
+        # as one yields any task rows, only falling back to the next
+        # candidate when the current DB is empty. The earlier #1542 fix
+        # walked every candidate and unioned rows, which reintroduced
+        # the same split-brain it was trying to repair: a clean
+        # canonical workspace DB padded by stale ``on_hold`` rows still
+        # sitting in the legacy per-project DB → wrong rail glyph.
         for db_path in candidate_db_paths:
             try:
                 work = create_work_service(
@@ -1861,8 +1870,8 @@ class CockpitRouter:
                 )
             except Exception:  # noqa: BLE001
                 continue
+            db_tasks: list = []
             try:
-                db_tasks: list = []
                 # #1092 — alias-aware lookup. The work DB stores tasks
                 # under the display name (``booktalk``) while the rollup
                 # receives the slugified config key, so a single
@@ -1896,7 +1905,7 @@ class CockpitRouter:
                         if not acceptable:
                             plan_blocked = True
             except Exception:  # noqa: BLE001
-                continue
+                db_tasks = []
             finally:
                 close = getattr(work, "close", None)
                 if callable(close):
@@ -1904,6 +1913,11 @@ class CockpitRouter:
                         close()
                     except Exception:  # noqa: BLE001
                         pass
+            # First DB with matching rows wins — break only AFTER the
+            # service is closed so the legacy candidate doesn't pad the
+            # canonical row set on the next loop iteration.
+            if db_tasks:
+                break
 
         if not used_any_db:
             return [], False

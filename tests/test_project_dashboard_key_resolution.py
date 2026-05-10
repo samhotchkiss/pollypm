@@ -152,3 +152,163 @@ def test_dashboard_bail_copy_names_a_real_command() -> None:
         "Bail-state copy must name ``pm project new`` (the real "
         "registration command) so the user has a concrete next action."
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex review of PR #1557 — hyphen-input → canonical key navigation
+# ---------------------------------------------------------------------------
+
+
+def _stub_dashboard_app(initial_key: str) -> PollyProjectDashboardApp:
+    """Mount a ``PollyProjectDashboardApp`` shell without booting Textual.
+
+    ``__init__`` boots a Textual pipeline + worker thread which is
+    way too heavy for a routing assertion. We bypass it and only set
+    the attributes ``_first_refresh_completed`` reads.
+    """
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    app.project_key = initial_key
+    app.data = None
+    app._first_refresh_running = True
+    app._last_render_signature = None
+
+    # ``_first_refresh_completed`` calls ``self._render`` at the end —
+    # stub it out so we don't drag the real render path (which expects
+    # mounted Textual widgets) into a unit test.
+    app._render = lambda: None  # type: ignore[method-assign]
+    return app
+
+
+def _data_stub(project_key: str) -> SimpleNamespace:
+    """Return a ``ProjectDashboardData``-shaped namespace populated with
+    just enough fields for ``_project_dashboard_signature`` to consume
+    without raising. Only ``project_key`` is meaningful for the routing
+    assertion — every other field is a benign default.
+    """
+    return SimpleNamespace(
+        project_key=project_key,
+        pm_label="",
+        exists_on_disk=True,
+        status_dot="",
+        status_label="",
+        active_worker=None,
+        task_counts={},
+        inbox_count=0,
+        alert_count=0,
+        alert_types=[],
+        action_items=[],
+        plan_path=None,
+        plan_mtime=None,
+        plan_stale_reason=None,
+        plan_task_summary=None,
+        activity_entries=[],
+    )
+
+
+def test_first_refresh_adopts_canonical_key_after_resolver_runs() -> None:
+    """Codex review (PR #1557) — when the user types a hyphenated key
+    (``health-coach``) at the rail and the gather resolves it to the
+    canonical config key (``health_coach``), the dashboard app MUST
+    update ``self.project_key`` to the canonical form.
+
+    Pre-fix the data was rendered under the canonical key but the app's
+    ``self.project_key`` stayed on the original input. Follow-on actions
+    (PM chat dispatch at ``c``, inbox jump at ``i``, task jumps) all
+    route through ``self.project_key``, so the user landed on the
+    canonical surface but every keystroke routed through the unregistered
+    hyphen form.
+    """
+    app = _stub_dashboard_app(initial_key="health-coach")
+    # Stand-in for ``ProjectDashboardData`` — the only attribute the
+    # canonical-key adoption path reads is ``project_key``; the rest
+    # exist so ``_project_dashboard_signature`` can run cleanly.
+    data = _data_stub("health_coach")
+
+    PollyProjectDashboardApp._first_refresh_completed(app, data)
+
+    assert app.project_key == "health_coach", (
+        "expected ``self.project_key`` to adopt the canonical key "
+        "``health_coach`` once the gather resolved the hyphenated "
+        f"input; got {app.project_key!r}"
+    )
+
+
+def test_first_refresh_completed_routes_inbox_through_canonical_key() -> None:
+    """Codex review (PR #1557) — after the dashboard adopts the canonical
+    key, the inbox-jump action (``i``) must route through the canonical
+    form (``health_coach``), not the original hyphenated input.
+
+    We capture the argument passed to ``jump_to_inbox`` via a monkeypatched
+    navigation client so the assertion is on the actual routing call,
+    not on the adopted attribute alone.
+    """
+    import pollypm.cockpit_ui as _cockpit_ui
+
+    captured: dict[str, str] = {}
+
+    class _ClientStub:
+        def jump_to_inbox(self, project_key: str) -> None:
+            captured["project_key"] = project_key
+
+    app = _stub_dashboard_app(initial_key="health-coach")
+    data = _data_stub("health_coach")
+    PollyProjectDashboardApp._first_refresh_completed(app, data)
+
+    app.config_path = None  # type: ignore[assignment]
+
+    original = _cockpit_ui.file_navigation_client
+    _cockpit_ui.file_navigation_client = lambda *a, **kw: _ClientStub()
+    try:
+        PollyProjectDashboardApp._route_to_inbox(app)
+    finally:
+        _cockpit_ui.file_navigation_client = original
+
+    assert captured.get("project_key") == "health_coach", (
+        "expected ``i`` (jump to inbox) to route through the canonical "
+        f"key after resolution; got {captured!r}"
+    )
+
+
+def test_first_refresh_completed_routes_tasks_through_canonical_key() -> None:
+    """Codex review (PR #1557) — task-list jumps must also route through
+    the canonical key after adoption. ``pm cockpit-pane project
+    health-coach`` → press ``→`` to drill into tasks → ``jump_to_project``
+    is called with ``health_coach``, not the original hyphen form.
+    """
+    import pollypm.cockpit_ui as _cockpit_ui
+
+    captured: dict[str, object] = {}
+
+    class _ClientStub:
+        def jump_to_project(self, project_key: str, *, view: str) -> None:
+            captured["project_key"] = project_key
+            captured["view"] = view
+
+    app = _stub_dashboard_app(initial_key="health-coach")
+    data = _data_stub("health_coach")
+    PollyProjectDashboardApp._first_refresh_completed(app, data)
+    app.config_path = None  # type: ignore[assignment]
+
+    original = _cockpit_ui.file_navigation_client
+    _cockpit_ui.file_navigation_client = lambda *a, **kw: _ClientStub()
+    try:
+        PollyProjectDashboardApp._route_to_tasks(app)
+    finally:
+        _cockpit_ui.file_navigation_client = original
+
+    assert captured.get("project_key") == "health_coach", (
+        "expected the tasks-jump to route through the canonical key "
+        f"after resolution; got {captured!r}"
+    )
+    assert captured.get("view") == "issues"
+
+
+def test_first_refresh_keeps_input_when_data_is_none() -> None:
+    """If the gather returned ``None`` (project genuinely missing),
+    the app must NOT clobber ``self.project_key`` with ``None`` — the
+    bail-state render path still needs the original input to surface
+    ``"X" is not registered`` copy.
+    """
+    app = _stub_dashboard_app(initial_key="ghost-project")
+    PollyProjectDashboardApp._first_refresh_completed(app, None)
+    assert app.project_key == "ghost-project"

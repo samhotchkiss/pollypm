@@ -205,6 +205,75 @@ def test_rollup_still_reads_legacy_per_project_db_when_canonical_empty(
     )
 
 
+def test_rollup_first_db_with_rows_wins_no_legacy_padding(
+    tmp_path: Path,
+) -> None:
+    """Codex review of PR #1557 — when both DBs exist, the canonical
+    workspace-root DB must "win" once it yields rows. The legacy
+    per-project DB MUST NOT pad those rows with stale records.
+
+    Pre-fix the rollup walked every candidate DB and unioned every
+    matching row, reintroducing the same split-brain it claimed to
+    repair: a clean canonical DB plus a stale legacy DB → wrong glyph.
+    Mirrors ``_dashboard_gather_tasks``'s "first DB with matching rows
+    wins" contract.
+    """
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    # Canonical workspace-root DB has the live (queued) task.
+    workspace_db = tmp_path / ".pollypm" / "state.db"
+    workspace_db.parent.mkdir(parents=True, exist_ok=True)
+    with SQLiteWorkService(
+        db_path=workspace_db, project_path=tmp_path,
+    ) as svc:
+        live = svc.create(
+            title="Active queued task",
+            description="Live work in canonical DB.",
+            type="task",
+            project="demo",
+            flow_template="standard",
+            roles={"worker": "pete", "reviewer": "russell"},
+            priority="normal",
+            created_by="polly",
+        )
+        svc.queue(live.task_id, "polly")
+
+    # Legacy per-project DB still on disk with a stale ``on_hold`` row.
+    legacy_db = project_path / ".pollypm" / "state.db"
+    _seed_held_task_in_db(legacy_db, project_path)
+
+    config = load_config(config_path)
+    project = config.projects["demo"]
+    router = _make_router()
+    tasks, _plan_blocked = router._project_tasks_for_rollup(
+        "demo", project, config=config,
+    )
+
+    statuses = [
+        getattr(getattr(t, "work_status", None), "value", None) for t in tasks
+    ]
+    titles = [getattr(t, "title", None) for t in tasks]
+
+    # The canonical DB wins — only the live ``queued`` row surfaces.
+    # The stale legacy ``on_hold`` row must be filtered out so the
+    # rail glyph reflects canonical state, not legacy split-brain.
+    assert "on_hold" not in statuses, (
+        "stale on_hold row from legacy per-project DB must NOT pad "
+        f"canonical rows; got statuses={statuses} titles={titles}"
+    )
+    assert "queued" in statuses, (
+        f"expected the canonical queued task to surface; got {statuses}"
+    )
+    assert len(tasks) == 1, (
+        f"first-DB-wins contract violated; expected 1 task, got {len(tasks)} "
+        f"(statuses={statuses}, titles={titles})"
+    )
+
+
 def test_rollup_returns_empty_when_no_db_exists(tmp_path: Path) -> None:
     """A project with neither DB present yields no tasks (and falls
     through to ``ProjectRailState.NONE``) — same as before #1542.

@@ -1,22 +1,35 @@
-"""`pm rail` subcommand — list, hide, show cockpit rail items.
+"""`pm rail` subcommand — list, hide, show, restart cockpit rail items.
 
 See docs/extensible-rail-spec.md §6 and issue #224.
 
-All three commands operate through the plugin-host rail registry — the
-same structure the cockpit builder walks. ``hide`` / ``show`` edit the
-user-global ``~/.pollypm/pollypm.toml`` ``[rail].hidden_items`` list.
+The list/hide/show trio operate through the plugin-host rail registry
+— the same structure the cockpit builder walks. ``hide`` / ``show``
+edit the user-global ``~/.pollypm/pollypm.toml``
+``[rail].hidden_items`` list. ``restart`` signals the headless
+``pollypm.rail_daemon`` (tracked via ``~/.pollypm/rail_daemon.pid``)
+to exit cleanly and respawns it — used by tier-4 Polly's
+``pm system restart-rail-daemon`` recovery path.
 """
 
 from __future__ import annotations
 
 import json
+import logging
+import os
 import re
+import signal
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
 import typer
 
 from pollypm.cli_help import help_with_examples
+
+
+logger = logging.getLogger(__name__)
 
 rail_app = typer.Typer(
     help=help_with_examples(
@@ -281,3 +294,188 @@ def _validate_key(key: str) -> None:
             "Rail item key must be in the form 'section.label' "
             "(e.g. 'tools.activity'). Use `pm rail list` to see keys."
         )
+
+
+# ---------------------------------------------------------------------------
+# `pm rail restart` — signal-then-respawn the headless rail_daemon.
+# ---------------------------------------------------------------------------
+
+
+_RAIL_DAEMON_PID_FILE = Path.home() / ".pollypm" / "rail_daemon.pid"
+_DEFAULT_GRACE_S = 3.0
+
+
+def _read_pid_file(pid_path: Path) -> int | None:
+    """Return the PID stored in ``pid_path`` or ``None`` if unreadable."""
+    try:
+        raw = pid_path.read_text().strip()
+    except (FileNotFoundError, OSError):
+        return None
+    try:
+        pid = int(raw)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_alive(pid: int) -> bool:
+    """Return True iff ``pid`` is currently a live process we can signal."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists but is owned by someone else — treat as alive
+        # but uncontrollable. The caller will refuse to kill it.
+        return True
+    return True
+
+
+def _terminate_daemon(
+    pid: int,
+    *,
+    grace_s: float = _DEFAULT_GRACE_S,
+    sleep_fn=time.sleep,
+    kill_fn=None,
+) -> str:
+    """SIGTERM ``pid``, wait ``grace_s``, escalate to SIGKILL on holdout.
+
+    Returns one of ``"already_gone"``, ``"SIGTERM"``, ``"SIGKILL"``,
+    ``"denied"``. Mirrors :func:`rail_daemon_reaper._terminate_with_grace`
+    so the manual restart path uses the same signal discipline as the
+    bootstrap reaper.
+
+    ``kill_fn`` defaults to the module-level ``os.kill`` looked up at
+    call time so tests can monkeypatch ``rail_cli.os.kill``.
+    """
+    _kill = kill_fn if kill_fn is not None else os.kill
+    if not _pid_alive(pid):
+        return "already_gone"
+    try:
+        _kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return "already_gone"
+    except PermissionError:
+        return "denied"
+    deadline = time.monotonic() + grace_s
+    while time.monotonic() < deadline:
+        if not _pid_alive(pid):
+            return "SIGTERM"
+        sleep_fn(0.1)
+    try:
+        _kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return "SIGTERM"
+    except PermissionError:
+        return "denied"
+    return "SIGKILL"
+
+
+def _spawn_daemon(
+    *,
+    spawn_fn=None,
+) -> int | None:
+    """Spawn a fresh ``python -m pollypm.rail_daemon`` in the background.
+
+    Returns the PID of the new daemon or ``None`` on failure. The new
+    process detaches via ``start_new_session=True`` so it survives the
+    parent CLI exiting. ``spawn_fn`` is injectable for tests.
+    """
+    if spawn_fn is not None:
+        try:
+            return int(spawn_fn())
+        except Exception:  # noqa: BLE001
+            logger.warning("rail restart: spawn_fn raised", exc_info=True)
+            return None
+    try:
+        proc = subprocess.Popen(  # noqa: S603 — we control argv
+            [sys.executable, "-m", "pollypm.rail_daemon"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning("rail restart: Popen raised", exc_info=True)
+        return None
+    return proc.pid
+
+
+@rail_app.command("restart")
+def restart_daemon(
+    grace_seconds: float = typer.Option(
+        _DEFAULT_GRACE_S,
+        "--grace-seconds",
+        help=(
+            "Seconds to wait between SIGTERM and SIGKILL on the "
+            "existing rail_daemon."
+        ),
+    ),
+    no_spawn: bool = typer.Option(
+        False, "--no-spawn/--spawn",
+        help=(
+            "Skip spawning a replacement daemon — useful when the "
+            "cockpit will start one on next boot. Default is to "
+            "respawn so the headless rail stays live."
+        ),
+    ),
+    pid_file: Path = typer.Option(
+        _RAIL_DAEMON_PID_FILE,
+        "--pid-file",
+        help="Override pid file location (defaults to ~/.pollypm/rail_daemon.pid).",
+    ),
+) -> None:
+    """Restart the headless rail_daemon.
+
+    Reads the PID from ``~/.pollypm/rail_daemon.pid``, sends SIGTERM
+    (escalating to SIGKILL after ``--grace-seconds``), then spawns a
+    replacement via ``python -m pollypm.rail_daemon`` unless
+    ``--no-spawn`` is set. Tier-4 Polly's
+    ``pm system restart-rail-daemon`` shells out to this command.
+    """
+    pid = _read_pid_file(pid_file)
+    if pid is None:
+        typer.echo(
+            f"no rail_daemon pid file at {pid_file} — nothing to kill."
+        )
+        # Spawn anyway so a missing-pid-file state recovers cleanly,
+        # unless the operator opted out.
+        existing_outcome = "no_pid_file"
+    elif not _pid_alive(pid):
+        typer.echo(
+            f"rail_daemon pid={pid} is not alive (stale pid file).",
+        )
+        try:
+            pid_file.unlink()
+        except OSError:
+            pass
+        existing_outcome = "stale"
+    else:
+        outcome = _terminate_daemon(pid, grace_s=grace_seconds)
+        typer.echo(f"rail_daemon pid={pid} {outcome}")
+        if outcome == "denied":
+            raise typer.Exit(code=2)
+        # Daemon's own atexit hook removes the pid file; if that didn't
+        # fire (SIGKILL path), clean up so the new daemon can claim it.
+        try:
+            if pid_file.exists() and not _pid_alive(pid):
+                pid_file.unlink()
+        except OSError:
+            pass
+        existing_outcome = outcome
+
+    if no_spawn:
+        typer.echo(f"restart outcome={existing_outcome} spawned=skipped")
+        return
+
+    new_pid = _spawn_daemon()
+    if new_pid is None:
+        typer.echo(
+            f"restart outcome={existing_outcome} spawned=failed",
+            err=True,
+        )
+        raise typer.Exit(code=3)
+    typer.echo(
+        f"restart outcome={existing_outcome} spawned_pid={new_pid}"
+    )

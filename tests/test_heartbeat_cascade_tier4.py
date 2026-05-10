@@ -860,3 +860,426 @@ def test_system_helper_accepts_env_flag(
     )
     assert result.exit_code == 0
     assert "restart-heartbeat" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# #1554 HIGH-1 — finding-resolved demotion before budget expiry.
+# ---------------------------------------------------------------------------
+
+
+def test_sweep_demotes_active_row_when_finding_resolves(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """A successful tier-4 fix should demote the row mid-budget.
+
+    Repro: a tier-4 row is active at t=0; at t=30min the underlying
+    finding is gone (Polly's fix worked). The sweep must clear the row
+    with reason ``finding_resolved`` and emit ``audit.tier4_demoted``,
+    NOT wait for the 2h budget and route to the terminal product-broken
+    path.
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="demo")
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    rch = root_cause_hash(finding)
+
+    services = _StubServices(db_path)
+    later = now + timedelta(minutes=30)
+    # Empty seen-hash set models "nothing was found this scan" — i.e.
+    # the finding has resolved.
+    counters = cadence._sweep_tier4_budget_and_demotion(
+        services=services,
+        now=later,
+        seen_root_cause_hashes=set(),
+    )
+    services.close()
+
+    assert counters["tier4_demoted_cleared"] >= 1
+    assert counters["tier4_budget_exhausted"] == 0
+    state = tracker.get(rch)
+    assert state is not None
+    assert state.tier4_active is False
+    rows = read_events(finding.project, event=EVENT_TIER4_DEMOTED)
+    assert len(rows) >= 1
+    reasons = [(r.metadata or {}).get("reason") for r in rows]
+    assert "finding_resolved" in reasons
+
+
+def test_sweep_keeps_active_row_when_finding_persists(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """The hash IS in the seen-set → row stays active until budget."""
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="demo")
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    rch = root_cause_hash(finding)
+    services = _StubServices(db_path)
+    later = now + timedelta(minutes=15)
+    counters = cadence._sweep_tier4_budget_and_demotion(
+        services=services,
+        now=later,
+        seen_root_cause_hashes={rch},
+    )
+    services.close()
+    assert counters["tier4_demoted_cleared"] == 0
+    assert counters["tier4_budget_exhausted"] == 0
+    state = tracker.get(rch)
+    assert state is not None
+    assert state.tier4_active is True
+
+
+def test_sweep_without_seen_hashes_keeps_legacy_budget_only_behaviour(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """``seen_root_cause_hashes=None`` skips resolved-detection.
+
+    Existing callers that don't pass the set (older invocations,
+    ad-hoc CLI use) must not have their rows demoted just because no
+    scan has been threaded through.
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="demo")
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    rch = root_cause_hash(finding)
+    services = _StubServices(db_path)
+    later = now + timedelta(minutes=30)
+    counters = cadence._sweep_tier4_budget_and_demotion(
+        services=services, now=later,
+    )
+    services.close()
+    assert counters["tier4_demoted_cleared"] == 0
+    state = tracker.get(rch)
+    assert state is not None
+    assert state.tier4_active is True
+
+
+# ---------------------------------------------------------------------------
+# #1554 HIGH-2 — failed inbox write must not flip tier4_active=1.
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_send_failed_leaves_tracker_inactive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """Inbox-write failure → tier-3 fallback, tracker row stays inactive.
+
+    Without this contract, a failed tier-4 dispatch leaves
+    ``tier4_active=1`` and throttles every subsequent tier-4 attempt
+    for the same root_cause_hash until the 2h budget — exactly the
+    bug Codex flagged on the original PR.
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding()
+    rch = root_cause_hash(finding)
+
+    def _failing_inbox(**_kwargs: Any) -> str:
+        raise RuntimeError("simulated msg_store failure")
+
+    monkeypatch.setattr(
+        cadence, "_create_operator_tier4_inbox_task", _failing_inbox,
+    )
+
+    outcome = cadence._dispatch_to_operator_tier4(
+        finding,
+        project_path=None,
+        now=now,
+        promotion_path=PROMOTION_PATH_WATCHDOG,
+        tracker=tracker,
+    )
+    assert outcome == "send_failed"
+
+    state = tracker.get(rch)
+    # Either no row at all, or the row exists but is NOT active. Both
+    # are safe — the failure mode we're guarding against is
+    # tier4_active=1 with no inbox payload.
+    assert state is None or state.tier4_active is False
+    # No promoted event was emitted (we only audit successful dispatches).
+    promoted_rows = read_events(
+        finding.project, event=EVENT_TIER4_PROMOTED,
+    )
+    assert all(
+        (r.metadata or {}).get("root_cause_hash") != rch
+        for r in promoted_rows
+    )
+
+
+def test_dispatch_send_failed_leaves_subsequent_attempt_unblocked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """After a send_failed, the next tier-4 attempt must succeed.
+
+    Asserts the absence of a stale-throttle: the second call returns
+    "dispatched" rather than "throttled".
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding()
+
+    fail_state = {"calls": 0}
+
+    def _flaky_inbox(**_kwargs: Any) -> str:
+        fail_state["calls"] += 1
+        if fail_state["calls"] == 1:
+            raise RuntimeError("simulated transient failure")
+        return "demo/T4-2"
+
+    monkeypatch.setattr(
+        cadence, "_create_operator_tier4_inbox_task", _flaky_inbox,
+    )
+
+    first = cadence._dispatch_to_operator_tier4(
+        finding,
+        project_path=None,
+        now=now,
+        promotion_path=PROMOTION_PATH_WATCHDOG,
+        tracker=tracker,
+    )
+    assert first == "send_failed"
+
+    second = cadence._dispatch_to_operator_tier4(
+        finding,
+        project_path=None,
+        now=now + timedelta(minutes=5),
+        promotion_path=PROMOTION_PATH_WATCHDOG,
+        tracker=tracker,
+    )
+    assert second == "dispatched"
+    state = tracker.get(root_cause_hash(finding))
+    assert state is not None and state.tier4_active is True
+
+
+# ---------------------------------------------------------------------------
+# #1554 HIGH-3 — storage-closet session naming.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_storage_closet_session_uses_canonical_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The CLI helper must match Supervisor's ``-storage-closet`` suffix.
+
+    Returning ``<base>-storage`` would have ``restart-heartbeat`` kill
+    a different (or non-existent) session than the one the supervisor /
+    runtime services actually own.
+    """
+    import pollypm.cli_features.tier4 as tier4_mod
+    import pollypm.config as config_mod
+    from pollypm.supervisor import Supervisor
+
+    # Stub the config so the test doesn't depend on a workspace.
+    class _CfgProject:
+        tmux_session = "polly-test"
+
+    class _Cfg:
+        project = _CfgProject()
+
+    monkeypatch.setattr(
+        config_mod, "load_config", lambda _path: _Cfg(),
+    )
+    # Sanity: the canonical suffix on Supervisor is the one we expect.
+    assert Supervisor._STORAGE_CLOSET_SESSION_SUFFIX == "-storage-closet"
+    name = tier4_mod._resolve_storage_closet_session()
+    assert name is not None
+    assert name == "polly-test-storage-closet"
+    # Defence-in-depth: the wrong (legacy) suffix is gone.
+    assert name.endswith("-storage-closet")
+    assert "-storage-closet" in name
+
+
+def test_resolve_storage_closet_session_matches_runtime_services(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Naming agrees with ``runtime_services.storage_closet_name``."""
+    import pollypm.cli_features.tier4 as tier4_mod
+    import pollypm.config as config_mod
+
+    class _CfgProject:
+        tmux_session = "alpha"
+
+    class _Cfg:
+        project = _CfgProject()
+
+    monkeypatch.setattr(
+        config_mod, "load_config", lambda _path: _Cfg(),
+    )
+    cli_name = tier4_mod._resolve_storage_closet_session()
+    runtime_name = f"{_CfgProject.tmux_session}-storage-closet"
+    assert cli_name == runtime_name
+
+
+# ---------------------------------------------------------------------------
+# #1554 MED-1 — `pm rail restart` exists and bounces by PID.
+# ---------------------------------------------------------------------------
+
+
+def test_pm_rail_restart_command_is_registered() -> None:
+    """The ``rail`` Typer app exposes a ``restart`` command."""
+    from pollypm.rail_cli import rail_app
+
+    command_names = {cmd.name for cmd in rail_app.registered_commands}
+    assert "restart" in command_names
+
+
+def test_pm_rail_restart_terminates_existing_pid_and_spawns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pm rail restart` SIGTERMs the tracked PID and respawns."""
+    from typer.testing import CliRunner
+    import pollypm.rail_cli as rail_mod
+
+    pid_file = tmp_path / "rail_daemon.pid"
+    pid_file.write_text("12345")
+
+    signals: list[tuple[int, int]] = []
+    pid_alive_state = {"alive": True}
+
+    def _fake_kill(pid: int, sig: int) -> None:
+        signals.append((pid, sig))
+        # First SIGTERM — pretend it took.
+        pid_alive_state["alive"] = False
+
+    def _fake_alive(pid: int) -> bool:
+        return pid_alive_state["alive"]
+
+    monkeypatch.setattr(rail_mod, "_pid_alive", _fake_alive)
+    monkeypatch.setattr(rail_mod.os, "kill", _fake_kill)
+
+    spawned: list[bool] = []
+
+    def _fake_spawn(*, spawn_fn=None) -> int | None:  # noqa: ARG001
+        spawned.append(True)
+        return 99999
+
+    monkeypatch.setattr(rail_mod, "_spawn_daemon", _fake_spawn)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        rail_mod.rail_app,
+        ["restart", "--pid-file", str(pid_file), "--grace-seconds", "0.1"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    # SIGTERM landed on the right PID.
+    import signal as _signal
+    assert (12345, _signal.SIGTERM) in signals
+    # A new daemon was spawned.
+    assert spawned == [True]
+    assert "spawned_pid=99999" in result.stdout
+
+
+def test_pm_rail_restart_handles_missing_pid_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing pid file is reported but doesn't block the spawn."""
+    from typer.testing import CliRunner
+    import pollypm.rail_cli as rail_mod
+
+    pid_file = tmp_path / "missing.pid"
+
+    def _fake_spawn(*, spawn_fn=None) -> int | None:  # noqa: ARG001
+        return 4242
+
+    monkeypatch.setattr(rail_mod, "_spawn_daemon", _fake_spawn)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        rail_mod.rail_app,
+        ["restart", "--pid-file", str(pid_file)],
+    )
+    assert result.exit_code == 0
+    assert "no rail_daemon pid file" in result.stdout
+    assert "spawned_pid=4242" in result.stdout
+
+
+def test_pm_rail_restart_no_spawn_flag_skips_respawn(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--no-spawn`` skips the respawn step (cockpit will start one)."""
+    from typer.testing import CliRunner
+    import pollypm.rail_cli as rail_mod
+
+    pid_file = tmp_path / "missing.pid"
+
+    spawned: list[bool] = []
+
+    def _fake_spawn(*, spawn_fn=None) -> int | None:  # noqa: ARG001
+        spawned.append(True)
+        return 4242
+
+    monkeypatch.setattr(rail_mod, "_spawn_daemon", _fake_spawn)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        rail_mod.rail_app,
+        ["restart", "--pid-file", str(pid_file), "--no-spawn"],
+    )
+    assert result.exit_code == 0
+    assert spawned == []
+    assert "spawned=skipped" in result.stdout
+
+
+def test_system_restart_rail_daemon_uses_rail_cli_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`pm system restart-rail-daemon` calls the new rail_cli plumbing.
+
+    Smoke test: the bounce path inside ``cli_features.tier4`` must
+    resolve to ``rail_cli._spawn_daemon`` (i.e. the helper exists and
+    is invoked). Previously the command shelled out to a non-existent
+    ``pm rail restart`` and silently failed.
+    """
+    from typer.testing import CliRunner
+    from pollypm.cli_features.tier4 import system_app
+    import pollypm.rail_cli as rail_mod
+    import pollypm.cli_features.tier4 as tier4_mod  # noqa: F401
+
+    monkeypatch.setenv("POLLYPM_TIER4_AUTHORITY", "1")
+
+    spawn_calls: list[bool] = []
+
+    def _fake_spawn(*, spawn_fn=None) -> int | None:  # noqa: ARG001
+        spawn_calls.append(True)
+        return 7777
+
+    monkeypatch.setattr(rail_mod, "_spawn_daemon", _fake_spawn)
+    monkeypatch.setattr(rail_mod, "_read_pid_file", lambda _p: None)
+    monkeypatch.setattr(rail_mod, "_pid_alive", lambda _p: False)
+    # Stub the desktop notifier path.
+    import pollypm.plugins_builtin.core_recurring.audit_watchdog as cadence
+    monkeypatch.setattr(
+        cadence, "_send_tier4_global_action_push",
+        lambda **_kw: True,
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        system_app,
+        ["restart-rail-daemon", "--root-cause-hash", "abc"],
+    )
+    assert result.exit_code == 0, result.stdout + result.stderr
+    assert spawn_calls == [True]
+    assert "ok=True" in result.stdout

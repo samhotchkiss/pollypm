@@ -2056,22 +2056,11 @@ def _dispatch_to_operator_tier4(
     if existing is not None and existing.tier4_active:
         return "throttled"
 
-    # Record the promotion before the inbox write so the audit log + the
-    # tracker reflect the promotion even if the inbox write fails.
-    tracker.record_promotion(
-        finding,
-        now=now,
-        promotion_path=promotion_path,
-        justification=justification,
-    )
-    _emit_tier4_promoted(
-        finding,
-        root_cause_hash_value=rch,
-        promotion_path=promotion_path,
-        project_path=project_path,
-        justification=justification,
-    )
-
+    # Build the inbox payload + write it FIRST. Recording the promotion
+    # before the inbox write would leave ``tier4_active=1`` when the
+    # write fails, throttling all future tier-4 dispatches for this
+    # root_cause_hash until the budget expired. We only flip the
+    # tracker into the active state once the inbox row is committed.
     body = _build_tier4_body(
         finding,
         root_cause_hash_value=rch,
@@ -2086,14 +2075,6 @@ def _dispatch_to_operator_tier4(
     )[:200]
 
     inbox_task_id: str | None = None
-    _emit_tier4_dispatched(
-        finding,
-        root_cause_hash_value=rch,
-        promotion_path=promotion_path,
-        inbox_task_id=None,
-        dedup_key=dedup_key,
-        project_path=project_path,
-    )
     try:
         inbox_task_id = _create_operator_tier4_inbox_task(
             project_key=finding.project,
@@ -2110,6 +2091,21 @@ def _dispatch_to_operator_tier4(
         return "send_failed"
     if inbox_task_id is None:
         return "send_failed"
+
+    # Inbox write committed — now record the promotion + audit it.
+    tracker.record_promotion(
+        finding,
+        now=now,
+        promotion_path=promotion_path,
+        justification=justification,
+    )
+    _emit_tier4_promoted(
+        finding,
+        root_cause_hash_value=rch,
+        promotion_path=promotion_path,
+        project_path=project_path,
+        justification=justification,
+    )
     _emit_tier4_dispatched(
         finding,
         root_cause_hash_value=rch,
@@ -2322,17 +2318,29 @@ def _sweep_tier4_budget_and_demotion(
     *,
     services: Any,
     now: datetime,
+    seen_root_cause_hashes: set[str] | None = None,
 ) -> dict[str, int]:
-    """Per-tick sweep — enforce wall-clock budget on every active tier-4 row.
+    """Per-tick sweep — enforce budget AND demote on finding-resolved.
 
     For each row in ``tier4_promotion_state`` with ``tier4_active=1``:
 
+    * If ``seen_root_cause_hashes`` is supplied (i.e. the cadence has
+      finished its per-project finding scan this tick) and the row's
+      ``root_cause_hash`` is NOT in the set, the underlying finding has
+      resolved while tier-4 was active. Demote the row, emit
+      ``audit.tier4_demoted`` with reason ``finding_resolved``. Without
+      this, a fast tier-4 fix still hit the 2h budget → terminal/
+      product-broken — defeating the recovery (#1554 HIGH-1).
     * If ``now - tier4_entered_at`` >= budget → fire the terminal path:
       emit ``audit.tier4_budget_exhausted``, route to product-broken +
       urgent inbox via :func:`_route_tier4_to_terminal`, then demote.
-    * Otherwise leave the row alone — the dispatch path is responsible
-      for clearing on finding-resolution; future work can add explicit
-      finding-resolved detection here.
+    * Otherwise leave the row alone — let the next tick check again.
+
+    Resolved-finding demotion runs BEFORE the budget check so a row
+    that resolved exactly at the budget boundary takes the demotion
+    path (good outcome) rather than the terminal one. Pass
+    ``seen_root_cause_hashes=None`` to skip resolved-finding detection
+    (callers without finding-scan output, e.g. ad-hoc invocations).
 
     Returns counter increments to fold into the cadence totals.
     """
@@ -2350,6 +2358,28 @@ def _sweep_tier4_budget_and_demotion(
         return counters
     for state in active_rows:
         try:
+            # 1) Finding-resolved demotion. Only runs when the caller
+            # supplied a seen-hash set — otherwise we can't safely
+            # distinguish "finding gone" from "no scan happened yet".
+            if (
+                seen_root_cause_hashes is not None
+                and state.root_cause_hash not in seen_root_cause_hashes
+            ):
+                cleared = tracker.clear(
+                    state.root_cause_hash,
+                    now=now,
+                    reason="finding_resolved",
+                )
+                if cleared:
+                    _emit_tier4_demoted(
+                        project=state.project,
+                        root_cause_hash_value=state.root_cause_hash,
+                        reason="finding_resolved",
+                    )
+                    counters["tier4_demoted_cleared"] += 1
+                continue
+
+            # 2) Budget enforcement.
             if tracker.is_budget_exhausted(state.root_cause_hash, now=now):
                 elapsed = (
                     int((now - state.tier4_entered_at).total_seconds())
@@ -2628,6 +2658,24 @@ def _scan_one_project(
         )
         return counters
 
+    # #1554 HIGH-1 — collect the root_cause_hash for every finding seen
+    # this scan. The cadence-level sweep uses the union across projects
+    # to detect tier-4 rows whose finding has resolved (hash absent →
+    # demote, no terminal-path required). Stored on the counters dict
+    # under a sentinel key the cadence handler pops out.
+    from pollypm.audit.tier4 import root_cause_hash as _root_cause_hash
+
+    seen_hashes: set[str] = set()
+    for finding in findings:
+        try:
+            seen_hashes.add(_root_cause_hash(finding))
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "tier4: root_cause_hash failed for %s/%s",
+                finding.rule, finding.project, exc_info=True,
+            )
+    counters["_seen_root_cause_hashes"] = seen_hashes  # type: ignore[assignment]
+
     for finding in findings:
         counters["findings"] += 1
         emit_finding(finding)
@@ -2872,6 +2920,10 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 "audit.watchdog: state-db-probe failed", exc_info=True,
             )
             state_db_probes = []
+        # #1554 HIGH-1 — accumulate the union of seen root_cause_hash
+        # values across every project scan. The tier-4 sweep uses this
+        # to demote rows whose underlying finding has resolved.
+        seen_root_cause_hashes: set[str] = set()
         for project in services.known_projects or ():
             project_key = getattr(project, "key", None)
             if not project_key or project_key in seen_projects:
@@ -2892,6 +2944,9 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 config_path=config_path,
             )
             totals["projects_scanned"] += 1
+            project_seen = partial.pop("_seen_root_cause_hashes", None)
+            if isinstance(project_seen, set):
+                seen_root_cause_hashes.update(project_seen)
             for k, v in partial.items():
                 totals[k] = totals.get(k, 0) + v
 
@@ -2900,9 +2955,14 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         # the tier-4 tracker + audit log + product_state; idempotent
         # across ticks because every transition is gated on tracker
         # state. Best-effort — failure here does not break the cadence.
+        # #1554 HIGH-1 — pass the seen-hashes union so a successful
+        # tier-4 fix (finding gone) demotes cleanly without hitting the
+        # 2h budget / terminal path.
         try:
             sweep_counters = _sweep_tier4_budget_and_demotion(
-                services=services, now=now,
+                services=services,
+                now=now,
+                seen_root_cause_hashes=seen_root_cause_hashes,
             )
         except Exception:  # noqa: BLE001
             logger.warning(

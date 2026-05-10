@@ -308,15 +308,23 @@ def clear(
 
 
 def _resolve_storage_closet_session() -> str | None:
-    """Return the heartbeat / storage-closet tmux session name."""
+    """Return the heartbeat / storage-closet tmux session name.
+
+    Mirrors :meth:`Supervisor.storage_closet_session_name` and the
+    runtime-services ``storage_closet_name`` builder: the canonical
+    suffix is ``-storage-closet`` (NOT ``-storage`` — see
+    :data:`Supervisor._STORAGE_CLOSET_SESSION_SUFFIX`). Returning the
+    short suffix here would have us tmux-killing an unrelated session.
+    """
     try:
         from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+        from pollypm.supervisor import Supervisor
         cfg = load_config(DEFAULT_CONFIG_PATH)
-        # Mirror Supervisor.storage_closet_session_name() — the session
-        # is ``<tmux_session>-storage`` per the constant in supervisor.py.
         base = getattr(cfg.project, "tmux_session", "polly")
-        # Defensive: read from the runtime services if available.
-        return f"{base}-storage"
+        suffix = getattr(
+            Supervisor, "_STORAGE_CLOSET_SESSION_SUFFIX", "-storage-closet",
+        )
+        return f"{base}{suffix}"
     except Exception:  # noqa: BLE001
         return None
 
@@ -453,23 +461,46 @@ def restart_rail_daemon(
     ),
 ) -> None:
     _require_tier4(tier4)
-    # The rail daemon doesn't run in a separate tmux session — it's a
-    # subprocess of the cockpit. The recovery is to flip the cockpit
-    # supervisor's run-flag, which the existing cockpit launcher
-    # honours on next mount. Until the supervisor exposes a clean
-    # restart hook we shell out via `pm rail restart` if available;
-    # otherwise we no-op the bounce and rely on the audit row + push.
+
+    # Bounce the headless rail_daemon by signalling its tracked PID
+    # and respawning a replacement. Implementation lives in
+    # ``pollypm.rail_cli._terminate_daemon`` / ``_spawn_daemon`` so the
+    # ``pm rail restart`` CLI shares this code path.
     def _bounce() -> bool:
-        if not shutil.which("pm"):
-            return False
-        try:
-            proc = subprocess.run(
-                ["pm", "rail", "restart"],
-                check=False, capture_output=True, timeout=5.0,
-            )
-        except Exception:  # noqa: BLE001
-            return False
-        return proc.returncode == 0
+        from pollypm.rail_cli import (
+            _RAIL_DAEMON_PID_FILE,
+            _pid_alive,
+            _read_pid_file,
+            _spawn_daemon,
+            _terminate_daemon,
+        )
+
+        pid = _read_pid_file(_RAIL_DAEMON_PID_FILE)
+        terminate_outcome = "no_pid_file"
+        if pid is not None and _pid_alive(pid):
+            terminate_outcome = _terminate_daemon(pid)
+            if terminate_outcome == "denied":
+                logger.warning(
+                    "system: rail_daemon SIGTERM denied for pid=%d", pid,
+                )
+                return False
+            try:
+                if _RAIL_DAEMON_PID_FILE.exists() and not _pid_alive(pid):
+                    _RAIL_DAEMON_PID_FILE.unlink()
+            except OSError:
+                pass
+        elif pid is not None and not _pid_alive(pid):
+            try:
+                _RAIL_DAEMON_PID_FILE.unlink()
+            except OSError:
+                pass
+            terminate_outcome = "stale"
+        new_pid = _spawn_daemon()
+        logger.info(
+            "system: rail_daemon restart outcome=%s spawned_pid=%s",
+            terminate_outcome, new_pid,
+        )
+        return new_pid is not None
 
     code = _system_action(
         action_name="restart-rail-daemon",

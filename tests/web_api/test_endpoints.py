@@ -8,6 +8,10 @@ so the test path matches what the cockpit uses.
 
 from __future__ import annotations
 
+import sqlite3
+
+import pytest
+
 from pollypm.work.factory import create_work_service
 
 from .conftest import make_task
@@ -282,3 +286,89 @@ def test_validation_error_shape_for_bad_query(client, auth_headers) -> None:
     assert "details" in body
     assert isinstance(body["details"], list)
     assert all("field" in row and "message" in row for row in body["details"])
+
+
+# ---------------------------------------------------------------------------
+# Backing-store failures during work-service construction map to 503.
+#
+# Round-2 Codex finding: the round-1 fix wrapped some service calls
+# with ``_BACKING_STORE_ERRORS`` but not the construction step itself.
+# ``_open_work_service_readonly`` calls
+# :func:`pollypm.work.factory.create_work_service`, which can raise
+# :class:`sqlite3.OperationalError` during DB open / pragmas / schema
+# create / migrations. Spec §6 maps backing-store failures to 503
+# ``service_unavailable``; the tests below confirm that wrapping the
+# entire ``with`` block (not just the body) gets us there for all
+# three endpoints.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def backing_store_unavailable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force ``_open_work_service_readonly`` to fail on construction.
+
+    Patches the lazy import target —
+    :func:`pollypm.work.factory.create_work_service` — to raise the
+    same ``OperationalError`` SQLite emits when the DB file can't be
+    opened or a pragma fails. This simulates the construction-time
+    failure mode the round-2 review flagged.
+    """
+
+    def _boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("unable to open database file")
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", _boom
+    )
+
+
+def test_list_project_tasks_returns_503_when_construction_fails(
+    client, auth_headers, backing_store_unavailable
+) -> None:
+    response = client.get("/api/v1/projects/myproj/tasks", headers=auth_headers)
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "service_unavailable"
+    # The hint nudges the operator toward retry / doctor — keeps the
+    # contract from MED-6 round 1.
+    assert "hint" in body["error"]
+
+
+def test_get_task_detail_returns_503_when_construction_fails(
+    client, auth_headers, backing_store_unavailable
+) -> None:
+    response = client.get("/api/v1/tasks/myproj/1", headers=auth_headers)
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "service_unavailable"
+    assert "hint" in body["error"]
+
+
+def test_get_active_plan_returns_503_when_construction_fails(
+    client, auth_headers, backing_store_unavailable
+) -> None:
+    response = client.get("/api/v1/projects/myproj/plan", headers=auth_headers)
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "service_unavailable"
+    assert "hint" in body["error"]
+
+
+def test_get_task_detail_still_404s_for_genuinely_missing_task(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """Backing-store wrap must not swallow legitimate 404s.
+
+    ``svc.get(...)`` raises ``TaskNotFoundError`` (a non-DB error) for
+    a missing task; the inner swallow returns ``None`` and the route
+    maps that to 404. Only ``OperationalError`` /
+    ``sqlite3.DatabaseError`` / ``OSError`` get reclassified to 503.
+    """
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        make_task(svc, project="myproj", title="Real task")
+    # Ask for a task number that doesn't exist — should still 404.
+    response = client.get("/api/v1/tasks/myproj/9999", headers=auth_headers)
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"

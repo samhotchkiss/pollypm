@@ -345,33 +345,37 @@ def list_project_tasks(
         except ValueError:
             cursor_n = None
 
-    with _open_work_service_readonly(
-        config=config, project_key=project_key, project_path=project.path
-    ) as svc:
-        try:
+    # Wrap the entire ``with`` so failures during work-service
+    # construction (DB open, pragmas, schema bootstrap, migrations)
+    # also surface as 503 — not just failures inside the body.
+    # Spec §6 maps DB lock contention / I/O failures to
+    # ``service_unavailable`` so the client can retry. APIError /
+    # other typed exceptions fall outside ``_BACKING_STORE_ERRORS``
+    # so they pass through unchanged.
+    try:
+        with _open_work_service_readonly(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
             tasks = svc.list_tasks(project=project_key, work_status=status)
-        except _BACKING_STORE_ERRORS as exc:
-            # Spec §6 maps DB lock contention / I/O failures to 503 so
-            # the client can retry. Logging full traceback so the
-            # operator can diagnose without rerunning under DEBUG.
-            logger.warning(
-                "list_tasks: backing store error for %s: %s",
-                project_key,
-                exc,
-                exc_info=True,
-            )
-            raise service_unavailable(
-                f"Backing store unavailable for project {project_key}",
-                hint="Retry shortly; check `pm doctor` if the failure persists.",
-            ) from exc
-        tasks.sort(key=lambda t: getattr(t, "task_number", 0))
-        if cursor_n is not None:
-            tasks = [t for t in tasks if getattr(t, "task_number", 0) > cursor_n]
-        page = tasks[:limit]
-        next_cursor: str | None = None
-        if len(tasks) > limit and page:
-            next_cursor = str(getattr(page[-1], "task_number", 0))
-        return [_task_to_summary(t) for t in page], next_cursor
+            tasks.sort(key=lambda t: getattr(t, "task_number", 0))
+            if cursor_n is not None:
+                tasks = [t for t in tasks if getattr(t, "task_number", 0) > cursor_n]
+            page = tasks[:limit]
+            next_cursor: str | None = None
+            if len(tasks) > limit and page:
+                next_cursor = str(getattr(page[-1], "task_number", 0))
+            return [_task_to_summary(t) for t in page], next_cursor
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "list_tasks: backing store error for %s: %s",
+            project_key,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable for project {project_key}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
 
 
 def get_task_detail(
@@ -382,20 +386,44 @@ def get_task_detail(
         return None
 
     task_id = f"{project_key}/{task_number}"
-    with _open_work_service_readonly(
-        config=config, project_key=project_key, project_path=project.path
-    ) as svc:
-        try:
-            task = svc.get(task_id)
-        except Exception:  # noqa: BLE001
-            return None
-        plan: APIPlan | None = None
-        if _is_plan_task(task) and _is_in_review(task):
+    # Wrap the entire ``with`` so failures during work-service
+    # construction (DB open, pragmas, schema bootstrap, migrations)
+    # surface as 503, not 500. Genuine missing-task failures (the
+    # narrow ``Exception`` swallow inside ``svc.get(...)``) still
+    # collapse to ``None`` ⇒ 404 — but a backing-store failure on
+    # ``svc.get`` re-raises ``OperationalError`` past the inner
+    # swallow so the outer handler can map it to 503.
+    try:
+        with _open_work_service_readonly(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
             try:
-                plan = _build_plan(svc, task)
+                task = svc.get(task_id)
+            except _BACKING_STORE_ERRORS:
+                # Re-raise so the outer handler converts to 503 —
+                # don't conflate a DB error with "task not found".
+                raise
             except Exception:  # noqa: BLE001
-                plan = None
-        return _task_to_detail(task, plan=plan)
+                return None
+            plan: APIPlan | None = None
+            if _is_plan_task(task) and _is_in_review(task):
+                try:
+                    plan = _build_plan(svc, task)
+                except Exception:  # noqa: BLE001
+                    plan = None
+            return _task_to_detail(task, plan=plan)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "get_task_detail: backing store error for %s/%s: %s",
+            project_key,
+            task_number,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable for task {project_key}/{task_number}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -417,17 +445,35 @@ def get_active_plan(
     project = config.projects.get(project_key)
     if project is None:
         return None
-    with _open_work_service_readonly(
-        config=config, project_key=project_key, project_path=project.path
-    ) as svc:
-        plan = _active_plan_for_project(svc, project_key)
-        if plan is None:
-            return None
-        if version is not None and plan.version != version:
-            # Older versions are not retrievable yet; matching strict
-            # version returns the active plan only when it matches.
-            return None
-        return plan
+    # Wrap the entire ``with`` so failures during work-service
+    # construction surface as 503. ``_active_plan_for_project``
+    # internally swallows broad exceptions (so a transient query
+    # failure during plan reconstruction degrades to "no plan"),
+    # but a backing-store failure on ``__enter__`` would otherwise
+    # leak as 500.
+    try:
+        with _open_work_service_readonly(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            plan = _active_plan_for_project(svc, project_key)
+            if plan is None:
+                return None
+            if version is not None and plan.version != version:
+                # Older versions are not retrievable yet; matching strict
+                # version returns the active plan only when it matches.
+                return None
+            return plan
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "get_active_plan: backing store error for %s: %s",
+            project_key,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable for project {project_key}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
 
 
 def _active_plan_for_project(svc, project_key: str) -> APIPlan | None:

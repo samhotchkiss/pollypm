@@ -7755,3 +7755,145 @@ def test_995_layout_heal_skips_when_layout_is_already_healthy(
         "the layout already being healthy; this would re-split the "
         "right pane every click and undo a successful live mount."
     )
+
+
+def test_compact_rail_normalises_selected_subrow_to_parent_project(monkeypatch) -> None:
+    """#1559 — compact-mode (#1543) drops ``state == "sub"`` rail rows
+    when the projected line count exceeds the available terminal
+    height. Without normalization, a selected ``project:<key>:dashboard``
+    row was silently dropped from the visible nav and ``_apply_built_items``
+    fell back to the first selectable nav item (Home), so the next
+    keystroke routed from the wrong project. This test pins that the
+    selection lands on the parent ``project:<key>`` row instead.
+    """
+    # ``RailItem.update_body`` reaches into the active Textual app to
+    # render text — bypass it so we can drive ``_apply_built_items``
+    # outside the harness.
+    monkeypatch.setattr(RailItem, "update_body", lambda self: None)
+
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+
+    full_items = [
+        CockpitItem(key="dashboard", label="Home", state="idle"),
+        CockpitItem(key="inbox", label="Inbox", state="idle"),
+        CockpitItem(key="workers", label="Workers", state="idle"),
+        CockpitItem(key="activity", label="Activity", state="idle"),
+        CockpitItem(key="project:alpha", label="Alpha", state="idle"),
+        CockpitItem(
+            key="project:alpha:dashboard",
+            label="Dashboard",
+            state="sub",
+            selectable=False,
+        ),
+        CockpitItem(
+            key="project:alpha:session",
+            label="PM Chat",
+            state="sub",
+            selectable=False,
+        ),
+        CockpitItem(
+            key="project:alpha:tasks",
+            label="Tasks",
+            state="sub",
+            selectable=False,
+        ),
+        CockpitItem(key="project:demo", label="Demo", state="idle"),
+        CockpitItem(
+            key="project:demo:dashboard",
+            label="Dashboard",
+            state="sub",
+            selectable=False,
+        ),
+        CockpitItem(
+            key="project:demo:session",
+            label="PM Chat",
+            state="sub",
+            selectable=False,
+        ),
+        CockpitItem(
+            key="project:demo:tasks",
+            label="Tasks",
+            state="sub",
+            selectable=False,
+        ),
+        CockpitItem(key="settings", label="Settings", state="idle"),
+    ]
+
+    # ``App.size`` is a read-only property and Textual won't construct
+    # one outside the running app harness. Override the bound method
+    # with an injected available-height so we can drive the production
+    # filter logic through ``_apply_compact_rail_if_short`` and ensure
+    # both the drop AND the downstream selection-normalization land.
+    available_height = 12  # full list (13 items + 10 overhead = 23) > 12
+
+    def _compact_with_fixed_height(items):  # noqa: ANN001
+        projected = len(items) + PollyCockpitApp._RAIL_FIXED_OVERHEAD_LINES
+        if projected <= available_height:
+            return items
+        return [item for item in items if item.state != "sub"]
+
+    app._apply_compact_rail_if_short = _compact_with_fixed_height  # type: ignore[method-assign]
+
+    pre_compact = full_items
+    post_compact = app._apply_compact_rail_if_short(pre_compact)
+    assert all(item.state != "sub" for item in post_compact), (
+        "compact mode must drop sub rows when the rail can't fit at the "
+        "current terminal height"
+    )
+    visible_keys = [item.key for item in post_compact]
+    assert "project:demo" in visible_keys
+    assert "project:demo:dashboard" not in visible_keys
+
+    # Now drive _apply_built_items with the selected sub-row gone from
+    # the compact list. The caller is viewing project:demo's dashboard
+    # in the right pane; the rail must follow up to ``project:demo``,
+    # not collapse all the way back to Home.
+    app._items = []
+    app._working_keys = set()
+    app._unread_keys = set()
+    app.selected_key = "project:demo:dashboard"
+    app._tick_count = 100
+    app._last_nav_change = 0  # not "recently navigated"
+    app.spinner_index = 0
+    app.presence = None  # type: ignore[assignment]
+    app._row_widgets = {}
+    app._suspend_selection_events = False
+
+    captured_active_keys: list[str] = []
+
+    def _capture_apply_active() -> None:
+        captured_active_keys.append(app.selected_key)
+
+    app._apply_active_view_to_rows = _capture_apply_active  # type: ignore[method-assign]
+    app._update_ticker = lambda: None  # type: ignore[method-assign]
+    app._update_hint = lambda: None  # type: ignore[method-assign]
+    app._selected_row_key = lambda: None  # type: ignore[method-assign]
+    app._nav_items = lambda: post_compact  # type: ignore[method-assign]
+
+    class _StubNavList:
+        index: int | None = None
+        children: list = []  # noqa: RUF012
+
+        def clear(self) -> None:
+            return None
+
+        def extend(self, rows) -> None:  # noqa: ANN001
+            self.children = list(rows)
+
+    app.nav = _StubNavList()  # type: ignore[assignment]
+
+    class _StubSettingsRow:
+        display = True
+
+        def set_class(self, *_args, **_kwargs) -> None:  # noqa: ANN002, ANN003
+            return None
+
+    app.settings_row = _StubSettingsRow()  # type: ignore[assignment]
+
+    app._apply_built_items(full_items)
+
+    assert app.selected_key == "project:demo", (
+        "compact mode hid project:demo:dashboard; selection must snap "
+        "up to the parent project:demo, not fall back to Home"
+    )
+    assert captured_active_keys == ["project:demo"]

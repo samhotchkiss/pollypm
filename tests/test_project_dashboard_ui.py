@@ -774,13 +774,22 @@ def _run(coro) -> None:
 
 
 def test_topbar_renders_name_and_default_pm(dashboard_env, dashboard_app) -> None:
-    """With no persona configured the top bar uses a neutral PM label."""
+    """With no persona configured the top bar omits the PM meta entirely.
+
+    #1542 — ``media`` rendered ``PM: Project PM`` while every other
+    project showed a real PM name; the placeholder leaked into the UI.
+    Hiding the meta when no persona is set is the smaller change vs
+    auto-naming.
+    """
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
             await pilot.pause()
             topbar_text = str(dashboard_app.topbar.render())
             assert "Demo" in topbar_text
-            assert "PM: Project PM" in topbar_text
+            # No persona → no ``PM:`` prefix at all (vs the old
+            # ``PM: Project PM`` placeholder).
+            assert "PM:" not in topbar_text
+            assert "Project PM" not in topbar_text
     _run(body())
 
 
@@ -1162,11 +1171,11 @@ def test_banner_celebrates_when_plan_task_summary_present() -> None:
 
 
 def test_banner_falls_through_when_plan_task_summary_absent() -> None:
-    """#1531 — without a ``plan_task_summary``, the ``plan_missing``
-    alert keeps the original "ask the PM to plan" framing — but does
-    NOT lie about a plan being absent / present, and the new copy
-    drops the redundant "Waiting on you:" prefix while keeping the
-    affordance ("press c").
+    """#1531/#1540 — without a ``plan_task_summary``, the
+    ``plan_missing`` alert frames the state as a *next step* (not an
+    "alert" the user is failing at). Banner does NOT claim a plan
+    exists, keeps the ``c`` affordance, and drops the trailing
+    ``· N alert`` count for this one specific state.
     """
     from types import SimpleNamespace
 
@@ -1182,15 +1191,45 @@ def test_banner_falls_through_when_plan_task_summary_absent() -> None:
         task_buckets={"on_hold": [], "review": []},
         inbox_count=0,
         plan_task_summary=None,
+        persona_name=None,
     )
     banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
     # Must NOT claim the plan is ready when it isn't.
     assert "Plan's ready" not in banner
     # Affordance: still routes to ``c`` (chat the PM to plan).
-    assert "press c" in banner
+    assert "Press c" in banner or "press c" in banner
     # Avoid the misleading "press a to review" ambiguous instruction
     # that was the trap.
     assert "press a to review" not in banner
+    # #1540 — no trailing count_suffix on this state; the "no plan"
+    # state is the default early state, not a "1 alert".
+    assert "1 alert" not in banner
+
+
+def test_banner_no_plan_uses_persona_name_when_set() -> None:
+    """#1540 — when a persona is configured (Archie/Cole/...) the
+    no-plan banner names the PM instead of saying "the PM".
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["plan_missing"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary=None,
+        persona_name="Archie",
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    assert "Archie" in banner
+    # Anonymous fallback must NOT leak when a persona is set.
+    assert "the PM" not in banner
 
 
 def test_banner_celebrates_with_only_task_id_when_title_missing() -> None:
@@ -1218,6 +1257,251 @@ def test_banner_celebrates_with_only_task_id_when_title_missing() -> None:
     # With no title, the banner falls back to the task_id so the user
     # still gets a routable identifier.
     assert "coffeeboardnm/1" in banner
+
+
+def test_action_bar_soft_plan_missing_state_is_not_critical(
+    dashboard_env, dashboard_app,
+) -> None:
+    """#1555 (MED-1) — the soft ``plan_missing``-no-summary state
+    renders the calm "Press c to plan this with <PM>" lede and drops
+    the trailing ``· N alert`` count from the banner copy. Treating
+    that exact state as ``-critical`` (red border, red background)
+    contradicts the soft framing and mismatches the status pill (which
+    #1540 already routes to ``next step`` for the same state). The
+    action bar must demote to ``-attention`` so the styling matches
+    the copy.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+
+    class _FakeBar:
+        def __init__(self) -> None:
+            self._classes: set[str] = set()
+
+        def remove_class(self, name: str) -> None:
+            self._classes.discard(name)
+
+        def add_class(self, name: str) -> None:
+            self._classes.add(name)
+
+        def update(self, _text: str) -> None:
+            pass
+
+        def has_class(self, name: str) -> bool:
+            return name in self._classes
+
+    app.action_bar = _FakeBar()
+    # Stub out the review CTA path so _update_action_bar's call into
+    # _update_review_cta doesn't need a real widget tree.
+    app._update_review_cta = lambda _data: None
+
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["plan_missing"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary=None,
+        persona_name="Archie",
+        pm_persona="Archie",
+    )
+    app._update_action_bar(fake_data)
+    assert not app.action_bar.has_class("-critical"), (
+        "soft plan_missing-no-summary state must not get -critical "
+        "styling — banner copy is calm, pill is yellow"
+    )
+    # Demote to -attention so the bar still reads as something to do
+    # (without yelling).
+    assert app.action_bar.has_class("-attention")
+
+
+def test_action_bar_other_alerts_still_critical() -> None:
+    """#1555 (MED-1) — the demotion above is *only* for the soft
+    plan_missing-no-summary state. Every other alert family
+    (recovery_limit, auth_broken, worker_question, ...) still goes
+    critical so the user sees red on real failure modes.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+
+    class _FakeBar:
+        def __init__(self) -> None:
+            self._classes: set[str] = set()
+
+        def remove_class(self, name: str) -> None:
+            self._classes.discard(name)
+
+        def add_class(self, name: str) -> None:
+            self._classes.add(name)
+
+        def update(self, _text: str) -> None:
+            pass
+
+        def has_class(self, name: str) -> bool:
+            return name in self._classes
+
+    app.action_bar = _FakeBar()
+    app._update_review_cta = lambda _data: None
+
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["recovery_limit"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary=None,
+        persona_name=None,
+        pm_persona=None,
+    )
+    app._update_action_bar(fake_data)
+    assert app.action_bar.has_class("-critical")
+
+
+def test_banner_no_plan_uses_pm_persona_for_architect_session() -> None:
+    """#1555 (MED-2) — the no-plan banner names the *effective* PM
+    (the one the topbar shows), not the raw project ``persona_name``.
+
+    Repro: a project configured with ``persona_name="Bea"`` is being
+    routed by an architect session (the architect persona overrides
+    the project-level PM in ``_project_pm_persona``). The topbar reads
+    ``PM: Archie``; before this fix the banner read
+    ``Press c to plan this with Bea`` — two different teammate names
+    on one screen for the same project.
+
+    The fix populates ``ProjectDashboardData.pm_persona`` from
+    ``_project_pm_persona`` (the same helper the topbar uses) and the
+    banner reads from there.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["plan_missing"],
+        active_worker=None,
+        task_counts={},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary=None,
+        # Raw project persona (what the topbar would have shown if no
+        # architect session was routing) — must NOT appear in the
+        # banner because the architect routing wins.
+        persona_name="Bea",
+        # Effective PM, matches what _project_pm_label puts in the
+        # topbar.
+        pm_persona="Archie",
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    assert "Archie" in banner, (
+        f"banner must use effective PM persona: {banner!r}"
+    )
+    assert "Bea" not in banner, (
+        f"banner leaked raw project persona instead of effective PM: "
+        f"{banner!r}"
+    )
+
+
+def test_calm_banner_drops_p_to_plan_when_no_plan_route() -> None:
+    """#1555 (MED-3) — the calm-idle banner must not advertise the
+    ``p to plan`` shortcut when there is no plan_path on disk AND no
+    plan_task_summary. The footer hint already hides ``p plan`` for
+    that exact state (because pressing ``p`` opens an empty plan
+    surface — a dead-end); the banner has to agree.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=0,
+        active_worker={
+            "session_name": "architect_bikepath",
+            "role": "architect",
+            "activity": "idle",
+        },
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+        persona_name=None,
+        pm_persona=None,
+        plan_path=None,
+        plan_task_summary=None,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ Clear")
+    # Still a CTA (banner shouldn't read as a dead-end).
+    assert "Press c to chat" in banner
+    # But ``p to plan`` would point at an empty plan surface — drop it.
+    assert "p to plan" not in banner, (
+        f"calm banner advertised dead-end p shortcut: {banner!r}"
+    )
+
+
+def test_calm_banner_keeps_p_to_plan_when_plan_path_exists() -> None:
+    """#1555 (MED-3) — the inverse: when there IS a plan file on disk
+    (or a plan_task_summary), pressing ``p`` lands on a real plan
+    surface, so the calm banner keeps the ``p to plan`` advertisement.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data_with_plan_file = SimpleNamespace(
+        action_items=[],
+        alert_count=0,
+        active_worker={
+            "session_name": "architect_bikepath",
+            "role": "architect",
+            "activity": "idle",
+        },
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+        persona_name=None,
+        pm_persona=None,
+        plan_path=Path("/tmp/plan.md"),
+        plan_task_summary=None,
+    )
+    banner_a = app._render_project_state_banner(
+        fake_data_with_plan_file, "▸ Clear",
+    )
+    assert "p to plan" in banner_a
+
+    fake_data_with_plan_summary = SimpleNamespace(
+        action_items=[],
+        alert_count=0,
+        active_worker={
+            "session_name": "architect_bikepath",
+            "role": "architect",
+            "activity": "idle",
+        },
+        task_counts={},
+        task_buckets={"on_hold": []},
+        inbox_count=0,
+        persona_name=None,
+        pm_persona=None,
+        plan_path=None,
+        plan_task_summary={"task_id": "demo/1", "title": "POC plan"},
+    )
+    banner_b = app._render_project_state_banner(
+        fake_data_with_plan_summary, "▸ Clear",
+    )
+    assert "p to plan" in banner_b
 
 
 def test_status_yellow_when_task_is_on_hold(
@@ -3418,11 +3702,18 @@ def test_status_pill_celebrates_plan_ready_when_plan_task_summary_present() -> N
     assert dot == "◆"
 
 
-def test_status_pill_falls_back_to_red_alert_without_plan_task_summary() -> None:
-    """#1536 — ``plan_missing`` family WITHOUT a ``plan_task_summary``
-    keeps the existing red ``alert`` palette. The summary signal is what
-    distinguishes a plan-ready celebration from an actual missing-plan
-    debt."""
+def test_status_pill_reads_next_step_for_plan_missing_without_summary() -> None:
+    """#1540 — ``plan_missing`` family WITHOUT a ``plan_task_summary``
+    is the *default early state* for a freshly-registered project, not
+    a problem the user is failing at. Reframe the pill as a soft
+    ``◇ next step`` instead of the red ``◆ alert`` framing the
+    cockpit uses for genuine problems.
+
+    Supersedes #1536's red-alert framing for this specific case;
+    real alert families (recovery_limit, auth_broken, ...) still hit
+    the red ``alert`` path — see
+    ``test_status_pill_keeps_red_alert_for_non_plan_missing_families``.
+    """
     from pollypm.cockpit_ui import _dashboard_status
 
     dot, color, label = _dashboard_status(
@@ -3433,9 +3724,11 @@ def test_status_pill_falls_back_to_red_alert_without_plan_task_summary() -> None
         plan_task_summary=None,
         alert_types=["plan_missing"],
     )
-    assert label == "alert"
-    assert color == "#f85149"  # the existing red alert palette
-    assert dot == "◆"
+    assert label == "next step"
+    # Soft grey/blue rather than the red alert palette.
+    assert color != "#f85149"
+    # Open diamond to signal the soft state.
+    assert dot == "◇"
 
 
 def test_status_pill_keeps_red_alert_for_non_plan_missing_families() -> None:
@@ -3467,6 +3760,11 @@ def test_banner_does_not_claim_in_action_for_idle_worker() -> None:
     "standing by." The fix routes ``idle`` to a standby banner and
     falls through to category banners (queued/blocked/review) when
     other work is waiting.
+
+    #1541 — the banner copy was reframed as a calm-but-inviting
+    note (no worker internals, ends with a CTA). Test now asserts
+    the negative shape ("Moving now"/"is active" must not appear)
+    plus the new positive shape (CTA points at ``c``/``p``).
     """
     from types import SimpleNamespace
 
@@ -3484,11 +3782,24 @@ def test_banner_does_not_claim_in_action_for_idle_worker() -> None:
         task_counts={},
         task_buckets={"on_hold": []},
         inbox_count=0,
+        persona_name=None,
+        # #1555 (MED-3) — populate plan_path so the calm CTA still
+        # advertises ``p to plan``. Without a plan route the CTA
+        # correctly drops ``p to plan`` (footer hides the keystroke
+        # too); a separate test covers that no-plan variant.
+        plan_path=Path("/tmp/plan.md"),
+        plan_task_summary=None,
     )
     banner = app._render_project_state_banner(fake_data, "▸ Clear")
     assert "Moving now" not in banner
     assert "is active" not in banner
-    assert "standing by" in banner
+    # #1541 — the worker key + role tag must not leak into copy.
+    assert "architect_bikepath" not in banner
+    assert "(architect)" not in banner
+    # #1541 — the banner ends with an actionable CTA so a calm
+    # project doesn't read as a dead-end.
+    assert "Press c to chat" in banner
+    assert "p to plan" in banner
 
 
 def test_banner_says_waiting_on_you_for_permission_prompt() -> None:

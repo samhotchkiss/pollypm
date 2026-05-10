@@ -7025,8 +7025,16 @@ def _project_pm_persona(config: object, project_key: str, project: object) -> st
 
 
 def _project_pm_label(config: object, project_key: str, project: object) -> str:
+    """Return the topbar PM label, e.g. ``"PM: Archie"``.
+
+    When the project has no persona configured we return ``""`` instead
+    of the placeholder ``"PM: Project PM"``; the caller is expected to
+    skip rendering an empty PM meta. #1542 — ``media`` rendered
+    ``PM: Project PM`` while every other project showed a real PM
+    name; the placeholder leaked into the UI.
+    """
     persona = _project_pm_persona(config, project_key, project)
-    return f"PM: {persona}" if persona else "PM: Project PM"
+    return f"PM: {persona}" if persona else ""
 
 
 def _resolve_pm_target(config_path: Path, project_key: str | None) -> tuple[str, str]:
@@ -11757,6 +11765,21 @@ def _dashboard_status(
         and "plan_missing" in alert_types
     ):
         return ("\u25c6", "#3ddc84", "plan ready")
+    # #1540 \u2014 a fresh project with no plan yet is the *default* early
+    # state, not a problem the user is failing at. Reframe the
+    # ``plan_missing`` (no-summary) alert as ``\u25c7 next step``
+    # instead of the red ``\u25c6 alert`` framing the cockpit uses
+    # for genuine problems. ``alert_types`` may carry other entries
+    # alongside ``plan_missing`` \u2014 only soften when ``plan_missing``
+    # is the *only* family in play (otherwise a real problem would
+    # be masked by next-step framing).
+    if (
+        alert_count
+        and alert_types
+        and list(alert_types) == ["plan_missing"]
+        and not plan_task_summary
+    ):
+        return ("\u25c7", "#97a6b2", "next step")
     if alert_count:
         return ("\u25c6", "#f85149", "alert")
     if active_worker is not None:
@@ -11799,6 +11822,7 @@ class ProjectDashboardData:
         "project_name",
         "project_path",
         "persona_name",
+        "pm_persona",
         "pm_label",
         "exists_on_disk",
         "status_dot",
@@ -11833,6 +11857,7 @@ class ProjectDashboardData:
         project_path: Path | None,
         persona_name: str | None,
         pm_label: str,
+        pm_persona: str | None = None,
         exists_on_disk: bool,
         status_dot: str,
         status_color: str,
@@ -11861,6 +11886,7 @@ class ProjectDashboardData:
         self.project_name = project_name
         self.project_path = project_path
         self.persona_name = persona_name
+        self.pm_persona = pm_persona
         self.pm_label = pm_label
         self.exists_on_disk = exists_on_disk
         self.status_dot = status_dot
@@ -14080,6 +14106,12 @@ def _gather_project_dashboard(
         else (getattr(project, "name", None) or project_key)
     )
     persona = getattr(project, "persona_name", None)
+    # #1555 (MED-2) — banner copy must match the topbar PM, not the raw
+    # project persona. ``_project_pm_persona`` already encodes the
+    # architect-session override (architect routing wins over the
+    # project-level ``persona_name``); use the same effective PM name
+    # everywhere the banner names a teammate.
+    pm_persona = _project_pm_persona(config, project_key, project)
     pm_label = _project_pm_label(config, project_key, project)
 
     exists_on_disk = bool(
@@ -14179,6 +14211,7 @@ def _gather_project_dashboard(
         project_name=name,
         project_path=project_path if exists_on_disk else None,
         persona_name=persona if isinstance(persona, str) else None,
+        pm_persona=pm_persona,
         pm_label=pm_label,
         exists_on_disk=exists_on_disk,
         status_dot=status_dot,
@@ -14279,6 +14312,7 @@ def _alert_banner_copy(
     alert_count: int,
     *,
     plan_task_summary: dict | None = None,
+    persona_name: str | None = None,
 ) -> str | None:
     """Return banner copy describing the alerts waiting on the user.
 
@@ -14351,9 +14385,14 @@ def _alert_banner_copy(
                 f"Plan's ready — {title}. Press → to review together"
                 f"{other_part}"
             )
+        # #1540 — name the PM (Archie/Cole/...) when one is configured
+        # so the banner reads as an invitation to a teammate, not a
+        # mechanical "ask the PM" nag. The fallback keeps the previous
+        # anonymous wording when no persona is set so the affordance
+        # ("press c") still routes correctly.
+        pm_label = (persona_name or "").strip() or "the PM"
         return (
-            f"This project has no plan yet — press c to ask the PM to "
-            f"plan it{other_part}"
+            f"Press c to plan this with {pm_label}{other_part}"
         )
     if family == "no_session_for_assignment":
         return (
@@ -14705,6 +14744,14 @@ class PollyProjectDashboardApp(App[None]):
 
     _DEFAULT_HINT = (
         "c chat \u00b7 p plan \u00b7 i inbox \u00b7 l log \u00b7 q home"
+    )
+    # #1540 \u2014 when the project has no plan yet, ``p plan`` opens an
+    # empty plan-review surface. Hide the keystroke from the footer
+    # so the user isn't told to press ``p`` and walked into a dead-
+    # end. The banner CTA still routes them via ``c`` to chat with
+    # the PM, which is the actual plan-creation flow.
+    _NO_PLAN_HINT = (
+        "c chat \u00b7 i inbox \u00b7 l log \u00b7 q home"
     )
     _ACTION_HINT = (
         "1 primary \u00b7 2 secondary \u00b7 3 reply \u00b7 c chat "
@@ -15290,9 +15337,16 @@ class PollyProjectDashboardApp(App[None]):
             return
 
         # ── Top bar ──
+        # #1542 — when no persona is configured, ``data.pm_label`` is
+        # the empty string (rather than the old ``"PM: Project PM"``
+        # placeholder). Drop the meta in that case so the topbar reads
+        # cleanly as just the project name.
         title = f"[#eef6ff][b]{_escape(data.project_name)}[/b][/#eef6ff]"
-        meta = f"[#97a6b2]{_escape(data.pm_label)}[/#97a6b2]"
-        self.topbar.update(f"{title}   {meta}")
+        if data.pm_label:
+            meta = f"[#97a6b2]{_escape(data.pm_label)}[/#97a6b2]"
+            self.topbar.update(f"{title}   {meta}")
+        else:
+            self.topbar.update(title)
 
         status_markup = (
             f"[{data.status_color}]{data.status_dot}[/] "
@@ -15402,6 +15456,15 @@ class PollyProjectDashboardApp(App[None]):
                 if visible_action_count > 1
                 else self._ACTION_HINT
             )
+        elif (
+            not getattr(data, "plan_path", None)
+            and not getattr(data, "plan_task_summary", None)
+        ):
+            # #1540 — no plan file on disk and no plan-shaped done
+            # task → ``p plan`` would open an empty plan surface.
+            # Hide the keystroke so the footer doesn't advertise a
+            # dead-end. Banner CTA already points users to ``c``.
+            hint = self._NO_PLAN_HINT
         else:
             hint = self._DEFAULT_HINT
         self.hint.update(hint)
@@ -15437,9 +15500,32 @@ class PollyProjectDashboardApp(App[None]):
         summary = self._render_project_state_banner(data, counts)
         self.action_bar.remove_class("-attention")
         self.action_bar.remove_class("-critical")
-        if data.alert_count or _project_hold_failure_summary(data):
+        # #1555 (MED-1) — the soft ``plan_missing``-no-summary state
+        # renders the calm "Press c to plan this with <PM>" lede and
+        # intentionally drops the ``· N alert`` count from the banner
+        # copy. Treating that exact state as ``-critical`` (red border,
+        # red background) contradicts the soft framing — the action
+        # pill yells while the banner sentence is a gentle invitation.
+        # Demote that one state to ``-attention`` so the styling matches
+        # the copy. (Other plan_missing-with-summary cases stay critical
+        # because they still surface a plan-ready action.)
+        alert_types = list(getattr(data, "alert_types", []) or [])
+        plan_summary = getattr(data, "plan_task_summary", None)
+        soft_plan_missing = (
+            alert_types == ["plan_missing"]
+            and not plan_summary
+            and not data.action_items
+        )
+        hold_failure = _project_hold_failure_summary(data)
+        if (data.alert_count and not soft_plan_missing) or hold_failure:
             self.action_bar.add_class("-critical")
-        elif data.action_items or review_count or data.inbox_count or on_hold_count:
+        elif (
+            data.action_items
+            or review_count
+            or data.inbox_count
+            or on_hold_count
+            or soft_plan_missing
+        ):
             self.action_bar.add_class("-attention")
         self.action_bar.update(f"[b]{_escape(summary)}[/b]")
         self._update_review_cta(data)
@@ -15554,12 +15640,36 @@ class PollyProjectDashboardApp(App[None]):
             # ("press a to review") when the family is unmapped — never
             # to a dead-end string that implies the system is going to
             # handle this on its own.
+            # #1555 (MED-2) — name the effective PM (architect persona
+            # when an architect session is routing this project), not
+            # the raw project ``persona_name``. The topbar uses the same
+            # effective lookup; the banner must match so a project with
+            # ``persona_name="Bea"`` running an architect session reads
+            # ``Press c to plan this with Archie`` (not ``Bea``).
+            pm_persona = (
+                getattr(data, "pm_persona", None)
+                or getattr(data, "persona_name", None)
+            )
             specific = _alert_banner_copy(
                 getattr(data, "alert_types", []) or [],
                 int(data.alert_count),
                 plan_task_summary=getattr(data, "plan_task_summary", None),
+                persona_name=pm_persona,
             )
             if specific:
+                # #1540 — drop the trailing ``· 1 alert`` for the
+                # plan_missing-no-summary "next step" state. The
+                # "no plan yet" framing is the default early state,
+                # not an alert the user should be chastised for. The
+                # action-bar pill still surfaces the count for users
+                # who want it; the banner stays clean.
+                alert_types = list(getattr(data, "alert_types", []) or [])
+                plan_summary = getattr(data, "plan_task_summary", None)
+                if (
+                    alert_types == ["plan_missing"]
+                    and not plan_summary
+                ):
+                    return specific
                 return f"{specific}{count_suffix}"
         # On-hold tasks must outrank an active background worker. Today
         # media renders ``Moving now: worker_media is active · 1 on
@@ -15632,10 +15742,43 @@ class PollyProjectDashboardApp(App[None]):
                 blocked = int(data.task_counts.get("blocked", 0))
                 review = int(data.task_counts.get("review", 0))
                 if not (queued or blocked or review):
-                    return (
-                        f"{session} ({role}) is alive but standing by "
-                        f"— no task in flight{count_suffix}"
+                    # #1541 — the calm-project banner used to leak
+                    # worker internals (``architect_bikepath
+                    # (architect)``) and stack four redundant ways
+                    # of saying "nothing to do" with no next step.
+                    # Reframe as a short, warm note that names the
+                    # PM persona and ends with an actionable CTA.
+                    #
+                    # #1555 (MED-2) — name the effective PM (matches
+                    # topbar) instead of the raw project persona.
+                    persona = (
+                        getattr(data, "pm_persona", None)
+                        or getattr(data, "persona_name", None)
+                        or ""
+                    ).strip()
+                    # #1555 (MED-3) — the footer hides the ``p plan``
+                    # keystroke when there is no plan_path AND no
+                    # plan_task_summary (because ``p`` would open an
+                    # empty plan surface). The banner CTA must agree:
+                    # advertising ``p to plan`` here points at the same
+                    # dead-end the footer just hid. Drop ``or p to
+                    # plan`` for that exact state; ``c`` (chat the PM
+                    # to plan it) is the live affordance.
+                    has_plan_route = bool(
+                        getattr(data, "plan_path", None)
+                        or getattr(data, "plan_task_summary", None)
                     )
+                    cta = (
+                        "Press c to chat or p to plan."
+                        if has_plan_route
+                        else "Press c to chat."
+                    )
+                    if persona:
+                        return f"{persona} is here when you need them. {cta}"
+                    # Fallback when no persona is configured: keep
+                    # the calm-but-inviting tone without inventing a
+                    # name (and without leaking the worker key).
+                    return f"All caught up. {cta}"
                 # Fall through to queued/blocked/review banners below
                 # so the user-facing category leads.
             else:

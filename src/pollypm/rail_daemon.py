@@ -38,11 +38,25 @@ def _pid_file(home: Path) -> Path:
 
 
 def _claim_pid_file(pid_path: Path) -> bool:
-    """Write our PID if no live daemon already holds the file.
+    """Atomically write our PID iff no live daemon already holds the file.
+
+    The supervisor's flock at the parent layer is the primary guard
+    against duplicate spawns, but it cannot help when two daemons are
+    started by completely independent paths (two ``pm up`` invocations,
+    cron tick that bypasses the supervisor, launchd KeepAlive racing a
+    cockpit revive). Belt-and-suspenders: this claim itself uses
+    ``O_EXCL`` so two children that both pass the initial existence
+    check still see exactly one winner — the loser gets ``FileExistsError``
+    and exits cleanly, leaving the original holder undisturbed.
+
+    A stale PID file (process no longer exists) is overwritten. The
+    overwrite path is racy on its own — two callers can both observe
+    the stale file, both unlink, both ``O_EXCL`` create — but exactly
+    one will win the create, so the duplicate-spawn outcome is
+    impossible regardless.
 
     Returns True on successful claim, False when a live daemon
-    already owns the slot. A stale PID file (process no longer
-    exists) is overwritten.
+    already owns the slot.
     """
     if pid_path.exists():
         try:
@@ -51,8 +65,38 @@ def _claim_pid_file(pid_path: Path) -> bool:
             existing = 0
         if existing > 0 and _pid_alive(existing):
             return False
+        # Stale file — clear it so our O_EXCL create below can succeed.
+        # ``missing_ok`` is fine; another concurrent reaper may have
+        # already unlinked it.
+        try:
+            pid_path.unlink()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            # Best-effort cleanup; the O_EXCL below will surface any
+            # genuine issue as a FileExistsError → False.
+            pass
     pid_path.parent.mkdir(parents=True, exist_ok=True)
-    pid_path.write_text(str(os.getpid()))
+    # ``O_EXCL | O_CREAT`` guarantees that two simultaneous claimers
+    # see exactly one success: the loser hits ``FileExistsError`` and
+    # bails (the daemon's caller logs and exits). Without this, two
+    # daemons can both observe a missing file, both ``write_text``,
+    # and the second write silently overwrites — leaving two live
+    # tickers with only one named in the PID file.
+    try:
+        fd = os.open(
+            str(pid_path),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o644,
+        )
+    except FileExistsError:
+        return False
+    except OSError:
+        return False
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    finally:
+        os.close(fd)
     return True
 
 

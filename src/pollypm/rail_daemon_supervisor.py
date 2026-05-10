@@ -85,6 +85,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shlex
 import signal
 import subprocess
 import time
@@ -125,6 +126,17 @@ DEFAULT_REVIVAL_THROTTLE_SECONDS = 60.0
 #: own SIGTERM handler tears down ``CoreRail`` synchronously and exits
 #: in well under this window when it's responsive at all.
 DEFAULT_SIGTERM_GRACE_SECONDS = 3.0
+
+#: How long to wait for a freshly-spawned daemon to write its PID file
+#: while we still hold the supervisor lock. The real spawner is a
+#: detached ``Popen`` that returns immediately — the child still has
+#: to import its modules, claim the PID file, and start the rail.
+#: Without this wait, the lock is released before the child writes
+#: ``rail_daemon.pid`` and a second supervisor can re-diagnose
+#: ``missing_pid`` and spawn again. 5s comfortably covers cold-import
+#: latency on the slowest field machines we've measured (~1-2s) without
+#: making cron callers block longer than their tick budget.
+DEFAULT_CHILD_PID_WAIT_SECONDS = 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -254,21 +266,82 @@ def _read_pid_command_line(pid: int) -> str | None:
     return text or None
 
 
+def _extract_config_arg(argv: list[str]) -> str | None:
+    """Return the ``--config`` value from ``argv``, or ``None`` if absent.
+
+    Handles both shapes:
+    * ``--config /path/to/cfg`` (two argv elements)
+    * ``--config=/path/to/cfg`` (single argv element)
+
+    Operates on parsed argv elements — substring matching across the
+    whole joined cmdline would let a path that merely *contains*
+    ``--config`` (e.g. ``/workspace/--config-test/...``) spoof the
+    match.
+    """
+    for i, tok in enumerate(argv):
+        if tok == "--config":
+            if i + 1 < len(argv):
+                return argv[i + 1]
+            return None
+        if tok.startswith("--config="):
+            return tok.split("=", 1)[1]
+    return None
+
+
+def _resolve_for_compare(path: Path | str) -> Path:
+    """Return a resolved Path for cross-process comparison.
+
+    Uses ``Path.resolve(strict=False)`` so that paths inside ephemeral
+    test directories (which may be on different mount points) still
+    compare equal across the supervisor and a daemon argv. Falls back
+    to ``Path(path)`` if resolution itself raises (e.g. permission
+    error walking a symlink chain).
+    """
+    try:
+        return Path(path).resolve(strict=False)
+    except (OSError, RuntimeError):
+        return Path(path)
+
+
+def _is_default_config(config_path: Path | None) -> bool:
+    """True iff ``config_path`` resolves to the global default.
+
+    A daemon spawned with no explicit ``--config`` is using
+    :data:`pollypm.config.DEFAULT_CONFIG_PATH`. Matching that daemon
+    against a non-default supervisor would let one workspace's
+    supervisor SIGTERM a different workspace's default-config daemon.
+    """
+    if config_path is None:
+        # Caller didn't give us a config to enforce — accept either way.
+        return True
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH as _default
+    except Exception:  # noqa: BLE001
+        # If we can't import the default for some reason, fail safe and
+        # decline to treat any config as default — the no-config daemon
+        # path will reject, which is the conservative answer.
+        return False
+    return _resolve_for_compare(config_path) == _resolve_for_compare(_default)
+
+
 def _pid_matches_daemon(pid: int, config_path: Path | None) -> bool:
     """True iff ``pid``'s command line looks like our rail daemon.
 
     Matches ``pollypm.rail_daemon`` (or the path-form ``pollypm/rail_daemon``
     in case ``ps`` reports the script path rather than the ``-m`` form)
-    in the argv. When ``config_path`` is provided AND the daemon's argv
-    carries an explicit ``--config <path>``, the path must also match —
-    a stray daemon for a different workspace must NOT be killed by this
-    supervisor.
+    in the argv. When ``config_path`` is provided we require one of:
 
-    A daemon spawned with no ``--config`` flag (using its default) still
-    matches when ``config_path`` is the workspace default — we accept
-    the absence of an explicit ``--config`` argument as compatible with
-    any config_path so old daemons predating the explicit flag still
-    register as ours.
+    * The daemon's argv carries an explicit ``--config <path>`` whose
+      resolved value equals the resolved ``config_path``.
+    * The daemon has NO ``--config`` flag (default-config daemon) AND
+      ``config_path`` itself resolves to :data:`DEFAULT_CONFIG_PATH`.
+
+    The second case is the only safe interpretation of a no-``--config``
+    daemon: it's pinned to the default config, so a non-default
+    supervisor must NOT claim it as theirs. Without this, a workspace
+    whose ``config_path`` is ``/workspace/A/.pollypm/config.yaml`` would
+    misidentify a separate user's default-config daemon as ours and
+    eventually SIGTERM it.
 
     Returns ``False`` on any read error — callers must treat that as
     "not our daemon" and skip signaling. Better to leave a possibly-stale
@@ -277,25 +350,43 @@ def _pid_matches_daemon(pid: int, config_path: Path | None) -> bool:
     cmdline = _read_pid_command_line(pid)
     if not cmdline:
         return False
+    # Tokenize argv properly. ``shlex.split`` handles quoted paths-with-
+    # spaces; on parse failure (truncated cmdline, weird shell escapes)
+    # fall back to whitespace split — still better than substring on
+    # the whole string for the entry-point check below.
+    try:
+        argv = shlex.split(cmdline, posix=True)
+    except ValueError:
+        argv = cmdline.split()
+
     # Must look like the rail_daemon entry point. Both forms appear in
     # the wild: ``-m pollypm.rail_daemon`` (our spawn) and the eager
     # ``python /path/to/pollypm/rail_daemon.py`` form some launchers
-    # produce on macOS.
-    if "pollypm.rail_daemon" not in cmdline and "pollypm/rail_daemon" not in cmdline:
+    # produce on macOS. Match on argv tokens — a plain substring on
+    # the joined cmdline could be spoofed by a process whose argv
+    # happens to mention the string in a comment / log path.
+    def _looks_like_entry_point(tok: str) -> bool:
+        if tok == "pollypm.rail_daemon":
+            return True
+        # Path form, possibly absolute, possibly with .py suffix.
+        return "pollypm/rail_daemon" in tok or "pollypm\\rail_daemon" in tok
+
+    if not any(_looks_like_entry_point(t) for t in argv):
         return False
+
     if config_path is None:
         return True
-    # Only enforce config match when the daemon actually carries a
-    # ``--config`` flag. A daemon launched with the implicit default
-    # is compatible with any caller pointing at that same default.
-    if "--config" not in cmdline:
-        return True
-    expected = str(config_path)
-    # Conservative substring match — argv joined by spaces, paths can
-    # contain spaces, so we accept any occurrence of the resolved
-    # config path in the cmdline. A mismatched workspace's path won't
-    # appear in our daemon's argv.
-    return expected in cmdline
+
+    daemon_cfg = _extract_config_arg(argv)
+    if daemon_cfg is None:
+        # Implicit-default daemon. Only ours when our own config_path
+        # IS the default — otherwise it belongs to a different
+        # (default-config) workspace and we must not signal it.
+        return _is_default_config(config_path)
+
+    # Both sides explicit — compare resolved Paths so symlinks /
+    # relative components don't cause spurious mismatches.
+    return _resolve_for_compare(daemon_cfg) == _resolve_for_compare(config_path)
 
 
 def _parse_iso_age_seconds(iso_text: str | None, *, now: datetime | None = None) -> float | None:
@@ -694,6 +785,58 @@ def _emit_revival_audit(
         pass
 
 
+def _wait_for_child_pid(
+    pid_path: Path,
+    config_path: Path | None,
+    *,
+    timeout_seconds: float = DEFAULT_CHILD_PID_WAIT_SECONDS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    poll_interval: float = 0.05,
+) -> int | None:
+    """Block until ``pid_path`` names a live, matching daemon (or timeout).
+
+    The default ``spawn_fn`` is :func:`pollypm.cli._spawn_rail_daemon`,
+    which returns as soon as ``Popen`` succeeds — long before the child
+    has imported ``pollypm.rail_daemon`` and written its PID file. If
+    we release the supervisor lock the moment ``spawn_fn`` returns, a
+    second supervisor can acquire the lock, observe ``missing_pid``,
+    and spawn a *second* daemon. Holding the lock until the child has
+    written a matching PID file closes that race.
+
+    "Matching" means: the file contains a positive int, that PID is
+    alive, and :func:`_pid_matches_daemon` accepts it (entry-point +
+    config check). A different PID (e.g. left over from a stuck
+    daemon we just SIGTERM'd that hasn't been cleaned up yet) is
+    treated as not-yet-arrived and we keep polling.
+
+    Returns the matching PID on success, or ``None`` on timeout. The
+    caller MUST log + release the lock either way — never deadlock.
+    """
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    last_seen: int | None = None
+    while True:
+        pid = _read_pid(pid_path)
+        if pid is not None and pid > 0 and _pid_is_alive(pid):
+            if _pid_matches_daemon(pid, config_path):
+                return pid
+            last_seen = pid
+        if time.monotonic() >= deadline:
+            if last_seen is not None:
+                logger.warning(
+                    "rail_daemon_supervisor: child PID file %s named "
+                    "pid=%d but identity check rejected it within %.1fs",
+                    pid_path, last_seen, timeout_seconds,
+                )
+            else:
+                logger.warning(
+                    "rail_daemon_supervisor: child did not write %s "
+                    "within %.1fs after spawn — releasing lock anyway",
+                    pid_path, timeout_seconds,
+                )
+            return None
+        sleep_fn(poll_interval)
+
+
 def check_and_revive_rail_daemon(
     *,
     config_path: Path,
@@ -708,6 +851,7 @@ def check_and_revive_rail_daemon(
     emit_audit: bool = True,
     cron: bool = False,
     lock_timeout_seconds: float = 5.0,
+    child_wait_seconds: float = DEFAULT_CHILD_PID_WAIT_SECONDS,
 ) -> RevivalResult:
     """Diagnose the rail daemon and respawn it if it's dead / stuck.
 
@@ -750,6 +894,16 @@ def check_and_revive_rail_daemon(
             concurrent-revival race that would otherwise spawn two
             daemons. Default 5s — covers the SIGTERM grace + spawn
             latency without making the caller block forever.
+        child_wait_seconds: how long, after ``spawn_fn`` returns, to
+            keep holding the lock while we wait for the freshly-
+            spawned child to write a matching PID file. The default
+            spawner is a detached ``Popen`` that returns BEFORE the
+            child has imported and claimed the PID file — releasing
+            the lock immediately would let a second supervisor
+            re-diagnose ``missing_pid`` and spawn again. Default
+            :data:`DEFAULT_CHILD_PID_WAIT_SECONDS` (5s). On timeout
+            we log + release anyway so a buggy spawner can never
+            deadlock the supervisor.
 
     Returns:
         :class:`RevivalResult` carrying the diagnosis, whether a spawn
@@ -942,6 +1096,38 @@ def check_and_revive_rail_daemon(
         except Exception as exc:  # noqa: BLE001
             spawn_error = f"{type(exc).__name__}: {exc}"
             logger.exception("rail_daemon_supervisor: spawn failed")
+
+        # Step 4: wait — still under the supervisor lock — for the
+        # freshly-spawned child to write a matching PID file. The real
+        # spawner is a detached ``Popen`` that returns immediately; if
+        # we release the lock now, a sibling supervisor can re-diagnose
+        # ``missing_pid`` and spawn a *second* daemon before this child
+        # gets to ``_claim_pid_file``. The wait is bounded
+        # (``child_wait_seconds``) so a buggy spawner can't deadlock us.
+        # Skipped if ``spawner`` itself raised — there is no child to
+        # wait for, and the existing "revived=False" reporting is correct.
+        if spawn_error is None:
+            confirmed_pid = _wait_for_child_pid(
+                pid_path,
+                config_path,
+                timeout_seconds=child_wait_seconds,
+                sleep_fn=sleep_fn,
+            )
+            if confirmed_pid is None:
+                # Don't flip revived=False — the spawn itself succeeded
+                # from our POV (Popen returned 0). But we did NOT
+                # observe the child claim the PID file before the
+                # timeout, so warn loudly so operators see chronic
+                # cases (slow imports, container OOM-on-boot, etc).
+                # Subsequent supervisor cycles will diagnose
+                # missing_pid / dead_process and recover the layer
+                # below us.
+                logger.warning(
+                    "rail_daemon_supervisor: spawned daemon did not "
+                    "register a PID at %s within %.1fs — proceeding "
+                    "but next cycle may re-spawn",
+                    pid_path, child_wait_seconds,
+                )
 
         revived = spawn_error is None
         result = RevivalResult(

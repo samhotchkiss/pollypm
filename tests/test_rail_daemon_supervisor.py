@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -261,22 +262,40 @@ class _SpawnRecorder:
     Records every config_path it was invoked with so tests can assert
     not just "did revival happen" but "did revival happen at all" /
     "with the right config".
+
+    By default the recorder also writes the current pytest PID into
+    ``pid_path`` (when supplied), mimicking a real freshly-spawned
+    daemon claiming its PID file. This is required so the supervisor's
+    post-spawn ``_wait_for_child_pid`` step (which holds the lock until
+    a matching PID lands on disk) returns promptly rather than waiting
+    out the full 5s timeout. Tests that need to model "spawn returned
+    but child never wrote a PID" pass ``write_pid=False``.
     """
 
-    def __init__(self, raise_on_call: bool = False) -> None:
+    def __init__(
+        self,
+        raise_on_call: bool = False,
+        *,
+        pid_path: Path | None = None,
+        write_pid: bool = True,
+    ) -> None:
         self.calls: list[Path] = []
         self.raise_on_call = raise_on_call
+        self.pid_path = pid_path
+        self.write_pid = write_pid
 
     def __call__(self, config_path: Path) -> None:
         self.calls.append(config_path)
         if self.raise_on_call:
             raise RuntimeError("simulated spawn failure")
+        if self.write_pid and self.pid_path is not None:
+            self.pid_path.write_text(str(os.getpid()))
 
 
 def test_revive_calls_spawner_when_pid_missing(tmp_path: Path):
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
 
     result = check_and_revive_rail_daemon(
         config_path=config_path,
@@ -297,7 +316,7 @@ def test_revive_skips_when_alive(tmp_path: Path):
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
     pid_path.write_text(str(os.getpid()))
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
     last_tick_iso = (datetime.now(UTC) - timedelta(seconds=10)).isoformat()
 
     result = check_and_revive_rail_daemon(
@@ -318,7 +337,7 @@ def test_revive_skips_when_throttled(tmp_path: Path):
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
     pid_path.write_text("999999")
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
     last_revival = datetime.now(UTC) - timedelta(seconds=5)
 
     result = check_and_revive_rail_daemon(
@@ -341,7 +360,7 @@ def test_revive_unlinks_stale_pid_file(tmp_path: Path):
     pid_path = tmp_path / "rail_daemon.pid"
     # Use our own PID so the supervisor sees "alive but stuck".
     pid_path.write_text(str(os.getpid()))
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
     stale_tick = (datetime.now(UTC) - timedelta(seconds=DEFAULT_STALE_TICK_SECONDS + 60)).isoformat()
 
     # Inject a no-op terminator (we can't actually SIGKILL ourselves
@@ -376,16 +395,20 @@ def test_revive_unlinks_stale_pid_file(tmp_path: Path):
     finally:
         _mod.os.kill = real_kill
 
-    # The pid file is unlinked even though our fake_kill didn't really
-    # kill the process — the unlink is unconditional after the term step.
-    assert not pid_path.exists()
+    # The OLD pid file (containing the stuck PID) is replaced by the
+    # spawner with a fresh PID. The supervisor unlinks the stale entry
+    # before invoking the spawner, and the spawner — modeling
+    # ``_claim_pid_file`` — writes its own PID. The post-revive file
+    # therefore exists and names the spawner's process, not pre-state.
+    assert pid_path.exists()
+    assert pid_path.read_text().strip() == str(os.getpid())
     assert spawner.calls == [config_path]
 
 
 def test_spawn_failure_is_reported(tmp_path: Path):
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
-    spawner = _SpawnRecorder(raise_on_call=True)
+    spawner = _SpawnRecorder(raise_on_call=True, pid_path=pid_path)
 
     result = check_and_revive_rail_daemon(
         config_path=config_path,
@@ -405,7 +428,7 @@ def test_revive_idempotent_under_throttle(tmp_path: Path):
     """Two back-to-back calls only spawn once because of the throttle."""
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
 
     first = check_and_revive_rail_daemon(
         config_path=config_path,
@@ -484,7 +507,7 @@ def test_revive_skips_signaling_when_pid_identity_mismatches(
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
     pid_path.write_text(str(os.getpid()))
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
 
     # Force the classifier to say "stuck_no_tick" even though the PID
     # isn't our daemon. The terminate helper must still refuse to kill.
@@ -555,13 +578,22 @@ def test_pid_matches_daemon_uses_cmdline(monkeypatch: pytest.MonkeyPatch):
     )
     assert _REAL_PID_MATCHES(12345, Path("/x/pollypm.toml")) is False
 
-    # Daemon with no explicit --config (legacy default) — accept as ours.
+    # Daemon with no explicit --config (legacy / default-config daemon).
+    # HIGH (#1556 round 2): a no-``--config`` daemon is using the global
+    # default config. A *non-default* supervisor must NOT match it —
+    # they belong to different workspaces.
     monkeypatch.setattr(
         _supervisor_mod,
         "_read_pid_command_line",
         lambda pid: "/usr/bin/python -m pollypm.rail_daemon",
     )
-    assert _REAL_PID_MATCHES(12345, Path("/x/pollypm.toml")) is True
+    assert _REAL_PID_MATCHES(12345, Path("/x/pollypm.toml")) is False
+
+    # ...but the SAME no-``--config`` daemon IS ours when our supervisor's
+    # config_path resolves to the global default. (We compute the
+    # default lazily so the test doesn't have to care where it lives.)
+    from pollypm.config import DEFAULT_CONFIG_PATH as _default_cfg
+    assert _REAL_PID_MATCHES(12345, _default_cfg) is True
 
     # No cmdline available at all (process gone, ps failed) — fail safe.
     monkeypatch.setattr(
@@ -652,7 +684,7 @@ def test_post_lock_recheck_stands_down_when_daemon_revived_concurrently(
     pid_path = tmp_path / "rail_daemon.pid"
     # Initial state: dead PID, original diagnose says dead_process.
     pid_path.write_text("999999")
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
 
     # Stage the world: AFTER the initial diagnose runs but BEFORE the
     # post-lock recheck, replace the PID file with a fresh "alive" PID
@@ -708,7 +740,7 @@ def test_cron_skips_revival_on_missing_pid(tmp_path: Path):
     """
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"  # never created
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
 
     result = check_and_revive_rail_daemon(
         config_path=config_path,
@@ -738,7 +770,7 @@ def test_cron_still_revives_dead_process(tmp_path: Path):
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
     pid_path.write_text("999999")  # dead PID
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
 
     result = check_and_revive_rail_daemon(
         config_path=config_path,
@@ -763,7 +795,7 @@ def test_non_cron_caller_still_revives_missing_pid(tmp_path: Path):
     """
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"  # never created
-    spawner = _SpawnRecorder()
+    spawner = _SpawnRecorder(pid_path=pid_path)
 
     result = check_and_revive_rail_daemon(
         config_path=config_path,
@@ -778,3 +810,237 @@ def test_non_cron_caller_still_revives_missing_pid(tmp_path: Path):
     assert result.decision.state == "missing_pid"
     assert result.revived is True
     assert spawner.calls == [config_path]
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL (#1556 round 2) — race remains when spawn_fn returns before
+# the child writes its PID file. Lock must be held until the child has
+# claimed the slot (or a timeout elapses and we release anyway).
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_revive_when_spawner_returns_without_writing_pid(
+    tmp_path: Path,
+):
+    """Spawner returns BEFORE child writes PID → second revive must NOT spawn.
+
+    The real spawner is a detached ``Popen`` that returns the moment
+    the OS hands back a process — long before the child has imported
+    the daemon module and called ``_claim_pid_file``. Without the
+    in-lock ``_wait_for_child_pid`` step, a sibling supervisor that
+    grabs the lock during that window will observe ``missing_pid``
+    and spawn a SECOND daemon. The fix holds the lock until the child
+    confirms (or a 5s default timeout fires).
+
+    This test models that race deterministically: a spawner that
+    records the call but never writes a PID file. We use a tiny
+    ``child_wait_seconds`` so the test doesn't actually pay the
+    full timeout — but still long enough to verify the lock-held
+    semantic. The second concurrent caller must observe ``lock_busy``
+    or post-lock recheck == ``missing_pid``-but-no-spawn (depending on
+    timing); critically, the spawner must NOT be invoked twice
+    *during the window where the first call is still inside the lock*.
+    """
+    config_path = tmp_path / "pollypm.toml"
+    pid_path = tmp_path / "rail_daemon.pid"
+
+    # Spawner that, like the real Popen, returns immediately without
+    # writing the PID file. ``write_pid=False`` opts out of the
+    # _SpawnRecorder default that mimics a real claim.
+    spawner = _SpawnRecorder(pid_path=pid_path, write_pid=False)
+
+    # Single-thread scenario first: even when the child never writes,
+    # the supervisor must surface this as a warning + revived=True
+    # (the spawn itself succeeded), and on retry NOT re-spawn while
+    # we're still inside the wait window. We bound the wait to keep
+    # the test fast.
+    result = check_and_revive_rail_daemon(
+        config_path=config_path,
+        pid_path=pid_path,
+        last_tick_iso=None,
+        last_revival_at=None,
+        spawn_fn=spawner,
+        sleep_fn=lambda _s: None,  # don't actually sleep during poll
+        emit_audit=False,
+        child_wait_seconds=0.2,  # short: we just want to verify the
+                                  # lock is held for SOME bounded time
+    )
+    # The first call records exactly one spawn — the wait timed out
+    # but the spawn itself was attempted, so revived=True.
+    assert spawner.calls == [config_path]
+    assert result.revived is True
+
+    # Now the racy window: a SECOND concurrent caller (modeled here
+    # as a thread that fires while the first is mid-wait). To exercise
+    # the "lock held during wait" guarantee we run the second call
+    # while a long-wait first call is in flight. The second must hit
+    # the lock-busy timeout — NOT spawn a duplicate.
+    pid_path.unlink(missing_ok=True)  # reset to missing_pid for race
+    spawner_a = _SpawnRecorder(pid_path=pid_path, write_pid=False)
+    spawner_b = _SpawnRecorder(pid_path=pid_path, write_pid=False)
+    barrier = threading.Barrier(2)
+    results: list = [None, None]
+
+    def runner_a() -> None:
+        barrier.wait()
+        results[0] = check_and_revive_rail_daemon(
+            config_path=config_path,
+            pid_path=pid_path,
+            last_tick_iso=None,
+            last_revival_at=None,
+            spawn_fn=spawner_a,
+            sleep_fn=lambda _s: None,
+            emit_audit=False,
+            # Hold the lock for ~1s while the child "fails to write"
+            child_wait_seconds=1.0,
+            lock_timeout_seconds=2.0,
+        )
+
+    def runner_b() -> None:
+        barrier.wait()
+        # Give A a head start so it acquires the lock first.
+        time.sleep(0.05)
+        results[1] = check_and_revive_rail_daemon(
+            config_path=config_path,
+            pid_path=pid_path,
+            last_tick_iso=None,
+            last_revival_at=None,
+            spawn_fn=spawner_b,
+            sleep_fn=lambda _s: None,
+            emit_audit=False,
+            child_wait_seconds=0.1,
+            # B's lock_timeout < A's child_wait so B times out
+            # waiting for the lock instead of spawning.
+            lock_timeout_seconds=0.3,
+        )
+
+    t1 = threading.Thread(target=runner_a)
+    t2 = threading.Thread(target=runner_b)
+    t1.start()
+    t2.start()
+    t1.join(timeout=10)
+    t2.join(timeout=10)
+    assert not t1.is_alive() and not t2.is_alive()
+
+    # A spawned exactly once.
+    assert spawner_a.calls == [config_path]
+    # B never invoked its spawner — the lock was still held by A.
+    # This is the central guarantee: even when A's child fails to
+    # write a PID file, B can't slip in and double-spawn.
+    assert spawner_b.calls == [], (
+        "second supervisor must NOT spawn while first holds the lock "
+        "waiting for child PID — race regression"
+    )
+    # B reported lock_busy.
+    assert results[1] is not None
+    assert results[1].spawn_error == "lock_busy"
+
+
+def test_daemon_pid_claim_is_atomic(tmp_path: Path):
+    """Two daemons racing to claim the same PID file → exactly one wins.
+
+    Belt-and-suspenders for the supervisor lock: even if two daemon
+    processes start by entirely independent paths (no shared
+    supervisor lock), the daemon's own ``_claim_pid_file`` uses
+    ``O_EXCL`` to ensure exactly one ends up named in the PID file.
+    The loser sees ``False`` and exits cleanly.
+    """
+    from pollypm.rail_daemon import _claim_pid_file
+
+    pid_path = tmp_path / "rail_daemon.pid"
+    barrier = threading.Barrier(8)
+    outcomes: list[bool] = []
+    outcomes_lock = threading.Lock()
+
+    def claimer() -> None:
+        barrier.wait()
+        ok = _claim_pid_file(pid_path)
+        with outcomes_lock:
+            outcomes.append(ok)
+
+    threads = [threading.Thread(target=claimer) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+        assert not t.is_alive()
+
+    # Exactly one winner — the rest see the file already exists.
+    assert outcomes.count(True) == 1, (
+        f"expected exactly one O_EXCL winner, got {outcomes.count(True)} "
+        f"of {len(outcomes)} (outcomes={outcomes!r})"
+    )
+    # The PID file names exactly one PID — ours.
+    assert pid_path.exists()
+    assert pid_path.read_text().strip() == str(os.getpid())
+
+
+# ---------------------------------------------------------------------------
+# HIGH (#1556 round 2) — config identity matching must not be loose:
+# a non-default-config supervisor must NOT match a default-config daemon.
+# ---------------------------------------------------------------------------
+
+
+def test_non_default_supervisor_does_not_match_default_config_daemon(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Workspace A's supervisor must NOT claim a default-config daemon as ours.
+
+    Scenario: two workspaces on one host. Workspace A's supervisor is
+    configured for ``/workspace/A/.pollypm/config.yaml``. A daemon is
+    running with no ``--config`` flag (using the global default). The
+    old loose substring matcher would treat the no-``--config`` daemon
+    as "compatible with any caller" and accept it as ours — meaning A
+    could SIGTERM workspace B's default-config daemon, or worse,
+    skip respawning A's actually-missing daemon because it thinks the
+    one already running covers it.
+
+    Strict matcher: a no-``--config`` daemon is ONLY ours when our
+    own config_path resolves to the global default.
+    """
+    monkeypatch.setattr(
+        _supervisor_mod,
+        "_read_pid_command_line",
+        lambda pid: "/usr/bin/python -m pollypm.rail_daemon",
+    )
+    workspace_a_cfg = Path("/workspace/A/.pollypm/config.yaml")
+    assert _REAL_PID_MATCHES(12345, workspace_a_cfg) is False, (
+        "default-config daemon must not match a non-default supervisor"
+    )
+
+    # Same daemon, but supervisor IS the global default — match expected.
+    from pollypm.config import DEFAULT_CONFIG_PATH as _default_cfg
+    assert _REAL_PID_MATCHES(12345, _default_cfg) is True
+
+
+def test_config_match_uses_argv_boundary_not_substring(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Path containing the supervisor's config path as a substring → not a match.
+
+    The old matcher used ``expected in cmdline`` which would falsely
+    match e.g. supervisor=/x/pollypm.toml against a daemon running
+    --config /other/contains-/x/pollypm.toml-decoy.yaml. The new
+    matcher tokenizes argv and compares resolved paths element-by-
+    element, so a substring-only collision is rejected.
+    """
+    monkeypatch.setattr(
+        _supervisor_mod,
+        "_read_pid_command_line",
+        lambda pid: (
+            "/usr/bin/python -m pollypm.rail_daemon "
+            "--config /other/contains-x-pollypm.toml-decoy.yaml"
+        ),
+    )
+    assert _REAL_PID_MATCHES(12345, Path("/x/pollypm.toml")) is False
+
+
+def test_config_match_handles_equals_form(monkeypatch: pytest.MonkeyPatch):
+    """``--config=/x.toml`` (single token) parses as well as the two-token form."""
+    monkeypatch.setattr(
+        _supervisor_mod,
+        "_read_pid_command_line",
+        lambda pid: "/usr/bin/python -m pollypm.rail_daemon --config=/x/pollypm.toml",
+    )
+    assert _REAL_PID_MATCHES(12345, Path("/x/pollypm.toml")) is True
+    assert _REAL_PID_MATCHES(12345, Path("/y/pollypm.toml")) is False

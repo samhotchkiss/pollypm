@@ -71,6 +71,7 @@ from pollypm.audit.log import (
     EVENT_TASK_CREATED,
     EVENT_TASK_STATUS_CHANGED,
     EVENT_WATCHDOG_ESCALATION_DISPATCHED,
+    EVENT_WATCHDOG_OPERATOR_DISPATCHED,
     EVENT_WORKER_SESSION_REAPED,
     AuditEvent,
 )
@@ -94,6 +95,14 @@ __all__ = [
     "RULE_PLAN_REVIEW_MISSING",
     "RULE_LEGACY_DB_SHADOW",
     "RULE_PLAN_MISSING_ALERT_CHURN",
+    "RULE_REJECTION_LOOP",
+    "RULE_STATE_DB_MISSING",
+    "RULE_QUEUE_WITHOUT_MOTION",
+    "TIER_1",
+    "TIER_2",
+    "TIER_3",
+    "TIER_4",
+    "TIER_TERMINAL",
     "ON_HOLD_HUMAN_NEEDED_TAG",
     "ON_HOLD_ARCHITECT_TAG",
     "scan_events",
@@ -101,11 +110,18 @@ __all__ = [
     "emit_heartbeat_tick",
     "emit_finding",
     "emit_escalation_dispatched",
+    "emit_operator_dispatched",
     "format_unstick_brief",
+    "tier_handoff_prompt",
+    "build_urgent_human_handoff",
     "watchdog_alert_session_name",
     "WATCHDOG_ALERT_TYPE",
     "format_finding_message",
     "ESCALATION_THROTTLE_SECONDS",
+    "OPERATOR_DISPATCH_THROTTLE_SECONDS",
+    "REJECTION_LOOP_THRESHOLD",
+    "REJECTION_LOOP_WINDOW_SECONDS",
+    "QUEUE_MOTION_THRESHOLD_SECONDS",
 ]
 
 
@@ -176,6 +192,56 @@ RULE_LEGACY_DB_SHADOW = "legacy_db_shadow"
 # in the cockpit. Threshold defaults to >=3 clear events on the same
 # ``plan_gate-<project>`` scope inside ``plan_missing_churn_window_seconds``.
 RULE_PLAN_MISSING_ALERT_CHURN = "plan_missing_alert_churn"
+# #1546 — heartbeat-cascade foundation. Three new rules:
+#
+# * ``rejection_loop`` — fires when a task accumulates K=3+ consecutive
+#   reviewer rejections at the same review node within a 2h window with
+#   reject reasons that share a root-cause family (stem-overlap or
+#   shared error-token signal). Tier-1 detector → tier-2 PM dispatch:
+#   the worker can't escape the dependency-and-runtime context locally,
+#   so the project PM receives structured evidence and decides between
+#   retry-with-structural-change, restructure-the-work-itself, or
+#   escalate-to-Polly. The detector deliberately does NOT auto-cancel.
+# * ``state_db_missing`` — fires when a registered project has only
+#   ``state.db.legacy-*`` archives in ``.pollypm/`` (the canonical
+#   workspace DB was never created or got renamed away). Heals via
+#   ``enable_tracked_project`` which re-runs the scaffold step.
+# * ``queue_without_motion`` — generic safety-net probe: a project with
+#   queued tasks and zero ``claim`` / execution-advance / status-change
+#   events in the last ``queue_motion_threshold_seconds`` window (default
+#   30 min). Fires as tier-2 with structured evidence (affected task IDs
+#   + last-activity timestamps); the dispatcher routes it to the operator
+#   leg today because the queue stalling out is a cross-cutting failure
+#   that frequently outlives a tier-2 PM dispatch.
+RULE_REJECTION_LOOP = "rejection_loop"
+RULE_STATE_DB_MISSING = "state_db_missing"
+RULE_QUEUE_WITHOUT_MOTION = "queue_without_motion"
+
+# #1546 — tier classifications for the heartbeat cascade. Every Finding
+# carries a ``tier`` so the dispatcher can route without re-reading the
+# rule body:
+#
+# * ``TIER_1`` — self-heal. The watchdog itself fixes the symptom (e.g.
+#   migrate legacy DB, backfill plan_review row, cancel duplicate
+#   advisor tasks, spawn missing role lane). Idempotent across ticks.
+# * ``TIER_2`` — PM/architect dispatch. The watchdog hands evidence to
+#   the project's architect tmux pane via send-keys; the architect
+#   decides what to do.
+# * ``TIER_3`` — operator/human dispatch. The watchdog routes to the
+#   user's inbox via the ``pm notify``-shaped path. Used when tier-2
+#   has been tried (or is structurally unavailable) and the next rung
+#   is a human.
+# * ``TIER_4`` — broadened-Polly authority. Reserved for follow-up
+#   issues; today no rule emits at this tier.
+# * ``TIER_TERMINAL`` — observe-only. The rule produces a finding for
+#   forensic / alerting purposes but no automated action follows. Used
+#   for orphan_marker, marker_leaked, cancellation_no_promotion,
+#   plan_missing_alert_churn (canary detectors).
+TIER_1 = "1"
+TIER_2 = "2"
+TIER_3 = "3"
+TIER_4 = "4"
+TIER_TERMINAL = "terminal"
 
 # Reason-string tags reviewers use to hint the watchdog routing. The
 # default (no tag) is architect-actionable. ``ON_HOLD_HUMAN_NEEDED_TAG``
@@ -193,6 +259,27 @@ ON_HOLD_HUMAN_NEEDED_TAG = "human-needed"
 # itself is the source of truth — querying the audit log avoids any
 # in-memory state that wouldn't survive a heartbeat process restart.
 ESCALATION_THROTTLE_SECONDS = 1800
+# #1546 — operator-leg throttle. Tier-3 dispatch is more disruptive than
+# tier-2 (it surfaces a card in the user's cockpit inbox) so the cooldown
+# is wider — same hour-long window plus 30 min headroom. The throttle is
+# enforced by querying the audit log for
+# ``EVENT_WATCHDOG_OPERATOR_DISPATCHED`` rows on (rule, project, subject)
+# tuples — same idempotence model as the architect leg.
+OPERATOR_DISPATCH_THROTTLE_SECONDS = 5400
+# #1546 — rejection-loop detector tunables. Three consecutive rejections
+# at the same review node inside two hours, with reject reasons that
+# cluster, is the worker-can't-escape-locally signal. Tunable via the
+# ``WatchdogConfig`` so future-us can experiment without touching the
+# detector body.
+REJECTION_LOOP_THRESHOLD = 3
+REJECTION_LOOP_WINDOW_SECONDS = 7200
+# #1546 — queue-without-motion probe threshold. A project with queued
+# tasks and zero claim / execution / status-change activity for this
+# long is treated as a stalled queue. 30 min is intentionally shorter
+# than ``ESCALATION_THROTTLE_SECONDS`` so the probe lands on the same
+# cadence as the architect throttle window expires — a queue that's
+# been silent for 30 min has already missed several heartbeat ticks.
+QUEUE_MOTION_THRESHOLD_SECONDS = 1800
 
 # Audit events emitted *by* the watchdog itself.
 EVENT_HEARTBEAT_TICK = "heartbeat.tick"
@@ -280,6 +367,15 @@ class WatchdogConfig:
     # place, never closes-and-reopens).
     plan_missing_churn_window_seconds: int = 600
     plan_missing_churn_threshold: int = 3
+    # #1546 — rejection-loop detector. K=3 consecutive rejections at
+    # the same review node inside W=2h with clustered reject reasons.
+    rejection_loop_threshold: int = REJECTION_LOOP_THRESHOLD
+    rejection_loop_window_seconds: int = REJECTION_LOOP_WINDOW_SECONDS
+    # #1546 — queue-without-motion safety-net probe. A project with
+    # queued tasks and no claim / execution / status-change activity
+    # for this many seconds fires a tier-2 finding routed to the
+    # operator leg.
+    queue_motion_threshold_seconds: int = QUEUE_MOTION_THRESHOLD_SECONDS
 
 
 @dataclass(slots=True, frozen=True)
@@ -291,6 +387,19 @@ class Finding:
     can scope itself the same way other PollyPM alerts do.
     ``recommendation`` is a copy-pasteable hint (CLI command, file
     pointer, etc.) — surfaced to the user verbatim.
+
+    #1546 — ``tier`` classifies the finding for the heartbeat-cascade
+    dispatcher. See the ``TIER_*`` module constants for values; the
+    dispatcher uses this field to decide between self-heal, architect
+    dispatch, and operator dispatch without re-reading the rule body.
+    Defaults to :data:`TIER_TERMINAL` so a rule that forgets to set
+    the field stays observe-only (the safe default).
+    ``evidence`` is the structured payload for tier-2/3/4 prompt
+    builders — what was tried, what failed, the pattern across them.
+    Distinct from ``metadata`` (free-form telemetry) because the
+    cascade prompt builders consume ``evidence`` directly and refuse
+    to read free-form fields. Optional; rules that don't need
+    evidence-driven escalation can leave it empty.
     """
 
     rule: str
@@ -300,6 +409,8 @@ class Finding:
     message: str = ""
     recommendation: str = ""
     metadata: dict[str, Any] = field(default_factory=dict)
+    tier: str = TIER_TERMINAL
+    evidence: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
@@ -444,6 +555,7 @@ def _detect_orphan_markers(
         project, task_number = key
         findings.append(Finding(
             rule=RULE_ORPHAN_MARKER,
+            tier=TIER_TERMINAL,
             project=project,
             subject=f"{project}/{task_number}",
             message=(
@@ -495,6 +607,7 @@ def _detect_marker_leaks(
             subject = ev.subject or "<unknown>"
         findings.append(Finding(
             rule=RULE_MARKER_LEAKED,
+            tier=TIER_TERMINAL,
             project=project,
             subject=subject,
             message=(
@@ -567,6 +680,7 @@ def _detect_stuck_drafts(
             actor = getattr(task, "created_by", "") or "unknown"
             findings.append(Finding(
                 rule=RULE_STUCK_DRAFT,
+                tier=TIER_2,
                 project=project,
                 subject=subject,
                 message=(
@@ -617,6 +731,7 @@ def _detect_stuck_drafts(
         seen_subjects.add(ev.subject)
         findings.append(Finding(
             rule=RULE_STUCK_DRAFT,
+            tier=TIER_2,
             project=project,
             subject=ev.subject,
             message=(
@@ -683,6 +798,7 @@ def _detect_cancellation_no_promotion(
             continue
         findings.append(Finding(
             rule=RULE_CANCEL_NO_PROMOTION,
+            tier=TIER_TERMINAL,
             project=ev.project,
             subject=ev.subject,
             message=(
@@ -807,6 +923,7 @@ def _detect_task_review_stale(
             seen_subjects.add(subject)
             findings.append(Finding(
                 rule=RULE_TASK_REVIEW_STALE,
+                tier=TIER_2,
                 project=project,
                 subject=subject,
                 message=(
@@ -854,6 +971,7 @@ def _detect_task_review_stale(
         seen_subjects.add(subject)
         findings.append(Finding(
             rule=RULE_TASK_REVIEW_STALE,
+            tier=TIER_2,
             project=project,
             subject=subject,
             message=(
@@ -947,6 +1065,7 @@ def _detect_task_on_hold_stale(
             seen_subjects.add(subject)
             findings.append(Finding(
                 rule=RULE_TASK_ON_HOLD_STALE,
+                tier=TIER_2,
                 project=project,
                 subject=subject,
                 message=(
@@ -1004,6 +1123,7 @@ def _detect_task_on_hold_stale(
         seen_subjects.add(subject)
         findings.append(Finding(
             rule=RULE_TASK_ON_HOLD_STALE,
+            tier=TIER_2,
             project=project,
             subject=subject,
             message=(
@@ -1136,6 +1256,7 @@ def _detect_task_progress_stale(
             )
             findings.append(Finding(
                 rule=RULE_TASK_PROGRESS_STALE,
+                tier=TIER_2,
                 project=project,
                 subject=subject,
                 message=(
@@ -1202,6 +1323,7 @@ def _detect_task_progress_stale(
         seen_subjects.add(subject)
         findings.append(Finding(
             rule=RULE_TASK_PROGRESS_STALE,
+            tier=TIER_2,
             project=project,
             subject=subject,
             message=(
@@ -1256,22 +1378,40 @@ def _detect_role_session_missing(
         status = getattr(task, "work_status", None)
         # Accept either a WorkStatus enum or a raw string.
         status_value = getattr(status, "value", status)
-        if status_value not in ("in_progress", "review"):
+        # #1546 — widened from ("in_progress", "review") to also cover
+        # ``queued``. The pre-#1546 filter missed queued advisor tasks
+        # whose role-<project> lane never spawned: the auto-claim sweep
+        # cancels them after a few ticks and the advisor sweeper
+        # re-creates them, producing the 52-cancellation cycle observed
+        # in the coffeeboardnm session. Detecting at queued lets the
+        # tier-1 self-heal spawn the lane *before* the auto-claim path
+        # cancels the task, breaking the cycle at its source.
+        if status_value not in ("in_progress", "review", "queued"):
             continue
         task_project = getattr(task, "project", "") or project
         task_number = getattr(task, "task_number", None)
         if not task_project or task_number is None:
             continue
-        # Role resolution preference: explicit roles dict (architect /
-        # reviewer / worker) → assignee fallback. We pick the most
-        # specific role for the current state — review tasks need a
-        # reviewer; in_progress tasks need a worker.
+        # Role resolution preference: explicit roles dict (advisor /
+        # architect / reviewer / worker) → assignee fallback. We pick
+        # the most specific role for the current state — review tasks
+        # need a reviewer; in_progress / queued tasks need a worker
+        # (or a role explicitly set on the task).
+        #
+        # ``advisor`` (#1546) — production advisor tasks land with
+        # ``roles={"advisor": "advisor"}`` (see
+        # ``plugins_builtin/advisor/handlers/advisor_tick.py``). The
+        # canonical lane is ``advisor-<project>``. Pre-fix this
+        # detector only walked worker/architect/reviewer, so a queued
+        # advisor task whose advisor lane wasn't running silently
+        # missed the auto-spawn — the regression #1546 was filed to
+        # close.
         roles = getattr(task, "roles", {}) or {}
         candidate_roles: list[str] = []
         if status_value == "review":
-            candidate_roles = ["reviewer", "architect", "worker"]
+            candidate_roles = ["reviewer", "architect", "worker", "advisor"]
         else:
-            candidate_roles = ["worker", "architect", "reviewer"]
+            candidate_roles = ["worker", "architect", "reviewer", "advisor"]
         role_used: str | None = None
         for role in candidate_roles:
             if role in roles and roles[role]:
@@ -1291,6 +1431,7 @@ def _detect_role_session_missing(
             continue
         findings.append(Finding(
             rule=RULE_ROLE_SESSION_MISSING,
+            tier=TIER_1,
             project=task_project,
             subject=f"{task_project}/{task_number}",
             message=(
@@ -1351,6 +1492,7 @@ def _detect_worker_session_dead_loop(
         latest_ts, latest_ev = max(hits, key=lambda x: x[0])
         findings.append(Finding(
             rule=RULE_WORKER_SESSION_DEAD_LOOP,
+            tier=TIER_2,
             project=project,
             subject=subject,
             message=(
@@ -1434,6 +1576,7 @@ def _detect_duplicate_advisor_tasks(
         ]
         findings.append(Finding(
             rule=RULE_DUPLICATE_ADVISOR_TASKS,
+            tier=TIER_1,
             project=project,
             subject=keep_id,
             message=(
@@ -1529,6 +1672,7 @@ def _detect_plan_review_missing(
         flow_id = getattr(task, "flow_template_id", "") or ""
         findings.append(Finding(
             rule=RULE_PLAN_REVIEW_MISSING,
+            tier=TIER_1,
             project=project,
             subject=plan_task_id,
             message=(
@@ -1607,6 +1751,7 @@ def _detect_legacy_db_shadow(
         canonical_path_str = str(canonical_db)
         findings.append(Finding(
             rule=RULE_LEGACY_DB_SHADOW,
+            tier=TIER_1,
             project=project_key,
             subject=legacy_path_str,
             message=(
@@ -1719,6 +1864,7 @@ def _detect_plan_missing_alert_churn(
         scope_str = f"plan_gate-{project_key}"
         findings.append(Finding(
             rule=RULE_PLAN_MISSING_ALERT_CHURN,
+            tier=TIER_TERMINAL,
             project=project_key,
             subject=scope_str,
             message=(
@@ -1752,6 +1898,520 @@ def _detect_plan_missing_alert_churn(
 
 
 # ---------------------------------------------------------------------------
+# Rejection-loop detector (#1546)
+# ---------------------------------------------------------------------------
+
+
+# Tokens we strip when comparing reject-reason "stems" so that small
+# wording variations between attempts don't defeat the cluster check.
+# The point isn't lexical equality — it's "do these reasons share a
+# root-cause family". A short stop-list is enough because the
+# cluster check also looks at the failing node and node-specific
+# error tokens (extracted via ``_REJECT_TOKEN_RE``).
+_REJECT_REASON_STOPWORDS: frozenset[str] = frozenset({
+    "the", "a", "an", "and", "or", "but", "so", "is", "was", "were",
+    "be", "been", "to", "of", "in", "on", "at", "by", "for", "with",
+    "without", "from", "as", "this", "that", "these", "those", "it",
+    "its", "i", "we", "you", "they", "task", "rejected", "reject",
+    "rejection", "reason", "reasons", "node", "review", "code",
+    "test", "tests", "failed", "failing", "fails", "error", "errors",
+    "issue", "issues", "fix", "please", "v1", "v2", "v3", "v4", "v5",
+})
+
+_REJECT_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9_.\-]+")
+
+
+def _reason_tokens(reason: str | None) -> set[str]:
+    """Extract a stem-set from a reject reason for cluster comparison.
+
+    Lowercases, splits on non-token characters, drops short tokens
+    (<3 chars) and the stop-list. Returns the deduplicated set so a
+    later overlap check is symmetric. We keep the symbol-bearing
+    tokens (e.g. ``better-sqlite3``, ``Node25``, ``ENOENT``) because
+    those are the high-signal terms when reject reasons cluster
+    around a dependency / runtime / error code.
+    """
+    if not reason:
+        return set()
+    out: set[str] = set()
+    for raw in _REJECT_TOKEN_RE.findall(reason):
+        token = raw.lower()
+        if len(token) < 3:
+            continue
+        if token in _REJECT_REASON_STOPWORDS:
+            continue
+        out.add(token)
+    return out
+
+
+def _reasons_cluster(
+    reasons: Sequence[str | None],
+    *,
+    nodes: Sequence[str | None],
+    min_overlap: int = 1,
+) -> tuple[bool, list[str]]:
+    """Return ``(clustered, shared_tokens)`` for a set of reject reasons.
+
+    The cluster predicate is:
+
+    * Every reject must be at the same review node — handled by the
+      caller (we only see reasons that already share a node).
+    * Across the reasons, at least ``min_overlap`` tokens appear in
+      every reason's token set. The default is 1 because the stop-list
+      already filters out generic words (``test``, ``error``, …); a
+      single shared symbol-bearing token like ``better-sqlite3`` /
+      ``ENOENT`` / ``node25`` is the "shared error-family" signal the
+      spec calls out. Tests can pass ``min_overlap=2`` for a stricter
+      bar.
+
+    Returns ``(False, [])`` if reasons / nodes lists don't carry
+    enough signal (empty / all None) to call a cluster.
+    """
+    if not reasons:
+        return False, []
+    token_sets = [_reason_tokens(r) for r in reasons]
+    # Drop empty token sets — a missing reason is no signal either way.
+    nonempty = [s for s in token_sets if s]
+    if len(nonempty) < 2:
+        return False, []
+    shared = set.intersection(*nonempty)
+    if len(shared) < min_overlap:
+        return False, []
+    # Sort for deterministic forensic output.
+    return True, sorted(shared)
+
+
+def _detect_rejection_loop(
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+    open_tasks: Sequence[Any] | None = None,
+) -> list[Finding]:
+    """Rule (#1546): K=3+ consecutive rejections at the same review node.
+
+    Walks ``open_tasks`` (which the cadence handler hydrates with
+    executions). For each task, looks at its ``executions`` list, picks
+    out reviewer rows where ``decision == REJECTED`` (or whose
+    ``decision_reason`` looks rejection-shaped on services that don't
+    populate the enum), filters to the configured window, and groups
+    by ``node_id``. A cluster of K+ rejects in the window at the same
+    node whose reject reasons share a token-stem of size >= 2 fires a
+    tier-1 finding routed to tier-2 dispatch.
+
+    The detector is deliberately strict on cluster shape: it counts
+    exactly K (or more) rejections in window at the *same* node. A
+    task that bounced reject → fix → reject → fix at different nodes
+    is a separate worker problem (a dependency-resolution loop, not a
+    structural one) and gets caught by ``task_progress_stale`` /
+    ``worker_session_dead_loop`` instead.
+
+    Pure detector — no I/O. Returns an empty list when ``open_tasks``
+    is missing (the right default for synthetic-fixture tests that
+    don't hydrate executions).
+    """
+    findings: list[Finding] = []
+    if not open_tasks:
+        return findings
+    cutoff = now - timedelta(seconds=config.rejection_loop_window_seconds)
+    threshold = max(1, int(config.rejection_loop_threshold))
+
+    for task in open_tasks:
+        project = getattr(task, "project", "") or ""
+        task_number = getattr(task, "task_number", None)
+        if not project or task_number is None:
+            continue
+        executions = list(getattr(task, "executions", None) or [])
+        if not executions:
+            continue
+        # Group rows by node_id and walk newest→oldest; the detector
+        # fires only when the most-recent K rows at the same node are
+        # *consecutively* rejections. Any non-rejection row (approval,
+        # progress, status change) at that node resets the run — a
+        # task that bounced reject → approve → reject is not stuck in
+        # the structural-loop shape this rule flags.
+        #
+        # We accept either the ``Decision.REJECTED`` enum value OR a
+        # string-valued decision column — :class:`SQLiteWorkService`
+        # materialises Decision as the enum, but legacy / synthetic
+        # test fixtures may carry the raw string.
+        rows_by_node: dict[str, list[Any]] = {}
+        for ex in executions:
+            completed = getattr(ex, "completed_at", None) or getattr(
+                ex, "started_at", None,
+            )
+            completed_dt = _coerce_datetime(completed)
+            if completed_dt is None:
+                continue
+            node_id = getattr(ex, "node_id", "") or ""
+            if not node_id:
+                continue
+            rows_by_node.setdefault(node_id, []).append(ex)
+
+        rejects_by_node: dict[str, list[Any]] = {}
+        for node_id, node_rows in rows_by_node.items():
+            # Sort newest-first so we can read the consecutive run
+            # off the head of the list.
+            node_rows.sort(
+                key=lambda ex: _coerce_datetime(
+                    getattr(ex, "completed_at", None)
+                    or getattr(ex, "started_at", None),
+                ) or now,
+                reverse=True,
+            )
+            consecutive: list[Any] = []
+            for ex in node_rows:
+                decision = getattr(ex, "decision", None)
+                decision_value = getattr(decision, "value", decision)
+                decision_norm = (
+                    decision_value.lower()
+                    if isinstance(decision_value, str)
+                    else ""
+                )
+                if decision_norm != "rejected":
+                    # Run broken — anything other than a rejection at
+                    # the same node resets the consecutive counter.
+                    break
+                completed_dt = _coerce_datetime(
+                    getattr(ex, "completed_at", None)
+                    or getattr(ex, "started_at", None),
+                )
+                if completed_dt is None or completed_dt < cutoff:
+                    # The run goes back too far; older rejections
+                    # don't count toward the K-in-a-row contract.
+                    break
+                consecutive.append(ex)
+            if consecutive:
+                rejects_by_node[node_id] = consecutive
+
+        for node_id, rows in rejects_by_node.items():
+            if len(rows) < threshold:
+                continue
+            # ``rows`` is already newest-first by construction.
+            recent = rows[:threshold]
+            reasons = [
+                (getattr(ex, "decision_reason", None) or "").strip()
+                for ex in recent
+            ]
+            nodes = [getattr(ex, "node_id", "") for ex in recent]
+            clustered, shared_tokens = _reasons_cluster(
+                reasons, nodes=nodes, min_overlap=1,
+            )
+            if not clustered:
+                continue
+            subject = f"{project}/{task_number}"
+            attempt_lines = [
+                {
+                    "node": getattr(ex, "node_id", "") or "",
+                    "completed_at": (
+                        _coerce_datetime(
+                            getattr(ex, "completed_at", None)
+                            or getattr(ex, "started_at", None),
+                        )
+                        or now
+                    ).isoformat(),
+                    "reason": reason or "",
+                }
+                for ex, reason in zip(recent, reasons)
+            ]
+            findings.append(Finding(
+                rule=RULE_REJECTION_LOOP,
+                # The detector itself is cheap and pure (the issue
+                # frames it as "tier-1 detector"), but the dispatch
+                # tier — what downstream consumers branch on — is
+                # tier-2. The finding carries tier=TIER_2 so the
+                # cadence handler routes it to the architect leg of
+                # the cascade (structured evidence, no auto-cancel).
+                tier=TIER_2,
+                project=project,
+                subject=subject,
+                message=(
+                    f"Task {subject} has {len(rows)} rejections at node "
+                    f"'{node_id}' inside the last "
+                    f"{config.rejection_loop_window_seconds // 60} min — "
+                    f"the worker is in a structural loop."
+                ),
+                recommendation=(
+                    f"Hand structured evidence to the project PM for "
+                    f"{subject}; do NOT auto-cancel."
+                ),
+                metadata={
+                    "node_id": node_id,
+                    "reject_count": len(rows),
+                    "window_seconds": config.rejection_loop_window_seconds,
+                    "shared_tokens": shared_tokens,
+                    "detected_via": "state",
+                },
+                evidence={
+                    "node_id": node_id,
+                    "reject_count": len(rows),
+                    "attempts": attempt_lines,
+                    "shared_tokens": shared_tokens,
+                    "window_seconds": config.rejection_loop_window_seconds,
+                },
+            ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Missing canonical state.db detector (#1546 tier-1)
+# ---------------------------------------------------------------------------
+
+
+def _detect_state_db_missing(
+    *,
+    state_db_probes: Sequence[Any] | None = None,
+) -> list[Finding]:
+    """Rule (#1546 tier-1): canonical ``.pollypm/state.db`` is missing.
+
+    Each probe entry must expose:
+
+    * ``project_key`` — the project key.
+    * ``project_path`` — the project root (Path or str).
+    * ``canonical_present`` — True iff ``.pollypm/state.db`` exists.
+    * ``legacy_archives_present`` — True iff one or more
+      ``.pollypm/state.db.legacy-*`` files exist (signal that this is a
+      project that *had* a canonical DB but no longer has one).
+
+    Fires only when canonical is absent. The legacy-archives signal is
+    advisory — it tells the architect this is the "post-archival"
+    failure mode, not a brand-new project that simply hasn't been
+    initialised. Heal action lives in the cadence handler and calls
+    ``enable_tracked_project`` to re-run the scaffold.
+
+    Pure detector. ``None`` disables the rule (the right default when
+    the cadence caller didn't probe the filesystem).
+    """
+    findings: list[Finding] = []
+    if not state_db_probes:
+        return findings
+    for probe in state_db_probes:
+        project_key = getattr(probe, "project_key", "") or ""
+        project_path = getattr(probe, "project_path", None)
+        canonical_present = bool(
+            getattr(probe, "canonical_present", False),
+        )
+        legacy_archives_present = bool(
+            getattr(probe, "legacy_archives_present", False),
+        )
+        canonical_db_path_raw = getattr(probe, "canonical_db_path", None)
+        canonical_db_path_str = (
+            str(canonical_db_path_raw) if canonical_db_path_raw is not None else ""
+        )
+        if not project_key or canonical_present:
+            continue
+        path_str = str(project_path) if project_path is not None else ""
+        findings.append(Finding(
+            rule=RULE_STATE_DB_MISSING,
+            tier=TIER_1,
+            project=project_key,
+            subject=project_key,
+            message=(
+                f"Workspace canonical state.db is missing"
+                + (f" at {canonical_db_path_str}" if canonical_db_path_str else "")
+                + (
+                    " — only legacy archives remain (state.db.legacy-*)."
+                    if legacy_archives_present else
+                    "; the workspace tracker scaffold may have been "
+                    "removed."
+                )
+            ),
+            recommendation=(
+                f"Re-create the workspace state.db by opening it via "
+                f"``create_work_service`` (the schema replay rebuilds "
+                f"the tables); the heartbeat self-heal does this "
+                f"automatically."
+            ),
+            metadata={
+                "project_key": project_key,
+                "project_path": path_str,
+                "canonical_db_path": canonical_db_path_str,
+                "legacy_archives_present": legacy_archives_present,
+                "detected_via": "state",
+            },
+            evidence={
+                "project_key": project_key,
+                "project_path": path_str,
+                "canonical_db_path": canonical_db_path_str,
+                "canonical_present": canonical_present,
+                "legacy_archives_present": legacy_archives_present,
+            },
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
+# Generic safety-net probe framework (#1546)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class ProbeContext:
+    """Inputs a project-level safety-net probe sees.
+
+    Probes are pure functions of this context — they receive the
+    project key, the open-task snapshot, recent audit events, and the
+    wall clock, and emit zero or more :class:`Finding` objects.
+    Filesystem / DB lookups are not allowed: anything a probe needs
+    must be hydrated by the cadence handler and exposed here, so the
+    probe stays unit-testable without a workspace.
+    """
+
+    project_key: str
+    now: datetime
+    config: WatchdogConfig
+    open_tasks: Sequence[Any]
+    events: Sequence[AuditEvent]
+
+
+# Probe registry — public so future PRs can register new probes
+# without touching ``scan_events``. Each entry is a callable
+# ``(ProbeContext) -> list[Finding]``.
+_SAFETY_NET_PROBES: list[Any] = []
+
+
+def register_safety_net_probe(probe: Any) -> Any:
+    """Register a project-level safety-net probe.
+
+    Returns the probe unchanged so it can be used as a decorator.
+    Probes registered here are run once per project per heartbeat
+    tick, in registration order. The probe is responsible for its own
+    threshold / window logic; the framework provides no per-probe
+    throttling because the dispatcher handles dedup at the
+    finding → dispatch boundary.
+    """
+    _SAFETY_NET_PROBES.append(probe)
+    return probe
+
+
+def _run_safety_net_probes(ctx: ProbeContext) -> list[Finding]:
+    """Run every registered probe against ``ctx`` and collect findings."""
+    out: list[Finding] = []
+    for probe in _SAFETY_NET_PROBES:
+        try:
+            out.extend(probe(ctx) or [])
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "safety-net probe %s raised; skipping",
+                getattr(probe, "__name__", repr(probe)),
+                exc_info=True,
+            )
+    return out
+
+
+# Activity events that count as "queue motion" — at least one of these
+# inside the threshold window means the queue isn't actually wedged,
+# even if there are queued tasks.
+_QUEUE_MOTION_EVENTS: frozenset[str] = frozenset({
+    EVENT_TASK_STATUS_CHANGED,
+    EVENT_TASK_CREATED,
+    "task.claimed",
+    "execution.advanced",
+    "execution.completed",
+    "worker.heartbeat",
+})
+
+
+def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
+    """Safety-net probe: queued tasks but no recent activity events.
+
+    Detects "the queue is full but nothing's moving" — fires a tier-2
+    finding (routed to operator dispatch in the cadence handler today,
+    because a stalled queue typically outlives a tier-2 PM dispatch).
+    Evidence carries the affected task IDs and the most-recent activity
+    timestamp so the prompt builder can hand structured signal upward.
+    """
+    cutoff = ctx.now - timedelta(
+        seconds=ctx.config.queue_motion_threshold_seconds,
+    )
+    queued_subjects: list[str] = []
+    queued_oldest: dict[str, str] = {}
+    for task in ctx.open_tasks or ():
+        status = getattr(task, "work_status", None)
+        status_value = getattr(status, "value", status)
+        if status_value != "queued":
+            continue
+        project = getattr(task, "project", "") or ""
+        task_number = getattr(task, "task_number", None)
+        if not project or task_number is None:
+            continue
+        if project != ctx.project_key:
+            continue
+        subject = f"{project}/{task_number}"
+        queued_subjects.append(subject)
+        updated_at = getattr(task, "updated_at", None) or getattr(
+            task, "created_at", None,
+        )
+        if isinstance(updated_at, datetime):
+            queued_oldest[subject] = (
+                updated_at if updated_at.tzinfo is not None
+                else updated_at.replace(tzinfo=timezone.utc)
+            ).isoformat()
+    if not queued_subjects:
+        return []
+
+    last_activity_ts: datetime | None = None
+    last_activity_event: str = ""
+    for ev in ctx.events or ():
+        if ev.event not in _QUEUE_MOTION_EVENTS:
+            continue
+        if ev.project and ev.project != ctx.project_key:
+            continue
+        ts = _parse_iso(ev.ts)
+        if ts is None:
+            continue
+        if last_activity_ts is None or ts > last_activity_ts:
+            last_activity_ts = ts
+            last_activity_event = ev.event
+    if last_activity_ts is not None and last_activity_ts >= cutoff:
+        return []
+
+    last_iso = last_activity_ts.isoformat() if last_activity_ts else None
+    minutes_silent = int(
+        (ctx.now - last_activity_ts).total_seconds() // 60
+    ) if last_activity_ts else None
+    return [Finding(
+        rule=RULE_QUEUE_WITHOUT_MOTION,
+        # #1546 — operator-level concern: a wedged queue is a
+        # cross-cutting failure that has consistently outlived
+        # tier-2 architect dispatches in the field. Routing it
+        # straight to the operator (tier-3) matches the dispatch
+        # rule registry and makes the contract honest.
+        tier=TIER_3,
+        project=ctx.project_key,
+        subject=ctx.project_key,
+        message=(
+            f"Project {ctx.project_key} has {len(queued_subjects)} "
+            f"queued task(s) but no claim / execution / status-change "
+            f"activity for "
+            + (f"~{minutes_silent} min." if minutes_silent is not None
+               else "the entire scan window.")
+        ),
+        recommendation=(
+            f"Hand structured evidence to the operator for "
+            f"{ctx.project_key}; the queue is wedged."
+        ),
+        metadata={
+            "queued_count": len(queued_subjects),
+            "last_activity_at": last_iso,
+            "last_activity_event": last_activity_event,
+            "threshold_seconds": ctx.config.queue_motion_threshold_seconds,
+            "detected_via": "probe",
+        },
+        evidence={
+            "queued_subjects": list(queued_subjects),
+            "queued_last_updated": dict(queued_oldest),
+            "last_activity_at": last_iso,
+            "last_activity_event": last_activity_event,
+            "threshold_seconds": ctx.config.queue_motion_threshold_seconds,
+        },
+    )]
+
+
+# Register the one shipped probe on import.
+register_safety_net_probe(_queue_without_motion_probe)
+
+
+# ---------------------------------------------------------------------------
 # Public API — scan_events / scan_project
 # ---------------------------------------------------------------------------
 
@@ -1768,6 +2428,8 @@ def scan_events(
     plan_review_present: Any = None,
     legacy_db_shadows: Sequence[Any] | None = None,
     plan_missing_clears: Sequence[Any] | None = None,
+    state_db_probes: Sequence[Any] | None = None,
+    run_safety_net_probes: bool = True,
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
 
@@ -1872,6 +2534,35 @@ def scan_events(
         config=config,
         plan_missing_clears=plan_missing_clears,
     ))
+    # #1546 — rejection-loop detector. Walks ``open_tasks`` executions
+    # for clusters of rejections at the same review node within the
+    # configured window. Fires tier-1 → tier-2 dispatch with structured
+    # evidence; the action path does NOT auto-cancel.
+    findings.extend(_detect_rejection_loop(
+        now=now, config=config, open_tasks=open_tasks,
+    ))
+    # #1546 — state-db-missing detector. Pure detector that consumes
+    # ``state_db_probes`` (one per project) and fires when the canonical
+    # ``.pollypm/state.db`` is absent. Tier-1 self-heal lives in the
+    # cadence handler.
+    findings.extend(_detect_state_db_missing(
+        state_db_probes=state_db_probes,
+    ))
+    # #1546 — generic safety-net probes. Each registered probe is run
+    # once per project per scan; the framework swallows probe-side
+    # exceptions so a buggy probe can't break the cadence. Probes are
+    # opt-in via ``run_safety_net_probes`` so synthetic-fixture tests
+    # that only exercise specific detectors aren't perturbed by a
+    # generic probe firing.
+    if run_safety_net_probes and project:
+        ctx = ProbeContext(
+            project_key=project,
+            now=now,
+            config=config,
+            open_tasks=tuple(open_tasks or ()),
+            events=materialised,
+        )
+        findings.extend(_run_safety_net_probes(ctx))
     return findings
 
 
@@ -1887,6 +2578,8 @@ def scan_project(
     plan_review_present: Any = None,
     legacy_db_shadows: Sequence[Any] | None = None,
     plan_missing_clears: Sequence[Any] | None = None,
+    state_db_probes: Sequence[Any] | None = None,
+    run_safety_net_probes: bool = True,
 ) -> list[Finding]:
     """Read audit events for ``project`` and scan them.
 
@@ -1932,6 +2625,8 @@ def scan_project(
         plan_review_present=plan_review_present,
         legacy_db_shadows=legacy_db_shadows,
         plan_missing_clears=plan_missing_clears,
+        state_db_probes=state_db_probes,
+        run_safety_net_probes=run_safety_net_probes,
     )
 
 
@@ -2074,6 +2769,299 @@ def emit_escalation_dispatched(
         logger.debug("emit_escalation_dispatched failed", exc_info=True)
 
 
+def was_recently_operator_dispatched(
+    *,
+    project: str,
+    finding_type: str,
+    subject: str,
+    now: datetime,
+    project_path: Path | str | None = None,
+    throttle_seconds: int = OPERATOR_DISPATCH_THROTTLE_SECONDS,
+) -> bool:
+    """Return True iff a matching tier-3 dispatch landed in the throttle window.
+
+    Mirrors :func:`was_recently_dispatched` but reads
+    ``EVENT_WATCHDOG_OPERATOR_DISPATCHED`` rows. Same idempotence
+    model — the audit log itself is the source of truth, so a
+    heartbeat-process restart doesn't reset the dedup window.
+    """
+    from pollypm.audit.log import read_events
+
+    cutoff = (now - timedelta(seconds=throttle_seconds)).isoformat()
+    try:
+        recent = read_events(
+            project,
+            since=cutoff,
+            event=EVENT_WATCHDOG_OPERATOR_DISPATCHED,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "was_recently_operator_dispatched: read_events failed",
+            exc_info=True,
+        )
+        return False
+    for ev in recent:
+        meta = ev.metadata or {}
+        if (
+            meta.get("finding_type") == finding_type
+            and (ev.subject == subject or meta.get("subject") == subject)
+        ):
+            return True
+    return False
+
+
+def emit_operator_dispatched(
+    *,
+    project: str,
+    finding_type: str,
+    subject: str,
+    inbox_task_id: str | None = None,
+    dedup_key: str = "",
+    project_path: Path | str | None = None,
+) -> None:
+    """Emit a ``watchdog.operator_dispatched`` event.
+
+    Symmetric to :func:`emit_escalation_dispatched` but for the
+    tier-3 (operator) leg of the cascade. Best-effort — never raises.
+    """
+    from pollypm.audit.log import emit as _audit_emit
+    try:
+        _audit_emit(
+            event=EVENT_WATCHDOG_OPERATOR_DISPATCHED,
+            project=project,
+            subject=subject,
+            actor="audit_watchdog",
+            status="warn",
+            metadata={
+                "finding_type": finding_type,
+                "subject": subject,
+                "inbox_task_id": inbox_task_id or "",
+                "dedup_key": dedup_key,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("emit_operator_dispatched failed", exc_info=True)
+
+
+# ---------------------------------------------------------------------------
+# Tier handoff prompt builder (#1546)
+# ---------------------------------------------------------------------------
+
+
+# Reserved keys that callers MUST NOT pass through ``evidence`` because
+# they would re-introduce solution-menu language. The lint test asserts
+# this set is honored at runtime.
+_FORBIDDEN_EVIDENCE_KEYS: frozenset[str] = frozenset({
+    "options", "solutions", "candidates", "choices", "menu",
+    "recommended_actions", "suggested_actions",
+})
+
+
+class SolutionMenuError(ValueError):
+    """Raised when a tier-handoff prompt builder is asked to embed
+    candidate solutions in its evidence section.
+
+    The cascade is a model-capability ladder. Pre-loading the upstairs
+    reasoner with the downstairs hypothesis set caps the upstairs at
+    that hypothesis space, defeating the escalation. Tier-2/3/4
+    prompts must hand structured evidence and a question — never a
+    menu of solutions. The builder refuses any evidence dict that
+    looks like a solution menu so the constraint can't drift in
+    callers.
+    """
+
+
+def tier_handoff_prompt(evidence: dict[str, Any], question: str) -> str:
+    """Render a structured-evidence handoff prompt for tier-2/3/4 dispatch.
+
+    Builder shape — the function intentionally accepts ONLY ``evidence``
+    and ``question``. There is no ``solutions`` parameter and the
+    evidence dict is structurally rejected if it carries solution-menu
+    keys (see :data:`_FORBIDDEN_EVIDENCE_KEYS`).
+
+    Format:
+
+        TIER HANDOFF
+
+        Question: <one-line question>
+
+        Evidence:
+        - <key>: <value>
+        - <key>: <value>
+          - <subkey>: <subvalue>
+
+    Lists are rendered as nested bullets. Dicts nest one level deep
+    (deeper structure is fine — the renderer reflects whatever shape
+    is passed in). The format is a paste-friendly text block; the
+    architect / operator pane reads it as the agent's user-turn
+    content, so we keep it ASCII and avoid markdown headers that
+    different agents render differently.
+
+    The lint test in ``tests/test_audit_watchdog.py`` exercises a
+    representative evidence dict for every rule and asserts the
+    rendered prompt contains no solution-menu language.
+    """
+    if not isinstance(evidence, dict):
+        raise SolutionMenuError(
+            "tier_handoff_prompt: evidence must be a dict, got "
+            f"{type(evidence).__name__}",
+        )
+    bad_keys = sorted(set(evidence.keys()) & _FORBIDDEN_EVIDENCE_KEYS)
+    if bad_keys:
+        raise SolutionMenuError(
+            "tier_handoff_prompt: evidence contains solution-menu "
+            f"keys {bad_keys}. The cascade is a model-capability "
+            "ladder; the upstairs reasoner gets evidence and a "
+            "question, never a pre-loaded solution space."
+        )
+    if not isinstance(question, str) or not question.strip():
+        raise SolutionMenuError(
+            "tier_handoff_prompt: question must be a non-empty string",
+        )
+
+    lines: list[str] = ["TIER HANDOFF", ""]
+    lines.append(f"Question: {question.strip()}")
+    lines.append("")
+    lines.append("Evidence:")
+    if not evidence:
+        lines.append("- (none)")
+        return "\n".join(lines)
+
+    def _render_value(value: Any, indent: int) -> list[str]:
+        prefix = "  " * indent
+        out: list[str] = []
+        if isinstance(value, dict):
+            if not value:
+                out.append(f"{prefix}(empty)")
+                return out
+            for k, v in value.items():
+                if isinstance(v, (dict, list, tuple)):
+                    out.append(f"{prefix}- {k}:")
+                    out.extend(_render_value(v, indent + 1))
+                else:
+                    out.append(f"{prefix}- {k}: {v}")
+        elif isinstance(value, (list, tuple)):
+            if not value:
+                out.append(f"{prefix}(empty)")
+                return out
+            for entry in value:
+                if isinstance(entry, (dict, list, tuple)):
+                    out.append(f"{prefix}-")
+                    out.extend(_render_value(entry, indent + 1))
+                else:
+                    out.append(f"{prefix}- {entry}")
+        else:
+            out.append(f"{prefix}{value}")
+        return out
+
+    for key, value in evidence.items():
+        if isinstance(value, (dict, list, tuple)):
+            lines.append(f"- {key}:")
+            lines.extend(_render_value(value, 1))
+        else:
+            lines.append(f"- {key}: {value}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Urgent-inbox structured-message helper (#1546 terminal handoff)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True, frozen=True)
+class InboxItemBuilder:
+    """Pre-built urgent-inbox handoff payload.
+
+    Returned by :func:`build_urgent_human_handoff`. The cadence handler
+    converts this into a ``pm notify``-shaped row when the cascade has
+    exhausted automated options. Carries enough to render the inbox
+    card (subject, body, labels, priority) without re-deriving from
+    the failed-attempt history.
+
+    Today the helper is wired but not auto-triggered — the explicit
+    rule covering "Polly has exhausted authority" lives in a follow-up
+    PR. Shipping the helper + tests now means the terminal-handoff
+    surface is a stable target for that future rule.
+    """
+
+    subject: str
+    body: str
+    labels: tuple[str, ...]
+    priority: str = "immediate"
+    requester: str = "user"
+    actor: str = "audit_watchdog"
+    project: str = ""
+    forensics_path: str = ""
+
+
+def build_urgent_human_handoff(
+    *,
+    tried: Sequence[str],
+    failed: Sequence[str],
+    hypothesis: str,
+    forensics_path: str,
+    project: str = "",
+    subject_hint: str = "",
+) -> InboxItemBuilder:
+    """Compose an urgent-inbox handoff message.
+
+    The message body opens with ``hypothesis`` (one paragraph the
+    operator reads first), then lists what was tried and what failed,
+    and ends with the forensics path so the user can drill in. The
+    inbox item is tagged ``urgent`` and ``notify`` so the cockpit
+    surface lifts it above the regular queue.
+
+    The helper enforces non-empty hypothesis / forensics_path so a
+    caller can't ship a card that's structurally indistinguishable
+    from a normal notify; user-blocking is the very last resort and
+    the body has to carry the load when it lands.
+    """
+    if not isinstance(hypothesis, str) or not hypothesis.strip():
+        raise ValueError(
+            "build_urgent_human_handoff: hypothesis must be a "
+            "non-empty paragraph — the operator reads this first.",
+        )
+    if not isinstance(forensics_path, str) or not forensics_path.strip():
+        raise ValueError(
+            "build_urgent_human_handoff: forensics_path must be a "
+            "non-empty path — the operator drills in via this link.",
+        )
+
+    subject_text = subject_hint.strip() or (
+        f"Cascade exhausted for {project or 'workspace'} — operator decision needed"
+    )
+
+    body_lines: list[str] = []
+    body_lines.append(hypothesis.strip())
+    body_lines.append("")
+    if tried:
+        body_lines.append("What was tried:")
+        for item in tried:
+            body_lines.append(f"- {item}")
+        body_lines.append("")
+    if failed:
+        body_lines.append("What failed:")
+        for item in failed:
+            body_lines.append(f"- {item}")
+        body_lines.append("")
+    body_lines.append(f"Forensics: {forensics_path.strip()}")
+    body = "\n".join(body_lines).strip()
+
+    labels: tuple[str, ...] = ("urgent", "notify")
+    return InboxItemBuilder(
+        subject=subject_text,
+        body=body,
+        labels=labels,
+        priority="immediate",
+        requester="user",
+        actor="audit_watchdog",
+        project=project,
+        forensics_path=forensics_path.strip(),
+    )
+
+
 def format_unstick_brief(finding: Finding) -> str:
     """Render a finding as a structured brief for the architect.
 
@@ -2128,17 +3116,15 @@ def format_unstick_brief(finding: Finding) -> str:
             lines.append("- No transition reason was recorded.")
         lines.append("")
         lines.append(
-            "Your job (DEFAULT: fix and re-submit). Options: "
-            "(a) address the reviewer's findings yourself (fix code / "
-            f"docs / commit untracked artifacts) and run `pm task queue "
-            f"{subject}` to put the task back in the worker pool, "
-            "(b) create a sibling tracking task for a non-blocking "
-            f"finding and `pm task approve {subject}` the original, "
-            "(c) ONLY escalate to user via `pm notify --priority "
-            "immediate` if the issue genuinely needs human judgement "
-            "(product direction, taste, external info you can't "
-            "access). Parking on the user is the failure mode this "
-            "rule exists to prevent."
+            "Your job (DEFAULT: fix and re-submit). Read the evidence "
+            "above and generate hypotheses fresh from the reviewer's "
+            "findings — do NOT ratify any framing in this brief."
+        )
+        lines.append(
+            f"Cli levers available: `pm task queue {subject}`, "
+            f"`pm task approve {subject}`, `pm notify --priority immediate`. "
+            "Parking on the user is the failure mode this rule exists "
+            "to prevent."
         )
     elif finding.rule == RULE_TASK_REVIEW_STALE:
         stuck_minutes = meta.get("stuck_minutes")
@@ -2158,11 +3144,13 @@ def format_unstick_brief(finding: Finding) -> str:
         )
         lines.append("")
         lines.append(
-            "Your job: investigate and unstick. Options: "
-            "(a) spawn a reviewer for this project so the queue resumes, "
-            f"(b) review the work yourself and call `pm task done {subject}` "
-            "if it's correct, "
-            "(c) escalate to user via `pm notify` with a clear summary."
+            "Your job: investigate the evidence above and unstick the "
+            "task. Generate hypotheses fresh from the data — do NOT "
+            "ratify the framing in this brief."
+        )
+        lines.append(
+            f"Cli levers available: `pm task done {subject}`, "
+            "`pm chat <project> --role reviewer`, `pm notify`."
         )
     elif finding.rule == RULE_TASK_PROGRESS_STALE:
         stuck_minutes = meta.get("stuck_minutes")
@@ -2195,14 +3183,14 @@ def format_unstick_brief(finding: Finding) -> str:
         )
         lines.append("")
         lines.append(
-            "Your job: investigate and unstick. Options: "
-            "(a) inspect the worker pane and account/auth state, then "
-            "restart or fail over the worker if auth/quota is broken, "
-            "(b) reassign or resume the task and verify progress, "
-            f"(c) cancel and re-plan (`pm task cancel {subject}`) if the "
-            "claim cannot be recovered, "
-            "(d) escalate to user via `pm notify` only if credentials, "
-            "org policy, or external access need human action."
+            "Your job: investigate the evidence above and unstick the "
+            "task. Auth / sandbox / quota / worker logic are the usual "
+            "root-cause families — generate hypotheses fresh from the "
+            "evidence rather than ratifying any framing in this brief."
+        )
+        lines.append(
+            f"Cli levers available: `pm task cancel {subject}`, "
+            "`pm chat <project>`, `pm notify`."
         )
     elif finding.rule == RULE_ROLE_SESSION_MISSING:
         expected = meta.get("expected_window") or "<unknown>"
@@ -2220,12 +3208,13 @@ def format_unstick_brief(finding: Finding) -> str:
         )
         lines.append("")
         lines.append(
-            "Your job: investigate and unstick. Options: "
-            f"(a) spawn the missing `{role}` (e.g. "
-            f"`pm chat {project} --role {role}`) and let it pick up the work, "
-            "(b) reassign the task to a role that IS present, "
-            "(c) escalate to user via `pm notify` if the spawn failure is "
-            "persistent (config / auth / quota)."
+            "Your job: spawn the missing role lane or reassign the task. "
+            "Generate hypotheses fresh from the evidence — do NOT ratify "
+            "the framing in this brief."
+        )
+        lines.append(
+            f"Cli levers available: `pm chat {project} --role {role}`, "
+            "`pm notify`."
         )
     elif finding.rule == RULE_PLAN_REVIEW_MISSING:
         plan_task_id = meta.get("plan_task_id") or subject
@@ -2254,6 +3243,62 @@ def format_unstick_brief(finding: Finding) -> str:
             "No manual action required unless the backfill itself fails "
             "in the cadence logs."
         )
+    elif finding.rule == RULE_REJECTION_LOOP:
+        node_id = (finding.evidence or {}).get("node_id") or meta.get(
+            "node_id",
+        ) or "<unknown>"
+        reject_count = (
+            (finding.evidence or {}).get("reject_count")
+            or meta.get("reject_count")
+            or "?"
+        )
+        attempts = (finding.evidence or {}).get("attempts") or []
+        shared_tokens = (finding.evidence or {}).get("shared_tokens") or []
+        window_seconds = (
+            (finding.evidence or {}).get("window_seconds")
+            or meta.get("window_seconds")
+            or REJECTION_LOOP_WINDOW_SECONDS
+        )
+        try:
+            window_minutes = max(1, int(window_seconds) // 60)
+        except (TypeError, ValueError):
+            window_minutes = 120
+        lines.append(
+            f"Stuck for: {reject_count} rejections at node '{node_id}' in the "
+            f"last {window_minutes} min"
+        )
+        lines.append("Observed evidence:")
+        for entry in attempts:
+            if not isinstance(entry, dict):
+                continue
+            attempt_node = entry.get("node") or "?"
+            completed = entry.get("completed_at") or "?"
+            reason = entry.get("reason") or ""
+            line = (
+                f"- attempt at {attempt_node} @ {completed}"
+            )
+            if reason:
+                clipped = reason.strip().splitlines()[0][:240]
+                line = f"{line} reason: {clipped}"
+            lines.append(line)
+        if shared_tokens:
+            lines.append(
+                "- Pattern across rejections (shared tokens): "
+                f"{', '.join(str(t) for t in shared_tokens[:8])}"
+            )
+        lines.append("")
+        lines.append(
+            "Your job: this task is in a structural rejection loop. The "
+            "worker can't escape its dependency-and-runtime context "
+            "locally. Generate hypotheses fresh from the evidence above "
+            "rather than ratifying any framing in this brief."
+        )
+        lines.append(
+            "Decisions in scope: retry-with-structural-change, "
+            "restructure-the-work-itself (cancel + recreate with a "
+            "different approach), or escalate-to-Polly. Do NOT "
+            "auto-cancel — let the PM choose."
+        )
     elif finding.rule == RULE_WORKER_SESSION_DEAD_LOOP:
         reap_count = meta.get("reap_count") or "?"
         latest_reason = meta.get("latest_reason") or "<unknown>"
@@ -2271,12 +3316,13 @@ def format_unstick_brief(finding: Finding) -> str:
         )
         lines.append("")
         lines.append(
-            "Your job: investigate and unstick. Options: "
-            f"(a) cancel the task (`pm task cancel {subject}`) if it's "
-            "fundamentally broken, "
-            "(b) reassign or rewrite the task to bypass the spawn failure, "
-            "(c) escalate to user via `pm notify` if the failure is in the "
-            "spawn infra itself, not the task content."
+            "Your job: investigate the evidence above and unstick the "
+            "task. The reaper firing in a loop is a session-spawn root "
+            "cause — generate hypotheses fresh from the evidence rather "
+            "than ratifying any framing in this brief."
+        )
+        lines.append(
+            f"Cli levers available: `pm task cancel {subject}`, `pm notify`."
         )
     else:
         # Fallback: orphan_marker / marker_leaked / stuck_draft / cancel_no_promotion
@@ -2289,9 +3335,13 @@ def format_unstick_brief(finding: Finding) -> str:
             lines.append(f"- Recommendation: {finding.recommendation}")
         lines.append("")
         lines.append(
-            "Your job: investigate and unstick. Options: "
-            "(a) act on the recommendation above, "
-            "(b) take a different action you judge appropriate, "
-            "(c) escalate to user via `pm notify`."
+            "Your job: investigate the evidence above and unstick the "
+            "task. Generate hypotheses fresh from the evidence rather "
+            "than ratifying the recommendation."
+        )
+        lines.append(
+            "Cli levers available: act on the recommendation above, take "
+            "a different action you judge appropriate, or escalate to "
+            "user via `pm notify`."
         )
     return "\n".join(lines)

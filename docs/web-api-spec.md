@@ -503,7 +503,7 @@ This PR ships only the spec. The implementation lands across three
 phases, each as a separate issue (issues to be opened by the user
 after this PR merges).
 
-### Phase 1 — Read + auth + SSE (issue: TBD)
+### Phase 1 — Read + auth + SSE (issue: #1547)
 
 - `pm serve` skeleton with FastAPI, bearer-token auth, OpenAPI doc at
   `/api/v1/openapi.json`, `pm api regen-token` CLI.
@@ -516,7 +516,7 @@ after this PR merges).
 
 Outcome: frontend can render the dashboard and stream live updates.
 
-### Phase 2 — Write endpoints (issue: TBD)
+### Phase 2 — Write endpoints (issue: #1548)
 
 - `POST /api/v1/projects` (register)
 - `POST /api/v1/projects/{key}/plan` (kick off / replan)
@@ -530,7 +530,7 @@ Outcome: frontend can render the dashboard and stream live updates.
 Outcome: frontend has feature parity with the cockpit for the
 documented surface.
 
-### Phase 3 — Doctor + admin (issue: TBD)
+### Phase 3 — Doctor + admin (issue: #1549)
 
 - `GET /api/v1/doctor` (#1347)
 - Idempotency-Key persistence

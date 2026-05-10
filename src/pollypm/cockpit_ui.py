@@ -15241,6 +15241,34 @@ class PollyProjectDashboardApp(App[None]):
         self.topbar.update(
             f"[#ff5f6d]Error loading project:[/#ff5f6d] {_escape(error)}"
         )
+        # #1539 follow-up — first-gather failure must clear the skeleton
+        # body bars too. Otherwise the topbar reads "Error loading
+        # project" while ``Current activity`` / ``Inbox`` keep showing
+        # animated-looking placeholder rows, which reads as "still
+        # loading". Replace them with the empty-string state ``_render``
+        # would have rendered for an empty project.
+        self._clear_skeleton_bodies()
+
+    def _clear_skeleton_bodies(self) -> None:
+        """Replace every skeleton-seeded body Static with an empty
+        string so the cold-fetch placeholder bars disappear when the
+        render path bails before painting real data (unknown project
+        key, first-gather failure). #1539 originally seeded these to
+        avoid a blank-panel look during the load window — without this
+        clear, the bars stay visible forever on the bail paths.
+        """
+        # Each of these is a Static whose initial body is a SKELETON
+        # constant set in __init__. The render path normally overwrites
+        # them with rendered markup; the bail paths must blank them.
+        for widget in (
+            getattr(self, "now_body", None),
+            getattr(self, "pipeline_body", None),
+            getattr(self, "plan_body", None),
+            getattr(self, "activity_body", None),
+            getattr(self, "inbox_body", None),
+        ):
+            if widget is not None:
+                widget.update("")
 
     def _render(self) -> None:
         data = self.data
@@ -15253,6 +15281,12 @@ class PollyProjectDashboardApp(App[None]):
                 f"[dim]is not a tracked project — "
                 f"open the project picker to choose a tracked project.[/dim]"
             )
+            # #1539 follow-up — without this, the skeleton bars seeded
+            # in ``__init__`` stay visible forever on the unknown-project
+            # path: the topbar says "not a tracked project" while every
+            # body section keeps its loading-bar placeholders, which reads
+            # as "still loading" instead of "nothing here".
+            self._clear_skeleton_bodies()
             return
 
         # ── Top bar ──

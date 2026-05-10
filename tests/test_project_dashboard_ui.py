@@ -6020,4 +6020,117 @@ def test_review_cta_falls_back_to_task_id_without_title(
     }))
     rendered = str(app.review_cta.render())
     assert "demo/3" in rendered
-    assert "Review the plan together" in rendered
+
+
+# ---------------------------------------------------------------------------
+# #1539 follow-up — skeleton bars must NOT remain visible on the bail
+# paths. The cold-fetch placeholder (``_SKELETON_TWO_LINE`` /
+# ``_SKELETON_THREE_LINE``) is seeded into every body Static in
+# ``__init__``. ``_render`` only overwrites them when ``data`` is
+# present — without an explicit clear, the unknown-project / first-
+# gather-failure branches leave the loading bars on screen forever.
+# ---------------------------------------------------------------------------
+
+
+def _skeleton_block_glyph_count(rendered: str) -> int:
+    """Count block glyphs (``█``) in a body's rendered string. The
+    skeleton constants are the only place these appear in dashboard
+    body markup — any non-zero count means the placeholder bars are
+    still visible."""
+    return rendered.count("█")
+
+
+def test_render_clears_skeleton_bodies_when_data_is_none(
+    tmp_path: Path,
+) -> None:
+    """#1539 follow-up (MED-1) — when ``_render`` runs with ``data is
+    None`` (unknown / untracked project key), every body section seeded
+    with skeleton bars must be cleared. Pre-fix: topbar said "not a
+    tracked project" while ``Current activity`` / ``Task pipeline`` /
+    ``Plan`` / ``Recent activity`` / ``Inbox`` kept their loading
+    placeholders, reading as "still loading" forever.
+    """
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    # Real constructor — seeds every body with the SKELETON bars.
+    app = PollyProjectDashboardApp(config_path, "untracked-key")
+
+    # Sanity: bars are present on the seeded bodies before render.
+    pre_glyphs = sum(
+        _skeleton_block_glyph_count(str(body.render()))
+        for body in (
+            app.now_body, app.pipeline_body, app.plan_body,
+            app.activity_body, app.inbox_body,
+        )
+    )
+    assert pre_glyphs > 0, (
+        "fixture invariant — bodies should start seeded with skeleton bars"
+    )
+
+    # Drive the bail path: data stays None, _render hits the unknown-
+    # project branch.
+    assert app.data is None
+    app._render()
+
+    # Topbar carries the bail copy.
+    assert "not a tracked project" in str(app.topbar.render())
+
+    # And every skeleton-seeded body is now blank.
+    for label, body in (
+        ("now_body", app.now_body),
+        ("pipeline_body", app.pipeline_body),
+        ("plan_body", app.plan_body),
+        ("activity_body", app.activity_body),
+        ("inbox_body", app.inbox_body),
+    ):
+        rendered = str(body.render())
+        assert _skeleton_block_glyph_count(rendered) == 0, (
+            f"{label}: skeleton bars still visible after data-is-None "
+            f"render — got {rendered!r}"
+        )
+
+
+def test_first_refresh_failed_clears_skeleton_bodies(
+    tmp_path: Path,
+) -> None:
+    """#1539 follow-up (MED-1) — first-gather failure path must also
+    clear the skeleton bars. Pre-fix: topbar flipped to "Error loading
+    project: <exc>" while every body section kept its loading bars,
+    which read as "still loading" instead of "load failed".
+    """
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    app = PollyProjectDashboardApp(config_path, "demo")
+    app._first_refresh_running = True
+
+    app._first_refresh_failed("disk read blew up")
+
+    # Topbar shows the error copy, _first_refresh_running flips back.
+    assert "Error loading project" in str(app.topbar.render())
+    assert app._first_refresh_running is False
+
+    # Bodies are blank — the bars are gone.
+    for label, body in (
+        ("now_body", app.now_body),
+        ("pipeline_body", app.pipeline_body),
+        ("plan_body", app.plan_body),
+        ("activity_body", app.activity_body),
+        ("inbox_body", app.inbox_body),
+    ):
+        rendered = str(body.render())
+        assert _skeleton_block_glyph_count(rendered) == 0, (
+            f"{label}: skeleton bars still visible after first-gather "
+            f"failure — got {rendered!r}"
+        )

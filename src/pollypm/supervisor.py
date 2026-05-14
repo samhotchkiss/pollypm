@@ -2522,18 +2522,28 @@ class Supervisor:
     ) -> None:
         """Close alerts whose session is both unconfigured and window-less.
 
-        Two categories get cleared:
+        Three categories get cleared:
 
         1. Alerts keyed on session names that aren't in the current
            launch plan (the session was removed from config or never
            existed) AND whose expected tmux window doesn't exist.
         2. Alerts on shipped / removed ``architect-<project>`` sessions
            that have lingered past their project's lifecycle.
+        3. **#1545** — Alerts whose underlying task has reached a
+           terminal status (``done`` / ``cancelled`` / ``abandoned``).
+           Witness symptom: a ``plan_missing`` alert (rendered as
+           "Plan's ready" by the celebratory banner from #1532) kept
+           ticking on coffeeboardnm even after the plan-shaped task
+           moved to ``done``. This category fires regardless of
+           session-tracked status because the alert is only meaningful
+           while its task is still live; once the task terminates, the
+           alert message is misleading.
 
         We intentionally DO NOT clear alerts whose session is still in
-        the launch plan: those represent current state and the caller
-        will re-upsert them next sweep if the underlying condition
-        persists. Any alert that should recur will recur.
+        the launch plan AND whose task is still live: those represent
+        current state and the caller will re-upsert them next sweep if
+        the underlying condition persists. Any alert that should recur
+        will recur.
 
         Best-effort. Failures are logged and swallowed so alert-sweep
         flakiness can't break the heartbeat sweep for live sessions.
@@ -2560,6 +2570,7 @@ class Supervisor:
             }
 
             swept = 0
+            terminal_swept = 0
             # Read through ``self.open_alerts()`` — the supervisor method
             # that routes to the unified ``messages`` store (#349) and
             # strips the ``[Alert]`` title tag for caller-friendly
@@ -2568,6 +2579,17 @@ class Supervisor:
             for alert in self.open_alerts():
                 session_name = alert.session_name
                 alert_type = alert.alert_type or ""
+                # #1545 — terminal-task clear runs FIRST so it covers
+                # alert families the existing skip-list excludes
+                # (``plan_missing`` etc.). The check is opt-in: only
+                # alerts whose underlying task we can identify and look
+                # up are eligible. Idempotent because ``clear_alert``
+                # is keyed on (session_name, alert_type, status='open');
+                # a re-run on an already-closed alert is a no-op.
+                if self._clear_alert_if_task_terminal(alert):
+                    terminal_swept += 1
+                    swept += 1
+                    continue
                 # Ephemeral sessions (task-*, critic_*, downtime_*)
                 # are swept elsewhere (see sweep_ephemeral_sessions in
                 # core_recurring). Skip them here so we don't fight.
@@ -2618,11 +2640,280 @@ class Supervisor:
 
             if swept > 0:
                 alert_word = "alert" if swept == 1 else "alerts"
-                logger.info(
-                    "stale-alert sweep cleared %d orphaned %s", swept, alert_word,
-                )
+                if terminal_swept > 0 and terminal_swept == swept:
+                    logger.info(
+                        "stale-alert sweep cleared %d %s "
+                        "(underlying task terminal)",
+                        swept, alert_word,
+                    )
+                elif terminal_swept > 0:
+                    logger.info(
+                        "stale-alert sweep cleared %d orphaned %s "
+                        "(%d via terminal-task path)",
+                        swept, alert_word, terminal_swept,
+                    )
+                else:
+                    logger.info(
+                        "stale-alert sweep cleared %d orphaned %s",
+                        swept, alert_word,
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.warning("stale-alert sweep skipped: %s", exc)
+
+    def _clear_alert_if_task_terminal(self, alert: object) -> bool:
+        """Clear ``alert`` when its underlying task has reached a terminal status.
+
+        Returns True iff the alert was cleared.
+
+        #1545 — extends ``_sweep_stale_alerts`` to drop alerts whose
+        underlying task is no longer live. The "underlying task" is
+        identified via :func:`pollypm.supervision.alert_task_lookup.extract_task_ids`,
+        which understands the four reference shapes alerts use today:
+
+        * ``stuck_on_task:<project>/<num>`` / ``no_session_for_assignment:<project>/<num>``
+          (task id in the alert_type suffix).
+        * ``review-<project>-<num>`` (task number in the session_name
+          scope).
+        * ``plan_missing`` (task named in the message body — the
+          witness shape from #1545).
+
+        For each candidate, we look up the task on the project's
+        canonical workspace DB (with a per-project legacy DB fallback,
+        mirroring the dashboard's resolution order). Status values
+        ``done`` / ``cancelled`` / ``abandoned`` are terminal — if any
+        candidate matches, the alert is closed and an
+        ``audit.alert_cleared_task_terminal`` event is emitted so the
+        forensic log records the lifecycle.
+
+        Best-effort: any error returns False so the existing sweep
+        path picks the alert up via its other categories.
+        """
+        try:
+            from pollypm.supervision.alert_task_lookup import (
+                extract_task_ids,
+                project_key_from_task_id,
+            )
+        except Exception:  # noqa: BLE001
+            return False
+
+        alert_type = str(getattr(alert, "alert_type", "") or "")
+        session_name = str(getattr(alert, "session_name", "") or "")
+        message = getattr(alert, "message", None)
+        candidates = extract_task_ids(
+            alert_type=alert_type,
+            session_name=session_name,
+            message=str(message) if message else "",
+        )
+        if not candidates:
+            return False
+
+        terminal_statuses = frozenset({"done", "cancelled", "abandoned"})
+        for task_id in candidates:
+            project_key = project_key_from_task_id(task_id)
+            if not project_key:
+                continue
+            status = self._lookup_task_status(project_key, task_id)
+            if status is None:
+                continue
+            if status not in terminal_statuses:
+                # Found the task and it's still live — the alert
+                # remains valid. Don't fall through to the next
+                # candidate (which would be a different task and
+                # therefore not the "underlying" one).
+                return False
+            # Task terminated — close the alert and stamp the audit
+            # log so the lifecycle is recoverable from the forensic
+            # event stream.
+            try:
+                self._msg_store.clear_alert(session_name, alert_type)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "_sweep_stale_alerts: clear_alert(%s, %s) failed",
+                    session_name, alert_type, exc_info=True,
+                )
+                return False
+            self._record_alert_cleared_task_terminal(
+                alert=alert,
+                task_id=task_id,
+                task_status=status,
+            )
+            return True
+        return False
+
+    def _lookup_task_status(
+        self, project_key: str, task_id: str,
+    ) -> str | None:
+        """Return the work_status for ``task_id`` or None when not found.
+
+        Walks the same DB candidate list the dashboard uses
+        (``cockpit_ui._dashboard_task_db_paths``): workspace-root
+        canonical DB first, per-project legacy DB second. Returns the
+        first match. Best-effort — any exception returns None so the
+        terminal-task sweep falls back to leaving the alert alone.
+        """
+        try:
+            project = self.config.projects.get(project_key)
+        except Exception:  # noqa: BLE001
+            return None
+        if project is None:
+            # PR #1560 codex-review HIGH-1 — the alert's task-id
+            # project segment is the storage form (display name /
+            # on-disk dir), which can differ from the canonical
+            # config key (``health-coach`` vs ``health_coach``).
+            # Resolve through ``project_storage_aliases`` so a
+            # legacy per-project DB at ``<project>/.pollypm/state.db``
+            # actually gets searched. Without this the lookup returns
+            # None and the alert stays stale forever even though the
+            # task is terminal.
+            project = self._resolve_project_by_alias(project_key)
+
+        from pathlib import Path as _Path
+
+        candidate_db_paths: list[_Path] = []
+        seen_paths: set[_Path] = set()
+
+        def _add_candidate(path: object) -> None:
+            try:
+                candidate = _Path(path)
+            except TypeError:
+                return
+            if candidate in seen_paths:
+                return
+            try:
+                if not candidate.exists():
+                    return
+            except OSError:
+                return
+            seen_paths.add(candidate)
+            candidate_db_paths.append(candidate)
+
+        project_settings = getattr(self.config, "project", None)
+        workspace_root = getattr(project_settings, "workspace_root", None)
+        if workspace_root is not None:
+            _add_candidate(_Path(workspace_root) / ".pollypm" / "state.db")
+        if project is not None:
+            project_path = getattr(project, "path", None)
+            if project_path is not None:
+                _add_candidate(_Path(project_path) / ".pollypm" / "state.db")
+        state_db = getattr(project_settings, "state_db", None)
+        if state_db is not None:
+            _add_candidate(state_db)
+
+        if not candidate_db_paths:
+            return None
+
+        try:
+            from pollypm.work import create_work_service
+        except Exception:  # noqa: BLE001
+            return None
+
+        project_path = (
+            getattr(project, "path", None) if project is not None else None
+        )
+
+        for db_path in candidate_db_paths:
+            try:
+                svc = create_work_service(
+                    db_path=db_path, project_path=project_path,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            try:
+                try:
+                    task = svc.get(task_id)
+                except Exception:  # noqa: BLE001
+                    task = None
+                if task is None:
+                    continue
+                status = getattr(task, "work_status", None)
+                value = getattr(status, "value", status)
+                if value is None:
+                    return None
+                return str(value)
+            finally:
+                close = getattr(svc, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+        return None
+
+    def _resolve_project_by_alias(self, project_key: str) -> object | None:
+        """Return the configured project whose storage aliases include ``project_key``.
+
+        PR #1560 codex-review HIGH-1 — projects can be configured under
+        a slug key (``health_coach``) while the work-service stores
+        task IDs using a different storage form (``health-coach``,
+        the on-disk directory or display name). When an alert's
+        task-id project segment doesn't match a config key directly,
+        consult the same alias resolver the dashboard uses
+        (``project_storage_aliases``) so we still find the project's
+        on-disk path and walk its legacy ``<project>/.pollypm/state.db``.
+
+        Returns None when no project's alias set contains ``project_key``.
+        Pure best-effort — any exception is swallowed.
+        """
+        if not project_key:
+            return None
+        try:
+            from pollypm.work.project_aliases import project_storage_aliases
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            projects = self.config.projects or {}
+        except Exception:  # noqa: BLE001
+            return None
+        for known_key, project in projects.items():
+            try:
+                aliases = project_storage_aliases(self.config, known_key)
+            except Exception:  # noqa: BLE001
+                continue
+            if project_key in aliases:
+                return project
+        return None
+
+    def _record_alert_cleared_task_terminal(
+        self,
+        *,
+        alert: object,
+        task_id: str,
+        task_status: str,
+    ) -> None:
+        """Write an ``audit.alert_cleared_task_terminal`` event.
+
+        Stamps the forensic log so a future operator (or watchdog rule)
+        can correlate "alert disappeared" with "task hit terminal
+        status". Best-effort: any failure is swallowed because the
+        primary clear has already landed.
+        """
+        try:
+            session_name = str(
+                getattr(alert, "session_name", "") or ""
+            )
+            alert_type = str(getattr(alert, "alert_type", "") or "")
+            payload = {
+                "session_name": session_name,
+                "alert_type": alert_type,
+                "task_id": task_id,
+                "task_status": task_status,
+                "alert_id": getattr(alert, "alert_id", None),
+            }
+            subject = (
+                f"alert {alert_type} on {session_name} cleared "
+                f"because task {task_id} reached {task_status}"
+            )
+            self._msg_store.record_event(
+                scope=session_name or "audit",
+                sender="audit.alert_cleared_task_terminal",
+                subject=subject,
+                payload=payload,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "alert_cleared_task_terminal event emit failed",
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # #1008 — auto-clear ``recovery_limit`` / ``stuck_session`` alerts

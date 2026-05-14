@@ -124,6 +124,19 @@ Every request (except `GET /api/v1/health`) must carry:
 Authorization: Bearer <token>
 ```
 
+### SSE escape hatch (`?token=`)
+
+The browser `EventSource` API cannot set custom HTTP headers, so the
+`Authorization: Bearer …` form above is impossible for SSE consumers.
+The single SSE endpoint (`GET /api/v1/events`) therefore *also*
+accepts the bearer token via the `?token=` query parameter as a
+fallback. Header form is still preferred for non-browser clients.
+
+This escape hatch is **SSE-only**. Read and write JSON endpoints
+reject `?token=` with `401 unauthorized` so the secret doesn't leak
+into proxy logs / browser history for routine traffic. See `auth.py`
+(`make_sse_auth_dependency`) for the mechanics.
+
 ### Token storage
 
 - Token lives at `~/.pollypm/api-token` (mode `0600`).
@@ -313,7 +326,13 @@ inbox `plan_review` payload (see `_extract_plan_judgment_calls` in
 
 Fields:
 - `task_id`
-- `version` (`plan_version`; integer, increments on refinement)
+- `version` (`plan_version`; integer, increments on refinement). Plan
+  history is **not** stored server-side in v1 — only the currently
+  active plan body is fetchable. Calling
+  `GET /projects/{key}/plan?version=N` with a version that doesn't
+  match the active task returns `404 not_found`. (When plan history
+  lands the contract will switch to returning historical revisions
+  here.)
 - `predecessor_task_id` (nullable; populated when a replan creates a
   new task)
 - `summary` (one-paragraph synthesis)
@@ -368,7 +387,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | POST   | `/api/v1/projects/{key}/plan` | Kick off `pm project plan` (initial or replan) |
 | POST   | `/api/v1/projects/{key}/chat` | Send a chat message to the project's PM persona |
 | GET    | `/api/v1/projects/{key}/tasks` | Task list (`?status=&limit=&cursor=`) |
-| GET    | `/api/v1/projects/{key}/plan` | Structured plan body (`?version=N`) |
+| GET    | `/api/v1/projects/{key}/plan` | Structured plan body (`?version=N` matches the active version only — see §7) |
 | GET    | `/api/v1/tasks/{project}/{n}` | Task detail — status, node, executions, transitions |
 | POST   | `/api/v1/tasks/{project}/{n}/approve` | Approve plan or code review |
 | POST   | `/api/v1/tasks/{project}/{n}/reject` | Reject + capture reason |

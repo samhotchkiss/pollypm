@@ -29,7 +29,7 @@ from collections import OrderedDict
 from pathlib import Path
 import subprocess
 import time
-from typing import Callable, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 # Raise FD limit early — the cockpit opens many subprocesses and file handles.
 try:
@@ -1322,6 +1322,32 @@ class PollyCockpitApp(App[None]):
         )
         self._route_status_hint: str | None = None
         self._transient_notice_active = False
+        # #1546-followup — rail_daemon self-recovery state. Tracks the
+        # most recent revival attempt (so the throttle in
+        # ``rail_daemon_supervisor.diagnose_rail_daemon`` actually
+        # throttles across periodic-timer calls) and the most recent
+        # decision (so the rail can render a "rail daemon respawning"
+        # alert if revivals are happening repeatedly). ``Any`` rather
+        # than ``datetime`` so we don't have to add a top-level
+        # datetime import to ``cockpit_ui.py`` (every other use is
+        # imported lazily inside its method).
+        self._last_rail_revival_at: Any = None
+        self._last_rail_decision_state: str | None = None
+        # Captured at mount time inside ``_start_core_rail``. ``True``
+        # means a live rail_daemon held the PID file when the cockpit
+        # booted, so the cockpit deferred to it rather than starting
+        # its own in-process HeartbeatRail. The liveness watcher only
+        # respawns in that mode — running the watcher in cockpit-
+        # hosted mode would race the cockpit's own ticker thread.
+        self._rail_daemon_was_external: bool = False
+
+    #: Cadence for the rail_daemon liveness check. Long enough that the
+    #: heartbeat's own internal retry handles transient stalls before
+    #: this layer interferes (the in-thread ``_tick_loop`` retries on
+    #: every interval — default 15s — and ``stale_tick_seconds`` is
+    #: 180s) but short enough that a dead daemon is revived within a
+    #: minute. Tunable with ``POLLYPM_RAIL_LIVENESS_INTERVAL_SECONDS``.
+    RAIL_LIVENESS_CHECK_INTERVAL_SECONDS = 60
 
     def compose(self) -> ComposeResult:
         with Vertical():
@@ -1368,6 +1394,21 @@ class PollyCockpitApp(App[None]):
         # Failures here are non-fatal — the TUI still works, just
         # without autonomous sweeps. See issue #268 Gap A.
         self._start_core_rail()
+        # #1546-followup — layer-2 watchdog: periodically check that
+        # the headless ``pollypm.rail_daemon`` is alive AND ticking. If
+        # it died (OOM, sandbox kill, segfault) or is wedged (no
+        # heartbeat event for 180s), respawn it. The cockpit is the
+        # natural place for this layer because it's the longest-lived
+        # in-process Python that *isn't* the rail daemon — i.e. the
+        # only viable external supervisor when launchd isn't installed.
+        # Tunable cadence via ``POLLYPM_RAIL_LIVENESS_INTERVAL_SECONDS``.
+        try:
+            interval = self._resolve_rail_liveness_interval()
+            self.set_interval(interval, self._tick_rail_liveness)
+        except Exception:  # noqa: BLE001
+            # Setting up a periodic timer should never block boot;
+            # fall through silently if Textual rejects the call.
+            logger.debug("rail_liveness timer install failed", exc_info=True)
         # Alert toast surface removed in #956 — the rail still shows
         # alert badges and ``a`` still opens the alert list.
         self.call_after_refresh(self._show_palette_tip_once)
@@ -1700,6 +1741,11 @@ class PollyCockpitApp(App[None]):
         ``pm cockpit`` at ~200% CPU for hours on 2026-04-20.
         """
         if self._rail_daemon_alive():
+            # Capture the boot-time decision so the rail-liveness
+            # watcher (which fires every 60s after this) only respawns
+            # the daemon in modes where the cockpit deferred to it.
+            # See ``_cockpit_uses_external_rail_daemon`` (#1546-followup).
+            self._rail_daemon_was_external = True
             return
         try:
             supervisor = self.router._load_supervisor()
@@ -1738,6 +1784,111 @@ class PollyCockpitApp(App[None]):
         except PermissionError:
             # Different user owns the PID — treat as alive from our POV.
             return True
+
+    def _resolve_rail_liveness_interval(self) -> float:
+        """Resolve the rail-daemon liveness check cadence in seconds.
+
+        Reads ``POLLYPM_RAIL_LIVENESS_INTERVAL_SECONDS`` so tests +
+        operators can dial it down without a code edit. Falls back to
+        :attr:`RAIL_LIVENESS_CHECK_INTERVAL_SECONDS`. Negative or
+        non-numeric values fall back to the class default.
+        """
+        import os as _os
+
+        raw = _os.environ.get("POLLYPM_RAIL_LIVENESS_INTERVAL_SECONDS")
+        if not raw:
+            return float(self.RAIL_LIVENESS_CHECK_INTERVAL_SECONDS)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return float(self.RAIL_LIVENESS_CHECK_INTERVAL_SECONDS)
+        if value <= 0:
+            return float(self.RAIL_LIVENESS_CHECK_INTERVAL_SECONDS)
+        return value
+
+    def _tick_rail_liveness(self) -> None:
+        """Periodic: revive ``pollypm.rail_daemon`` if it's dead/stuck.
+
+        Best-effort: any exception is swallowed so a transient failure
+        (DB lock, permission glitch) doesn't kill the periodic timer
+        for the rest of the cockpit's lifetime. The next tick retries.
+
+        Skips itself when the cockpit is hosting an in-process
+        ``HeartbeatRail`` (no headless daemon configured) — there's
+        nothing to revive in that mode; the in-thread retry covers
+        single-tick crashes and a process-level death of the cockpit
+        is a launchd / user-restart concern, not this layer's.
+        """
+        from pathlib import Path as _Path
+
+        from pollypm.rail_daemon_supervisor import revive_if_needed
+
+        # If the cockpit is the rail's host (rather than a separate
+        # rail_daemon process), skip — see _start_core_rail.
+        if not self._cockpit_uses_external_rail_daemon():
+            return
+
+        try:
+            home = _Path.home() / ".pollypm"
+            pid_path = home / "rail_daemon.pid"
+            # Resolve the workspace state.db path via the supervisor
+            # if we can; fall back to the conventional location so the
+            # liveness check still works on a half-mounted cockpit.
+            state_db = self._resolve_state_db_path() or (home / "state.db")
+            result = revive_if_needed(
+                config_path=self.config_path,
+                state_db_path=state_db,
+                pid_path=pid_path,
+                last_revival_at=self._last_rail_revival_at,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("rail_liveness tick failed", exc_info=True)
+            return
+
+        self._last_rail_decision_state = result.decision.state
+        if result.revived:
+            from datetime import UTC, datetime as _dt
+
+            self._last_rail_revival_at = _dt.now(UTC)
+            logger.warning(
+                "cockpit: revived rail_daemon (%s) — %s",
+                result.decision.state, result.decision.reason,
+            )
+
+    def _cockpit_uses_external_rail_daemon(self) -> bool:
+        """True iff the layout uses a separate ``pollypm.rail_daemon``.
+
+        Returns the boot-time captured value from ``_start_core_rail``
+        — set to True only when a live rail_daemon held the PID file
+        when the cockpit mounted, and the cockpit consequently DID
+        NOT start its own in-process ``HeartbeatRail``. In that case
+        respawning the daemon when it dies is safe: there's no other
+        ticker for it to race.
+
+        When the cockpit booted into its own in-process rail (no
+        daemon at boot, or daemon was dead and the cockpit took over),
+        respawning a daemon now would create a second concurrent
+        ticker — the exact contention failure ``_start_core_rail``
+        warns about. So we leave it alone.
+
+        The boot-time decision is intentionally sticky for the lifetime
+        of this cockpit process. If the user manually starts a daemon
+        via ``pm up`` mid-session, they've opted in to a manual
+        recovery path and we don't try to second-guess. The next
+        cockpit restart re-evaluates.
+        """
+        return self._rail_daemon_was_external
+
+    def _resolve_state_db_path(self):
+        """Return the workspace state.db path, or ``None`` if unresolvable."""
+        try:
+            supervisor = self.router._load_supervisor()
+        except Exception:  # noqa: BLE001
+            return None
+        try:
+            return supervisor.config.project.state_db
+        except Exception:  # noqa: BLE001
+            return None
 
     def _enforce_rail_width_once(self) -> None:
         try:

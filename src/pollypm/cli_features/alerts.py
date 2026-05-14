@@ -103,6 +103,15 @@ def heartbeat(
     from pollypm import cli as cli_mod
 
     supervisor = cli_mod._load_supervisor(config_path)
+    # #1546-followup — defense-in-depth rail-daemon liveness check.
+    # The cockpit's periodic timer is the primary watcher when it's
+    # open; this cron-driven path covers the case where the cockpit
+    # itself is dead so nothing else would notice a stale daemon.
+    # Best-effort: never blocks the heartbeat sweep.
+    try:
+        cli_mod._revive_rail_daemon_if_dead(config_path)
+    except Exception:  # noqa: BLE001
+        pass
     alerts = supervisor.run_heartbeat(snapshot_lines=snapshot_lines)
     tick_result = cli_mod._tick_core_rail_if_available(supervisor)
     cli_mod._drain_and_stop_core_rail_if_available(
@@ -276,6 +285,116 @@ def heartbeat_uninstall() -> None:
     new_crontab = "\n".join(lines) + "\n" if lines else ""
     subprocess.run(["crontab", "-"], input=new_crontab, text=True, check=True)
     typer.echo("Removed heartbeat cron job.")
+
+
+@heartbeat_app.command(
+    "install-launchd",
+    help=(
+        "Install a macOS LaunchAgent that auto-restarts pollypm.rail_daemon. "
+        "Layer-3 supervision: launchd watches the rail daemon process, "
+        "respawns it if it dies, and starts it on machine boot."
+    ),
+)
+def heartbeat_install_launchd(
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
+    ),
+    label: str = typer.Option(
+        "com.pollypm.rail-daemon", "--label",
+        help="LaunchAgent label (defaults to com.pollypm.rail-daemon).",
+    ),
+    load: bool = typer.Option(
+        True, "--load/--no-load",
+        help="Run launchctl bootstrap immediately after installing (default: yes).",
+    ),
+) -> None:
+    """Install ``~/Library/LaunchAgents/<label>.plist`` for the rail daemon."""
+    from pollypm.rail_daemon_launchd import install_launchd_keepalive
+
+    try:
+        plist_path = install_launchd_keepalive(
+            config_path=config_path, label=label, load=load,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise typer.BadParameter(f"Failed to install LaunchAgent: {exc}") from exc
+
+    typer.echo(f"Installed {plist_path}")
+    if load:
+        typer.echo(
+            f"Loaded {label} via launchctl. The rail daemon will be "
+            "auto-restarted if it crashes and on every login."
+        )
+    else:
+        typer.echo(
+            f"To activate: launchctl bootstrap gui/$(id -u) {plist_path}"
+        )
+
+
+@heartbeat_app.command(
+    "uninstall-launchd",
+    help=(
+        "Remove the macOS LaunchAgent that supervises pollypm.rail_daemon. "
+        "Stops the daemon (if launchd-managed) and unlinks the plist."
+    ),
+)
+def heartbeat_uninstall_launchd(
+    label: str = typer.Option(
+        "com.pollypm.rail-daemon", "--label",
+        help="LaunchAgent label to remove (defaults to com.pollypm.rail-daemon).",
+    ),
+) -> None:
+    """Remove the rail-daemon LaunchAgent and unload it."""
+    from pollypm.rail_daemon_launchd import uninstall_launchd_keepalive
+
+    removed = uninstall_launchd_keepalive(label=label)
+    if removed:
+        typer.echo(f"Removed LaunchAgent {label}.")
+    else:
+        typer.echo(f"No LaunchAgent named {label} was installed.")
+
+
+@heartbeat_app.command(
+    "status",
+    help=(
+        "Diagnose the rail daemon's liveness without taking any action. "
+        "Mirrors the periodic check that the cockpit / cron path "
+        "performs, so operators can see what the supervisor sees."
+    ),
+)
+def heartbeat_status(
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+) -> None:
+    """Print the rail daemon's diagnosis (alive / missing / dead / stuck)."""
+    from pollypm import cli as cli_mod
+    from pollypm.config import load_config
+    from pollypm.rail_daemon_supervisor import (
+        diagnose_rail_daemon, query_last_heartbeat_iso,
+    )
+
+    cfg = load_config(config_path)
+    pid_path = cli_mod._rail_daemon_pid_path()
+    last_tick_iso = query_last_heartbeat_iso(cfg.project.state_db)
+    decision = diagnose_rail_daemon(
+        pid_path=pid_path, last_tick_iso=last_tick_iso,
+    )
+    if json_output:
+        cli_mod._emit_json({
+            "state": decision.state,
+            "pid": decision.pid,
+            "last_tick_age_seconds": decision.last_tick_age_seconds,
+            "reason": decision.reason,
+            "needs_revival": decision.needs_revival,
+        })
+        return
+    label = "alive" if decision.state == "alive" else "DEGRADED"
+    typer.echo(f"rail_daemon: {label} ({decision.state})")
+    typer.echo(f"  pid: {decision.pid}")
+    if decision.last_tick_age_seconds is not None:
+        typer.echo(f"  last tick: {decision.last_tick_age_seconds:.0f}s ago")
+    typer.echo(f"  {decision.reason}")
 
 
 @heartbeat_app.command(

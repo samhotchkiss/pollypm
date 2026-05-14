@@ -64,6 +64,10 @@ system_app = typer.Typer(
 _TIER4_ENV_FLAG = "POLLYPM_TIER4_AUTHORITY"
 
 
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
 def _require_tier4(use_flag: bool) -> None:
     """Refuse system-scoped helpers unless the caller has tier-4 authority.
 
@@ -198,7 +202,7 @@ def self_promote(
             err=True,
         )
         raise typer.Exit(code=3)
-    now = datetime.now(UTC)
+    now = _now()
     allowed, reason = tracker.can_self_promote(finding, now=now)
     from pollypm.audit.tier4 import root_cause_hash
     rch = root_cause_hash(finding)
@@ -247,7 +251,7 @@ def status() -> None:
     if not rows:
         typer.echo("(no active tier-4 rows)")
         return
-    now = datetime.now(UTC)
+    now = _now()
     for row in rows:
         remaining = tracker.budget_remaining_seconds(
             row.root_cause_hash, now=now,
@@ -286,7 +290,7 @@ def clear(
     if state is None or not state.tier4_active:
         typer.echo(f"no active tier-4 row for {root_cause_hash_value}.")
         raise typer.Exit(code=2)
-    now = datetime.now(UTC)
+    now = _now()
     cleared = tracker.clear(root_cause_hash_value, now=now, reason=reason)
     if cleared:
         from pollypm.plugins_builtin.core_recurring.audit_watchdog import (

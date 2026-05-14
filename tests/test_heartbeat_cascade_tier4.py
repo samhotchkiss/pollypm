@@ -597,6 +597,10 @@ def test_self_promote_cli_blocked_inside_cooldown(
         "pollypm.cli_features.tier4._build_tracker",
         lambda: Tier4PromotionTracker(db_path),
     )
+    monkeypatch.setattr(
+        "pollypm.cli_features.tier4._now",
+        lambda: now,
+    )
 
     # Pre-populate a self-promotion so the cooldown is active.
     tracker = Tier4PromotionTracker(db_path)

@@ -1793,56 +1793,164 @@ class CockpitRouter:
         project_path = getattr(project, "path", None)
         if not isinstance(project_path, Path):
             return [], False
-        db_path = project_path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            return [], False
+        from pollypm.notify_task import is_notify_inbox_task
         from pollypm.plan_presence import has_acceptable_plan
         from pollypm.work import create_work_service
         from pollypm.work.project_aliases import project_storage_aliases
 
-        work = create_work_service(db_path=db_path, project_path=project_path)
-        try:
-            # #1092 — match the dashboard's alias-aware lookup. The work
-            # DB stores tasks under the display name (``booktalk``) while
-            # the rollup receives the slugified config key, so a single
-            # ``list_tasks(project=project_key)`` silently returned zero
-            # tasks for projects whose key and display name diverge.
-            # The dashboard correctly counts ``on_hold`` via the alias
-            # union — without it here, the rail rollup falls through to
-            # ``ProjectRailState.NONE`` and the held-task project shows
-            # up in the rail with the idle ``♥·`` glyph (no marker)
-            # instead of the ``◆`` "needs attention" indicator.
-            aliases = project_storage_aliases(config, project_key)
-            seen_ids: set[str] = set()
-            tasks: list = []
-            for alias in aliases:
-                for task in work.list_tasks(project=alias):
-                    tid = getattr(task, "task_id", None)
-                    if tid and tid in seen_ids:
-                        continue
-                    if tid:
-                        seen_ids.add(tid)
-                    tasks.append(task)
-            planner = getattr(config, "planner", None)
-            plan_dir = str(getattr(planner, "plan_dir", "docs/plan") or "docs/plan")
-            global_enforce = bool(getattr(planner, "enforce_plan", True))
-            project_enforce = getattr(project, "enforce_plan", None)
-            enforce_plan = (
-                project_enforce if project_enforce is not None else global_enforce
-            )
-            if not enforce_plan:
-                return tasks, False
-            plan_blocked = bool(tasks) and not has_acceptable_plan(
-                project_key,
-                project_path,
-                work,
-                plan_dir=plan_dir,
-            )
-            return tasks, plan_blocked
-        except Exception:  # noqa: BLE001
+        # #1542 — mirror the dashboard's DB-resolution order. Pre-#1542
+        # the rail rollup only looked at the legacy per-project DB
+        # (``<project>/.pollypm/state.db``) — the dashboard's task
+        # gather (``_dashboard_task_db_paths``) walks the workspace-root
+        # canonical DB FIRST and falls back to the per-project legacy
+        # DB only if the canonical query came up empty. A project whose
+        # tasks live in the canonical workspace DB (the post-#1519 norm)
+        # rolled up to ``ProjectRailState.NONE`` here, even though the
+        # dashboard correctly painted ``◆ needs attention`` from the
+        # same data. The result was the rail glyph (``○``) and dashboard
+        # banner contradicting on the same project key — cf. #1542's
+        # ``media`` repro: rail says quiet, dashboard says please-look-
+        # at-me. We now walk both DBs in the canonical-first order and
+        # union the rows so the rail picks up paused-with-work projects.
+        candidate_db_paths: list[Path] = []
+        seen_paths: set[Path] = set()
+
+        def _add_candidate(path: object) -> None:
+            try:
+                candidate = Path(path)
+            except TypeError:
+                return
+            if candidate in seen_paths:
+                return
+            try:
+                if not candidate.exists():
+                    return
+            except OSError:
+                return
+            seen_paths.add(candidate)
+            candidate_db_paths.append(candidate)
+
+        project_settings = getattr(config, "project", None)
+        workspace_root = getattr(project_settings, "workspace_root", None)
+        if workspace_root is not None:
+            _add_candidate(Path(workspace_root) / ".pollypm" / "state.db")
+        _add_candidate(project_path / ".pollypm" / "state.db")
+        state_db = getattr(project_settings, "state_db", None)
+        if state_db is not None:
+            _add_candidate(state_db)
+
+        if not candidate_db_paths:
             return [], False
-        finally:
-            work.close()
+
+        aliases = project_storage_aliases(config, project_key)
+        planner = getattr(config, "planner", None)
+        plan_dir = str(getattr(planner, "plan_dir", "docs/plan") or "docs/plan")
+        global_enforce = bool(getattr(planner, "enforce_plan", True))
+        project_enforce = getattr(project, "enforce_plan", None)
+        enforce_plan = (
+            project_enforce if project_enforce is not None else global_enforce
+        )
+
+        seen_ids: set[str] = set()
+        tasks: list = []
+        plan_blocked = False
+        used_any_db = False
+        # Codex review (PR #1557) — "first DB with matching rows wins".
+        # Mirror ``cockpit_ui._dashboard_gather_tasks``'s iteration shape:
+        # walk candidates in order (canonical → legacy) and STOP as soon
+        # as one yields any real-work rows, only falling back to the next
+        # candidate when the current DB is empty (or notify-only). The
+        # earlier #1542 fix walked every candidate and unioned rows,
+        # which reintroduced the same split-brain it was trying to
+        # repair: a clean canonical workspace DB padded by stale
+        # ``on_hold`` rows still sitting in the legacy per-project DB →
+        # wrong rail glyph.
+        #
+        # Codex re-review of PR #1557 — notify-only canonical DBs must
+        # not latch the gate. ``is_notify_inbox_task`` (rejection
+        # feedback, plan-review handoff, supervisor alerts, …) marks
+        # rows that are addressed to the user and carry no node-level
+        # transition affordance. The dashboard already filters them
+        # BEFORE deciding whether a DB has pipeline rows
+        # (cf. ``cockpit_ui._dashboard_gather_tasks`` lines ~12283 /
+        # ~12367). The rail must mirror that filter: a canonical DB
+        # holding only notify rows + a legacy DB with real paused work
+        # would otherwise have the dashboard fall back (correct
+        # ``on_hold`` glyph) while the rail stops at canonical and
+        # rolls up ``WORKING`` — mismatched glyph and dashboard.
+        for db_path in candidate_db_paths:
+            try:
+                work = create_work_service(
+                    db_path=db_path, project_path=project_path,
+                )
+            except Exception:  # noqa: BLE001
+                continue
+            db_tasks: list = []
+            try:
+                # #1092 — alias-aware lookup. The work DB stores tasks
+                # under the display name (``booktalk``) while the rollup
+                # receives the slugified config key, so a single
+                # ``list_tasks(project=project_key)`` silently returned
+                # zero tasks for projects whose key and display name
+                # diverge.
+                for alias in aliases:
+                    try:
+                        for task in work.list_tasks(project=alias):
+                            tid = getattr(task, "task_id", None)
+                            if tid and tid in seen_ids:
+                                continue
+                            # Skip notify-shaped rows BEFORE the gate /
+                            # ``seen_ids``. Mirrors the dashboard: notify
+                            # tids are intentionally NOT added to the
+                            # dedup set so a same-tid real-work row in a
+                            # later DB can still surface (defensive
+                            # against legacy/canonical drift).
+                            if is_notify_inbox_task(task):
+                                continue
+                            if tid:
+                                seen_ids.add(tid)
+                            db_tasks.append(task)
+                    except Exception:  # noqa: BLE001
+                        continue
+                if db_tasks:
+                    used_any_db = True
+                    tasks.extend(db_tasks)
+                    if enforce_plan and not plan_blocked:
+                        try:
+                            acceptable = has_acceptable_plan(
+                                project_key,
+                                project_path,
+                                work,
+                                plan_dir=plan_dir,
+                            )
+                        except Exception:  # noqa: BLE001
+                            acceptable = True
+                        if not acceptable:
+                            plan_blocked = True
+            except Exception:  # noqa: BLE001
+                db_tasks = []
+            finally:
+                close = getattr(work, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+            # First DB with matching real-work rows wins — break only
+            # AFTER the service is closed so the legacy candidate
+            # doesn't pad the canonical row set on the next loop
+            # iteration. ``db_tasks`` already excludes notify-shaped
+            # rows (see filter above), so a canonical DB holding only
+            # inbox notifications will fall through to legacy — matching
+            # the dashboard's "filtered rows only" gate.
+            if db_tasks:
+                break
+
+        if not used_any_db:
+            return [], False
+        if not enforce_plan:
+            return tasks, False
+        return tasks, plan_blocked
 
     def _inject_mounted_task_rows(
         self,

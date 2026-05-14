@@ -14203,6 +14203,51 @@ def _dashboard_activity(
     return result
 
 
+def _resolve_project_key(
+    config: object, project_key: str,
+) -> tuple[str, object] | None:
+    """Resolve ``project_key`` to a ``(canonical_key, project)`` pair.
+
+    #1544 — the rail label can include hyphens (``health-coach``) while
+    the canonical config key is slugified (``health_coach``). A direct
+    ``config.projects.get(project_key)`` lookup misses the project even
+    though the rail just routed to it, leaving the dashboard with no
+    data and bailing into the "not a tracked project" header. Try the
+    direct lookup first, then a slugified variant, then a case-folded
+    walk so a user typing ``pm cockpit-pane project Health-Coach`` lands
+    on the same row.
+
+    Returns ``None`` when no match is found.
+    """
+    projects = getattr(config, "projects", {}) or {}
+    project = projects.get(project_key)
+    if project is not None:
+        return project_key, project
+    # Try the slug-normalized variant. ``slugify_project_key`` is the
+    # canonicalizer used at ``register_project`` time, so a hyphenated
+    # rail label collapses to the underscore form here.
+    try:
+        from pollypm.projects import slugify_project_key
+
+        canonical = slugify_project_key(project_key)
+    except Exception:  # noqa: BLE001
+        canonical = ""
+    if canonical and canonical != project_key:
+        project = projects.get(canonical)
+        if project is not None:
+            return canonical, project
+    # Last-ditch: case-folded scan. Catches operator typos like
+    # ``Coffeeboardnm`` for the registered ``coffeeboardnm``.
+    target = (project_key or "").strip().casefold()
+    if target:
+        for key, candidate in projects.items():
+            if str(key).casefold() == target:
+                return str(key), candidate
+            if canonical and str(key).casefold() == canonical.casefold():
+                return str(key), candidate
+    return None
+
+
 def _gather_project_dashboard(
     config_path: Path, project_key: str,
 ) -> ProjectDashboardData | None:
@@ -14211,10 +14256,10 @@ def _gather_project_dashboard(
         config = load_config(config_path)
     except Exception:  # noqa: BLE001
         return None
-    projects = getattr(config, "projects", {}) or {}
-    project = projects.get(project_key)
-    if project is None:
+    resolved = _resolve_project_key(config, project_key)
+    if resolved is None:
         return None
+    project_key, project = resolved
 
     project_path = getattr(project, "path", None)
     name = (
@@ -15365,6 +15410,20 @@ class PollyProjectDashboardApp(App[None]):
                 f"[#ff5f6d]Error loading project:[/#ff5f6d] {_escape(str(exc))}"
             )
             return
+        # Codex review (PR #1557) — adopt the canonical key after the
+        # gather. ``_gather_project_dashboard`` calls ``_resolve_project_key``
+        # to bridge a hyphenated / case-folded operator input to the
+        # registered config key, but only the returned ``data`` carried the
+        # canonical form — ``self.project_key`` stayed on the original
+        # input string. Follow-on actions (PM chat dispatch at #16978, inbox
+        # jump at #17239, task jumps) all route through ``self.project_key``,
+        # so a user landing on ``health-coach`` rendered ``health_coach``'s
+        # data but routed ``c``/``i`` through the unregistered hyphen form,
+        # which the cockpit-router then mismatched. Mirror ``data.project_key``
+        # back onto the app once the resolver has run so every downstream
+        # route uses the canonical key.
+        if self.data is not None and getattr(self.data, "project_key", None):
+            self.project_key = self.data.project_key
         # Skip the full re-paint when nothing the user can see has
         # changed. Force-refresh every Nth tick so "5m ago" age labels
         # don't freeze. Mirrors the inbox loader's #752 signature
@@ -15396,6 +15455,11 @@ class PollyProjectDashboardApp(App[None]):
     def _first_refresh_completed(self, data) -> None:
         self._first_refresh_running = False
         self.data = data
+        # Codex review (PR #1557) — see ``_refresh``: route follow-on
+        # actions (``c``/``i``/jumps) through the canonical key the
+        # gather resolved, not whatever the user typed at the rail.
+        if data is not None and getattr(data, "project_key", None):
+            self.project_key = data.project_key
         self._last_render_signature = _project_dashboard_signature(data)
         self._render()
 
@@ -15436,13 +15500,21 @@ class PollyProjectDashboardApp(App[None]):
     def _render(self) -> None:
         data = self.data
         if data is None:
-            # Friendlier text + matching 3-space gap so the error
-            # case doesn't look subtly different from the regular
-            # ``<Project>   PM: <label>`` topbar.
+            # #1544 — replace the internal-vocabulary "is not a tracked
+            # project — open the project picker to choose" copy. That
+            # message used data-model jargon (``tracked``) and pointed
+            # at a non-existent affordance (``the project picker``),
+            # leaving the user with no way to act. The new copy names
+            # the failure (no project registered with that key) and
+            # gives the concrete CLI command to register one. Matches
+            # the 3-space gap used in the regular
+            # ``<Project>   PM: ...`` topbar so the error-case framing
+            # isn't visually distinct.
             self.topbar.update(
                 f"[b]{_escape(self.project_key)}[/b]   "
-                f"[dim]is not a tracked project — "
-                f"open the project picker to choose a tracked project.[/dim]"
+                f"[dim]no project registered with that key — "
+                f"run [b]pm project new <path>[/b] to register one, "
+                f"or press [b]q[/b] to go back.[/dim]"
             )
             # #1539 follow-up — without this, the skeleton bars seeded
             # in ``__init__`` stay visible forever on the unknown-project

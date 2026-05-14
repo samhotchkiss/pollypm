@@ -130,6 +130,40 @@ EVENT_WATCHDOG_WORKER_LANE_SPAWNED = "audit.worker_lane_spawned"
 # remain). Metadata carries ``project_key`` and ``project_path`` so
 # forensic reads can confirm which project was repaired.
 EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED = "audit.project_tracked_mode_repaired"
+# #1553 — tier-4 cascade events. Mirror the tier-3 dispatch event shape
+# but for the broadened-authority leg of the cascade. Each event's
+# metadata MUST carry enough for forensic reads to reconstruct the
+# decision without re-running the cascade:
+#
+# * ``EVENT_WATCHDOG_OPERATOR_TIER4_DISPATCHED`` — fires once per tier-4
+#   dispatch (auto-promoted OR self-promoted). Metadata carries
+#   ``finding_type``, ``subject``, ``root_cause_hash``,
+#   ``promotion_path`` (``"watchdog"`` / ``"self"``), ``inbox_task_id``.
+# * ``EVENT_TIER4_PROMOTED`` — fires before the dispatch so the
+#   promotion event is observable even if inbox creation fails.
+#   Metadata: ``finding_type``, ``subject``, ``root_cause_hash``,
+#   ``promotion_path``, ``justification`` (self-promote only).
+# * ``EVENT_TIER4_ACTION`` / ``EVENT_TIER4_GLOBAL_ACTION`` — emitted by
+#   tier-4 Polly when she takes a project-scoped or system-scoped
+#   action under the broadened authority. The global variant is the
+#   "louder" signature: it MUST be paired with a desktop-notification
+#   call so the user knows the system was bounced. Metadata carries
+#   ``action`` (free-form), ``root_cause_hash``, and any caller-supplied
+#   forensic context.
+# * ``EVENT_TIER4_DEMOTED`` — fires when the finding clears (status
+#   moves to terminal-good) and the tracker auto-clears tier-4 state.
+#   Metadata: ``root_cause_hash``, ``reason`` (``"finding_cleared"``).
+# * ``EVENT_TIER4_BUDGET_EXHAUSTED`` — fires when the 2h wall-clock
+#   budget at tier-4 elapses without resolution. The cascade then
+#   routes the finding to terminal (product-broken + urgent inbox).
+#   Metadata: ``root_cause_hash``, ``elapsed_seconds``,
+#   ``budget_seconds``, ``urgent_handoff_subject``.
+EVENT_WATCHDOG_OPERATOR_TIER4_DISPATCHED = "watchdog.operator_tier4_dispatched"
+EVENT_TIER4_PROMOTED = "audit.tier4_promoted"
+EVENT_TIER4_ACTION = "audit.tier4_action"
+EVENT_TIER4_GLOBAL_ACTION = "audit.tier4_global_action"
+EVENT_TIER4_DEMOTED = "audit.tier4_demoted"
+EVENT_TIER4_BUDGET_EXHAUSTED = "audit.tier4_budget_exhausted"
 # #1413 — emitted whenever the supervisor / on-demand path provisions a
 # project-scoped role session (e.g. reviewer-<project>) that did not
 # previously exist. The watchdog (#1414) reads this stream to surface
@@ -498,6 +532,12 @@ __all__ = [
     "EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED",
     "EVENT_DAEMON_REAPED",
     "EVENT_DAEMON_REVIVED",
+    "EVENT_WATCHDOG_OPERATOR_TIER4_DISPATCHED",
+    "EVENT_TIER4_PROMOTED",
+    "EVENT_TIER4_ACTION",
+    "EVENT_TIER4_GLOBAL_ACTION",
+    "EVENT_TIER4_DEMOTED",
+    "EVENT_TIER4_BUDGET_EXHAUSTED",
     "AuditEvent",
     "central_log_path",
     "emit",

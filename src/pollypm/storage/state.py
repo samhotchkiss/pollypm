@@ -323,6 +323,35 @@ CREATE TABLE IF NOT EXISTS workspace_state (
     set_at TEXT NOT NULL,
     set_by TEXT NOT NULL DEFAULT 'system'
 );
+
+-- #1553 — tier4_promotion_state: per-root-cause-hash promotion accounting
+-- for the heartbeat cascade. One row per root_cause_hash that has ever
+-- been auto- or self-promoted to tier-4. ``dispatch_history_json`` is a
+-- JSON array of ISO-8601 timestamps of recent tier-3 dispatches (the
+-- 24h sliding window the auto-promote threshold reads from);
+-- ``last_promotion_at`` and ``promotion_path`` capture the most recent
+-- tier-4 entry for the self-promote cooldown gate;
+-- ``tier4_entered_at`` is the wall-clock anchor for the 2h budget;
+-- ``tier4_active`` is 1 while Polly is operating at tier-4 for this
+-- hash and 0 once the finding clears or the budget exhausts.
+-- ``last_finding_signature`` snapshots the structured signature so
+-- forensic reads can reconstruct what hash the row covers without
+-- re-deriving from the original Finding.
+CREATE TABLE IF NOT EXISTS tier4_promotion_state (
+    root_cause_hash TEXT PRIMARY KEY,
+    project TEXT NOT NULL DEFAULT '',
+    rule TEXT NOT NULL DEFAULT '',
+    dispatch_history_json TEXT NOT NULL DEFAULT '[]',
+    last_promotion_at TEXT,
+    promotion_path TEXT,
+    tier4_entered_at TEXT,
+    tier4_active INTEGER NOT NULL DEFAULT 0,
+    last_finding_signature TEXT NOT NULL DEFAULT '',
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_tier4_promotion_state_active
+ON tier4_promotion_state(tier4_active, tier4_entered_at);
 """
 
 

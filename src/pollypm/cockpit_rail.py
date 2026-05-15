@@ -2248,20 +2248,89 @@ class CockpitRouter:
         return False
 
     def _cleanup_duplicate_windows(self, storage_session: str) -> None:
-        """Kill duplicate windows in the storage closet, keeping only the first of each name."""
+        """Kill duplicate-named storage-closet windows whose pane is dead.
+
+        #1562 — historically this kept the lowest-index window per name
+        and killed the rest unconditionally. When a freshly-parked
+        operator pane landed at a higher index than a stale empty
+        window, the kill could take out the user's live conversation —
+        the symptom is "click Polly → click inbox → click Polly → fresh
+        standing-by prompt, prior history gone." Only ``pane_dead=True``
+        candidates are killed now; if multiple live duplicates exist,
+        emit a ``warn`` audit event and bail without killing anyone.
+        """
         try:
             windows = self.tmux.list_windows(storage_session)
         except Exception:  # noqa: BLE001
             return
-        seen: dict[str, int] = {}  # name -> first index
+        by_name: dict[str, list] = {}
         for window in windows:
-            if window.name in seen:
+            by_name.setdefault(window.name, []).append(window)
+        for name, dupes in by_name.items():
+            if len(dupes) <= 1:
+                continue
+            dead = [w for w in dupes if getattr(w, "pane_dead", False)]
+            live = [w for w in dupes if not getattr(w, "pane_dead", False)]
+            if len(live) > 1:
+                self._emit_cockpit_audit(
+                    event_name="cockpit.duplicate_window_killed",
+                    subject=name,
+                    status="warn",
+                    metadata={
+                        "storage_session": storage_session,
+                        "window_name": name,
+                        "live_duplicates": [w.index for w in live],
+                        "dead_duplicates": [w.index for w in dead],
+                        "action": "skipped_live_duplicates",
+                    },
+                )
+                continue
+            for window in dead:
                 try:
                     self.tmux.kill_window(f"{storage_session}:{window.index}")
                 except Exception:  # noqa: BLE001
-                    pass
-            else:
-                seen[window.name] = window.index
+                    continue
+                self._emit_cockpit_audit(
+                    event_name="cockpit.duplicate_window_killed",
+                    subject=name,
+                    status="ok",
+                    metadata={
+                        "storage_session": storage_session,
+                        "window_name": name,
+                        "killed_index": window.index,
+                        "pane_dead": True,
+                        "kept_indices": [w.index for w in live],
+                    },
+                )
+
+    def _emit_cockpit_audit(
+        self,
+        *,
+        event_name: str,
+        subject: str,
+        status: str,
+        metadata: dict,
+    ) -> None:
+        """Best-effort audit emit for cockpit lifecycle events (#1562).
+
+        Imported lazily so a missing/broken audit-log module never
+        blocks rail navigation.
+        """
+        try:
+            from pollypm.audit.log import emit as audit_emit
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            audit_emit(
+                event=event_name,
+                project="",
+                subject=subject,
+                actor="cockpit-rail",
+                status=status,
+                metadata=metadata,
+            )
+        except Exception:  # noqa: BLE001
+            return
 
     def ensure_cockpit_layout(self) -> None:
         if self._layout_mutation_active_elsewhere():
@@ -3371,6 +3440,21 @@ class CockpitRouter:
             # when missing — the user clicking on Polly expects to talk to
             # Polly, not see a placeholder.
             if launch.session.role in {"operator-pm", "reviewer"}:
+                # #1562 — respawn here means the user's prior conversation
+                # is about to be wiped. Emit forensics BEFORE the spawn so
+                # the audit row exists even if launch_session raises.
+                self._emit_cockpit_audit(
+                    event_name="cockpit.session_respawned",
+                    subject=session_name,
+                    status="warn",
+                    metadata={
+                        "session_name": session_name,
+                        "role": launch.session.role,
+                        "window_name": launch.window_name,
+                        "storage_windows_present": sorted(storage_windows),
+                        "reason": "storage_window_missing_on_mount",
+                    },
+                )
                 try:
                     supervisor.launch_session(session_name)
                     storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
@@ -3605,6 +3689,20 @@ class CockpitRouter:
         state.pop("mounted_identity", None)
         self._write_state(state)
         self._release_cockpit_lease(supervisor, mounted_session)
+        # #1562 — record the park so the next repro can correlate
+        # "parked at T" with a later "respawned at T+N" event and
+        # tell us whether the storage window vanished between them.
+        self._emit_cockpit_audit(
+            event_name="cockpit.session_parked",
+            subject=mounted_session,
+            status="ok",
+            metadata={
+                "session_name": mounted_session,
+                "window_name": window_name,
+                "storage_session": storage_session,
+                "storage_windows_after": sorted(w.name for w in after),
+            },
+        )
 
     # Roles that should NEVER be auto-detected as mounted via CWD fallback.
     # These are background roles — if the user is looking at a pane, it's

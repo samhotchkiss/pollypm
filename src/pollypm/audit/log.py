@@ -172,6 +172,30 @@ EVENT_TIER4_BUDGET_EXHAUSTED = "audit.tier4_budget_exhausted"
 # ``"architect"``), ``project``, and ``reason`` (``"bootstrap"`` /
 # ``"on_demand_review"``).
 EVENT_SESSION_PROVISIONED = "session.provisioned"
+# #1562 — cockpit session lifecycle events. Diagnostic forensics for
+# the "top-level Polly conversation disappears on rail switch" symptom.
+# Emitted at three rail-mount transition boundaries so the next repro
+# pinpoints which path fired:
+#
+# * ``EVENT_COCKPIT_SESSION_PARKED`` — fires after ``_park_mounted_session``
+#   successfully breaks the operator/reviewer pane back into a
+#   storage-closet window. Informational. Metadata: ``session_name``,
+#   ``window_name``, ``storage_session``, ``storage_windows_after``.
+# * ``EVENT_COCKPIT_SESSION_RESPAWNED`` — fires when ``_show_live_session``
+#   spawns a FRESH session because the storage window was missing. This
+#   is the conversation-loss path — every emission is a bug to
+#   investigate. Status ``"warn"``. Metadata: ``session_name``,
+#   ``role``, ``storage_windows_present``, ``reason``.
+# * ``EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED`` — fires when
+#   ``_cleanup_duplicate_windows`` kills a duplicate-named storage
+#   window (only ``pane_dead=True`` candidates). When two live duplicates
+#   exist, no kill happens and a ``warn`` event with
+#   ``action="skipped_live_duplicates"`` fires instead. Metadata:
+#   ``storage_session``, ``window_name``, ``killed_index`` (kill path)
+#   or ``live_duplicates`` (skip path), ``kept_indices``.
+EVENT_COCKPIT_SESSION_PARKED = "cockpit.session_parked"
+EVENT_COCKPIT_SESSION_RESPAWNED = "cockpit.session_respawned"
+EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED = "cockpit.duplicate_window_killed"
 
 
 @dataclass(slots=True, frozen=True)
@@ -538,6 +562,9 @@ __all__ = [
     "EVENT_TIER4_GLOBAL_ACTION",
     "EVENT_TIER4_DEMOTED",
     "EVENT_TIER4_BUDGET_EXHAUSTED",
+    "EVENT_COCKPIT_SESSION_PARKED",
+    "EVENT_COCKPIT_SESSION_RESPAWNED",
+    "EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED",
     "AuditEvent",
     "central_log_path",
     "emit",

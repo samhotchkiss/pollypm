@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from pollypm.inbox.kind import InboxItemKind
+
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -294,6 +296,14 @@ class Task:
     # canonical ``project/task_number`` form, ``None`` for originals.
     plan_version: int = 1
     predecessor_task_id: str | None = None
+
+    # --- Inbox classification (#1565) ---
+    # Structured inbox-item discriminator. The canonical
+    # ``pollypm.inbox.awaits_user`` predicate reads this field to
+    # decide whether the row needs the user's attention. Defaults to
+    # ``LEGACY`` so a Task built outside the create() path doesn't
+    # silently misclassify.
+    kind: InboxItemKind = InboxItemKind.LEGACY
 
     # --- Roles ---
     roles: dict[str, str] = field(default_factory=dict)

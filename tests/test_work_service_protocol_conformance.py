@@ -26,7 +26,10 @@ from pollypm.work.sqlite_service import SQLiteWorkService
 # in every shipped concrete implementation. Update both sides at once
 # when adding a new optional flag.
 _REQUIRED_PARAMETERS: dict[str, set[str]] = {
-    "create": {"created_by", "priority", "description"},
+    # ``kind`` (#1565) is part of the create contract so producers can
+    # stamp the structured inbox-item discriminator at task creation
+    # time without reaching past the work-service boundary.
+    "create": {"created_by", "priority", "description", "kind"},
     "queue": {"skip_gates"},
     "claim": {"skip_gates"},
     "node_done": {"skip_gates"},

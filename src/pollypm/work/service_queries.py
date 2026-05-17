@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.work.models import Priority, Task, TaskType, WorkStatus
 from pollypm.work.role_validation import validate_role_assignments
 from pollypm.work.service_support import TaskNotFoundError, ValidationError, _now, _parse_task_id
@@ -227,6 +228,7 @@ def create_task(
     labels: list[str] | None = None,
     requires_human_review: bool = False,
     predecessor_task_id: str | None = None,
+    kind: str = "legacy",
 ) -> Task:
     # #1546 — product-broken gate. When the workspace state DB carries
     # ``product_state=broken``, refuse new task queueing with a clear
@@ -294,6 +296,10 @@ def create_task(
         pred_project, pred_number = _parse_task_id(predecessor_task_id)
         predecessor_normalized = f"{pred_project}/{pred_number}"
 
+    # #1565 — normalise ``kind`` through the enum so a typo'd value
+    # from a caller doesn't land a malformed row.
+    kind_value = _coerce_inbox_kind(kind).value
+
     service._conn.execute(
         "INSERT INTO work_tasks "
         "(project, task_number, title, type, labels, work_status, "
@@ -301,8 +307,8 @@ def create_task(
         "assignee, priority, requires_human_review, description, "
         "acceptance_criteria, constraints, relevant_files, "
         "roles, external_refs, created_at, created_by, updated_at, "
-        "plan_version, predecessor_task_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "plan_version, predecessor_task_id, kind) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             project,
             task_number,
@@ -327,6 +333,7 @@ def create_task(
             now,
             1,
             predecessor_normalized,
+            kind_value,
         ),
     )
     service._conn.commit()

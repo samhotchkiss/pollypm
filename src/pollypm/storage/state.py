@@ -82,6 +82,13 @@ CREATE TABLE IF NOT EXISTS messages (
     body TEXT NOT NULL DEFAULT '',
     payload_json TEXT NOT NULL DEFAULT '{}',
     labels TEXT NOT NULL DEFAULT '[]',
+    -- #1565 — structured inbox-item discriminator. See
+    -- ``pollypm.inbox.kind.InboxItemKind`` for the value set. Default
+    -- ``legacy`` so rows created before the column existed surface as
+    -- "not yet classified" (the canonical ``awaits_user`` predicate
+    -- treats ``legacy`` as user-facing until #1570 backfills the
+    -- real kind).
+    kind TEXT NOT NULL DEFAULT 'legacy',
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     closed_at TEXT
@@ -927,6 +934,15 @@ class StateStore:
                 set_by TEXT NOT NULL DEFAULT 'system'
             )""",
         ]),
+        # --- Migration 18 ----------------------------------------------
+        # #1565 — structured ``kind`` column on the unified messages
+        # table. Existing rows backfill to ``'legacy'`` via the column
+        # DEFAULT; the canonical ``awaits_user`` predicate (#1566)
+        # treats legacy as user-facing until #1570 reclassifies them.
+        # The column is also declared on the SCHEMA constant so fresh
+        # DBs pick it up on first open. Dispatch block below adds the
+        # column on upgraded DBs via ``_safe_add_column``.
+        (18, "Add kind column to messages for structured inbox taxonomy (#1565)", []),
     ]
 
     def _migrate(self) -> None:
@@ -1193,6 +1209,23 @@ class StateStore:
                         ON messages(scope, sender, recipient, type)
                         WHERE state = 'open' AND type = 'alert'
                         """
+                    )
+            elif version == 18:
+                # #1565 — add ``kind`` column. Pre-bootstrap DBs that
+                # opened StateStore before SQLAlchemyStore won't have
+                # the table yet; that case is handled by SCHEMA on
+                # next open (fresh-bootstrap path). For upgraded DBs
+                # that have the messages table already, ALTER TABLE
+                # adds the column with the default backfill. Fresh DBs
+                # whose SCHEMA already declares the column hit the
+                # ``_safe_add_column`` no-op.
+                if self.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+                ).fetchone():
+                    self._safe_add_column(
+                        "messages",
+                        "kind",
+                        "TEXT NOT NULL DEFAULT 'legacy'",
                     )
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",

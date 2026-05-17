@@ -271,8 +271,8 @@ def test_legacy_db_gets_hot_query_indexes_and_schema_bump(conn):
     version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
-    # Migration 9 records the task-delete audit outbox/trigger.
-    assert version == 9
+    # Migration 10 records the kind column on work_tasks (#1565).
+    assert version == 10
 
 
 def test_migration_6_adds_provider_columns_to_work_sessions(conn):
@@ -308,10 +308,10 @@ def test_migration_7_adds_kickoff_sent_at_to_work_node_executions(conn):
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
     # The migration walk applies every pending step in order, so a v6
-    # legacy DB ends up at the latest version (v9 after #1442) — not
+    # legacy DB ends up at the latest version (v10 after #1565) — not
     # at v7. Asserting the whole walk completed protects future
     # migrations from a stale floor here.
-    assert version == 9
+    assert version == 10
 
 
 def test_migration_8_adds_plan_metadata_columns_to_work_tasks(conn):
@@ -397,7 +397,9 @@ def test_migration_8_adds_plan_metadata_columns_to_work_tasks(conn):
     version = conn.execute(
         "SELECT COALESCE(MAX(version), 0) FROM work_schema_version"
     ).fetchone()[0]
-    assert version == 9
+    # v10 (#1565) is the latest; a v7-shaped legacy DB walks through
+    # every step on first open.
+    assert version == 10
 
     idxs = _indexes(conn)
     assert "idx_work_tasks_predecessor" in idxs, (

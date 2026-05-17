@@ -165,14 +165,41 @@ class SQLAlchemyStore:
         keeps the *oldest* row id per ``(type='alert', scope, sender)``
         group and marks the rest as ``closed`` — the operator-facing
         view de-duplicates in the same heartbeat tick the upgrade lands.
+
+        #1565 — ``create_all`` is a no-op on an already-existing
+        ``messages`` table, so a legacy DB opened directly through
+        ``SQLAlchemyStore`` (without passing through the StateStore v18
+        migration) won't gain the ``kind`` column. Backfill it here
+        with the documented default so every consumer's SELECT path
+        sees the column.
         """
         metadata.create_all(self._write_engine)
         with self.transaction() as conn:
+            self._ensure_messages_kind_column(conn)
             # Run the backfill first so the partial unique index DDL
             # below doesn't trip over pre-existing duplicates.
             self._collapse_duplicate_open_alerts(conn)
             for stmt in FTS_DDL_STATEMENTS:
                 conn.execute(text(stmt))
+
+    @staticmethod
+    def _ensure_messages_kind_column(conn: Connection) -> None:
+        """Backfill ``messages.kind`` on legacy DBs (#1565).
+
+        Mirrors the ``_safe_add_column`` pattern from StateStore. SQLite
+        lacks IF NOT EXISTS on ADD COLUMN, so check PRAGMA first. The
+        default ``'legacy'`` matches both the SCHEMA constant and the
+        StateStore migration v18 so a DB opened through either entry
+        point ends up with the same shape.
+        """
+        cols = {
+            row[1] for row in conn.exec_driver_sql("PRAGMA table_info(messages)")
+        }
+        if "kind" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE messages "
+                "ADD COLUMN kind TEXT NOT NULL DEFAULT 'legacy'"
+            )
 
     @staticmethod
     def _collapse_duplicate_open_alerts(conn: Connection) -> int:
@@ -269,6 +296,12 @@ class SQLAlchemyStore:
             "body": "",
             "payload_json": json.dumps(payload if payload is not None else {}),
             "labels": "[]",
+            # Events are firehose entries, not user-facing rows. They
+            # carry ``activity_event`` so any future inbox/dashboard
+            # filter that queries the unified messages table treats
+            # them as informational. The kind here mirrors the
+            # ``InboxItemKind.ACTIVITY_EVENT`` value verbatim.
+            "kind": "activity_event",
         }
         with self.transaction() as conn:
             result = conn.execute(insert(messages), row)
@@ -292,6 +325,7 @@ class SQLAlchemyStore:
         parent_id: int | None = None,
         payload: dict[str, Any] | None = None,
         state: str = "open",
+        kind: str = "legacy",
     ) -> int:
         """Insert a single message row. Returns the new row id.
 
@@ -319,6 +353,7 @@ class SQLAlchemyStore:
             "body": body,
             "payload_json": json.dumps(payload if payload is not None else {}),
             "labels": json.dumps(labels if labels is not None else []),
+            "kind": kind,
         }
         with self.transaction() as conn:
             result = conn.execute(insert(messages), row)
@@ -338,6 +373,7 @@ class SQLAlchemyStore:
         labels: list[str] | None = None,
         parent_id: int | None = None,
         payload: dict[str, Any] | None = None,
+        kind: str = "legacy",
     ) -> int:
         """Insert-if-no-open-match-else-update. Returns the row id.
 
@@ -408,6 +444,7 @@ class SQLAlchemyStore:
                     payload_json=payload_json,
                     labels=labels_json,
                     parent_id=parent_id,
+                    kind=kind,
                     updated_at=now,
                 )
             )
@@ -440,6 +477,7 @@ class SQLAlchemyStore:
                         "body": body,
                         "payload_json": payload_json,
                         "labels": labels_json,
+                        "kind": kind,
                     },
                 )
                 inserted = result.inserted_primary_key
@@ -471,6 +509,7 @@ class SQLAlchemyStore:
                         "body": body,
                         "payload_json": payload_json,
                         "labels": labels_json,
+                        "kind": kind,
                     },
                 )
                 inserted = result.inserted_primary_key

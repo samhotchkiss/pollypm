@@ -60,6 +60,7 @@ from pollypm.signal_routing import (  # noqa: E402
 register_routed_emitter("work_service")
 
 from pollypm.atomic_io import atomic_write_json
+from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates
 from pollypm.work.models import (
@@ -1271,6 +1272,9 @@ class SQLiteWorkService:
             # the documented defaults.
             plan_version=int(_row_get(row, "plan_version", 1) or 1),
             predecessor_task_id=_row_get(row, "predecessor_task_id", None),
+            # #1565 — coerce_kind handles legacy DBs whose column is
+            # NULL or carries a value the current enum doesn't know.
+            kind=_coerce_inbox_kind(_row_get(row, "kind", None)),
             roles=_safe_json_dict(row["roles"]),
             external_refs=_safe_json_dict(row["external_refs"]),
             created_at=datetime.fromisoformat(row["created_at"]),
@@ -1739,6 +1743,7 @@ class SQLiteWorkService:
         labels: list[str] | None = None,
         requires_human_review: bool = False,
         predecessor_task_id: str | None = None,
+        kind: str = "legacy",
     ) -> Task:
         """Create a task in draft state.
 
@@ -1748,6 +1753,10 @@ class SQLiteWorkService:
         default and produces a regular standalone task. Setting the
         value emits a ``plan.successor_created`` audit event so the
         heartbeat can render plan-history breadcrumbs.
+
+        ``kind`` (#1565) stamps the inbox-item discriminator on the
+        new row. Defaults to ``"legacy"`` for callers that haven't
+        been retrained yet (#1567 / #1568 retrain every emit site).
         """
         return create_task(
             self,
@@ -1765,6 +1774,7 @@ class SQLiteWorkService:
             labels=labels,
             requires_human_review=requires_human_review,
             predecessor_task_id=predecessor_task_id,
+            kind=kind,
         )
 
     def increment_plan_version(

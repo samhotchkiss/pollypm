@@ -18,6 +18,7 @@ from typing import Any
 import typer
 
 from pollypm.cli_help import help_with_examples
+from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.inbox_message_refs import unknown_project_refs
 from pollypm.work.cli import (
     _DB_OPTION,
@@ -100,12 +101,18 @@ def _message_row_to_display(row: dict[str, Any]) -> dict[str, Any]:
     from pollypm.inbox_dedup import format_dedup_suffix
     dedup_suffix = format_dedup_suffix(payload)
     count_value = payload.get("count") if isinstance(payload, dict) else None
+    # #1565 — surface the structured kind so JSON consumers (rail,
+    # dashboard, ``pm inbox --awaits-user``) can read it without
+    # having to import ``coerce_kind`` themselves. Falls back to
+    # ``'legacy'`` for rows that pre-date the column.
+    kind_value = _coerce_inbox_kind(row.get("kind")).value
     return {
         "id": f"msg:{row.get('id')}",
         "title": row.get("subject") or "(no subject)",
         "type": row.get("type") or "notify",
         "tier": tier,
         "priority": priority,
+        "kind": kind_value,
         "state": row.get("state") or "open",
         "sender": sender,
         "project": project,

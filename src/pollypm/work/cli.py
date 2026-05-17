@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 import typer
 
 from pollypm.cli_help import help_with_examples
+from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.errors import (
     format_cli_error,
     format_invalid_task_id_error,
@@ -416,6 +417,10 @@ def _print_task(task, as_json: bool = False, show_internal: bool = False) -> Non
 
 def _task_to_dict(task) -> dict:
     """Serialize a task to a JSON-friendly dict."""
+    # #1565 — emit ``kind`` so ``pm inbox --json`` and ``pm task get
+    # --json`` consumers can read the structured inbox-item
+    # discriminator alongside the rest of the task state.
+    kind_value = _coerce_inbox_kind(getattr(task, "kind", None)).value
     return {
         "task_id": task.task_id,
         "project": task.project,
@@ -424,6 +429,7 @@ def _task_to_dict(task) -> dict:
         "type": task.type.value,
         "work_status": task.work_status.value,
         "priority": task.priority.value,
+        "kind": kind_value,
         "assignee": task.assignee,
         "current_node_id": task.current_node_id,
         "description": task.description,

@@ -18,6 +18,7 @@ import re
 from typing import Any
 
 from pollypm.cockpit_inbox import _inbox_db_sources, _row_is_dev_channel
+from pollypm.inbox.kind import InboxItemKind, coerce_kind
 from pollypm.rejection_feedback import (
     feedback_target_task_id,
     is_rejection_feedback_task,
@@ -328,6 +329,10 @@ def task_to_inbox_entry(task, *, db_path: Path | None) -> InboxEntry:
         payload={},
         recipient="user",
         scope=getattr(task, "project", "") or "",
+        # #1565 — propagate the structured kind onto the inbox surface
+        # so ``awaits_user`` and downstream filters can read it without
+        # touching the underlying Task object.
+        kind=coerce_kind(getattr(task, "kind", None)),
         db_path=db_path,
     )
 
@@ -366,6 +371,8 @@ def message_row_to_inbox_entry(
         payload=payload,
         recipient=row.get("recipient") or "",
         scope=scope,
+        # #1565 — propagate the structured kind from the messages row.
+        kind=coerce_kind(row.get("kind")),
         db_path=db_path,
     )
 

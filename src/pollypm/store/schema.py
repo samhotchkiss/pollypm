@@ -84,6 +84,12 @@ messages = Table(
     # decode via ``json.loads`` at the store boundary.
     Column("payload_json", Text, nullable=False, default="{}"),
     Column("labels", Text, nullable=False, default="[]"),
+    # #1565 — structured inbox-item discriminator. See
+    # ``pollypm.inbox.kind.InboxItemKind`` for the value set. The
+    # server_default ensures the on-disk DDL DEFAULT matches the
+    # StateStore schema so pre-migration rows and
+    # SQLAlchemy-bootstrapped rows agree on the sentinel.
+    Column("kind", String, nullable=False, server_default="legacy", default="legacy"),
     Column(
         "created_at",
         DateTime(timezone=True),

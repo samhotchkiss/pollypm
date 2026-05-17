@@ -47,6 +47,7 @@ class WorkService(Protocol):
         labels: list[str] | None = None,
         requires_human_review: bool = False,
         predecessor_task_id: str | None = None,
+        kind: str = "legacy",
     ) -> Task:
         """Create a task in ``draft`` state.
 
@@ -60,6 +61,10 @@ class WorkService(Protocol):
         successor of an earlier attempt (replan flow). Defaults to
         ``None`` (no predecessor — original task). Setting the value
         emits a ``plan.successor_created`` audit event.
+
+        ``kind`` (#1565) stamps the structured inbox-item
+        discriminator. Defaults to ``"legacy"`` until emit sites are
+        retrained (#1567 / #1568).
         """
         ...
 

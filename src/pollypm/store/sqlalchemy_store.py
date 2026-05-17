@@ -269,6 +269,12 @@ class SQLAlchemyStore:
             "body": "",
             "payload_json": json.dumps(payload if payload is not None else {}),
             "labels": "[]",
+            # Events are firehose entries, not user-facing rows. They
+            # carry ``activity_event`` so any future inbox/dashboard
+            # filter that queries the unified messages table treats
+            # them as informational. The kind here mirrors the
+            # ``InboxItemKind.ACTIVITY_EVENT`` value verbatim.
+            "kind": "activity_event",
         }
         with self.transaction() as conn:
             result = conn.execute(insert(messages), row)
@@ -292,6 +298,7 @@ class SQLAlchemyStore:
         parent_id: int | None = None,
         payload: dict[str, Any] | None = None,
         state: str = "open",
+        kind: str = "legacy",
     ) -> int:
         """Insert a single message row. Returns the new row id.
 
@@ -319,6 +326,7 @@ class SQLAlchemyStore:
             "body": body,
             "payload_json": json.dumps(payload if payload is not None else {}),
             "labels": json.dumps(labels if labels is not None else []),
+            "kind": kind,
         }
         with self.transaction() as conn:
             result = conn.execute(insert(messages), row)
@@ -338,6 +346,7 @@ class SQLAlchemyStore:
         labels: list[str] | None = None,
         parent_id: int | None = None,
         payload: dict[str, Any] | None = None,
+        kind: str = "legacy",
     ) -> int:
         """Insert-if-no-open-match-else-update. Returns the row id.
 
@@ -408,6 +417,7 @@ class SQLAlchemyStore:
                     payload_json=payload_json,
                     labels=labels_json,
                     parent_id=parent_id,
+                    kind=kind,
                     updated_at=now,
                 )
             )
@@ -440,6 +450,7 @@ class SQLAlchemyStore:
                         "body": body,
                         "payload_json": payload_json,
                         "labels": labels_json,
+                        "kind": kind,
                     },
                 )
                 inserted = result.inserted_primary_key
@@ -471,6 +482,7 @@ class SQLAlchemyStore:
                         "body": body,
                         "payload_json": payload_json,
                         "labels": labels_json,
+                        "kind": kind,
                     },
                 )
                 inserted = result.inserted_primary_key

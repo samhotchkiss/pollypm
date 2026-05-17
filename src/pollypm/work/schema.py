@@ -94,6 +94,14 @@ CREATE TABLE IF NOT EXISTS work_tasks (
     -- convention; NULL means "no predecessor — original attempt".
     predecessor_task_id TEXT,
 
+    -- #1565 — structured inbox-item discriminator. See
+    -- ``pollypm.inbox.kind.InboxItemKind`` for the value set. Default
+    -- ``legacy`` so rows created before the column existed surface as
+    -- "not yet classified" (the canonical ``awaits_user`` predicate
+    -- treats ``legacy`` as user-facing until #1570 backfills the
+    -- real kind).
+    kind TEXT NOT NULL DEFAULT 'legacy',
+
     roles TEXT NOT NULL DEFAULT '{}',
     external_refs TEXT NOT NULL DEFAULT '{}',
 
@@ -294,6 +302,7 @@ def create_work_tables(conn: sqlite3.Connection) -> None:
     _ensure_context_entry_columns(conn)
     _ensure_node_execution_columns(conn)
     _ensure_work_task_plan_columns(conn)
+    _ensure_work_task_kind_column(conn)
     _run_work_migrations(conn)
 
 
@@ -364,6 +373,23 @@ def _ensure_work_task_plan_columns(conn: sqlite3.Connection) -> None:
         "ON work_tasks(predecessor_task_id) "
         "WHERE predecessor_task_id IS NOT NULL"
     )
+
+
+def _ensure_work_task_kind_column(conn: sqlite3.Connection) -> None:
+    """Backfill ``kind`` on work_tasks for legacy DBs (#1565).
+
+    Same guard pattern as the other ``_ensure_*`` helpers — SQLite
+    lacks IF NOT EXISTS on ADD COLUMN, so we check PRAGMA before the
+    ALTER. Migration v10 records the version bump so
+    ``work_schema_version`` stays accurate for both fresh and legacy
+    DBs.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(work_tasks)")}
+    if "kind" not in cols:
+        conn.execute(
+            "ALTER TABLE work_tasks "
+            "ADD COLUMN kind TEXT NOT NULL DEFAULT 'legacy'"
+        )
 
 
 def _ensure_context_entry_columns(conn: sqlite3.Connection) -> None:
@@ -522,6 +548,19 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             # The table, index, and trigger are created by WORK_SCHEMA before
             # the migration walk. This row records that the DB has the delete
             # audit guard installed.
+        ],
+    ),
+    (
+        10,
+        "Add kind column to work_tasks for structured inbox-item "
+        "discriminator (#1565)",
+        [
+            # Same pattern as v7 / v8 — the column is actually added by
+            # ``_ensure_work_task_kind_column`` (runs BEFORE the migration
+            # walk) because SQLite lacks IF NOT EXISTS on ADD COLUMN. The
+            # migration entry records the v10 bump so
+            # ``work_schema_version`` stays accurate for both fresh and
+            # legacy DBs.
         ],
     ),
 ]

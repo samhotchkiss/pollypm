@@ -10,6 +10,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from copy import deepcopy
 
+from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates, has_hard_failure
 from pollypm.work.models import (
@@ -128,6 +129,7 @@ class MockWorkService:
         labels: list[str] | None = None,
         requires_human_review: bool = False,
         predecessor_task_id: str | None = None,
+        kind: str = "legacy",
     ) -> Task:
         template = self._resolve_flow(flow_template)
 
@@ -185,6 +187,7 @@ class MockWorkService:
             updated_at=now,
             plan_version=1,
             predecessor_task_id=predecessor_normalized,
+            kind=_coerce_inbox_kind(kind),
         )
         self._tasks[task.task_id] = task
         self._context[task.task_id] = []

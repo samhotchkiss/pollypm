@@ -114,6 +114,7 @@ When you add a project with `pm add-project`, the import runs automatically. Use
 | Command | What it does |
 |---------|-------------|
 | `pm notify "<subject>" "<body>"` | Create an inbox item for the human user |
+| `pm bug-report "<title>" "<body>"` | File a PollyPM self-bug-report as a GitHub issue |
 | `pm mail` | List open inbox items |
 | `pm mail <id>` | Read a message or thread |
 | `pm mail --reply <id> --text "msg"` | Reply to a message (creates thread) |
@@ -125,6 +126,8 @@ When you add a project with `pm add-project`, the import runs automatically. Use
 | `pm discuss <id>` | Jump into live discussion about an inbox message |
 
 **When to use `pm notify`:** Any time you need the human user's input, approval, or attention — and they may not be watching your session. The inbox is the reliable way to reach the user. Don't just ask in chat and hope they see it.
+
+**When to use `pm bug-report` instead of `pm notify`:** When the observation is a meta-bug about PollyPM itself (misrouted ping, stale alert, confusing CLI output, unexpected internal state) rather than something the user needs to decide. `pm bug-report` routes the observation to a GitHub issue with the `polly-self-report` label, keeping the user's inbox focused on actionable tasks (#1569).
 
 **Decision prefixes:**
 - `[Decision]` — Polly made a judgment call. User can review and override.

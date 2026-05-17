@@ -138,7 +138,12 @@ _NOTIFY_HELP = help_with_examples(
     (
         "Create a work-service inbox item for the human user.\n\n"
         "This is PollyPM's canonical escalation channel for blockers, "
-        "handoffs, and status updates."
+        "handoffs, and status updates.\n\n"
+        "For meta-bugs about PollyPM itself (misrouted ping, stale "
+        "alert, confusing CLI output), use ``pm bug-report`` instead "
+        "(#1569) — those file a GitHub issue with the "
+        "``polly-self-report`` label instead of cluttering the user's "
+        "inbox."
     ),
     [
         (

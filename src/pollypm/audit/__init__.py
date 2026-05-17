@@ -69,6 +69,16 @@ under that threshold.
 
 from __future__ import annotations
 
+from pollypm.audit.bug_reporter import (
+    BugReportResult,
+    DEFAULT_DEDUP_WINDOW_SECONDS,
+    EVENT_BUG_REPORT_DEDUPED,
+    EVENT_BUG_REPORT_FAILED,
+    EVENT_BUG_REPORT_FILED,
+    SELF_REPORT_LABEL,
+    file_bug_report,
+    file_bug_report_detailed,
+)
 from pollypm.audit.log import (
     AuditEvent,
     central_log_path,
@@ -91,14 +101,22 @@ from pollypm.audit.watchdog import (
 
 __all__ = [
     "AuditEvent",
+    "BugReportResult",
+    "DEFAULT_DEDUP_WINDOW_SECONDS",
     "ESCALATION_THROTTLE_SECONDS",
     "EVENT_AUDIT_FINDING",
+    "EVENT_BUG_REPORT_DEDUPED",
+    "EVENT_BUG_REPORT_FAILED",
+    "EVENT_BUG_REPORT_FILED",
     "EVENT_HEARTBEAT_TICK",
     "Finding",
+    "SELF_REPORT_LABEL",
     "WatchdogConfig",
     "central_log_path",
     "emit",
     "emit_escalation_dispatched",
+    "file_bug_report",
+    "file_bug_report_detailed",
     "format_unstick_brief",
     "project_log_path",
     "read_events",

@@ -1096,6 +1096,110 @@ def notify(
         typer.echo(str(inbox_task_id or message_id))
 
 
+def bug_report(
+    helpers,
+    title: str = typer.Argument(
+        ...,
+        help=(
+            "One-line summary of the system bug you noticed. Used "
+            "verbatim as the GitHub issue title — keep it stable "
+            "across observations so the helper can dedup repeated "
+            "reports."
+        ),
+    ),
+    body: str = typer.Argument(
+        ...,
+        help=(
+            "Full bug description. Markdown supported. Pass '-' to "
+            "read from stdin (typical: pipe Polly's longer "
+            "explanation in)."
+        ),
+    ),
+    actor: str = typer.Option(
+        "polly",
+        "--actor",
+        help=(
+            "Who noticed the bug. Recorded in the audit log and "
+            "added as a footer on the GitHub issue body."
+        ),
+    ),
+    project: str = typer.Option(
+        "",
+        "--project",
+        "-p",
+        help=(
+            "PollyPM project key the bug was observed against. Leave "
+            "empty for workspace-level / cross-project bugs."
+        ),
+    ),
+    subject: str = typer.Option(
+        "",
+        "--subject",
+        help=(
+            "Free-form forensic subject (task id, session name, "
+            "etc.). Recorded in audit metadata only — the issue "
+            "title is the user-facing surface."
+        ),
+    ),
+    dedup_window: int = typer.Option(
+        3600,
+        "--dedup-window-seconds",
+        help=(
+            "Suppress duplicate issues with the same title filed "
+            "within this many seconds. Default 1 hour. Set to 0 to "
+            "disable deduplication."
+        ),
+    ),
+) -> None:
+    """File a PollyPM self-bug-report as a GitHub issue (#1569).
+
+    Before this command existed, Polly and the heartbeat filed
+    system-bug observations via ``pm notify`` with ``--project inbox``.
+    Those rows ended up in the user's actionable to-do queue, even
+    though every one of them is a meta-bug about PollyPM itself.
+
+    This command routes the observation to a GitHub issue with the
+    ``polly-self-report`` label, where it can be prioritized against
+    other dev work. The user's inbox stays focused on tasks that need
+    a human decision.
+    """
+    from pollypm.audit.bug_reporter import file_bug_report_detailed
+
+    clean_title = (title or "").strip()
+    if not clean_title:
+        typer.echo("Error: title must not be empty.", err=True)
+        raise typer.Exit(code=1)
+
+    if body == "-":
+        body = sys.stdin.read()
+    if not (body or "").strip():
+        typer.echo(
+            "Error: body must not be empty (pass '-' to read from stdin).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    result = file_bug_report_detailed(
+        title=clean_title,
+        body=body,
+        actor=actor or "polly",
+        project=project or "",
+        subject=subject or "",
+        dedup_window_seconds=max(0, int(dedup_window)),
+    )
+    if result is None:
+        typer.echo(
+            "bug_report: gh CLI unavailable or create failed — "
+            "observation recorded in the audit log only.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    if result.created:
+        typer.echo(f"filed:#{result.issue_number}")
+    else:
+        typer.echo(f"deduped:#{result.issue_number}")
+
+
 def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
     app.command(help=helpers._UP_HELP)(_bind_session_command(launch, helpers))
     app.command("rail-daemon")(_bind_session_command(rail_daemon, helpers))
@@ -1130,3 +1234,13 @@ def register_session_runtime_commands(app: typer.Typer, *, helpers) -> None:
     )
     app.command(help=helpers._SEND_HELP)(_bind_session_command(send, helpers))
     app.command(help=helpers._NOTIFY_HELP)(_bind_session_command(notify, helpers))
+    app.command(
+        "bug-report",
+        help=(
+            "File a PollyPM self-bug-report as a GitHub issue with "
+            "the polly-self-report label (#1569). Use this instead "
+            "of ``pm notify`` when reporting meta-bugs about PollyPM "
+            "itself — the user's inbox stays focused on actionable "
+            "tasks."
+        ),
+    )(_bind_session_command(bug_report, helpers))

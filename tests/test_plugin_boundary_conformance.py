@@ -98,6 +98,7 @@ def test_work_task_query_callers_do_not_open_sqlite_directly() -> None:
         "src/pollypm/cockpit_settings_projects.py",
         "src/pollypm/cockpit_sections/base.py",
         "src/pollypm/dashboard_data.py",
+        "src/pollypm/doctor.py",
         "src/pollypm/plugins_builtin/project_planning/cli/project.py",
     )
     offenders: list[str] = []

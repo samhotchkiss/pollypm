@@ -3346,92 +3346,14 @@ class SQLiteWorkService:
 
         # --resume path: the user (or a previous run) may have hand-resolved
         # an earlier conflict. Two valid states to detect here.
-        if resume_merge:
-            already_merged = self._git_run(
-                project_path,
-                "merge-base",
-                "--is-ancestor",
-                task_branch,
-                "HEAD",
-            )
-            if already_merged.returncode == 0:
-                return
-
-            merge_head = project_path / ".git" / "MERGE_HEAD"
-            if merge_head.exists():
-                # If unresolved conflicts remain, surface them; otherwise
-                # commit the staged merge.
-                conflicts = self._git_run(
-                    project_path,
-                    "diff",
-                    "--name-only",
-                    "--diff-filter=U",
-                )
-                if (
-                    conflicts.returncode == 0
-                    and conflicts.stdout.strip() == ""
-                ):
-                    commit = self._git_run(
-                        project_path,
-                        "commit",
-                        "--no-edit",
-                    )
-                    if commit.returncode == 0:
-                        return
-                    detail = (
-                        commit.stderr.strip()
-                        or commit.stdout.strip()
-                        or "git commit failed"
-                    )
-                    raise ValidationError(
-                        f"Could not finalize the in-progress merge of "
-                        f"`{task_branch}` into `{current_branch}`. "
-                        f"Git said: {detail}"
-                    )
-                # Conflicts remain unresolved; fall through to the standard
-                # error-surfacing path below.
-                still = (
-                    conflicts.stdout.strip()
-                    if conflicts.returncode == 0
-                    else "(unable to list conflicts)"
-                )
-                raise ValidationError(
-                    f"Cannot resume merge of `{task_branch}` into "
-                    f"`{current_branch}`: unresolved conflicts in:\n"
-                    f"  {still}\n"
-                    f"Resolve them by editing each file, then run "
-                    f"`git -C {project_path} add <file>` and retry "
-                    f"`pm task approve --resume`."
-                )
-
-        status = self._git_run(project_path, "status", "--porcelain")
-        if status.returncode != 0:
-            detail = status.stderr.strip() or status.stdout.strip() or "git status failed"
-            raise ValidationError(
-                "Cannot auto-merge approved work right now. "
-                f"Git status failed in {project_path}: {detail}"
-            )
-        # ``rstrip`` not ``strip`` so we keep any leading space from
-        # the first porcelain status code (e.g. ` M path` for a
-        # modified-in-worktree-only file). ``.strip()`` would shift
-        # the path by one character and break the helper's parser
-        # (#930).
-        dirty_status = status.stdout.rstrip()
-        if dirty_status and not _status_is_only_pollypm_scaffold(
-            project_path,
-            dirty_status,
+        if resume_merge and self._resume_in_progress_merge(
+            project_path, task_branch, current_branch
         ):
-            raise ValidationError(
-                "Cannot auto-merge approved work because the project root has "
-                "uncommitted changes. Commit or stash them, then retry approve."
-            )
+            return
 
-        branch_exists = self._git_run(project_path, "rev-parse", "--verify", task_branch)
-        if branch_exists.returncode != 0:
-            raise ValidationError(
-                f"Cannot auto-merge approved work because branch `{task_branch}` "
-                "does not exist."
-            )
+        dirty_status = self._check_clean_tree_and_branch_exist(
+            project_path, task_branch
+        )
 
         already_merged = self._git_run(
             project_path,
@@ -3568,36 +3490,10 @@ class SQLiteWorkService:
         # shape is textually unambiguous — we can auto-resolve by including
         # both sides. Anything more complex (overlapping edits to shared
         # base content) still surfaces to the operator.
-        if conflicted_files:
-            # Conflict markers are already in diff3 form (see merge
-            # invocation above). Walk each file's hunks; auto-resolve
-            # iff every hunk has an empty base section (= pure addition).
-            resolved_paths: list[str] = []
-            for rel_path in conflicted_files:
-                target = project_path / rel_path
-                try:
-                    current_text = target.read_text(encoding="utf-8")
-                except (OSError, UnicodeDecodeError):
-                    resolved_paths = []
-                    break
-                merged = _resolve_disjoint_addition_conflicts(current_text)
-                if merged is None:
-                    resolved_paths = []
-                    break
-                target.write_text(merged, encoding="utf-8")
-                add = self._git_run(project_path, "add", "--", rel_path)
-                if add.returncode != 0:
-                    resolved_paths = []
-                    break
-                resolved_paths.append(rel_path)
-            if resolved_paths and len(resolved_paths) == len(conflicted_files):
-                commit = self._git_run(
-                    project_path, "commit", "--no-edit",
-                )
-                if commit.returncode == 0:
-                    return
-                # Commit failed even after textual resolution — fall through
-                # and let ``git merge --abort`` below clean the worktree.
+        if conflicted_files and self._try_disjoint_addition_autoresolve(
+            project_path, conflicted_files
+        ):
+            return
 
         # At least one conflict is on a non-safelist file. Abort the merge
         # cleanly and tell the user how to recover.
@@ -3629,6 +3525,159 @@ class SQLiteWorkService:
             f"Could not auto-merge `{task_branch}` into `{current_branch}`. "
             f"Resolve the repo state and retry approve. Git said: {detail}"
         )
+
+    def _resume_in_progress_merge(
+        self,
+        project_path: Path,
+        task_branch: str,
+        current_branch: str,
+    ) -> bool:
+        """Handle the ``resume_merge=True`` path of auto-merge.
+
+        Returns ``True`` if the resume path fully handled the merge (caller
+        should return). Returns ``False`` if no in-progress merge state was
+        found and the caller should continue with the normal merge flow.
+        Raises :class:`ValidationError` if an in-progress merge has
+        unresolved conflicts or the final commit fails.
+        """
+        already_merged = self._git_run(
+            project_path,
+            "merge-base",
+            "--is-ancestor",
+            task_branch,
+            "HEAD",
+        )
+        if already_merged.returncode == 0:
+            return True
+
+        merge_head = project_path / ".git" / "MERGE_HEAD"
+        if not merge_head.exists():
+            return False
+
+        # If unresolved conflicts remain, surface them; otherwise
+        # commit the staged merge.
+        conflicts = self._git_run(
+            project_path,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+        )
+        if conflicts.returncode == 0 and conflicts.stdout.strip() == "":
+            commit = self._git_run(
+                project_path,
+                "commit",
+                "--no-edit",
+            )
+            if commit.returncode == 0:
+                return True
+            detail = (
+                commit.stderr.strip()
+                or commit.stdout.strip()
+                or "git commit failed"
+            )
+            raise ValidationError(
+                f"Could not finalize the in-progress merge of "
+                f"`{task_branch}` into `{current_branch}`. "
+                f"Git said: {detail}"
+            )
+        # Conflicts remain unresolved; surface them.
+        still = (
+            conflicts.stdout.strip()
+            if conflicts.returncode == 0
+            else "(unable to list conflicts)"
+        )
+        raise ValidationError(
+            f"Cannot resume merge of `{task_branch}` into "
+            f"`{current_branch}`: unresolved conflicts in:\n"
+            f"  {still}\n"
+            f"Resolve them by editing each file, then run "
+            f"`git -C {project_path} add <file>` and retry "
+            f"`pm task approve --resume`."
+        )
+
+    def _check_clean_tree_and_branch_exist(
+        self,
+        project_path: Path,
+        task_branch: str,
+    ) -> str:
+        """Verify project root is clean enough to merge and ``task_branch`` exists.
+
+        Returns the porcelain status output (``dirty_status``) for downstream
+        callers that need to know which scaffold-allowlisted paths are dirty.
+        Raises :class:`ValidationError` if ``git status`` fails, the tree has
+        non-scaffold uncommitted changes, or the task branch is missing.
+        """
+        status = self._git_run(project_path, "status", "--porcelain")
+        if status.returncode != 0:
+            detail = (
+                status.stderr.strip()
+                or status.stdout.strip()
+                or "git status failed"
+            )
+            raise ValidationError(
+                "Cannot auto-merge approved work right now. "
+                f"Git status failed in {project_path}: {detail}"
+            )
+        # ``rstrip`` not ``strip`` so we keep any leading space from
+        # the first porcelain status code (e.g. ` M path` for a
+        # modified-in-worktree-only file). ``.strip()`` would shift
+        # the path by one character and break the helper's parser
+        # (#930).
+        dirty_status = status.stdout.rstrip()
+        if dirty_status and not _status_is_only_pollypm_scaffold(
+            project_path,
+            dirty_status,
+        ):
+            raise ValidationError(
+                "Cannot auto-merge approved work because the project root has "
+                "uncommitted changes. Commit or stash them, then retry approve."
+            )
+
+        branch_exists = self._git_run(
+            project_path, "rev-parse", "--verify", task_branch
+        )
+        if branch_exists.returncode != 0:
+            raise ValidationError(
+                f"Cannot auto-merge approved work because branch `{task_branch}` "
+                "does not exist."
+            )
+        return dirty_status
+
+    def _try_disjoint_addition_autoresolve(
+        self,
+        project_path: Path,
+        conflicted_files: list[str],
+    ) -> bool:
+        """Attempt textual disjoint-addition auto-resolution of ``conflicted_files``.
+
+        Conflict markers are expected to be in diff3 form (set by the caller
+        via ``merge.conflictStyle=diff3``). For each file, every hunk must
+        have an empty base section (= pure addition on both sides) for the
+        resolver to succeed (#1072). Returns ``True`` iff every file was
+        resolved textually AND ``git commit --no-edit`` succeeded; the caller
+        should then return without aborting the merge. Returns ``False`` if
+        any file is unresolvable or the post-resolution commit fails — the
+        caller is responsible for ``git merge --abort`` in that case.
+        """
+        resolved_paths: list[str] = []
+        for rel_path in conflicted_files:
+            target = project_path / rel_path
+            try:
+                current_text = target.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                return False
+            merged = _resolve_disjoint_addition_conflicts(current_text)
+            if merged is None:
+                return False
+            target.write_text(merged, encoding="utf-8")
+            add = self._git_run(project_path, "add", "--", rel_path)
+            if add.returncode != 0:
+                return False
+            resolved_paths.append(rel_path)
+        if len(resolved_paths) != len(conflicted_files):
+            return False
+        commit = self._git_run(project_path, "commit", "--no-edit")
+        return commit.returncode == 0
 
     def _resolve_union_safe_conflict(
         self,

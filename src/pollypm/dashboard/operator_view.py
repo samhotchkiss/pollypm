@@ -14,6 +14,7 @@ per-project DB so paused-with-work projects still surface.
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -28,6 +29,13 @@ from pollypm.dashboard.categorization import (
     what_working,
     why_waiting,
 )
+
+# #1630 — cap concurrent per-project sqlite opens. Each project costs
+# one sqlite ``open`` plus a small number of read queries; 12 projects
+# was measured at ~12s serial on the operator dashboard. A modest pool
+# (capped to avoid swamping the FS / GIL when the worker count >>
+# project count) brings the sweep close to single-project latency.
+_MAX_PARALLEL_PROJECT_SCANS = 8
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +201,91 @@ def load_operator_view(config_path: Path) -> OperatorDashboardView:
     return load_operator_view_from_config(config)
 
 
+def _scan_to_row(
+    scan: _ProjectScan, items: list,
+) -> OperatorDashboardRow:
+    """Per-project worker: open the DB, categorize, return the row.
+
+    Extracted from ``load_operator_view_from_config`` so it can run on
+    a worker thread without sharing mutable state with peer scans —
+    each call opens its own work-service handle and closes it before
+    returning. This keeps the parallel sweep correctness-equivalent to
+    the original serial loop (#1630).
+    """
+    svc = _open_work_service(scan)
+    try:
+        if svc is None:
+            state = (
+                ProjectState.WAITING if items
+                else (ProjectState.PAUSED if not scan.tracked else ProjectState.IDLE)
+            )
+            detail = (
+                why_waiting(items) if state is ProjectState.WAITING
+                else ("Paused" if state is ProjectState.PAUSED else "Quiet")
+            )
+            return OperatorDashboardRow(
+                project_key=scan.project_key,
+                state=state,
+                glyph=glyph_for_project_state(state),
+                detail=detail,
+            )
+        state = categorize_project(
+            scan.project_key,
+            work_service=svc,
+            inbox_items=items,
+            tracked=scan.tracked,
+        )
+        glyph = glyph_for_project_state(state)
+        if state is ProjectState.WAITING:
+            detail = why_waiting(items)
+        elif state is ProjectState.WORKING:
+            detail = what_working(scan.project_key, work_service=svc)
+        elif state is ProjectState.PAUSED:
+            detail = "Paused"
+        else:
+            detail = "Quiet"
+        return OperatorDashboardRow(
+            project_key=scan.project_key,
+            state=state,
+            glyph=glyph,
+            detail=detail,
+        )
+    finally:
+        if svc is not None:
+            _safe_close(svc)
+
+
+def _parallel_scan_rows(
+    scans: list[_ProjectScan],
+    waiting_by_project: dict[str, list],
+) -> list[OperatorDashboardRow]:
+    """Run ``_scan_to_row`` over ``scans`` with a small thread pool.
+
+    Falls through to a serial loop when there's only one scan — the
+    pool overhead isn't worth it. Bounded at
+    :data:`_MAX_PARALLEL_PROJECT_SCANS` so a 50-project workspace
+    doesn't open 50 sqlite handles at once.
+    """
+    if len(scans) <= 1:
+        return [
+            _scan_to_row(scan, waiting_by_project.get(scan.project_key, []))
+            for scan in scans
+        ]
+    max_workers = min(_MAX_PARALLEL_PROJECT_SCANS, len(scans))
+    with ThreadPoolExecutor(
+        max_workers=max_workers,
+        thread_name_prefix="operator-scan",
+    ) as pool:
+        return list(
+            pool.map(
+                lambda scan: _scan_to_row(
+                    scan, waiting_by_project.get(scan.project_key, []),
+                ),
+                scans,
+            )
+        )
+
+
 def load_operator_view_from_config(config) -> OperatorDashboardView:  # noqa: ANN001
     """Like :func:`load_operator_view` but starting from a loaded config.
 
@@ -202,60 +295,17 @@ def load_operator_view_from_config(config) -> OperatorDashboardView:  # noqa: AN
     scans = _collect_project_scans(config)
     waiting_by_project = _waiting_items_by_project(config)
 
+    # #1630 — per-project sqlite opens run in parallel. Each scan is
+    # independent (its own DB handle, its own categorize), so the only
+    # contention is the GIL during pure-Python work; sqlite I/O
+    # releases the GIL and is the dominant cost.
+    rows = _parallel_scan_rows(scans, waiting_by_project)
+
     waiting: list[OperatorDashboardRow] = []
     working: list[OperatorDashboardRow] = []
     idle: list[OperatorDashboardRow] = []
     paused: list[OperatorDashboardRow] = []
-
-    for scan in scans:
-        svc = _open_work_service(scan)
-        items = waiting_by_project.get(scan.project_key, [])
-        try:
-            if svc is None:
-                state = (
-                    ProjectState.WAITING if items
-                    else (ProjectState.PAUSED if not scan.tracked else ProjectState.IDLE)
-                )
-                detail = (
-                    why_waiting(items) if state is ProjectState.WAITING
-                    else ("Paused" if state is ProjectState.PAUSED else "Quiet")
-                )
-                row = OperatorDashboardRow(
-                    project_key=scan.project_key,
-                    state=state,
-                    glyph=glyph_for_project_state(state),
-                    detail=detail,
-                )
-            else:
-                state = categorize_project(
-                    scan.project_key,
-                    work_service=svc,
-                    inbox_items=items,
-                    tracked=scan.tracked,
-                )
-                glyph = glyph_for_project_state(state)
-                if state is ProjectState.WAITING:
-                    detail = why_waiting(items)
-                elif state is ProjectState.WORKING:
-                    detail = what_working(scan.project_key, work_service=svc)
-                elif state is ProjectState.PAUSED:
-                    detail = "Paused"
-                else:
-                    detail = "Quiet"
-                row = OperatorDashboardRow(
-                    project_key=scan.project_key,
-                    state=state,
-                    glyph=glyph,
-                    detail=detail,
-                )
-        finally:
-            close = getattr(svc, "close", None) if svc is not None else None
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # noqa: BLE001
-                    pass
-
+    for row in rows:
         if row.state is ProjectState.WAITING:
             waiting.append(row)
         elif row.state is ProjectState.WORKING:

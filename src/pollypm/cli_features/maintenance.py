@@ -12,6 +12,7 @@ Contract:
 from __future__ import annotations
 
 import json
+import logging
 import shutil
 import subprocess
 from collections import OrderedDict
@@ -31,6 +32,8 @@ from pollypm.errors import format_config_not_found_error
 from pollypm.models import ProviderKind
 from pollypm.transcript_ledger import token_usage_costs
 from pollypm.worktrees import list_worktrees as list_project_worktrees
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -353,7 +356,10 @@ def doctor(
             },
         )
     except Exception:  # noqa: BLE001 — audit must never break CLI
-        pass
+        logger.warning(
+            "Failed to emit audit row for pm doctor (#1355)",
+            exc_info=True,
+        )
 
     raise typer.Exit(code=0 if report.ok else 1)
 
@@ -1036,7 +1042,10 @@ def restore_cmd(
                 "restored DB may be overwritten by the live cockpit."
             )
     except Exception:
-        pass
+        logger.warning(
+            "Failed to probe tmux session before restore (#1355)",
+            exc_info=True,
+        )
 
     try:
         result = backup_mod.execute_restore(plan)

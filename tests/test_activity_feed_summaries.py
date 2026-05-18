@@ -14,7 +14,7 @@ import json
 
 import pytest
 
-from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+from pollypm.events.summaries import activity_summary
 from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     _parse_message,
 )

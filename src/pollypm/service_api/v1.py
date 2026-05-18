@@ -44,7 +44,7 @@ from pollypm.accounts import (
 from pollypm.checkpoints import create_issue_completion_checkpoint, record_checkpoint
 from pollypm.config_patches import apply_preference_patch, detect_preference_patch, list_project_overrides
 from pollypm.config import load_config
-from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+from pollypm.events.summaries import activity_summary
 from pollypm.itsalive import (
     deploy_site,
     pending_deploys,

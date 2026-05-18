@@ -3562,6 +3562,12 @@ def test_now_body_says_standing_by_for_idle_worker() -> None:
     must NOT be rendered as ``in action``. The dashboard renders the
     standby state explicitly so the user knows the session is alive
     but not progressing work (#990).
+
+    #1541 — the calm-state copy was reworded to drop the syslog feel
+    ("The session is alive but not progressing work") and the raw
+    worker key + role tag ("architect_bikepath (architect)"). The
+    section header still flags ``standing by`` and uses the grey
+    glyph, but the trailing line invites a next step via ``c``/``p``.
     """
     from types import SimpleNamespace
     from pollypm.cockpit_ui import PollyProjectDashboardApp
@@ -3581,12 +3587,24 @@ def test_now_body_says_standing_by_for_idle_worker() -> None:
             "blocked": [], "on_hold": [], "done": [],
         },
         task_counts={},
+        pm_persona="Archie",
+        persona_name="Archie",
     )
     rendered = app._render_now_body(fake_data)
     assert "standing by" in rendered
     # Yellow/grey dot, NOT the green ● that signals "active".
     assert "[#3ddc84]●[/#3ddc84]" not in rendered
-    assert "not progressing" in rendered
+    # #1541 — name the PM, not the raw role / session key.
+    assert "Archie" in rendered
+    assert "architect_bikepath" not in rendered
+    # Use the role tag only outside the calm-state branch — the
+    # identity line must not surface ``architect`` either, since the
+    # topbar already named the PM as Archie.
+    assert "[b]architect[/b]" not in rendered
+    # #1541 — syslog phrasing is gone; the line invites a next step.
+    assert "not progressing" not in rendered
+    assert "The session is alive" not in rendered
+    assert "press [b]c[/b]" in rendered
 
 
 def test_now_body_says_waiting_on_input_for_permission_prompt() -> None:

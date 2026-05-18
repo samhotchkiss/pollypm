@@ -22,6 +22,7 @@ from __future__ import annotations
 import gc
 import asyncio
 import json
+import logging
 import os
 import resource
 import webbrowser
@@ -38,6 +39,8 @@ try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, _hard), _hard))
 except (ValueError, OSError):
     pass
+
+logger = logging.getLogger(__name__)
 
 from rich.text import Text
 from textual import events, on
@@ -11621,8 +11624,16 @@ class PollyInboxApp(App[None]):
         actor_name = pending["actor_name"]
         is_message_item = pending["is_message_item"]
         item = pending["item"]
+        logger.info(
+            "plan_review.commit start task_id=%s plan_task_id=%s actor=%s",
+            task_id, plan_task_id, actor_name,
+        )
         svc = self._resolve_inbox_svc(item, plan_task_id)
         if svc is None:
+            logger.warning(
+                "plan_review.commit could-not-open-db task_id=%s plan_task_id=%s",
+                task_id, plan_task_id,
+            )
             self.notify(
                 "Could not open project database for plan task.",
                 severity="error",
@@ -11630,10 +11641,42 @@ class PollyInboxApp(App[None]):
             return
         first_shipped_created = False
         try:
-            svc.approve(plan_task_id, actor_name, None)
-            first_shipped_created = bool(
-                getattr(svc, "last_first_shipped_created", False)
-            )
+            # #1589 — backstop-emitted plan_review rows (work/plan_review_emit.py)
+            # reference a plan_task that is ALREADY at work_status=done.
+            # ``svc.approve`` requires REVIEW status and raises
+            # ``InvalidTransitionError`` otherwise — the celebration toast
+            # would fire while the row stayed in the inbox indefinitely.
+            # Detect the terminal case up-front and skip the approve call,
+            # but still archive the inbox row so the keystroke clears the
+            # action lens.
+            plan_task_terminal = False
+            try:
+                plan_task = svc.get(plan_task_id)
+                status = getattr(plan_task, "work_status", None)
+                status_value = getattr(status, "value", status)
+                plan_task_terminal = status_value in {"done", "cancelled"}
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "plan_review.commit pre-approve get(%s) failed",
+                    plan_task_id, exc_info=True,
+                )
+            if plan_task_terminal:
+                logger.info(
+                    "plan_review.commit plan_task already terminal "
+                    "task_id=%s plan_task_id=%s — skipping svc.approve, "
+                    "archiving inbox row only",
+                    task_id, plan_task_id,
+                )
+            else:
+                svc.approve(plan_task_id, actor_name, None)
+                logger.info(
+                    "plan_review.commit svc.approve succeeded "
+                    "task_id=%s plan_task_id=%s",
+                    task_id, plan_task_id,
+                )
+                first_shipped_created = bool(
+                    getattr(svc, "last_first_shipped_created", False)
+                )
             if is_message_item:
                 try:
                     svc.add_context(
@@ -11643,8 +11686,16 @@ class PollyInboxApp(App[None]):
                         entry_type="plan_review_approved",
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug(
+                        "plan_review.commit add_context on plan_task failed",
+                        exc_info=True,
+                    )
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "plan_review.commit svc.approve failed task_id=%s "
+                "plan_task_id=%s exc=%r",
+                task_id, plan_task_id, exc, exc_info=True,
+            )
             self.notify(f"Approve failed: {exc}", severity="error")
             return
         finally:
@@ -11676,13 +11727,26 @@ class PollyInboxApp(App[None]):
                         entry_type="plan_review_approved",
                     )
                     svc.archive_task(task_id, actor=actor_name)
+                    logger.info(
+                        "plan_review.commit archived inbox row task_id=%s",
+                        task_id,
+                    )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "plan_review.commit archive_task failed task_id=%s",
+                        task_id, exc_info=True,
+                    )
                 finally:
                     try:
                         svc.close()
                     except Exception:  # noqa: BLE001
                         pass
+            else:
+                logger.warning(
+                    "plan_review.commit could-not-open-inbox-svc to archive "
+                    "task_id=%s",
+                    task_id,
+                )
         self._emit_event(
             task_id, "inbox.plan_review.approved",
             f"{actor_name} approved plan {plan_task_id} via {task_id}",

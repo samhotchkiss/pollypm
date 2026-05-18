@@ -16,6 +16,7 @@ from __future__ import annotations
 import functools
 import inspect
 import json
+import logging
 import os
 import re
 import sys
@@ -25,6 +26,8 @@ import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH
 from pollypm.inbox.kind import InboxItemKind
+
+logger = logging.getLogger(__name__)
 
 _TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
 
@@ -346,7 +349,10 @@ def reset(
         )
         supervisor.store.commit()
     except Exception:  # noqa: BLE001
-        pass
+        logger.warning(
+            "Failed to clear leases/session_runtime/open alerts during reset (#1355)",
+            exc_info=True,
+        )
     session_word = "session" if len(sessions_to_kill) == 1 else "sessions"
     typer.echo(
         f"Killed {len(sessions_to_kill)} {session_word}: {', '.join(sessions_to_kill)}"

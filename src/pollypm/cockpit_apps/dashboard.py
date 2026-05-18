@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -11,6 +12,8 @@ from textual.widgets import Static
 from pollypm.cockpit_markup import _escape
 from pollypm.cockpit_navigation_client import file_navigation_client
 from pollypm.cockpit_palette import _open_keyboard_help
+
+logger = logging.getLogger(__name__)
 
 
 class PollyDashboardApp(App[None]):
@@ -100,6 +103,11 @@ class PollyDashboardApp(App[None]):
                 self, kind="dashboard", config_path=self.config_path,
             )
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to start dashboard input bridge; "
+                "automation key-send disabled (#1355)",
+                exc_info=True,
+            )
             self._input_bridge_handle = None
 
     def on_unmount(self) -> None:

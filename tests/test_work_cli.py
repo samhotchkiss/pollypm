@@ -633,11 +633,46 @@ class TestCliJsonOutput:
 
 class TestCliErrors:
     def test_cli_create_missing_roles_shows_fix_without_traceback(self, db_path):
+        # #1629 — the ``standard`` flow now auto-adds worker + reviewer
+        # when no ``--role`` flags are supplied, so the missing-roles
+        # gate has to be exercised against a flow that does NOT
+        # auto-default (the ``bug`` flow also requires worker +
+        # reviewer but isn't covered by the auto-default).
         result = runner.invoke(
             task_app,
             [
                 "create",
                 "Missing roles",
+                "--project",
+                "proj",
+                "--flow",
+                "bug",
+                "--db",
+                db_path,
+            ],
+        )
+
+        assert result.exit_code == 1
+        assert "Traceback" not in result.output
+        assert "✗ Required task roles are missing." in result.output
+        assert "Why: flow 'bug' requires worker, reviewer." in result.output
+        # Tightened post-savethenovel: the fix-suggestion now spells out
+        # legal agent values and explicitly warns against ``user``.
+        assert "--role worker=<agent> --role reviewer=<agent>" in result.output
+        assert "architect, reviewer, worker, polly, russell, triage" in result.output
+        assert "NOT `user`" in result.output
+
+    def test_cli_create_auto_adds_roles_for_standard_flow(self, db_path):
+        # #1629 — sensible-default for ``pm task create`` on the
+        # ``standard`` flow: when no ``--role`` flags are supplied,
+        # auto-populate worker + reviewer so the agent doesn't have to
+        # trial-and-error its way through the role contract on every
+        # cold-start task creation.
+        result = runner.invoke(
+            task_app,
+            [
+                "create",
+                "Auto-roled task",
                 "--project",
                 "proj",
                 "--flow",
@@ -647,15 +682,48 @@ class TestCliErrors:
             ],
         )
 
+        assert result.exit_code == 0, result.output
+        assert "Created proj/1" in result.output
+        # Notice is on stderr (mixed_stderr default keeps it in output).
+        assert "auto-added required roles: worker, reviewer" in result.output
+
+        # The created task should have worker + reviewer bound so it
+        # can progress through the standard flow without a follow-up
+        # ``pm task update --role``.
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        svc = SQLiteWorkService(db_path=db_path)
+        try:
+            task = svc.get("proj/1")
+            assert task.roles.get("worker") == "worker"
+            assert task.roles.get("reviewer") == "reviewer"
+        finally:
+            svc.close()
+
+    def test_cli_create_explicit_role_disables_auto_add(self, db_path):
+        # #1629 — when the operator passes ANY ``--role`` flag, the
+        # auto-default must NOT fire. (Otherwise we'd quietly stomp on
+        # an intentional partial role assignment.)
+        result = runner.invoke(
+            task_app,
+            [
+                "create",
+                "Partial role task",
+                "--project",
+                "proj",
+                "--flow",
+                "standard",
+                "--role",
+                "worker=architect",
+                "--db",
+                db_path,
+            ],
+        )
+
+        # Missing reviewer trips the role-gate (no auto-default).
         assert result.exit_code == 1
-        assert "Traceback" not in result.output
+        assert "auto-added required roles" not in result.output
         assert "✗ Required task roles are missing." in result.output
-        assert "Why: flow 'standard' requires worker, reviewer." in result.output
-        # Tightened post-savethenovel: the fix-suggestion now spells out
-        # legal agent values and explicitly warns against ``user``.
-        assert "--role worker=<agent> --role reviewer=<agent>" in result.output
-        assert "architect, reviewer, worker, polly, russell, triage" in result.output
-        assert "NOT `user`" in result.output
 
     def test_cli_get_missing_task_includes_why_fix_and_suggestion(self, db_path):
         _create_task(db_path, title="Only task")
@@ -765,8 +833,11 @@ class TestCliCreateRoleAgentValidation:
     def test_required_role_gate_still_fires_for_missing_role(self, db_path):
         # When ``--role`` is omitted entirely we should still hit the
         # "Required task roles are missing" gate, not the new
-        # invalid-agent gate.
-        result = self._create(db_path, [])
+        # invalid-agent gate. #1629: ``standard`` flow now auto-adds
+        # roles when ``--role`` is omitted, so exercise the gate via
+        # the ``bug`` flow (which also requires worker + reviewer but
+        # is NOT covered by the auto-default).
+        result = self._create(db_path, [], flow="bug")
         assert result.exit_code == 1
         assert "✗ Required task roles are missing." in result.output
 

@@ -111,6 +111,9 @@ from pollypm.cockpit_settings_data import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_project_dashboard_data import (  # noqa: F401  (re-exported)
     ProjectDashboardData,
 )
+from pollypm.cockpit_rail_listview import (  # noqa: F401  (re-exported)
+    _RailListView,
+)
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
     clear_live_chat_network_dead_notice,
@@ -383,67 +386,6 @@ def _wrap_with_hanging_indent(
     if current:
         lines.append(f"{indent}{open_tag}{current}{close_tag}")
     return lines
-
-
-class _RailListView(ListView):
-    """Rail-aware ``ListView`` that survives mid-dispatch re-renders.
-
-    Textual's stock ``_on_list_item__child_clicked`` calls
-    ``self._nodes.index(event.item)`` on the clicked widget. The rail
-    rebuilds its row widgets (``self.nav.clear()`` + ``extend(rows)``)
-    every tick that ``keys != list(self._row_widgets)``; a click event
-    queued just before that rebuild lands on a widget that is no longer
-    in ``_nodes`` and Textual raises ``ValueError: x not in list``,
-    swallowing the click and surfacing a traceback in the rail's
-    scrollback (#964 boot symptom).
-
-    The defensive override re-resolves the click against the live
-    ``_nodes`` list. When the original widget is gone we fall back to
-    the cockpit_key recorded on the orphan ``RailItem`` to find the
-    matching live row, then post the standard ``Selected`` message so
-    downstream handlers see a clean event. If everything fails we
-    swallow rather than raise — the rail re-renders next tick and the
-    user simply re-clicks; raising would leave a traceback overlay
-    obscuring the actual rail and there's no useful recovery for the
-    user to take.
-    """
-
-    def _on_list_item__child_clicked(  # type: ignore[override]
-        self, event: "ListItem._ChildClicked"
-    ) -> None:
-        # Textual's message dispatch walks the full MRO and invokes
-        # every matching ``_on_<message>`` method it finds. To prevent
-        # the parent ``ListView._on_list_item__child_clicked`` from
-        # also running (and re-raising the very ``ValueError`` we are
-        # guarding against), call ``prevent_default()`` so the
-        # ``_get_dispatch_methods`` loop breaks before it reaches the
-        # parent class. Without this our handler would only catch the
-        # error half the time — and the unguarded parent run still
-        # surfaces the traceback in the rail.
-        event.prevent_default()
-        event.stop()
-        self.focus()
-        clicked = event.item
-        try:
-            new_index = self._nodes.index(clicked)
-        except ValueError:
-            # Re-resolve by stable key when the clicked widget has been
-            # swapped out by an in-flight rail rebuild.
-            target_key = getattr(clicked, "cockpit_key", None)
-            new_index = None
-            replacement = clicked
-            if target_key is not None:
-                for idx, candidate in enumerate(self._nodes):
-                    if getattr(candidate, "cockpit_key", None) == target_key:
-                        new_index = idx
-                        replacement = candidate
-                        break
-            if new_index is None:
-                # Nothing actionable — drop the click rather than crash.
-                return
-            clicked = replacement
-        self.index = new_index
-        self.post_message(self.Selected(self, clicked, new_index))
 
 
 class RailItem(ListItem):

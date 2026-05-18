@@ -797,6 +797,14 @@ class CockpitRouter:
     _COCKPIT_WINDOW = "PollyPM"
     _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
     _STATE_WRITE_DEBOUNCE_SECONDS = 0.25
+    # #1642 — TTL for the project-state categorization sweep. Pre-#1642
+    # every rail refresh re-opened every project DB + every inbox source
+    # to recompute glyphs; with 0.8s ticks + state-mtime debouncing, a
+    # navigation burst could stack ~5-10 sweeps inside ``rail_refresh``.
+    # Picked at ~1 tick so a freshly-completed task still surfaces on
+    # the next refresh; callers that need stronger freshness clear via
+    # ``_clear_rail_caches`` (which the supervisor reload already does).
+    _PROJECT_CATEGORIZATIONS_TTL_SECONDS = 2.0
     _SUPERVISOR_FREE_STATIC_KEYS = frozenset(
         {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "operator"},
     )
@@ -824,6 +832,20 @@ class CockpitRouter:
         # value: (db_mtime, git_mtime, is_active, has_working_task)
         # Skips re-opening SQLite on every 0.8s cockpit tick when nothing changed.
         self._project_activity_cache: dict[str, tuple[float, float, bool, bool]] = {}
+        # #1642 — short-TTL cache for the operator-state categorization that
+        # the rail glyph draws. ``project_state_map_from_config`` opens every
+        # project DB + walks every inbox source; running that on every
+        # rail-refresh tick (or every burst of state-bumps) stacks a
+        # multi-second sweep into the ``rail_refresh`` worker and contends
+        # with route workers / pane loaders. The cache key is
+        # ``(config_identity, dirty_marker)`` so a config reload (which
+        # ``_load_config`` already routes through ``_clear_rail_caches``)
+        # always misses; within a config lifetime entries expire after
+        # ``_PROJECT_CATEGORIZATIONS_TTL_SECONDS`` so freshly-completed work
+        # still surfaces within ~1 tick.
+        self._project_categorizations_cache_key: int | None = None
+        self._project_categorizations_cache: dict[str, str] | None = None
+        self._project_categorizations_cached_at: float = 0.0
 
     def _presence(self) -> CockpitPresence:
         presence = getattr(self, "presence", None)
@@ -854,6 +876,11 @@ class CockpitRouter:
         self._collapsed_sections_cache = None
         self._grouped_rail_cache_key = None
         self._grouped_rail_cache = None
+        # #1642 — also drop the project-state categorization cache so a
+        # supervisor / config reload doesn't keep painting stale glyphs.
+        self._project_categorizations_cache_key = None
+        self._project_categorizations_cache = None
+        self._project_categorizations_cached_at = 0.0
 
     def _config_identity(self, config: object) -> int:
         return id(config)
@@ -1786,7 +1813,27 @@ class CockpitRouter:
         Best-effort: a project whose DB can't be opened falls through
         to the tracked / paused IDLE classification rather than
         raising, mirroring the rest of the rail render path.
+
+        #1642 — Cached with a short TTL keyed on the config identity
+        (which already rolls forward on every config-file mtime change
+        via ``_load_config`` → ``_clear_rail_caches``). The underlying
+        ``project_state_map_from_config`` opens every project DB and
+        every inbox source on each call; running it on every 0.8s
+        rail-refresh tick stacked a multi-second sweep into the
+        ``rail_refresh`` worker and contended with route workers + pane
+        loaders. The TTL collapses navigation-burst refreshes into a
+        single sweep while keeping glyph staleness bounded.
         """
+        cache_key = self._config_identity(config)
+        now = time.monotonic()
+        cached = self._project_categorizations_cache
+        if (
+            cached is not None
+            and self._project_categorizations_cache_key == cache_key
+            and now - self._project_categorizations_cached_at
+            < self._PROJECT_CATEGORIZATIONS_TTL_SECONDS
+        ):
+            return dict(cached)
         try:
             from pollypm.dashboard.operator_view import (
                 project_state_map_from_config,
@@ -1794,8 +1841,18 @@ class CockpitRouter:
 
             states = project_state_map_from_config(config)
         except Exception:  # noqa: BLE001
+            # Best-effort: cache the empty result too so a hard failure
+            # doesn't re-trigger the (expensive, failing) sweep on every
+            # tick until the TTL elapses.
+            self._project_categorizations_cache_key = cache_key
+            self._project_categorizations_cache = {}
+            self._project_categorizations_cached_at = now
             return {}
-        return {key: state.value for key, state in states.items()}
+        result = {key: state.value for key, state in states.items()}
+        self._project_categorizations_cache_key = cache_key
+        self._project_categorizations_cache = result
+        self._project_categorizations_cached_at = now
+        return dict(result)
 
     def _project_state_rollups(
         self,

@@ -237,7 +237,7 @@ def register_worker_commands(app: typer.Typer) -> None:
     ) -> None:
         """Stop a worker and mark it disabled so the heartbeat won't recover it."""
         from pollypm import cli as cli_mod
-        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+        from pollypm.events.summaries import activity_summary
 
         supervisor = cli_mod._load_supervisor(config_path)
         session = supervisor.config.sessions.get(session_name)

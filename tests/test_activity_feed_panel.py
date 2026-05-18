@@ -36,7 +36,7 @@ from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     EventProjector,
     FeedEntry,
 )
-from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+from pollypm.events.summaries import activity_summary
 from pollypm.storage.state import StateStore
 
 

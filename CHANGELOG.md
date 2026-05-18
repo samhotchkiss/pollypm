@@ -9,6 +9,12 @@ Added, Changed, and Removed.
 ## [Unreleased]
 
 ### Added
+- `pm cli-reference --json` dumps the full Typer command tree (commands,
+  subcommands, flags, types, help text, defaults) as a single JSON
+  document. Lets autonomous agents grep one structured surface instead
+  of recursively walking `--help` pages. Third wedge of #1629 after
+  the auto-role default (#1637) and task context/transitions
+  inspection CLIs (#1669).
 - `pm serve --port N [--host H] [--allow-remote]` runs the new Web API
   server (FastAPI) as a peer to the cockpit. Reads the same `state.db`
   / `audit.jsonl` via `pollypm.work.factory.create_work_service`

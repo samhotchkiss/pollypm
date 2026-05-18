@@ -13,6 +13,7 @@ clean per ``docs/architecture.md``.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from textual import on
@@ -28,6 +29,8 @@ from pollypm.dashboard import (
     ProjectState,
     glyph_for_project_state,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _empty_view() -> OperatorDashboardView:
@@ -147,6 +150,11 @@ class PollyOperatorDashboardApp(App[None]):
                 self, kind="operator", config_path=self.config_path,
             )
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to start operator dashboard input bridge; "
+                "automation key-send disabled (#1355)",
+                exc_info=True,
+            )
             self._input_bridge_handle = None
 
     def _paint_skeleton(self) -> None:

@@ -597,7 +597,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             except Exception as exc:  # noqa: BLE001
                 # Log and continue — don't let one session abort the entire sweep
                 try:
-                    from pollypm.plugins_builtin.activity_feed.summaries import (
+                    from pollypm.events.summaries import (
                         activity_summary,
                     )
 
@@ -617,7 +617,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     )
                 except Exception:  # noqa: BLE001
                     pass
-        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+        from pollypm.events.summaries import activity_summary
 
         open_alerts = api.open_alerts()
         alerts_n = len(open_alerts)
@@ -724,7 +724,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 subject=f"Unmanaged tmux window: {window.window_name}",
             )
             if alert_type not in existing_alert_types:
-                from pollypm.plugins_builtin.activity_feed.summaries import (
+                from pollypm.events.summaries import (
                     activity_summary,
                 )
 
@@ -1114,7 +1114,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         """Detect and react to mid-flight persona drift (#757).
 
         Kickoff-time swaps are caught by
-        ``supervisor._assert_session_launch_matches``; this catches sessions
+        :meth:`Supervisor._assert_session_launch_matches`; this catches sessions
         whose identity drifted AFTER kickoff (e.g. a prompt-injection loop,
         or a session reading a wrong-role control-prompts file). Conservative:
         only fires on strong identity-claim phrasings, never on casual
@@ -1414,7 +1414,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 owner="heartbeat",
             )
             try:
-                from pollypm.plugins_builtin.activity_feed.summaries import (
+                from pollypm.events.summaries import (
                     activity_summary,
                 )
 
@@ -1490,7 +1490,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     "Open Workers and restart the stalled session."
                 ),
             )
-            from pollypm.plugins_builtin.activity_feed.summaries import (
+            from pollypm.events.summaries import (
                 activity_summary,
             )
 
@@ -1713,7 +1713,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             message = "State the remaining task in one sentence, execute the next step, and report."
         self._send_worker_message(api, context, message, owner="heartbeat")
         try:
-            from pollypm.plugins_builtin.activity_feed.summaries import (
+            from pollypm.events.summaries import (
                 activity_summary,
             )
 
@@ -1775,7 +1775,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 "Yes, proceed. Do the next step you outlined.",
                 owner="heartbeat",
             )
-            from pollypm.plugins_builtin.activity_feed.summaries import (
+            from pollypm.events.summaries import (
                 activity_summary,
             )
 

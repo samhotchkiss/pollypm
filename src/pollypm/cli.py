@@ -77,7 +77,9 @@ _APP_HELP = help_with_examples(
     trailing=(
         "Sub-help:  pm task --help, pm session --help, pm project --help, "
         "pm plugins --help.\n"
-        "Role guides: pm help worker."
+        "Role guides: pm help worker.\n"
+        "Autonomous agents: see docs/agent-handbook.md "
+        "(or run `pm cli-reference --json` for the full command tree)."
     ),
 )
 

@@ -221,6 +221,7 @@ Contributor rules of thumb:
 ## Docs
 
 - [docs/getting-started.md](docs/getting-started.md)
+- [docs/agent-handbook.md](docs/agent-handbook.md) — drive PollyPM from an autonomous agent (Polly, architect, worker)
 - [docs/worker-guide.md](docs/worker-guide.md)
 - [docs/architecture.md](docs/architecture.md)
 - [docs/plugin-authoring.md](docs/plugin-authoring.md)

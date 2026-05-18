@@ -510,6 +510,17 @@ def _initialize(api) -> None:  # noqa: ANN001
         key="dashboard",
         state_provider=lambda _ctx: "home",
     )
+    # #1572 — operator dashboard (Waiting / Working / Idle). Sits
+    # directly under Home so the 1-second "what's the state of the
+    # system?" surface is one keystroke away.
+    rail.register_item(
+        section="top",
+        index=5,
+        label="Operator",
+        handler=_route_handler("operator"),
+        key="operator",
+        state_provider=lambda _ctx: "ready",
+    )
     rail.register_item(
         section="top",
         index=10,

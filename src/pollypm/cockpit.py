@@ -126,6 +126,15 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
     if kind in ("polly", "dashboard"):
         return _build_dashboard(supervisor, config, config_path=config_path)
 
+    if kind == "operator":
+        # #1572 — text fallback for the operator dashboard pane.
+        from pollypm.dashboard.operator_view import (
+            load_operator_view_from_config,
+            view_as_ascii,
+        )
+
+        return view_as_ascii(load_operator_view_from_config(config))
+
     if kind == "inbox":
         return _render_inbox_panel(config)
 

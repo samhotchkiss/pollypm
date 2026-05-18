@@ -43,6 +43,10 @@ _LIVE_SESSION_ROUTES: dict[str, LiveSessionRoute] = {
 
 _STATIC_VIEW_ROUTES: dict[str, StaticViewRoute] = {
     "dashboard": StaticViewRoute(kind="dashboard", selected_key="dashboard"),
+    # #1572 — operator dashboard (Waiting / Working / Idle). Distinct
+    # from "dashboard" (Home / token usage / activity) so neither
+    # surface needs to absorb the other's responsibilities mid-epic.
+    "operator": StaticViewRoute(kind="operator", selected_key="operator"),
     "inbox": StaticViewRoute(kind="inbox", selected_key="inbox"),
     "workers": StaticViewRoute(kind="workers", selected_key="workers"),
     "metrics": StaticViewRoute(kind="metrics", selected_key="metrics"),

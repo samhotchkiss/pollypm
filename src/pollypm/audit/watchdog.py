@@ -93,6 +93,7 @@ __all__ = [
     "RULE_TASK_ON_HOLD_STALE",
     "RULE_DUPLICATE_ADVISOR_TASKS",
     "RULE_PLAN_REVIEW_MISSING",
+    "RULE_PLAN_REVIEW_BYPASSED_APPROVAL",
     "RULE_LEGACY_DB_SHADOW",
     "RULE_PLAN_MISSING_ALERT_CHURN",
     "RULE_REJECTION_LOOP",
@@ -169,6 +170,20 @@ RULE_DUPLICATE_ADVISOR_TASKS = "duplicate_advisor_tasks"
 # uses; idempotent because both call sites probe the messages table for
 # an existing plan_review row before writing.
 RULE_PLAN_REVIEW_MISSING = "plan_review_missing"
+# #1633 — plan-handoff resurrection. A ``plan_project`` task in ``done``
+# whose canonical ``user_approval`` execution was completed by a non-user
+# actor (watchdog, auto, polly, etc.) AND has no ``plan_review_pending``
+# inbox item is a bypassed approval — Sam never saw the "approve the
+# plan?" surface because automation skipped it. Detector + tier-1 self-
+# heal: synthesize the missing plan_review inbox item via
+# :func:`pollypm.work.plan_review_emit.emit_plan_review_for_task` so the
+# user gets the gate they were supposed to get. Distinct from
+# ``plan_review_missing`` (#1511) — that rule excludes ``plan_project``
+# tasks on the assumption the reflection node emits canonically. This
+# rule covers the case where the reflection node DID run but the
+# approval was bypassed (e.g. the watchdog's tier-3 escalation auto-
+# approved on the user's behalf).
+RULE_PLAN_REVIEW_BYPASSED_APPROVAL = "plan_review_bypassed_approval"
 # #1519 — legacy per-project DB shadows the canonical workspace DB. A
 # project has rows in BOTH ``<workspace_root>/.pollypm/state.db`` AND
 # ``<project>/.pollypm/state.db``; the dashboard's pipeline counts used
@@ -1698,6 +1713,135 @@ def _detect_plan_review_missing(
 
 
 # ---------------------------------------------------------------------------
+# Plan-handoff bypassed-approval detector (#1633)
+# ---------------------------------------------------------------------------
+
+
+# Canonical user-actor names. Anything else in the ``plan_approved``
+# context entry actor field counts as a bypass — automation
+# (audit_watchdog, polly, architect, auto, etc.) approving on the
+# user's behalf. Mirrors :data:`pollypm.work.sqlite_service` actor
+# checks; keep in sync if the canonical set changes.
+_USER_ACTORS: frozenset[str] = frozenset({"user", "sam", "human"})
+
+
+def _detect_plan_review_bypassed_approval(
+    *,
+    now: datetime,
+    config: WatchdogConfig,
+    bypassed_plan_tasks: Sequence[Any] | None = None,
+    plan_review_present: Any = None,
+) -> list[Finding]:
+    """Rule (#1633): plan_project done task whose approval was bypassed.
+
+    The watchdog's tier-3 escalation (or any non-user actor in the
+    plumbing) can call ``svc.approve(task_id, actor=...)`` on a
+    ``plan_project`` task parked at the ``user_approval`` node. The
+    approval lands, the flow advances to ``done``, and the project
+    looks "approved" — but the user never saw the "approve the plan?"
+    surface. Downstream queued tasks then sit waiting for user input
+    nobody asked the user to provide.
+
+    This detector finds those bypassed approvals and emits a finding so
+    the tier-1 healer can synthesize the missing plan_review inbox
+    item. Distinct from :func:`_detect_plan_review_missing` — that rule
+    excludes ``plan_project`` flow tasks on the assumption the
+    reflection node emits canonically. This rule covers the case where
+    the reflection emit + the approval BOTH happened, but the approval
+    actor was non-user.
+
+    Inputs are passed in by the cadence handler so this function stays
+    pure / unit-testable:
+
+    * ``bypassed_plan_tasks`` — sequence of objects each carrying
+      ``project``, ``task_number``, ``approval_actor``, optional
+      ``approval_completed_at`` / ``flow_template_id`` / ``labels``.
+      The cadence handler builds this list by walking done plan_project
+      tasks and reading the ``plan_approved`` context entry (or
+      ``user_approval`` execution's completed_at on legacy plans).
+    * ``plan_review_present`` — callable taking
+      ``(project, plan_task_id) -> bool`` returning True if a
+      plan_review message already exists. Same shape as
+      ``_detect_plan_review_missing``; if a plan_review row IS
+      present, the user has the gate even if approval was non-user.
+
+    Both inputs default to ``None`` — the detector then no-ops, which
+    is the right default when the caller can't enumerate bypassed
+    approvals / probe the messages table.
+    """
+    findings: list[Finding] = []
+    if not bypassed_plan_tasks:
+        return findings
+    if plan_review_present is None:
+        return findings
+    cutoff = now - timedelta(seconds=config.plan_review_lookback_seconds)
+    for task in bypassed_plan_tasks:
+        project = getattr(task, "project", "") or ""
+        task_number = getattr(task, "task_number", None)
+        if not project or task_number is None:
+            continue
+        plan_task_id = f"{project}/{task_number}"
+        approval_actor = str(getattr(task, "approval_actor", "") or "").strip()
+        if not approval_actor:
+            continue
+        if approval_actor.lower() in _USER_ACTORS:
+            # The user actually approved; nothing was bypassed.
+            continue
+        completed_at = getattr(task, "approval_completed_at", None)
+        if isinstance(completed_at, datetime):
+            ts = (
+                completed_at
+                if completed_at.tzinfo is not None
+                else completed_at.replace(tzinfo=timezone.utc)
+            )
+            if ts < cutoff:
+                continue
+        try:
+            already_present = bool(plan_review_present(project, plan_task_id))
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "plan_review_bypassed_approval: probe failed for %s",
+                plan_task_id, exc_info=True,
+            )
+            continue
+        if already_present:
+            # The user already has a plan_review surface for this plan
+            # task — no second card needed.
+            continue
+        labels = list(getattr(task, "labels", None) or [])
+        flow_id = getattr(task, "flow_template_id", "") or "plan_project"
+        findings.append(Finding(
+            rule=RULE_PLAN_REVIEW_BYPASSED_APPROVAL,
+            tier=TIER_1,
+            project=project,
+            subject=plan_task_id,
+            message=(
+                f"plan_project task {plan_task_id} was approved by "
+                f"non-user actor '{approval_actor}' and has no "
+                f"plan_review inbox card. The user never saw the "
+                f"approval gate."
+            ),
+            recommendation=(
+                f"Backfill via plan_review_emit.emit_plan_review_for_task "
+                f"so the cockpit approval surface renders for {plan_task_id}."
+            ),
+            metadata={
+                "plan_task_id": plan_task_id,
+                "flow_template_id": flow_id,
+                "labels": labels,
+                "approval_actor": approval_actor,
+                "approval_completed_at": (
+                    completed_at.isoformat()
+                    if isinstance(completed_at, datetime)
+                    else None
+                ),
+                "detected_via": "state",
+            },
+        ))
+    return findings
+
+
+# ---------------------------------------------------------------------------
 # Legacy-DB shadow detector (#1519)
 # ---------------------------------------------------------------------------
 
@@ -2426,6 +2570,7 @@ def scan_events(
     project: str = "",
     done_plan_tasks: Sequence[Any] | None = None,
     plan_review_present: Any = None,
+    bypassed_plan_tasks: Sequence[Any] | None = None,
     legacy_db_shadows: Sequence[Any] | None = None,
     plan_missing_clears: Sequence[Any] | None = None,
     state_db_probes: Sequence[Any] | None = None,
@@ -2519,6 +2664,16 @@ def scan_events(
         done_plan_tasks=done_plan_tasks,
         plan_review_present=plan_review_present,
     ))
+    # #1633 — bypassed-approval detector. Pure detector; cadence handler
+    # walks ``plan_project`` done tasks, reads the plan_approved context
+    # entry (or user_approval execution's completed_at on legacy plans),
+    # and feeds one descriptor per task with the recorded approval actor.
+    findings.extend(_detect_plan_review_bypassed_approval(
+        now=now,
+        config=config,
+        bypassed_plan_tasks=bypassed_plan_tasks,
+        plan_review_present=plan_review_present,
+    ))
     # #1519 — legacy DB shadows the canonical workspace DB. State-only
     # detector; the cadence handler probes the filesystem + sqlite for
     # the row counts and passes them in so this function stays pure.
@@ -2576,6 +2731,7 @@ def scan_project(
     storage_window_names: Sequence[str] | None = None,
     done_plan_tasks: Sequence[Any] | None = None,
     plan_review_present: Any = None,
+    bypassed_plan_tasks: Sequence[Any] | None = None,
     legacy_db_shadows: Sequence[Any] | None = None,
     plan_missing_clears: Sequence[Any] | None = None,
     state_db_probes: Sequence[Any] | None = None,
@@ -2623,6 +2779,7 @@ def scan_project(
         project=project,
         done_plan_tasks=done_plan_tasks,
         plan_review_present=plan_review_present,
+        bypassed_plan_tasks=bypassed_plan_tasks,
         legacy_db_shadows=legacy_db_shadows,
         plan_missing_clears=plan_missing_clears,
         state_db_probes=state_db_probes,
@@ -3242,6 +3399,29 @@ def format_unstick_brief(finding: Finding) -> str:
             "this tick via plan_review_emit.emit_plan_review_for_task. "
             "No manual action required unless the backfill itself fails "
             "in the cadence logs."
+        )
+    elif finding.rule == RULE_PLAN_REVIEW_BYPASSED_APPROVAL:
+        plan_task_id = meta.get("plan_task_id") or subject
+        actor = meta.get("approval_actor") or "<unknown>"
+        completed = meta.get("approval_completed_at")
+        lines.append("Stuck for: plan approved by non-user actor")
+        lines.append("Observed evidence:")
+        lines.append(
+            f"- plan_project task {plan_task_id} reached done with "
+            f"user_approval completed by actor='{actor}'"
+        )
+        if completed:
+            lines.append(f"- Approval completed at: {completed}")
+        lines.append(
+            "- No plan_review inbox card exists for the task. The user "
+            "never saw the 'approve the plan?' surface."
+        )
+        lines.append("")
+        lines.append(
+            "Your job: the watchdog will synthesize a plan_review inbox "
+            "card on this tick via "
+            "plan_review_emit.emit_plan_review_for_task. The user gets "
+            "the gate they were supposed to get; nothing else changes."
         )
     elif finding.rule == RULE_REJECTION_LOOP:
         node_id = (finding.evidence or {}).get("node_id") or meta.get(

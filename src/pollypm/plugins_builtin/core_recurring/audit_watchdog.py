@@ -41,6 +41,7 @@ from pollypm.audit.watchdog import (
     RULE_DUPLICATE_ADVISOR_TASKS,
     RULE_LEGACY_DB_SHADOW,
     RULE_PLAN_MISSING_ALERT_CHURN,
+    RULE_PLAN_REVIEW_BYPASSED_APPROVAL,
     RULE_PLAN_REVIEW_MISSING,
     RULE_QUEUE_WITHOUT_MOTION,
     RULE_REJECTION_LOOP,
@@ -287,6 +288,169 @@ def _gather_done_plan_tasks(
             project_key, exc_info=True,
         )
         return []
+
+
+@dataclass(slots=True, frozen=True)
+class _BypassedPlanTask:
+    """One ``plan_project`` task whose approval was completed by a non-user actor.
+
+    Used by :func:`_gather_bypassed_plan_tasks` to feed the pure
+    :func:`pollypm.audit.watchdog._detect_plan_review_bypassed_approval`
+    detector. ``approval_actor`` is the actor string the work-service
+    recorded against the canonical ``plan_approved`` context entry
+    (preferred) or the ``user_approval`` execution's most recent
+    completion. The cadence handler builds one of these per done
+    plan_project task so the detector stays pure.
+    """
+
+    project: str
+    task_number: int
+    approval_actor: str
+    approval_completed_at: Any = None  # datetime | None
+    flow_template_id: str = "plan_project"
+    labels: tuple[str, ...] = ()
+
+
+def _gather_bypassed_plan_tasks(
+    project_key: str, project_path: Path | None,
+) -> list[_BypassedPlanTask]:
+    """Walk ``plan_project`` done tasks for non-user approval actors (#1633).
+
+    Filters tasks the cadence handler should feed to the
+    bypassed-approval detector:
+
+    * ``flow_template_id == "plan_project"``
+    * ``work_status == done``
+    * A canonical ``plan_approved`` context entry exists (so we have a
+      recorded approval actor) OR a completed ``user_approval``
+      execution exists.
+
+    The detector itself filters out user actors and tasks that already
+    have a plan_review inbox card. Returns an empty list on any failure;
+    the rule then no-ops for that project, which is safer than firing
+    false-positive findings on partial reads.
+    """
+    try:
+        from pollypm.work import create_work_service
+        from pollypm.work.models import (
+            Decision,
+            ExecutionStatus,
+            WorkStatus,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: bypassed-plan imports failed", exc_info=True,
+        )
+        return []
+    out: list[_BypassedPlanTask] = []
+    try:
+        with create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            list_fn = getattr(svc, "list_tasks", None)
+            get_fn = getattr(svc, "get", None)
+            get_ctx_fn = getattr(svc, "get_context", None)
+            if not callable(list_fn) or not callable(get_fn):
+                return []
+            tasks = list(
+                list_fn(work_status=WorkStatus.DONE.value, project=project_key)
+            )
+            for task in tasks:
+                flow_id = getattr(task, "flow_template_id", "") or ""
+                if flow_id != "plan_project":
+                    continue
+                # Hydrate executions/context so the actor lookup is
+                # reliable — ``list_tasks`` returns the lite shape.
+                project = getattr(task, "project", "") or ""
+                task_number = getattr(task, "task_number", None)
+                if not project or task_number is None:
+                    continue
+                task_id = f"{project}/{task_number}"
+                try:
+                    full = get_fn(task_id)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "audit.watchdog: get(%s) failed during "
+                        "bypassed-plan scan", task_id, exc_info=True,
+                    )
+                    continue
+                if full is None:
+                    continue
+
+                # Prefer the plan_approved context entry — it's the
+                # canonical actor source the approve() path writes
+                # (#281). Fall back to the user_approval execution's
+                # completed_at when no context entry exists (which
+                # happens on legacy plans approved pre-#281).
+                approval_actor = ""
+                approval_completed_at = None
+                if callable(get_ctx_fn):
+                    try:
+                        entries = get_ctx_fn(
+                            task_id, entry_type="plan_approved",
+                        )
+                    except Exception:  # noqa: BLE001
+                        entries = []
+                    if entries:
+                        first = entries[0]
+                        approval_actor = (
+                            getattr(first, "actor", "") or ""
+                        ).strip()
+                        approval_completed_at = getattr(
+                            first, "timestamp", None,
+                        )
+
+                if not approval_actor:
+                    # Fallback: walk executions backwards for the
+                    # latest APPROVED user_approval visit. We can't get
+                    # the actor from the execution row (the schema
+                    # doesn't store it), so this fallback path leaves
+                    # ``approval_actor=""`` which the detector treats
+                    # as "skip" — that's deliberate: without a recorded
+                    # actor we can't tell whether the approval was a
+                    # bypass.
+                    for execution in reversed(
+                        getattr(full, "executions", []) or []
+                    ):
+                        if getattr(execution, "node_id", "") != "user_approval":
+                            continue
+                        if getattr(execution, "status", None) is not (
+                            ExecutionStatus.COMPLETED
+                        ):
+                            continue
+                        if getattr(execution, "decision", None) is (
+                            Decision.APPROVED
+                        ):
+                            approval_completed_at = getattr(
+                                execution, "completed_at", None,
+                            )
+                            break
+
+                if not approval_actor:
+                    # No recorded actor — skip. We don't want to
+                    # false-positive on legacy plans where the actor
+                    # is genuinely unknown.
+                    continue
+
+                labels_tuple = tuple(
+                    str(label) for label in (getattr(full, "labels", None) or [])
+                )
+                out.append(_BypassedPlanTask(
+                    project=project,
+                    task_number=int(task_number),
+                    approval_actor=approval_actor,
+                    approval_completed_at=approval_completed_at,
+                    flow_template_id=flow_id,
+                    labels=labels_tuple,
+                ))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: bypassed-plan walk failed for %s",
+            project_key, exc_info=True,
+        )
+        return []
+    return out
 
 
 def _make_plan_review_probe(project_key: str, project_path: Path | None):
@@ -1141,6 +1305,35 @@ def _self_heal_plan_review_missing(
     return {"plan_review_backfill_failed": 1}
 
 
+def _self_heal_plan_review_bypassed_approval(
+    finding: Finding,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    **_: Any,
+) -> dict[str, int]:
+    """#1633 — synthesize the plan_review inbox card the user never got.
+
+    Wraps :func:`_backfill_plan_review_for_finding` (the same helper the
+    ``plan_review_missing`` healer uses). The downstream
+    :func:`emit_plan_review_for_task` is idempotent — if the messages
+    table already carries a plan_review row for this plan task it
+    no-ops, so re-runs across cadence ticks don't double-emit.
+
+    Returns a distinct counter shape so the cadence handler can report
+    "we resurrected N bypassed approvals" separately from the
+    pre-#1633 ``plan_review_missing`` backfill counter.
+    """
+    backfilled = _backfill_plan_review_for_finding(
+        finding,
+        project_key=project_key,
+        project_path=project_path,
+    )
+    if backfilled is not None:
+        return {"plan_review_bypassed_resurrected": 1}
+    return {"plan_review_bypassed_resurrect_failed": 1}
+
+
 def _self_heal_legacy_db_shadow_counter(
     finding: Finding,
     *,
@@ -1420,6 +1613,8 @@ _TIER1_HEALERS: dict[str, Any] = {
     # #1546 — new tier-1 entries.
     RULE_ROLE_SESSION_MISSING: _self_heal_role_session_missing,
     RULE_STATE_DB_MISSING: _self_heal_state_db_missing,
+    # #1633 — plan-handoff resurrection.
+    RULE_PLAN_REVIEW_BYPASSED_APPROVAL: _self_heal_plan_review_bypassed_approval,
 }
 
 
@@ -2596,6 +2791,9 @@ def _scan_one_project(
         "advisor_duplicates_failed": 0,
         "plan_review_backfilled": 0,
         "plan_review_backfill_failed": 0,
+        # #1633 — plan-handoff resurrection counters.
+        "plan_review_bypassed_resurrected": 0,
+        "plan_review_bypassed_resurrect_failed": 0,
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
         "plan_missing_churn_detected": 0,
@@ -2618,9 +2816,16 @@ def _scan_one_project(
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
     done_plan_tasks = _gather_done_plan_tasks(project_key, project_path)
+    # #1633 — gather plan_project done tasks for the bypassed-approval
+    # detector. We always probe the messages table when EITHER list is
+    # non-empty so the rule can fire even when the legacy
+    # plan_review_missing rule (#1511) has nothing to feed.
+    bypassed_plan_tasks = _gather_bypassed_plan_tasks(
+        project_key, project_path,
+    )
     plan_review_present = (
         _make_plan_review_probe(project_key, project_path)
-        if done_plan_tasks
+        if (done_plan_tasks or bypassed_plan_tasks)
         else None
     )
     # #1519 — filter the workspace-wide shadow list down to this
@@ -2654,6 +2859,7 @@ def _scan_one_project(
             storage_window_names=storage_window_names,
             done_plan_tasks=done_plan_tasks,
             plan_review_present=plan_review_present,
+            bypassed_plan_tasks=bypassed_plan_tasks or None,
             legacy_db_shadows=project_shadows or None,
             plan_missing_clears=project_clears or None,
             state_db_probes=project_state_probes or None,
@@ -2866,6 +3072,9 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "advisor_duplicates_failed": 0,
         "plan_review_backfilled": 0,
         "plan_review_backfill_failed": 0,
+        # #1633 — plan-handoff resurrection totals.
+        "plan_review_bypassed_resurrected": 0,
+        "plan_review_bypassed_resurrect_failed": 0,
         "legacy_db_shadows_migrated": 0,
         "legacy_db_shadows_failed": 0,
         "plan_missing_churn_detected": 0,

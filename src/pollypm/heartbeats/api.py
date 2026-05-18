@@ -268,7 +268,7 @@ class SupervisorHeartbeatAPI:
                 ),
                 owner="heartbeat",
             )
-            from pollypm.plugins_builtin.activity_feed.summaries import (
+            from pollypm.events.summaries import (
                 activity_summary,
             )
 

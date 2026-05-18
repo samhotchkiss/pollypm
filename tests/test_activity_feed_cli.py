@@ -23,7 +23,7 @@ from pollypm.plugins_builtin.activity_feed.cli import (
     activity_app,
     parse_duration,
 )
-from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+from pollypm.events.summaries import activity_summary
 from pollypm.storage.state import StateStore
 
 

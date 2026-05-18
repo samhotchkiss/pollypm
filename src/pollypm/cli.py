@@ -500,6 +500,39 @@ def shortcuts() -> None:
     typer.echo(render_shortcuts_text())
 
 
+@app.command("cli-reference")
+def cli_reference(
+    output_json: bool = typer.Option(
+        False,
+        "--json",
+        help=(
+            "Emit the command tree as JSON (the only supported format). "
+            "Reserved for forward compatibility; required today so the "
+            "command's contract stays explicit."
+        ),
+    ),
+) -> None:
+    """Dump the full Typer command tree (commands, flags, types, help) as JSON.
+
+    Designed for agents that would otherwise grep through ``--help``
+    pages. The schema is documented in
+    :mod:`pollypm.cli_reference`; consumers should treat unknown fields
+    as informational and rely on ``commands``, ``subcommands``,
+    ``params``, ``name``, ``opts``, ``type``, ``required``, and
+    ``multiple`` as the stable surface.
+    """
+    if not output_json:
+        typer.echo(
+            "pm cli-reference currently only supports --json output. "
+            "Re-run with `pm cli-reference --json`.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    from pollypm.cli_reference import build_cli_reference
+
+    _emit_json(build_cli_reference(app))
+
+
 _ROLE_GUIDES = {
     # role: (repo-relative path, packaged-resource path under pollypm/, title)
     "worker": (

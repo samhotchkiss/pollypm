@@ -14,7 +14,13 @@ from pathlib import Path
 
 import pytest
 
-from pollypm.rail_daemon import _claim_pid_file, _pid_alive, _pid_file
+from pollypm.rail_daemon import (
+    _acquire_lifetime_lock,
+    _claim_pid_file,
+    _lock_file,
+    _pid_alive,
+    _pid_file,
+)
 
 
 def test_pid_file_resolves_under_home(tmp_path: Path):
@@ -77,3 +83,82 @@ def test_claim_pid_file_creates_parent_dir(tmp_path: Path):
     pid_path = tmp_path / "new_subdir" / "rail_daemon.pid"
     assert _claim_pid_file(pid_path) is True
     assert pid_path.exists()
+
+
+# --- Lifetime flock (#1586) ------------------------------------------------
+
+
+def test_lock_file_resolves_under_home(tmp_path: Path):
+    assert _lock_file(tmp_path) == tmp_path / "rail_daemon.lock"
+
+
+def test_acquire_lifetime_lock_fresh(tmp_path: Path):
+    lock_path = tmp_path / "rail_daemon.lock"
+    fd = _acquire_lifetime_lock(lock_path)
+    assert fd is not None
+    assert lock_path.exists()
+    os.close(fd)
+
+
+def test_acquire_lifetime_lock_rejects_when_held(tmp_path: Path):
+    """Second acquire returns None while first fd is still open.
+
+    This is the #1586 regression: even if the PID file has been
+    unlinked by ``pm reset --force``, a second daemon must not be
+    able to start while the first one's process is still alive.
+    """
+    lock_path = tmp_path / "rail_daemon.lock"
+    first_fd = _acquire_lifetime_lock(lock_path)
+    assert first_fd is not None
+    try:
+        second_fd = _acquire_lifetime_lock(lock_path)
+        assert second_fd is None, (
+            "second acquire should have been refused while first lock is held"
+        )
+    finally:
+        os.close(first_fd)
+
+
+def test_acquire_lifetime_lock_succeeds_after_release(tmp_path: Path):
+    """Once the holder closes its fd, a fresh acquire succeeds.
+
+    Mirrors the production lifecycle: daemon A exits (OS releases the
+    lock), then ``pm up`` invokes daemon B which claims it cleanly.
+    """
+    lock_path = tmp_path / "rail_daemon.lock"
+    first_fd = _acquire_lifetime_lock(lock_path)
+    assert first_fd is not None
+    os.close(first_fd)
+    second_fd = _acquire_lifetime_lock(lock_path)
+    assert second_fd is not None
+    os.close(second_fd)
+
+
+def test_acquire_lifetime_lock_creates_parent_dir(tmp_path: Path):
+    lock_path = tmp_path / "new_subdir" / "rail_daemon.lock"
+    fd = _acquire_lifetime_lock(lock_path)
+    assert fd is not None
+    assert lock_path.exists()
+    os.close(fd)
+
+
+def test_acquire_lifetime_lock_independent_of_pid_file(tmp_path: Path):
+    """The flock guard works even if the PID file does not exist.
+
+    This is the precise #1586 scenario: ``pm reset --force`` unlinks
+    the PID file pre-emptively, but the daemon process survives. A
+    second ``pm up`` cannot rely on the PID file being there — it must
+    be the flock that refuses the duplicate spawn.
+    """
+    lock_path = tmp_path / "rail_daemon.lock"
+    pid_path = tmp_path / "rail_daemon.pid"
+    assert not pid_path.exists()
+    first_fd = _acquire_lifetime_lock(lock_path)
+    assert first_fd is not None
+    try:
+        # PID file does not exist (simulating ``pm reset`` having
+        # unlinked it). The flock must still refuse a second daemon.
+        assert not pid_path.exists()
+        assert _acquire_lifetime_lock(lock_path) is None
+    finally:
+        os.close(first_fd)

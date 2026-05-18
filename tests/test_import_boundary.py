@@ -62,7 +62,6 @@ _SUPERVISOR_IMPORT_ALLOWLIST: frozenset[str] = frozenset(
         # TODO(#179+): Remaining internal integration points that still need
         # a direct Supervisor — migrate each onto CoreRail / service_api as
         # the rail grows (tracked under the decomposition meta-issue).
-        "src/pollypm/heartbeats/api.py",
         "src/pollypm/job_runner.py",
         "src/pollypm/plugins_builtin/core_recurring/plugin.py",
         "src/pollypm/schedulers/base.py",

@@ -13854,102 +13854,17 @@ def _dashboard_inbox(
             return text
         return text[: limit - 1].rstrip() + "…"
 
-    def _summary_from_body(body: str) -> str:
-        paragraphs = [
-            _plain_text(part)
-            for part in body.split("\n\n")
-            if _plain_text(part)
-        ]
-        for paragraph in paragraphs:
-            lower = paragraph.lower()
-            if lower.startswith("blocker:"):
-                return _trim(paragraph[8:].strip())
-        for paragraph in paragraphs:
-            lower = paragraph.lower()
-            if lower.startswith(("task:", "status:")):
-                continue
-            if any(
-                token in lower
-                for token in (
-                    "blocked",
-                    "waiting on",
-                    "without ",
-                    "requires ",
-                    "acceptance gate",
-                    "scope split",
-                    "need your call",
-                    "needs your call",
-                )
-            ):
-                return _trim(paragraph)
-        for paragraph in paragraphs:
-            lower = paragraph.lower()
-            if lower.startswith(("task:", "status:")):
-                continue
-            return _trim(paragraph)
-        return ""
-
-    def _requirement_step(part: str) -> str:
-        cleaned = _plain_text(part).strip(" .,:;")
-        if not cleaned:
-            return ""
-        lower = cleaned.lower()
-        if lower.startswith(("a ", "an ", "the ")):
-            cleaned = cleaned.split(" ", 1)[1]
-            lower = cleaned.lower()
-        if lower.endswith(" provisioned"):
-            cleaned = cleaned[: -len(" provisioned")]
-            lower = cleaned.lower()
-            return f"Provision {cleaned}"
-        if any(token in lower for token in ("cred", "access", "token", "login")):
-            return f"Grant {cleaned}"
-        if any(token in lower for token in ("app", "pipeline", "deploy", "fly.io")):
-            return f"Set up {cleaned}"
-        if any(token in lower for token in ("postgres", "redis", "database")):
-            return f"Provision {cleaned}"
-        if any(lower.startswith(verb) for verb in (
-            "accept",
-            "reopen",
-            "create",
-            "run",
-            "exercise",
-            "verify",
-            "choose",
-            "split",
-        )):
-            return cleaned[:1].upper() + cleaned[1:]
-        return cleaned[:1].upper() + cleaned[1:]
-
-    def _steps_from_body(body: str) -> list[str]:
-        steps: list[str] = []
-        for line in body.splitlines():
-            match = _ACTION_STEP_RE.match(line)
-            if match is not None:
-                step = _plain_text(match.group("step"))
-                if step:
-                    steps.append(step)
-        for paragraph in body.split("\n\n"):
-            plain = _plain_text(paragraph)
-            lower = plain.lower()
-            for marker in ("without ", "requires "):
-                idx = lower.find(marker)
-                if idx < 0:
-                    continue
-                chunk = plain[idx + len(marker):].split(". ", 1)[0]
-                chunk = chunk.replace(", and ", ", ").replace(" and ", ", ")
-                for part in chunk.split(","):
-                    step = _requirement_step(part)
-                    if step:
-                        steps.append(step)
-        deduped: list[str] = []
-        seen: set[str] = set()
-        for step in steps:
-            key = step.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(step)
-        return deduped[:4]
+    # Body-parsing helpers (#1356 wedge): the inner ``_summary_from_body``
+    # / ``_steps_from_body`` / ``_requirement_step`` closures here were
+    # near-duplicates of the module-level ``_dashboard_*`` helpers already
+    # used by ``_render_heuristic_action_block`` (line ~6849) and the
+    # blocker-row path in this same function (line ~13359). The bodies
+    # passed in here are pre-normalized via ``_message_body`` so the
+    # module-level versions (which also re-normalize ``\\n``) are
+    # behaviour-compatible supersets. Consolidating trims ~95 LOC and
+    # exposes both legs of the dispatch to the same unit tests.
+    _summary_from_body = _dashboard_summary_from_body
+    _steps_from_body = _dashboard_steps_from_body
 
     _decision_prompt_from_body = _dashboard_decision_prompt_from_body
     _user_prompt_decision = _dashboard_user_prompt_decision

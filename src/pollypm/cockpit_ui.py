@@ -86,6 +86,11 @@ from pollypm.cockpit_inbox_items import (
     message_row_to_inbox_entry,
     task_to_inbox_entry,
 )
+from pollypm.cockpit_first_shipped import (  # noqa: F401  (re-exported)
+    _FIRST_SHIPPED_FRAMES,
+    _FirstShippedCelebrationModal,
+    _celebrate_first_shipped,
+)
 from pollypm.cockpit_inbox_project_picker import (  # noqa: F401  (re-exported)
     _InboxProjectPickerModal,
 )
@@ -249,86 +254,6 @@ ASCII_POLLY = "\n".join(
 )
 
 POLLY_TAGLINE = "Plans first.\nChaos later."
-
-
-_FIRST_SHIPPED_FRAMES = (
-    "  ✨   🎉   ✨\n🎊  First PR shipped  🎊\n  ✨   🎉   ✨",
-    "🎉   ✨   🎊   ✨\n  First PR shipped\n✨   🎊   ✨   🎉",
-    "  🎊   ✨   🎉\n🎉  First PR shipped  🎉\n  ✨   🎊   ✨",
-)
-
-
-class _FirstShippedCelebrationModal(ModalScreen[None]):
-    """Short-lived modal that celebrates the first shipped task."""
-
-    DEFAULT_CSS = """
-    #first-shipped-modal {
-        width: 60;
-        padding: 1 2;
-        border: round #6fcf97;
-        background: #102019;
-        color: #effaf3;
-    }
-    #first-shipped-title {
-        text-align: center;
-        margin-bottom: 1;
-    }
-    #first-shipped-confetti {
-        text-align: center;
-        color: #ffd166;
-        height: auto;
-    }
-    #first-shipped-hint {
-        text-align: center;
-        color: #93a7b3;
-        margin-top: 1;
-    }
-    """
-
-    BINDINGS = [Binding("escape", "dismiss", "Dismiss", show=False)]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._frame_index = 0
-
-    def compose(self) -> ComposeResult:  # pragma: no cover - Textual harness
-        with Vertical(id="first-shipped-modal"):
-            yield Static("First PR shipped", id="first-shipped-title")
-            yield Static(_FIRST_SHIPPED_FRAMES[0], id="first-shipped-confetti", markup=True)
-            yield Static(
-                "Recorded once and pinned in Activity.",
-                id="first-shipped-hint",
-            )
-
-    def on_mount(self) -> None:  # pragma: no cover - Textual harness
-        try:
-            self.set_interval(0.16, self._advance_frame)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.set_timer(2.0, self.dismiss)
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _advance_frame(self) -> None:
-        self._frame_index = (self._frame_index + 1) % len(_FIRST_SHIPPED_FRAMES)
-        try:
-            self.query_one("#first-shipped-confetti", Static).update(
-                _FIRST_SHIPPED_FRAMES[self._frame_index],
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _celebrate_first_shipped(app) -> None:
-    """Announce the one-time shipped milestone in whichever cockpit view approved it."""
-    app.notify("🎉 First PR shipped. Nicely done.", severity="information", timeout=2.0)
-    if os.getenv("POLLY_NO_CONFETTI") == "1":
-        return
-    try:
-        app.push_screen(_FirstShippedCelebrationModal())
-    except Exception:  # noqa: BLE001
-        pass
 
 
 class _AlertDetailModal(ModalScreen[str | None]):

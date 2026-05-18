@@ -1,29 +1,76 @@
 """Flow transition helpers for the SQLite work service.
 
 Contract:
-- Inputs: a ``SQLiteWorkService`` plus task ids, flow nodes, and actor
-  metadata.
+- Inputs: a work-service collaborator (see :class:`_WorkService` below)
+  plus task ids, flow nodes, and actor metadata.
 - Outputs: visit counters and post-transition side effects.
 - Side effects: mutates task/execution state and triggers notification
   hooks after commits.
 - Invariants: transition side effects stay owned by the work service.
+
+The helpers in this module are parameterised over a structural
+:class:`typing.Protocol` rather than the concrete
+``pollypm.work.sqlite_service.SQLiteWorkService`` class. This breaks
+the import cycle flagged in #1367 (the service top-imports this module,
+so a reverse type-annotation import — even guarded with
+``TYPE_CHECKING`` — registers as a cycle in the AST boundary scan).
+``SQLiteWorkService`` satisfies :class:`_WorkService` structurally; no
+runtime registration or subclass change is required.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+import sqlite3
+from pathlib import Path
+from typing import Protocol
 
-from pollypm.work.models import ExecutionStatus, FlowTemplate, NodeType, Task, WorkStatus, TERMINAL_STATUSES
+from pollypm.work.models import (
+    ExecutionStatus,
+    FlowNode,
+    FlowTemplate,
+    NodeType,
+    Task,
+    WorkStatus,
+    TERMINAL_STATUSES,
+)
 from pollypm.work.service_support import InvalidTransitionError, _now
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+
+class _WorkService(Protocol):
+    """Structural view of the SQLite work service used by transition helpers.
+
+    Captures the exact slice these helpers reach into so the
+    ``service_transitions <-> sqlite_service`` cycle can be broken without
+    pulling the full concrete class into this module's type graph
+    (#1367 wedge).
+    """
+
+    _conn: sqlite3.Connection
+    _project_path: Path | None
+
+    def _record_transition(
+        self,
+        project: str,
+        task_number: int,
+        from_state: str,
+        to_state: str,
+        actor: str,
+    ) -> None: ...
+
+    def _resolve_node_assignee(self, task: Task, node: FlowNode) -> str | None: ...
+
+    def _check_auto_unblock(self, task_id: str) -> None: ...
+
+    def _on_task_done(self, task_id: str, actor: str) -> None: ...
+
+    def get(self, task_id: str) -> Task: ...
+
 
 logger = logging.getLogger(__name__)
 
 
-def next_visit(service: "SQLiteWorkService", project: str, task_number: int, node_id: str) -> int:
+def next_visit(service: _WorkService, project: str, task_number: int, node_id: str) -> int:
     row = service._conn.execute(
         "SELECT COALESCE(MAX(visit), 0) AS max_v "
         "FROM work_node_executions "
@@ -33,7 +80,7 @@ def next_visit(service: "SQLiteWorkService", project: str, task_number: int, nod
     return row["max_v"] + 1
 
 
-def current_node_visit(service: "SQLiteWorkService", project: str, task_number: int, node_id: str) -> int:
+def current_node_visit(service: _WorkService, project: str, task_number: int, node_id: str) -> int:
     row = service._conn.execute(
         "SELECT COALESCE(MAX(visit), 0) AS max_v "
         "FROM work_node_executions "
@@ -44,7 +91,7 @@ def current_node_visit(service: "SQLiteWorkService", project: str, task_number: 
 
 
 def advance_to_node(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     task: Task,
     flow: FlowTemplate,
     next_node_id: str | None,
@@ -113,7 +160,7 @@ def advance_to_node(
     )
 
 
-def on_task_done(service: "SQLiteWorkService", task_id: str, actor: str) -> None:
+def on_task_done(service: _WorkService, task_id: str, actor: str) -> None:
     try:
         from pollypm.notification_staging import check_and_flush_on_done
 
@@ -169,7 +216,7 @@ def on_task_done(service: "SQLiteWorkService", task_id: str, actor: str) -> None
 
 
 def on_task_transition(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     task_id: str,
     from_state: str,
     to_state: str,
@@ -200,7 +247,7 @@ def on_task_transition(
             )
 
 
-def mark_done(service: "SQLiteWorkService", task_id: str, actor: str):
+def mark_done(service: _WorkService, task_id: str, actor: str) -> Task:
     task = service.get(task_id)
     if task.work_status in TERMINAL_STATUSES:
         raise InvalidTransitionError(

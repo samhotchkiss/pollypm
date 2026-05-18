@@ -1267,6 +1267,128 @@ def test_banner_celebrates_with_only_task_id_when_title_missing() -> None:
     assert "coffeeboardnm/1" in banner
 
 
+def test_banner_plan_on_disk_overrides_press_c_to_plan(tmp_path) -> None:
+    """#1710 — when a ``plan_missing`` alert fires AND no
+    ``plan_task_summary`` reached the backstop matcher BUT the plan
+    file is on disk (canonical or worktree fallback from #1709), the
+    banner must celebrate the handoff and advertise ``p`` / ``A``
+    instead of nagging Sam to "Press c to plan this project."
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n\n## Goals\n\nShip v1.\n", encoding="utf-8")
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["plan_missing"],
+        active_worker=None,
+        task_counts={"queued": 9, "blocked": 2},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary=None,
+        persona_name="Archie",
+        plan_path=plan_path,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    # The bug being fixed: never tell Sam to plan a project that's
+    # already been planned.
+    assert "Press c to plan" not in banner
+    # Celebratory copy + PM name.
+    assert "Plan ready" in banner
+    assert "Archie" in banner
+    # Affordances advertised in the issue body.
+    assert "press p" in banner.lower()
+    assert " A " in banner or "A to approve" in banner
+    # Task counts surface so Sam sees what's queued up.
+    assert "9 task" in banner
+    assert "2 blocked" in banner
+    # #1710 mirrors #1540 — no trailing "· 1 alert" on the soft state.
+    assert "1 alert" not in banner
+
+
+def test_banner_plan_on_disk_falls_through_for_other_alerts(
+    tmp_path,
+) -> None:
+    """#1710 — the plan-on-disk celebratory CTA must only kick in for
+    pure ``plan_missing`` alerts. A genuine alert family (e.g.
+    ``worker_question``) must still route to the regular "press a"
+    banner, even if a plan happens to be on disk.
+    """
+    from types import SimpleNamespace
+
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    plan_path = tmp_path / "plan.md"
+    plan_path.write_text("# Plan\n", encoding="utf-8")
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    fake_data = SimpleNamespace(
+        action_items=[],
+        alert_count=1,
+        alert_types=["worker_question"],
+        active_worker=None,
+        task_counts={"queued": 1},
+        task_buckets={"on_hold": [], "review": []},
+        inbox_count=0,
+        plan_task_summary=None,
+        persona_name="Archie",
+        plan_path=plan_path,
+    )
+    banner = app._render_project_state_banner(fake_data, "▸ 1 alert")
+    # Must not borrow plan-ready copy for an unrelated alert family.
+    assert "Plan ready" not in banner
+    # Worker-question banner still routes via the legacy ``a`` action.
+    assert "press a" in banner.lower()
+
+
+def test_status_pill_plan_ready_when_plan_on_disk_without_summary() -> None:
+    """#1710 — the project status pill must read ``◆ plan ready``
+    (green) when a ``plan_missing`` alert fires with no
+    ``plan_task_summary`` but the plan IS on disk. Showing
+    ``◇ next step`` in that state contradicts the celebratory banner
+    introduced for the same bug.
+    """
+    from pollypm.cockpit_ui import _dashboard_status
+
+    dot, color, label = _dashboard_status(
+        active_worker=None,
+        inbox_count=0,
+        alert_count=1,
+        idle_minutes=None,
+        plan_task_summary=None,
+        alert_types=["plan_missing"],
+        plan_on_disk=True,
+    )
+    assert label == "plan ready"
+    assert color == "#3ddc84"
+    assert dot == "◆"
+
+
+def test_status_pill_still_next_step_without_plan_on_disk() -> None:
+    """#1710 — the soft ``◇ next step`` pill stays in place for the
+    pre-plan case (no summary, no plan on disk). The new branch must
+    only activate when a plan file genuinely exists.
+    """
+    from pollypm.cockpit_ui import _dashboard_status
+
+    dot, color, label = _dashboard_status(
+        active_worker=None,
+        inbox_count=0,
+        alert_count=1,
+        idle_minutes=None,
+        plan_task_summary=None,
+        alert_types=["plan_missing"],
+        plan_on_disk=False,
+    )
+    assert label == "next step"
+    assert dot == "◇"
+
+
 def test_action_bar_soft_plan_missing_state_is_not_critical(
     dashboard_env, dashboard_app,
 ) -> None:

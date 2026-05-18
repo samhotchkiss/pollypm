@@ -5600,6 +5600,131 @@ def test_inbox_preview_splits_action_vs_info_items(dashboard_app) -> None:
     assert "Architect status update" in tail
 
 
+def test_inbox_preview_press_i_cta_suppressed_when_only_fyi_spillover(
+    dashboard_app,
+) -> None:
+    """#1650 — the ``Press i to jump to the inbox`` CTA must NOT print
+    when the only spillover under the rendered action cards is purely
+    informational (FYI / completed-update rows). The screen footer
+    already exposes the ``i`` keybinding, and the FYI rows are visible
+    inline — repeating the CTA is pure noise.
+
+    Setup: one action card represents the only action item; one FYI
+    row sits in ``inbox_top`` (an "Other open items" entry). The CTA
+    is redundant in this case.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        inbox_count=1,
+        task_counts={},
+        task_buckets={},
+        action_items=[
+            {
+                "task_id": "demo/1",
+                "primary_ref": "demo/1",
+                "title": "Approve scoped delivery",
+                "source": "message",
+                "needs_action": True,
+                "triage_label": "action required",
+                "user_prompt": {
+                    "summary": "One thing waiting.",
+                    "steps": ["Look at it"],
+                    "question": "Approve?",
+                    "actions": [
+                        {"label": "Approve", "kind": "approve_task",
+                         "task_id": "demo/1"},
+                    ],
+                },
+            },
+        ],
+        inbox_top=[
+            {
+                "task_id": "demo/1",
+                "primary_ref": "demo/1",
+                "title": "Approve scoped delivery",
+                "updated_at": "",
+                "triage_label": "action required",
+                "source": "message",
+                "needs_action": True,
+            },
+            {
+                "task_id": "demo/3",
+                "primary_ref": "demo/3",
+                "title": "SHIPPED — Built it",
+                "updated_at": "",
+                "triage_label": "completed update",
+                "source": "message",
+                "needs_action": False,
+            },
+        ],
+    )
+    rendered = dashboard_app._render_inbox_body(fake_data)
+    # The FYI row is still visible inline...
+    assert "SHIPPED — Built it" in rendered
+    assert "Other open items" in rendered
+    # ...but the redundant inbox-jump CTA is gone. The CTA renders
+    # with Rich markup (``Press [b]i[/b] to jump to the inbox``);
+    # match the prefix to avoid coupling to the markup format.
+    assert "to jump to the inbox" not in rendered, (
+        "redundant 'press i' hint printed when only FYI spillover: "
+        f"{rendered!r}"
+    )
+
+
+def test_inbox_preview_press_i_cta_kept_when_action_spillover(
+    dashboard_app,
+) -> None:
+    """#1650 sibling — keep the CTA when the spillover contains an
+    actionable item that the dashboard couldn't render as a card. The
+    user needs the pointer to discover the hidden action.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        inbox_count=2,
+        task_counts={},
+        task_buckets={},
+        action_items=[
+            {
+                "task_id": "demo/1",
+                "primary_ref": "demo/1",
+                "title": "Approve scoped delivery",
+                "source": "message",
+                "needs_action": True,
+                "triage_label": "action required",
+                "user_prompt": {
+                    "summary": "One thing waiting.",
+                    "steps": ["Look"],
+                    "question": "Approve?",
+                    "actions": [
+                        {"label": "Approve", "kind": "approve_task",
+                         "task_id": "demo/1"},
+                    ],
+                },
+            },
+        ],
+        inbox_top=[
+            {
+                "task_id": "demo/2",
+                "primary_ref": "demo/2",
+                "title": "Hidden action waiting",
+                "updated_at": "",
+                "triage_label": "action required",
+                "source": "task",
+                "needs_action": True,
+            },
+        ],
+    )
+    rendered = dashboard_app._render_inbox_body(fake_data)
+    # The CTA renders with Rich markup (``Press [b]i[/b] to jump to
+    # the inbox``); match a stable suffix.
+    assert "to jump to the inbox" in rendered, (
+        "CTA missing when actionable spillover exists: "
+        f"{rendered!r}"
+    )
+
+
 def test_action_response_controls_sit_under_their_own_card(
     dashboard_env, dashboard_app,
 ) -> None:

@@ -12,8 +12,9 @@ Contract:
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Protocol
 
 from pollypm.work.models import WorkerSessionRecord
 from pollypm.work.service_worker_sessions import (
@@ -27,15 +28,27 @@ from pollypm.work.service_worker_sessions import (
     upsert_worker_session,
 )
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+
+class _WorkService(Protocol):
+    """Structural slice of ``SQLiteWorkService`` used by the worker-session
+    helpers.
+
+    The helpers in :mod:`pollypm.work.service_worker_sessions` only reach
+    into ``service._conn`` to run the ``work_sessions`` DDL / CRUD. Typing
+    against this Protocol lets the manager annotate ``service`` without a
+    back-edge ``TYPE_CHECKING`` import of :class:`SQLiteWorkService`,
+    which breaks the ``service_worker_session_manager`` <->
+    ``sqlite_service`` cycle (#1367).
+    """
+
+    _conn: sqlite3.Connection
 
 
 @dataclass(slots=True)
 class WorkSessionManager:
     """Facade for worker-session persistence."""
 
-    service: "SQLiteWorkService"
+    service: _WorkService
 
     WORK_SESSIONS_DDL = _WORK_SESSIONS_DDL
 

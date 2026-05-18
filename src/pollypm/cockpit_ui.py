@@ -103,6 +103,9 @@ from pollypm.cockpit_settings_account_reassign import (  # noqa: F401  (re-expor
 from pollypm.cockpit_settings_confirm import (  # noqa: F401  (re-exported)
     _SettingsConfirmModal,
 )
+from pollypm.cockpit_inbox_rollup_item import (  # noqa: F401  (re-exported)
+    _RollupItem,
+)
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
     clear_live_chat_network_dead_notice,
@@ -7386,72 +7389,6 @@ def _extract_proposal_spec(task, *, labels: list[str] | None = None) -> dict:
     else:
         spec["description"] = body
     return spec
-
-
-class _RollupItem(ListItem):
-    """One sub-item in a rollup's expanded thread.
-
-    We inherit ListItem for consistent hover/click semantics, but the
-    widget lives inside a ``Vertical`` (not a ``ListView``), so it
-    behaves as a click target only — no cursor selection. Click emits a
-    ``Clicked`` message which the inbox app handles via ``on``.
-    """
-
-    def __init__(
-        self,
-        *,
-        index: int,
-        item: dict,
-        expanded: bool,
-        focused: bool,
-    ) -> None:
-        self.index = index
-        self.item = item
-        self.expanded = expanded
-        self._body = Static(self._build_text(), markup=True)
-        classes = ["rollup-item"]
-        if expanded:
-            classes.append("-expanded")
-        if focused:
-            classes.append("-focused")
-        super().__init__(self._body, classes=" ".join(classes))
-
-    def _build_text(self) -> str:
-        from pollypm.tz import format_relative
-        subject = self.item.get("subject") or "(no subject)"
-        created = self.item.get("created_at") or ""
-        age = format_relative(created) if created else ""
-        payload = self.item.get("payload") or {}
-        ref_bits: list[str] = []
-        for key in ("commit", "pr", "pull_request", "url"):
-            val = payload.get(key)
-            if val:
-                ref_bits.append(f"{key}={val}")
-        marker = "\u25bc" if self.expanded else "\u25b8"
-        header = f"[b]{marker} {_escape(subject)}[/b]"
-        if age:
-            header += f"  [dim]{_escape(age)}[/dim]"
-        lines = [header]
-        if ref_bits:
-            separator = " · "
-            lines.append(f"[dim]{_escape(separator.join(ref_bits))}[/dim]")
-        if self.expanded:
-            body = (self.item.get("body") or "").strip()
-            if body:
-                lines.append("")
-                lines.append(_md_to_rich(_escape_body(body)))
-            actor = self.item.get("actor") or ""
-            source_project = self.item.get("source_project") or ""
-            meta_bits: list[str] = []
-            if actor:
-                meta_bits.append(actor)
-            if source_project:
-                meta_bits.append(source_project)
-            if meta_bits:
-                lines.append("")
-                meta_separator = " · "
-                lines.append(f"[dim]{_escape(meta_separator.join(meta_bits))}[/dim]")
-        return "\n".join(lines)
 
 
 class _InboxListItem(ListItem):

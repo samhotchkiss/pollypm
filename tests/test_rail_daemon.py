@@ -10,6 +10,11 @@ path is covered by the end-to-end smoke test in the demo runbook.
 from __future__ import annotations
 
 import os
+import signal
+import subprocess
+import sys
+import textwrap
+import time
 from pathlib import Path
 
 import pytest
@@ -140,6 +145,97 @@ def test_acquire_lifetime_lock_creates_parent_dir(tmp_path: Path):
     assert fd is not None
     assert lock_path.exists()
     os.close(fd)
+
+
+# --- SIGTERM watchdog (#1591) ---------------------------------------------
+
+
+def _spawn_stuck_daemon_stub(grace_s: float) -> subprocess.Popen:
+    """Spawn a child that mimics the rail_daemon's SIGTERM-watchdog wiring
+    but with the main thread deliberately wedged inside an uninterruptible
+    loop — emulating the production case where the heartbeat ticker holds
+    the GIL inside a long sqlite call and the main thread's signal handler
+    can't run cleanup quickly.
+
+    The child arms the same watchdog/handler pattern rail_daemon uses, so
+    a SIGTERM should still cause the process to exit within ``grace_s``
+    seconds courtesy of the SIGKILL backstop. Without the backstop, the
+    child would survive indefinitely (it ignores the cleanup deadline).
+    """
+    script = textwrap.dedent(
+        f"""
+        import os, signal, sys, threading, time
+
+        GRACE = {grace_s!r}
+        stopping = {{"flag": False, "deadline": 0.0}}
+
+        def watchdog():
+            while not stopping["flag"]:
+                time.sleep(0.02)
+            remaining = max(0.0, stopping["deadline"] - time.monotonic())
+            time.sleep(remaining)
+            os.kill(os.getpid(), signal.SIGKILL)
+
+        def handler(signum, frame):
+            if not stopping["flag"]:
+                stopping["deadline"] = time.monotonic() + GRACE
+                stopping["flag"] = True
+
+        signal.signal(signal.SIGTERM, handler)
+        threading.Thread(target=watchdog, daemon=True).start()
+
+        # Tell parent we're ready.
+        sys.stdout.write("READY\\n")
+        sys.stdout.flush()
+
+        # Simulate "GIL held by C code" by busy-looping; even if the
+        # main thread checks the flag, never break out — only the
+        # SIGKILL backstop should end us.
+        while True:
+            time.sleep(60)
+            # If sleep is interrupted by the signal handler, just go
+            # back to sleeping — we intentionally do NOT honour the
+            # flag to prove the backstop works.
+        """
+    )
+    proc = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    # Wait for the child to install the handler.
+    assert proc.stdout is not None
+    ready = proc.stdout.readline()
+    assert ready.strip() == "READY", f"unexpected child stdout: {ready!r}"
+    return proc
+
+
+def test_sigterm_watchdog_kills_stuck_daemon():
+    """Issue #1591: a SIGTERM must terminate the daemon within the
+    grace window even when the main thread refuses to honour the
+    shutdown flag (simulating the sqlite-blocked production case)."""
+    proc = _spawn_stuck_daemon_stub(grace_s=0.5)
+    try:
+        proc.send_signal(signal.SIGTERM)
+        # Allow grace + small slack for the backstop to fire.
+        try:
+            rc = proc.wait(timeout=3.0)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=2.0)
+            pytest.fail(
+                "SIGTERM watchdog did not kill the process within 3s — "
+                "the SIGKILL backstop is not wired up correctly"
+            )
+        # SIGKILL produces -SIGKILL (negative) exit code on POSIX.
+        assert rc == -signal.SIGKILL, (
+            f"expected SIGKILL exit (-{int(signal.SIGKILL)}), got {rc}"
+        )
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2.0)
 
 
 def test_acquire_lifetime_lock_independent_of_pid_file(tmp_path: Path):

@@ -13,7 +13,11 @@ The daemon is a small ``while True: sleep()`` that:
 2. Writes its PID to ``~/.pollypm/rail_daemon.pid`` so ``pm up`` can
    detect an existing daemon and ``pm reset`` can stop it cleanly.
 3. Handles ``SIGTERM`` / ``SIGINT`` by calling ``CoreRail.stop()``
-   and removing the PID file.
+   and removing the PID file. A background watchdog thread escalates
+   to ``SIGKILL`` self if graceful shutdown doesn't complete within
+   ``_SIGTERM_WATCHDOG_GRACE`` seconds (#1591 — the chaos-primitive
+   ``pkill -f pollypm.rail_daemon`` is otherwise silently a no-op
+   when the ticker thread is holding the GIL inside a sqlite call).
 
 The rail's own ticker thread does the actual work — this process
 just keeps the Python interpreter alive so the thread can run.
@@ -27,6 +31,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -110,6 +115,13 @@ def _acquire_lifetime_lock(lock_path: Path) -> int | None:
 # garbage-collected. Closing the fd releases the flock, so we MUST hold
 # this reference for as long as the daemon is running.
 _LIFETIME_LOCK_FD: int | None = None
+
+# #1591 — SIGTERM watchdog deadline. The signal handler arms this so a
+# background thread can SIGKILL the process if graceful shutdown stalls
+# (e.g. ``rail.stop()`` blocked behind a long sqlite call that the
+# ticker thread is holding the GIL for). Module-global so tests can
+# override the grace window via ``_SIGTERM_WATCHDOG_GRACE``.
+_SIGTERM_WATCHDOG_GRACE: float = 2.0
 
 
 def _claim_pid_file(pid_path: Path) -> bool:
@@ -253,14 +265,80 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
         pid_path.unlink(missing_ok=True)
         return 2
 
-    stopping = {"flag": False}
+    stopping = {"flag": False, "deadline": 0.0}
+
+    def _fast_exit_watchdog() -> None:
+        """Backstop: SIGKILL ourselves if graceful shutdown stalls.
+
+        Python signal handlers run only at bytecode checkpoints in the
+        main thread, and ``rail.stop()`` itself can block behind a
+        long-running sqlite call that the heartbeat ticker thread is
+        executing under the GIL. Without this backstop, ``pkill -f
+        pollypm.rail_daemon`` (default SIGTERM) is silently a no-op —
+        the daemon stays alive at 100%+ CPU until the operator escalates
+        to ``-9``. That broke #1591's chaos-test primitive and any
+        supervisor path that uses SIGTERM-then-respawn.
+
+        We watch ``stopping['deadline']`` on a tight loop; when the
+        signal handler arms it, we sleep until that wall-clock instant
+        and then SIGKILL ourselves regardless of where the main thread
+        is stuck.
+        """
+        # Sleep until the signal handler arms a deadline.
+        while not stopping["flag"]:
+            time.sleep(0.05)
+        # Honour any deadline set by the handler, then escalate.
+        now = time.monotonic()
+        remaining = max(0.0, stopping["deadline"] - now)
+        time.sleep(remaining)
+        # Last chance — if we got here we exceeded the grace window.
+        logger.warning(
+            "rail_daemon: graceful shutdown exceeded %.1fs grace — SIGKILL self",
+            _SIGTERM_WATCHDOG_GRACE,
+        )
+        try:
+            os.kill(os.getpid(), signal.SIGKILL)
+        except OSError:
+            # Belt + braces: if SIGKILL self somehow fails, fall through
+            # to os._exit so we still leave the process table.
+            os._exit(137)
 
     def _shutdown(signum: int, _frame: object) -> None:
-        logger.info("rail_daemon: received signal %d — shutting down", signum)
-        stopping["flag"] = True
+        # Re-entry safe: if a second signal arrives while we're already
+        # winding down, just refresh the deadline rather than reset it.
+        if not stopping["flag"]:
+            logger.info(
+                "rail_daemon: received signal %d — shutting down "
+                "(SIGKILL backstop in %.1fs)",
+                signum, _SIGTERM_WATCHDOG_GRACE,
+            )
+            stopping["deadline"] = time.monotonic() + _SIGTERM_WATCHDOG_GRACE
+            stopping["flag"] = True
+        # Best-effort: interrupt any in-flight sqlite call on this
+        # process's state-store connection so ``rail.stop()`` can make
+        # progress. The heartbeat ticker may be holding the GIL inside
+        # a long ``sqlite3_step``; ``Connection.interrupt`` is one of
+        # the few sqlite APIs documented as safe to call from another
+        # thread / signal handler.
+        try:
+            store = rail.get_state_store()
+            conn = getattr(store, "_conn", None)
+            if conn is not None:
+                conn.interrupt()
+        except Exception:  # noqa: BLE001 — best-effort
+            pass
 
     signal.signal(signal.SIGTERM, _shutdown)
     signal.signal(signal.SIGINT, _shutdown)
+
+    # Start the watchdog before rail.start() so a SIGTERM during boot
+    # still gets the SIGKILL backstop. Daemon=True so it never blocks
+    # interpreter shutdown.
+    threading.Thread(
+        target=_fast_exit_watchdog,
+        name="rail_daemon-sigterm-watchdog",
+        daemon=True,
+    ).start()
 
     def _cleanup() -> None:
         try:
@@ -294,9 +372,18 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     )
 
     # The rail's internal ticker thread does the work; we just keep
-    # the interpreter alive so the thread can run.
+    # the interpreter alive so the thread can run. Short slices (rather
+    # than ``time.sleep(poll_interval)``) keep us responsive to signals
+    # even if some platform / libc quirk swallows the EINTR wakeup —
+    # POSIX *should* interrupt the sleep on SIGTERM, but #1591 showed
+    # the daemon can be unkillable in practice, so we don't rely on it.
+    deadline = time.monotonic() + poll_interval
     while not stopping["flag"]:
-        time.sleep(poll_interval)
+        slice_s = min(0.5, max(0.0, deadline - time.monotonic()))
+        if slice_s <= 0:
+            deadline = time.monotonic() + poll_interval
+            continue
+        time.sleep(slice_s)
 
     return 0
 

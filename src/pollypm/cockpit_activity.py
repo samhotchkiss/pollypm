@@ -352,6 +352,15 @@ class PollyActivityFeedApp(App[None]):
         self._open_entry_id: str | None = None
         self._follow_on: bool = False
         self._follow_timer = None
+        # #1649 — cold-boot off-thread gather. ``_initial_load_running``
+        # gates the follow-mode tick + manual refresh so we don't race
+        # the worker's ``call_from_thread`` completion against a parallel
+        # sync gather. ``_initial_load_done`` flips to True after the
+        # first gather completes (success or failure) so subsequent
+        # refresh calls fall back to the synchronous path used by tests
+        # that monkeypatch ``_gather``.
+        self._initial_load_running: bool = False
+        self._initial_load_done: bool = False
 
     def _load_config(self):
         if self._config is None:
@@ -374,7 +383,15 @@ class PollyActivityFeedApp(App[None]):
         self.detail.display = False
         self.filter_input.value = self._filter_fuzzy
         self.table.focus()
-        self._refresh()
+        # #1649 — initial activity-feed gather opens the events DB and
+        # projects entries on the Textual asyncio main thread, blocking
+        # the first paint while sqlite IO finishes. Paint a "Loading
+        # activity…" skeleton immediately, then run ``_gather`` on a
+        # worker thread and apply the result back via
+        # ``call_from_thread``. Follow-mode ticks + manual refresh
+        # also go off-thread (see ``_refresh`` / ``_follow_tick``).
+        self._paint_loading_skeleton()
+        self._schedule_initial_load()
         # Alert toast surface removed in #956 — alerts already appear
         # as activity rows in the table below.
 
@@ -419,7 +436,73 @@ class PollyActivityFeedApp(App[None]):
             limit=self.INITIAL_LIMIT,
         )
 
-    def _refresh(self) -> None:
+    # ------------------------------------------------------------------
+    # Cold-boot + steady-state refresh (#1649). The activity feed
+    # gather opens sqlite + projects entries; running it on the main
+    # asyncio thread blocks first paint. Pattern mirrors #1605 (inbox)
+    # and #1653 (operator dashboard): paint a skeleton, dispatch a
+    # ``run_worker(thread=True)`` gather, marshal the result back via
+    # ``call_from_thread``.
+    # ------------------------------------------------------------------
+
+    def _paint_loading_skeleton(self) -> None:
+        """Render a minimal "Loading…" placeholder before any IO."""
+        try:
+            self.topbar.update("[b #eef6ff]Activity[/b #eef6ff]")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.counters.update("[dim]Loading activity…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _schedule_initial_load(self) -> None:
+        """Kick the cold-boot gather onto a worker thread."""
+        if self._initial_load_running:
+            return
+        self._initial_load_running = True
+        try:
+            self.run_worker(
+                self._gather_async_sync,
+                thread=True,
+                exclusive=True,
+                group="activity_feed_initial_load",
+            )
+        except Exception:  # noqa: BLE001
+            # Worker dispatch failure (unlikely outside teardown): fall
+            # back to the synchronous gather so the pane still loads.
+            self._initial_load_running = False
+            self._refresh_sync()
+
+    def _gather_async_sync(self) -> None:
+        """Worker-thread body: gather entries, hand back to UI thread."""
+        try:
+            entries = self._gather()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._initial_load_failed, str(exc))
+            return
+        self.call_from_thread(self._initial_load_completed, list(entries))
+
+    def _initial_load_completed(self, entries: list) -> None:
+        self._initial_load_running = False
+        self._initial_load_done = True
+        self._entries = entries[: self.MAX_ROWS_IN_MEMORY]
+        self._render()
+
+    def _initial_load_failed(self, error: str) -> None:
+        self._initial_load_running = False
+        self._initial_load_done = True
+        try:
+            self.topbar.update(
+                f"[#ff5f6d]Error loading activity:[/#ff5f6d] {_escape(error)}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _refresh_sync(self) -> None:
+        """Synchronous gather + render (fallback path used on worker
+        dispatch failure and by tests that drive ``_refresh`` directly
+        without spinning a pilot)."""
         try:
             entries = self._gather()
         except Exception as exc:  # noqa: BLE001
@@ -430,11 +513,81 @@ class PollyActivityFeedApp(App[None]):
         self._entries = list(entries)[: self.MAX_ROWS_IN_MEMORY]
         self._render()
 
+    def _refresh(self) -> None:
+        # Cold-boot worker still in flight — don't double-dispatch.
+        if self._initial_load_running:
+            return
+        # Once mounted, do refreshes off-thread too so a slow gather
+        # doesn't freeze the UI on a manual ``R`` press or follow tick.
+        if not self.is_running:
+            # Not yet mounted under a pilot/app loop — fall back to
+            # the synchronous path so __init__-time refreshes (tests)
+            # still work.
+            self._refresh_sync()
+            return
+        try:
+            self.run_worker(
+                self._refresh_async_sync,
+                thread=True,
+                exclusive=True,
+                group="activity_feed_refresh",
+            )
+        except Exception:  # noqa: BLE001
+            self._refresh_sync()
+
+    def _refresh_async_sync(self) -> None:
+        try:
+            entries = self._gather()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._refresh_failed, str(exc))
+            return
+        self.call_from_thread(self._refresh_completed, list(entries))
+
+    def _refresh_completed(self, entries: list) -> None:
+        self._entries = entries[: self.MAX_ROWS_IN_MEMORY]
+        self._render()
+
+    def _refresh_failed(self, error: str) -> None:
+        try:
+            self.topbar.update(
+                f"[#ff5f6d]Error loading activity:[/#ff5f6d] {_escape(error)}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     def _follow_tick(self) -> None:
+        # Don't stack a follow gather on top of an in-flight cold-boot
+        # or manual refresh worker.
+        if self._initial_load_running:
+            return
+        if not self.is_running:
+            self._follow_tick_sync()
+            return
+        try:
+            self.run_worker(
+                self._follow_tick_async_sync,
+                thread=True,
+                exclusive=True,
+                group="activity_feed_follow",
+            )
+        except Exception:  # noqa: BLE001
+            self._follow_tick_sync()
+
+    def _follow_tick_async_sync(self) -> None:
         try:
             fresh = self._gather()
         except Exception:  # noqa: BLE001
             return
+        self.call_from_thread(self._follow_tick_completed, list(fresh))
+
+    def _follow_tick_sync(self) -> None:
+        try:
+            fresh = self._gather()
+        except Exception:  # noqa: BLE001
+            return
+        self._follow_tick_completed(list(fresh))
+
+    def _follow_tick_completed(self, fresh: list) -> None:
         if not fresh:
             return
         seen = {entry.id for entry in self._entries}

@@ -773,6 +773,96 @@ def test_empty_feed_renders_without_crashing(
 
 
 # ---------------------------------------------------------------------------
+# 7b. Cold-boot skeleton + off-thread gather (#1649).
+# ---------------------------------------------------------------------------
+
+
+def test_first_paint_is_skeleton_before_gather_completes(
+    activity_env, activity_app,
+) -> None:
+    """Activity feed paints "Loading activity…" before the gather lands.
+
+    Models a slow ``_gather`` by parking it on a ``threading.Event`` and
+    asserts the skeleton + empty table render before the event is
+    released. If ``_gather`` ran on the main asyncio thread (the #1649
+    regression), the skeleton would never paint and the test would
+    deadlock on ``pilot.pause``.
+    """
+    import threading
+    import time
+
+    proceed = threading.Event()
+    started = threading.Event()
+
+    def slow_gather():
+        started.set()
+        # Cap the wait so a regression aborts the suite instead of
+        # hanging forever.
+        proceed.wait(timeout=10.0)
+        return [_make_entry(entry_id="evt:1", summary="late")]
+
+    activity_app._gather = slow_gather  # type: ignore[method-assign]
+
+    async def body() -> None:
+        t0 = time.monotonic()
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            await pilot.pause()
+            skeleton_elapsed = time.monotonic() - t0
+            counters_text = str(activity_app.counters.render())
+            assert "Loading activity" in counters_text, (
+                f"expected loading skeleton, got: {counters_text!r}"
+            )
+            assert activity_app.table.row_count == 0
+            assert skeleton_elapsed < 2.0, (
+                f"skeleton paint took {skeleton_elapsed*1000:.0f}ms — "
+                "first-paint regression"
+            )
+            # Release the slow gather so the worker can finish.
+            proceed.set()
+            for _ in range(50):
+                await pilot.pause()
+                if activity_app._entries:
+                    break
+            assert activity_app._entries, "gather never completed"
+            assert activity_app.table.row_count == 1
+            assert started.is_set()
+
+    _run(body())
+
+
+def test_initial_gather_runs_off_main_thread(
+    activity_env, activity_app,
+) -> None:
+    """The cold-boot ``_gather`` must run on a worker thread, not the
+    Textual main thread — otherwise sqlite IO would block first paint
+    (regression #1649)."""
+    import threading
+
+    thread_ids: list[int] = []
+    main_thread_id = threading.main_thread().ident
+
+    def recording_gather():
+        thread_ids.append(threading.get_ident())
+        return [_make_entry(entry_id="evt:1", summary="ok")]
+
+    activity_app._gather = recording_gather  # type: ignore[method-assign]
+
+    async def body() -> None:
+        async with activity_app.run_test(size=(160, 40)) as pilot:
+            for _ in range(30):
+                await pilot.pause()
+                if activity_app._entries:
+                    break
+            assert activity_app._entries, "gather never completed"
+            assert thread_ids, "gather never invoked"
+            assert all(tid != main_thread_id for tid in thread_ids), (
+                "gather ran on the main thread — would block first paint"
+            )
+
+    _run(body())
+
+
+# ---------------------------------------------------------------------------
 # 8. Project dashboard `l` keybinding routes activity:<project_key>.
 # ---------------------------------------------------------------------------
 

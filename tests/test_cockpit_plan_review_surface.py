@@ -643,6 +643,29 @@ class TestLoadPlanText:
         text = load_plan_text(proj)
         assert "introduce a new module to validate URLs" in text
 
+    def test_reads_plan_from_architect_worktree_when_main_absent(
+        self, tmp_path: Path,
+    ):
+        """#1620 — synthesize writes the plan into its session worktree
+        before the merge back to the project root lands. The cockpit
+        should surface the worktree copy so the plan-review surface is
+        readable as soon as the architect commits, not only after the
+        async merge."""
+        proj = tmp_path / "samblog"
+        proj.mkdir()
+        wt_dir = (
+            proj
+            / ".pollypm"
+            / "worktrees"
+            / "architect_samblog"
+            / "samblog-architect-architect_samblog"
+        )
+        (wt_dir / "docs" / "plan").mkdir(parents=True)
+        plan_in_wt = wt_dir / "docs" / "plan" / "plan.md"
+        plan_in_wt.write_text(SAMPLE_PLAN, encoding="utf-8")
+        text = load_plan_text(proj)
+        assert "introduce a new module to validate URLs" in text
+
 
 # ---------------------------------------------------------------------------
 # Orchestrator integration — _render_project_dashboard switches surfaces

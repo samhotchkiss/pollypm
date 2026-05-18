@@ -8437,7 +8437,17 @@ class PollyInboxApp(App[None]):
             self.filter_bar.display = False
             self.filter_chips.display = False
         self._set_filter_bridge_active(False)
-        self._refresh_list(select_first=True)
+        # #1594 — initial inbox load opens 12+ per-project sqlite DBs
+        # synchronously, blocking the Textual main thread for ~10s and
+        # leaving the rail user staring at a blank pane. Mirror the
+        # operator/project dashboard pattern: paint a "Loading…"
+        # skeleton immediately, then run ``_load_inbox`` on a worker
+        # thread and swap in the real list when it lands. Scope is
+        # the cold-boot path only; steady-state ``_background_refresh``
+        # still runs on the UI thread (#1587 territory).
+        self._initial_load_running = False
+        self._render_loading_skeleton()
+        self._schedule_initial_load()
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
         self.list_view.focus()
         # Alert toast surface removed in #956 — alerts still appear in
@@ -8820,6 +8830,118 @@ class PollyInboxApp(App[None]):
             bits.append(f"filters: {desc}")
         self.status.update(" \u00b7 ".join(bits))
 
+    # ------------------------------------------------------------------
+    # Initial load (#1594) — off-thread cold-boot so the pane paints in
+    # <1s instead of blocking on 12+ per-project sqlite opens.
+    # ------------------------------------------------------------------
+
+    def _render_loading_skeleton(self) -> None:
+        """Paint a 'Loading…' placeholder until the worker hands back data.
+
+        Mirrors the operator dashboard's ``Loading operator dashboard…``
+        treatment. Stays minimal: a single disabled list row + a status
+        line, so the swap-in is a clean replacement rather than a layout
+        shift. The detail pane intentionally stays empty until selection
+        lands; populating it here would just flash.
+        """
+        try:
+            self.list_view.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.list_view.append(
+                ListItem(
+                    Static("Loading inbox…", classes="inbox-empty"),
+                    disabled=True,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.detail.update("[dim]Loading inbox…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.status.update("[dim]Loading inbox…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _schedule_initial_load(self) -> None:
+        """Kick the cold-boot inbox gather onto a worker thread."""
+        if getattr(self, "_initial_load_running", False):
+            return
+        self._initial_load_running = True
+        try:
+            self.run_worker(
+                self._initial_load_sync,
+                thread=True,
+                exclusive=True,
+                group="inbox_initial_load",
+            )
+        except Exception:  # noqa: BLE001
+            # Worker dispatch failed (unlikely outside teardown); fall
+            # back to the synchronous path so the pane still loads.
+            self._initial_load_running = False
+            try:
+                self._refresh_list(select_first=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _initial_load_sync(self) -> None:
+        """Off-thread gather; hands results back to the UI thread."""
+        try:
+            tasks, unread, replies_by_task = self._load_inbox()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._initial_load_failed, str(exc))
+            return
+        self.call_from_thread(
+            self._initial_load_completed, tasks, unread, replies_by_task,
+        )
+
+    def _initial_load_completed(
+        self,
+        tasks: list,
+        unread: set,
+        replies_by_task: dict,
+    ) -> None:
+        self._initial_load_running = False
+        self._tasks = tasks
+        self._unread_ids = unread
+        self._replies_by_task = replies_by_task
+        active_thread_ids = {
+            task.task_id for task in tasks if replies_by_task.get(task.task_id)
+        }
+        self._thread_expanded_task_ids.intersection_update(active_thread_ids)
+        # Prime the signature cache so the next ``_background_refresh``
+        # tick can short-circuit on unchanged state (#752).
+        self._last_inbox_signature = self._inbox_content_signature(
+            tasks, unread, replies_by_task,
+        )
+        try:
+            self._render_list(select_first=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _initial_load_failed(self, error: str) -> None:
+        self._initial_load_running = False
+        try:
+            self.list_view.clear()
+            self.list_view.append(
+                ListItem(
+                    Static(
+                        f"Error loading inbox: {error}",
+                        classes="inbox-empty",
+                    ),
+                    disabled=True,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.status.update(f"[#ff5f6d]Error: {_escape(error)}[/#ff5f6d]")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _background_refresh(self) -> None:
         """Periodic re-read; don't stomp the current cursor position.
 
@@ -8832,6 +8954,11 @@ class PollyInboxApp(App[None]):
         would care about: task state, replies, unread set, filter
         state, filter chips.
         """
+        # #1594 — skip when the cold-boot worker hasn't finished yet,
+        # so we don't race its ``call_from_thread`` completion with a
+        # parallel sync gather and double-render the list.
+        if getattr(self, "_initial_load_running", False):
+            return
         try:
             tasks, unread, replies_by_task = self._load_inbox()
         except Exception:  # noqa: BLE001

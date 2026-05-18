@@ -675,6 +675,182 @@ def send(
     typer.echo(f"Sent input to {session_name}")
 
 
+def _validate_user_prompt_payload(user_prompt_json: str) -> dict[str, object] | None:
+    """Parse and validate ``--user-prompt-json`` for ``pm notify`` (#1356 wedge).
+
+    Returns the parsed payload dict when the caller supplied a non-empty
+    JSON string, ``None`` when ``user_prompt_json`` is empty/whitespace.
+    Emits the same producer-side errors and raises ``typer.Exit(1)`` on
+    contract violations so the operator sees the failure immediately
+    instead of in the dashboard pane hours later. Extracted verbatim from
+    :func:`notify` to keep the parent body under the 200-LOC threshold;
+    see issue #1356.
+    """
+    if not user_prompt_json.strip():
+        return None
+    try:
+        parsed_prompt = json.loads(user_prompt_json)
+    except json.JSONDecodeError as exc:
+        typer.echo(f"Error: --user-prompt-json is not valid JSON: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    if not isinstance(parsed_prompt, dict):
+        typer.echo(
+            "Error: --user-prompt-json must decode to an object.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    # The dashboard contract requires at least one of summary,
+    # steps (or required_actions), or question — otherwise the
+    # rendered Action Needed card has nothing to show and the
+    # caller is sending a structurally-empty payload that
+    # silently degrades to the heuristic fallback. Catch this
+    # at the producer so the operator sees the contract failure
+    # immediately instead of in the dashboard pane hours later.
+    has_summary = bool(str(parsed_prompt.get("summary") or "").strip())
+    has_question = bool(str(parsed_prompt.get("question") or "").strip())
+    raw_steps = (
+        parsed_prompt.get("steps") or parsed_prompt.get("required_actions") or []
+    )
+    has_steps = isinstance(raw_steps, list) and any(
+        str(step).strip() for step in raw_steps
+    )
+    if not (has_summary or has_question or has_steps):
+        typer.echo(
+            "Error: --user-prompt-json must include at least one of "
+            "'summary', 'steps' (or 'required_actions'), or "
+            "'question' — those are the fields the dashboard "
+            "Action Needed card renders. Empty payloads degrade "
+            "to body heuristics and are indistinguishable from "
+            "omitting the flag entirely.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    # Each ``action`` must use one of the dispatch identifiers
+    # the dashboard's _perform_dashboard_action understands.
+    # Unknown kinds silently fall through to the generic
+    # record-response path, so the operator clicks a button
+    # labelled 'Approve' and nothing actually approves —
+    # exactly the symptom the v1 doc flagged. Reject at the
+    # producer so typos and outdated kind names surface
+    # immediately.
+    raw_actions = parsed_prompt.get("actions") or []
+    if isinstance(raw_actions, list):
+        for idx, raw_action in enumerate(raw_actions):
+            if not isinstance(raw_action, dict):
+                typer.echo(
+                    f"Error: --user-prompt-json action[{idx}] "
+                    f"must be an object with 'label' and 'kind' "
+                    f"keys, got {type(raw_action).__name__}.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            label_value = str(raw_action.get("label") or "").strip()
+            kind_value = str(raw_action.get("kind") or "").strip()
+            # An action without a label can't render a button, and
+            # an action without a kind can't dispatch on click —
+            # the dashboard's _user_prompt_decision drops both
+            # silently and falls back to default copy. Producer
+            # almost certainly meant to specify both.
+            if not label_value:
+                typer.echo(
+                    f"Error: --user-prompt-json action[{idx}] is "
+                    f"missing a non-empty 'label'. The dashboard "
+                    f"renders that as the button caption — "
+                    f"actions without one get silently dropped.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            if not kind_value:
+                typer.echo(
+                    f"Error: --user-prompt-json action[{idx}] "
+                    f"('label': {label_value!r}) is missing a "
+                    f"non-empty 'kind'. Supported kinds: "
+                    f"{', '.join(sorted(_USER_PROMPT_ACTION_KINDS))}.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+            if kind_value not in _USER_PROMPT_ACTION_KINDS:
+                typer.echo(
+                    f"Error: --user-prompt-json action[{idx}] "
+                    f"has unknown kind '{kind_value}'. Supported "
+                    f"kinds: "
+                    f"{', '.join(sorted(_USER_PROMPT_ACTION_KINDS))}. "
+                    f"Custom kinds silently fall back to "
+                    f"record-response in the dashboard, which is "
+                    f"almost never the producer's intent.",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
+    return parsed_prompt
+
+
+def _create_notify_inbox_task(
+    *,
+    db_path: Path,
+    message_id: object,
+    subject: str,
+    body: str,
+    project: str,
+    actor: str,
+    requester_role: str,
+    label_list: list[str],
+    notify_kind: str,
+    payload: dict[str, object],
+) -> str:
+    """Create the inbox task for an immediate-priority ``pm notify``.
+
+    Extracted from :func:`notify` (#1356 wedge) to keep the parent body
+    under the 200-LOC threshold. Builds the work-service task, refreshes
+    the originating message payload with the assigned ``task_id`` so the
+    dashboard can cross-link them, and returns the ``task_id``. Errors
+    are surfaced via ``typer.echo`` + ``typer.Exit(1)`` to match the
+    original inline behavior.
+    """
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.work import create_work_service
+
+    svc = create_work_service(
+        db_path=db_path,
+        project_path=db_path.parent.parent,
+    )
+    try:
+        task_labels = [
+            *label_list,
+            "notify",
+            f"notify_message:{message_id}",
+        ]
+        task = svc.create(
+            title=subject,
+            description=body,
+            type="task",
+            project=project,
+            flow_template="chat",
+            roles={
+                "requester": requester_role,
+                "operator": actor or "polly",
+            },
+            priority="high",
+            created_by=actor,
+            labels=task_labels,
+            kind=notify_kind,
+        )
+        inbox_task_id = task.task_id
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        try:
+            store.update_message(
+                message_id,
+                payload={**payload, "task_id": inbox_task_id},
+            )
+        finally:
+            store.close()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Failed to create inbox task: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    finally:
+        svc.close()
+    return inbox_task_id
+
+
 def _kind_for_notify(
     labels: list[str],
     *,
@@ -889,102 +1065,7 @@ def notify(
         if "channel:dev" not in label_list:
             label_list.append("channel:dev")
     milestone_key = milestone.strip() or None
-    user_prompt_payload: dict[str, object] | None = None
-    if user_prompt_json.strip():
-        try:
-            parsed_prompt = json.loads(user_prompt_json)
-        except json.JSONDecodeError as exc:
-            typer.echo(f"Error: --user-prompt-json is not valid JSON: {exc}", err=True)
-            raise typer.Exit(code=1) from exc
-        if not isinstance(parsed_prompt, dict):
-            typer.echo(
-                "Error: --user-prompt-json must decode to an object.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        # The dashboard contract requires at least one of summary,
-        # steps (or required_actions), or question — otherwise the
-        # rendered Action Needed card has nothing to show and the
-        # caller is sending a structurally-empty payload that
-        # silently degrades to the heuristic fallback. Catch this
-        # at the producer so the operator sees the contract failure
-        # immediately instead of in the dashboard pane hours later.
-        has_summary = bool(str(parsed_prompt.get("summary") or "").strip())
-        has_question = bool(str(parsed_prompt.get("question") or "").strip())
-        raw_steps = (
-            parsed_prompt.get("steps") or parsed_prompt.get("required_actions") or []
-        )
-        has_steps = isinstance(raw_steps, list) and any(
-            str(step).strip() for step in raw_steps
-        )
-        if not (has_summary or has_question or has_steps):
-            typer.echo(
-                "Error: --user-prompt-json must include at least one of "
-                "'summary', 'steps' (or 'required_actions'), or "
-                "'question' — those are the fields the dashboard "
-                "Action Needed card renders. Empty payloads degrade "
-                "to body heuristics and are indistinguishable from "
-                "omitting the flag entirely.",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        # Each ``action`` must use one of the dispatch identifiers
-        # the dashboard's _perform_dashboard_action understands.
-        # Unknown kinds silently fall through to the generic
-        # record-response path, so the operator clicks a button
-        # labelled 'Approve' and nothing actually approves —
-        # exactly the symptom the v1 doc flagged. Reject at the
-        # producer so typos and outdated kind names surface
-        # immediately.
-        raw_actions = parsed_prompt.get("actions") or []
-        if isinstance(raw_actions, list):
-            for idx, raw_action in enumerate(raw_actions):
-                if not isinstance(raw_action, dict):
-                    typer.echo(
-                        f"Error: --user-prompt-json action[{idx}] "
-                        f"must be an object with 'label' and 'kind' "
-                        f"keys, got {type(raw_action).__name__}.",
-                        err=True,
-                    )
-                    raise typer.Exit(code=1)
-                label_value = str(raw_action.get("label") or "").strip()
-                kind_value = str(raw_action.get("kind") or "").strip()
-                # An action without a label can't render a button, and
-                # an action without a kind can't dispatch on click —
-                # the dashboard's _user_prompt_decision drops both
-                # silently and falls back to default copy. Producer
-                # almost certainly meant to specify both.
-                if not label_value:
-                    typer.echo(
-                        f"Error: --user-prompt-json action[{idx}] is "
-                        f"missing a non-empty 'label'. The dashboard "
-                        f"renders that as the button caption — "
-                        f"actions without one get silently dropped.",
-                        err=True,
-                    )
-                    raise typer.Exit(code=1)
-                if not kind_value:
-                    typer.echo(
-                        f"Error: --user-prompt-json action[{idx}] "
-                        f"('label': {label_value!r}) is missing a "
-                        f"non-empty 'kind'. Supported kinds: "
-                        f"{', '.join(sorted(_USER_PROMPT_ACTION_KINDS))}.",
-                        err=True,
-                    )
-                    raise typer.Exit(code=1)
-                if kind_value not in _USER_PROMPT_ACTION_KINDS:
-                    typer.echo(
-                        f"Error: --user-prompt-json action[{idx}] "
-                        f"has unknown kind '{kind_value}'. Supported "
-                        f"kinds: "
-                        f"{', '.join(sorted(_USER_PROMPT_ACTION_KINDS))}. "
-                        f"Custom kinds silently fall back to "
-                        f"record-response in the dashboard, which is "
-                        f"almost never the producer's intent.",
-                        err=True,
-                    )
-                    raise typer.Exit(code=1)
-        user_prompt_payload = parsed_prompt
+    user_prompt_payload = _validate_user_prompt_payload(user_prompt_json)
 
     # The dashboard has a heuristic fallback when producers omit
     # ``--user-prompt-json``. Keep that fallback quiet by default:
@@ -1101,47 +1182,18 @@ def notify(
 
     inbox_task_id: str | None = None
     if resolved_priority == "immediate":
-        from pollypm.work import create_work_service
-
-        svc = create_work_service(
+        inbox_task_id = _create_notify_inbox_task(
             db_path=db_path,
-            project_path=db_path.parent.parent,
+            message_id=message_id,
+            subject=subject,
+            body=body,
+            project=project,
+            actor=actor,
+            requester_role=requester_role,
+            label_list=label_list,
+            notify_kind=notify_kind,
+            payload=payload,
         )
-        try:
-            task_labels = [
-                *label_list,
-                "notify",
-                f"notify_message:{message_id}",
-            ]
-            task = svc.create(
-                title=subject,
-                description=body,
-                type="task",
-                project=project,
-                flow_template="chat",
-                roles={
-                    "requester": requester_role,
-                    "operator": actor or "polly",
-                },
-                priority="high",
-                created_by=actor,
-                labels=task_labels,
-                kind=notify_kind,
-            )
-            inbox_task_id = task.task_id
-            store = SQLAlchemyStore(f"sqlite:///{db_path}")
-            try:
-                store.update_message(
-                    message_id,
-                    payload={**payload, "task_id": inbox_task_id},
-                )
-            finally:
-                store.close()
-        except Exception as exc:  # noqa: BLE001
-            typer.echo(f"Failed to create inbox task: {exc}", err=True)
-            raise typer.Exit(code=1) from exc
-        finally:
-            svc.close()
 
     _hold_review_tasks_for_notify(
         actor=actor,

@@ -889,7 +889,15 @@ def test_status_green_when_worker_heartbeat_alive(
         )
 
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            # #1643 — wait for the secondary pass; ``active_worker`` is
+            # populated by ``_first_refresh_secondary_completed``.
+            for _ in range(30):
+                await pilot.pause()
+                if (
+                    dashboard_app.data is not None
+                    and dashboard_app.data.active_worker is not None
+                ):
+                    break
             assert dashboard_app.data is not None
             assert dashboard_app.data.active_worker == fake_worker
             assert dashboard_app.data.status_label == "active"
@@ -2175,7 +2183,19 @@ def test_current_activity_calls_out_user_decision_when_only_architect_active(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
+            # #1643 — the dashboard renders in two passes: the fast pass
+            # (tasks + inbox + plan) lands first, the secondary pass
+            # (active_worker + activity entries) lands a beat later.
+            # ``active_worker`` is set by the secondary pass, so wait
+            # for it explicitly instead of asserting on the fast-pass
+            # snapshot.
+            for _ in range(30):
+                await pilot.pause()
+                if (
+                    dashboard_app.data is not None
+                    and dashboard_app.data.active_worker is not None
+                ):
+                    break
             assert dashboard_app.data is not None
             assert dashboard_app.data.active_worker is not None
             assert dashboard_app.data.action_items
@@ -2226,7 +2246,15 @@ def test_current_activity_keeps_session_name_when_distinct_from_role(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            # #1643 — wait for the secondary pass; the now_body
+            # renders the session name from ``active_worker``.
+            for _ in range(30):
+                await pilot.pause()
+                if (
+                    dashboard_app.data is not None
+                    and dashboard_app.data.active_worker is not None
+                ):
+                    break
             rendered = str(dashboard_app.now_body.render())
             # Both bits of identity survive when they're distinct.
             assert "task-demo-7" in rendered
@@ -3178,7 +3206,15 @@ def test_status_pill_prefers_user_attention_over_active_worker(
 
     async def body() -> None:
         async with dashboard_app.run_test(size=(140, 50)) as pilot:
-            await pilot.pause()
+            # #1643 — wait for the secondary pass that sets
+            # ``active_worker``; see ``_first_refresh_sync``.
+            for _ in range(30):
+                await pilot.pause()
+                if (
+                    dashboard_app.data is not None
+                    and dashboard_app.data.active_worker is not None
+                ):
+                    break
             assert dashboard_app.data is not None
             assert dashboard_app.data.active_worker is not None
             assert dashboard_app.data.inbox_count >= 1
@@ -4484,7 +4520,15 @@ def test_recent_activity_renders_feed_entries(
         )
 
         async with dashboard_app.run_test(size=(160, 60)) as pilot:
-            await pilot.pause()
+            # #1643 — wait for the secondary pass; ``activity_entries``
+            # is populated by ``_first_refresh_secondary_completed``.
+            for _ in range(30):
+                await pilot.pause()
+                if (
+                    dashboard_app.data is not None
+                    and dashboard_app.data.activity_entries
+                ):
+                    break
             assert dashboard_app.data is not None
             assert len(dashboard_app.data.activity_entries) == 10
             rendered = str(dashboard_app.activity_body.render())
@@ -5859,27 +5903,35 @@ def test_inbox_section_hides_action_groups_when_no_action_items(
 def test_gather_project_dashboard_completes_under_budget(
     dashboard_env, monkeypatch,
 ) -> None:
-    """Cold ``_gather_project_dashboard`` must finish under 500ms (#1290).
+    """Cold fast-pass ``_gather_project_dashboard_fast`` must finish under 500ms.
 
-    Regression for #1290: the cockpit drilldown felt sluggish (3.6–8.0s)
-    because ``_dashboard_active_worker`` called
+    Regression for #1290 + #1643: the cockpit drilldown felt sluggish
+    (3.6–8.0s) because ``_dashboard_active_worker`` called
     ``supervisor.plan_launches()``, which resolves provider profiles,
     scans the rules catalog, and writes session manifests for every
     enabled session — all to surface the worker name + role on the
-    drilldown banner. Profiling pinned ~380ms of the 510ms budget on
-    that one call. Now we enumerate ``config.sessions`` directly and
-    skip the launch-plan pipeline entirely.
+    drilldown banner. #1290 fixed the launch-pipeline call. #1643 split
+    the gather into two passes after the activity-feed projection +
+    supervisor open_alerts re-bloated total gather time past the budget
+    on cold SQLite DBs.
+
+    The 500ms budget now lives on the *fast* path —
+    :func:`_gather_project_dashboard_fast` — which is what the user
+    sees first via ``_first_refresh_sync``. The activity-feed + worker
+    classification fields fold in via the secondary pass, which is not
+    budgeted under 500ms because the operator already has content
+    rendered by then.
 
     The fixture is intentionally scaled: 30 dummy sessions are written
-    to the config so the *old* code path would have done 30x the
-    profile / catalog work. The new path skips that pipeline so the
-    session count barely moves the needle. Threshold is 500ms — well
-    under the 1000ms acceptance bar — so a regression that re-introduces
-    plan_launches-style work shows up clearly.
+    to the config so the *old* (#1290) code path would have done 30x
+    the profile / catalog work. The fast path skips
+    ``_dashboard_active_worker`` entirely, so the session count is
+    irrelevant — the assertion catches regressions that re-introduce
+    plan_launches-style work in the fast pass.
     """
     import time as _time
 
-    from pollypm.cockpit_ui import _gather_project_dashboard
+    from pollypm.cockpit_ui import _gather_project_dashboard_fast
 
     # Re-write the config with many enabled sessions on the project so
     # the worker-enumeration path has real work to do.
@@ -5925,7 +5977,7 @@ def test_gather_project_dashboard_completes_under_budget(
 
     # Warm every module that the function imports lazily so the timed
     # call measures *work*, not first-import overhead.
-    _gather_project_dashboard(config_path, "demo")
+    _gather_project_dashboard_fast(config_path, "demo")
     for cache_name in (
         "_PROJECT_DASHBOARD_TASK_CACHE",
         "_DASHBOARD_INBOX_CACHE",
@@ -5937,14 +5989,16 @@ def test_gather_project_dashboard_completes_under_budget(
             cache.clear()
 
     t0 = _time.perf_counter()
-    data = _gather_project_dashboard(config_path, "demo")
+    data = _gather_project_dashboard_fast(config_path, "demo")
     elapsed_ms = (_time.perf_counter() - t0) * 1000
 
     assert data is not None
     assert elapsed_ms < 500.0, (
-        f"_gather_project_dashboard took {elapsed_ms:.0f}ms with 30 "
-        f"sessions configured — exceeds 500ms budget. Likely regression "
-        f"of #1290 (worker enumeration re-running the launch pipeline)."
+        f"_gather_project_dashboard_fast took {elapsed_ms:.0f}ms with 30 "
+        f"sessions configured — exceeds 500ms first-paint budget (#1643). "
+        f"Likely regression of #1290 (worker enumeration re-running the "
+        f"launch pipeline) or activity-feed projection leaking into the "
+        f"fast pass."
     )
 
 

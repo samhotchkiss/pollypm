@@ -123,8 +123,20 @@ class _WorkServiceLike(Protocol):
 # category. Tasks parked on user-waiting statuses
 # (``waiting_on_user`` / ``on_hold`` / ``blocked`` / ``review``) do
 # NOT count as working — they're either user-waiting (covered by the
-# inbox predicate) or stalled (which is not "system is acting").
+# inbox predicate or the ``_WAITING_TASK_STATUSES`` check below) or
+# stalled (which is not "system is acting").
 _WORKING_TASK_STATUSES: frozenset[str] = frozenset({"in_progress", "rework"})
+
+# Task statuses where the user is the next-action owner. An ``on_hold``
+# root task blocks downstream work and reads on the project dashboard
+# as "◆ needs attention" — the user must decide to resume or cancel.
+# #1542 — the rail used to roll these up to IDLE (``○``) because they
+# weren't in ``_WORKING_TASK_STATUSES`` and there was no inbox item
+# tracking them, so the rail glyph contradicted the dashboard banner
+# on the same project key (cf. ``media``: rail says quiet, dashboard
+# says please-look-at-me). Promote ``on_hold`` to WAITING so both
+# surfaces read the same.
+_WAITING_TASK_STATUSES: frozenset[str] = frozenset({"on_hold"})
 
 
 def _project_of(item: _InboxItem) -> str:
@@ -179,6 +191,22 @@ def categorize_project(
         return ProjectState.WAITING
 
     try:
+        tasks = work_service.list_tasks(project=project_key)
+    except Exception:  # noqa: BLE001
+        tasks = []
+
+    # #1542 — an ``on_hold`` task makes the project ◆ "needs attention"
+    # on the dashboard banner; mirror that priority here so the rail
+    # glyph doesn't paint ``○`` (quiet) while the dashboard paints ◆.
+    # Checked BEFORE the live-worker branch because a paused root with
+    # a background worker still active reads as user-owed on the
+    # dashboard pill (``_dashboard_status``: ``on_hold_count`` outranks
+    # active_worker).
+    for task in tasks:
+        if _task_status(task) in _WAITING_TASK_STATUSES:
+            return ProjectState.WAITING
+
+    try:
         live_workers = work_service.list_worker_sessions(
             project=project_key, active_only=True,
         )
@@ -187,10 +215,6 @@ def categorize_project(
     if live_workers:
         return ProjectState.WORKING
 
-    try:
-        tasks = work_service.list_tasks(project=project_key)
-    except Exception:  # noqa: BLE001
-        tasks = []
     for task in tasks:
         if _task_status(task) in _WORKING_TASK_STATUSES:
             return ProjectState.WORKING

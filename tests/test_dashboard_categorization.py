@@ -149,9 +149,35 @@ def test_categorize_idle_when_nothing_active() -> None:
     assert categorize_project("demo", work_service=svc) is ProjectState.IDLE
 
 
-def test_categorize_idle_when_only_waiting_status_tasks() -> None:
-    """Tasks parked on user-waiting statuses don't count as Working."""
+def test_categorize_waiting_when_task_on_hold() -> None:
+    """#1542 — ``on_hold`` tasks surface as WAITING so the rail glyph
+    matches the dashboard's ``◆ needs attention`` banner. A paused root
+    task is blocking downstream work — the user owes a resume-or-cancel
+    decision even if no inbox item tracks it.
+    """
     svc = FakeWorkService(tasks=[_task(status="on_hold")])
+    assert categorize_project("demo", work_service=svc) is ProjectState.WAITING
+
+
+def test_categorize_waiting_when_on_hold_with_background_worker() -> None:
+    """#1542 — the on_hold priority must outrank a live background
+    worker, mirroring ``_dashboard_status``'s pill priority. Without
+    this the rail would paint ``●`` while the dashboard pill paints
+    ``◆ needs attention``.
+    """
+    svc = FakeWorkService(
+        workers=[_worker()],
+        tasks=[_task(status="on_hold")],
+    )
+    assert categorize_project("demo", work_service=svc) is ProjectState.WAITING
+
+
+def test_categorize_idle_when_only_review_status_tasks() -> None:
+    """``review`` parked tasks don't count as Working (or Waiting via
+    the on_hold short-circuit). They surface via the inbox approval
+    items instead.
+    """
+    svc = FakeWorkService(tasks=[_task(status="review")])
     assert categorize_project("demo", work_service=svc) is ProjectState.IDLE
 
 

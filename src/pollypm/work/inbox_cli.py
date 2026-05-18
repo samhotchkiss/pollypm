@@ -20,7 +20,8 @@ import typer
 
 from pollypm.cli_help import help_with_examples
 from pollypm.inbox import awaits_user
-from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
+from pollypm.inbox.backfill_heuristics import Classification, classify_legacy
+from pollypm.inbox.kind import InboxItemKind, coerce_kind as _coerce_inbox_kind
 from pollypm.inbox_message_refs import unknown_project_refs
 from pollypm.work.cli import (
     _DB_OPTION,
@@ -1034,3 +1035,256 @@ def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
         typer.echo(f"Failed to archive {len(failures)}:", err=True)
         for mid, reason in failures[:5]:
             typer.echo(f"  msg:{mid}: {reason}", err=True)
+
+
+# ---------------------------------------------------------------------------
+# pm inbox backfill-kinds — one-time legacy-row reclassification (#1570).
+#
+# The ``kind`` column landed in #1565 with ``'legacy'`` as the default for
+# every pre-existing row. The :func:`pollypm.inbox.awaits_user` predicate
+# treats ``legacy`` as "awaits user" so the migration window doesn't hide
+# work; this command is the one-time pass that runs the heuristics from
+# :mod:`pollypm.inbox.backfill_heuristics` against every legacy message and
+# moves the matched rows onto a real kind. Unmatched rows stay legacy and
+# remain visible to the predicate.
+# ---------------------------------------------------------------------------
+
+
+_BACKFILL_HINT = (
+    "Re-run with --commit to apply; unmatched rows stay legacy and "
+    "remain visible to the awaits_user predicate."
+)
+
+
+def _legacy_message_rows(
+    db_path: str,
+    *,
+    project: str | None,
+) -> list[dict[str, Any]]:
+    """Return every open user-facing message still tagged ``kind='legacy'``.
+
+    Scope mirrors ``pm inbox`` (recipient=user, the same three message
+    types) so the backfill operates over exactly the population the
+    dashboard's "Waiting on you" section would otherwise lump together.
+    Closed rows are ignored — they are archive, not inbox.
+
+    ``query_messages`` does not accept ``kind`` as a server-side filter,
+    so we trim in Python after the call. The volume is bounded (low
+    hundreds for the original 2026-05-17 sample); a wider filter would
+    require widening :meth:`SQLAlchemyStore.query_messages` and is out
+    of scope for the one-shot migration helper.
+    """
+    from pollypm.store import SQLAlchemyStore
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        filters: dict[str, Any] = dict(
+            recipient="user",
+            state="open",
+            type=["notify", "inbox_task", "alert"],
+        )
+        if project:
+            filters["scope"] = project
+        rows = store.query_messages(**filters)
+    finally:
+        store.close()
+
+    legacy_rows: list[dict[str, Any]] = []
+    for row in rows:
+        kind_value = _coerce_inbox_kind(row.get("kind"))
+        if kind_value is InboxItemKind.LEGACY:
+            legacy_rows.append(row)
+    return legacy_rows
+
+
+def _row_classification(
+    row: dict[str, Any],
+) -> Classification | None:
+    """Run the heuristic against one row's title / sender / scope."""
+    return classify_legacy(
+        title=str(row.get("subject") or ""),
+        sender=str(row.get("sender") or ""),
+        project=str(row.get("scope") or ""),
+    )
+
+
+def _title_preview(title: str, limit: int = 60) -> str:
+    text = (title or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: limit - 1] + "…"
+
+
+def _apply_kind_update(
+    db_path: str,
+    *,
+    msg_id: int,
+    new_kind: InboxItemKind,
+) -> None:
+    """Persist a single ``messages.kind`` reclassification."""
+    from pollypm.store import SQLAlchemyStore
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        store.update_message(msg_id, kind=new_kind.value)
+    finally:
+        store.close()
+
+
+def _emit_backfill_audit(
+    *,
+    project: str,
+    msg_id: int,
+    new_kind: InboxItemKind,
+    heuristic: str,
+) -> None:
+    """Audit-log one reclassification. Best-effort — never raises."""
+    from pollypm.audit.log import EVENT_INBOX_KIND_BACKFILLED, emit
+
+    emit(
+        event=EVENT_INBOX_KIND_BACKFILLED,
+        project=project or "",
+        subject=f"msg:{msg_id}",
+        actor="user",
+        status="ok",
+        metadata={
+            "old_kind": InboxItemKind.LEGACY.value,
+            "new_kind": new_kind.value,
+            "heuristic": heuristic,
+        },
+    )
+
+
+@inbox_app.command(
+    "backfill-kinds",
+    help=(
+        "One-time backfill of ``kind`` for inbox rows that still carry "
+        "``kind='legacy'`` (#1570). Dry-run by default — pass --commit "
+        "to actually mutate. Idempotent: rows already on a non-legacy "
+        "kind are skipped."
+    ),
+)
+def backfill_kinds(
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Classify every legacy row and print what would change "
+            "without writing to the DB. This is the default behaviour "
+            "when neither --dry-run nor --commit is passed — the flag "
+            "exists so an automation can make the intent explicit."
+        ),
+    ),
+    commit: bool = typer.Option(
+        False,
+        "--commit",
+        help=(
+            "Apply the reclassification. Required for any DB mutation "
+            "— mutually exclusive with --dry-run."
+        ),
+    ),
+    project: str | None = _PROJECT_OPTION,
+    db: str = _DB_OPTION,
+) -> None:
+    """Reclassify legacy inbox rows by heuristic.
+
+    Heuristics live in :mod:`pollypm.inbox.backfill_heuristics` and
+    are applied in spec order; unmatched rows stay legacy. Every
+    committed row emits one ``inbox.kind_backfilled`` audit event
+    with the old kind, new kind, and matched heuristic name.
+    """
+    if commit and dry_run:
+        typer.echo(
+            "Error: --commit and --dry-run are mutually exclusive.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # Default = dry-run. --commit is the explicit opt-in to mutation.
+    effective_commit = bool(commit)
+
+    db_path = _resolve_db_path(db, project=project)
+
+    try:
+        rows = _legacy_message_rows(db_path, project=project)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(
+            f"Error: failed to read legacy inbox rows ({exc}).",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    if not rows:
+        typer.echo("No legacy inbox rows to reclassify.")
+        return
+
+    mode_label = "commit" if effective_commit else "dry-run"
+    typer.echo(
+        f"Scanning {len(rows)} legacy inbox row(s) "
+        f"({mode_label})."
+    )
+    typer.echo(
+        f"{'ID':<12} {'Project':<18} {'Heuristic → New kind':<48} Title"
+    )
+    typer.echo("-" * 110)
+
+    matched = 0
+    unmatched = 0
+    failures: list[tuple[int, str]] = []
+    for row in rows:
+        msg_id_raw = row.get("id")
+        if msg_id_raw is None:
+            continue
+        msg_id = int(msg_id_raw)
+        scope = str(row.get("scope") or "-")
+        title_preview = _title_preview(str(row.get("subject") or ""))
+        classification = _row_classification(row)
+        if classification is None:
+            unmatched += 1
+            typer.echo(
+                f"msg:{msg_id:<8} {scope:<18} {'(unmatched, stays legacy)':<48} "
+                f"{title_preview}"
+            )
+            continue
+
+        matched += 1
+        action = (
+            f"{classification.heuristic} → {classification.kind.value}"
+        )
+        typer.echo(
+            f"msg:{msg_id:<8} {scope:<18} {action:<48} {title_preview}"
+        )
+
+        if not effective_commit:
+            continue
+
+        try:
+            _apply_kind_update(
+                db_path, msg_id=msg_id, new_kind=classification.kind,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append((msg_id, str(exc)))
+            continue
+        _emit_backfill_audit(
+            project=scope,
+            msg_id=msg_id,
+            new_kind=classification.kind,
+            heuristic=classification.heuristic,
+        )
+
+    typer.echo("-" * 110)
+    if effective_commit:
+        typer.echo(
+            f"Reclassified {matched} row(s); {unmatched} unmatched."
+        )
+        if failures:
+            typer.echo(
+                f"Failed to update {len(failures)} row(s):", err=True,
+            )
+            for mid, reason in failures[:5]:
+                typer.echo(f"  msg:{mid}: {reason}", err=True)
+    else:
+        typer.echo(
+            f"Would reclassify {matched} row(s); {unmatched} unmatched."
+        )
+    typer.echo(_BACKFILL_HINT)

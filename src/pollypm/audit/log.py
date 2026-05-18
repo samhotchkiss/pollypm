@@ -196,6 +196,15 @@ EVENT_SESSION_PROVISIONED = "session.provisioned"
 EVENT_COCKPIT_SESSION_PARKED = "cockpit.session_parked"
 EVENT_COCKPIT_SESSION_RESPAWNED = "cockpit.session_respawned"
 EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED = "cockpit.duplicate_window_killed"
+# #1570 — emitted once per row that ``pm inbox backfill-kinds --commit``
+# reclassifies from ``kind='legacy'`` to a real
+# :class:`pollypm.inbox.kind.InboxItemKind`. Carries ``msg_id``,
+# ``old_kind`` (always ``"legacy"``), ``new_kind``, and ``heuristic``
+# (the label of the matched rule in
+# :mod:`pollypm.inbox.backfill_heuristics`) so an operator can later
+# answer "why did this row become completion_fyi?" by tail-grepping
+# the audit log instead of re-running the heuristic.
+EVENT_INBOX_KIND_BACKFILLED = "inbox.kind_backfilled"
 
 
 @dataclass(slots=True, frozen=True)
@@ -565,6 +574,7 @@ __all__ = [
     "EVENT_COCKPIT_SESSION_PARKED",
     "EVENT_COCKPIT_SESSION_RESPAWNED",
     "EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED",
+    "EVENT_INBOX_KIND_BACKFILLED",
     "AuditEvent",
     "central_log_path",
     "emit",

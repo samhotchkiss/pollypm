@@ -25,6 +25,10 @@ Design notes
 - No imports of ``supervisor.py``, ``work/session_manager.py``,
   ``work/sqlite_service.py``, ``plugin_api/v1.py``, or
   ``memory_backends/*`` — per the spec's hard constraints.
+- No direct SQLite imports or connections — the doctor sits above the
+  storage layer (#1376). Read-only state-DB probes go through
+  :mod:`pollypm.storage.doctor_state_probes`; the SQLAlchemy store is
+  used for richer queries.
 """
 
 from __future__ import annotations
@@ -36,7 +40,6 @@ import re
 import shlex
 import shutil
 import socket
-import sqlite3
 import subprocess
 import sys
 import time
@@ -49,6 +52,12 @@ from typing import Any, Callable, Iterable
 
 from pollypm.models import AccountConfig, ModelAssignment, PollyPMConfig, ProjectSettings, ProviderKind
 from pollypm.service_api import PollyPMService
+from pollypm.storage.doctor_state_probes import (
+    applied_schema_version_ro,
+    count_work_tasks_ro,
+    session_window_names_ro,
+    sessions_row_count_ro,
+)
 
 # Allow ``pollypm.doctor`` to host internal submodules while keeping the
 # public import path stable as a module-level facade.
@@ -616,25 +625,12 @@ def _latest_work_migration_version() -> int | None:
 def _applied_version_from_sqlite(db_path: Path, table: str) -> int | None:
     """Return ``MAX(version)`` from a schema-version table, or ``None``.
 
-    Uses read-only access (``mode=ro``) so we never mutate a missing DB.
-    Returns ``None`` if the DB or the table does not exist — the caller
-    interprets that as "no migrations applied yet".
+    Thin shim over
+    :func:`pollypm.storage.doctor_state_probes.applied_schema_version_ro` —
+    kept for backwards compatibility with anything that imported the
+    private helper. New callers should use the storage facade directly.
     """
-    if not db_path.is_file():
-        return None
-    uri = f"file:{db_path}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return None
-    try:
-        try:
-            row = conn.execute(f"SELECT COALESCE(MAX(version), 0) FROM {table}").fetchone()
-        except sqlite3.Error:
-            return None
-        return int(row[0]) if row and row[0] is not None else 0
-    finally:
-        conn.close()
+    return applied_schema_version_ro(db_path, table)
 
 
 def _workspace_state_db_path(config: PollyPMConfig | None = None) -> Path | None:
@@ -1094,60 +1090,26 @@ def check_db_layout_canonical() -> CheckResult:
 def _count_work_tasks_ro(db_path: Path) -> int | None:
     """Return ``COUNT(*) FROM work_tasks`` on ``db_path``, or ``None``.
 
-    Returns ``None`` when the file is missing OR when the ``work_tasks``
-    table does not exist on it. Returns 0 when the table exists but is
-    empty. Read-only access (``mode=ro``) — never mutates the DB,
-    never holds a write lock; safe to run against a live cockpit DB.
+    Thin shim over
+    :func:`pollypm.storage.doctor_state_probes.count_work_tasks_ro` —
+    preserved as a module-private name because the dual-DB drift check
+    below references it and several tests rely on the wrapped function
+    being attached to the ``doctor`` module.
     """
-    if not db_path.is_file():
-        return None
-    uri = f"file:{db_path}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return None
-    try:
-        try:
-            row = conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name='work_tasks'"
-            ).fetchone()
-        except sqlite3.Error:
-            return None
-        if row is None:
-            return None
-        try:
-            row = conn.execute("SELECT COUNT(*) FROM work_tasks").fetchone()
-        except sqlite3.Error:
-            return None
-        return int(row[0]) if row and row[0] is not None else 0
-    finally:
-        conn.close()
+    return count_work_tasks_ro(db_path)
 
 
 def _has_messages_table_ro(db_path: Path) -> bool:
     """Return True when ``db_path`` is a messages-side DB (has ``messages``).
 
-    Read-only probe; returns False on any open / read failure.
+    Thin shim over
+    :func:`pollypm.storage.doctor_state_probes.has_messages_table_ro`;
+    preserved for the same backwards-compatibility reason as
+    :func:`_count_work_tasks_ro`.
     """
-    if not db_path.is_file():
-        return False
-    uri = f"file:{db_path}?mode=ro"
-    try:
-        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return False
-    try:
-        try:
-            row = conn.execute(
-                "SELECT name FROM sqlite_master "
-                "WHERE type='table' AND name='messages'"
-            ).fetchone()
-        except sqlite3.Error:
-            return False
-        return row is not None
-    finally:
-        conn.close()
+    from pollypm.storage.doctor_state_probes import has_messages_table_ro
+
+    return has_messages_table_ro(db_path)
 
 
 def _messages_side_db_path(config: PollyPMConfig | None = None) -> Path | None:
@@ -2855,15 +2817,6 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
     )
 
 
-def _open_state_db_ro(db_path: Path) -> sqlite3.Connection | None:
-    if not db_path.is_file():
-        return None
-    try:
-        return sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=1.0)
-    except sqlite3.Error:
-        return None
-
-
 def _primary_state_db() -> Path | None:
     """First tracked-project state.db, or None.
 
@@ -2968,17 +2921,13 @@ def check_sessions_table_populated() -> CheckResult:
     db_path = _supervisor_state_db() or _primary_state_db()
     if db_path is None:
         return _skip("sessions-table check skipped (no state.db)")
-    conn = _open_state_db_ro(db_path)
-    if conn is None:
-        return _skip(f"sessions-table check skipped (cannot open {db_path})")
-    try:
-        try:
-            row = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
-        except sqlite3.Error:
-            return _skip("sessions-table check skipped (table missing)")
-        count = int(row[0]) if row and row[0] is not None else 0
-    finally:
-        conn.close()
+    count = sessions_row_count_ro(db_path)
+    if count is None:
+        # ``None`` covers both "cannot open" and "table missing" — the
+        # facade collapses them, which matches the prior skip behaviour.
+        return _skip(
+            "sessions-table check skipped (cannot open / table missing)"
+        )
 
     def _fix() -> tuple[bool, str]:
         # Run repair_sessions_table via a transient supervisor.
@@ -3318,17 +3267,25 @@ def _invoke_prune_handler() -> tuple[bool, str]:
     Bypasses the scheduler so the prune runs immediately rather than
     waiting for the next hourly tick. The handler is idempotent —
     calling it when nothing is prunable is a cheap no-op.
+
+    Resolved through :mod:`pollypm.maintenance_handlers_registry` so
+    ``doctor`` never imports from ``pollypm.plugins_builtin`` directly
+    (#1363).
     """
+    from pollypm.maintenance_handlers_registry import (
+        AGENT_WORKTREE_PRUNE,
+        invoke_maintenance_handler,
+    )
+
     try:
-        from pollypm.plugins_builtin.core_recurring.plugin import (
-            agent_worktree_prune_handler,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return (False, f"import failed: {exc}")
-    try:
-        result = agent_worktree_prune_handler({})
+        result = invoke_maintenance_handler(AGENT_WORKTREE_PRUNE, {})
     except Exception as exc:  # noqa: BLE001
         return (False, f"prune handler failed: {exc}")
+    if result is None:
+        return (
+            False,
+            "prune handler unavailable (core_recurring plugin not loaded)",
+        )
     pruned = int(result.get("pruned", 0)) if isinstance(result, dict) else 0
     errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0
     warned = int(result.get("warned_stale", 0)) if isinstance(result, dict) else 0
@@ -3406,15 +3363,25 @@ def _invoke_log_rotate_handler(logs_dir: Path) -> tuple[bool, str]:
     rotates files past the threshold and prunes retention-exceeded
     siblings; calling it when nothing is over-threshold is a cheap
     no-op.
+
+    Resolved through :mod:`pollypm.maintenance_handlers_registry` so
+    ``doctor`` never imports from ``pollypm.plugins_builtin`` directly
+    (#1363).
     """
+    from pollypm.maintenance_handlers_registry import (
+        LOG_ROTATE,
+        invoke_maintenance_handler,
+    )
+
     try:
-        from pollypm.plugins_builtin.core_recurring.plugin import log_rotate_handler
-    except Exception as exc:  # noqa: BLE001
-        return (False, f"import failed: {exc}")
-    try:
-        result = log_rotate_handler({"logs_dir": str(logs_dir)})
+        result = invoke_maintenance_handler(LOG_ROTATE, {"logs_dir": str(logs_dir)})
     except Exception as exc:  # noqa: BLE001
         return (False, f"log.rotate handler failed: {exc}")
+    if result is None:
+        return (
+            False,
+            "log.rotate handler unavailable (core_recurring plugin not loaded)",
+        )
     rotated = int(result.get("rotated", 0)) if isinstance(result, dict) else 0
     deleted = int(result.get("deleted", 0)) if isinstance(result, dict) else 0
     errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0
@@ -3705,19 +3672,14 @@ def check_sessions_table_vs_tmux() -> CheckResult:
     db_path = _supervisor_state_db() or _primary_state_db()
     if db_path is None:
         return _skip("session-drift check skipped (no state.db)")
-    conn = _open_state_db_ro(db_path)
-    if conn is None:
-        return _skip("session-drift check skipped (db unreadable)")
-    db_windows: set[str] = set()
-    try:
-        try:
-            for row in conn.execute("SELECT window_name FROM sessions"):
-                if row and row[0]:
-                    db_windows.add(str(row[0]))
-        except sqlite3.Error:
-            return _skip("session-drift check skipped (sessions table missing)")
-    finally:
-        conn.close()
+    db_windows = session_window_names_ro(db_path)
+    if db_windows is None:
+        # ``None`` covers both "db unreadable" and "sessions table
+        # missing" — collapse the two skip messages so the doctor still
+        # exits cleanly without leaking the storage-layer distinction.
+        return _skip(
+            "session-drift check skipped (db unreadable / table missing)"
+        )
 
     # We only flag tmux windows that the supervisor *should* have
     # registered: those whose name matches a known PollyPM role prefix.

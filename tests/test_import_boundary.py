@@ -180,6 +180,12 @@ _HUMAN_NOTIFY_PLUGIN_PREFIX = "pollypm.plugins_builtin.human_notify"
 # plugin directly (see #1363, sibling of #1597).
 _DASHBOARD_SECTION_FILE = "src/pollypm/cockpit_sections/dashboard.py"
 _MORNING_BRIEFING_PLUGIN_PREFIX = "pollypm.plugins_builtin.morning_briefing"
+# ``doctor`` invokes the ``agent_worktree.prune`` / ``log.rotate``
+# maintenance handlers via :mod:`pollypm.maintenance_handlers_registry`
+# so it never imports from the optional ``core_recurring`` plugin
+# directly (see #1363, sibling of #1597 / #1621).
+_DOCTOR_FILE = "src/pollypm/doctor.py"
+_CORE_RECURRING_PLUGIN_PREFIX = "pollypm.plugins_builtin.core_recurring"
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -257,6 +263,33 @@ def test_dashboard_does_not_import_morning_briefing_plugin() -> None:
         f"{_MORNING_BRIEFING_PLUGIN_PREFIX}; use "
         "pollypm.briefings_registry.list_briefings instead so the "
         "plugin stays optional."
+    )
+
+
+def test_doctor_does_not_import_core_recurring_plugin() -> None:
+    """``pm doctor`` invokes maintenance handlers through the core registry.
+
+    :mod:`pollypm.maintenance_handlers_registry` is the sanctioned read
+    path for ``agent_worktree.prune`` and ``log.rotate``. The
+    ``core_recurring`` plugin installs the real handlers during
+    ``initialize``; if ``doctor.py`` reaches into the plugin tree
+    directly we re-couple core to an "optional" plugin and the
+    ``--fix`` flow stops degrading cleanly when the plugin is disabled.
+    Fail loudly so the seam stays clean.
+    """
+    root = _project_root()
+    source_file = root / _DOCTOR_FILE
+    assert source_file.exists(), (
+        f"Expected {_DOCTOR_FILE} to exist — boundary test "
+        "needs updating if the file moved."
+    )
+    assert not _imports_module_or_subpackage(
+        source_file, _CORE_RECURRING_PLUGIN_PREFIX
+    ), (
+        f"{_DOCTOR_FILE} must not import from "
+        f"{_CORE_RECURRING_PLUGIN_PREFIX}; use "
+        "pollypm.maintenance_handlers_registry.invoke_maintenance_handler "
+        "instead so the plugin stays optional."
     )
 
 

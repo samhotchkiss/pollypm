@@ -1,4 +1,4 @@
-# russell/58 critique blocked at output_present gate
+# [CANCELLED] russell/58 critique blocked at output_present gate
 
 **Deliverable shipped:** Maintainability critique committed to task/russell-58 at `docs/plan/critique_maintainability.json` (commit `d4707c6`).
 

@@ -4988,6 +4988,22 @@ class PollyCockpitRail:
         return row
 
     def _indicator(self, item: CockpitItem) -> tuple[str, _C | None]:
+        # #1633 — PM-turn-ended override. When the workspace operator
+        # ("polly") or a project's architect persona has finished its
+        # turn and is waiting on the user, paint the "needs attention"
+        # ◆ glyph regardless of any other heartbeat / project-rollup
+        # signal. Sits at the top so it outranks the legacy
+        # heartbeat / working glyphs but below operational faults
+        # (project-red / approvals-pending) which still own the row.
+        if self._pm_turn_ended_for_item(item) and not item.state.startswith("!"):
+            if item.key == "polly":
+                return "◆", PALETTE["inbox_has"]
+            if (
+                item.key.startswith("project:")
+                and item.state != "project-red"
+                and item.approvals_pending == 0
+            ):
+                return "◆", PALETTE["inbox_has"]
         if item.key.startswith("project:"):
             # #1390 — Approval-pending takes precedence over the rollup
             # color so a project parked at user_approval reads as "act
@@ -5107,6 +5123,39 @@ class PollyCockpitRail:
         if item.state == "sub":
             return " ", None
         return "\u25cb", PALETTE["idle"]
+
+    def _pm_turn_ended_for_item(self, item: CockpitItem) -> bool:
+        """True when a PM persona attached to ``item`` is awaiting the user.
+
+        Drives the #1633 ``◆`` glyph override. Consults the on-disk
+        state file populated by the recurring ``pm.turn_classify`` sweep
+        — never re-runs the heuristic from the render path. Safe to
+        call on every row; the file read is one small JSON load and
+        the lookup falls through to ``False`` on any error so a missing
+        / corrupted state file degrades to "no override" rather than
+        breaking rail rendering.
+        """
+        try:
+            from pollypm.pm_turn_state import is_turn_ended
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            if item.key == "polly":
+                return is_turn_ended("operator")
+            if item.key.startswith("project:") and item.key.count(":") == 1:
+                project_key = item.key.split(":", 1)[1]
+                # Per-project PM is the architect session. Project keys
+                # may use ``-`` or ``_`` separators (session names sanitize
+                # ``-`` to ``_``); check both forms so the lookup matches
+                # the session name the detector recorded.
+                alias = project_key.replace("-", "_")
+                return (
+                    is_turn_ended(f"architect_{project_key}")
+                    or is_turn_ended(f"architect_{alias}")
+                )
+        except Exception:  # noqa: BLE001
+            return False
+        return False
 
     def _session_work_glyph(
         self,

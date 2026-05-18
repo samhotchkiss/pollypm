@@ -6464,8 +6464,11 @@ def test_render_clears_skeleton_bodies_when_data_is_none(
     assert app.data is None
     app._render()
 
-    # Topbar carries the bail copy.
-    assert "not a tracked project" in str(app.topbar.render())
+    # Topbar carries the bail copy. (#1544 rewrote the copy from
+    # "is not a tracked project" → "no project registered with that
+    # key — run pm project new ..." so the operator sees the concrete
+    # affordance, not data-model jargon.)
+    assert "no project registered with that key" in str(app.topbar.render())
 
     # And every skeleton-seeded body is now blank.
     for label, body in (
@@ -6519,4 +6522,41 @@ def test_first_refresh_failed_clears_skeleton_bodies(
         assert _skeleton_block_glyph_count(rendered) == 0, (
             f"{label}: skeleton bars still visible after first-gather "
             f"failure — got {rendered!r}"
+        )
+
+
+def test_seeded_skeleton_carries_loading_hint(tmp_path: Path) -> None:
+    """#1539 v2 — the original skeleton used ``#1e2730`` bars on a
+    ``#111820`` panel background, which crushed to "invisible" on most
+    terminals and left the panels reading as "loaded but empty" during
+    the 8–12s cold-fetch window. Each seeded body now carries an
+    explicit italic ``loading project dashboard…`` hint plus brighter
+    ``#2a3a4a`` placeholder bars so the busy state is legible even if
+    the dim block glyphs don't render.
+    """
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+    _init_git_repo(project_path)
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(project_path, config_path)
+
+    app = PollyProjectDashboardApp(config_path, "demo")
+
+    for label, body in (
+        ("now_body", app.now_body),
+        ("pipeline_body", app.pipeline_body),
+        ("plan_body", app.plan_body),
+        ("activity_body", app.activity_body),
+        ("inbox_body", app.inbox_body),
+    ):
+        rendered = str(body.render())
+        assert "loading project dashboard" in rendered, (
+            f"{label}: seeded skeleton missing the explicit "
+            f"'loading project dashboard…' hint — got {rendered!r}"
+        )
+        assert _skeleton_block_glyph_count(rendered) > 0, (
+            f"{label}: seeded skeleton missing the dim placeholder bars "
+            f"— got {rendered!r}"
         )

@@ -15547,21 +15547,34 @@ class PollyProjectDashboardApp(App[None]):
     _PM_CONTEXT_REATTACH_WINDOW_SECONDS = 300.0
     # #1539 \u2014 skeleton placeholder bars rendered into each panel body
     # during the cold-fetch window so the panels read as "loading"
-    # rather than "loaded with nothing in them". Two dim block-glyph
-    # bars per panel are enough to look intentionally placeholdered
-    # without flashing. Replaced wholesale by ``_render`` the moment
-    # the worker thread hands data back; layout stays stable across
-    # the swap so content doesn't pop into place.
+    # rather than "loaded with nothing in them". An italic
+    # ``loading project dashboard\u2026`` hint plus two dim block-glyph bars
+    # per panel read as intentionally placeholdered without flashing.
+    # Replaced wholesale by ``_render`` the moment the worker thread
+    # hands data back; layout stays stable across the swap so content
+    # doesn't pop into place.
+    #
+    # #1539 v2 \u2014 the original ``#1e2730`` bar color was nearly
+    # indistinguishable from the panel background ``#111820``, so the
+    # bars rendered invisible and the panels still read as "loaded but
+    # empty" for the full 8\u201312s cold-fetch window. Bumped the bar
+    # color to ``#2a3a4a`` (visible-but-muted, brighter than the
+    # scrollbar track) and prepended an explicit italic
+    # ``loading project dashboard\u2026`` hint so the busy state is legible
+    # even on terminals that crush the dim block glyphs.
     _SKELETON_BAR_LONG = "\u2588" * 24
     _SKELETON_BAR_SHORT = "\u2588" * 14
+    _SKELETON_HINT = "[#6b7a88][i]loading project dashboard\u2026[/i][/]"
     _SKELETON_TWO_LINE = (
-        f"[#1e2730]{_SKELETON_BAR_LONG}[/]\n"
-        f"[#1e2730]{_SKELETON_BAR_SHORT}[/]"
+        f"{_SKELETON_HINT}\n"
+        f"[#2a3a4a]{_SKELETON_BAR_LONG}[/]\n"
+        f"[#2a3a4a]{_SKELETON_BAR_SHORT}[/]"
     )
     _SKELETON_THREE_LINE = (
-        f"[#1e2730]{_SKELETON_BAR_LONG}[/]\n"
-        f"[#1e2730]{_SKELETON_BAR_SHORT}[/]\n"
-        f"[#1e2730]{_SKELETON_BAR_LONG}[/]"
+        f"{_SKELETON_HINT}\n"
+        f"[#2a3a4a]{_SKELETON_BAR_LONG}[/]\n"
+        f"[#2a3a4a]{_SKELETON_BAR_SHORT}[/]\n"
+        f"[#2a3a4a]{_SKELETON_BAR_LONG}[/]"
     )
 
     def __init__(self, config_path: Path, project_key: str) -> None:

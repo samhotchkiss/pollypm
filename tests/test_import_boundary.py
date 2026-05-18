@@ -194,6 +194,16 @@ _CORE_RECURRING_PLUGIN_PREFIX = "pollypm.plugins_builtin.core_recurring"
 _COCKPIT_UI_FILE = "src/pollypm/cockpit_ui.py"
 _COCKPIT_INBOX_FILE = "src/pollypm/cockpit_inbox.py"
 _ACTIVITY_FEED_PLUGIN_MODULE = "pollypm.plugins_builtin.activity_feed.plugin"
+# The ``activity_summary`` packer is owned by core
+# (:mod:`pollypm.events.summaries`). The ``activity_feed`` plugin keeps
+# a backward-compat re-export at
+# ``pollypm.plugins_builtin.activity_feed.summaries`` for external plugin
+# consumers, but core (non-plugin) callers must import the canonical
+# path so the optional-plugin contract holds (see #1363, sibling of
+# #1597 / #1621 / #1626 / #1672).
+_ACTIVITY_FEED_SUMMARIES_PLUGIN_MODULE = (
+    "pollypm.plugins_builtin.activity_feed.summaries"
+)
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -331,6 +341,33 @@ def test_cockpit_does_not_import_activity_feed_plugin_for_projector() -> None:
         f"{_ACTIVITY_FEED_PLUGIN_MODULE}; use "
         "pollypm.activity_projector_registry.build_activity_projector "
         "instead so the plugin stays optional. Offenders:\n  - "
+        + "\n  - ".join(offenders)
+    )
+
+
+def test_non_plugin_sources_do_not_import_activity_feed_summaries_shim() -> None:
+    """``activity_summary`` is owned by core, not the activity_feed plugin.
+
+    The canonical packer lives at
+    :mod:`pollypm.events.summaries`. The plugin keeps a backward-compat
+    re-export so external plugin consumers (and the plugin's own
+    handlers) can import either path, but core (non-plugin) callers must
+    use the canonical path. Reaching into the plugin shim re-couples
+    core to an "optional" plugin — fail loudly so the seam stays clean.
+    """
+    root = _project_root()
+    offenders: list[str] = []
+    for source_file in _iter_source_files(root):
+        rel = _relative_posix(source_file, root)
+        if "/plugins_builtin/" in rel:
+            continue
+        if _imports_module(source_file, _ACTIVITY_FEED_SUMMARIES_PLUGIN_MODULE):
+            offenders.append(rel)
+    assert not offenders, (
+        "Non-plugin sources must not import from "
+        f"{_ACTIVITY_FEED_SUMMARIES_PLUGIN_MODULE}; import "
+        "`activity_summary` from pollypm.events.summaries (the canonical "
+        "path) instead so the plugin stays optional. Offenders:\n  - "
         + "\n  - ".join(offenders)
     )
 

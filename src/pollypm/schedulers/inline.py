@@ -34,7 +34,7 @@ class InlineSchedulerBackend(SchedulerBackend):
         jobs = self._load_jobs(supervisor)
         jobs.append(job)
         self._save_jobs(supervisor, jobs)
-        from pollypm.plugins_builtin.activity_feed.summaries import activity_summary
+        from pollypm.events.summaries import activity_summary
 
         supervisor.msg_store.append_event(
             scope="scheduler",
@@ -80,7 +80,7 @@ class InlineSchedulerBackend(SchedulerBackend):
                     job.status = "pending"
                 else:
                     job.status = "failed"
-                from pollypm.plugins_builtin.activity_feed.summaries import (
+                from pollypm.events.summaries import (
                     activity_summary,
                 )
 
@@ -109,7 +109,7 @@ class InlineSchedulerBackend(SchedulerBackend):
                     job.last_error = None
                 else:
                     job.status = "done"
-                from pollypm.plugins_builtin.activity_feed.summaries import (
+                from pollypm.events.summaries import (
                     activity_summary,
                 )
 

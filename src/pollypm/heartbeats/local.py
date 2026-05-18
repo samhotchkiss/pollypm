@@ -926,193 +926,11 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         # Only the suspected_loop detector (below) alerts on sustained identical snapshots.
         api.clear_alert(context.session_name, "idle_output")
 
-        if not mechanical_only and context.previous_snapshot_hash and context.previous_snapshot_hash == context.snapshot_hash:
-            hashes = api.recent_snapshot_hashes(context.session_name, limit=3)
-            if len(hashes) == 3 and len(set(hashes)) == 1:
-                # #765 — run the same-snapshot finding through the
-                # stall classifier. Only ``unrecoverable_stall`` earns
-                # an alert; ``legitimate_idle`` and ``transient`` stay
-                # silent so the cockpit doesn't toast the user for a
-                # session that's behaving correctly (architect awaiting
-                # approval, reviewer idle with empty queue, etc.).
-                from pollypm.heartbeats.stall_classifier import (
-                    StallContext,
-                    classify_stall,
-                )
-                from pollypm.idle_placeholders import (
-                    pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
-                    pane_is_idle_placeholder as _pane_is_idle_placeholder,
-                )
+        alerts.extend(
+            self._handle_same_snapshot_stall(api, context, mechanical_only=mechanical_only)
+        )
 
-                _pane_text = context.pane_text or ""
-                stall_ctx = StallContext(
-                    role=context.role or "",
-                    session_name=context.session_name,
-                    has_pending_work=self._has_pending_work(api, context),
-                    pane_is_idle_placeholder=_pane_is_idle_placeholder(_pane_text),
-                    awaiting_operator_question=_pane_ends_with_unanswered_question(_pane_text),
-                )
-                stall_class = classify_stall(stall_ctx)
-                if stall_class == "awaiting_operator":
-                    # Surface the worker's pending question to the operator
-                    # inbox so polly / the user can see and answer it,
-                    # instead of the pane sitting silently with `pm status`
-                    # reporting healthy. Distinct alert_type from
-                    # ``suspected_loop`` so dedupe and routing don't
-                    # collapse the two categories.
-                    question_text = (stall_ctx.awaiting_operator_question or "").strip()
-                    short_question = question_text
-                    if len(short_question) > 140:
-                        short_question = short_question[:137].rstrip() + "…"
-                    _emit_routed_alert(
-                        api,
-                        session_name=context.session_name,
-                        alert_type="worker_question",
-                        severity="warn",
-                        message=(
-                            f"{context.role or 'session'} "
-                            f"{context.session_name} is waiting for an "
-                            f"operator answer: {short_question}"
-                        ),
-                        subject=f"{context.session_name} asked a question",
-                        suggested_action=(
-                            "Open the worker pane and answer, or `pm send "
-                            f"{context.session_name} \"<answer>\"`."
-                        ),
-                    )
-                    alerts.append("worker_question")
-                    api.clear_alert(context.session_name, "suspected_loop")
-                elif stall_class != "unrecoverable_stall":
-                    api.clear_alert(context.session_name, "suspected_loop")
-                else:
-                    # #760 — concrete actionable copy: name the role,
-                    # say what's wrong in plain English, and keep the
-                    # next step in the cockpit.
-                    _emit_routed_alert(
-                        api,
-                        session_name=context.session_name,
-                        alert_type="suspected_loop",
-                        severity="warn",
-                        message=(
-                            f"{context.role or 'session'} "
-                            f"{context.session_name} stalled — no new output "
-                            f"for 3 heartbeats with queued work. "
-                            "Open Workers and restart the stalled session."
-                        ),
-                        subject=(
-                            f"{context.session_name} appears stalled"
-                        ),
-                        suggested_action=(
-                            "Open Workers and restart the stalled session."
-                        ),
-                    )
-                    alerts.append("suspected_loop")
-                    # After 5 consecutive identical snapshots, queue a Haiku triage
-                    longer_hashes = api.recent_snapshot_hashes(context.session_name, limit=5)
-                    if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
-                        if context.role == "worker":
-                            self._triage_stalled_worker(api, context)
-            else:
-                api.clear_alert(context.session_name, "suspected_loop")
-        else:
-            api.clear_alert(context.session_name, "suspected_loop")
-
-        # #757 — mid-flight persona-drift detection. Kickoff-time swaps
-        # are caught by supervisor._assert_session_launch_matches; this
-        # catches sessions whose identity drifted AFTER kickoff (e.g. a
-        # prompt-injection loop, or a session reading a wrong-role
-        # control-prompts file). Conservative: only fires on strong
-        # identity-claim phrasings, never on casual mentions.
-        try:
-            from pollypm.supervisor import detect_persona_drift
-            drifted_to = detect_persona_drift(context.role, context.pane_text or "")
-        except Exception:  # noqa: BLE001
-            drifted_to = None
-        if drifted_to:
-            # #757/#815 — determine whether this is a newly-opened
-            # drift alert before upserting it. ``raise_alert`` persists
-            # immediately, so checking afterward would always suppress
-            # the one-shot remediation message.
-            try:
-                drift_alert_already_open = any(
-                    getattr(alert, "alert_type", None) == "persona_drift_detected"
-                    for alert in api.open_alerts()
-                    if getattr(alert, "session_name", None) == context.session_name
-                )
-            except Exception:  # noqa: BLE001
-                drift_alert_already_open = True  # err on the side of NOT spamming
-            # #760 — actionable copy: explain what drifted, name the
-            # restart command the user can copy-paste, keep the
-            # observed-identity detail present for context.
-            #
-            # Note: ``severity="error"`` puts this through the
-            # ACTION_REQUIRED toast tier (cockpit_alerts.alert_channel
-            # — #765). Drift is one of the rare cases where we DO want
-            # to interrupt the user.
-            # #894 — route through SignalEnvelope so the canonical
-            # routing policy (audience/actionability/dedupe) is the
-            # source of truth for whether this alert toasts. The
-            # ``raise_alert`` call below is the existing storage
-            # write; SignalEnvelope.route_signal classifies the
-            # delivery surfaces — for ACTION_REQUIRED + USER the
-            # decision includes Toast, which matches the legacy
-            # severity="error" intent of the original site.
-            _drift_subject = (
-                f"{context.session_name} ({context.role}) drifted to "
-                f"{drifted_to!r}"
-            )
-            _drift_body = (
-                f"{context.session_name} ({context.role}) identified "
-                f"itself as {drifted_to!r} mid-session — identity drift. "
-                "Open Workers and restart the drifted session."
-            )
-            # #910 — consolidated through the same routed-emit helper
-            # used by every other heartbeat alert. The helper is the
-            # single funnel: it builds the envelope, calls
-            # route_signal, and only then persists. Keeping the
-            # persistence here means the cockpit alert reader and the
-            # `pm alerts` listing keep working exactly as before;
-            # what changes is that no alert reaches the store
-            # without first passing through the routing policy.
-            _emit_routed_alert(
-                api,
-                session_name=context.session_name,
-                alert_type="persona_drift_detected",
-                severity="error",
-                message=_drift_body,
-                subject=_drift_subject,
-                suggested_action=(
-                    "Open Workers and restart the drifted session."
-                ),
-            )
-            alerts.append("persona_drift_detected")
-            # #757 — reactive remediation: send a one-shot re-assertion
-            # message to the drifted session so the model can correct
-            # itself before the user has to intervene. Gated by the
-            # alert state — only sent on the *first* heartbeat that
-            # detects the drift, not on every subsequent tick the
-            # alert is still open. The owner-tagged path (``persona-
-            # drift-remediation``) makes the corrective message
-            # distinguishable from arbitrary user input in transcript
-            # scans, and avoids the ``<system-update>`` tag that
-            # tripped prompt-injection defenses (#755).
-            if not drift_alert_already_open:
-                try:
-                    api.send_session_message(
-                        context.session_name,
-                        _build_persona_reassertion_message(
-                            role=context.role or "",
-                            drifted_to=drifted_to,
-                        ),
-                        owner="persona-drift-remediation",
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.exception(
-                        "heartbeat: persona-drift remediation send failed for %s",
-                        context.session_name,
-                    )
-        else:
-            api.clear_alert(context.session_name, "persona_drift_detected")
+        alerts.extend(self._handle_persona_drift(api, context))
 
         combined_text = "\n".join(part for part in [context.transcript_delta, context.pane_text] if part).lower()
         status_locked = False
@@ -1289,6 +1107,226 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     self._escalate(api, context, intervention.reason)
             except Exception:  # noqa: BLE001
                 pass
+
+    def _handle_persona_drift(
+        self, api, context: HeartbeatSessionContext
+    ) -> list[str]:
+        """Detect and react to mid-flight persona drift (#757).
+
+        Kickoff-time swaps are caught by
+        ``supervisor._assert_session_launch_matches``; this catches sessions
+        whose identity drifted AFTER kickoff (e.g. a prompt-injection loop,
+        or a session reading a wrong-role control-prompts file). Conservative:
+        only fires on strong identity-claim phrasings, never on casual
+        mentions.
+
+        Returns the list of alert types raised this tick (empty if no drift).
+        """
+        try:
+            from pollypm.supervisor import detect_persona_drift
+            drifted_to = detect_persona_drift(context.role, context.pane_text or "")
+        except Exception:  # noqa: BLE001
+            drifted_to = None
+        if not drifted_to:
+            api.clear_alert(context.session_name, "persona_drift_detected")
+            return []
+
+        # #757/#815 — determine whether this is a newly-opened
+        # drift alert before upserting it. ``raise_alert`` persists
+        # immediately, so checking afterward would always suppress
+        # the one-shot remediation message.
+        try:
+            drift_alert_already_open = any(
+                getattr(alert, "alert_type", None) == "persona_drift_detected"
+                for alert in api.open_alerts()
+                if getattr(alert, "session_name", None) == context.session_name
+            )
+        except Exception:  # noqa: BLE001
+            drift_alert_already_open = True  # err on the side of NOT spamming
+        # #760 — actionable copy: explain what drifted, name the
+        # restart command the user can copy-paste, keep the
+        # observed-identity detail present for context.
+        #
+        # Note: ``severity="error"`` puts this through the
+        # ACTION_REQUIRED toast tier (cockpit_alerts.alert_channel
+        # — #765). Drift is one of the rare cases where we DO want
+        # to interrupt the user.
+        # #894 — route through SignalEnvelope so the canonical
+        # routing policy (audience/actionability/dedupe) is the
+        # source of truth for whether this alert toasts. The
+        # ``raise_alert`` call below is the existing storage
+        # write; SignalEnvelope.route_signal classifies the
+        # delivery surfaces — for ACTION_REQUIRED + USER the
+        # decision includes Toast, which matches the legacy
+        # severity="error" intent of the original site.
+        _drift_subject = (
+            f"{context.session_name} ({context.role}) drifted to "
+            f"{drifted_to!r}"
+        )
+        _drift_body = (
+            f"{context.session_name} ({context.role}) identified "
+            f"itself as {drifted_to!r} mid-session — identity drift. "
+            "Open Workers and restart the drifted session."
+        )
+        # #910 — consolidated through the same routed-emit helper
+        # used by every other heartbeat alert. The helper is the
+        # single funnel: it builds the envelope, calls
+        # route_signal, and only then persists. Keeping the
+        # persistence here means the cockpit alert reader and the
+        # `pm alerts` listing keep working exactly as before;
+        # what changes is that no alert reaches the store
+        # without first passing through the routing policy.
+        _emit_routed_alert(
+            api,
+            session_name=context.session_name,
+            alert_type="persona_drift_detected",
+            severity="error",
+            message=_drift_body,
+            subject=_drift_subject,
+            suggested_action=(
+                "Open Workers and restart the drifted session."
+            ),
+        )
+        # #757 — reactive remediation: send a one-shot re-assertion
+        # message to the drifted session so the model can correct
+        # itself before the user has to intervene. Gated by the
+        # alert state — only sent on the *first* heartbeat that
+        # detects the drift, not on every subsequent tick the
+        # alert is still open. The owner-tagged path (``persona-
+        # drift-remediation``) makes the corrective message
+        # distinguishable from arbitrary user input in transcript
+        # scans, and avoids the ``<system-update>`` tag that
+        # tripped prompt-injection defenses (#755).
+        if not drift_alert_already_open:
+            try:
+                api.send_session_message(
+                    context.session_name,
+                    _build_persona_reassertion_message(
+                        role=context.role or "",
+                        drifted_to=drifted_to,
+                    ),
+                    owner="persona-drift-remediation",
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "heartbeat: persona-drift remediation send failed for %s",
+                    context.session_name,
+                )
+        return ["persona_drift_detected"]
+
+    def _handle_same_snapshot_stall(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        *,
+        mechanical_only: bool,
+    ) -> list[str]:
+        """Classify and react to identical-snapshot stalls (#765).
+
+        When the previous and current snapshot hashes match and three
+        consecutive snapshots are identical, run the finding through the
+        stall classifier. Only ``unrecoverable_stall`` earns a
+        ``suspected_loop`` alert; ``legitimate_idle`` and ``transient``
+        stay silent so the cockpit doesn't toast the user for a session
+        that's behaving correctly (architect awaiting approval, reviewer
+        idle with empty queue, etc.). A worker that ``classify_stall``
+        flags as ``awaiting_operator`` is surfaced as a ``worker_question``
+        alert instead.
+
+        Returns the list of alert types raised this tick (empty when no
+        alert fires).
+        """
+        if (
+            mechanical_only
+            or not context.previous_snapshot_hash
+            or context.previous_snapshot_hash != context.snapshot_hash
+        ):
+            api.clear_alert(context.session_name, "suspected_loop")
+            return []
+
+        hashes = api.recent_snapshot_hashes(context.session_name, limit=3)
+        if not (len(hashes) == 3 and len(set(hashes)) == 1):
+            api.clear_alert(context.session_name, "suspected_loop")
+            return []
+
+        from pollypm.heartbeats.stall_classifier import (
+            StallContext,
+            classify_stall,
+        )
+        from pollypm.idle_placeholders import (
+            pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
+            pane_is_idle_placeholder as _pane_is_idle_placeholder,
+        )
+
+        _pane_text = context.pane_text or ""
+        stall_ctx = StallContext(
+            role=context.role or "",
+            session_name=context.session_name,
+            has_pending_work=self._has_pending_work(api, context),
+            pane_is_idle_placeholder=_pane_is_idle_placeholder(_pane_text),
+            awaiting_operator_question=_pane_ends_with_unanswered_question(_pane_text),
+        )
+        stall_class = classify_stall(stall_ctx)
+        if stall_class == "awaiting_operator":
+            # Surface the worker's pending question to the operator
+            # inbox so polly / the user can see and answer it,
+            # instead of the pane sitting silently with `pm status`
+            # reporting healthy. Distinct alert_type from
+            # ``suspected_loop`` so dedupe and routing don't
+            # collapse the two categories.
+            question_text = (stall_ctx.awaiting_operator_question or "").strip()
+            short_question = question_text
+            if len(short_question) > 140:
+                short_question = short_question[:137].rstrip() + "…"
+            _emit_routed_alert(
+                api,
+                session_name=context.session_name,
+                alert_type="worker_question",
+                severity="warn",
+                message=(
+                    f"{context.role or 'session'} "
+                    f"{context.session_name} is waiting for an "
+                    f"operator answer: {short_question}"
+                ),
+                subject=f"{context.session_name} asked a question",
+                suggested_action=(
+                    "Open the worker pane and answer, or `pm send "
+                    f"{context.session_name} \"<answer>\"`."
+                ),
+            )
+            api.clear_alert(context.session_name, "suspected_loop")
+            return ["worker_question"]
+        if stall_class != "unrecoverable_stall":
+            api.clear_alert(context.session_name, "suspected_loop")
+            return []
+
+        # #760 — concrete actionable copy: name the role,
+        # say what's wrong in plain English, and keep the
+        # next step in the cockpit.
+        _emit_routed_alert(
+            api,
+            session_name=context.session_name,
+            alert_type="suspected_loop",
+            severity="warn",
+            message=(
+                f"{context.role or 'session'} "
+                f"{context.session_name} stalled — no new output "
+                f"for 3 heartbeats with queued work. "
+                "Open Workers and restart the stalled session."
+            ),
+            subject=(
+                f"{context.session_name} appears stalled"
+            ),
+            suggested_action=(
+                "Open Workers and restart the stalled session."
+            ),
+        )
+        # After 5 consecutive identical snapshots, queue a Haiku triage
+        longer_hashes = api.recent_snapshot_hashes(context.session_name, limit=5)
+        if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
+            if context.role == "worker":
+                self._triage_stalled_worker(api, context)
+        return ["suspected_loop"]
 
     def _apply_resume_ping(
         self, api, context: HeartbeatSessionContext, signals: SessionSignals,

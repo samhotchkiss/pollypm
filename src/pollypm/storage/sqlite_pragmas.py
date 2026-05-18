@@ -50,6 +50,7 @@ import sqlite3
 import time
 from pathlib import Path
 from typing import Callable, TypeVar
+from urllib.parse import quote
 
 
 # 5 s is the recommended floor for a multi-writer SQLite workload — long
@@ -73,6 +74,31 @@ logger = logging.getLogger(__name__)
 T = TypeVar("T")
 
 _CLOSED_DB_MARKER = "Cannot operate on a closed database"
+
+
+def readonly_uri(db_path: Path | str, *, immutable: bool = False) -> str:
+    """Return a ``file:<path>?mode=ro`` URI safe to pass to ``sqlite3.connect``.
+
+    #1674 — the naive ``f"file:{path}?mode=ro"`` construction breaks for
+    valid filesystem paths that contain URI metacharacters such as ``#``
+    (parsed as a fragment) or ``?`` (parsed as a query start), because
+    SQLite's URI parser treats those characters as syntax rather than
+    path bytes. Workspace paths under macOS temp dirs, draft branches
+    named ``feature?wip``, etc., would silently fail to open and the
+    presentation-side facades would return ``None`` instead of the real
+    aggregate.
+
+    The path is percent-encoded with ``urllib.parse.quote`` keeping ``/``
+    as a literal separator so the encoding is reversible and matches
+    SQLite's documented URI grammar.
+
+    ``immutable=True`` adds ``&immutable=1`` to the query string for the
+    one caller (``StateStore``) that opens a known-immutable read-only
+    snapshot.
+    """
+    encoded = quote(str(db_path), safe="/")
+    suffix = "&immutable=1" if immutable else ""
+    return f"file:{encoded}?mode=ro{suffix}"
 
 
 def apply_workspace_pragmas(

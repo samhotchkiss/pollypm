@@ -123,7 +123,10 @@ def _readonly_connect(db_path: Path) -> sqlite3.Connection | None:
     """Open a read-only SQLite connection, or ``None`` if the DB is absent."""
     if not db_path.is_file():
         return None
-    uri = f"file:{db_path}?mode=ro"
+    # #1674: percent-encode so URI metacharacters in the workspace path
+    # don't get parsed as fragment/query.
+    from pollypm.storage.sqlite_pragmas import readonly_uri
+    uri = readonly_uri(db_path)
     try:
         return sqlite3.connect(uri, uri=True, timeout=1.0)
     except sqlite3.Error:

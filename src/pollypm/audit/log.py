@@ -407,6 +407,15 @@ def emit(
         try:
             line = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
         except Exception:  # noqa: BLE001
+            # #1355: previously silent. Even the stripped fallback failed
+            # to serialize — log so a dropped audit event leaves a trail
+            # instead of vanishing.
+            logger.warning(
+                "audit.emit: stripped record still not serializable for %s/%s; dropping",
+                project,
+                event,
+                exc_info=True,
+            )
             return
 
     # Per-project log first (authoritative), central tail second

@@ -8,7 +8,6 @@ from typing import TYPE_CHECKING
 from pollypm.models import AccountConfig, SessionConfig
 
 if TYPE_CHECKING:
-    from pollypm.providers.base import LaunchCommand
     from pollypm.tmux.client import TmuxClient
 
 
@@ -17,6 +16,17 @@ class TranscriptSource:
     root: Path
     pattern: str = "*.jsonl"
     description: str = ""
+
+
+@dataclass(slots=True)
+class LaunchCommand:
+    argv: list[str]
+    env: dict[str, str]
+    cwd: Path
+    resume_argv: list[str] | None = None
+    resume_marker: Path | None = None
+    initial_input: str | None = None
+    fresh_launch_marker: Path | None = None
 
 
 @dataclass(slots=True)
@@ -44,13 +54,13 @@ class ProviderAdapterBase(ABC):
         return shutil.which(self.binary) is not None
 
     @abstractmethod
-    def build_launch_command(self, session: SessionConfig, account: AccountConfig) -> "LaunchCommand": ...
+    def build_launch_command(self, session: SessionConfig, account: AccountConfig) -> LaunchCommand: ...
 
     def build_resume_command(
         self,
         session: SessionConfig,
         account: AccountConfig,
-    ) -> "LaunchCommand | None":
+    ) -> LaunchCommand | None:
         return None
 
     def transcript_sources(

@@ -1,22 +1,24 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from pathlib import Path
 from typing import Protocol
 
 from pollypm.models import AccountConfig, SessionConfig
-from pollypm.provider_sdk import ProviderUsageSnapshot, TranscriptSource
+from pollypm.provider_sdk import (
+    LaunchCommand,
+    ProviderUsageSnapshot,
+    TranscriptSource,
+)
 
-
-@dataclass(slots=True)
-class LaunchCommand:
-    argv: list[str]
-    env: dict[str, str]
-    cwd: Path
-    resume_argv: list[str] | None = None
-    resume_marker: Path | None = None
-    initial_input: str | None = None
-    fresh_launch_marker: Path | None = None
+# ``LaunchCommand`` is defined in :mod:`pollypm.provider_sdk` so that
+# ``provider_sdk`` no longer needs a (formerly-cyclic) TYPE_CHECKING import
+# from this module. Re-exported here for backwards compatibility — many
+# call sites still ``from pollypm.providers.base import LaunchCommand``.
+__all__ = [
+    "LaunchCommand",
+    "ProviderAdapter",
+    "ProviderUsageSnapshot",
+    "TranscriptSource",
+]
 
 
 class ProviderAdapter(Protocol):

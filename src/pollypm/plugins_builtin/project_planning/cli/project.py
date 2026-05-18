@@ -764,6 +764,16 @@ def _count_project_state_rows(
     return counts
 
 
+class _PurgeStateError(RuntimeError):
+    """Raised when ``_purge_project_state`` cannot commit the row sweep.
+
+    Signals a hard failure (locked DB, corrupt file, unwritable path)
+    that left the rows in place. The caller MUST abort before
+    ``remove_project`` so the TOML config doesn't drift relative to
+    the DB rows (see issue #1673).
+    """
+
+
 def _purge_project_state(
     config_path: Path,
     project_key: str,
@@ -773,39 +783,61 @@ def _purge_project_state(
     """Delete every project-scoped row from the workspace state DB.
 
     Returns a ``{table: removed_count}`` dict (plus ``audit_tail`` for
-    the central-tail JSONL file). In ``dry_run`` mode no mutations
-    happen; the returned counts reflect what WOULD be deleted.
+    the central-tail JSONL file). The counts reflect rows actually
+    deleted by the committed transaction (via ``cursor.rowcount``),
+    NOT the pre-purge estimate. In ``dry_run`` mode no mutations
+    happen and the returned counts mirror what
+    :func:`_count_project_state_rows` reports.
 
     The SQLite bulk DELETE happens inside
     :func:`pollypm.storage.project_state_purge.purge_project_state_rows`
     (#1676 — keeps schema/connection knowledge out of the plugin
-    CLI). The audit-tail JSONL teardown is a file operation, so it
-    stays here.
+    CLI). Per-table errors (missing table on a fresh DB, schema drift)
+    are swallowed inside the facade so they never abort the rest of
+    the sweep; the count for that table falls through as ``0``. A
+    connection-level failure (locked DB, corrupt file, unwritable
+    path) raises :class:`_PurgeStateError` so the caller can abort
+    before ``remove_project`` strips the project from ``pollypm.toml``
+    (see issue #1673 — the previous best-effort-on-everything
+    behaviour silently desynced the config from the orphaned rows).
+
+    The audit-tail JSONL teardown is a file operation, so it stays
+    here. It runs AFTER the DB commit so the rows-vs-tail asymmetry
+    only ever points one way: tail may linger after a successful row
+    purge, never the reverse.
     """
-    from pollypm.storage.project_state_purge import purge_project_state_rows
+    from pollypm.storage.project_state_purge import (
+        ProjectStatePurgeError,
+        purge_project_state_rows,
+    )
 
     db_path = _workspace_db_path(config_path)
-    counts = purge_project_state_rows(db_path, project_key, dry_run=dry_run)
-
-    # Audit tail file — central-tail JSONL at
-    # ~/.pollypm/audit/<project>.jsonl. The per-project log inside
-    # ``<project_path>/.pollypm/audit.jsonl`` lives in the project
-    # directory, which ``pm project remove`` deliberately leaves on
-    # disk (worktree teardown is a separate wedge, see #1561).
+    try:
+        counts = purge_project_state_rows(
+            db_path, project_key, dry_run=dry_run,
+        )
+    except ProjectStatePurgeError as exc:
+        # Re-raise via the CLI-local sentinel so existing callers /
+        # tests can keep catching ``_PurgeStateError`` without
+        # reaching into the storage facade's module namespace.
+        raise _PurgeStateError(str(exc)) from exc
     counts["audit_tail"] = 0
+
     try:
         from pollypm.audit.log import central_log_path
 
         tail_path = central_log_path(project_key)
         if tail_path.exists():
-            counts["audit_tail"] = 1
-            if not dry_run:
+            if dry_run:
+                counts["audit_tail"] = 1
+            else:
                 try:
                     tail_path.unlink()
+                    counts["audit_tail"] = 1
                 except OSError:
-                    # Best-effort. Leave the count as 1 so the summary
-                    # reports "would have removed" but we couldn't.
-                    pass
+                    # Best-effort. Leave the count at 0 so the summary
+                    # truthfully reports nothing was removed.
+                    counts["audit_tail"] = 0
     except Exception:  # noqa: BLE001
         pass
 
@@ -1078,7 +1110,9 @@ def remove_cmd(
     # purging first and removing second, a failure on the second
     # step leaves the user with a clearly-orphaned project entry
     # they can retry the remove on; a failure on the first step
-    # exits before touching the config.
+    # (``_PurgeStateError``) exits with code 1 before touching the
+    # config (see issue #1673 — previously this caught the error
+    # silently and stripped the project anyway).
     state_summary: dict[str, int] | None = None
     if purge_state:
         state_counts = _count_project_state_rows(path, project_key)
@@ -1102,7 +1136,23 @@ def remove_cmd(
                 if not proceed:
                     typer.echo("Aborted. No changes made.")
                     raise typer.Exit(code=1)
-            state_summary = _purge_project_state(path, project_key)
+            try:
+                state_summary = _purge_project_state(path, project_key)
+            except _PurgeStateError as exc:
+                # Hard DB failure (locked / corrupt / unwritable).
+                # Abort BEFORE ``remove_project`` so the config doesn't
+                # drift relative to the orphaned rows (issue #1673).
+                typer.echo(
+                    f"Error: state.db purge failed for '{project_key}': "
+                    f"{exc}",
+                    err=True,
+                )
+                typer.echo(
+                    "Aborted. Project entry left in pollypm.toml so you "
+                    "can retry once the DB is reachable.",
+                    err=True,
+                )
+                raise typer.Exit(code=1) from exc
             removed_total = sum(
                 n for table, n in state_summary.items()
                 if table != "audit_tail"

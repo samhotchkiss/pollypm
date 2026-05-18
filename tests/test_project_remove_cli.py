@@ -1069,3 +1069,141 @@ def test_plugin_cli_does_not_import_sqlite3() -> None:
     text = Path(cli_mod.__file__).read_text(encoding="utf-8")
     assert "import sqlite3" not in text
     assert "sqlite3.connect" not in text
+
+
+# --------------------------------------------------------------------------
+# Regression: #1673 — DB purge failure must NOT strip the TOML project.
+# Before the fix, ``_purge_project_state`` caught ``sqlite3.Error`` and
+# returned the pre-purge counts, so ``remove_cmd`` happily printed
+# "Deleted N rows" and called ``remove_project`` — leaving rows in the
+# DB and the project gone from pollypm.toml. The fix raises a
+# ``_PurgeStateError`` (translated from the facade's
+# ``ProjectStatePurgeError``) on hard DB failures so the command aborts
+# before touching the config.
+# --------------------------------------------------------------------------
+
+
+def test_purge_project_state_raises_on_db_open_failure(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Connection failure surfaces as ``_PurgeStateError`` (#1673)."""
+    import sqlite3
+
+    from pollypm.plugins_builtin.project_planning.cli import (
+        project as project_mod,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+
+    real_connect = sqlite3.connect
+
+    def boom(*_args, **_kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    # Patch the sqlite3 module the storage facade imports.
+    monkeypatch.setattr(sqlite3, "connect", boom)
+    try:
+        with pytest.raises(project_mod._PurgeStateError):
+            project_mod._purge_project_state(env["config_path"], "demo")
+    finally:
+        monkeypatch.setattr(sqlite3, "connect", real_connect)
+
+
+def test_purge_project_state_raises_on_commit_failure(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-transaction failure rolls back and raises (#1673)."""
+    import sqlite3
+
+    from pollypm.plugins_builtin.project_planning.cli import (
+        project as project_mod,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+
+    real_connect = sqlite3.connect
+
+    class _BoomConn:
+        def __init__(self, inner):
+            self._inner = inner
+
+        def execute(self, sql, *args, **kwargs):
+            if sql.strip().upper().startswith("BEGIN"):
+                raise sqlite3.OperationalError("database is locked")
+            return self._inner.execute(sql, *args, **kwargs)
+
+        def commit(self):
+            return self._inner.commit()
+
+        def rollback(self):
+            return self._inner.rollback()
+
+        def close(self):
+            return self._inner.close()
+
+    def wrap(*args, **kwargs):
+        return _BoomConn(real_connect(*args, **kwargs))
+
+    monkeypatch.setattr(sqlite3, "connect", wrap)
+    try:
+        with pytest.raises(project_mod._PurgeStateError):
+            project_mod._purge_project_state(env["config_path"], "demo")
+    finally:
+        monkeypatch.setattr(sqlite3, "connect", real_connect)
+
+    # Rows still present — purge never committed.
+    after = project_mod._count_project_state_rows(env["config_path"], "demo")
+    assert after["work_tasks"] == 2
+
+
+def test_cli_remove_purge_state_aborts_when_db_purge_fails(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``pm project remove --purge-state`` does NOT strip TOML on DB failure (#1673)."""
+    from pollypm.plugins_builtin.project_planning.cli import (
+        project as project_mod,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+
+    def boom(*_args, **_kwargs):
+        raise project_mod._PurgeStateError("simulated locked DB")
+
+    monkeypatch.setattr(project_mod, "_purge_project_state", boom)
+
+    result = runner.invoke(
+        project_app,
+        [
+            "remove", "demo", "--purge-state", "--yes",
+            "--config", str(env["config_path"]),
+        ],
+    )
+
+    # Command must exit non-zero with an explicit error message.
+    assert result.exit_code == 1, result.output
+    assert "state.db purge failed" in result.output
+    assert "Aborted" in result.output
+
+    # CRITICAL: project entry still in pollypm.toml.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+    # CRITICAL: no "Removed project" line emitted.
+    assert "Removed project 'demo'" not in result.output
+
+    # Audit tail untouched (purge bailed before audit cleanup too).
+    assert tail_path.exists()

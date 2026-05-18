@@ -39,6 +39,16 @@ logger = logging.getLogger(__name__)
 # is ``"single"`` (binds ``project_key`` once) or ``"pair"`` (binds it
 # twice — used by ``work_task_dependencies`` whose WHERE matches
 # from-project OR to-project).
+class ProjectStatePurgeError(RuntimeError):
+    """Raised when the bulk state-db purge cannot commit cleanly.
+
+    Signals a hard failure (locked DB, corrupt file, unwritable path,
+    aborted transaction) that left the rows in place. The CLI catches
+    this and aborts before touching ``pollypm.toml`` so the config
+    doesn't drift relative to the still-present rows (see issue #1673).
+    """
+
+
 _STATE_PURGE_TABLES: tuple[tuple[str, str, str], ...] = (
     # Work-service children of work_tasks (FK to work_tasks(project,
     # task_number)) — these MUST go first or a future FK-enabled
@@ -130,10 +140,18 @@ def purge_project_state_rows(
     deleted (the same numbers :func:`count_project_state_rows`
     returns).
 
-    Best-effort throughout: a missing DB, missing table, or write
-    failure on one table never aborts the rest of the sweep. The
-    deletes run in a single ``BEGIN IMMEDIATE`` transaction so a
-    mid-sweep crash leaves the DB consistent.
+    Per-table best-effort: a missing table (fresh DB, schema drift)
+    is swallowed so it never aborts the rest of the sweep; the count
+    for that table falls through as ``0``. The deletes run in a
+    single ``BEGIN IMMEDIATE`` transaction so a mid-sweep crash
+    leaves the DB consistent.
+
+    A connection-level failure (locked DB, corrupt file, unwritable
+    path) or transaction-level failure (BEGIN/COMMIT error) raises
+    :class:`ProjectStatePurgeError` so the caller can abort before
+    any downstream config mutation (issue #1673 — best-effort-on-
+    everything silently desynced ``pollypm.toml`` from the orphaned
+    rows).
 
     Why a single bulk SQL sweep instead of routing through
     ``work_service.delete_task``: per-task deletes would fire
@@ -152,34 +170,42 @@ def purge_project_state_rows(
     try:
         conn = sqlite3.connect(db_path)
     except sqlite3.Error as exc:
-        logger.debug(
-            "project_state_purge: write connect failed for %s: %s",
-            db_path, exc,
-        )
-        return counts
+        # Can't even open the DB. Surface so the caller aborts before
+        # touching downstream config.
+        raise ProjectStatePurgeError(
+            f"could not open state.db at {db_path}: {exc}"
+        ) from exc
     try:
         try:
             conn.execute("BEGIN IMMEDIATE")
             for table, where, ptype in _STATE_PURGE_TABLES:
                 params = _params_for(project_key, ptype)
                 try:
-                    conn.execute(
+                    cur = conn.execute(
                         f"DELETE FROM {table} WHERE {where}", params,
                     )
                 except sqlite3.Error:
                     # Missing table — skip silently. We already counted
                     # 0 for it above so the summary line stays
                     # accurate.
-                    pass
+                    continue
+                counts[table] = int(cur.rowcount or 0)
             conn.commit()
         except sqlite3.Error as exc:
-            # Pathological case (locked DB, corrupted file). Counts
-            # remain as the pre-sweep estimate so the caller can warn
-            # the user; we don't fabricate success.
+            # BEGIN failed (locked DB) or COMMIT failed (disk full,
+            # corrupt). Roll back so the partial-state risk is zero,
+            # then signal hard failure to the caller.
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
             logger.debug(
                 "project_state_purge: bulk DELETE failed for %s: %s",
                 db_path, exc,
             )
+            raise ProjectStatePurgeError(
+                f"state.db purge failed for '{project_key}': {exc}"
+            ) from exc
     finally:
         conn.close()
 
@@ -187,6 +213,7 @@ def purge_project_state_rows(
 
 
 __all__ = [
+    "ProjectStatePurgeError",
     "count_project_state_rows",
     "purge_project_state_rows",
 ]

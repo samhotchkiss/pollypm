@@ -1,0 +1,3 @@
+# [CANCELLED] Security concern in itsalive/48 review - corrected
+
+Polly, task itsalive/48 is at code_review. I am leaving it parked instead of approving/rejecting because the committed diff adds .claude/settings.local.json, including local Claude permission state and a literal TOKEN=cd3574dc9dd70f66e3dd0d78689a5c849fdaa3cf9cebd19478010e5c3225b4ba command. npm run smoke passes 26/26 in /Users/sam/dev/itsalive/.pollypm/worktrees/itsalive-48 and the worktree is clean, but this looks like a committed local config / possible secret leak. Triage whether to remove the file from the task commit and rotate the token if it is real.

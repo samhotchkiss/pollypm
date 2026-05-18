@@ -1244,6 +1244,198 @@ def _purge_project_worktrees(
     return results
 
 
+def _print_remove_dry_run_plan(
+    config_path: Path,
+    project_key: str,
+    project_entry: Any,
+    active: int,
+    session_names: list[str],
+    *,
+    purge_sessions: bool,
+    purge_state: bool,
+    purge_worktrees: bool,
+    force_discard_worktree_changes: bool,
+) -> None:
+    """Print the dry-run teardown plan for ``pm project remove`` and return.
+
+    Pulled out of :func:`remove_cmd` so the command body reads as a
+    linear sequence of side-effecting steps instead of branching into
+    a 100-line preview block. Pure ``typer.echo`` side effects — no
+    config / state / disk mutation. Mirrors the exact output the
+    inline block used to produce (tests assert on the literal strings).
+    """
+    typer.echo(f"Dry run: would remove project '{project_key}'.")
+    typer.echo(f"  path:    {project_entry.path}")
+    if active > 0:
+        task_word = "task" if active == 1 else "tasks"
+        typer.echo(
+            f"  active:  {active} queued/in-flight work-service "
+            f"{task_word} (would be left in place)"
+        )
+    if session_names:
+        preview = _purge_project_sessions(
+            config_path, project_key, dry_run=True,
+        )
+        if purge_sessions:
+            typer.echo("  sessions to purge:")
+        else:
+            typer.echo(
+                "  sessions referencing project "
+                "(use --purge-sessions to tear down):"
+            )
+        for name, live, _killed in preview:
+            state = "live" if live else "stale"
+            typer.echo(f"    - {name} ({state})")
+    else:
+        typer.echo("  sessions: (none)")
+    if session_names and not purge_sessions:
+        typer.echo(
+            "Note: remove_project will refuse while sessions are "
+            "enabled. Re-run with --purge-sessions to tear them down."
+        )
+
+    # ------------------------------------------------------------------
+    # state.db row teardown preview. We always sum the rows so the
+    # operator sees the magnitude of orphan state, even when they
+    # don't pass --purge-state — that's exactly the "left in place"
+    # surface area #1561 wants to make visible.
+    # ------------------------------------------------------------------
+    state_counts = _count_project_state_rows(config_path, project_key)
+    nonzero = {
+        table: n for table, n in state_counts.items() if n > 0
+    }
+    if nonzero:
+        if purge_state:
+            typer.echo("  state.db rows to purge:")
+        else:
+            typer.echo(
+                "  state.db rows referencing project "
+                "(use --purge-state to delete):"
+            )
+        for table, n in sorted(nonzero.items()):
+            noun = (
+                "file" if table == "audit_tail"
+                else ("row" if n == 1 else "rows")
+            )
+            typer.echo(f"    - {table}: {n} {noun}")
+    else:
+        typer.echo("  state.db rows: (none)")
+    if nonzero and not purge_state:
+        typer.echo(
+            "Note: state.db rows are NOT touched without --purge-state."
+        )
+
+    # ------------------------------------------------------------------
+    # Worktree directory teardown preview. Same "show the orphan
+    # footprint even if the flag isn't set" pattern as --purge-state
+    # so the operator sees what they're leaving on disk.
+    # ------------------------------------------------------------------
+    wt_preview = _purge_project_worktrees(
+        config_path, project_key, dry_run=True,
+    )
+    if wt_preview:
+        if purge_worktrees:
+            typer.echo("  worktree directories to purge:")
+        else:
+            typer.echo(
+                "  worktree directories under .pollypm/worktrees/ "
+                "(use --purge-worktrees to remove):"
+            )
+        for wt_path, is_git, dirty, _ok, _reason in wt_preview:
+            kind = "git" if is_git else "stale"
+            dirty_marker = " [dirty]" if dirty else ""
+            typer.echo(f"    - {wt_path} ({kind}){dirty_marker}")
+        dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
+        if (
+            dirty_count > 0
+            and purge_worktrees
+            and not force_discard_worktree_changes
+        ):
+            typer.echo(
+                f"Note: {dirty_count} worktree(s) have uncommitted "
+                "changes and will be skipped. Pass "
+                "--force-discard-worktree-changes to remove anyway."
+            )
+    else:
+        typer.echo("  worktree directories: (none)")
+    if wt_preview and not purge_worktrees:
+        typer.echo(
+            "Note: worktree directories are NOT touched without "
+            "--purge-worktrees."
+        )
+    typer.echo("Re-run without --dry-run to apply.")
+
+
+def _apply_state_purge(
+    config_path: Path,
+    project_key: str,
+    *,
+    force: bool,
+    yes: bool,
+) -> None:
+    """Run the ``--purge-state`` confirmation + delete cascade.
+
+    Pulled out of :func:`remove_cmd` so the command body doesn't carry
+    50+ lines of nested confirmation / error-handling. Behaviour is
+    preserved verbatim: same prompts, same error text, same exit codes,
+    same per-table summary lines. Raises :class:`typer.Exit` to abort
+    the parent command on cancel / DB failure.
+    """
+    state_counts = _count_project_state_rows(config_path, project_key)
+    total_rows = sum(
+        n for table, n in state_counts.items() if table != "audit_tail"
+    )
+    if total_rows <= 0 and state_counts.get("audit_tail", 0) <= 0:
+        return
+    if not (force or yes):
+        # Destructive — explicit confirm, default No. The
+        # active-task prompt above only covers queued / in-flight
+        # rows; --purge-state also nukes completed / archived
+        # rows and audit history, so we need a second gate.
+        typer.echo(
+            f"--purge-state will delete {total_rows} state.db "
+            f"row(s) for '{project_key}' plus the audit tail."
+        )
+        proceed = typer.confirm(
+            f"Permanently delete state.db rows for '{project_key}'?",
+            default=False,
+        )
+        if not proceed:
+            typer.echo("Aborted. No changes made.")
+            raise typer.Exit(code=1)
+    try:
+        state_summary = _purge_project_state(config_path, project_key)
+    except _PurgeStateError as exc:
+        # Hard DB failure (locked / corrupt / unwritable).
+        # Abort BEFORE ``remove_project`` so the config doesn't
+        # drift relative to the orphaned rows (issue #1673).
+        typer.echo(
+            f"Error: state.db purge failed for '{project_key}': "
+            f"{exc}",
+            err=True,
+        )
+        typer.echo(
+            "Aborted. Project entry left in pollypm.toml so you "
+            "can retry once the DB is reachable.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    removed_total = sum(
+        n for table, n in state_summary.items()
+        if table != "audit_tail"
+    )
+    typer.echo(
+        f"Deleted {removed_total} state.db row(s) for "
+        f"'{project_key}' across "
+        f"{sum(1 for n in state_summary.values() if n > 0)} "
+        "table(s)."
+    )
+    if state_summary.get("audit_tail", 0) > 0:
+        typer.echo(
+            f"Removed central audit-tail JSONL for '{project_key}'."
+        )
+
+
 @project_app.command("remove")
 def remove_cmd(
     project_key: str = typer.Argument(
@@ -1371,106 +1563,17 @@ def remove_cmd(
     # Dry-run: print the plan and exit 0 without mutating anything.
     # ------------------------------------------------------------------
     if dry_run:
-        typer.echo(f"Dry run: would remove project '{project_key}'.")
-        typer.echo(f"  path:    {project_entry.path}")
-        if active > 0:
-            task_word = "task" if active == 1 else "tasks"
-            typer.echo(
-                f"  active:  {active} queued/in-flight work-service "
-                f"{task_word} (would be left in place)"
-            )
-        if session_names:
-            preview = _purge_project_sessions(
-                path, project_key, dry_run=True,
-            )
-            if purge_sessions:
-                typer.echo("  sessions to purge:")
-            else:
-                typer.echo(
-                    "  sessions referencing project "
-                    "(use --purge-sessions to tear down):"
-                )
-            for name, live, _killed in preview:
-                state = "live" if live else "stale"
-                typer.echo(f"    - {name} ({state})")
-        else:
-            typer.echo("  sessions: (none)")
-        if session_names and not purge_sessions:
-            typer.echo(
-                "Note: remove_project will refuse while sessions are "
-                "enabled. Re-run with --purge-sessions to tear them down."
-            )
-
-        # ------------------------------------------------------------------
-        # state.db row teardown preview. We always sum the rows so the
-        # operator sees the magnitude of orphan state, even when they
-        # don't pass --purge-state — that's exactly the "left in place"
-        # surface area #1561 wants to make visible.
-        # ------------------------------------------------------------------
-        state_counts = _count_project_state_rows(path, project_key)
-        nonzero = {
-            table: n for table, n in state_counts.items() if n > 0
-        }
-        if nonzero:
-            if purge_state:
-                typer.echo("  state.db rows to purge:")
-            else:
-                typer.echo(
-                    "  state.db rows referencing project "
-                    "(use --purge-state to delete):"
-                )
-            for table, n in sorted(nonzero.items()):
-                noun = (
-                    "file" if table == "audit_tail"
-                    else ("row" if n == 1 else "rows")
-                )
-                typer.echo(f"    - {table}: {n} {noun}")
-        else:
-            typer.echo("  state.db rows: (none)")
-        if nonzero and not purge_state:
-            typer.echo(
-                "Note: state.db rows are NOT touched without --purge-state."
-            )
-
-        # ------------------------------------------------------------------
-        # Worktree directory teardown preview. Same "show the orphan
-        # footprint even if the flag isn't set" pattern as --purge-state
-        # so the operator sees what they're leaving on disk.
-        # ------------------------------------------------------------------
-        wt_preview = _purge_project_worktrees(
-            path, project_key, dry_run=True,
+        _print_remove_dry_run_plan(
+            path,
+            project_key,
+            project_entry,
+            active,
+            session_names,
+            purge_sessions=purge_sessions,
+            purge_state=purge_state,
+            purge_worktrees=purge_worktrees,
+            force_discard_worktree_changes=force_discard_worktree_changes,
         )
-        if wt_preview:
-            if purge_worktrees:
-                typer.echo("  worktree directories to purge:")
-            else:
-                typer.echo(
-                    "  worktree directories under .pollypm/worktrees/ "
-                    "(use --purge-worktrees to remove):"
-                )
-            for wt_path, is_git, dirty, _ok, _reason in wt_preview:
-                kind = "git" if is_git else "stale"
-                dirty_marker = " [dirty]" if dirty else ""
-                typer.echo(f"    - {wt_path} ({kind}){dirty_marker}")
-            dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
-            if (
-                dirty_count > 0
-                and purge_worktrees
-                and not force_discard_worktree_changes
-            ):
-                typer.echo(
-                    f"Note: {dirty_count} worktree(s) have uncommitted "
-                    "changes and will be skipped. Pass "
-                    "--force-discard-worktree-changes to remove anyway."
-                )
-        else:
-            typer.echo("  worktree directories: (none)")
-        if wt_preview and not purge_worktrees:
-            typer.echo(
-                "Note: worktree directories are NOT touched without "
-                "--purge-worktrees."
-            )
-        typer.echo("Re-run without --dry-run to apply.")
         return
 
     if active > 0 and not force:
@@ -1523,60 +1626,8 @@ def remove_cmd(
     # (``_PurgeStateError``) exits with code 1 before touching the
     # config (see issue #1673 — previously this caught the error
     # silently and stripped the project anyway).
-    state_summary: dict[str, int] | None = None
     if purge_state:
-        state_counts = _count_project_state_rows(path, project_key)
-        total_rows = sum(
-            n for table, n in state_counts.items() if table != "audit_tail"
-        )
-        if total_rows > 0 or state_counts.get("audit_tail", 0) > 0:
-            if not (force or yes):
-                # Destructive — explicit confirm, default No. The
-                # active-task prompt above only covers queued / in-flight
-                # rows; --purge-state also nukes completed / archived
-                # rows and audit history, so we need a second gate.
-                typer.echo(
-                    f"--purge-state will delete {total_rows} state.db "
-                    f"row(s) for '{project_key}' plus the audit tail."
-                )
-                proceed = typer.confirm(
-                    f"Permanently delete state.db rows for '{project_key}'?",
-                    default=False,
-                )
-                if not proceed:
-                    typer.echo("Aborted. No changes made.")
-                    raise typer.Exit(code=1)
-            try:
-                state_summary = _purge_project_state(path, project_key)
-            except _PurgeStateError as exc:
-                # Hard DB failure (locked / corrupt / unwritable).
-                # Abort BEFORE ``remove_project`` so the config doesn't
-                # drift relative to the orphaned rows (issue #1673).
-                typer.echo(
-                    f"Error: state.db purge failed for '{project_key}': "
-                    f"{exc}",
-                    err=True,
-                )
-                typer.echo(
-                    "Aborted. Project entry left in pollypm.toml so you "
-                    "can retry once the DB is reachable.",
-                    err=True,
-                )
-                raise typer.Exit(code=1) from exc
-            removed_total = sum(
-                n for table, n in state_summary.items()
-                if table != "audit_tail"
-            )
-            typer.echo(
-                f"Deleted {removed_total} state.db row(s) for "
-                f"'{project_key}' across "
-                f"{sum(1 for n in state_summary.values() if n > 0)} "
-                "table(s)."
-            )
-            if state_summary.get("audit_tail", 0) > 0:
-                typer.echo(
-                    f"Removed central audit-tail JSONL for '{project_key}'."
-                )
+        _apply_state_purge(path, project_key, force=force, yes=yes)
 
     # Worktree directory teardown. Runs BEFORE ``remove_project`` to
     # match the pattern of --purge-state: clean up the on-disk debris

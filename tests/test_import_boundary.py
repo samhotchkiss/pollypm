@@ -186,6 +186,14 @@ _MORNING_BRIEFING_PLUGIN_PREFIX = "pollypm.plugins_builtin.morning_briefing"
 # directly (see #1363, sibling of #1597 / #1621).
 _DOCTOR_FILE = "src/pollypm/doctor.py"
 _CORE_RECURRING_PLUGIN_PREFIX = "pollypm.plugins_builtin.core_recurring"
+# The cockpit dashboard's activity panel and the full-screen activity
+# inbox view both resolve a feed projector through
+# :func:`pollypm.activity_projector_registry.build_activity_projector`
+# instead of importing ``build_projector`` from the ``activity_feed``
+# plugin directly (see #1363, sibling of #1597 / #1621 / #1626).
+_COCKPIT_UI_FILE = "src/pollypm/cockpit_ui.py"
+_COCKPIT_INBOX_FILE = "src/pollypm/cockpit_inbox.py"
+_ACTIVITY_FEED_PLUGIN_MODULE = "pollypm.plugins_builtin.activity_feed.plugin"
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -290,6 +298,40 @@ def test_doctor_does_not_import_core_recurring_plugin() -> None:
         f"{_CORE_RECURRING_PLUGIN_PREFIX}; use "
         "pollypm.maintenance_handlers_registry.invoke_maintenance_handler "
         "instead so the plugin stays optional."
+    )
+
+
+def test_cockpit_does_not_import_activity_feed_plugin_for_projector() -> None:
+    """Cockpit surfaces resolve the activity projector via the core seam.
+
+    :func:`pollypm.activity_projector_registry.build_activity_projector`
+    is the sanctioned read path. The ``activity_feed`` plugin installs
+    its ``build_projector`` factory during ``initialize``; if the
+    dashboard panel (``cockpit_ui._dashboard_activity``) or the full-
+    screen activity inbox (``cockpit_inbox._fetch_activity_entries``)
+    reach into the plugin tree directly we lose the "plugin is optional"
+    contract — fail loudly so the seam stays clean.
+
+    Other ``activity_feed`` submodules (e.g. ``cockpit.feed_panel``
+    Textual widgets) are intentionally NOT covered here — those are
+    UI-rendering helpers tracked under a separate slice of #1363.
+    """
+    root = _project_root()
+    offenders: list[str] = []
+    for rel in (_COCKPIT_UI_FILE, _COCKPIT_INBOX_FILE):
+        source_file = root / rel
+        assert source_file.exists(), (
+            f"Expected {rel} to exist — boundary test needs updating if "
+            "the file moved."
+        )
+        if _imports_module(source_file, _ACTIVITY_FEED_PLUGIN_MODULE):
+            offenders.append(rel)
+    assert not offenders, (
+        "Cockpit surfaces must not import `build_projector` from "
+        f"{_ACTIVITY_FEED_PLUGIN_MODULE}; use "
+        "pollypm.activity_projector_registry.build_activity_projector "
+        "instead so the plugin stays optional. Offenders:\n  - "
+        + "\n  - ".join(offenders)
     )
 
 

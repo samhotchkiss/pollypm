@@ -220,10 +220,8 @@ def self_promote(
         )
         return
 
-    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
-        _dispatch_to_operator_tier4,
-    )
-    outcome = _dispatch_to_operator_tier4(
+    from pollypm.tier4_actions_registry import dispatch_to_operator_tier4
+    outcome = dispatch_to_operator_tier4(
         finding,
         project_path=None,
         now=now,
@@ -234,6 +232,12 @@ def self_promote(
     typer.echo(
         f"self-promote outcome={outcome} root_cause_hash={rch}"
     )
+    if outcome == "unavailable":
+        typer.echo(
+            "tier-4 dispatch unavailable (core_recurring plugin not loaded).",
+            err=True,
+        )
+        raise typer.Exit(code=6)
     if outcome == "send_failed":
         raise typer.Exit(code=5)
 
@@ -293,14 +297,17 @@ def clear(
     now = _now()
     cleared = tracker.clear(root_cause_hash_value, now=now, reason=reason)
     if cleared:
-        from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
-            _emit_tier4_demoted,
-        )
-        _emit_tier4_demoted(
+        from pollypm.tier4_actions_registry import emit_tier4_demoted
+        emitted = emit_tier4_demoted(
             project=state.project,
             root_cause_hash_value=root_cause_hash_value,
             reason=reason,
         )
+        if not emitted:
+            logger.debug(
+                "tier4 cli: emit_tier4_demoted unavailable for %s",
+                root_cause_hash_value,
+            )
         typer.echo(f"cleared {root_cause_hash_value} ({reason}).")
     else:
         typer.echo(f"clear no-op for {root_cause_hash_value}.")
@@ -369,9 +376,7 @@ def _system_action(
 
     Returns 0 on success, 1 on bounce failure.
     """
-    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
-        emit_tier4_global_action,
-    )
+    from pollypm.tier4_actions_registry import emit_tier4_global_action
     push_delivered = emit_tier4_global_action(
         action=action_name,
         root_cause_hash_value=root_cause_hash_value,

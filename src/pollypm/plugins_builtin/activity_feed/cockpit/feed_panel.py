@@ -32,7 +32,9 @@ from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     EventProjector,
     FeedEntry,
 )
-from pollypm.plugins_builtin.activity_feed.plugin import build_projector
+from pollypm.plugins_builtin.activity_feed.projector_factory import (
+    build_projector,
+)
 
 logger = logging.getLogger(__name__)
 

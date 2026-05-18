@@ -30,45 +30,19 @@ from pollypm.plugin_api.v1 import (
     PollyPMPlugin,
     RailContext,
 )
+from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
+    new_event_count,
+)
 from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     EventProjector,
     FeedEntry,
 )
+from pollypm.plugins_builtin.activity_feed.projector_factory import (
+    _collect_work_db_paths,
+    build_projector,
+)
 
 logger = logging.getLogger(__name__)
-
-
-def _collect_work_db_paths(config: Any) -> list[tuple[str, Any]]:
-    """Build the list of (project_key, work_db_path) for the projector.
-
-    Missing config, missing projects, or missing work DBs are tolerated
-    — the projector checks path existence before querying.
-    """
-    result: list[tuple[str, Any]] = []
-    if config is None:
-        return result
-    projects = getattr(config, "projects", None) or {}
-    for key, project in projects.items():
-        project_path = getattr(project, "path", None)
-        if project_path is None:
-            continue
-        result.append((str(key), project_path / ".pollypm" / "state.db"))
-    return result
-
-
-def build_projector(config: Any) -> EventProjector | None:
-    """Construct an :class:`EventProjector` wired to the active config.
-
-    Returns ``None`` if no state DB is configured (typical in test
-    harnesses with stub configs). Callers treat ``None`` as "no feed
-    available" and show an empty panel.
-    """
-    if config is None:
-        return None
-    state_db = getattr(getattr(config, "project", None), "state_db", None)
-    if state_db is None:
-        return None
-    return EventProjector(state_db, _collect_work_db_paths(config))
 
 
 _LAST_SEEN_FILE_NAME = "activity_feed_last_seen"
@@ -122,13 +96,6 @@ def _badge_provider_factory(config: Any):
     def _provider(_ctx: RailContext) -> str | None:
         projector = build_projector(config)
         if projector is None:
-            return None
-        try:
-            from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
-                new_event_count,
-            )
-        except Exception:  # noqa: BLE001
-            logger.debug("activity_feed: badge helper import failed", exc_info=True)
             return None
         last_seen = _load_last_seen_id(config)
         count = new_event_count(projector, last_seen)

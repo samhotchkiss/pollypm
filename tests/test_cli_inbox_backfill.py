@@ -161,7 +161,10 @@ def test_dry_run_classifies_but_writes_nothing(tmp_path: Path) -> None:
     )
 
     assert result.exit_code == 0, result.output
-    assert "Would reclassify 5 row(s); 2 unmatched." in result.output
+    assert (
+        "Would reclassify 5 row(s) (5 message(s), 0 task(s)); "
+        "2 unmatched (2 message(s), 0 task(s))."
+    ) in result.output
     assert "Re-run with --commit" in result.output
     # Each classified row is printed with its heuristic + new kind.
     assert "completion_fyi" in result.output
@@ -205,7 +208,10 @@ def test_commit_writes_audit_events_and_updates_kinds(
     )
 
     assert result.exit_code == 0, result.output
-    assert "Reclassified 5 row(s); 2 unmatched." in result.output
+    assert (
+        "Reclassified 5 row(s) (5 message(s), 0 task(s)); "
+        "2 unmatched (2 message(s), 0 task(s))."
+    ) in result.output
 
     # Each matched row landed on its expected kind.
     assert _read_kind(db_path, ids["completion"]) is InboxItemKind.COMPLETION_FYI
@@ -251,7 +257,10 @@ def test_commit_is_idempotent(
         inbox_app, ["backfill-kinds", "--commit", "--db", str(db_path)],
     )
     assert first.exit_code == 0, first.output
-    assert "Reclassified 5 row(s); 2 unmatched." in first.output
+    assert (
+        "Reclassified 5 row(s) (5 message(s), 0 task(s)); "
+        "2 unmatched (2 message(s), 0 task(s))."
+    ) in first.output
 
     second = runner.invoke(
         inbox_app, ["backfill-kinds", "--commit", "--db", str(db_path)],
@@ -259,7 +268,10 @@ def test_commit_is_idempotent(
     assert second.exit_code == 0, second.output
     # The two remaining legacy rows are still scanned but only re-printed
     # as unmatched; nothing reclassifies on the second pass.
-    assert "Reclassified 0 row(s); 2 unmatched." in second.output
+    assert (
+        "Reclassified 0 row(s) (0 message(s), 0 task(s)); "
+        "2 unmatched (2 message(s), 0 task(s))."
+    ) in second.output
 
 
 def test_dry_run_after_commit_reports_remaining_legacy_rows(
@@ -276,7 +288,10 @@ def test_dry_run_after_commit_reports_remaining_legacy_rows(
     )
     assert result.exit_code == 0, result.output
     # Two legacy rows remain (the unmatched ones); both still print.
-    assert "Would reclassify 0 row(s); 2 unmatched." in result.output
+    assert (
+        "Would reclassify 0 row(s) (0 message(s), 0 task(s)); "
+        "2 unmatched (2 message(s), 0 task(s))."
+    ) in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -354,3 +369,227 @@ def test_empty_db_reports_no_rows(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "No legacy inbox rows to reclassify." in result.output
+
+
+# ---------------------------------------------------------------------------
+# Task-side backfill (#1564 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _seed_legacy_task(
+    db_path: Path,
+    *,
+    title: str,
+    created_by: str = "audit_watchdog",
+    project: str = "demo",
+) -> str:
+    """Create a draft work_tasks row with ``kind='legacy'`` and return ``task_id``.
+
+    ``SQLiteWorkService.create`` defaults ``kind`` to ``"legacy"`` —
+    which is precisely the pre-#1565 state the backfill targets.
+    """
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    svc = SQLiteWorkService(db_path=db_path, project_path=db_path.parent)
+    try:
+        task = svc.create(
+            title=title,
+            description="seed",
+            type="task",
+            project=project,
+            flow_template="chat",
+            roles={"requester": "user", "operator": "user"},
+            priority="normal",
+            created_by=created_by,
+        )
+    finally:
+        svc.close()
+    return task.task_id
+
+
+def _read_task_kind(db_path: Path, task_id: str) -> InboxItemKind:
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    svc = SQLiteWorkService(db_path=db_path, project_path=db_path.parent)
+    try:
+        return svc.get(task_id).kind
+    finally:
+        svc.close()
+
+
+def test_task_backfill_reclassifies_watchdog_queue_motion_rows(
+    tmp_path: Path, _isolate_audit_home: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    watchdog_task = _seed_legacy_task(
+        db_path,
+        title=(
+            "Project savethenovel has 2 queued task(s) but no claim / "
+            "execution / status-change activity for the entire scan window."
+        ),
+        created_by="audit_watchdog",
+        project="savethenovel",
+    )
+    plan_review_task = _seed_legacy_task(
+        db_path,
+        title="Plan ready for review: bikepath",
+        created_by="audit_watchdog",
+        project="bikepath",
+    )
+    other_task = _seed_legacy_task(
+        db_path,
+        title="Refactor session_runtime helper",
+        created_by="polly",
+        project="demo",
+    )
+
+    result = runner.invoke(
+        inbox_app, ["backfill-kinds", "--commit", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    # Per-surface counts surface in the summary line.
+    assert "0 message(s), 2 task(s)" in result.output
+    # And the dedicated Tasks section actually renders.
+    assert "Tasks:" in result.output
+
+    assert (
+        _read_task_kind(db_path, watchdog_task)
+        is InboxItemKind.WATCHDOG_OPERATOR_DISPATCH
+    )
+    assert (
+        _read_task_kind(db_path, plan_review_task)
+        is InboxItemKind.PLAN_REVIEW_PENDING
+    )
+    # Unmatched task stays legacy.
+    assert _read_task_kind(db_path, other_task) is InboxItemKind.LEGACY
+
+    # Audit log carries one inbox.kind_backfilled per reclassified task,
+    # subject set to the task_id (not msg:<n>).
+    events = [
+        e for e in _audit_lines_for_project(_isolate_audit_home, "savethenovel")
+        if e.get("event") == EVENT_INBOX_KIND_BACKFILLED
+    ]
+    assert len(events) == 1
+    assert events[0]["subject"] == watchdog_task
+    assert events[0]["metadata"]["heuristic"] == "watchdog_queue_without_motion"
+    assert (
+        events[0]["metadata"]["new_kind"]
+        == InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value
+    )
+
+    bikepath_events = [
+        e for e in _audit_lines_for_project(_isolate_audit_home, "bikepath")
+        if e.get("event") == EVENT_INBOX_KIND_BACKFILLED
+    ]
+    assert len(bikepath_events) == 1
+    assert bikepath_events[0]["subject"] == plan_review_task
+
+
+def test_task_backfill_dry_run_writes_nothing(tmp_path: Path) -> None:
+    db_path = tmp_path / "state.db"
+    watchdog_task = _seed_legacy_task(
+        db_path,
+        title=(
+            "Project demo has 1 queued task(s) but no claim / "
+            "execution / status-change activity for ~5 min."
+        ),
+        created_by="audit_watchdog",
+        project="demo",
+    )
+
+    result = runner.invoke(
+        inbox_app, ["backfill-kinds", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    # Dry-run summary surfaces counts but writes nothing.
+    assert "Would reclassify 1 row(s)" in result.output
+    assert "0 message(s), 1 task(s)" in result.output
+    assert _read_task_kind(db_path, watchdog_task) is InboxItemKind.LEGACY
+
+
+def test_task_backfill_is_idempotent(
+    tmp_path: Path, _isolate_audit_home: Path,
+) -> None:
+    db_path = tmp_path / "state.db"
+    _seed_legacy_task(
+        db_path,
+        title=(
+            "Project demo has 1 queued task(s) but no claim / "
+            "execution / status-change activity for ~5 min."
+        ),
+        created_by="audit_watchdog",
+        project="demo",
+    )
+
+    first = runner.invoke(
+        inbox_app, ["backfill-kinds", "--commit", "--db", str(db_path)],
+    )
+    assert first.exit_code == 0, first.output
+    assert "Reclassified 1 row(s)" in first.output
+
+    # Second commit: the row is now non-legacy, so the scan finds zero.
+    second = runner.invoke(
+        inbox_app, ["backfill-kinds", "--commit", "--db", str(db_path)],
+    )
+    assert second.exit_code == 0, second.output
+    assert "No legacy inbox rows to reclassify." in second.output
+
+
+def test_task_and_message_backfill_mix_in_single_run(
+    tmp_path: Path, _isolate_audit_home: Path,
+) -> None:
+    """Combined scan reports per-surface counts in one go."""
+    db_path = tmp_path / "state.db"
+    _seed_legacy_message(
+        db_path,
+        subject="Web API phase 1 complete",
+        sender="polly",
+        scope="demo",
+    )
+    _seed_legacy_task(
+        db_path,
+        title=(
+            "Project demo has 1 queued task(s) but no claim / "
+            "execution / status-change activity for ~5 min."
+        ),
+        created_by="audit_watchdog",
+        project="demo",
+    )
+
+    result = runner.invoke(
+        inbox_app, ["backfill-kinds", "--commit", "--db", str(db_path)],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Reclassified 2 row(s) (1 message(s), 1 task(s))" in result.output
+    # Both per-surface sections render.
+    assert "Messages:" in result.output
+    assert "Tasks:" in result.output
+
+
+def test_backfill_kind_refuses_to_overwrite_non_legacy_task(
+    tmp_path: Path,
+) -> None:
+    """SQLiteWorkService.backfill_kind is the lock against accidental re-tagging."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work.service_support import ValidationError
+
+    db_path = tmp_path / "state.db"
+    task_id = _seed_legacy_task(
+        db_path,
+        title="Plan ready for review: demo",
+        created_by="audit_watchdog",
+        project="demo",
+    )
+
+    svc = SQLiteWorkService(db_path=db_path, project_path=db_path.parent)
+    try:
+        svc.backfill_kind(
+            task_id, new_kind=InboxItemKind.PLAN_REVIEW_PENDING.value,
+        )
+        with pytest.raises(ValidationError):
+            svc.backfill_kind(
+                task_id, new_kind=InboxItemKind.COMPLETION_FYI.value,
+            )
+    finally:
+        svc.close()

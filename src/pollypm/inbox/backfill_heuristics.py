@@ -1,4 +1,4 @@
-"""Heuristic classifier for legacy inbox rows (#1570).
+"""Heuristic classifier for legacy inbox rows (#1570, #1564 follow-up).
 
 Pre-#1565 messages all surface with ``kind='legacy'`` because the
 column did not exist when they were written. The
@@ -8,6 +8,15 @@ window — but the dashboard's "Waiting on you" section then lumps
 ~133 historical rows together. This module is the one-time pass
 that reclassifies those rows by matching title + sender + project
 patterns observed in the real inbox.
+
+Two classifier entry points:
+
+* :func:`classify_legacy` — messages-shaped rows (title / sender /
+  scope). Original surface from #1570.
+* :func:`classify_legacy_task` — work_tasks-shaped rows (title /
+  created_by). Added in the #1564 follow-up so the dashboard's
+  "Watchdog escalated: …" rows (which come from the work_tasks
+  table, not messages) can also be retagged off ``legacy``.
 
 Pure leaf: depends only on the :class:`InboxItemKind` enum so it
 can be imported from the CLI command + tests without dragging in
@@ -29,6 +38,13 @@ mirrors the precedence in #1570's spec:
    :attr:`InboxItemKind.WATCHDOG_OPERATOR_DISPATCH`
 6. unmatched → ``None`` (leave the row as legacy; the awaits-user
    predicate still surfaces it for manual triage)
+
+The task-side classifier (:func:`classify_legacy_task`) is
+deliberately narrower: tasks don't carry a ``sender`` / ``scope``
+pair the way messages do, and the watchdog-created task rows the
+2026-05-17 dashboard surfaced are dominated by the
+queue-without-motion subject. Adding heuristics there that don't
+have field-observed evidence would just guess.
 """
 
 from __future__ import annotations
@@ -152,4 +168,82 @@ def classify_legacy(
     return None
 
 
-__all__ = ["Classification", "classify_legacy"]
+# ---------------------------------------------------------------------------
+# Task-side heuristics (#1564 follow-up)
+# ---------------------------------------------------------------------------
+
+
+# Substring of the queue_without_motion watchdog finding's message —
+# the exact title every legacy ``audit_watchdog``-created task in the
+# field carries when the watchdog escalated a wedged queue to the
+# operator. Match is case-insensitive; only the distinctive middle of
+# the phrase is checked so a future minor copy edit (e.g. "claim or
+# execution") doesn't silently break the rule.
+_WATCHDOG_QUEUE_WITHOUT_MOTION_TOKEN = "queued task"
+_WATCHDOG_QUEUE_WITHOUT_MOTION_TAIL = "claim / execution"
+
+# Watchdog operator-dispatch tasks created via
+# :func:`pollypm.dashboard.categorization.why_waiting` carry the prefix
+# below in any rerouted form. The cockpit copy "Watchdog escalated:"
+# is rendered only — it never ends up in storage — but we include the
+# token so a future producer that does name itself this way is caught.
+_WATCHDOG_ESCALATED_TOKEN = "watchdog escalated"
+
+# Tasks the watchdog files via
+# :func:`pollypm.work.plan_review_emit.emit_plan_review` use the
+# ``"Plan ready for review"`` prefix. Matching this here would
+# duplicate the message-side heuristic; the prefix check below reuses
+# the same constant so the two surfaces classify identically.
+
+
+def classify_legacy_task(
+    *,
+    title: str,
+    created_by: str,
+) -> Classification | None:
+    """Map a legacy ``work_tasks`` row to a new :class:`InboxItemKind`.
+
+    Returns ``None`` when no heuristic matches. The CLI uses ``None``
+    as the signal to leave the row's ``kind`` at ``legacy`` and add
+    it to the unmatched-row count — never as an excuse to guess.
+
+    Args:
+        title: the task's ``title`` column.
+        created_by: the task's ``created_by`` column (e.g.
+            ``"audit_watchdog"`` for watchdog-emitted dispatches).
+    """
+    title_l = (title or "").lower()
+    created_by_l = (created_by or "").lower()
+
+    # Rule 1: watchdog-emitted queue-without-motion escalations →
+    # WATCHDOG_OPERATOR_DISPATCH. Two shapes are matched:
+    # the literal "queued task(s) but no claim / execution …" finding
+    # body, and any future "Watchdog escalated:" prefix.
+    if created_by_l == "audit_watchdog":
+        if (
+            _WATCHDOG_QUEUE_WITHOUT_MOTION_TOKEN in title_l
+            and _WATCHDOG_QUEUE_WITHOUT_MOTION_TAIL in title_l
+        ):
+            return Classification(
+                kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH,
+                heuristic="watchdog_queue_without_motion",
+            )
+        if title_l.startswith(_WATCHDOG_ESCALATED_TOKEN):
+            return Classification(
+                kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH,
+                heuristic="watchdog_escalated_prefix",
+            )
+
+    # Rule 2: plan-review tasks (watchdog or architect emitter) →
+    # PLAN_REVIEW_PENDING. Matches the messages-side prefix rule so
+    # the two surfaces classify a plan-review pair identically.
+    if title_l.startswith(_PLAN_REVIEW_PREFIX):
+        return Classification(
+            kind=InboxItemKind.PLAN_REVIEW_PENDING,
+            heuristic="title_prefix:plan_ready_for_review",
+        )
+
+    return None
+
+
+__all__ = ["Classification", "classify_legacy", "classify_legacy_task"]

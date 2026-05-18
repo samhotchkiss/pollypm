@@ -2022,6 +2022,43 @@ class SQLiteWorkService:
         """Update mutable fields on a task."""
         return update_task(self, task_id, **fields)
 
+    def backfill_kind(self, task_id: str, *, new_kind: str) -> Task:
+        """Reclassify a task whose ``kind`` is still ``legacy`` (#1564 follow-up).
+
+        Sibling of :meth:`update` for the one-shot
+        ``pm inbox backfill-kinds`` migration helper. Kept off the
+        general ``update`` allow-list because ``kind`` is the canonical
+        producer-set discriminator (#1565) — once a row carries a
+        real kind, the value is the emit-site contract, not a
+        general-purpose mutable column.
+
+        Refuses to overwrite anything except ``legacy`` so a follow-up
+        run cannot reclassify an already-tagged row.
+        """
+        project, task_number = _parse_task_id(task_id)
+        row = self._conn.execute(
+            "SELECT kind FROM work_tasks "
+            "WHERE project = ? AND task_number = ?",
+            (project, task_number),
+        ).fetchone()
+        if row is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        current = _coerce_inbox_kind(_row_get(row, "kind", None))
+        if current is not InboxItemKind.LEGACY:
+            raise ValidationError(
+                f"Cannot backfill kind on task '{task_id}': "
+                f"current kind is '{current.value}', not 'legacy'."
+            )
+        new_kind_value = _coerce_inbox_kind(new_kind).value
+        self._conn.execute(
+            "UPDATE work_tasks "
+            "SET kind = ?, updated_at = ? "
+            "WHERE project = ? AND task_number = ?",
+            (new_kind_value, _now(), project, task_number),
+        )
+        self._conn.commit()
+        return self.get(task_id)
+
     # ------------------------------------------------------------------
     # State transitions
     # ------------------------------------------------------------------

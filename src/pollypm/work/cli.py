@@ -677,8 +677,30 @@ def task_create(
         k, v = _parse_role(r)
         roles[k] = v
 
+    # #1629 — Sensible-default: when the operator (or agent) runs
+    # ``pm task create`` on the default ``standard`` flow without any
+    # ``--role`` flags, auto-populate worker + reviewer with the
+    # canonical fallback agents. This eliminates the trial-and-error
+    # "Required task roles are missing" loop that Polly + architect
+    # agents hit on every cold-start task creation. The auto-default is
+    # narrowly scoped: only fires for ``flow == "standard"`` AND when
+    # the caller passed zero ``--role`` flags, so existing flows /
+    # explicit assignments are unaffected.
+    auto_added_roles: list[str] = []
+    if flow == "standard" and not roles:
+        roles = {"worker": "worker", "reviewer": "reviewer"}
+        auto_added_roles = ["worker", "reviewer"]
+
     ac_text = "\n".join(acceptance_criteria) if acceptance_criteria else None
     constraints_text = "\n".join(constraints) if constraints else None
+
+    if auto_added_roles and not output_json:
+        typer.echo(
+            "Notice: auto-added required roles: "
+            f"{', '.join(auto_added_roles)} "
+            "(override with --role <role>=<agent>).",
+            err=True,
+        )
 
     svc = _svc(db, project=project)
     task = _run(

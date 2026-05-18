@@ -486,6 +486,7 @@ def _pane_text_classify_body(
     alerts_cleared = 0
     inbox_items_emitted = 0
     capture_failures = 0
+    pm_turn_transitions = 0  # #1633 — active → ended PM turn flips this tick.
     match_counts: dict[str, int] = {name: 0 for name in all_rule_names}
 
     try:
@@ -524,6 +525,28 @@ def _pane_text_classify_body(
                 session_name, exc_info=True,
             )
             continue
+
+        # #1633 — detect PM-persona turn-ended transitions inline so we
+        # piggyback on the existing pane capture rather than spinning a
+        # second sweep. ``record_turn_state`` emits the ``pm.turn_ended``
+        # audit event exactly once per active → ended transition and
+        # persists the per-session state for the rail glyph override.
+        try:
+            from pollypm.pm_turn_state import (
+                detect_pm_turn_ended,
+                is_pm_session,
+                record_turn_state,
+            )
+
+            if is_pm_session(session_name):
+                turn_ended = detect_pm_turn_ended(pane_text)
+                if record_turn_state(session_name, turn_ended=turn_ended):
+                    pm_turn_transitions += 1
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "pane_text_classify: pm_turn_state record failed for %s",
+                session_name, exc_info=True,
+            )
 
         for rule_name in all_rule_names:
             alert_type = f"pane:{rule_name}"
@@ -609,6 +632,10 @@ def _pane_text_classify_body(
         "inbox_items_emitted": inbox_items_emitted,
         "capture_failures": capture_failures,
         "match_counts": match_counts,
+        # #1633 — count of PM personas that just transitioned to
+        # awaiting-user this tick. Each non-zero value corresponds to
+        # one ``pm.turn_ended`` audit event.
+        "pm_turn_transitions": pm_turn_transitions,
     }
 
 

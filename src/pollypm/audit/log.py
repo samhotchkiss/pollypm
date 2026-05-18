@@ -193,9 +193,18 @@ EVENT_SESSION_PROVISIONED = "session.provisioned"
 #   ``action="skipped_live_duplicates"`` fires instead. Metadata:
 #   ``storage_session``, ``window_name``, ``killed_index`` (kill path)
 #   or ``live_duplicates`` (skip path), ``kept_indices``.
+# * ``EVENT_COCKPIT_PARK_SKIPPED_EXISTING`` — fires when
+#   ``_park_mounted_session`` detects that the storage closet already
+#   has a live window of the same name and refuses to call
+#   ``tmux break-pane`` (which would otherwise create a duplicate-named
+#   second window — the upstream root cause of #1635). Status
+#   ``"warn"``. Metadata: ``session_name``, ``window_name``,
+#   ``storage_session``, ``live_duplicate_indices``,
+#   ``dead_duplicate_indices``, ``reason``.
 EVENT_COCKPIT_SESSION_PARKED = "cockpit.session_parked"
 EVENT_COCKPIT_SESSION_RESPAWNED = "cockpit.session_respawned"
 EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED = "cockpit.duplicate_window_killed"
+EVENT_COCKPIT_PARK_SKIPPED_EXISTING = "cockpit.park_skipped_existing"
 # #1570 — emitted once per row that ``pm inbox backfill-kinds --commit``
 # reclassifies from ``kind='legacy'`` to a real
 # :class:`pollypm.inbox.kind.InboxItemKind`. Carries ``msg_id``,
@@ -583,6 +592,7 @@ __all__ = [
     "EVENT_COCKPIT_SESSION_PARKED",
     "EVENT_COCKPIT_SESSION_RESPAWNED",
     "EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED",
+    "EVENT_COCKPIT_PARK_SKIPPED_EXISTING",
     "EVENT_INBOX_KIND_BACKFILLED",
     "AuditEvent",
     "central_log_path",

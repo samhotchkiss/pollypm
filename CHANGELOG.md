@@ -37,6 +37,13 @@ Added, Changed, and Removed.
   an empty surface. The topbar omits the `PM:` meta entirely when no
   persona is configured (vs the old `PM: Project PM` placeholder).
   #1540 #1541 #1542.
+- Project dashboard Plan card empty-state copy names the configured PM
+  persona instead of "the PM" — `No plan yet — Archie will draft one
+  when this project picks up work. Press c in this pane to chat with
+  Archie and ask for a plan now.` Falls back to "the PM" when no
+  persona is configured, matching the banner-copy reframe so the
+  Plan card no longer reads anonymously on the very surface that
+  invites the user to start a plan. #1540 follow-up.
 
 ## [1.0.0] - 2026-04-20
 

@@ -3433,55 +3433,14 @@ class SQLiteWorkService:
 
         # Merge produced conflicts. Inspect them: if every conflict is on a
         # union-safe file, resolve each via line-union and commit. Otherwise
-        # abort and surface a clearer error.
-        conflicts_result = self._git_run(
-            project_path,
-            "diff",
-            "--name-only",
-            "--diff-filter=U",
+        # fall through to disjoint-addition / operator-abort handling.
+        handled, conflicted_files, unsafe = (
+            self._try_union_safe_conflict_resolution(
+                project_path, task_branch, current_branch
+            )
         )
-        conflicted_files = (
-            [
-                line.strip()
-                for line in conflicts_result.stdout.splitlines()
-                if line.strip()
-            ]
-            if conflicts_result.returncode == 0
-            else []
-        )
-
-        unsafe = [
-            f for f in conflicted_files
-            if f not in self._UNION_SAFE_MERGE_FILES
-        ]
-        if conflicted_files and not unsafe:
-            # Every conflict is union-safe — resolve them in place.
-            try:
-                for rel_path in conflicted_files:
-                    self._resolve_union_safe_conflict(project_path, rel_path)
-            except ValidationError:
-                self._git_run(project_path, "merge", "--abort")
-                raise
-
-            commit = self._git_run(
-                project_path,
-                "commit",
-                "--no-edit",
-            )
-            if commit.returncode == 0:
-                return
-            self._git_run(project_path, "merge", "--abort")
-            detail = (
-                commit.stderr.strip()
-                or commit.stdout.strip()
-                or "git commit failed after union resolution"
-            )
-            raise ValidationError(
-                f"Could not finalize the auto-merge of `{task_branch}` "
-                f"into `{current_branch}` after resolving "
-                f"{', '.join(conflicted_files)} via line union. "
-                f"Git said: {detail}"
-            )
+        if handled:
+            return
 
         # At least one conflict is on a non-safelist file. Before bouncing
         # to the operator, try the disjoint-addition resolver: parallel
@@ -3593,6 +3552,84 @@ class SQLiteWorkService:
             f"Resolve them by editing each file, then run "
             f"`git -C {project_path} add <file>` and retry "
             f"`pm task approve --resume`."
+        )
+
+    def _try_union_safe_conflict_resolution(
+        self,
+        project_path: Path,
+        task_branch: str,
+        current_branch: str,
+    ) -> tuple[bool, list[str], list[str]]:
+        """Inspect post-merge conflicts and resolve them if all are union-safe.
+
+        Lists the currently-conflicted files (``--diff-filter=U``) and
+        partitions them against ``_UNION_SAFE_MERGE_FILES``. If every conflict
+        is union-safe, each file is resolved in place via
+        :meth:`_resolve_union_safe_conflict` and the merge is committed.
+
+        Returns ``(handled, conflicted_files, unsafe)``:
+
+        - ``handled`` is ``True`` iff the union-safe path fully finalised the
+          merge (caller should return without further work).
+        - ``conflicted_files`` is the raw list of conflicted paths (used by
+          the caller's disjoint-addition fallback and operator-error path).
+        - ``unsafe`` is the subset of ``conflicted_files`` not in
+          ``_UNION_SAFE_MERGE_FILES`` (used by the caller's operator-error
+          path).
+
+        Raises :class:`ValidationError` if union resolution fails on any file
+        or the post-resolution commit fails; the in-progress merge is aborted
+        before raising.
+        """
+        conflicts_result = self._git_run(
+            project_path,
+            "diff",
+            "--name-only",
+            "--diff-filter=U",
+        )
+        conflicted_files = (
+            [
+                line.strip()
+                for line in conflicts_result.stdout.splitlines()
+                if line.strip()
+            ]
+            if conflicts_result.returncode == 0
+            else []
+        )
+
+        unsafe = [
+            f for f in conflicted_files
+            if f not in self._UNION_SAFE_MERGE_FILES
+        ]
+        if not conflicted_files or unsafe:
+            return False, conflicted_files, unsafe
+
+        # Every conflict is union-safe — resolve them in place.
+        try:
+            for rel_path in conflicted_files:
+                self._resolve_union_safe_conflict(project_path, rel_path)
+        except ValidationError:
+            self._git_run(project_path, "merge", "--abort")
+            raise
+
+        commit = self._git_run(
+            project_path,
+            "commit",
+            "--no-edit",
+        )
+        if commit.returncode == 0:
+            return True, conflicted_files, unsafe
+        self._git_run(project_path, "merge", "--abort")
+        detail = (
+            commit.stderr.strip()
+            or commit.stdout.strip()
+            or "git commit failed after union resolution"
+        )
+        raise ValidationError(
+            f"Could not finalize the auto-merge of `{task_branch}` "
+            f"into `{current_branch}` after resolving "
+            f"{', '.join(conflicted_files)} via line union. "
+            f"Git said: {detail}"
         )
 
     def _check_clean_tree_and_branch_exist(

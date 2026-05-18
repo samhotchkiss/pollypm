@@ -140,11 +140,19 @@ def ensure_reviewer_session_for_project(
     try:
         from pollypm.config import load_config
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "reviewer_provisioning: config import failed for %s",
+            project_key, exc_info=True,
+        )
         return False, f"import failed: {exc}"
 
     try:
         config = load_config(config_path)
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "reviewer_provisioning: load_config(%s) failed for %s",
+            config_path, project_key, exc_info=True,
+        )
         return False, f"load_config failed: {exc}"
 
     project = getattr(config, "projects", {}).get(project_key)
@@ -164,6 +172,10 @@ def ensure_reviewer_session_for_project(
     try:
         from pollypm.workers import create_worker_session, launch_worker_session
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "reviewer_provisioning: pollypm.workers import failed for %s",
+            project_key, exc_info=True,
+        )
         return False, f"import workers failed: {exc}"
 
     try:

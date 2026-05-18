@@ -23,8 +23,11 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def _decode_jwt_payload(token: str) -> dict[str, object]:
@@ -61,6 +64,10 @@ def detect_codex_email(home: Path) -> str | None:
         email = payload.get("email")
         return str(email).lower() if isinstance(email, str) and email else None
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "codex.detect: failed to parse %s; treating as not logged in",
+            auth_path, exc_info=True,
+        )
         return None
 
 

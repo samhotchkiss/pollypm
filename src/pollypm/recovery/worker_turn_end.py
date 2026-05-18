@@ -244,6 +244,11 @@ def _resolve_pm_actor(task: Any, config: Any) -> str:
         projects = getattr(config, "projects", {}) or {}
         project = projects.get(project_key)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "worker_turn_end: config.projects lookup failed for %s; "
+            "defaulting pm actor to 'polly'",
+            project_key, exc_info=True,
+        )
         return "polly"
     if project is None:
         return "polly"
@@ -503,6 +508,10 @@ def load_transcript_tail(
                 )
                 return data[-tail_chars:]
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "worker_turn_end: transcript-file fallback read failed for %s",
+                session_name, exc_info=True,
+            )
             return ""
     return ""
 

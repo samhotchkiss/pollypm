@@ -13781,7 +13781,7 @@ def _dashboard_inbox(
         from pollypm.store import SQLAlchemyStore
         from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.cockpit_inbox import _row_is_dev_channel
+        from pollypm.cockpit_inbox_sources import _row_is_dev_channel
     except Exception:  # noqa: BLE001
         return 0, [], []
     try:

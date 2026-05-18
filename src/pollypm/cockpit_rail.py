@@ -798,7 +798,7 @@ class CockpitRouter:
     _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
     _STATE_WRITE_DEBOUNCE_SECONDS = 0.25
     _SUPERVISOR_FREE_STATIC_KEYS = frozenset(
-        {"dashboard", "inbox", "workers", "metrics", "activity", "settings"},
+        {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "operator"},
     )
 
     def __init__(self, config_path: Path) -> None:

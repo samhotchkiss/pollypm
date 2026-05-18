@@ -24,6 +24,7 @@ from pollypm.cockpit_sections.header import _section_header, _worker_presence
 from pollypm.cockpit_sections.health import format_project_health_scorecard
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
+from pollypm.cockpit_sections.plan import _section_plan
 from pollypm.cockpit_sections.plan_review import (
     find_actionable_plan_review_task,
     load_plan_text,
@@ -227,6 +228,12 @@ def _render_project_dashboard(
     out.extend(_section_velocity(tasks, tokens))
 
     out.extend(_section_you_need_to(review, project_alerts, 0))
+    # #1620 — Plan section. Renders the synthesized plan inline when
+    # it exists on disk (or in a worktree via the fallback) so the
+    # user SEES the plan as soon as they open the project dashboard
+    # rather than having to chase the inbox row. Empty section when
+    # no plan is present.
+    out.extend(_section_plan(project.path))
     out.extend(_section_in_flight(in_progress, blocked))
     out.extend(_section_recent(completed))
     out.extend(_section_recent_commits(project.path))

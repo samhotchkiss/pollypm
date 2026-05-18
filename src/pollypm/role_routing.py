@@ -11,12 +11,13 @@ from pollypm.models import ModelAssignment, PollyPMConfig, ProviderKind
 
 
 _log = logging.getLogger(__name__)
-_ROLE_KEYS = ("operator_pm", "architect", "worker", "reviewer")
+_ROLE_KEYS = ("operator_pm", "architect", "worker", "reviewer", "advisor")
 _FALLBACK_ASSIGNMENTS: dict[str, ModelAssignment] = {
     "operator_pm": ModelAssignment(alias="codex-gpt-5.4"),
     "architect": ModelAssignment(alias="opus-4.7"),
     "worker": ModelAssignment(alias="codex-gpt-5.4"),
     "reviewer": ModelAssignment(alias="sonnet-4.6"),
+    "advisor": ModelAssignment(alias="opus-4.7"),
 }
 
 

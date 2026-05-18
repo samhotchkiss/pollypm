@@ -856,6 +856,186 @@ class TestCliContext:
         assert "Hello context" in result.output
 
 
+class TestCliContextInspection:
+    """``pm task context <task_id>`` without a ``text`` argument lists
+    entries instead of adding one — replaces raw sqlite SELECTs for
+    Polly/agent introspection.
+    """
+
+    def test_list_mode_renders_table(self, db_path):
+        _create_task(db_path, title="Inspect ctx task")
+        runner.invoke(
+            task_app,
+            ["context", "proj/1", "first entry", "--db", db_path],
+        )
+        runner.invoke(
+            task_app,
+            ["context", "proj/1", "second entry", "--db", db_path],
+        )
+
+        result = runner.invoke(task_app, ["context", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        assert "first entry" in result.output
+        assert "second entry" in result.output
+        # Header row present.
+        assert "Timestamp" in result.output
+        assert "Actor" in result.output
+
+    def test_list_mode_empty_task(self, db_path):
+        _create_task(db_path, title="No ctx task")
+
+        result = runner.invoke(task_app, ["context", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        assert "No context entries on proj/1" in result.output
+
+    def test_list_mode_json(self, db_path):
+        _create_task(db_path, title="Inspect ctx json")
+        runner.invoke(
+            task_app,
+            ["context", "proj/1", "hello", "--actor", "worker-x",
+             "--db", db_path],
+        )
+
+        result = runner.invoke(
+            task_app, ["context", "proj/1", "--json", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["task_id"] == "proj/1"
+        assert len(payload["entries"]) == 1
+        assert payload["entries"][0]["actor"] == "worker-x"
+        assert payload["entries"][0]["text"] == "hello"
+        assert payload["entries"][0]["entry_type"] == "note"
+
+    def test_list_mode_filters_sweeper_pings_by_default(self, db_path):
+        from pollypm.plugins_builtin.task_assignment_notify.handlers.sweep import (
+            SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+        )
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        _create_task(db_path, title="Filter sweeper")
+        svc = SQLiteWorkService(db_path=db_path)
+        try:
+            svc.add_context(
+                "proj/1", "sweeper", "task_assignment.sweep:sent",
+                entry_type=SWEEPER_PING_CONTEXT_ENTRY_TYPE,
+            )
+            svc.add_context("proj/1", "worker", "real entry", entry_type="note")
+        finally:
+            svc.close()
+
+        result = runner.invoke(task_app, ["context", "proj/1", "--db", db_path])
+        assert result.exit_code == 0, result.output
+        assert "real entry" in result.output
+        assert "task_assignment.sweep:sent" not in result.output
+        assert "hidden" in result.output  # hint about hidden internal rows
+
+        # ``--show-internal`` reveals everything.
+        result = runner.invoke(
+            task_app,
+            ["context", "proj/1", "--show-internal", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert "task_assignment.sweep:sent" in result.output
+
+    def test_list_mode_entry_type_filter(self, db_path):
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        _create_task(db_path, title="entry_type filter")
+        svc = SQLiteWorkService(db_path=db_path)
+        try:
+            svc.add_context("proj/1", "worker", "note one", entry_type="note")
+            svc.add_context("proj/1", "user", "reply one", entry_type="reply")
+        finally:
+            svc.close()
+
+        result = runner.invoke(
+            task_app,
+            ["context", "proj/1", "--entry-type", "reply",
+             "--json", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        texts = [e["text"] for e in payload["entries"]]
+        assert texts == ["reply one"]
+
+
+class TestCliTransitions:
+    """``pm task transitions <task_id>`` exposes ``work_transitions``
+    rows so Polly and agents can audit lifecycle without sqlite3.
+    """
+
+    def _drive_some_transitions(self, db_path):
+        _create_task(db_path, title="Transition task")
+        # draft -> queued
+        r = runner.invoke(task_app, ["queue", "proj/1", "--db", db_path])
+        assert r.exit_code == 0, r.output
+        # queued -> in_progress
+        r = runner.invoke(
+            task_app,
+            ["claim", "proj/1", "--actor", "agent-1", "--db", db_path],
+        )
+        assert r.exit_code == 0, r.output
+
+    def test_transitions_table(self, db_path):
+        self._drive_some_transitions(db_path)
+
+        result = runner.invoke(
+            task_app, ["transitions", "proj/1", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        # Should mention the new states from our drive sequence.
+        assert "queued" in result.output
+        assert "in_progress" in result.output
+        # Header row.
+        assert "From" in result.output
+        assert "To" in result.output
+
+    def test_transitions_json(self, db_path):
+        self._drive_some_transitions(db_path)
+
+        result = runner.invoke(
+            task_app, ["transitions", "proj/1", "--json", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert payload["task_id"] == "proj/1"
+        transitions = payload["transitions"]
+        assert len(transitions) >= 2
+        states = [(t["from_state"], t["to_state"]) for t in transitions]
+        assert ("draft", "queued") in states
+        assert ("queued", "in_progress") in states
+
+    def test_transitions_empty_when_draft(self, db_path):
+        _create_task(db_path, title="No transitions yet")
+
+        result = runner.invoke(
+            task_app, ["transitions", "proj/1", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        assert "No transitions recorded on proj/1" in result.output
+
+    def test_transitions_limit_keeps_most_recent(self, db_path):
+        self._drive_some_transitions(db_path)
+
+        result = runner.invoke(
+            task_app,
+            ["transitions", "proj/1", "--limit", "1",
+             "--json", "--db", db_path],
+        )
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output)
+        assert len(payload["transitions"]) == 1
+        # Newest tail kept.
+        assert payload["transitions"][0]["to_state"] == "in_progress"
+
+    def test_transitions_unknown_task(self, db_path):
+        result = runner.invoke(
+            task_app, ["transitions", "proj/999", "--db", db_path],
+        )
+        assert result.exit_code == 1
+
+
 class TestCliSweeperContextFiltering:
     """``pm task get`` / ``pm task status`` should hide infrastructure
     sweeper-ping context rows by default — they drown user-visible

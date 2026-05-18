@@ -271,6 +271,13 @@ def _central_root() -> Path:
 
         return Path(DEFAULT_CONFIG_PATH).parent / "audit"
     except Exception:  # noqa: BLE001 — never fail audit on config errors
+        # #1355: previously silent. Log so a config-resolution failure
+        # doesn't quietly redirect audit output to the home-dir fallback.
+        logger.warning(
+            "audit.log: DEFAULT_CONFIG_PATH resolution failed; "
+            "falling back to ~/.pollypm/audit",
+            exc_info=True,
+        )
         return Path.home() / ".pollypm" / "audit"
 
 

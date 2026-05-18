@@ -16750,6 +16750,29 @@ class PollyProjectDashboardApp(App[None]):
             sess_raw = w.get("session_name") or ""
             role_raw = w.get("role") or "worker"
             activity = str(w.get("activity") or "working")
+            in_flight = data.task_buckets.get("in_progress", [])
+            # #1541 \u2014 when the project is calm (idle worker, no in-flight
+            # task, no action card), prefer the configured PM persona
+            # over the raw role / session key. The topbar already names
+            # the PM (``PM: Archie``); the Current activity panel must
+            # not re-introduce ``architect`` or ``architect_bikepath``
+            # one line below. Other activity branches (working /
+            # awaiting_user / in-flight task surfaced) keep the
+            # role-based identity so the operator still sees which
+            # session is doing the work.
+            pm_persona = (
+                getattr(data, "pm_persona", None)
+                or getattr(data, "persona_name", None)
+                or ""
+            )
+            pm_persona = pm_persona.strip() if isinstance(pm_persona, str) else ""
+            calm_state = (
+                activity == "idle"
+                and not in_flight
+                and not data.action_items
+            )
+            if calm_state and pm_persona:
+                identity_markup = f"[b]{_escape(pm_persona)}[/b]"
             # Collapse "<role>_<project_key>" sessions on their own
             # project's dashboard down to just the role \u2014 both the
             # role name and the project context are already implicit
@@ -16757,7 +16780,7 @@ class PollyProjectDashboardApp(App[None]):
             # ``architect_polly_remote  architect`` repeats info the
             # operator already has. Leave any session_name with extra
             # information (task-N, workerN, ad-hoc names) unchanged.
-            if sess_raw in {role_raw, f"{role_raw}_{self.project_key}"}:
+            elif sess_raw in {role_raw, f"{role_raw}_{self.project_key}"}:
                 identity_markup = f"[b]{_escape(role_raw)}[/b]"
             else:
                 identity_markup = (
@@ -16785,7 +16808,6 @@ class PollyProjectDashboardApp(App[None]):
                 f"{dot_markup} {identity_markup}{age_part}{state_tail}",
             ]
             # Surface the top-most in-flight task as context.
-            in_flight = data.task_buckets.get("in_progress", [])
             if in_flight:
                 t = in_flight[0]
                 num = t.get("task_number")
@@ -16835,11 +16857,25 @@ class PollyProjectDashboardApp(App[None]):
                 # \u2026 standing by." The dashboard had no way to show
                 # this, so it implied work was happening. Spell out
                 # the actual state instead.
-                lines.append(
-                    "  [dim]No task in flight. The session is alive "
-                    "but not progressing work \u2014 it will pick up the "
-                    "next queued task or wait for instructions.[/dim]"
-                )
+                #
+                # #1541 \u2014 drop the syslog-style "The session is alive
+                # but not progressing work" phrasing in favour of a
+                # warmer, PM-named note that invites a next step.
+                # The topbar already names the PM; this line echoes
+                # the same identity so the operator sees one voice,
+                # not "Archie" up top and "the session" below.
+                if pm_persona:
+                    lines.append(
+                        f"  [dim]{_escape(pm_persona)} is ready when "
+                        "you want to pick something up \u2014 press [b]c[/b] "
+                        "to chat or [b]p[/b] to plan.[/dim]"
+                    )
+                else:
+                    lines.append(
+                        "  [dim]Ready when you want to pick something "
+                        "up \u2014 press [b]c[/b] to chat or [b]p[/b] to "
+                        "plan.[/dim]"
+                    )
             elif activity == "awaiting_user":
                 lines.append(
                     "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "

@@ -16827,6 +16827,25 @@ class PollyProjectDashboardApp(App[None]):
                     "Workers can pick up tasks directly without a plan "
                     "ceremony.[/dim]"
                 )
+            # #1540 — name the effective PM in the empty-state copy so
+            # the Plan card matches the banner's warm "Press c to plan
+            # this with <PM>" framing. Falls back to "the PM" when no
+            # persona is configured (matches ``_alert_banner_copy``'s
+            # fallback). The effective PM mirrors the banner/topbar
+            # lookup: ``pm_persona`` (architect session routing) wins
+            # over the raw project ``persona_name``.
+            pm_persona = (
+                getattr(data, "pm_persona", None)
+                or getattr(data, "persona_name", None)
+            )
+            pm_label = (pm_persona or "").strip() if pm_persona else ""
+            if pm_label:
+                return (
+                    f"[dim]No plan yet — {_escape(pm_label)} will draft "
+                    f"one when this project picks up work.\n"
+                    f"Press [b]c[/b] in this pane to chat with "
+                    f"{_escape(pm_label)} and ask for a plan now.[/dim]"
+                )
             return (
                 "[dim]No plan yet — the PM will draft one when this "
                 "project picks up work.\n"

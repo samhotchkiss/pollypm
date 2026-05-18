@@ -5076,6 +5076,81 @@ def test_plan_body_with_enforce_plan_true_uses_default_nudge(dashboard_app) -> N
     assert "Plan not required" not in body
 
 
+def test_plan_body_uses_persona_name_when_set(dashboard_app) -> None:
+    """#1540 — the no-plan-yet Plan card names the PM when a persona
+    is configured. Mirrors the banner's warm "plan this with <PM>"
+    framing so the Plan card stops reading "the PM" anonymously on
+    the very surface where the user is being invited to start a plan.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        plan_path=None,
+        plan_sections=[],
+        plan_aux_files=[],
+        plan_explainer=None,
+        enforce_plan=True,
+        plan_task_summary=None,
+        persona_name="Archie",
+        pm_persona=None,
+    )
+    body = dashboard_app._render_plan_body(fake_data)
+    assert "Archie" in body
+    assert "the PM will draft" not in body
+    assert "chat with the PM" not in body
+    # The structural hints stay — pane focus + chat keystroke.
+    assert "in this pane" in body
+    assert "ask for a plan" in body
+
+
+def test_plan_body_prefers_pm_persona_over_project_persona(dashboard_app) -> None:
+    """#1540 — when an architect session routes the project, the
+    effective PM persona (``pm_persona``) wins over the raw project
+    ``persona_name``. Matches the banner/topbar lookup.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        plan_path=None,
+        plan_sections=[],
+        plan_aux_files=[],
+        plan_explainer=None,
+        enforce_plan=True,
+        plan_task_summary=None,
+        persona_name="Bea",
+        pm_persona="Archie",
+    )
+    body = dashboard_app._render_plan_body(fake_data)
+    assert "Archie" in body
+    assert "Bea" not in body
+
+
+def test_plan_body_falls_back_to_the_pm_without_persona(dashboard_app) -> None:
+    """Without a configured persona, the Plan card still renders the
+    generic "the PM" fallback — no broken substitution artefacts.
+    """
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        exists_on_disk=True,
+        plan_path=None,
+        plan_sections=[],
+        plan_aux_files=[],
+        plan_explainer=None,
+        enforce_plan=True,
+        plan_task_summary=None,
+        persona_name=None,
+        pm_persona=None,
+    )
+    body = dashboard_app._render_plan_body(fake_data)
+    assert "the PM" in body
+    # No empty substitution slots left over.
+    assert "with .\n" not in body
+    assert "chat with  and" not in body
+
+
 # ---------------------------------------------------------------------------
 # #1518 — Plan section recognizes a done plan-shaped task in the work
 # service so the dashboard stops reading "No plan yet" forever for projects

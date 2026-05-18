@@ -963,3 +963,376 @@ def test_cli_remove_dry_run_warns_when_state_rows_present_without_purge(
     assert result.exit_code == 0, result.output
     assert "use --purge-state to delete" in result.output
     assert "NOT touched without --purge-state" in result.output
+
+
+# --------------------------------------------------------------------------
+# --purge-worktrees cascade: tear down .pollypm/worktrees/ subdirs
+# (#1561 wedge #4).
+# --------------------------------------------------------------------------
+
+
+def _init_git_project(project_path: Path) -> None:
+    """Initialize a real git repo at ``project_path``.
+
+    ``pm project remove --purge-worktrees`` calls ``git worktree`` against
+    the parent repo, so the test fixture's bare ``.git`` directory is
+    insufficient — we need an actual repo with at least one commit so
+    ``git worktree add`` can succeed.
+    """
+    import subprocess
+    # Replace the fixture's empty .git dir with a real init.
+    git_dir = project_path / ".git"
+    if git_dir.exists():
+        import shutil
+        shutil.rmtree(git_dir)
+    subprocess.run(
+        ["git", "init", "-b", "main", str(project_path)],
+        check=True, capture_output=True,
+    )
+    # Identity + a seed commit so HEAD exists.
+    subprocess.run(
+        ["git", "-C", str(project_path), "config", "user.email",
+         "test@example.com"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_path), "config", "user.name", "Test"],
+        check=True, capture_output=True,
+    )
+    (project_path / "README").write_text("seed\n")
+    subprocess.run(
+        ["git", "-C", str(project_path), "add", "README"],
+        check=True, capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(project_path), "commit", "-m", "seed"],
+        check=True, capture_output=True,
+    )
+
+
+def _seed_worktree(
+    project_path: Path, session_id: str, worktree_name: str,
+) -> Path:
+    """Create a real git worktree under ``.pollypm/worktrees/<session_id>/``.
+
+    Mirrors the on-disk layout ``ensure_worktree`` produces so the
+    teardown sweep walks the same structure production code does.
+    """
+    import subprocess
+    wt_root = (
+        project_path / ".pollypm" / "worktrees" / session_id
+    )
+    wt_root.mkdir(parents=True, exist_ok=True)
+    wt_path = wt_root / worktree_name
+    subprocess.run(
+        ["git", "-C", str(project_path), "worktree", "add",
+         "-B", f"pollypm/test/{worktree_name}",
+         "--", str(wt_path), "HEAD"],
+        check=True, capture_output=True,
+    )
+    return wt_path
+
+
+def _seed_stale_worktree_dir(
+    project_path: Path, session_id: str, worktree_name: str,
+) -> Path:
+    """Drop a non-git directory in the worktrees layout.
+
+    Simulates a half-cleaned-up worktree left behind by a crashed
+    teardown — the sweep should ``shutil.rmtree`` it rather than calling
+    ``git worktree remove`` on something git doesn't know about.
+    """
+    wt_root = project_path / ".pollypm" / "worktrees" / session_id
+    wt_root.mkdir(parents=True, exist_ok=True)
+    wt_path = wt_root / worktree_name
+    wt_path.mkdir()
+    # Drop a fake .git pointer so _enumerate_project_worktree_dirs
+    # picks it up — without it the enumerator skips the dir.
+    (wt_path / ".git").write_text("gitdir: /nonexistent\n")
+    (wt_path / "leftover.txt").write_text("orphan\n")
+    return wt_path
+
+
+def test_enumerate_project_worktree_dirs_finds_seeded_worktrees(
+    env,
+) -> None:
+    """The enumerator walks the scoped layout produced by ensure_worktree."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _enumerate_project_worktree_dirs,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    wt_b = _seed_worktree(env["project_path"], "reviewer-demo", "demo-rev")
+
+    entries = _enumerate_project_worktree_dirs(env["project_path"])
+    resolved = {p.resolve() for p in entries}
+
+    assert wt_a.resolve() in resolved
+    assert wt_b.resolve() in resolved
+
+
+def test_purge_project_worktrees_removes_clean_worktrees(env) -> None:
+    """Clean (non-dirty) git worktrees get removed end-to-end."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    wt_b = _seed_worktree(env["project_path"], "reviewer-demo", "demo-rev")
+
+    results = _purge_project_worktrees(env["config_path"], "demo")
+
+    paths = {p.resolve(): (is_git, dirty, ok, reason)
+             for p, is_git, dirty, ok, reason in results}
+    # Both registered as git worktrees.
+    assert paths[wt_a.resolve()][0] is True
+    assert paths[wt_b.resolve()][0] is True
+    # Neither dirty.
+    assert paths[wt_a.resolve()][1] is False
+    # Both removed.
+    assert paths[wt_a.resolve()][2] is True
+    assert paths[wt_b.resolve()][2] is True
+    assert not wt_a.exists()
+    assert not wt_b.exists()
+
+
+def test_purge_project_worktrees_dry_run_is_noop(env) -> None:
+    """Dry-run reports what WOULD be removed without touching disk."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+
+    results = _purge_project_worktrees(
+        env["config_path"], "demo", dry_run=True,
+    )
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    assert path.resolve() == wt_a.resolve()
+    assert is_git is True
+    assert ok is False
+    assert reason == "dry-run"
+    # Nothing mutated.
+    assert wt_a.exists()
+
+
+def test_purge_project_worktrees_refuses_dirty_without_force(env) -> None:
+    """Dirty worktrees are skipped unless ``force_discard_changes`` is set."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    # Mutate a tracked file so git status reports dirty.
+    (wt_a / "README").write_text("dirty\n")
+
+    results = _purge_project_worktrees(env["config_path"], "demo")
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    assert dirty is True
+    assert ok is False
+    assert reason == "dirty"
+    # Worktree is still on disk — we refused to touch it.
+    assert wt_a.exists()
+
+
+def test_purge_project_worktrees_force_discard_removes_dirty(env) -> None:
+    """``force_discard_changes`` removes worktrees even with local changes."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    (wt_a / "README").write_text("dirty\n")
+
+    results = _purge_project_worktrees(
+        env["config_path"], "demo", force_discard_changes=True,
+    )
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    assert dirty is True
+    assert ok is True
+    assert not wt_a.exists()
+
+
+def test_purge_project_worktrees_rmtrees_stale_dirs(env) -> None:
+    """Non-git stale leftover directories fall back to ``shutil.rmtree``."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    stale = _seed_stale_worktree_dir(
+        env["project_path"], "architect-demo", "demo-stale",
+    )
+
+    results = _purge_project_worktrees(env["config_path"], "demo")
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    # Not registered with the parent repo — treated as stale.
+    assert is_git is False
+    assert ok is True
+    assert not stale.exists()
+
+
+def test_cli_remove_purge_worktrees_full_cascade(env) -> None:
+    """``pm project remove --purge-worktrees --yes`` removes worktree dirs."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Removed 1 worktree directory" in result.output
+    assert "Removed project 'demo'" in result.output
+    assert not wt_a.exists()
+
+    config = _load_cfg(env["config_path"])
+    assert "demo" not in config.projects
+
+
+def test_cli_remove_purge_worktrees_prompts_without_force(env) -> None:
+    """Without --yes / --force, --purge-worktrees prompts before destruction."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        # Decline the destructive prompt.
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees",
+                "--config", str(env["config_path"]),
+            ],
+            input="n\n",
+        )
+
+    assert result.exit_code == 1, result.output
+    assert "Permanently remove worktree directories" in result.output
+    assert "Aborted" in result.output
+    # Worktree still on disk; project still in config.
+    assert wt_a.exists()
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_remove_purge_worktrees_skips_dirty_without_force(env) -> None:
+    """Dirty worktrees are reported as skipped, not removed."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    (wt_a / "README").write_text("local changes\n")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Skipped (uncommitted changes)" in result.output
+    assert "--force-discard-worktree-changes" in result.output
+    # Dirty worktree still exists.
+    assert wt_a.exists()
+
+
+def test_cli_remove_purge_worktrees_force_discard_removes_dirty(env) -> None:
+    """--force-discard-worktree-changes discards local changes and removes."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    (wt_a / "README").write_text("local changes\n")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees",
+                "--force-discard-worktree-changes", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Removed 1 worktree directory" in result.output
+    assert not wt_a.exists()
+
+
+def test_cli_remove_dry_run_lists_worktrees_without_removing(env) -> None:
+    """``--dry-run`` shows worktree paths but never deletes them."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--dry-run", "--purge-worktrees",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "worktree directories to purge:" in result.output
+    assert str(wt_a) in result.output
+    # Nothing removed.
+    assert wt_a.exists()
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_remove_dry_run_warns_when_worktrees_present_without_purge(
+    env,
+) -> None:
+    """``--dry-run`` without ``--purge-worktrees`` flags the orphan dirs."""
+    _init_git_project(env["project_path"])
+    _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--dry-run",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "use --purge-worktrees to remove" in result.output
+    assert "NOT touched without --purge-worktrees" in result.output

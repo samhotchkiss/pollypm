@@ -313,7 +313,7 @@ def pm_inbox_filtered_list(
     awaits-user lens still goes through :func:`pm_inbox_awaits_user_list`
     (the canonical predicate is more specific than any single kind).
     """
-    from pollypm.inbox.kind import InboxItemKind, coerce_kind
+    from pollypm.inbox.kind import coerce_kind
 
     try:
         from pollypm.work import create_work_service

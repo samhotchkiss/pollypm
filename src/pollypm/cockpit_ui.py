@@ -97,6 +97,9 @@ from pollypm.cockpit_inbox_project_picker import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_alert_detail import (  # noqa: F401  (re-exported)
     _AlertDetailModal,
 )
+from pollypm.cockpit_settings_account_reassign import (  # noqa: F401  (re-exported)
+    _SettingsAccountReassignModal,
+)
 from pollypm.cockpit_settings_confirm import (  # noqa: F401  (re-exported)
     _SettingsConfirmModal,
 )
@@ -6351,116 +6354,6 @@ class PollySettingsPaneApp(App[None]):
             self.notify(f"Removed account {key}.", timeout=1.5)
         except Exception:  # noqa: BLE001
             pass
-
-
-class _SettingsAccountReassignModal(ModalScreen[str | None]):
-    CSS = """
-    Screen {
-        align: center middle;
-    }
-    #settings-account-reassign {
-        width: 86;
-        max-height: 34;
-        padding: 1 2;
-        background: $panel;
-        border: heavy $primary;
-    }
-    #settings-account-reassign-title {
-        padding-bottom: 1;
-        text-style: bold;
-    }
-    #settings-account-reassign-list {
-        max-height: 12;
-        padding-top: 1;
-        padding-bottom: 1;
-    }
-    #settings-account-reassign-target {
-        width: 1fr;
-    }
-    #settings-account-reassign-buttons {
-        height: auto;
-        align-horizontal: right;
-        padding-top: 1;
-    }
-    #settings-account-reassign-buttons Button {
-        margin-left: 1;
-    }
-    """
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def __init__(
-        self,
-        *,
-        source_key: str,
-        session_refs: list[dict[str, object]],
-        target_options: list[tuple[str, str]],
-        include_controller: bool,
-        title: str,
-        prompt: str,
-    ) -> None:
-        super().__init__()
-        self._source_key = source_key
-        self._session_refs = list(session_refs)
-        self._target_options = list(target_options)
-        self._include_controller = include_controller
-        self._title = title
-        self._prompt = prompt
-
-    def compose(self) -> ComposeResult:
-        default_value = (
-            self._target_options[0][1]
-            if self._target_options else Select.NULL
-        )
-        with Vertical(id="settings-account-reassign"):
-            yield Static(self._title, id="settings-account-reassign-title")
-            yield Static(self._prompt)
-            with VerticalScroll(id="settings-account-reassign-list"):
-                if self._include_controller:
-                    yield Static(
-                        f"Controller account: {self._source_key}",
-                    )
-                if self._session_refs:
-                    yield Static("Pinned sessions:")
-                    for ref in self._session_refs:
-                        role = str(ref.get("role") or "-")
-                        project = str(ref.get("project") or "-")
-                        provider = str(ref.get("provider") or "-")
-                        yield Static(
-                            f"  {ref.get('name') or ''}  {role} / {project} / {provider}",
-                        )
-                else:
-                    yield Static("Pinned sessions: none.")
-            yield Static("Target account")
-            yield Select(
-                self._target_options,
-                allow_blank=False,
-                value=default_value,
-                id="settings-account-reassign-target",
-            )
-            with Horizontal(id="settings-account-reassign-buttons"):
-                yield Button("Cancel", id="cancel")
-                yield Button("Reassign", variant="primary", id="confirm")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        if event.button.id != "confirm":
-            self.dismiss(None)
-            return
-        try:
-            select = self.query_one(
-                "#settings-account-reassign-target",
-                Select,
-            )
-            value = select.value
-        except Exception:  # noqa: BLE001
-            value = None
-        if value is Select.NULL or not value:
-            self.dismiss(None)
-            return
-        self.dismiss(str(value))
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
 
 
 # ---------------------------------------------------------------------------

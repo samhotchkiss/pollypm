@@ -696,6 +696,13 @@ def register_ui_commands(app: typer.Typer) -> None:
 
             PollyDashboardApp(config_path).run(mouse=True)
             return
+        if kind == "operator":
+            from pollypm.cockpit_apps.operator_dashboard import (
+                PollyOperatorDashboardApp,
+            )
+
+            PollyOperatorDashboardApp(config_path).run(mouse=True)
+            return
         if kind == "inbox":
             from pollypm.cockpit_ui import PollyInboxApp
 

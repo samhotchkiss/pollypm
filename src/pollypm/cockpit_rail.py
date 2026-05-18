@@ -332,6 +332,13 @@ class CockpitItem:
     # human-decision review node (status=review + assignee=human).
     # Drives the rail's ▶ "needs your decision" affordance + suffix.
     approvals_pending: int = 0
+    # #1572 — Canonical operator-facing project category, sourced from
+    # :func:`pollypm.dashboard.categorize_project`. When present, the
+    # rail draws the new ``◆ ● ○ ⏸`` glyph vocabulary instead of the
+    # legacy state-specific glyph; both the rail and the operator
+    # dashboard read the same enum so the section a project lands in
+    # always matches the glyph painted next to it.
+    project_state: str | None = None
 
 
 def _stuck_alert_already_user_waiting(
@@ -1359,6 +1366,11 @@ class CockpitRouter:
         grouped: dict[str, list[CockpitItem]] = {name: [] for name in RAIL_SECTIONS}
         project_session_map = self._project_session_map(launches)
         project_rollups = self._project_state_rollups(config, alerts)
+        # #1572 — canonical operator-facing categorization (Waiting /
+        # Working / Idle / Paused). Single source shared with the
+        # operator dashboard so the rail glyph and the dashboard
+        # section can never disagree on a project.
+        project_states = self._project_categorizations(config)
 
         for section, registrations in grouped_registrations.items():
             for reg in registrations:
@@ -1416,6 +1428,7 @@ class CockpitRouter:
             recent_events=recent_events,
             project_session_map=project_session_map,
             project_rollups=project_rollups,
+            project_states=project_states,
         )
 
     def _attach_session_metadata(
@@ -1621,6 +1634,7 @@ class CockpitRouter:
         recent_events: list,
         project_session_map: dict[str, str],
         project_rollups: dict[str, ProjectStateRollup] | None = None,
+        project_states: dict[str, str] | None = None,
     ) -> list[CockpitItem]:
         from pollypm.cockpit_sections.base import _iso_to_dt, _spark_bar
 
@@ -1645,6 +1659,7 @@ class CockpitRouter:
         )
 
         rollups = project_rollups or {}
+        states = project_states or {}
         project_blocks: list[tuple[str, list[CockpitItem], bool, bool, ProjectStateRollup | None]] = []
         current_key: str | None = None
         current_block: list[CockpitItem] = []
@@ -1679,6 +1694,7 @@ class CockpitRouter:
                             item,
                             project_event_spark.get(current_key),
                             rollup=rollups.get(current_key),
+                            project_state=states.get(current_key),
                         )
                     ]
                     continue
@@ -1721,6 +1737,7 @@ class CockpitRouter:
         sparkline: str | None,
         *,
         rollup: ProjectStateRollup | None = None,
+        project_state: str | None = None,
     ) -> CockpitItem:
         label = item.label
         if self.is_project_pinned(item.key.split(":", 1)[1]):
@@ -1739,6 +1756,7 @@ class CockpitRouter:
             label=label,
             state=self._project_row_state(item.state, rollup),
             approvals_pending=approvals,
+            project_state=project_state,
         )
 
     def _project_row_state(
@@ -1757,6 +1775,27 @@ class CockpitRouter:
         if rollup.state is ProjectRailState.WORKING:
             return "project-working"
         return fallback
+
+    def _project_categorizations(self, config: object) -> dict[str, str]:
+        """Canonical operator-facing categorization per project (#1572).
+
+        Returns ``{project_key: ProjectState.value}`` for every
+        registered project. Shared with the operator dashboard so the
+        glyph drawn here and the section the dashboard renders match.
+
+        Best-effort: a project whose DB can't be opened falls through
+        to the tracked / paused IDLE classification rather than
+        raising, mirroring the rest of the rail render path.
+        """
+        try:
+            from pollypm.dashboard.operator_view import (
+                project_state_map_from_config,
+            )
+
+            states = project_state_map_from_config(config)
+        except Exception:  # noqa: BLE001
+            return {}
+        return {key: state.value for key, state in states.items()}
 
     def _project_state_rollups(
         self,
@@ -4504,6 +4543,26 @@ class PollyCockpitRail:
             # \u2014 the worker's stuck \u26a0 glyph already covers them.
             if _alert_type_is_user_action_waiting(item.alert_type):
                 return "\u25c6", PALETTE["warn_indicator"]
+            # #1572 \u2014 canonical operator categorization. When the
+            # dashboard says "Waiting on you" the rail draws ``\u25c6``;
+            # "Working" gets ``\u25cf``; "Idle" gets ``\u25cb``; "Paused" gets
+            # ``\u23f8``. The single source of truth for both surfaces is
+            # :func:`pollypm.dashboard.categorize_project`, so the
+            # glyph and the section a project lands in never
+            # disagree. Sits below the operational-fault + approvals
+            # branches so a real fault still takes the dedicated
+            # glyph; sits above the legacy ``project-yellow/green``
+            # state branches so the new vocabulary wins when both
+            # signals are available.
+            project_state = item.project_state
+            if project_state == "waiting":
+                return "\u25c6", PALETTE["inbox_has"]
+            if project_state == "working":
+                return "\u25cf", PALETTE["live_indicator"]
+            if project_state == "paused":
+                return "\u23f8", PALETTE["item_muted"]
+            if project_state == "idle":
+                return "\u25cb", PALETTE["idle"]
             if item.state == "project-yellow":
                 # #1092 \u2014 use \u25c6 to match the dashboard's "needs attention"
                 # diamond. ``\u2022`` (U+2022) and the idle ``\u00b7`` (U+00B7) are

@@ -662,11 +662,24 @@ def _count_active_tasks(project_key: str, config_path: Path) -> int:
     ``--force`` to bypass the prompt either way, and refusing to remove
     a TOML entry because we can't *read* the state DB would be worse
     than letting the user proceed.
+
+    The ``config_path`` is plumbed through to ``create_work_service`` so
+    the active-task lookup honors ``pm project remove --config <path>``
+    (#1645). Without it, an alternate config would silently fall through
+    to the default-resolver workspace DB, hiding or fabricating active
+    work relative to the config being edited.
     """
     try:
         from pollypm.work import create_work_service
 
-        with create_work_service(project_key=project_key) as svc:
+        try:
+            config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            config = None
+
+        with create_work_service(
+            project_key=project_key, config=config
+        ) as svc:
             return len(svc.list_nonterminal_tasks(project=project_key))
     except Exception:  # noqa: BLE001
         return 0

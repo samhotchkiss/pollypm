@@ -490,3 +490,130 @@ def test_cli_remove_dry_run_warns_when_sessions_present_without_purge(
     assert result.exit_code == 0, result.output
     assert "use --purge-sessions to tear down" in result.output
     assert "remove_project will refuse" in result.output
+
+
+# --------------------------------------------------------------------------
+# #1645: _count_active_tasks must honor --config and not leak to the
+# default-resolver workspace DB.
+# --------------------------------------------------------------------------
+
+
+def _seed_active_task(
+    config_path: Path, *, project_key: str, count: int = 1
+) -> Path:
+    """Seed ``count`` non-terminal tasks in the work DB tied to ``config_path``.
+
+    Returns the resolved work-service DB path so callers can assert on it.
+    Uses the same resolver/factory the production code uses so the test
+    proves the wiring end-to-end, not just an isolated layer.
+    """
+    from pollypm.config import load_config as _load
+    from pollypm.work import create_work_service
+
+    config = _load(config_path)
+    db_paths: list[Path] = []
+    with create_work_service(project_key=project_key, config=config) as svc:
+        db_paths.append(Path(svc._db_path))
+        for idx in range(count):
+            svc.create(
+                title=f"seed task {idx}",
+                description="seeded by test",
+                type="task",
+                project=project_key,
+                flow_template="standard",
+                roles={"worker": "agent-1", "reviewer": "agent-2"},
+                priority="normal",
+                created_by="test",
+            )
+    return db_paths[0]
+
+
+def test_count_active_tasks_honors_config_path(env, tmp_path: Path) -> None:
+    """#1645: the active-task guard must read the work DB tied to --config.
+
+    Seeds active work via the same factory ``_count_active_tasks`` uses,
+    points it at the test's config, and asserts the count is non-zero —
+    proving ``config_path`` is plumbed through. Before #1645's fix this
+    test would observe 0 active tasks because the function ignored
+    ``config_path`` and fell through to the default resolver.
+    """
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _count_active_tasks,
+    )
+
+    seeded_db = _seed_active_task(
+        env["config_path"], project_key="demo", count=2,
+    )
+    # Sanity: the DB landed inside the test workspace, not the developer's
+    # default workspace_root.
+    assert seeded_db.is_relative_to(env["workspace_root"]), (
+        f"seeded DB {seeded_db} is outside test workspace "
+        f"{env['workspace_root']} — fixture is leaking"
+    )
+
+    active = _count_active_tasks("demo", env["config_path"])
+    assert active == 2
+
+
+def test_cli_remove_prompts_on_active_tasks_seeded_via_config(
+    env, tmp_path: Path
+) -> None:
+    """End-to-end: ``pm project remove --config <path>`` sees active work.
+
+    No ``_count_active_tasks`` monkeypatch — the prompt must fire purely
+    because the seeded workspace DB resolved through ``--config`` reports
+    non-zero non-terminal tasks. Reproduces the regression body for #1645.
+    """
+    _seed_active_task(env["config_path"], project_key="demo", count=1)
+
+    result = runner.invoke(
+        project_app,
+        ["remove", "demo", "--config", str(env["config_path"])],
+        input="n\n",
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "1 queued or in-flight task" in result.output
+    assert "Aborted" in result.output
+
+    # Config untouched — abort means no mutation.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_count_active_tasks_does_not_leak_across_configs(
+    env, tmp_path: Path
+) -> None:
+    """A second config with no seeded work must report 0 active tasks.
+
+    Guards against the inverse regression: ``_count_active_tasks`` MUST
+    NOT count tasks from any other workspace DB just because the default
+    resolver would have landed there. Seeds work in config A, asks about
+    config B → expect 0.
+    """
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _count_active_tasks,
+    )
+
+    _seed_active_task(env["config_path"], project_key="demo", count=3)
+
+    # Build a second, independent config + workspace_root with no seeded
+    # work. The two configs share no on-disk state.
+    other_workspace = tmp_path / "other_dev"
+    other_workspace.mkdir()
+    other_project = other_workspace / "demo"
+    other_project.mkdir()
+    (other_project / ".git").mkdir()
+    other_config = tmp_path / "other.toml"
+    _write_config(
+        other_config,
+        workspace_root=other_workspace,
+        project_path=other_project,
+        slug="demo",
+    )
+
+    # The seeded config sees its 3 tasks.
+    assert _count_active_tasks("demo", env["config_path"]) == 3
+    # The clean config sees none — even though both use project key
+    # "demo", the work DB lookup is keyed off the resolved workspace_root.
+    assert _count_active_tasks("demo", other_config) == 0

@@ -54,6 +54,7 @@ unit-test without live sessions or a running work-service.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -62,6 +63,8 @@ from typing import Any
 from pollypm.plan_presence import (
     CANONICAL_PLAN_RELATIVE_PATHS as _PLAN_FILE_CANDIDATES,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # Minimum non-whitespace byte count before a plan file counts as a
@@ -151,6 +154,11 @@ def _plan_ready_notify_recent(
     try:
         rows = query_messages(type="event", since=cutoff_dt, limit=50)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_reconciliation: plan-ready notify query failed for %s; "
+            "treating as no recent notify",
+            project_key, exc_info=True,
+        )
         return False
     if not rows:
         return False
@@ -197,6 +205,11 @@ def _flow_template_for_task(task: Any, work_service: Any) -> Any | None:
             flow_id, project=getattr(task, "project", None),
         )
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_reconciliation: flow template lookup failed for %s "
+            "(flow_id=%s); skipping artifact_gate heuristic",
+            getattr(task, "task_id", "?"), flow_id, exc_info=True,
+        )
         return None
 
 

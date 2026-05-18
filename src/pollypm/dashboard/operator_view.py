@@ -103,9 +103,22 @@ def _waiting_items_by_project(config) -> dict[str, list]:  # noqa: ANN001
 
 
 def _open_work_service(scan: _ProjectScan):  # noqa: ANN202
-    """Open the first usable work-service handle for ``scan``."""
+    """Open the first work-service handle that has rows for ``scan``.
+
+    Mirrors ``cockpit_rail._project_tasks_for_rollup``'s canonical →
+    legacy walk: try each candidate DB in order, prefer the first one
+    that returns at least one task row for the project key, fall
+    through to the next candidate when the current DB is empty. This
+    keeps the dashboard and the rail in sync on which DB a project's
+    state lives in — without it, a canonical workspace DB that simply
+    opens (but has no rows for the project) would silently shadow the
+    legacy per-project DB where the real work lives.
+
+    Returns the handle the caller should close.
+    """
     from pollypm.work import create_work_service
 
+    fallback = None
     for db_path in scan.db_paths:
         try:
             svc = create_work_service(
@@ -113,8 +126,28 @@ def _open_work_service(scan: _ProjectScan):  # noqa: ANN202
             )
         except Exception:  # noqa: BLE001
             continue
-        return svc
-    return None
+        try:
+            tasks = svc.list_tasks(project=scan.project_key)
+        except Exception:  # noqa: BLE001
+            tasks = []
+        if tasks:
+            if fallback is not None and fallback is not svc:
+                _safe_close(fallback)
+            return svc
+        if fallback is None:
+            fallback = svc
+        else:
+            _safe_close(svc)
+    return fallback
+
+
+def _safe_close(svc) -> None:  # noqa: ANN001
+    close = getattr(svc, "close", None)
+    if callable(close):
+        try:
+            close()
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def load_operator_view(config_path: Path) -> OperatorDashboardView:

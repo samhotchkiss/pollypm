@@ -52,10 +52,10 @@ class ProjectState(Enum):
 # rail import the same constant — if the spec ever ships new symbols
 # the change lands here and propagates to both surfaces.
 _GLYPHS: dict[ProjectState, str] = {
-    ProjectState.WAITING: "◆",   # ◆
-    ProjectState.WORKING: "●",   # ●
-    ProjectState.IDLE:    "○",   # ○
-    ProjectState.PAUSED:  "⏸",   # ⏸
+    ProjectState.WAITING: "◆",
+    ProjectState.WORKING: "●",
+    ProjectState.IDLE:    "○",
+    ProjectState.PAUSED:  "⏸",
 }
 
 

@@ -704,42 +704,14 @@ def _sessions_for_project(config_path: Path, project_key: str) -> list[str]:
 # State-DB row teardown (#1561 wedge #3)
 # ---------------------------------------------------------------------------
 #
-# Tables that carry project-scoped rows. Listed in delete order so any
-# child-row foreign-key chains (work_tasks references in dependencies /
-# executions / context / transitions / sessions / sync) are pruned BEFORE
-# the parent ``work_tasks`` rows themselves. SQLite enforces FKs only
-# when ``PRAGMA foreign_keys=ON`` is set on the connection — the work
-# service opens connections without it, but we still respect the order
-# so a future enable doesn't bite us.
-#
-# Each entry: (table, where_clause, params_factory). ``params_factory``
-# is called with ``project_key`` and returns the SQL parameter tuple. We
-# keep this as data so the count + delete passes traverse the same list.
-_STATE_PURGE_TABLES: tuple[tuple[str, str, str], ...] = (
-    # Work-service children of work_tasks (FK to work_tasks(project,
-    # task_number)) — these MUST go first or a future FK-enabled
-    # connection would refuse the parent delete.
-    ("work_task_dependencies",
-     "from_project = ? OR to_project = ?", "pair"),
-    ("work_node_executions", "task_project = ?", "single"),
-    ("work_context_entries", "task_project = ?", "single"),
-    ("work_transitions", "task_project = ?", "single"),
-    ("work_sessions", "task_project = ?", "single"),
-    ("work_sync_state", "task_project = ?", "single"),
-    # Parent work_tasks row. The delete trigger fires
-    # ``work_task_delete_audit_outbox`` rows; we drop those next so the
-    # outbox doesn't dangle once the project is gone.
-    ("work_tasks", "project = ?", "single"),
-    ("work_task_delete_audit_outbox", "project = ?", "single"),
-    # Other work-service / notification rows keyed off project.
-    ("notification_staging", "project = ?", "single"),
-    # state.db core tables that scope by project key.
-    ("messages", "scope = ?", "single"),
-    ("worktrees", "project_key = ?", "single"),
-    ("architect_resume_tokens", "project_key = ?", "single"),
-    ("token_samples", "project_key = ?", "single"),
-    ("token_usage_hourly", "project_key = ?", "single"),
-)
+# SQLite row counting + bulk DELETE lives in the storage facade
+# ``pollypm.storage.project_state_purge`` (#1676). The CLI is only
+# responsible for resolving the workspace DB path, the audit-tail
+# JSONL file teardown (non-SQLite), and rendering the operator-facing
+# summary. The plugin CLI deliberately does not open the workspace
+# DB directly — boundary test
+# ``test_work_task_query_callers_do_not_open_sqlite_directly``
+# enforces that for every UI/plugin caller.
 
 
 def _workspace_db_path(config_path: Path) -> Path | None:
@@ -767,47 +739,19 @@ def _count_project_state_rows(
 ) -> dict[str, int]:
     """Return per-table row counts for ``project_key`` in the workspace DB.
 
-    Best-effort: a missing DB, missing table, or read failure yields
-    zero for that table. Used both by the dry-run preview and the
-    post-purge "removed N rows" summary so the two views agree on
-    scope.
-
-    Keys: every table in :data:`_STATE_PURGE_TABLES` plus
-    ``audit_tail`` for the ``~/.pollypm/audit/<key>.jsonl`` file (1
-    when present, 0 when absent — file teardown is not a row count
-    but mirrors the same idea).
+    Thin wrapper that delegates the SQLite work to
+    :func:`pollypm.storage.project_state_purge.count_project_state_rows`
+    and layers on the ``audit_tail`` key for the central-tail JSONL
+    file (``~/.pollypm/audit/<key>.jsonl``). The audit tail is a file,
+    not a row, but the dry-run preview surfaces it alongside the row
+    counts so the operator sees the full teardown footprint in one
+    list.
     """
-    import sqlite3 as _sqlite3
-
-    counts: dict[str, int] = {table: 0 for table, _w, _p in _STATE_PURGE_TABLES}
-    counts["audit_tail"] = 0
+    from pollypm.storage.project_state_purge import count_project_state_rows
 
     db_path = _workspace_db_path(config_path)
-    if db_path and db_path.exists():
-        try:
-            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
-            try:
-                for table, where, ptype in _STATE_PURGE_TABLES:
-                    params = (
-                        (project_key, project_key) if ptype == "pair"
-                        else (project_key,)
-                    )
-                    try:
-                        cur = conn.execute(
-                            f"SELECT COUNT(*) FROM {table} WHERE {where}",
-                            params,
-                        )
-                        row = cur.fetchone()
-                        counts[table] = int(row[0]) if row else 0
-                    except _sqlite3.Error:
-                        # Table doesn't exist yet (fresh DB, pre-migration,
-                        # or schema drift). Counts as zero — there's
-                        # nothing to delete.
-                        counts[table] = 0
-            finally:
-                conn.close()
-        except _sqlite3.Error:
-            pass
+    counts = count_project_state_rows(db_path, project_key)
+    counts["audit_tail"] = 0
 
     try:
         from pollypm.audit.log import central_log_path
@@ -845,93 +789,55 @@ def _purge_project_state(
     happen and the returned counts mirror what
     :func:`_count_project_state_rows` reports.
 
-    Per-table errors (missing table on a fresh DB, schema drift) are
-    swallowed so they never abort the rest of the sweep; the count
-    for that table falls through as ``0``. A connection-level failure
-    (locked DB, corrupt file, unwritable path) raises
-    :class:`_PurgeStateError` so the caller can abort before
-    ``remove_project`` strips the project from ``pollypm.toml`` (see
-    issue #1673 — the previous best-effort-on-everything behaviour
-    silently desynced the config from the orphaned rows).
+    The SQLite bulk DELETE happens inside
+    :func:`pollypm.storage.project_state_purge.purge_project_state_rows`
+    (#1676 — keeps schema/connection knowledge out of the plugin
+    CLI). Per-table errors (missing table on a fresh DB, schema drift)
+    are swallowed inside the facade so they never abort the rest of
+    the sweep; the count for that table falls through as ``0``. A
+    connection-level failure (locked DB, corrupt file, unwritable
+    path) raises :class:`_PurgeStateError` so the caller can abort
+    before ``remove_project`` strips the project from ``pollypm.toml``
+    (see issue #1673 — the previous best-effort-on-everything
+    behaviour silently desynced the config from the orphaned rows).
 
-    Why a single bulk SQL sweep instead of routing through
-    ``work_service.delete_task``: per-task deletes would fire
-    cascade-aware audit emits + sync hooks for every row, which is
-    exactly the noise the user is trying to clear. Bulk DELETE
-    silences the side-channels and matches the operator's mental
-    model ("tear it all down, fast").
+    The audit-tail JSONL teardown is a file operation, so it stays
+    here. It runs AFTER the DB commit so the rows-vs-tail asymmetry
+    only ever points one way: tail may linger after a successful row
+    purge, never the reverse.
     """
-    import sqlite3 as _sqlite3
-
-    if dry_run:
-        return _count_project_state_rows(config_path, project_key)
-
-    counts: dict[str, int] = {table: 0 for table, _, _ in _STATE_PURGE_TABLES}
-    counts["audit_tail"] = 0
+    from pollypm.storage.project_state_purge import (
+        ProjectStatePurgeError,
+        purge_project_state_rows,
+    )
 
     db_path = _workspace_db_path(config_path)
-    if db_path and db_path.exists():
-        try:
-            conn = _sqlite3.connect(db_path)
-        except _sqlite3.Error as exc:
-            # Can't even open the DB. Surface to the caller so it
-            # aborts before touching pollypm.toml.
-            raise _PurgeStateError(
-                f"could not open state.db at {db_path}: {exc}"
-            ) from exc
-        try:
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                for table, where, ptype in _STATE_PURGE_TABLES:
-                    params = (
-                        (project_key, project_key) if ptype == "pair"
-                        else (project_key,)
-                    )
-                    try:
-                        cur = conn.execute(
-                            f"DELETE FROM {table} WHERE {where}", params
-                        )
-                    except _sqlite3.Error:
-                        # Missing table on this DB — skip. The count
-                        # stays at 0 for that table; sweep continues.
-                        continue
-                    counts[table] = int(cur.rowcount or 0)
-                conn.commit()
-            except _sqlite3.Error as exc:
-                # BEGIN failed (locked DB) or COMMIT failed (disk full,
-                # corrupt). Roll back so the partial-state risk is
-                # zero, then signal hard-failure to the caller.
-                try:
-                    conn.rollback()
-                except _sqlite3.Error:
-                    pass
-                raise _PurgeStateError(
-                    f"state.db purge failed for '{project_key}': {exc}"
-                ) from exc
-        finally:
-            conn.close()
+    try:
+        counts = purge_project_state_rows(
+            db_path, project_key, dry_run=dry_run,
+        )
+    except ProjectStatePurgeError as exc:
+        # Re-raise via the CLI-local sentinel so existing callers /
+        # tests can keep catching ``_PurgeStateError`` without
+        # reaching into the storage facade's module namespace.
+        raise _PurgeStateError(str(exc)) from exc
+    counts["audit_tail"] = 0
 
-    # Audit tail file — central-tail JSONL at
-    # ~/.pollypm/audit/<project>.jsonl. The per-project log inside
-    # ``<project_path>/.pollypm/audit.jsonl`` lives in the project
-    # directory, which ``pm project remove`` deliberately leaves on
-    # disk (worktree teardown is a separate wedge, see #1561).
-    #
-    # Audit-tail removal is best-effort and runs AFTER the DB commit
-    # so the rows-vs-tail asymmetry only ever points one way: tail
-    # may linger after a successful row purge, never the reverse.
     try:
         from pollypm.audit.log import central_log_path
 
         tail_path = central_log_path(project_key)
         if tail_path.exists():
-            try:
-                tail_path.unlink()
+            if dry_run:
                 counts["audit_tail"] = 1
-            except OSError:
-                # Best-effort. Leave the count at 0 so the summary
-                # truthfully reports nothing was removed.
-                counts["audit_tail"] = 0
+            else:
+                try:
+                    tail_path.unlink()
+                    counts["audit_tail"] = 1
+                except OSError:
+                    # Best-effort. Leave the count at 0 so the summary
+                    # truthfully reports nothing was removed.
+                    counts["audit_tail"] = 0
     except Exception:  # noqa: BLE001
         pass
 

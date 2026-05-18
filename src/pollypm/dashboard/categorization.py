@@ -116,6 +116,8 @@ class _WorkServiceLike(Protocol):
         self, *, project: str | None = None, active_only: bool = True,
     ) -> list: ...
 
+    def get(self, task_id: str) -> object: ...
+
 
 # Task statuses that indicate active automated work for the WORKING
 # category. Tasks parked on user-waiting statuses

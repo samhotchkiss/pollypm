@@ -125,7 +125,16 @@ class PollyOperatorDashboardApp(App[None]):
         yield self.footer_w
 
     def on_mount(self) -> None:
-        self._refresh()
+        # #1630 — paint the skeleton synchronously so the user sees
+        # "Loading operator dashboard…" in <100ms, then defer the
+        # actual refresh (which spawns a worker thread for per-project
+        # sqlite reads) until AFTER the first paint cycle completes.
+        # Without ``call_after_refresh`` here the worker is still
+        # dispatched promptly, but ``run_worker`` initialization plus
+        # any synchronous import resolution can briefly delay the
+        # first frame on a cold cockpit-pane process.
+        self._paint_skeleton()
+        self.call_after_refresh(self._refresh)
         self.set_interval(10, self._refresh)
         # Focus the waiting list so j/k/enter work without an extra tab.
         try:
@@ -139,6 +148,24 @@ class PollyOperatorDashboardApp(App[None]):
             )
         except Exception:  # noqa: BLE001
             self._input_bridge_handle = None
+
+    def _paint_skeleton(self) -> None:
+        """Render the placeholder shown until the first worker result arrives.
+
+        Kept tiny and synchronous — every widget update here happens on
+        the main thread before any DB is opened, so a cold cockpit-pane
+        boot still shows *something* in <100ms.
+        """
+        self.header_w.update("[dim]Loading operator dashboard…[/dim]")
+        self._populate_waiting(())
+        self.working_body.update("[dim]Loading…[/dim]")
+        self.idle_body.update("[dim]Loading…[/dim]")
+        self.paused_title.update("")
+        self.paused_body.update("")
+        self.footer_w.update(
+            "[dim]Press [b]enter[/b] to open · [b]j[/b]/[b]k[/b] move"
+            " · [b]r[/b] refresh · [b]i[/b] inbox · [b]?[/b] help[/dim]"
+        )
 
     def on_unmount(self) -> None:
         bridge = getattr(self, "_input_bridge_handle", None)
@@ -155,7 +182,14 @@ class PollyOperatorDashboardApp(App[None]):
         self._refresh()
 
     def _refresh(self) -> None:
-        self._render_view(self._view or _empty_view())
+        # #1630 — only re-render synchronously when we already have a
+        # cached view (subsequent refreshes). On first call the
+        # skeleton painted from on_mount stays put until the worker
+        # thread returns — re-rendering an ``_empty_view()`` here
+        # would clobber the skeleton's "Loading…" placeholders with
+        # empty "Nothing waiting." copy that misleads the user.
+        if self._view is not None or self._refresh_error is not None:
+            self._render_view(self._view or _empty_view())
         if self._refresh_running:
             return
         self._refresh_running = True

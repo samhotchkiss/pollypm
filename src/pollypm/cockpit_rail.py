@@ -3812,6 +3812,66 @@ class CockpitRouter:
             self._release_cockpit_lease(supervisor, mounted_session)
             return
         storage_session = supervisor.storage_closet_session_name()
+        try:
+            storage_windows_before = self.tmux.list_windows(storage_session)
+        except Exception:  # noqa: BLE001
+            storage_windows_before = []
+        # #1635 — make break-pane idempotent against existing duplicates.
+        # Prior behavior unconditionally called ``tmux break-pane -n
+        # <window_name>``, which silently created a SECOND window with
+        # the same name when one was already present in the storage
+        # closet. The most painful repro: Sam clicks Polly → parks → the
+        # cockpit's right pane is broken into storage as a fresh
+        # ``pm-operator`` even though storage already had a live
+        # ``pm-operator`` window with the in-progress conversation.
+        # On the next mount, #1632's selector picked the wrong one
+        # (both are live) and Sam saw a fresh Polly re-asking the same
+        # 4 onboarding questions — the duplicate window held the
+        # original conversation.
+        existing_same_name = [
+            w for w in storage_windows_before
+            if getattr(w, "name", None) == window_name
+        ]
+        live_existing = [
+            w for w in existing_same_name
+            if self._storage_window_is_live(w)
+        ]
+        dead_existing = [
+            w for w in existing_same_name
+            if not self._storage_window_is_live(w)
+        ]
+        if live_existing:
+            # A live duplicate already owns ``window_name`` in storage —
+            # the existing window IS the persistent home. Skip the
+            # break-pane entirely. The caller's subsequent
+            # ``respawn_pane`` on our right pane will discard the
+            # duplicate process we would otherwise have parked.
+            state.pop("mounted_session", None)
+            state.pop("mounted_identity", None)
+            self._write_state(state)
+            self._release_cockpit_lease(supervisor, mounted_session)
+            self._emit_cockpit_audit(
+                event_name="cockpit.park_skipped_existing",
+                subject=mounted_session,
+                status="warn",
+                metadata={
+                    "session_name": mounted_session,
+                    "window_name": window_name,
+                    "storage_session": storage_session,
+                    "live_duplicate_indices": [w.index for w in live_existing],
+                    "dead_duplicate_indices": [w.index for w in dead_existing],
+                    "reason": "live_existing_storage_window",
+                },
+            )
+            return
+        # Re-occupy any stale (pane-dead) windows that already hold the
+        # name so break-pane lands at the canonical name rather than
+        # falling back to a tmux-generated suffix.
+        for window in dead_existing:
+            try:
+                self.tmux.kill_window(f"{storage_session}:{window.index}")
+            except Exception:  # noqa: BLE001
+                continue
         before = {(window.index, window.name) for window in self.tmux.list_windows(storage_session)}
         self.tmux.break_pane(right_pane_id, storage_session, window_name)
         after = self.tmux.list_windows(storage_session)
@@ -3839,8 +3899,29 @@ class CockpitRouter:
                 "window_name": window_name,
                 "storage_session": storage_session,
                 "storage_windows_after": sorted(w.name for w in after),
+                "reoccupied_dead_indices": [w.index for w in dead_existing],
             },
         )
+
+    def _storage_window_is_live(self, window) -> bool:
+        """Return True iff ``window``'s pane is alive and running a provider.
+
+        #1635 — mirrors :meth:`_select_storage_window_for_mount`'s
+        live-provider definition (``claude`` / ``codex`` / ``node``) so
+        the park-skip guard and the mount selector agree on what counts
+        as a live duplicate. A pane reporting any other ``pane_current_command``
+        (or marked ``pane_dead``) is treated as not-live and a fresh
+        break-pane will re-occupy the name.
+        """
+        if getattr(window, "pane_dead", False):
+            return False
+        cmd = getattr(window, "pane_current_command", "") or ""
+        if cmd in {"node", "claude", "codex"}:
+            return True
+        # Version-string fallback mirrors ``_is_live_provider_pane``.
+        if cmd and all(c.isdigit() or c == "." for c in cmd):
+            return True
+        return False
 
     # Roles that should NEVER be auto-detected as mounted via CWD fallback.
     # These are background roles — if the user is looking at a pane, it's

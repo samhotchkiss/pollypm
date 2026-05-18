@@ -27,7 +27,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from pollypm.cockpit_inbox_sources import (
     _inbox_db_sources,
@@ -42,6 +42,9 @@ from pollypm.cockpit_worker_identity import (
 )
 from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
 from pollypm.inbox_message_refs import row_project_refs as _row_project_refs
+
+if TYPE_CHECKING:
+    from pollypm.inbox.kind import InboxItemKind
 
 __all__ = (
     # Re-exported leaf helpers (now live in pollypm.cockpit_inbox_sources)

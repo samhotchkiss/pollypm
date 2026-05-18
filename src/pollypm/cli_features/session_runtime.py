@@ -24,6 +24,7 @@ from pathlib import Path
 import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH
+from pollypm.inbox.kind import InboxItemKind
 
 _TASK_ID_PATTERN = re.compile(r"\b([A-Za-z0-9_.-]+/\d+)\b")
 
@@ -647,6 +648,34 @@ def send(
     typer.echo(f"Sent input to {session_name}")
 
 
+def _kind_for_notify(
+    labels: list[str],
+    *,
+    requester: str,
+    user_prompt_payload: dict | None,
+) -> str:
+    """Pick the inbox ``kind`` for a ``pm notify`` emit (#1567/#1568).
+
+    Most ``pm notify`` calls land with no label hint, and the caller is
+    a human (the architect, Polly herself, etc.) typing free-form text
+    — those stay ``legacy`` so the predicate's fail-open default keeps
+    them visible until #1570 backfills. Only label-keyed shapes that
+    map cleanly onto an actionable kind get explicit retraining here:
+
+    * ``plan_review`` label → ``plan_review_pending`` (architect's
+      canonical ``pm notify --label plan_review`` handoff).
+    * ``--user-prompt-json`` payload routed at ``requester=user`` →
+      ``pm_question_unanswered`` (producer explicitly built an Action
+      Needed card with a question for the user).
+    """
+    label_set = {label for label in labels if isinstance(label, str)}
+    if "plan_review" in label_set:
+        return InboxItemKind.PLAN_REVIEW_PENDING.value
+    if user_prompt_payload is not None and requester == "user":
+        return InboxItemKind.PM_QUESTION_UNANSWERED.value
+    return InboxItemKind.LEGACY.value
+
+
 def notify(
     helpers,
     subject: str = typer.Argument(..., help="Short title for the inbox item."),
@@ -996,6 +1025,11 @@ def notify(
         else None
     )
 
+    notify_kind = _kind_for_notify(
+        label_list,
+        requester=requester_role,
+        user_prompt_payload=user_prompt_payload,
+    )
     try:
         if existing_dedup_row is not None:
             # Bump path — caller signaled "this is the same alert
@@ -1030,6 +1064,7 @@ def notify(
                 labels=label_list or None,
                 payload=seeded_payload,
                 state="closed" if resolved_priority == "immediate" else tier_state,
+                kind=notify_kind,
             )
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Failed to enqueue notify message: {exc}", err=True)
@@ -1064,6 +1099,7 @@ def notify(
                 priority="high",
                 created_by=actor,
                 labels=task_labels,
+                kind=notify_kind,
             )
             inbox_task_id = task.task_id
             store = SQLAlchemyStore(f"sqlite:///{db_path}")

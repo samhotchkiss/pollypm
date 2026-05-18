@@ -23,6 +23,7 @@ import logging
 import re
 from typing import Any, Protocol
 
+from pollypm.inbox.kind import InboxItemKind
 from pollypm.work.models import ArtifactKind
 
 logger = logging.getLogger(__name__)
@@ -213,6 +214,7 @@ def emit_task_shipped_card(
             priority="normal",
             created_by=actor or "polly",
             labels=labels,
+            kind=InboxItemKind.COMPLETION_FYI.value,
         )
         return getattr(card, "task_id", None)
     except Exception as exc:  # noqa: BLE001

@@ -15,6 +15,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from pollypm.inbox.kind import InboxItemKind
+
 FEEDBACK_LABEL = "review_feedback"
 TASK_LABEL_PREFIX = "task:"
 PROJECT_LABEL_PREFIX = "project:"
@@ -64,6 +66,7 @@ def emit_rejection_feedback(work_service, *, task, reviewer: str, reason: str):
             f"{TASK_LABEL_PREFIX}{task.task_id}",
             f"{PROJECT_LABEL_PREFIX}{getattr(task, 'project', '') or 'inbox'}",
         ],
+        kind=InboxItemKind.MANUAL_DECISION.value,
     )
 
 

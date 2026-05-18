@@ -23,6 +23,8 @@ import logging
 import time
 from typing import Any, Protocol
 
+from pollypm.inbox.kind import InboxItemKind
+
 logger = logging.getLogger(__name__)
 
 _WORKER_MILESTONE_LABEL = "worker_milestone"
@@ -167,7 +169,8 @@ def emit_worker_milestone(
 
         # operator is fixed: milestones always surface to polly. The
         # caller-controlled identity is ``created_by`` (which worker
-        # said it).
+        # said it). Polly is the addressee, not the user, so this is
+        # an informational activity-event on the user-facing surface.
         card = svc.create(
             title=title,
             description=body,
@@ -178,6 +181,7 @@ def emit_worker_milestone(
             priority="normal",
             created_by=actor or "worker",
             labels=[_WORKER_MILESTONE_LABEL],
+            kind=InboxItemKind.ACTIVITY_EVENT.value,
         )
         return getattr(card, "task_id", None)
     except Exception as exc:  # noqa: BLE001

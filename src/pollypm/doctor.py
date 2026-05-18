@@ -3267,17 +3267,25 @@ def _invoke_prune_handler() -> tuple[bool, str]:
     Bypasses the scheduler so the prune runs immediately rather than
     waiting for the next hourly tick. The handler is idempotent —
     calling it when nothing is prunable is a cheap no-op.
+
+    Resolved through :mod:`pollypm.maintenance_handlers_registry` so
+    ``doctor`` never imports from ``pollypm.plugins_builtin`` directly
+    (#1363).
     """
+    from pollypm.maintenance_handlers_registry import (
+        AGENT_WORKTREE_PRUNE,
+        invoke_maintenance_handler,
+    )
+
     try:
-        from pollypm.plugins_builtin.core_recurring.plugin import (
-            agent_worktree_prune_handler,
-        )
-    except Exception as exc:  # noqa: BLE001
-        return (False, f"import failed: {exc}")
-    try:
-        result = agent_worktree_prune_handler({})
+        result = invoke_maintenance_handler(AGENT_WORKTREE_PRUNE, {})
     except Exception as exc:  # noqa: BLE001
         return (False, f"prune handler failed: {exc}")
+    if result is None:
+        return (
+            False,
+            "prune handler unavailable (core_recurring plugin not loaded)",
+        )
     pruned = int(result.get("pruned", 0)) if isinstance(result, dict) else 0
     errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0
     warned = int(result.get("warned_stale", 0)) if isinstance(result, dict) else 0
@@ -3355,15 +3363,25 @@ def _invoke_log_rotate_handler(logs_dir: Path) -> tuple[bool, str]:
     rotates files past the threshold and prunes retention-exceeded
     siblings; calling it when nothing is over-threshold is a cheap
     no-op.
+
+    Resolved through :mod:`pollypm.maintenance_handlers_registry` so
+    ``doctor`` never imports from ``pollypm.plugins_builtin`` directly
+    (#1363).
     """
+    from pollypm.maintenance_handlers_registry import (
+        LOG_ROTATE,
+        invoke_maintenance_handler,
+    )
+
     try:
-        from pollypm.plugins_builtin.core_recurring.plugin import log_rotate_handler
-    except Exception as exc:  # noqa: BLE001
-        return (False, f"import failed: {exc}")
-    try:
-        result = log_rotate_handler({"logs_dir": str(logs_dir)})
+        result = invoke_maintenance_handler(LOG_ROTATE, {"logs_dir": str(logs_dir)})
     except Exception as exc:  # noqa: BLE001
         return (False, f"log.rotate handler failed: {exc}")
+    if result is None:
+        return (
+            False,
+            "log.rotate handler unavailable (core_recurring plugin not loaded)",
+        )
     rotated = int(result.get("rotated", 0)) if isinstance(result, dict) else 0
     deleted = int(result.get("deleted", 0)) if isinstance(result, dict) else 0
     errors = int(result.get("errors", 0)) if isinstance(result, dict) else 0

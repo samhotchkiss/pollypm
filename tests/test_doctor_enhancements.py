@@ -1343,8 +1343,10 @@ def test_agent_worktree_count_fix_invokes_prune(
         called["n"] += 1
         return {"pruned": 3, "skipped_active": 0, "warned_stale": 0, "errors": 0}
 
-    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
-    monkeypatch.setattr(rec_plugin, "agent_worktree_prune_handler", _fake_handler)
+    from pollypm import maintenance_handlers_registry as reg
+    # Swap in an isolated handler map so the registration is auto-rolled
+    # back by monkeypatch and doesn't leak between tests.
+    monkeypatch.setattr(reg, "_handlers", {reg.AGENT_WORKTREE_PRUNE: _fake_handler})
     success, message = result.fix_fn()
     assert success
     assert called["n"] == 1
@@ -1370,8 +1372,8 @@ def test_logs_dir_size_fix_invokes_rotate(
         called["payload"] = payload
         return {"rotated": 1, "deleted": 0, "errors": 0}
 
-    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
-    monkeypatch.setattr(rec_plugin, "log_rotate_handler", _fake_handler)
+    from pollypm import maintenance_handlers_registry as reg
+    monkeypatch.setattr(reg, "_handlers", {reg.LOG_ROTATE: _fake_handler})
     success, message = result.fix_fn()
     assert success
     # The fix passes the resolved logs_dir in the payload so the handler
@@ -1392,12 +1394,16 @@ def test_log_rotate_handler_message_pluralisation(
     awkward singular boundary. Lock the literal out of both the all-
     singular and all-plural cases.
     """
-    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
+    from pollypm import maintenance_handlers_registry as reg
 
     monkeypatch.setattr(
-        rec_plugin,
-        "log_rotate_handler",
-        lambda payload: {"rotated": 1, "deleted": 1, "errors": 1},
+        reg,
+        "_handlers",
+        {
+            reg.LOG_ROTATE: lambda payload: {
+                "rotated": 1, "deleted": 1, "errors": 1,
+            },
+        },
     )
     success, message = doctor._invoke_log_rotate_handler(tmp_path)
     assert not success
@@ -1407,9 +1413,13 @@ def test_log_rotate_handler_message_pluralisation(
     assert "(s)" not in message
 
     monkeypatch.setattr(
-        rec_plugin,
-        "log_rotate_handler",
-        lambda payload: {"rotated": 4, "deleted": 2, "errors": 0},
+        reg,
+        "_handlers",
+        {
+            reg.LOG_ROTATE: lambda payload: {
+                "rotated": 4, "deleted": 2, "errors": 0,
+            },
+        },
     )
     success, message = doctor._invoke_log_rotate_handler(tmp_path)
     assert success
@@ -1428,12 +1438,16 @@ def test_prune_handler_message_pluralisation(
     line, original prose was ``pruned 1 merged worktree(s), 0 stale
     unmerged retained, 1 error(s)`` at the singular boundary.
     """
-    import pollypm.plugins_builtin.core_recurring.plugin as rec_plugin
+    from pollypm import maintenance_handlers_registry as reg
 
     monkeypatch.setattr(
-        rec_plugin,
-        "agent_worktree_prune_handler",
-        lambda payload: {"pruned": 1, "warned_stale": 0, "errors": 1},
+        reg,
+        "_handlers",
+        {
+            reg.AGENT_WORKTREE_PRUNE: lambda payload: {
+                "pruned": 1, "warned_stale": 0, "errors": 1,
+            },
+        },
     )
     success, message = doctor._invoke_prune_handler()
     assert not success
@@ -1442,9 +1456,13 @@ def test_prune_handler_message_pluralisation(
     assert "(s)" not in message
 
     monkeypatch.setattr(
-        rec_plugin,
-        "agent_worktree_prune_handler",
-        lambda payload: {"pruned": 5, "warned_stale": 0, "errors": 0},
+        reg,
+        "_handlers",
+        {
+            reg.AGENT_WORKTREE_PRUNE: lambda payload: {
+                "pruned": 5, "warned_stale": 0, "errors": 0,
+            },
+        },
     )
     success, message = doctor._invoke_prune_handler()
     assert success
@@ -1809,15 +1827,19 @@ def test_fix_cli_real_handlers_no_op_surfaces_unverified(
     big.write_bytes(b"x" * (doctor._LOGS_WARN_BYTES + 1))
     monkeypatch.setattr(doctor, "_logs_dir_candidates", lambda: [logs_dir])
 
-    import pollypm.plugins_builtin.core_recurring.plugin as plugin_mod
+    from pollypm import maintenance_handlers_registry as reg
 
     monkeypatch.setattr(
-        plugin_mod, "agent_worktree_prune_handler",
-        lambda payload: {"pruned": 0, "errors": 0, "warned_stale": 0},
-    )
-    monkeypatch.setattr(
-        plugin_mod, "log_rotate_handler",
-        lambda payload: {"rotated": 0, "deleted": 0, "errors": 0},
+        reg,
+        "_handlers",
+        {
+            reg.AGENT_WORKTREE_PRUNE: (
+                lambda payload: {"pruned": 0, "errors": 0, "warned_stale": 0}
+            ),
+            reg.LOG_ROTATE: (
+                lambda payload: {"rotated": 0, "deleted": 0, "errors": 0}
+            ),
+        },
     )
 
     monkeypatch.setattr(

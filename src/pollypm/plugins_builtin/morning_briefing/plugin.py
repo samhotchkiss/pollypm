@@ -22,9 +22,11 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from pollypm.briefings_registry import register_briefing_provider
 from pollypm.plugin_api.v1 import (
     Capability,
     JobHandlerAPI,
+    PluginAPI,
     PollyPMPlugin,
     RosterAPI,
 )
@@ -32,7 +34,10 @@ from pollypm.agent_profiles.defaults import StaticPromptProfile
 from pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick import (
     briefing_tick_handler,
 )
-from pollypm.plugins_builtin.morning_briefing.inbox import briefing_sweep_handler
+from pollypm.plugins_builtin.morning_briefing.inbox import (
+    briefing_sweep_handler,
+    list_briefings,
+)
 
 
 _HERALD_PROFILE_PATH = Path(__file__).parent / "profiles" / "herald.md"
@@ -69,6 +74,19 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         max_attempts=1,
         timeout_seconds=30.0,
     )
+
+
+def _initialize(api: PluginAPI) -> None:
+    """Wire the briefing-inbox provider for core dashboard reads.
+
+    The dashboard surfaces briefings through
+    :func:`pollypm.briefings_registry.list_briefings` so core never
+    imports from this plugin. We register the real implementation here
+    during plugin initialize; with the plugin disabled the dashboard
+    sees no provider and renders without a briefing banner (#1363).
+    """
+    del api  # unused — the dashboard reads briefings off the filesystem
+    register_briefing_provider(list_briefings)
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -111,4 +129,5 @@ plugin = PollyPMPlugin(
     },
     register_handlers=_register_handlers,
     register_roster=_register_roster,
+    initialize=_initialize,
 )

@@ -499,7 +499,11 @@ def _render_account_usage_lines(rows: list[DashboardAccountUsage]) -> list[str]:
 
 
 def _recent_briefing_entry(base_dir: Path, *, now: datetime, status: str):
-    from pollypm.plugins_builtin.morning_briefing.inbox import list_briefings
+    # Resolved through the core registration seam (#1363) so the
+    # dashboard doesn't import from ``plugins_builtin``. With no
+    # provider registered (e.g. ``morning_briefing`` plugin disabled),
+    # ``list_briefings`` returns ``[]`` and the banner is simply absent.
+    from pollypm.briefings_registry import list_briefings
 
     for entry in list_briefings(base_dir, status=status, limit=8):
         created_at = _iso_to_dt(getattr(entry, "created_at", ""))

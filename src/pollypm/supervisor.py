@@ -1175,7 +1175,13 @@ class Supervisor:
                         f"Session {launch.session.name} failed to stabilize during bootstrap: {exc}",
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    # #1355: previously silent. Surface to logs so a broken
+                    # msg_store / schema drift stops swallowing stabilize bugs.
+                    logger.warning(
+                        "bootstrap stabilize failed to record alert for %s",
+                        launch.session.name,
+                        exc_info=True,
+                    )
 
         threads = []
         for launch, tgt in targets:
@@ -1236,7 +1242,14 @@ class Supervisor:
                 if w.name == window_name:
                     return w.pane_id
         except Exception:  # noqa: BLE001
-            pass
+            # #1355: previously silent. A tmux failure here is a real
+            # symptom (dead server, perms) — log so it surfaces.
+            logger.warning(
+                "resolve_pane_id failed for session=%s window=%s",
+                session_name,
+                window_name,
+                exc_info=True,
+            )
         return None
 
     def _record_launch(self, launch: SessionLaunchSpec) -> None:
@@ -1491,7 +1504,12 @@ class Supervisor:
                 try:
                     self._msg_store.clear_alert("heartbeat", "fd_exhaustion_pending")
                 except Exception:  # noqa: BLE001
-                    pass
+                    # #1355: previously silent. A stuck fd-pressure alert
+                    # is operator-visible; log so we know clear_alert broke.
+                    logger.warning(
+                        "fd_exhaustion_pending clear_alert failed",
+                        exc_info=True,
+                    )
         except Exception:  # noqa: BLE001
             # Sweep is best-effort — never let it crash the heartbeat tick.
             return
@@ -2140,7 +2158,14 @@ class Supervisor:
                         from pollypm.atomic_io import atomic_write_json
                         atomic_write_json(state_path, state)
             except Exception:  # noqa: BLE001
-                pass
+                # #1355: previously silent. JSON parse error or atomic
+                # write failure here means cockpit_state is corrupt or
+                # the disk write path is broken — both worth knowing.
+                logger.warning(
+                    "cockpit_state read/clear failed for %s",
+                    launch.session.name,
+                    exc_info=True,
+                )
         # Session not found anywhere — raise a clear error
         raise RuntimeError(
             f"Session '{launch.session.name}' (window '{launch.window_name}') not found in "
@@ -3489,7 +3514,15 @@ class Supervisor:
                 try:
                     self.launch_session(session_name)
                 except Exception:
-                    pass
+                    # #1355: previously silent. This is the second of two
+                    # launch attempts during account-recovery. If both
+                    # fail, the session stays degraded — surface the
+                    # follow-up failure so we know recovery is broken.
+                    logger.warning(
+                        "launch_session retry after collision failed for %s",
+                        session_name,
+                        exc_info=True,
+                    )
         except Exception:
             self.store.upsert_session_runtime(
                 session_name=session_name,
@@ -4149,7 +4182,14 @@ class Supervisor:
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            # #1355: previously silent. If the persona-swap diagnostic
+            # event can't be recorded the operator-visible signal is
+            # lost — log so we don't blindly trust the audit trail.
+            logger.warning(
+                "persona_swap_detected event record failed (pre-send guard, role=%s)",
+                role,
+                exc_info=True,
+            )
         return True
 
     def _target_window_matches_launch(

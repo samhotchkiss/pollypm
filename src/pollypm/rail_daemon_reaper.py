@@ -357,7 +357,14 @@ def _emit_audit(
             },
         )
     except Exception:  # noqa: BLE001
-        pass
+        # #1355: previously silent. A failed audit emit on rail reap
+        # means we lose the record of why the rail daemon was killed —
+        # log the failure so we know the audit path itself is broken.
+        logger.warning(
+            "daemon.reaped audit emit failed for rail_daemon pid=%s",
+            pid,
+            exc_info=True,
+        )
 
 
 def _pid_alive(pid: int) -> bool:

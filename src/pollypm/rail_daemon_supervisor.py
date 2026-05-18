@@ -782,7 +782,15 @@ def _emit_revival_audit(
             },
         )
     except Exception:  # noqa: BLE001
-        pass
+        # #1355: previously silent. A failed audit emit on rail revive
+        # means we lose the record of supervisor recovery decisions —
+        # log so we know the audit path itself is broken.
+        logger.warning(
+            "daemon.revived audit emit failed (state=%s, revived=%s)",
+            decision.state,
+            revived,
+            exc_info=True,
+        )
 
 
 def _wait_for_child_pid(

@@ -170,6 +170,11 @@ _PLAN_PRESENCE_PLUGIN_MODULE = (
 _TASK_ASSIGNMENT_NOTIFY_API_MODULE = (
     "pollypm.plugins_builtin.task_assignment_notify.api"
 )
+# ``approval_notifications`` lives in core; it must resolve the OS
+# adapter via :func:`pollypm.approval_notifications.register_default_os_adapter`
+# instead of reaching into the optional plugin tree.
+_APPROVAL_NOTIFICATIONS_FILE = "src/pollypm/approval_notifications.py"
+_HUMAN_NOTIFY_PLUGIN_PREFIX = "pollypm.plugins_builtin.human_notify"
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -180,6 +185,21 @@ def _imports_module(source_file: Path, module: str) -> bool:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 if alias.name == module or alias.name.startswith(f"{module}."):
+                    return True
+    return False
+
+
+def _imports_module_or_subpackage(source_file: Path, prefix: str) -> bool:
+    """True iff ``source_file`` imports ``prefix`` or any of its submodules."""
+    tree = ast.parse(source_file.read_text(encoding="utf-8"), filename=str(source_file))
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if module == prefix or module.startswith(f"{prefix}."):
+                return True
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == prefix or alias.name.startswith(f"{prefix}."):
                     return True
     return False
 
@@ -208,6 +228,30 @@ def test_non_plugin_sources_do_not_import_task_assignment_notify_api() -> None:
         if _imports_module(source_file, _TASK_ASSIGNMENT_NOTIFY_API_MODULE):
             offenders.append(rel)
     assert offenders == []
+
+
+def test_approval_notifications_does_not_import_human_notify_plugin() -> None:
+    """Core approval flow must not reach into the human_notify plugin.
+
+    The OS adapter is installed via
+    :func:`pollypm.approval_notifications.register_default_os_adapter`
+    during plugin initialize. Any direct import from
+    ``pollypm.plugins_builtin.human_notify`` re-couples core to the
+    optional plugin tree — fail loudly so the seam stays clean.
+    """
+    root = _project_root()
+    source_file = root / _APPROVAL_NOTIFICATIONS_FILE
+    assert source_file.exists(), (
+        f"Expected {_APPROVAL_NOTIFICATIONS_FILE} to exist — boundary test "
+        "needs updating if the file moved."
+    )
+    assert not _imports_module_or_subpackage(
+        source_file, _HUMAN_NOTIFY_PLUGIN_PREFIX
+    ), (
+        f"{_APPROVAL_NOTIFICATIONS_FILE} must not import from "
+        f"{_HUMAN_NOTIFY_PLUGIN_PREFIX}; use register_default_os_adapter "
+        "instead so the plugin stays optional."
+    )
 
 
 # ---------------------------------------------------------------------------

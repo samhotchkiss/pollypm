@@ -466,7 +466,14 @@ def _maybe_nudge_reviewer_review(
             force=lease is not None and lease.owner != "human",
         )
     except Exception:  # noqa: BLE001
-        pass
+        # #1355: previously silent. If the reviewer-nudge send fails,
+        # review work can stall indefinitely — surface so we can spot
+        # broken send_input / pane resolution paths.
+        _logger.warning(
+            "reviewer review nudge send_input failed for %s",
+            launch.session.name,
+            exc_info=True,
+        )
 
 
 _FRESH_CONTEXT_CONTRACT = (

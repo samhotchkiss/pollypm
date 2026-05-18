@@ -21,10 +21,12 @@ from openapi_spec_validator import validate as validate_openapi
 CONTRACT_PATH = Path(__file__).resolve().parents[2] / "docs" / "api" / "openapi.yaml"
 
 
-# Paths Phase 1 implements. Phase 2/3 paths exist in the contract but
-# the FastAPI app is not yet expected to serve them; we assert
-# implementation-side coverage only for the Phase 1 surface and leave
-# the remainder to the later phases.
+# Paths Phase 1 (#1547) implements + the Phase 2 wedge (#1548). The
+# remaining Phase 2 routes (approve / reject / register / plan / chat
+# / inbox-reply / inbox-archive) exist in the contract but the
+# FastAPI app is not yet expected to serve them; we assert
+# implementation-side coverage for what's actually wired up and leave
+# the remainder to the rest of Phase 2.
 PHASE_1_PATHS: set[tuple[str, str]] = {
     ("GET", "/health"),
     ("GET", "/projects"),
@@ -35,6 +37,8 @@ PHASE_1_PATHS: set[tuple[str, str]] = {
     ("GET", "/inbox"),
     ("GET", "/inbox/{id}"),
     ("GET", "/events"),
+    # Phase 2 wedge — first write endpoint, see #1548.
+    ("POST", "/tasks/{project}/{n}/queue"),
 }
 
 

@@ -2,28 +2,88 @@
 
 Contract:
 - Inputs: a reviewed ``Task`` plus a UI ``notify`` callback.
-- Outputs: a stable approval toast message, and best-effort macOS banner
-  delivery when Notification Center is available.
+- Outputs: a stable approval toast message, and best-effort OS banner
+  delivery when a notification adapter has been registered (typically
+  by the ``human_notify`` plugin).
 - Side effects: emits a Textual toast immediately and may queue an OS
-  notification on Darwin hosts.
+  notification when an adapter is registered.
 - Invariants: approval flows format the same message everywhere and never
   fail the underlying approval action when notification delivery flakes.
+
+Boundary note:
+This module is core — it must not import from ``pollypm.plugins_builtin``.
+The OS-level adapter is resolved through :func:`register_default_os_adapter`
+so the ``human_notify`` plugin (or any third-party replacement) can plug
+in without core taking a hard dependency on the optional plugin tree.
 """
 
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Callable
-
-from pollypm.plugins_builtin.human_notify.macos import MacOsNotifyAdapter
+from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
-    from pollypm.plugins_builtin.human_notify.protocol import HumanNotifyAdapter
     from pollypm.work.models import Task
 
 
 NotifyCallback = Callable[..., None]
 _TOAST_TIMEOUT_SECONDS = 5.0
+
+
+@runtime_checkable
+class OsApprovalNotifier(Protocol):
+    """Minimal OS-notification contract for the approval flow.
+
+    Mirrors the public surface of the ``human_notify`` plugin's
+    ``HumanNotifyAdapter`` but lives in core so this module doesn't
+    reach into the plugin tree. Plugin adapters that already satisfy
+    ``HumanNotifyAdapter`` structurally satisfy this Protocol too.
+    """
+
+    def is_available(self) -> bool:
+        """Return True iff this adapter can deliver a banner right now."""
+        ...
+
+    def notify(
+        self,
+        *,
+        title: str,
+        body: str,
+        task_id: str,
+        project: str,
+    ) -> None:
+        """Deliver a single approval banner."""
+        ...
+
+
+# Module-level registration slot. The ``human_notify`` plugin (or a
+# replacement) installs its OS adapter factory here during plugin
+# ``initialize``; when nothing is registered, the approval flow still
+# emits the in-cockpit toast but skips the OS banner.
+_default_os_adapter_factory: Callable[[], OsApprovalNotifier] | None = None
+
+
+def register_default_os_adapter(
+    factory: Callable[[], OsApprovalNotifier] | None,
+) -> None:
+    """Install (or clear) the default OS-notification adapter factory.
+
+    Called by the ``human_notify`` plugin during ``initialize`` so
+    ``notify_task_approved`` can deliver banners without a hard import
+    on the plugin tree. Pass ``None`` to clear (used by tests).
+    """
+    global _default_os_adapter_factory
+    _default_os_adapter_factory = factory
+
+
+def _resolve_default_os_adapter() -> OsApprovalNotifier | None:
+    factory = _default_os_adapter_factory
+    if factory is None:
+        return None
+    try:
+        return factory()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def format_task_approval_message(
@@ -37,8 +97,8 @@ def format_task_approval_message(
         approved_at or datetime.now(UTC),
     )
     if shipped_in:
-        return f"\u2713 {task.task_id} approved - shipped in {shipped_in}"
-    return f"\u2713 {task.task_id} approved"
+        return f"✓ {task.task_id} approved - shipped in {shipped_in}"
+    return f"✓ {task.task_id} approved"
 
 
 def notify_task_approved(
@@ -46,13 +106,21 @@ def notify_task_approved(
     *,
     notify: NotifyCallback,
     approved_at: datetime | None = None,
-    os_adapter: "HumanNotifyAdapter | None" = None,
+    os_adapter: "OsApprovalNotifier | None" = None,
 ) -> str:
-    """Emit the in-cockpit toast and best-effort macOS banner."""
+    """Emit the in-cockpit toast and best-effort OS banner.
+
+    The OS banner is delivered through ``os_adapter`` when the caller
+    supplies one (tests, custom flows); otherwise the registered
+    default adapter is consulted. With no registered adapter the
+    banner is skipped silently — the toast still fires.
+    """
     message = format_task_approval_message(task, approved_at=approved_at)
     notify(message, severity="information", timeout=_TOAST_TIMEOUT_SECONDS)
 
-    adapter = os_adapter or MacOsNotifyAdapter()
+    adapter = os_adapter if os_adapter is not None else _resolve_default_os_adapter()
+    if adapter is None:
+        return message
     try:
         available = adapter.is_available()
     except Exception:  # noqa: BLE001
@@ -104,6 +172,8 @@ def _coerce_utc(value: datetime | None) -> datetime | None:
 
 
 __all__ = [
+    "OsApprovalNotifier",
     "format_task_approval_message",
     "notify_task_approved",
+    "register_default_os_adapter",
 ]

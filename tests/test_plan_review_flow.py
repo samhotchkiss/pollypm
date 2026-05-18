@@ -1614,6 +1614,90 @@ class TestApproveDeferredUndo:
                 _S.approve = original_approve  # type: ignore[assignment]
         _run(body())
 
+    def test_backstop_emit_plan_task_already_done_archives_without_approve(
+        self, plan_review_env, deferred_inbox_app,
+    ) -> None:
+        """#1589 — when plan_task is already DONE (backstop emit), the
+        approve key still clears the inbox row.
+
+        ``plan_review_emit.py`` emits a plan_review notification card for
+        plan-shaped tasks that reached ``done`` without a plan_review
+        handoff. Calling ``svc.approve`` on a DONE task raises
+        ``InvalidTransitionError`` ("Cannot approve task in 'done' state").
+        Before the #1589 fix, that exception was caught + surfaced via
+        toast but the deferred-commit returned early, leaving the inbox
+        row indefinitely. The row should drop after the undo window
+        elapses regardless of the plan_task's terminal state — the user
+        is acknowledging the card, not transitioning the underlying task.
+        """
+        async def body() -> None:
+            _seed_round_trip(plan_review_env)
+            # Force the plan_task into a terminal state so ``svc.approve``
+            # would raise. We bypass the transition manager (which would
+            # itself complain about the current state) and write the
+            # status column directly — mirrors the backstop case where
+            # the plan_task reached done via a non-plan_project flow.
+            from pollypm.work.sqlite_service import SQLiteWorkService
+            db_path = plan_review_env["project_path"] / ".pollypm" / "state.db"
+            svc_direct = SQLiteWorkService(
+                db_path=db_path,
+                project_path=plan_review_env["project_path"],
+            )
+            try:
+                project, _, number = plan_review_env[
+                    "plan_task_id"
+                ].partition("/")
+                svc_direct._conn.execute(
+                    "UPDATE work_tasks SET work_status = 'done' "
+                    "WHERE project = ? AND task_number = ?",
+                    (project, int(number)),
+                )
+                svc_direct._conn.commit()
+            finally:
+                svc_direct.close()
+
+            approve_calls: list[tuple[str, str]] = []
+            from pollypm.work.sqlite_service import SQLiteWorkService as _S
+            original_approve = _S.approve
+
+            def _spy_approve(self, task_id, actor, reason=None):
+                approve_calls.append((task_id, actor))
+                return original_approve(self, task_id, actor, reason)
+
+            _S.approve = _spy_approve  # type: ignore[assignment]
+            try:
+                async with deferred_inbox_app.run_test(size=(140, 40)) as pilot:
+                    await pilot.pause()
+                    deferred_inbox_app.list_view.index = 0
+                    await pilot.press("enter")
+                    await pilot.pause()
+                    await pilot.press("A")
+                    # Wait past the window so the timer fires.
+                    for _ in range(30):
+                        await pilot.pause(0.05)
+                        if deferred_inbox_app._pending_plan_approval is None:
+                            break
+                    # Pending state cleared after commit.
+                    assert deferred_inbox_app._pending_plan_approval is None
+                    # svc.approve was NOT called against the terminal
+                    # plan_task — the fix skips it for the backstop case.
+                    assert approve_calls == []
+                    # The inbox row was archived (work_status -> done).
+                    svc_check = SQLiteWorkService(
+                        db_path=db_path,
+                        project_path=plan_review_env["project_path"],
+                    )
+                    try:
+                        plan_review_task = svc_check.get(
+                            plan_review_env["plan_review_id"],
+                        )
+                        assert plan_review_task.work_status.value == "done"
+                    finally:
+                        svc_check.close()
+            finally:
+                _S.approve = original_approve  # type: ignore[assignment]
+        _run(body())
+
 
 class TestUndoWindowConstant:
     def test_default_undo_window_is_ten_seconds(self) -> None:

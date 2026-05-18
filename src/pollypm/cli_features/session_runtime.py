@@ -314,6 +314,19 @@ def reset(
         )
     supervisor.shutdown_tmux()
     helpers._stop_rail_daemon()
+    # #1590 — tmux kill-session SIGHUP doesn't propagate to ``python -m
+    # pollypm cockpit-pane`` children (Python ignores SIGHUP by default,
+    # and the pane child often re-parents to the tmux daemon / PID 1
+    # so the pane-kill has no pollypm-side target). Without this sweep,
+    # orphans accumulate across ``pm reset`` cycles — the field report
+    # had one running 4 days at 98% CPU. Reap them explicitly after
+    # the tmux teardown so the reset promise actually holds.
+    try:
+        from pollypm.cockpit_pane_reaper import reap_orphan_cockpit_panes
+
+        reaped_panes = reap_orphan_cockpit_panes()
+    except Exception:  # noqa: BLE001 - reap is best-effort, never fail reset
+        reaped_panes = []
     jobs_path = supervisor.config.project.base_dir / "scheduler" / "jobs.json"
     jobs_path.unlink(missing_ok=True)
     cockpit_state = supervisor.config.project.base_dir / "cockpit_state.json"
@@ -338,6 +351,14 @@ def reset(
     typer.echo(
         f"Killed {len(sessions_to_kill)} {session_word}: {', '.join(sessions_to_kill)}"
     )
+    if reaped_panes:
+        # Surface the orphan kill so the operator knows the reset
+        # actually cleaned up tmux-leaked children (#1590).
+        pids_str = ", ".join(str(entry.pid) for entry in reaped_panes)
+        pane_word = "pane" if len(reaped_panes) == 1 else "panes"
+        typer.echo(
+            f"Reaped {len(reaped_panes)} orphan cockpit-{pane_word}: {pids_str}"
+        )
 
 
 def status(

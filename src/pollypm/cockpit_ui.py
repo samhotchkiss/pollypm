@@ -22,6 +22,7 @@ from __future__ import annotations
 import gc
 import asyncio
 import json
+import logging
 import os
 import resource
 import webbrowser
@@ -38,6 +39,8 @@ try:
         resource.setrlimit(resource.RLIMIT_NOFILE, (min(4096, _hard), _hard))
 except (ValueError, OSError):
     pass
+
+logger = logging.getLogger(__name__)
 
 from rich.text import Text
 from textual import events, on
@@ -82,6 +85,9 @@ from pollypm.cockpit_inbox_items import (
     load_inbox_entries,
     message_row_to_inbox_entry,
     task_to_inbox_entry,
+)
+from pollypm.cockpit_inbox_project_picker import (  # noqa: F401  (re-exported)
+    _InboxProjectPickerModal,
 )
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
@@ -1297,6 +1303,24 @@ class PollyCockpitApp(App[None]):
         self._update_pill_dismissed = False
         self.spinner_index = 0
         self._ticker_started_at = time.monotonic()
+        # #1587 — Ticker SQLite read moved off the asyncio main thread.
+        # ``_cached_ticker_events`` is populated by the worker spawned
+        # in ``_update_ticker``; the paint path consumes the cache
+        # without touching SQLite.
+        self._cached_ticker_events: list = []
+        self._ticker_refresh_in_flight: bool = False
+        # Sentinel so the first ``_update_ticker`` call schedules an
+        # immediate cache refresh on the next event-loop turn.
+        self._last_ticker_refresh_tick: int = -10**9
+        # #1587 — Pill release-check moved off the main thread so the
+        # cache file read + version compare can never block keystrokes.
+        self._cached_release_check: Any = None
+        self._release_check_refresh_in_flight: bool = False
+        # Sentinel ``-∞`` so the first ``_update_pill_refresh`` always
+        # triggers a refresh — both in tests (which call this method
+        # once and assert visible state) and on the first cockpit
+        # tick after mount.
+        self._last_release_check_refresh_tick: int = -10**9
         self.selected_key = "dashboard"
         self._last_router_selected_key = "dashboard"
         self._items: list[CockpitItem] = []
@@ -2496,24 +2520,43 @@ class PollyCockpitApp(App[None]):
     }
 
     def _event_ticker_text(self) -> str:
-        # Gate on real tmux-client attachment (not just isatty). When the
-        # user detaches from tmux, animation should stop — see #656.
+        """Synchronous ticker-text builder, used by unit tests.
+
+        Production code goes through :meth:`_update_ticker`, which
+        refreshes the event cache on a worker thread first and then
+        calls :meth:`_event_ticker_text_from_cache`. This direct path
+        still performs the SQLite read inline and is retained as a
+        test seam — unit tests that drive the method directly bypass
+        the Textual scheduler and want a deterministic result.
+        """
         try:
             if not self.router._presence().is_tmux_attached():
                 return ""
         except Exception:  # noqa: BLE001
             pass  # fall through — render as if attached if gate fails
+        events = self._fetch_ticker_events_sync()
+        return self._compose_ticker_text(events)
+
+    def _event_ticker_text_from_cache(self) -> str:
+        """Like :meth:`_event_ticker_text` but uses the cached events.
+
+        Cheap — no SQLite. Used by :meth:`_update_ticker` on the
+        asyncio main thread; the cache is populated off-thread by
+        :meth:`_refresh_ticker_events_worker`. #1587.
+        """
         try:
-            supervisor = self.router._load_supervisor()
-            # Pull a wider window than we display so we still have signal
-            # after suppressing infra ticks.
-            raw_events = list(supervisor.store.recent_events(limit=48))
+            if not self.router._presence().is_tmux_attached():
+                return ""
         except Exception:  # noqa: BLE001
-            return ""
-        events = [
-            e for e in raw_events
-            if getattr(e, "event_type", "") not in self._TICKER_SUPPRESSED_EVENT_TYPES
-        ]
+            pass
+        return self._compose_ticker_text(self._cached_ticker_events)
+
+    def _compose_ticker_text(self, events: list) -> str:
+        """Compose the ticker line from a pre-fetched event list.
+
+        Pure UI-thread work — no SQLite, no subprocess. Receives the
+        events fetched off-thread by ``_refresh_ticker_events_worker``.
+        """
         if not events:
             return ""
         # #667 acceptance: show the 3 newest events, cycle the window so
@@ -2537,10 +2580,73 @@ class PollyCockpitApp(App[None]):
 
         return _format_event_ticker(labels)
 
+    # #1587 — Keep the SQLite read off the asyncio main thread.
+    # ``_update_ticker`` now repaints from the cached event list every
+    # tick (cheap, pure-Python), and a worker thread refreshes the
+    # cache every ``_TICKER_EVENT_REFRESH_TICKS`` ticks. Before this
+    # split, ``supervisor.store.recent_events(limit=48)`` ran inside
+    # ``_tick`` on the main thread every 0.8s; under SQLite write
+    # contention the SELECT blocked the event loop for seconds at a
+    # time, dropping rail keystrokes (#1587).
+    _TICKER_EVENT_REFRESH_TICKS = 3  # ~2.4s at 0.8s/tick
+
     def _update_ticker(self) -> None:
-        ticker_text = self._event_ticker_text()
+        # Refresh cached events off-thread on a slower cadence than
+        # the spinner tick. The paint itself runs every tick so the
+        # 10s cycle offset remains smooth.
+        if (
+            not self._ticker_refresh_in_flight
+            and (self._tick_count - self._last_ticker_refresh_tick)
+            >= self._TICKER_EVENT_REFRESH_TICKS
+        ):
+            self._last_ticker_refresh_tick = self._tick_count
+            try:
+                self._ticker_refresh_in_flight = True
+                self.run_worker(
+                    self._refresh_ticker_events_worker,
+                    thread=True,
+                    exclusive=True,
+                    group="rail_ticker_refresh",
+                )
+            except Exception:  # noqa: BLE001
+                # No event loop (unit tests) — populate inline so
+                # legacy tests that drive ``_update_ticker`` directly
+                # still see the SQLite-backed event list.
+                self._ticker_refresh_in_flight = False
+                try:
+                    self._cached_ticker_events = self._fetch_ticker_events_sync()
+                except Exception:  # noqa: BLE001
+                    self._cached_ticker_events = []
+        ticker_text = self._event_ticker_text_from_cache()
         self.ticker.update(ticker_text)
         self.ticker.display = bool(ticker_text)
+
+    def _fetch_ticker_events_sync(self) -> list:
+        """Synchronous SQLite read — only safe off the main thread."""
+        try:
+            supervisor = self.router._load_supervisor()
+            raw_events = list(supervisor.store.recent_events(limit=48))
+        except Exception:  # noqa: BLE001
+            return []
+        return [
+            e for e in raw_events
+            if getattr(e, "event_type", "") not in self._TICKER_SUPPRESSED_EVENT_TYPES
+        ]
+
+    def _refresh_ticker_events_worker(self) -> None:
+        """Worker-thread entry: pull events, hand back to the UI thread."""
+        try:
+            events = self._fetch_ticker_events_sync()
+        except Exception:  # noqa: BLE001
+            events = []
+        try:
+            self.call_from_thread(self._apply_ticker_events, events)
+        except Exception:  # noqa: BLE001
+            self._apply_ticker_events(events)
+
+    def _apply_ticker_events(self, events: list) -> None:
+        self._cached_ticker_events = events
+        self._ticker_refresh_in_flight = False
 
     def _update_transient_notice(self) -> bool:
         try:
@@ -2563,6 +2669,11 @@ class PollyCockpitApp(App[None]):
         self.update_pill.display = True
         return True
 
+    # #1587 — Release-check file I/O moved off the main thread. The
+    # cache file is read at most every ``_RELEASE_CHECK_REFRESH_TICKS``
+    # ticks; the paint path is pure dict/attr access on a cached object.
+    _RELEASE_CHECK_REFRESH_TICKS = 13  # ~10s at 0.8s/tick
+
     def _update_pill_refresh(self) -> None:
         """Refresh the update-available pill in the rail top area.
 
@@ -2571,18 +2682,79 @@ class PollyCockpitApp(App[None]):
         active channel. Hidden otherwise — including when dismissed for
         this session, when the check is cached as "up-to-date", and
         when the check is offline or raised.
+
+        #1587 — ``check_latest`` reads (and occasionally writes) a JSON
+        cache file under ``~/.pollypm``; during cache misses it issues
+        a network request. None of those should run on the asyncio
+        main thread, so the actual fetch happens in a worker and this
+        method just repaints from the cached result.
         """
         if self._update_pill_dismissed:
             self.update_pill.display = False
             return
+        # Kick off a background refresh on a slow cadence. The check
+        # is cached for ~24h so most calls are a dict lookup, but the
+        # file read + parse still costs ~ms and we don't want it
+        # accumulating with SQLite contention elsewhere.
+        if (
+            not self._release_check_refresh_in_flight
+            and (self._tick_count - self._last_release_check_refresh_tick)
+            >= self._RELEASE_CHECK_REFRESH_TICKS
+        ):
+            self._last_release_check_refresh_tick = self._tick_count
+            if self._has_running_event_loop():
+                try:
+                    self._release_check_refresh_in_flight = True
+                    self.run_worker(
+                        self._refresh_release_check_worker,
+                        thread=True,
+                        exclusive=True,
+                        group="rail_release_check",
+                    )
+                except Exception:  # noqa: BLE001
+                    # Textual rejected the worker (mocked driver, etc.)
+                    # — fall back to inline so the pill still paints.
+                    self._release_check_refresh_in_flight = False
+                    self._cached_release_check = self._fetch_release_check_sync()
+            else:
+                # No event loop (tests calling this method directly).
+                # Run inline so the existing unit-test contract holds.
+                self._cached_release_check = self._fetch_release_check_sync()
+        self._paint_release_check_pill(self._cached_release_check)
+
+    @staticmethod
+    def _has_running_event_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+
+    def _fetch_release_check_sync(self) -> Any:
         try:
             from pollypm.release_check import _resolve_channel, check_latest
             channel = _resolve_channel(None)
-            check = check_latest(channel)
+            return check_latest(channel)
         except Exception:  # noqa: BLE001
+            return None
+
+    def _refresh_release_check_worker(self) -> None:
+        check = self._fetch_release_check_sync()
+        try:
+            self.call_from_thread(self._apply_release_check, check)
+        except Exception:  # noqa: BLE001
+            self._apply_release_check(check)
+
+    def _apply_release_check(self, check: Any) -> None:
+        self._cached_release_check = check
+        self._release_check_refresh_in_flight = False
+        self._paint_release_check_pill(check)
+
+    def _paint_release_check_pill(self, check: Any) -> None:
+        if self._update_pill_dismissed:
             self.update_pill.display = False
             return
-        if check is None or not check.upgrade_available:
+        if check is None or not getattr(check, "upgrade_available", False):
             self.update_pill.display = False
             return
         channel_label = (
@@ -7147,120 +7319,6 @@ def _task_recent_timestamp(task) -> float | None:
     return None
 
 
-class _InboxProjectPickerModal(ModalScreen[str | None]):
-    """Tiny modal listing project keys for the ``p`` filter chip.
-
-    Returns the selected key (string) or ``None`` when dismissed via
-    Esc. Selecting the currently-active project clears the chip.
-    """
-
-    CSS = """
-    _InboxProjectPickerModal {
-        align: center middle;
-        background: rgba(0, 0, 0, 0.45);
-    }
-    #ipp-dialog {
-        width: 48;
-        max-width: 90%;
-        height: auto;
-        max-height: 18;
-        padding: 1 1 0 1;
-        background: #141a20;
-        border: round #2a3340;
-    }
-    #ipp-title {
-        height: 1;
-        padding: 0 1;
-        color: #97a6b2;
-    }
-    #ipp-list {
-        height: auto;
-        max-height: 14;
-        background: #141a20;
-        border: none;
-        margin-top: 1;
-        padding: 0;
-    }
-    #ipp-list > .ipp-row {
-        height: 1;
-        padding: 0 1;
-        color: #d6dee5;
-        background: transparent;
-    }
-    #ipp-list > .ipp-row.-highlight {
-        background: #1e2730;
-    }
-    #ipp-hint {
-        height: 1;
-        padding: 0 1;
-        color: #3e4c5a;
-    }
-    """
-
-    BINDINGS = [
-        Binding("escape", "cancel", "Close"),
-        Binding("down,j", "cursor_down", "Down", show=False),
-        Binding("up,k", "cursor_up", "Up", show=False),
-        Binding("enter", "select", "Pick", show=False),
-    ]
-
-    def __init__(self, keys: list[str], current: str | None) -> None:
-        super().__init__()
-        self._keys = list(keys)
-        self._current = current
-        self.list_view = ListView(id="ipp-list")
-        self.title_bar = Static(
-            "[b]Filter by project[/b]", id="ipp-title", markup=True,
-        )
-        self.hint = Static(
-            "[dim]\u21b5 select  \u00b7  esc cancel  \u00b7  pick the active "
-            "project to clear[/dim]",
-            id="ipp-hint", markup=True,
-        )
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="ipp-dialog"):
-            yield self.title_bar
-            yield self.list_view
-            yield self.hint
-
-    def on_mount(self) -> None:
-        for key in self._keys:
-            label = key
-            if key == self._current:
-                label = f"\u25cf {key}"
-            self.list_view.append(
-                ListItem(Static(label, markup=False), classes="ipp-row")
-            )
-        self.list_view.index = 0
-        self.list_view.focus()
-
-    def action_cursor_down(self) -> None:
-        self.list_view.action_cursor_down()
-
-    def action_cursor_up(self) -> None:
-        self.list_view.action_cursor_up()
-
-    def action_select(self) -> None:
-        idx = self.list_view.index or 0
-        if 0 <= idx < len(self._keys):
-            picked = self._keys[idx]
-            # Picking the current chip again is a "clear" gesture.
-            if picked == self._current:
-                self.dismiss("")
-            else:
-                self.dismiss(picked)
-        else:
-            self.dismiss(None)
-
-    def action_cancel(self) -> None:
-        self.dismiss(None)
-
-    @on(ListView.Selected, "#ipp-list")
-    def _on_row_selected(self, _event: ListView.Selected) -> None:
-        self.action_select()
-
-
 def _project_pm_persona(config: object, project_key: str, project: object) -> str | None:
     sessions = getattr(config, "sessions", {}) or {}
     session_role: object | None = None
@@ -8281,6 +8339,13 @@ class PollyInboxApp(App[None]):
     # the instance attribute to a near-zero value to drive the commit
     # synchronously without sleeping for the full window.
     _approve_undo_window_seconds: float = 10.0
+    # #1485 follow-up to #1447/#1451 — inbox ``d`` (jump-to-PM) re-entry
+    # window. Mirrors :class:`PollyProjectDashboardApp`'s constant so the
+    # same (cockpit_key, context_line) dedupe behavior covers both surfaces:
+    # the dashboard ``c`` keybind AND the inbox ``d`` keybind. Repeated
+    # presses within this window route the cockpit back to the PM pane
+    # but skip the ``send-keys`` injection so chat history stays clean.
+    _PM_CONTEXT_REATTACH_WINDOW_SECONDS: float = 300.0
     # Show the first ``ROLLUP_DEFAULT_VISIBLE`` items of a rollup, collapse
     # the rest behind an expand keybind so a 40-item digest doesn't flood
     # the detail pane.
@@ -8405,6 +8470,13 @@ class PollyInboxApp(App[None]):
         self._pending_plan_approval_timer = None
         self._pending_plan_approval_sparkle_timer = None
         self._pending_plan_approval_countdown_timer = None
+        # #1485 (follow-up to #1447/#1451) — most-recent ``d`` dispatch
+        # (cockpit_key, context_line, monotonic_sent_at). Used by
+        # :meth:`_should_reattach_pm_context` to skip re-injecting the
+        # same context line into Polly's chat when the user bounces back
+        # to the inbox and presses ``d`` again within the re-attach
+        # window. Mirrors the dashboard-side state added by #1451.
+        self._last_pm_context_dispatch: tuple[str, str, float] | None = None
 
     def compose(self) -> ComposeResult:
         yield self.filter_bar
@@ -8437,7 +8509,17 @@ class PollyInboxApp(App[None]):
             self.filter_bar.display = False
             self.filter_chips.display = False
         self._set_filter_bridge_active(False)
-        self._refresh_list(select_first=True)
+        # #1594 — initial inbox load opens 12+ per-project sqlite DBs
+        # synchronously, blocking the Textual main thread for ~10s and
+        # leaving the rail user staring at a blank pane. Mirror the
+        # operator/project dashboard pattern: paint a "Loading…"
+        # skeleton immediately, then run ``_load_inbox`` on a worker
+        # thread and swap in the real list when it lands. Scope is
+        # the cold-boot path only; steady-state ``_background_refresh``
+        # still runs on the UI thread (#1587 territory).
+        self._initial_load_running = False
+        self._render_loading_skeleton()
+        self._schedule_initial_load()
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._background_refresh)
         self.list_view.focus()
         # Alert toast surface removed in #956 — alerts still appear in
@@ -8820,6 +8902,118 @@ class PollyInboxApp(App[None]):
             bits.append(f"filters: {desc}")
         self.status.update(" \u00b7 ".join(bits))
 
+    # ------------------------------------------------------------------
+    # Initial load (#1594) — off-thread cold-boot so the pane paints in
+    # <1s instead of blocking on 12+ per-project sqlite opens.
+    # ------------------------------------------------------------------
+
+    def _render_loading_skeleton(self) -> None:
+        """Paint a 'Loading…' placeholder until the worker hands back data.
+
+        Mirrors the operator dashboard's ``Loading operator dashboard…``
+        treatment. Stays minimal: a single disabled list row + a status
+        line, so the swap-in is a clean replacement rather than a layout
+        shift. The detail pane intentionally stays empty until selection
+        lands; populating it here would just flash.
+        """
+        try:
+            self.list_view.clear()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.list_view.append(
+                ListItem(
+                    Static("Loading inbox…", classes="inbox-empty"),
+                    disabled=True,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.detail.update("[dim]Loading inbox…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.status.update("[dim]Loading inbox…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _schedule_initial_load(self) -> None:
+        """Kick the cold-boot inbox gather onto a worker thread."""
+        if getattr(self, "_initial_load_running", False):
+            return
+        self._initial_load_running = True
+        try:
+            self.run_worker(
+                self._initial_load_sync,
+                thread=True,
+                exclusive=True,
+                group="inbox_initial_load",
+            )
+        except Exception:  # noqa: BLE001
+            # Worker dispatch failed (unlikely outside teardown); fall
+            # back to the synchronous path so the pane still loads.
+            self._initial_load_running = False
+            try:
+                self._refresh_list(select_first=True)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _initial_load_sync(self) -> None:
+        """Off-thread gather; hands results back to the UI thread."""
+        try:
+            tasks, unread, replies_by_task = self._load_inbox()
+        except Exception as exc:  # noqa: BLE001
+            self.call_from_thread(self._initial_load_failed, str(exc))
+            return
+        self.call_from_thread(
+            self._initial_load_completed, tasks, unread, replies_by_task,
+        )
+
+    def _initial_load_completed(
+        self,
+        tasks: list,
+        unread: set,
+        replies_by_task: dict,
+    ) -> None:
+        self._initial_load_running = False
+        self._tasks = tasks
+        self._unread_ids = unread
+        self._replies_by_task = replies_by_task
+        active_thread_ids = {
+            task.task_id for task in tasks if replies_by_task.get(task.task_id)
+        }
+        self._thread_expanded_task_ids.intersection_update(active_thread_ids)
+        # Prime the signature cache so the next ``_background_refresh``
+        # tick can short-circuit on unchanged state (#752).
+        self._last_inbox_signature = self._inbox_content_signature(
+            tasks, unread, replies_by_task,
+        )
+        try:
+            self._render_list(select_first=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _initial_load_failed(self, error: str) -> None:
+        self._initial_load_running = False
+        try:
+            self.list_view.clear()
+            self.list_view.append(
+                ListItem(
+                    Static(
+                        f"Error loading inbox: {error}",
+                        classes="inbox-empty",
+                    ),
+                    disabled=True,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.status.update(f"[#ff5f6d]Error: {_escape(error)}[/#ff5f6d]")
+        except Exception:  # noqa: BLE001
+            pass
+
     def _background_refresh(self) -> None:
         """Periodic re-read; don't stomp the current cursor position.
 
@@ -8832,6 +9026,11 @@ class PollyInboxApp(App[None]):
         would care about: task state, replies, unread set, filter
         state, filter chips.
         """
+        # #1594 — skip when the cold-boot worker hasn't finished yet,
+        # so we don't race its ``call_from_thread`` completion with a
+        # parallel sync gather and double-render the list.
+        if getattr(self, "_initial_load_running", False):
+            return
         try:
             tasks, unread, replies_by_task = self._load_inbox()
         except Exception:  # noqa: BLE001
@@ -10504,14 +10703,31 @@ class PollyInboxApp(App[None]):
         plan_review_discussion_item=None,
         plan_review_discussion_task_id: str | None = None,
     ) -> None:
-        """Worker-thread body: route cockpit + inject the context line."""
+        """Worker-thread body: route cockpit + inject the context line.
+
+        #1485 (follow-up to #1447/#1451): if the same
+        ``(cockpit_key, context_line)`` was dispatched within
+        :attr:`_PM_CONTEXT_REATTACH_WINDOW_SECONDS`, route the cockpit
+        right pane back to the PM but skip the ``send-keys`` injection
+        so Polly's chat history doesn't fill with duplicate context
+        lines on every inbox bounce-back. Mirrors the dashboard-side
+        dedupe added by #1451 for the ``c`` keybind.
+        """
+        now = self._pm_dispatch_now()
+        reattach = self._should_reattach_pm_context(
+            cockpit_key, context_line, now,
+        )
         try:
-            self._perform_pm_dispatch(cockpit_key, context_line)
+            if reattach:
+                self._route_pm_target(cockpit_key)
+            else:
+                self._perform_pm_dispatch(cockpit_key, context_line)
         except Exception as exc:  # noqa: BLE001
             self.call_from_thread(
                 self.notify, f"Jump to PM failed: {exc}", severity="error",
             )
             return
+        self._remember_pm_context_dispatch(cockpit_key, context_line, now)
         if (
             plan_review_discussion_task_id
             and self._record_plan_review_discussion_marker(
@@ -10537,6 +10753,17 @@ class PollyInboxApp(App[None]):
         # pane has focus) advertising the route home, and extend the
         # Textual toast for users glancing at the rail.
         self._surface_back_to_inbox_hint()
+        if reattach:
+            self.call_from_thread(
+                self.notify,
+                (
+                    f"Re-attached to {pm_label} \u2014 chat already has your "
+                    f"context. Ctrl-b \u2190 then I returns to inbox."
+                ),
+                severity="information",
+                timeout=5.0,
+            )
+            return
         self.call_from_thread(
             self.notify,
             (
@@ -10545,6 +10772,39 @@ class PollyInboxApp(App[None]):
             ),
             severity="information",
             timeout=5.0,
+        )
+
+    def _pm_dispatch_now(self) -> float:
+        """Monotonic clock for the inbox re-attach window (#1485).
+
+        Split out so tests can monkeypatch the clock and drive the
+        window deterministically without sleeping.
+        """
+        return time.monotonic()
+
+    def _should_reattach_pm_context(
+        self, cockpit_key: str, context_line: str, now: float,
+    ) -> bool:
+        """True iff the same ``(cockpit_key, context_line)`` is in-window."""
+        last = self._last_pm_context_dispatch
+        if last is None:
+            return False
+        last_cockpit_key, last_context_line, last_sent_at = last
+        if (last_cockpit_key, last_context_line) != (
+            cockpit_key, context_line,
+        ):
+            return False
+        return (
+            now - last_sent_at
+            <= self._PM_CONTEXT_REATTACH_WINDOW_SECONDS
+        )
+
+    def _remember_pm_context_dispatch(
+        self, cockpit_key: str, context_line: str, sent_at: float,
+    ) -> None:
+        """Stash the latest dispatch so the next press can dedupe (#1485)."""
+        self._last_pm_context_dispatch = (
+            cockpit_key, context_line, sent_at,
         )
 
     def _surface_back_to_inbox_hint(self) -> None:
@@ -10660,6 +10920,25 @@ class PollyInboxApp(App[None]):
         a real tmux server. See ``test_cockpit_inbox_ui.py`` for the
         monkeypatch target.
         """
+        router, window_target, right_pane = self._route_pm_target(cockpit_key)
+        if right_pane is None:
+            # Fall back to the window target — tmux resolves to the
+            # active pane, which is almost always the right pane for
+            # cockpit flows post-route.
+            router.tmux.send_keys(window_target, context_line, press_enter=False)
+            return
+        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+
+    def _route_pm_target(
+        self, cockpit_key: str,
+    ) -> tuple[CockpitRouter, str, str | None]:
+        """Route the cockpit right pane without injecting chat context.
+
+        #1485 split-out so the re-attach path in :meth:`_dispatch_to_pm_sync`
+        can reuse the routing (navigate the user back to the PM pane)
+        without re-sending the same context line via ``send-keys``.
+        Mirrors :meth:`PollyProjectDashboardApp._route_pm_target`.
+        """
         from pollypm.dev_network_simulation import raise_if_network_dead
 
         raise_if_network_dead(self.config_path, surface="Inbox discuss with PM")
@@ -10670,13 +10949,7 @@ class PollyInboxApp(App[None]):
             f"{supervisor.config.project.tmux_session}:{router._COCKPIT_WINDOW}"
         )
         right_pane = router._right_pane_id(window_target)
-        if right_pane is None:
-            # Fall back to the window target — tmux resolves to the
-            # active pane, which is almost always the right pane for
-            # cockpit flows post-route.
-            router.tmux.send_keys(window_target, context_line, press_enter=False)
-            return
-        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+        return router, window_target, right_pane
 
     @on(events.Click, ".rollup-item")
     def _on_rollup_item_click(self, event: events.Click) -> None:
@@ -11351,8 +11624,16 @@ class PollyInboxApp(App[None]):
         actor_name = pending["actor_name"]
         is_message_item = pending["is_message_item"]
         item = pending["item"]
+        logger.info(
+            "plan_review.commit start task_id=%s plan_task_id=%s actor=%s",
+            task_id, plan_task_id, actor_name,
+        )
         svc = self._resolve_inbox_svc(item, plan_task_id)
         if svc is None:
+            logger.warning(
+                "plan_review.commit could-not-open-db task_id=%s plan_task_id=%s",
+                task_id, plan_task_id,
+            )
             self.notify(
                 "Could not open project database for plan task.",
                 severity="error",
@@ -11360,10 +11641,42 @@ class PollyInboxApp(App[None]):
             return
         first_shipped_created = False
         try:
-            svc.approve(plan_task_id, actor_name, None)
-            first_shipped_created = bool(
-                getattr(svc, "last_first_shipped_created", False)
-            )
+            # #1589 — backstop-emitted plan_review rows (work/plan_review_emit.py)
+            # reference a plan_task that is ALREADY at work_status=done.
+            # ``svc.approve`` requires REVIEW status and raises
+            # ``InvalidTransitionError`` otherwise — the celebration toast
+            # would fire while the row stayed in the inbox indefinitely.
+            # Detect the terminal case up-front and skip the approve call,
+            # but still archive the inbox row so the keystroke clears the
+            # action lens.
+            plan_task_terminal = False
+            try:
+                plan_task = svc.get(plan_task_id)
+                status = getattr(plan_task, "work_status", None)
+                status_value = getattr(status, "value", status)
+                plan_task_terminal = status_value in {"done", "cancelled"}
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "plan_review.commit pre-approve get(%s) failed",
+                    plan_task_id, exc_info=True,
+                )
+            if plan_task_terminal:
+                logger.info(
+                    "plan_review.commit plan_task already terminal "
+                    "task_id=%s plan_task_id=%s — skipping svc.approve, "
+                    "archiving inbox row only",
+                    task_id, plan_task_id,
+                )
+            else:
+                svc.approve(plan_task_id, actor_name, None)
+                logger.info(
+                    "plan_review.commit svc.approve succeeded "
+                    "task_id=%s plan_task_id=%s",
+                    task_id, plan_task_id,
+                )
+                first_shipped_created = bool(
+                    getattr(svc, "last_first_shipped_created", False)
+                )
             if is_message_item:
                 try:
                     svc.add_context(
@@ -11373,8 +11686,16 @@ class PollyInboxApp(App[None]):
                         entry_type="plan_review_approved",
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug(
+                        "plan_review.commit add_context on plan_task failed",
+                        exc_info=True,
+                    )
         except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "plan_review.commit svc.approve failed task_id=%s "
+                "plan_task_id=%s exc=%r",
+                task_id, plan_task_id, exc, exc_info=True,
+            )
             self.notify(f"Approve failed: {exc}", severity="error")
             return
         finally:
@@ -11406,13 +11727,26 @@ class PollyInboxApp(App[None]):
                         entry_type="plan_review_approved",
                     )
                     svc.archive_task(task_id, actor=actor_name)
+                    logger.info(
+                        "plan_review.commit archived inbox row task_id=%s",
+                        task_id,
+                    )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "plan_review.commit archive_task failed task_id=%s",
+                        task_id, exc_info=True,
+                    )
                 finally:
                     try:
                         svc.close()
                     except Exception:  # noqa: BLE001
                         pass
+            else:
+                logger.warning(
+                    "plan_review.commit could-not-open-inbox-svc to archive "
+                    "task_id=%s",
+                    task_id,
+                )
         self._emit_event(
             task_id, "inbox.plan_review.approved",
             f"{actor_name} approved plan {plan_task_id} via {task_id}",
@@ -12485,6 +12819,161 @@ def _dashboard_steps_from_body(body: str) -> list[str]:
     return deduped[:4]
 
 
+def _dashboard_user_prompt_decision(
+    prompt: object, *, fallback_task_id: str | None = None,
+) -> dict[str, object] | None:
+    """Build a decision dict from a structured ``user_prompt`` payload.
+
+    Returns ``None`` if ``prompt`` is not a dict. Extracted from
+    ``_dashboard_inbox`` so each branch can be exercised directly in
+    tests (issue #1356).
+    """
+    if not isinstance(prompt, dict):
+        return None
+    summary = _dashboard_plain_text(prompt.get("summary"))
+    question = _dashboard_plain_text(prompt.get("question"))
+    raw_steps = prompt.get("steps") or prompt.get("required_actions") or []
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+    steps = [
+        _dashboard_plain_text(step).rstrip(".") + "."
+        for step in raw_steps
+        if _dashboard_plain_text(step)
+    ][:5]
+    raw_actions = prompt.get("actions") or []
+    if not isinstance(raw_actions, list):
+        raw_actions = []
+    actions: list[dict[str, object]] = []
+    for raw_action in raw_actions[:2]:
+        if not isinstance(raw_action, dict):
+            continue
+        label = _dashboard_plain_text(raw_action.get("label"))
+        # ``kind`` is a structured dispatch identifier — values like
+        # ``approve_task``, ``review_plan``, ``open_inbox``. We MUST
+        # NOT route it through ``_dashboard_plain_text`` because that
+        # strips the underscores out of markdown-decoration tokens,
+        # leaving ``approvetask`` / ``reviewplan`` etc., which then
+        # fail to match every branch in ``_perform_dashboard_action``.
+        # That was the silent root cause of "buttons record replies
+        # but don't drive the underlying task transition" — every
+        # custom action fell through to the generic record path.
+        kind = str(raw_action.get("kind") or "").strip()
+        if not label or not kind:
+            continue
+        action = dict(raw_action)
+        action["label"] = label
+        action["kind"] = kind
+        actions.append(action)
+    if not actions:
+        actions = [
+            {
+                "label": "Open task",
+                "kind": "open_task",
+                "task_id": fallback_task_id,
+            }
+        ]
+    primary_action = actions[0]
+    secondary_action = actions[1] if len(actions) > 1 else {
+        "label": "Open task",
+        "kind": "open_task",
+        "task_id": fallback_task_id,
+    }
+    return {
+        "plain_prompt": summary or "Polly needs your input before this project can continue.",
+        "unblock_steps": steps,
+        "steps_heading": _dashboard_plain_text(prompt.get("steps_heading")) or "What to do",
+        "decision_question": question or "Choose how Polly should proceed.",
+        "primary_label": str(primary_action.get("label") or "Open task"),
+        "secondary_label": str(secondary_action.get("label") or "Open task"),
+        "primary_action": primary_action,
+        "secondary_action": secondary_action,
+        "other_placeholder": _dashboard_plain_text(prompt.get("other_placeholder"))
+        or "Tell Polly what to do instead...",
+    }
+
+
+def _dashboard_deployment_decision(
+    body: str, steps: list[str],
+) -> dict[str, object]:
+    """Build a "deployment required" decision dict from a blocker body.
+
+    Extracted from ``_dashboard_inbox`` so the token-driven branch
+    table can be tested in isolation (issue #1356).
+    """
+    lower = body.lower()
+    setup_steps: list[str] = []
+    if any(token in lower for token in ("fly.io", "fly ", "live fly")):
+        setup_steps.append("Set up the Fly.io app for this project.")
+    if any(token in lower for token in ("deploy token", "org cred", "credential", "creds", "fly-enabled", "access")):
+        setup_steps.append(
+            "Give Polly deployment access, including the Fly.io org/app credentials or deploy token."
+        )
+    if any(token in lower for token in ("postgres", "redis", "database")):
+        setup_steps.append("Provision the required Postgres and Redis services.")
+    if any(token in lower for token in ("pipeline", "fly deploy", "deploy can run", "live environment")):
+        setup_steps.append("Confirm the deployment pipeline can run against the live environment.")
+    if any(token in lower for token in ("rollback", "smoke", "/v1/ping", "walkthrough", "clean laptop")):
+        setup_steps.append("Make the live app reachable so Polly can run the smoke test and rollback walkthrough.")
+    for step in steps:
+        clean = _dashboard_plain_text(step).rstrip(".")
+        if not clean:
+            continue
+        if not clean.lower().startswith(
+            (
+                "add ",
+                "create ",
+                "grant ",
+                "provision ",
+                "set up ",
+                "setup ",
+                "provide ",
+                "enable ",
+                "configure ",
+            )
+        ):
+            continue
+        normalized = clean.casefold()
+        if any(normalized == existing.rstrip(".").casefold() for existing in setup_steps):
+            continue
+        setup_steps.append(clean + ".")
+    deduped_steps: list[str] = []
+    seen: set[str] = set()
+    for step in setup_steps:
+        key = step.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_steps.append(step)
+    if not deduped_steps:
+        deduped_steps = [
+            "Set up the deployment environment Polly needs for end-to-end testing."
+        ]
+    return {
+        "plain_prompt": (
+            "The first batch of code is done, but Polly cannot fully test it "
+            "until the deployment environment exists."
+        ),
+        "unblock_steps": deduped_steps[:5],
+        "steps_heading": "What you need to set up",
+        "decision_question": (
+            "Do you want to approve the code work now and make deployment "
+            "testing a follow-up, or wait until the environment is set?"
+        ),
+        "primary_label": "Approve it anyway",
+        "secondary_label": "Wait until environment is set",
+        "primary_response": (
+            "Approve it anyway. Treat the code work as accepted now and create "
+            "a follow-up task for deployment, smoke testing, and rollback once "
+            "the environment is ready."
+        ),
+        "secondary_response": (
+            "Wait until the environment is set. Do not approve this work until "
+            "Polly can deploy and test it end to end."
+        ),
+        "other_placeholder": "Tell Polly what to do instead...",
+    }
+
+
 def _dashboard_task_blocker_body(task: object) -> str:
     """Pick the clearest human-facing blocker text from a task."""
     body, _ = _dashboard_task_blocker_body_with_kind(task)
@@ -13454,71 +13943,7 @@ def _dashboard_inbox(
             return _trim(f"Next: {steps[0]}", limit=260)
         return ""
 
-    def _user_prompt_decision(
-        prompt: object, *, fallback_task_id: str | None = None,
-    ) -> dict[str, object] | None:
-        if not isinstance(prompt, dict):
-            return None
-        summary = _plain_text(prompt.get("summary"))
-        question = _plain_text(prompt.get("question"))
-        raw_steps = prompt.get("steps") or prompt.get("required_actions") or []
-        if not isinstance(raw_steps, list):
-            raw_steps = []
-        steps = [
-            _plain_text(step).rstrip(".") + "."
-            for step in raw_steps
-            if _plain_text(step)
-        ][:5]
-        raw_actions = prompt.get("actions") or []
-        if not isinstance(raw_actions, list):
-            raw_actions = []
-        actions: list[dict[str, object]] = []
-        for raw_action in raw_actions[:2]:
-            if not isinstance(raw_action, dict):
-                continue
-            label = _plain_text(raw_action.get("label"))
-            # ``kind`` is a structured dispatch identifier — values like
-            # ``approve_task``, ``review_plan``, ``open_inbox``. We MUST
-            # NOT route it through ``_plain_text`` because that strips
-            # the underscores out of markdown-decoration tokens, leaving
-            # ``approvetask`` / ``reviewplan`` etc., which then fail to
-            # match every branch in ``_perform_dashboard_action``. That
-            # was the silent root cause of "buttons record replies but
-            # don't drive the underlying task transition" — every
-            # custom action fell through to the generic record path.
-            kind = str(raw_action.get("kind") or "").strip()
-            if not label or not kind:
-                continue
-            action = dict(raw_action)
-            action["label"] = label
-            action["kind"] = kind
-            actions.append(action)
-        if not actions:
-            actions = [
-                {
-                    "label": "Open task",
-                    "kind": "open_task",
-                    "task_id": fallback_task_id,
-                }
-            ]
-        primary_action = actions[0]
-        secondary_action = actions[1] if len(actions) > 1 else {
-            "label": "Open task",
-            "kind": "open_task",
-            "task_id": fallback_task_id,
-        }
-        return {
-            "plain_prompt": summary or "Polly needs your input before this project can continue.",
-            "unblock_steps": steps,
-            "steps_heading": _plain_text(prompt.get("steps_heading")) or "What to do",
-            "decision_question": question or "Choose how Polly should proceed.",
-            "primary_label": str(primary_action.get("label") or "Open task"),
-            "secondary_label": str(secondary_action.get("label") or "Open task"),
-            "primary_action": primary_action,
-            "secondary_action": secondary_action,
-            "other_placeholder": _plain_text(prompt.get("other_placeholder"))
-            or "Tell Polly what to do instead...",
-        }
+    _user_prompt_decision = _dashboard_user_prompt_decision
 
     def _plan_review_decision(
         labels: list[str], body: str, *, fallback_task_id: str | None = None,
@@ -13581,79 +14006,7 @@ def _dashboard_inbox(
             "plan_text": plan_text or "",
         }
 
-    def _deployment_decision(body: str, steps: list[str]) -> dict[str, object]:
-        lower = body.lower()
-        setup_steps: list[str] = []
-        if any(token in lower for token in ("fly.io", "fly ", "live fly")):
-            setup_steps.append("Set up the Fly.io app for this project.")
-        if any(token in lower for token in ("deploy token", "org cred", "credential", "creds", "fly-enabled", "access")):
-            setup_steps.append(
-                "Give Polly deployment access, including the Fly.io org/app credentials or deploy token."
-            )
-        if any(token in lower for token in ("postgres", "redis", "database")):
-            setup_steps.append("Provision the required Postgres and Redis services.")
-        if any(token in lower for token in ("pipeline", "fly deploy", "deploy can run", "live environment")):
-            setup_steps.append("Confirm the deployment pipeline can run against the live environment.")
-        if any(token in lower for token in ("rollback", "smoke", "/v1/ping", "walkthrough", "clean laptop")):
-            setup_steps.append("Make the live app reachable so Polly can run the smoke test and rollback walkthrough.")
-        for step in steps:
-            clean = _plain_text(step).rstrip(".")
-            if not clean:
-                continue
-            if not clean.lower().startswith(
-                (
-                    "add ",
-                    "create ",
-                    "grant ",
-                    "provision ",
-                    "set up ",
-                    "setup ",
-                    "provide ",
-                    "enable ",
-                    "configure ",
-                )
-            ):
-                continue
-            normalized = clean.casefold()
-            if any(normalized == existing.rstrip(".").casefold() for existing in setup_steps):
-                continue
-            setup_steps.append(clean + ".")
-        deduped_steps: list[str] = []
-        seen: set[str] = set()
-        for step in setup_steps:
-            key = step.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped_steps.append(step)
-        if not deduped_steps:
-            deduped_steps = [
-                "Set up the deployment environment Polly needs for end-to-end testing."
-            ]
-        return {
-            "plain_prompt": (
-                "The first batch of code is done, but Polly cannot fully test it "
-                "until the deployment environment exists."
-            ),
-            "unblock_steps": deduped_steps[:5],
-            "steps_heading": "What you need to set up",
-            "decision_question": (
-                "Do you want to approve the code work now and make deployment "
-                "testing a follow-up, or wait until the environment is set?"
-            ),
-            "primary_label": "Approve it anyway",
-            "secondary_label": "Wait until environment is set",
-            "primary_response": (
-                "Approve it anyway. Treat the code work as accepted now and create "
-                "a follow-up task for deployment, smoke testing, and rollback once "
-                "the environment is ready."
-            ),
-            "secondary_response": (
-                "Wait until the environment is set. Do not approve this work until "
-                "Polly can deploy and test it end to end."
-            ),
-            "other_placeholder": "Tell Polly what to do instead...",
-        }
+    _deployment_decision = _dashboard_deployment_decision
 
     def _plain_decision_from_body(
         subject: str, body: str, steps: list[str],
@@ -15258,14 +15611,14 @@ class PollyProjectDashboardApp(App[None]):
     _PM_CONTEXT_REATTACH_WINDOW_SECONDS = 300.0
     # #1539 \u2014 skeleton placeholder bars rendered into each panel body
     # during the cold-fetch window so the panels read as "loading"
-    # rather than "loaded with nothing in them". An italic "loading\u2026"
-    # hint plus two dim block-glyph bars per panel reads as
-    # intentionally placeholdered without flashing. Replaced wholesale
-    # by ``_render`` the moment the worker thread hands data back;
-    # layout stays stable across the swap so content doesn't pop into
-    # place.
+    # rather than "loaded with nothing in them". An italic
+    # ``loading project dashboard\u2026`` hint plus two dim block-glyph bars
+    # per panel read as intentionally placeholdered without flashing.
+    # Replaced wholesale by ``_render`` the moment the worker thread
+    # hands data back; layout stays stable across the swap so content
+    # doesn't pop into place.
     #
-    # #1539 v2 \u2014 the original ``#1e2730`` bar color was almost
+    # #1539 v2 \u2014 the original ``#1e2730`` bar color was nearly
     # indistinguishable from the panel background ``#111820``, so the
     # bars rendered invisible and the panels still read as "loaded but
     # empty" for the full 8\u201312s cold-fetch window. Bumped the bar
@@ -16461,6 +16814,29 @@ class PollyProjectDashboardApp(App[None]):
             sess_raw = w.get("session_name") or ""
             role_raw = w.get("role") or "worker"
             activity = str(w.get("activity") or "working")
+            in_flight = data.task_buckets.get("in_progress", [])
+            # #1541 \u2014 when the project is calm (idle worker, no in-flight
+            # task, no action card), prefer the configured PM persona
+            # over the raw role / session key. The topbar already names
+            # the PM (``PM: Archie``); the Current activity panel must
+            # not re-introduce ``architect`` or ``architect_bikepath``
+            # one line below. Other activity branches (working /
+            # awaiting_user / in-flight task surfaced) keep the
+            # role-based identity so the operator still sees which
+            # session is doing the work.
+            pm_persona = (
+                getattr(data, "pm_persona", None)
+                or getattr(data, "persona_name", None)
+                or ""
+            )
+            pm_persona = pm_persona.strip() if isinstance(pm_persona, str) else ""
+            calm_state = (
+                activity == "idle"
+                and not in_flight
+                and not data.action_items
+            )
+            if calm_state and pm_persona:
+                identity_markup = f"[b]{_escape(pm_persona)}[/b]"
             # Collapse "<role>_<project_key>" sessions on their own
             # project's dashboard down to just the role \u2014 both the
             # role name and the project context are already implicit
@@ -16468,7 +16844,7 @@ class PollyProjectDashboardApp(App[None]):
             # ``architect_polly_remote  architect`` repeats info the
             # operator already has. Leave any session_name with extra
             # information (task-N, workerN, ad-hoc names) unchanged.
-            if sess_raw in {role_raw, f"{role_raw}_{self.project_key}"}:
+            elif sess_raw in {role_raw, f"{role_raw}_{self.project_key}"}:
                 identity_markup = f"[b]{_escape(role_raw)}[/b]"
             else:
                 identity_markup = (
@@ -16496,7 +16872,6 @@ class PollyProjectDashboardApp(App[None]):
                 f"{dot_markup} {identity_markup}{age_part}{state_tail}",
             ]
             # Surface the top-most in-flight task as context.
-            in_flight = data.task_buckets.get("in_progress", [])
             if in_flight:
                 t = in_flight[0]
                 num = t.get("task_number")
@@ -16546,11 +16921,25 @@ class PollyProjectDashboardApp(App[None]):
                 # \u2026 standing by." The dashboard had no way to show
                 # this, so it implied work was happening. Spell out
                 # the actual state instead.
-                lines.append(
-                    "  [dim]No task in flight. The session is alive "
-                    "but not progressing work \u2014 it will pick up the "
-                    "next queued task or wait for instructions.[/dim]"
-                )
+                #
+                # #1541 \u2014 drop the syslog-style "The session is alive
+                # but not progressing work" phrasing in favour of a
+                # warmer, PM-named note that invites a next step.
+                # The topbar already names the PM; this line echoes
+                # the same identity so the operator sees one voice,
+                # not "Archie" up top and "the session" below.
+                if pm_persona:
+                    lines.append(
+                        f"  [dim]{_escape(pm_persona)} is ready when "
+                        "you want to pick something up \u2014 press [b]c[/b] "
+                        "to chat or [b]p[/b] to plan.[/dim]"
+                    )
+                else:
+                    lines.append(
+                        "  [dim]Ready when you want to pick something "
+                        "up \u2014 press [b]c[/b] to chat or [b]p[/b] to "
+                        "plan.[/dim]"
+                    )
             elif activity == "awaiting_user":
                 lines.append(
                     "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
@@ -16882,6 +17271,25 @@ class PollyProjectDashboardApp(App[None]):
                     "with [b]\\[planner].enforce_plan = false[/b].\n"
                     "Workers can pick up tasks directly without a plan "
                     "ceremony.[/dim]"
+                )
+            # #1540 — name the effective PM in the empty-state copy so
+            # the Plan card matches the banner's warm "Press c to plan
+            # this with <PM>" framing. Falls back to "the PM" when no
+            # persona is configured (matches ``_alert_banner_copy``'s
+            # fallback). The effective PM mirrors the banner/topbar
+            # lookup: ``pm_persona`` (architect session routing) wins
+            # over the raw project ``persona_name``.
+            pm_persona = (
+                getattr(data, "pm_persona", None)
+                or getattr(data, "persona_name", None)
+            )
+            pm_label = (pm_persona or "").strip() if pm_persona else ""
+            if pm_label:
+                return (
+                    f"[dim]No plan yet — {_escape(pm_label)} will draft "
+                    f"one when this project picks up work.\n"
+                    f"Press [b]c[/b] in this pane to chat with "
+                    f"{_escape(pm_label)} and ask for a plan now.[/dim]"
                 )
             return (
                 "[dim]No plan yet — the PM will draft one when this "

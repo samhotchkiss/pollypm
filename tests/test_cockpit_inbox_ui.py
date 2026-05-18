@@ -2051,6 +2051,68 @@ def test_d_key_dispatches_to_pm_with_context_line(inbox_env, inbox_app) -> None:
     _run(body())
 
 
+def test_d_inbox_dispatch_reattaches_recent_duplicate_context(
+    inbox_app, monkeypatch,
+) -> None:
+    """Repeated inbox ``d`` for same (key,context) skips the re-injection.
+
+    Regression test for #1485 — follow-up to #1447/#1451 covering the
+    inbox path. The dashboard ``c`` keybind already dedupes via #1451;
+    the inbox ``d`` keybind hits the same Polly chat session so the
+    same chat-history-pollution applies. Within
+    ``_PM_CONTEXT_REATTACH_WINDOW_SECONDS`` the cockpit should route
+    back to the PM pane but skip ``_perform_pm_dispatch`` so the
+    context line isn't re-injected.
+    """
+    sent: list[tuple[str, str]] = []
+    routed: list[str] = []
+    notices: list[str] = []
+    now = 100.0
+
+    def fake_dispatch(cockpit_key: str, context_line: str) -> None:
+        sent.append((cockpit_key, context_line))
+
+    def fake_route(cockpit_key: str):
+        routed.append(cockpit_key)
+        return (None, "", None)
+
+    def fake_call_from_thread(fn, *args, **kwargs):
+        fn(*args, **kwargs)
+
+    monkeypatch.setattr(inbox_app, "_perform_pm_dispatch", fake_dispatch)
+    monkeypatch.setattr(inbox_app, "_route_pm_target", fake_route)
+    monkeypatch.setattr(inbox_app, "_pm_dispatch_now", lambda: now)
+    monkeypatch.setattr(inbox_app, "call_from_thread", fake_call_from_thread)
+    monkeypatch.setattr(
+        inbox_app, "_surface_back_to_inbox_hint", lambda: None,
+    )
+    monkeypatch.setattr(
+        inbox_app,
+        "notify",
+        lambda message, **_kw: notices.append(message),
+    )
+
+    cockpit_key = "project:demo:session"
+    context_line = 're: inbox/abc "stub"'
+
+    # First press — sends the context line, records the dispatch.
+    inbox_app._dispatch_to_pm_sync(cockpit_key, context_line, "Project PM")
+    # Second press shortly after — within the window, same key/context:
+    # cockpit re-routes but no new send-keys.
+    now += 30.0
+    inbox_app._dispatch_to_pm_sync(cockpit_key, context_line, "Project PM")
+    # Third press well outside the window — sends again.
+    now += inbox_app._PM_CONTEXT_REATTACH_WINDOW_SECONDS + 1.0
+    inbox_app._dispatch_to_pm_sync(cockpit_key, context_line, "Project PM")
+
+    assert sent == [
+        (cockpit_key, context_line),
+        (cockpit_key, context_line),
+    ]
+    assert routed == [cockpit_key]
+    assert any("Re-attached to" in note for note in notices)
+
+
 def test_d_key_with_persona_routes_to_project_session(tmp_path: Path) -> None:
     """Persona projects dispatch to ``project:<key>:session`` + show PM name."""
     async def body() -> None:

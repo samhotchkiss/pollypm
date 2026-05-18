@@ -8281,6 +8281,13 @@ class PollyInboxApp(App[None]):
     # the instance attribute to a near-zero value to drive the commit
     # synchronously without sleeping for the full window.
     _approve_undo_window_seconds: float = 10.0
+    # #1485 follow-up to #1447/#1451 — inbox ``d`` (jump-to-PM) re-entry
+    # window. Mirrors :class:`PollyProjectDashboardApp`'s constant so the
+    # same (cockpit_key, context_line) dedupe behavior covers both surfaces:
+    # the dashboard ``c`` keybind AND the inbox ``d`` keybind. Repeated
+    # presses within this window route the cockpit back to the PM pane
+    # but skip the ``send-keys`` injection so chat history stays clean.
+    _PM_CONTEXT_REATTACH_WINDOW_SECONDS: float = 300.0
     # Show the first ``ROLLUP_DEFAULT_VISIBLE`` items of a rollup, collapse
     # the rest behind an expand keybind so a 40-item digest doesn't flood
     # the detail pane.
@@ -8405,6 +8412,13 @@ class PollyInboxApp(App[None]):
         self._pending_plan_approval_timer = None
         self._pending_plan_approval_sparkle_timer = None
         self._pending_plan_approval_countdown_timer = None
+        # #1485 (follow-up to #1447/#1451) — most-recent ``d`` dispatch
+        # (cockpit_key, context_line, monotonic_sent_at). Used by
+        # :meth:`_should_reattach_pm_context` to skip re-injecting the
+        # same context line into Polly's chat when the user bounces back
+        # to the inbox and presses ``d`` again within the re-attach
+        # window. Mirrors the dashboard-side state added by #1451.
+        self._last_pm_context_dispatch: tuple[str, str, float] | None = None
 
     def compose(self) -> ComposeResult:
         yield self.filter_bar
@@ -10504,14 +10518,31 @@ class PollyInboxApp(App[None]):
         plan_review_discussion_item=None,
         plan_review_discussion_task_id: str | None = None,
     ) -> None:
-        """Worker-thread body: route cockpit + inject the context line."""
+        """Worker-thread body: route cockpit + inject the context line.
+
+        #1485 (follow-up to #1447/#1451): if the same
+        ``(cockpit_key, context_line)`` was dispatched within
+        :attr:`_PM_CONTEXT_REATTACH_WINDOW_SECONDS`, route the cockpit
+        right pane back to the PM but skip the ``send-keys`` injection
+        so Polly's chat history doesn't fill with duplicate context
+        lines on every inbox bounce-back. Mirrors the dashboard-side
+        dedupe added by #1451 for the ``c`` keybind.
+        """
+        now = self._pm_dispatch_now()
+        reattach = self._should_reattach_pm_context(
+            cockpit_key, context_line, now,
+        )
         try:
-            self._perform_pm_dispatch(cockpit_key, context_line)
+            if reattach:
+                self._route_pm_target(cockpit_key)
+            else:
+                self._perform_pm_dispatch(cockpit_key, context_line)
         except Exception as exc:  # noqa: BLE001
             self.call_from_thread(
                 self.notify, f"Jump to PM failed: {exc}", severity="error",
             )
             return
+        self._remember_pm_context_dispatch(cockpit_key, context_line, now)
         if (
             plan_review_discussion_task_id
             and self._record_plan_review_discussion_marker(
@@ -10537,6 +10568,17 @@ class PollyInboxApp(App[None]):
         # pane has focus) advertising the route home, and extend the
         # Textual toast for users glancing at the rail.
         self._surface_back_to_inbox_hint()
+        if reattach:
+            self.call_from_thread(
+                self.notify,
+                (
+                    f"Re-attached to {pm_label} \u2014 chat already has your "
+                    f"context. Ctrl-b \u2190 then I returns to inbox."
+                ),
+                severity="information",
+                timeout=5.0,
+            )
+            return
         self.call_from_thread(
             self.notify,
             (
@@ -10545,6 +10587,39 @@ class PollyInboxApp(App[None]):
             ),
             severity="information",
             timeout=5.0,
+        )
+
+    def _pm_dispatch_now(self) -> float:
+        """Monotonic clock for the inbox re-attach window (#1485).
+
+        Split out so tests can monkeypatch the clock and drive the
+        window deterministically without sleeping.
+        """
+        return time.monotonic()
+
+    def _should_reattach_pm_context(
+        self, cockpit_key: str, context_line: str, now: float,
+    ) -> bool:
+        """True iff the same ``(cockpit_key, context_line)`` is in-window."""
+        last = self._last_pm_context_dispatch
+        if last is None:
+            return False
+        last_cockpit_key, last_context_line, last_sent_at = last
+        if (last_cockpit_key, last_context_line) != (
+            cockpit_key, context_line,
+        ):
+            return False
+        return (
+            now - last_sent_at
+            <= self._PM_CONTEXT_REATTACH_WINDOW_SECONDS
+        )
+
+    def _remember_pm_context_dispatch(
+        self, cockpit_key: str, context_line: str, sent_at: float,
+    ) -> None:
+        """Stash the latest dispatch so the next press can dedupe (#1485)."""
+        self._last_pm_context_dispatch = (
+            cockpit_key, context_line, sent_at,
         )
 
     def _surface_back_to_inbox_hint(self) -> None:
@@ -10660,6 +10735,25 @@ class PollyInboxApp(App[None]):
         a real tmux server. See ``test_cockpit_inbox_ui.py`` for the
         monkeypatch target.
         """
+        router, window_target, right_pane = self._route_pm_target(cockpit_key)
+        if right_pane is None:
+            # Fall back to the window target — tmux resolves to the
+            # active pane, which is almost always the right pane for
+            # cockpit flows post-route.
+            router.tmux.send_keys(window_target, context_line, press_enter=False)
+            return
+        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+
+    def _route_pm_target(
+        self, cockpit_key: str,
+    ) -> tuple[CockpitRouter, str, str | None]:
+        """Route the cockpit right pane without injecting chat context.
+
+        #1485 split-out so the re-attach path in :meth:`_dispatch_to_pm_sync`
+        can reuse the routing (navigate the user back to the PM pane)
+        without re-sending the same context line via ``send-keys``.
+        Mirrors :meth:`PollyProjectDashboardApp._route_pm_target`.
+        """
         from pollypm.dev_network_simulation import raise_if_network_dead
 
         raise_if_network_dead(self.config_path, surface="Inbox discuss with PM")
@@ -10670,13 +10764,7 @@ class PollyInboxApp(App[None]):
             f"{supervisor.config.project.tmux_session}:{router._COCKPIT_WINDOW}"
         )
         right_pane = router._right_pane_id(window_target)
-        if right_pane is None:
-            # Fall back to the window target — tmux resolves to the
-            # active pane, which is almost always the right pane for
-            # cockpit flows post-route.
-            router.tmux.send_keys(window_target, context_line, press_enter=False)
-            return
-        router.tmux.send_keys(right_pane, context_line, press_enter=False)
+        return router, window_target, right_pane
 
     @on(events.Click, ".rollup-item")
     def _on_rollup_item_click(self, event: events.Click) -> None:

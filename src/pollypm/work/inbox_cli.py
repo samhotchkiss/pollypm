@@ -13,11 +13,13 @@ from __future__ import annotations
 
 import json
 import re
+from types import SimpleNamespace
 from typing import Any
 
 import typer
 
 from pollypm.cli_help import help_with_examples
+from pollypm.inbox import awaits_user
 from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.inbox_message_refs import unknown_project_refs
 from pollypm.work.cli import (
@@ -67,7 +69,10 @@ inbox_app = typer.Typer(
         "Work assigned to the user.",
         [
             ("pm inbox", "list open inbox items"),
-            ("pm inbox show demo/1", "print one inbox task or message"),
+            (
+                "pm inbox --awaits-user",
+                "filter to rows the rail badge counts (#1571)",
+            ),
             ("pm inbox --json", "emit the merged inbox view as JSON"),
         ],
     )
@@ -172,7 +177,10 @@ def inbox_root(
             "one of these and clutters the listing without giving the "
             "user anything actionable to type. The cockpit inbox pane "
             "still surfaces them via its own structured action affordances. "
-            "(#1013, mirrors the ``pm task list`` opt-in shipped in #1003.)"
+            "(#1013, mirrors the ``pm task list`` opt-in shipped in #1003.) "
+            "Prefer ``--awaits-user`` (#1571) when you actually want the "
+            "canonical 'what needs my attention' set — ``--include-inbox`` "
+            "is the wider chat-flow-row lens, not the curated one."
         ),
     ),
     show_all: bool = typer.Option(
@@ -186,6 +194,19 @@ def inbox_root(
             "everything else is collapsed behind a footer count so the "
             "single thing that needs your attention doesn't get buried. "
             "(#1027.)"
+        ),
+    ),
+    awaits_user_only: bool = typer.Option(
+        False,
+        "--awaits-user",
+        help=(
+            "Filter the listing to rows where the canonical "
+            "``pollypm.inbox.awaits_user`` predicate (#1566) returns "
+            "True — the same predicate that drives the cockpit rail "
+            "badge (#1571) and the upcoming dashboard 'Waiting on you' "
+            "section. Use this to sanity-check the badge from the CLI: "
+            "the count printed by ``pm inbox --awaits-user`` matches "
+            "the rail badge on the same DB."
         ),
     ),
 ) -> None:
@@ -264,6 +285,17 @@ def inbox_root(
     if not include_inbox:
         from pollypm.notify_task import is_notify_inbox_task
         tasks = [task for task in tasks if not is_notify_inbox_task(task)]
+
+    # #1571 — narrow to the canonical "awaits user" set. The predicate
+    # reads ``item.kind`` (Task surfaces it as an attribute; for raw
+    # messages we coerce the stored value into a ``kind`` attribute on
+    # a tiny shim so the predicate stays the single source of truth).
+    if awaits_user_only:
+        tasks = [task for task in tasks if awaits_user(task)]
+        display_messages = [
+            m for m in display_messages
+            if awaits_user(SimpleNamespace(kind=m.get("kind")))
+        ]
 
     # #1027 — default-hide pure ``notify``-type messages (completion
     # announcements, heartbeat alerts, "Done:" / "Repeated stale review

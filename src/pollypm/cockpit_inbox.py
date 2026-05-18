@@ -176,31 +176,24 @@ def _row_is_dev_channel(labels_raw: object) -> bool:
     return "channel:dev" in labels
 
 
-def _count_inbox_tasks_for_label(config) -> int:
-    """Count actionable inbox items across tracked projects + workspace-root.
+def pm_inbox_awaits_user_list(config) -> list[object]:
+    """Return every inbox entry across the config that ``awaits_user``.
 
-    The cockpit rail is a notification surface, not an activity feed.
-    It should badge work that requires the user, while completion
-    updates and FYI messages stay discoverable inside the inbox's
-    all-messages lens.
+    Single source of truth for "what is waiting on the user across all
+    tracked projects + the workspace root" — the rail badge counts the
+    length of this list (#1571) and ``pm inbox --awaits-user`` renders
+    its rows. The predicate (:func:`pollypm.inbox.awaits_user`) is
+    applied to each candidate row before it lands in the result; the
+    plan-review approval filter (#1107) then drops phantom plan-review
+    rows whose underlying approval has already landed.
 
-    Dedupes:
-    - Tasks by ``task_id`` so a task present in more than one DB counts
-      once.
-    - Messages by their ``(scope, message_id)`` pair — same reason.
-
-    Applies ``_filter_approved_plan_reviews`` so the rail badge tracks
-    the inbox list view: phantom ``plan_review`` rows whose underlying
-    user_approval is already APPROVED don't inflate the count (#1107).
-    Without this filter the rail badge stays stale relative to the list
-    by however many phantom rows are pending sweep, which masked the
-    success of #1103 for several overnight loop ticks.
-
-    The function name is kept for backward compatibility with existing
-    callers; the return value is now an item count, not just a task
-    count.
+    Dedupes tasks by ``task_id`` and messages by ``(scope, message_id)``
+    so a row visible in more than one DB counts once. The function is
+    best-effort: a broken DB / missing source / failed store query
+    degrades a single source rather than raising.
     """
     try:
+        from pollypm.inbox import awaits_user
         from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
         from pollypm.cockpit_inbox_items import (
@@ -211,15 +204,13 @@ def _count_inbox_tasks_for_label(config) -> int:
             task_to_inbox_entry,
         )
     except Exception:  # noqa: BLE001
-        return 0
+        return []
 
     try:
         from pollypm.store import SQLAlchemyStore
     except Exception:  # noqa: BLE001
         SQLAlchemyStore = None  # type: ignore[assignment]
 
-    seen_task_ids: set[str] = set()
-    seen_message_keys: set[tuple[str, object]] = set()
     # Collect actionable entries so the plan-review filter can drop
     # phantoms before we count. ``_filter_approved_plan_reviews`` needs
     # a per-project ``(db_path, project_path)`` map to resolve refs.
@@ -244,8 +235,7 @@ def _count_inbox_tasks_for_label(config) -> int:
                         task_to_inbox_entry(task, db_path=db_path),
                         known_projects=known_projects,
                     )
-                    if getattr(item, "needs_action", False):
-                        seen_task_ids.add(task.task_id)
+                    if awaits_user(item):
                         task_entries.setdefault(task.task_id, item)
         except Exception:  # noqa: BLE001
             pass
@@ -302,9 +292,8 @@ def _count_inbox_tasks_for_label(config) -> int:
                     ),
                     known_projects=known_projects,
                 )
-                if getattr(item, "needs_action", False):
+                if awaits_user(item):
                     msg_key = (str(scope), row_id)
-                    seen_message_keys.add(msg_key)
                     message_entries.setdefault(msg_key, item)
         finally:
             try:
@@ -317,11 +306,34 @@ def _count_inbox_tasks_for_label(config) -> int:
     # ``load_inbox_entries``).
     collected = list(task_entries.values()) + list(message_entries.values())
     if collected and project_db_paths:
-        kept = _filter_approved_plan_reviews(
-            collected, project_db_paths=project_db_paths,
+        return list(
+            _filter_approved_plan_reviews(
+                collected, project_db_paths=project_db_paths,
+            )
         )
-        return len(kept)
-    return len(seen_task_ids) + len(seen_message_keys)
+    return collected
+
+
+def _count_inbox_tasks_for_label(config) -> int:
+    """Count actionable inbox items across tracked projects + workspace-root.
+
+    The cockpit rail is a notification surface, not an activity feed.
+    It should badge work that requires the user, while completion
+    updates and FYI messages stay discoverable inside the inbox's
+    all-messages lens.
+
+    Rewired in #1571 to read from the canonical
+    :func:`pollypm.inbox.awaits_user` predicate (#1566) via
+    :func:`pm_inbox_awaits_user_list` instead of the legacy
+    ``triage_bucket == "action"`` regex heuristic. Same answer as
+    ``pm inbox --awaits-user`` and the upcoming dashboard "Waiting on
+    you" surface — one predicate, three surfaces.
+
+    The function name is kept for backward compatibility with existing
+    callers; the return value is now an item count, not just a task
+    count.
+    """
+    return len(pm_inbox_awaits_user_list(config))
 
 
 @dataclass(slots=True, frozen=True)

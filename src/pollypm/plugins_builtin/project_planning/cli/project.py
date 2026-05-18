@@ -1076,6 +1076,31 @@ def _enumerate_project_worktree_dirs(project_path: Path) -> list[Path]:
     return out
 
 
+class _PurgeWorktreesError(RuntimeError):
+    """Raised when ``_purge_project_worktrees`` left a dirty worktree behind.
+
+    Signals that one or more worktrees were skipped because they had
+    uncommitted changes and ``--force-discard-worktree-changes`` was not
+    supplied. The caller MUST abort before ``remove_project`` so the
+    TOML config doesn't drift relative to the still-on-disk worktree
+    debris (see issue #1692 — previously this case silently stripped
+    the project entry while leaving the dirty directories behind, so
+    re-running the same command couldn't resolve the project path).
+
+    Carries the partial result list on ``.results`` so the caller can
+    still surface the per-entry summary (rows removed, rows failed)
+    before exiting.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        results: list[tuple[Path, bool, bool, bool, str]],
+    ) -> None:
+        super().__init__(message)
+        self.results = results
+
+
 def _purge_project_worktrees(
     config_path: Path,
     project_key: str,
@@ -1196,6 +1221,26 @@ def _purge_project_worktrees(
             except (subprocess.TimeoutExpired, OSError):
                 pass
         results.append((wt_path, is_git, dirty, removed_ok, reason))
+
+    # Hard refusal: any worktree skipped because it was dirty (and the
+    # operator hadn't passed --force-discard-worktree-changes) means
+    # the on-disk debris is NOT gone. Raise so the caller aborts BEFORE
+    # ``remove_project`` strips the project entry from pollypm.toml —
+    # otherwise the dirty worktrees become orphans the operator can't
+    # reach via the config (issue #1692). Dry-run never raises.
+    if not dry_run:
+        skipped_dirty = [
+            p for p, _g, _d, ok, reason in results
+            if not ok and reason == "dirty"
+        ]
+        if skipped_dirty:
+            joined = ", ".join(str(p) for p in skipped_dirty)
+            raise _PurgeWorktreesError(
+                f"refusing to strip project entry: {len(skipped_dirty)} "
+                f"worktree(s) with uncommitted changes were skipped "
+                f"({joined})",
+                results,
+            )
     return results
 
 
@@ -1565,10 +1610,20 @@ def remove_cmd(
                 if not proceed:
                     typer.echo("Aborted. No changes made.")
                     raise typer.Exit(code=1)
-            wt_results = _purge_project_worktrees(
-                path, project_key,
-                force_discard_changes=force_discard_worktree_changes,
-            )
+            wt_purge_failed = False
+            try:
+                wt_results = _purge_project_worktrees(
+                    path, project_key,
+                    force_discard_changes=force_discard_worktree_changes,
+                )
+            except _PurgeWorktreesError as exc:
+                # Dirty worktrees were skipped. Surface the same
+                # per-entry summary as the happy path, then abort BEFORE
+                # ``remove_project`` so the project entry survives in
+                # pollypm.toml and the operator can retry (issue #1692).
+                wt_results = exc.results
+                wt_purge_failed = True
+
             removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
             skipped_dirty = [
                 p for p, _g, _d, ok, reason in wt_results
@@ -1598,6 +1653,21 @@ def remove_cmd(
                 )
             for p, reason in failed:
                 typer.echo(f"  Failed to remove {p} ({reason}).")
+
+            if wt_purge_failed:
+                typer.echo(
+                    f"Error: --purge-worktrees left {len(skipped_dirty)} "
+                    f"dirty worktree(s) in place for '{project_key}'.",
+                    err=True,
+                )
+                typer.echo(
+                    "Aborted. Project entry left in pollypm.toml so you "
+                    "can retry once the worktrees are clean (or re-run "
+                    "with --force-discard-worktree-changes to discard "
+                    "the changes).",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
 
     try:
         removed = remove_project(path, project_key)

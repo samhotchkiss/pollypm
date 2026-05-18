@@ -1122,9 +1122,15 @@ def test_purge_project_worktrees_dry_run_is_noop(env) -> None:
 
 
 def test_purge_project_worktrees_refuses_dirty_without_force(env) -> None:
-    """Dirty worktrees are skipped unless ``force_discard_changes`` is set."""
+    """Dirty worktrees raise ``_PurgeWorktreesError`` so the caller aborts.
+
+    See issue #1692 — pre-fix this returned ``[(…, "dirty")]`` and the
+    CLI still went on to strip the project entry from pollypm.toml,
+    leaving the dirty worktree directories orphaned.
+    """
     from pollypm.plugins_builtin.project_planning.cli.project import (
         _purge_project_worktrees,
+        _PurgeWorktreesError,
     )
 
     _init_git_project(env["project_path"])
@@ -1132,8 +1138,10 @@ def test_purge_project_worktrees_refuses_dirty_without_force(env) -> None:
     # Mutate a tracked file so git status reports dirty.
     (wt_a / "README").write_text("dirty\n")
 
-    results = _purge_project_worktrees(env["config_path"], "demo")
+    with pytest.raises(_PurgeWorktreesError) as exc_info:
+        _purge_project_worktrees(env["config_path"], "demo")
 
+    results = exc_info.value.results
     assert len(results) == 1
     path, is_git, dirty, ok, reason = results[0]
     assert dirty is True
@@ -1352,7 +1360,13 @@ def test_cli_remove_purge_worktrees_prompts_without_force(env) -> None:
 
 
 def test_cli_remove_purge_worktrees_skips_dirty_without_force(env) -> None:
-    """Dirty worktrees are reported as skipped, not removed."""
+    """Dirty worktrees abort the cascade and the project entry survives.
+
+    Issue #1692 — previously the CLI reported the skipped worktree but
+    still called ``remove_project`` afterward, stripping the project
+    entry while leaving the dirty worktree on disk. The recoverable
+    behaviour is: exit 1, keep the project entry, surface the skip.
+    """
     _init_git_project(env["project_path"])
     wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
     (wt_a / "README").write_text("local changes\n")
@@ -1369,11 +1383,53 @@ def test_cli_remove_purge_worktrees_skips_dirty_without_force(env) -> None:
             ],
         )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
     assert "Skipped (uncommitted changes)" in result.output
     assert "--force-discard-worktree-changes" in result.output
     # Dirty worktree still exists.
     assert wt_a.exists()
+    # And the project entry must still be in the config so the operator
+    # can retry — that's the whole point of the abort (issue #1692).
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+    # The TOML-strip line from ``remove_project`` must not have fired.
+    assert "Removed project 'demo'" not in result.output
+
+
+def test_cli_remove_purge_worktrees_mixed_clean_and_dirty_aborts(env) -> None:
+    """Mixed cohort: clean worktrees still removed, dirty trip the abort.
+
+    Regression for issue #1692. The clean worktree must still get cleaned
+    up (best-effort row sweep is preserved) but the project entry stays
+    in ``pollypm.toml`` so the operator can retry — and the second pass
+    can still resolve the project path off the surviving entry.
+    """
+    _init_git_project(env["project_path"])
+    wt_clean = _seed_worktree(env["project_path"], "architect-clean", "clean")
+    wt_dirty = _seed_worktree(env["project_path"], "architect-dirty", "dirty")
+    (wt_dirty / "README").write_text("local changes\n")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 1, result.output
+    # Clean one got swept.
+    assert not wt_clean.exists()
+    # Dirty one survived.
+    assert wt_dirty.exists()
+    # Project entry survives — re-run is possible.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+    assert "Removed project 'demo'" not in result.output
 
 
 def test_cli_remove_purge_worktrees_force_discard_removes_dirty(env) -> None:

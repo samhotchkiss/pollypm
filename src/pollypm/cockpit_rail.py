@@ -4113,6 +4113,16 @@ class PollyCockpitRail:
         self._ticker_started_at = time.monotonic()
         self._last_items: list[CockpitItem] = []
         self._slogan_phase = 0
+        # #1543 — body scroll offset (in lines) when the rail can't fit
+        # every item on the current terminal height. ``None`` means "auto
+        # scroll to keep the selected item in view"; an int pins the
+        # offset (PgUp/PgDn). Reset to auto on every selection change so
+        # j/k navigation still keeps the cursor visible.
+        self._scroll_offset: int | None = None
+        # Cached on the last ``_render`` so PgUp/PgDn can clamp against
+        # the actual overflow size without re-running the layout pass.
+        self._last_body_total = 0
+        self._last_body_visible = 0
 
     def run(self) -> None:
         fd = sys.stdin.fileno()
@@ -4222,7 +4232,35 @@ class PollyCockpitRail:
             self.router.route_selected("settings")
             self.selected_key = "settings"
             return True
+        # #1543 — PgUp/PgDn (and ctrl+b/ctrl+f) page the rail body when
+        # the project list overflows the terminal height. Falls back to
+        # ``_move`` selection navigation when the body fits, so the keys
+        # do something predictable in either mode.
+        if key in {b"\x1b[5~", b"\x02"}:  # PgUp / Ctrl-B
+            self._page_scroll(-1, items)
+            return True
+        if key in {b"\x1b[6~", b"\x06"}:  # PgDn / Ctrl-F
+            self._page_scroll(1, items)
+            return True
         return True
+
+    def _page_scroll(self, direction: int, items: list[CockpitItem]) -> None:
+        """Scroll the rail body by one page, or skip selection if the
+        body isn't overflowing. Sets ``_scroll_offset`` so the next
+        ``_render`` honors the user's pinned position; a subsequent j/k
+        navigation that lands outside the window restores auto-scroll.
+        """
+        total = self._last_body_total
+        visible = self._last_body_visible
+        if total <= visible or visible <= 0:
+            # Body fits — page keys act as bigger jumps for selection.
+            self._move(direction * max(1, visible - 1), items)
+            return
+        window = max(1, visible - 1)
+        max_offset = max(0, total - window)
+        current = self._scroll_offset if self._scroll_offset is not None else 0
+        new_offset = max(0, min(max_offset, current + direction * window))
+        self._scroll_offset = new_offset
 
     def _send_key_to_settings_pane(self, key: str) -> None:
         delivered = None
@@ -4251,9 +4289,13 @@ class PollyCockpitRail:
         except ValueError:
             self.selected_key = keys[0]
             self.router.set_selected_key(self.selected_key)
+            self._scroll_offset = None
             return
         self.selected_key = keys[(index + delta) % len(keys)]
         self.router.set_selected_key(self.selected_key)
+        # #1543 — j/k selection moves resume auto-scroll so the selected
+        # item is always brought back into view. PgUp/PgDn re-pin.
+        self._scroll_offset = None
 
     def _select_first(self, items: list[CockpitItem]) -> None:
         for item in items:
@@ -4303,60 +4345,105 @@ class PollyCockpitRail:
         size = shutil.get_terminal_size((30, 24))
         width = max(16, size.columns)
         height = max(8, size.lines)
-        lines: list[RenderRow] = []
+        header: list[RenderRow] = []
+        body: list[RenderRow] = []
+        # Parallel to ``body``: row idx -> body_items index, or None for
+        # blank lines + ``-- projects --`` separators. Drives the
+        # auto-scroll logic so the selected item stays in view (#1543).
+        body_item_index: list[int | None] = []
+        footer: list[RenderRow] = []
         pad = " " * GUTTER
 
         # ── Wordmark (centered)
-        lines.append(RenderRow(""))
+        header.append(RenderRow(""))
         wm0 = ASCII_POLLY[0]
         wm1 = ASCII_POLLY[1]
-        lines.append(RenderRow(wm0.center(width)[:width], fg=PALETTE["wordmark_hi"], bold=True))
-        lines.append(RenderRow(wm1.center(width)[:width], fg=PALETTE["wordmark_lo"]))
-        lines.append(RenderRow(""))
+        header.append(RenderRow(wm0.center(width)[:width], fg=PALETTE["wordmark_hi"], bold=True))
+        header.append(RenderRow(wm1.center(width)[:width], fg=PALETTE["wordmark_lo"]))
+        header.append(RenderRow(""))
 
         # ── Slogan (centered)
         slogan = self._current_slogan()
         sc = self._slogan_color()
-        lines.append(RenderRow(slogan[0].center(width)[:width], fg=sc))
-        lines.append(RenderRow(slogan[1].center(width)[:width], fg=sc))
-        lines.append(RenderRow(""))
+        header.append(RenderRow(slogan[0].center(width)[:width], fg=sc))
+        header.append(RenderRow(slogan[1].center(width)[:width], fg=sc))
+        header.append(RenderRow(""))
 
-        # ── Section: navigation
+        # ── Body: navigation rows (scrollable when the rail can't fit)
         settings_item = next((item for item in items if item.key == "settings"), None)
         body_items = [item for item in items if item.key != "settings"]
         active_view = self.router.selected_key()
 
         first_project = True
-        for item in body_items:
+        for item_idx, item in enumerate(body_items):
             if item.key.startswith("project:") and first_project:
-                lines.append(RenderRow(""))
-                lines.append(self._section_header("projects", width))
+                body.append(RenderRow(""))
+                body_item_index.append(None)
+                body.append(self._section_header("projects", width))
+                body_item_index.append(None)
                 first_project = False
-            lines.append(self._item_row(item, width, active_view))
+            body.append(self._item_row(item, width, active_view))
+            body_item_index.append(item_idx)
 
-        # ── Spacer + settings at bottom
-        if settings_item is not None:
-            target_lines = len(lines) + 4  # section header + blank + item + hint
-            while len(lines) < height - target_lines + len(lines):
-                if len(lines) >= height - 4:
-                    break
-                lines.append(RenderRow(""))
-            lines.append(RenderRow(""))
-            lines.append(self._section_header("system", width))
-            lines.append(self._item_row(settings_item, width, active_view))
-
+        # ── Footer: settings, ticker, hint (pinned to bottom)
         ticker_text = self._event_ticker_text()
-        reserve = 3 if ticker_text else 2
-        while len(lines) < height - reserve:
-            lines.append(RenderRow(""))
-        lines.append(RenderRow(""))
+        if settings_item is not None:
+            footer.append(RenderRow(""))
+            footer.append(self._section_header("system", width))
+            footer.append(self._item_row(settings_item, width, active_view))
+        footer.append(RenderRow(""))
         if ticker_text:
-            lines.append(RenderRow(ticker_text[:width], fg=PALETTE["hint"]))
+            footer.append(RenderRow(ticker_text[:width], fg=PALETTE["hint"]))
         # Compact hint: full keymap is one ``?`` away (#790). Width
         # budget is the 30-col rail, so drop everything but the most
         # frequently-used actions.
         hint = f"{pad}j/k \u21b5open \u00b7 ? help \u00b7 q quit"
-        lines.append(RenderRow(hint[:width], fg=PALETTE["hint"]))
+        footer.append(RenderRow(hint[:width], fg=PALETTE["hint"]))
+
+        # ── Compose: header + body (with overflow handling) + footer.
+        # #1543 — when the body doesn't fit at the current terminal
+        # height, the old renderer silently truncated rows that fell
+        # past ``height``. A short laptop window could hide 11 of 12
+        # projects with no indicator. We now scroll the body within a
+        # bounded window so the selected item stays visible and a
+        # one-line overflow hint advertises the hidden rows.
+        body_budget = height - len(header) - len(footer)
+        if body_budget < 1:
+            body_budget = 1
+
+        if len(body) > body_budget:
+            window = max(1, body_budget - 1)  # reserve a row for the indicator
+            selected_row = self._row_for_selected(body_item_index, body_items)
+            offset = self._resolve_scroll_offset(
+                selected_row=selected_row,
+                total=len(body),
+                window=window,
+            )
+            self._scroll_offset = offset
+            slice_above = offset
+            slice_below = len(body) - offset - window
+            visible_body = list(body[offset : offset + window])
+            visible_body.append(
+                self._overflow_indicator_row(
+                    above=slice_above, below=slice_below, width=width,
+                )
+            )
+        else:
+            # Body fits — drop any pinned scroll offset so the next
+            # overflow lands at the natural auto-scroll position.
+            self._scroll_offset = None
+            visible_body = body
+
+        self._last_body_total = len(body)
+        self._last_body_visible = body_budget
+
+        lines: list[RenderRow] = []
+        lines.extend(header)
+        lines.extend(visible_body)
+        # Pad with blank rows so the footer sticks to the terminal bottom.
+        while len(lines) + len(footer) < height:
+            lines.append(RenderRow(""))
+        lines.extend(footer)
 
         # ── Flush
         bg = PALETTE["bg"]
@@ -4371,6 +4458,67 @@ class PollyCockpitRail:
                     self._write(_sgr(row) + row.text.ljust(width)[:width] + "\x1b[0m\r\n")
             else:
                 self._write(clear_line + "\r\n")
+
+    def _row_for_selected(
+        self,
+        body_item_index: list[int | None],
+        body_items: list[CockpitItem],
+    ) -> int | None:
+        """Return the body-row index of the currently selected item, or
+        ``None`` if the selection isn't a body row (e.g. ``settings``).
+        """
+        for row_idx, item_idx in enumerate(body_item_index):
+            if item_idx is None:
+                continue
+            if body_items[item_idx].key == self.selected_key:
+                return row_idx
+        return None
+
+    def _resolve_scroll_offset(
+        self,
+        *,
+        selected_row: int | None,
+        total: int,
+        window: int,
+    ) -> int:
+        """Pick the scroll offset that keeps the selected row in view.
+
+        Honors a pinned ``self._scroll_offset`` (set by PgUp/PgDn) when
+        possible; otherwise auto-scrolls so the selected row stays
+        visible. Clamps within ``[0, max_offset]``.
+        """
+        max_offset = max(0, total - window)
+        pinned = self._scroll_offset
+        if pinned is not None:
+            return max(0, min(pinned, max_offset))
+        if selected_row is None:
+            return 0
+        if selected_row < window:
+            return 0
+        # Scroll so the selected row sits near the bottom of the window;
+        # leaves the user a hint that more rows live above.
+        return min(max_offset, selected_row - window + 1)
+
+    def _overflow_indicator_row(
+        self, *, above: int, below: int, width: int,
+    ) -> "RenderRow":
+        """Build a visible "N more above/below" hint for the rail body.
+
+        Reclaims the user's mental model when the rail can't fit every
+        project on the current terminal height (#1543). Uses the inbox
+        amber tone so the indicator reads as a navigation hint, not an
+        alert.
+        """
+        pad = " " * GUTTER
+        if above and below:
+            text = f"{pad}↕ {above} above · {below} below"
+        elif below:
+            text = f"{pad}▼ {below} more · j to scroll"
+        elif above:
+            text = f"{pad}▲ {above} more · k to scroll"
+        else:
+            text = ""
+        return RenderRow(text[:width], fg=PALETTE["inbox_has"], bold=True)
 
     # Heartbeat ticks and token-ledger syncs flood the events stream
     # but carry no user-facing signal (#793, #876). Mirrors the

@@ -86,6 +86,15 @@ def _open_alert_exists(
                 limit=1,
             )
         except Exception:  # noqa: BLE001
+            # #1355: previously silent. Treating a query failure as
+            # "no open alert" causes the sweep to re-raise the same
+            # alert next tick — a tight loop dressed up as quiet. Log.
+            logger.warning(
+                "open_alert_exists: msg_store query failed for %s/%s",
+                session_name,
+                alert_type,
+                exc_info=True,
+            )
             return False
         return bool(rows)
 
@@ -97,6 +106,14 @@ def _open_alert_exists(
     try:
         rows = open_alerts()
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. Same re-raise risk as above on
+        # the state_store fallback path.
+        logger.warning(
+            "open_alert_exists: state_store.open_alerts() failed for %s/%s",
+            session_name,
+            alert_type,
+            exc_info=True,
+        )
         return False
     for row in rows:
         if (
@@ -138,6 +155,15 @@ def sweep_ephemeral_sessions(supervisor: Any, store: Any) -> dict[str, int]:
             launch.session.name for launch in supervisor.plan_launches()
         }
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. Empty planned_names means every
+        # ephemeral session looks unplanned — i.e. the sweep can
+        # mis-classify planned task sessions as zombies. Log so a
+        # broken plan_launches() stops hiding as quiet over-eagerness.
+        logger.warning(
+            "ephemeral_sweep: supervisor.plan_launches() failed; "
+            "treating all sessions as unplanned",
+            exc_info=True,
+        )
         planned_names = set()
 
     session_service = getattr(supervisor, "session_service", None)

@@ -1328,6 +1328,15 @@ class PollyCockpitApp(App[None]):
                 self, kind="cockpit", config_path=self.config_path,
             )
         except Exception:  # noqa: BLE001
+            # #1355: previously silent. A failed input-bridge boot
+            # breaks `pm cockpit-send-key` / automation routing
+            # without any signal to the user — log so the disabled
+            # surface is at least diagnosable.
+            logger.warning(
+                "cockpit: input bridge start failed; "
+                "automation key-send is disabled",
+                exc_info=True,
+            )
             self._input_bridge_handle = None
         # Textual's first render after mount reflows panes and can stretch the
         # rail past the persisted width. Re-enforce the rail width on a short
@@ -1699,6 +1708,16 @@ class PollyCockpitApp(App[None]):
         try:
             supervisor = self.router._load_supervisor()
         except Exception:  # noqa: BLE001
+            # #1355: previously silent. Failing to load the supervisor
+            # here means the cockpit boots without an in-process rail
+            # AND without the external daemon (we already gated above) —
+            # i.e. no autonomous sweeps. Log so the silent skip stops
+            # masking config / DB problems.
+            logger.warning(
+                "cockpit: supervisor load failed; "
+                "in-process HeartbeatRail not started",
+                exc_info=True,
+            )
             return
         rail = getattr(supervisor, "core_rail", None)
         if rail is None:

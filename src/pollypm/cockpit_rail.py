@@ -2342,11 +2342,31 @@ class CockpitRouter:
                     },
                 )
 
+    # #1636 — when the rail mount target is a project's PM persona but
+    # the literal ``window_name`` (taken from ``launch.window_name``) is
+    # not present in storage, the live PM conversation may be running
+    # under a sibling window-name pattern. PollyPM uses
+    # ``architect-<project>`` as the canonical PM-persona window for
+    # non-Polly projects (#1056 documents the hyphen vs underscore drift
+    # between session.name and window_name); workers and Polly-style PM
+    # panes use ``worker-<project>`` and ``pm-<project>``. Ordering here
+    # is "PM persona first" — architect over worker — because Sam's
+    # bikepath repro shows the architect window is what holds the
+    # ongoing conversation while a stale or never-launched worker
+    # session entry can make the literal lookup return None.
+    _PROJECT_PM_WINDOW_PREFIXES: tuple[str, ...] = (
+        "architect-",
+        "pm-",
+        "worker-",
+    )
+
     def _select_storage_window_for_mount(
         self,
         storage_windows: list,
         window_name: str,
         session_name: str,
+        *,
+        project_key: str | None = None,
     ):
         """Pick which storage-closet window to mount when duplicates exist.
 
@@ -2371,6 +2391,78 @@ class CockpitRouter:
             so forensics can trace which window won and why. **Do not**
             kill the loser — #1563's conservative cleanup will reap it
             once its pane dies.
+
+        #1636 — when ``project_key`` is supplied and the literal
+        ``window_name`` produces no match, fall back to project-PM
+        sibling patterns (``architect-<project>``, ``pm-<project>``,
+        ``worker-<project>``) and re-run the live-provider selection.
+        This catches the case where the rail item is a project's PM
+        chat, ``launch.window_name`` is ``worker-<project>`` (or absent
+        from the planner entirely), but the live conversation is in
+        ``architect-<project>`` — Sam's bikepath repro. Emits a
+        ``cockpit.project_pm_fallback_match`` audit event so forensics
+        can see when the fallback fired and which sibling won.
+        """
+        result = self._select_named_storage_window(
+            storage_windows,
+            window_name=window_name,
+            session_name=session_name,
+        )
+        if result is not None or not project_key:
+            return result
+        # #1636 — sibling-pattern fallback. Order matters: ``architect-``
+        # is the canonical PM persona for non-Polly projects, so try it
+        # first even though ``launch.window_name`` may have pointed at a
+        # ``worker-`` sibling.
+        for prefix in self._PROJECT_PM_WINDOW_PREFIXES:
+            sibling_name = f"{prefix}{project_key}"
+            if sibling_name == window_name:
+                continue  # already tried above
+            sibling = self._select_named_storage_window(
+                storage_windows,
+                window_name=sibling_name,
+                session_name=session_name,
+            )
+            if sibling is None:
+                continue
+            # Only accept the sibling when its pane is actually running
+            # a live provider — a stale empty placeholder of the same
+            # name is worse than letting the caller's fallback path
+            # spawn fresh, because the join would tear down the user's
+            # cockpit pane to mount an idle shell.
+            cmd = (getattr(sibling, "pane_current_command", "") or "")
+            if cmd not in {"claude", "codex", "node"} or getattr(sibling, "pane_dead", False):
+                continue
+            self._emit_cockpit_audit(
+                event_name="cockpit.project_pm_fallback_match",
+                subject=window_name,
+                status="warn",
+                metadata={
+                    "session_name": session_name,
+                    "requested_window_name": window_name,
+                    "matched_window_name": sibling_name,
+                    "matched_index": getattr(sibling, "index", None),
+                    "matched_pane_id": getattr(sibling, "pane_id", None),
+                    "matched_command": cmd,
+                    "project_key": project_key,
+                    "reason": "project_pm_sibling_pattern",
+                },
+            )
+            return sibling
+        return None
+
+    def _select_named_storage_window(
+        self,
+        storage_windows: list,
+        *,
+        window_name: str,
+        session_name: str,
+    ):
+        """Inner helper: pick a single window by exact ``window_name``.
+
+        Encapsulates the original #1631 selection logic so the #1636
+        sibling-pattern fallback can reuse it for each candidate name
+        without duplicating the live-provider preference / audit emit.
         """
         matches = [w for w in storage_windows if getattr(w, "name", None) == window_name]
         if not matches:
@@ -2794,10 +2886,24 @@ class CockpitRouter:
             session_name = self._project_session_map(launches).get(project_key)
             if session_name is not None:
                 if not self._session_available_for_mount(supervisor, session_name, window_target):
-                    try:
-                        supervisor.launch_session(session_name)
-                    except Exception:  # noqa: BLE001
-                        pass
+                    # #1636 — before respawning, check whether a sibling
+                    # PM-persona window (architect/worker/pm) is already
+                    # live in storage for this project. ``launch.window_name``
+                    # may point at a worker window that was never started
+                    # while the architect window (the canonical PM persona
+                    # for non-Polly projects) is actively holding the
+                    # user's conversation. Skipping ``launch_session``
+                    # here is the difference between attaching to that
+                    # live architect via the sibling-pattern fallback in
+                    # ``_select_storage_window_for_mount`` and killing it
+                    # off by spawning a fresh worker with the same name.
+                    if not self._project_pm_sibling_window_live(
+                        supervisor, project_key,
+                    ):
+                        try:
+                            supervisor.launch_session(session_name)
+                        except Exception:  # noqa: BLE001
+                            pass
                 try:
                     self._show_live_session(supervisor, session_name, window_target)
                 except Exception:  # noqa: BLE001
@@ -3364,6 +3470,7 @@ class CockpitRouter:
                     self.tmux.list_windows(storage_session),
                     launch.window_name,
                     session_name,
+                    project_key=project_key,
                 )
                 if target_window is not None:
                     source_pane_id = getattr(target_window, "pane_id", None)
@@ -3598,6 +3705,7 @@ class CockpitRouter:
                         live_windows = self.tmux.list_windows(storage_session)
                         target_window_for_identity = self._select_storage_window_for_mount(
                             live_windows, launch.window_name, session_name,
+                            project_key=getattr(launch.session, "project", None),
                         )
                         source_pane_id = (
                             getattr(target_window_for_identity, "pane_id", None)
@@ -3685,6 +3793,7 @@ class CockpitRouter:
         storage_windows = self.tmux.list_windows(storage_session)
         target_window = self._select_storage_window_for_mount(
             storage_windows, launch.window_name, session_name,
+            project_key=getattr(launch.session, "project", None),
         )
         if target_window is None:
             fallback_kind = "polly" if session_name == "operator" else "project"
@@ -4067,6 +4176,52 @@ class CockpitRouter:
         storage_session = supervisor.storage_closet_session_name()
         storage_windows = {window.name for window in self.tmux.list_windows(storage_session)}
         return launch.window_name in storage_windows
+
+    def _project_pm_sibling_window_live(
+        self, supervisor, project_key: str,
+    ) -> bool:
+        """Return True if a PM-persona window for ``project_key`` is live in storage.
+
+        #1636 — the rail's session-mount path treats ``launch.window_name``
+        as the only authoritative pointer to the project's PM. That works
+        for the worker-only case, but bikepath's repro had a stale or
+        unplanned worker entry plus a live ``architect-bikepath`` window
+        holding the ongoing conversation. The literal lookup then
+        triggered ``launch_session`` to "recreate" the missing window,
+        which spawned a fresh codex (PID 45316 in the issue forensics)
+        while the live one (PID 70760) stayed orphaned in storage.
+
+        This pre-check scans the project's canonical PM-persona window
+        names (``architect-<project>``, ``pm-<project>``,
+        ``worker-<project>``) and returns True only when at least one
+        is live — i.e. its pane is running a real provider
+        (``claude`` / ``codex`` / ``node``) and not marked dead. The
+        actual mount happens in ``_show_live_session`` via the
+        sibling-pattern fallback in ``_select_storage_window_for_mount``.
+        """
+        if not project_key:
+            return False
+        try:
+            storage_session = supervisor.storage_closet_session_name()
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            storage_windows = self.tmux.list_windows(storage_session)
+        except Exception:  # noqa: BLE001
+            return False
+        targets = {
+            f"{prefix}{project_key}" for prefix in self._PROJECT_PM_WINDOW_PREFIXES
+        }
+        live_provider = {"claude", "codex", "node"}
+        for window in storage_windows:
+            if getattr(window, "name", None) not in targets:
+                continue
+            if getattr(window, "pane_dead", False):
+                continue
+            cmd = (getattr(window, "pane_current_command", "") or "")
+            if cmd in live_provider:
+                return True
+        return False
 
     def _show_static_view(
         self,

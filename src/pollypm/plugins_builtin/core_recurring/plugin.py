@@ -6,7 +6,18 @@ import logging
 import threading
 from typing import Any
 
-from pollypm.plugin_api.v1 import Capability, JobHandlerAPI, PollyPMPlugin, RosterAPI
+from pollypm.maintenance_handlers_registry import (
+    AGENT_WORKTREE_PRUNE,
+    LOG_ROTATE,
+    register_maintenance_handler,
+)
+from pollypm.plugin_api.v1 import (
+    Capability,
+    JobHandlerAPI,
+    PluginAPI,
+    PollyPMPlugin,
+    RosterAPI,
+)
 
 from pollypm.plugins_builtin.core_recurring.maintenance import (
     AUDIT_EVENT_SUBJECTS,
@@ -556,6 +567,24 @@ def _register_roster(api: RosterAPI) -> None:
     )
 
 
+def _initialize(api: PluginAPI) -> None:
+    """Expose one-off entry points for the maintenance handlers (#1363).
+
+    ``doctor.py`` invokes ``agent_worktree.prune`` and ``log.rotate``
+    directly as ``--fix`` actions instead of waiting for the next
+    cadence tick. Registering them in
+    :mod:`pollypm.maintenance_handlers_registry` lets the doctor resolve
+    them without importing from the optional plugin tree — when this
+    plugin isn't loaded the doctor reports the fix as "unavailable" and
+    keeps working.
+
+    Idempotent — safe to call again if the rail re-initializes plugins.
+    """
+    del api  # unused — the registry is module-level state
+    register_maintenance_handler(AGENT_WORKTREE_PRUNE, agent_worktree_prune_handler)
+    register_maintenance_handler(LOG_ROTATE, log_rotate_handler)
+
+
 plugin = PollyPMPlugin(
     name="core_recurring",
     version="0.1.0",
@@ -589,4 +618,5 @@ plugin = PollyPMPlugin(
     ),
     register_handlers=_register_handlers,
     register_roster=_register_roster,
+    initialize=_initialize,
 )

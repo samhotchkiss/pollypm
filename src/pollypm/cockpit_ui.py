@@ -11685,7 +11685,71 @@ def _dashboard_plan_path(project_path: Path) -> Path | None:
         p = project_path / rel
         if p.is_file():
             return p
-    return None
+    # #1620 — fallback: the architect writes the plan into its session
+    # worktree (`<project>/.pollypm/worktrees/<session>/<wt>/docs/plan/plan.md`)
+    # and the merge back to the main tree is async; until it lands, the
+    # canonical path above is empty. Scan worktrees for the first
+    # non-trivial plan file so the cockpit can render the plan inline as
+    # soon as synthesize commits, not only after the worktree merge.
+    return _dashboard_plan_path_from_worktrees(project_path)
+
+
+def _dashboard_plan_path_from_worktrees(project_path: Path) -> Path | None:
+    """Fallback plan-path resolver that scans architect worktrees.
+
+    The synthesize / emit stages write ``docs/plan/plan.md`` inside the
+    architect's session worktree. Until that worktree merges back to
+    the project root, the canonical paths in
+    :data:`CANONICAL_PLAN_RELATIVE_PATHS` are empty even though a real
+    plan exists on disk. This walker returns the most-recent
+    non-trivial plan file under ``<project>/.pollypm/worktrees`` so the
+    plan-review surface and inbox detail can render the plan inline
+    without waiting for the merge. Returns ``None`` when no worktree
+    holds a plan file.
+    """
+    worktrees_root = project_path / ".pollypm" / "worktrees"
+    if not worktrees_root.is_dir():
+        return None
+    candidates: list[tuple[float, Path]] = []
+    try:
+        session_dirs = list(worktrees_root.iterdir())
+    except OSError:
+        return None
+    for session_dir in session_dirs:
+        if not session_dir.is_dir():
+            continue
+        # Prefer architect worktrees (they own plan output), but fall
+        # back to any session so a non-standard layout still surfaces.
+        prefer_architect = session_dir.name.startswith("architect")
+        try:
+            wt_dirs = list(session_dir.iterdir())
+        except OSError:
+            continue
+        for wt_dir in wt_dirs:
+            if not wt_dir.is_dir():
+                continue
+            for rel in _PLAN_FILE_CANDIDATES:
+                candidate = wt_dir / rel
+                if not candidate.is_file():
+                    continue
+                try:
+                    size = candidate.stat().st_size
+                    mtime = candidate.stat().st_mtime
+                except OSError:
+                    continue
+                if size < 200:
+                    # Skip placeholder / empty files — match the
+                    # plan-presence gate's "non-trivial" threshold so
+                    # we don't render a stub as "the plan".
+                    continue
+                # Architect worktrees outrank others; encode that into
+                # the sort key with a large additive bias on mtime.
+                rank_bias = 10 ** 12 if prefer_architect else 0
+                candidates.append((mtime + rank_bias, candidate))
+    if not candidates:
+        return None
+    candidates.sort(reverse=True)
+    return candidates[0][1]
 
 
 # URL-shaped match used to harvest a deliverable hint from a done plan

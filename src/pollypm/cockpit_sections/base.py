@@ -168,35 +168,13 @@ def _aggregate_project_tokens(
 ) -> tuple[int, int] | None:
     """SUM(total_input_tokens), SUM(total_output_tokens) for ``project_key``.
 
-    Queries ``work_sessions`` directly \u2014 when #86 lands its aggregate
-    helper we can swap this out for a single method call. Returns
-    ``None`` when the table is missing (old DB) or the query fails, so
-    the Tokens line degrades to "(n/a)" rather than breaking the render.
+    #1376 — the SQL/connection details live in
+    ``pollypm.work.session_queries`` so this section no longer reaches
+    into the raw workspace DB or knows the ``work_sessions`` schema. The
+    ``None``-on-missing-DB / query-failure contract is preserved so the
+    Tokens line still degrades to ``(n/a)`` rather than breaking the
+    render.
     """
-    import sqlite3
+    from pollypm.work.session_queries import project_session_token_totals
 
-    if not db_path.exists():
-        return None
-    try:
-        conn = sqlite3.connect(str(db_path))
-        try:
-            # #1018 — cockpit reader runs alongside JobWorkerPool +
-            # heartbeat writers on the same workspace DB. Apply a short
-            # busy_timeout so a transient lock during a writer's commit
-            # doesn't bubble up as "(n/a)" tokens in the rail.
-            from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
-
-            apply_workspace_pragmas(conn)
-            row = conn.execute(
-                "SELECT COALESCE(SUM(total_input_tokens), 0), "
-                "       COALESCE(SUM(total_output_tokens), 0) "
-                "FROM work_sessions WHERE task_project = ?",
-                (project_key,),
-            ).fetchone()
-        finally:
-            conn.close()
-    except sqlite3.Error:
-        return None
-    if row is None:
-        return 0, 0
-    return int(row[0] or 0), int(row[1] or 0)
+    return project_session_token_totals(db_path, project_key=project_key)

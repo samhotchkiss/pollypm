@@ -3091,7 +3091,7 @@ class PollyCockpitApp(App[None]):
     # this set — pressing Enter on a project should expand its
     # sub-items immediately (#1192).
     _STATIC_RAIL_KEYS = frozenset(
-        {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "polly"},
+        {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "polly", "operator"},
     )
 
     # Monotonically-increasing click counter (#967). Each click bumps

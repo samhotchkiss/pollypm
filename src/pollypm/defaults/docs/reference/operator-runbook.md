@@ -269,12 +269,19 @@ What an operator sees:
 What runs:
 
 - `pollypm.cockpit_socket_reaper::reap_stale_cockpit_sockets`, called
-  from `pollypm.supervisor.Supervisor._bootstrap_clear_markers`.
+  from `pollypm.supervisor.Supervisor._bootstrap_clear_markers` at
+  bootstrap, and periodically from
+  `pollypm.plugins_builtin.core_recurring.maintenance::cockpit_socket_reap_handler`
+  via the `cockpit_socket.reap` roster entry.
 
 When it runs:
 
 - Once during supervisor bootstrap, before new cockpit or per-task
   worker panes are launched.
+- Every 5 minutes thereafter on the `rail_daemon` / heartbeat thread
+  so a long-lived cockpit doesn't accumulate stale entries between
+  boots (#1592). Live PIDs are never touched, so the periodic sweep
+  is safe alongside running panes.
 
 What it touches:
 

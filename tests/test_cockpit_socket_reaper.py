@@ -279,6 +279,89 @@ def test_emits_socket_reaped_audit_event(
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Periodic recurring-handler reaper (#1592)
+#
+# The bootstrap call fires once at ``pm up``; without a periodic sweep a
+# long-lived cockpit accumulates stale sockets between boots. The
+# ``cockpit_socket.reap`` roster entry runs the same reaper logic on the
+# rail_daemon / heartbeat thread.
+# ---------------------------------------------------------------------------
+
+
+def test_cockpit_socket_reap_handler_unlinks_stale(base_dir: Path) -> None:
+    """The recurring handler reaps stale sockets when called with a base_dir."""
+    from pollypm.plugins_builtin.core_recurring.plugin import (
+        cockpit_socket_reap_handler,
+    )
+
+    dead_pid = _spawn_briefly()
+    stale = base_dir / "cockpit_inputs" / f"cockpit-{dead_pid}.sock"
+    sock = _bind_socket(stale)
+    sock.close()
+    assert stale.exists()
+
+    result = cockpit_socket_reap_handler({"base_dir": str(base_dir)})
+
+    assert result == {"reaped": 1}
+    assert not stale.exists()
+
+
+def test_cockpit_socket_reap_handler_preserves_live(base_dir: Path) -> None:
+    """The recurring handler does not touch sockets owned by live PIDs.
+
+    Critical safety property: the handler runs while the cockpit is alive,
+    so a live bridge's socket must survive every sweep.
+    """
+    from pollypm.plugins_builtin.core_recurring.plugin import (
+        cockpit_socket_reap_handler,
+    )
+
+    live_path = base_dir / "cockpit_inputs" / f"cockpit-{os.getpid()}.sock"
+    sock = _bind_socket(live_path)
+    try:
+        result = cockpit_socket_reap_handler({"base_dir": str(base_dir)})
+        assert result == {"reaped": 0}
+        assert live_path.exists() and live_path.is_socket()
+    finally:
+        sock.close()
+        live_path.unlink(missing_ok=True)
+
+
+def test_cockpit_socket_reap_registered_on_roster_every_5m() -> None:
+    """``cockpit_socket.reap`` is registered as a 5-minute roster entry.
+
+    Without a periodic schedule the bootstrap-only call recreates the
+    #1592 regression: stale sockets pile up over the lifetime of a boot.
+    """
+    from pollypm.heartbeat import Roster
+    from pollypm.heartbeat.roster import EverySchedule
+    from pollypm.plugin_api.v1 import RosterAPI
+    from pollypm.plugins_builtin.core_recurring.plugin import plugin as core_plugin
+
+    roster = Roster()
+    api = RosterAPI(roster, plugin_name="core_recurring")
+    core_plugin.register_roster(api)
+
+    entries = {entry.handler_name: entry for entry in roster.entries}
+    entry = entries.get("cockpit_socket.reap")
+    assert entry is not None, "cockpit_socket.reap missing from roster"
+    assert isinstance(entry.schedule, EverySchedule)
+    assert int(entry.schedule.interval.total_seconds()) == 300
+
+
+def test_cockpit_socket_reap_handler_registered() -> None:
+    """``cockpit_socket.reap`` is wired into the JobHandlerRegistry."""
+    from pollypm.jobs import JobHandlerRegistry
+    from pollypm.plugin_api.v1 import JobHandlerAPI
+    from pollypm.plugins_builtin.core_recurring.plugin import plugin as core_plugin
+
+    registry = JobHandlerRegistry()
+    api = JobHandlerAPI(registry, plugin_name="core_recurring")
+    core_plugin.register_handlers(api)
+    assert "cockpit_socket.reap" in registry.names()
+
+
 def test_bootstrap_path_creates_then_reaps_only_stale(base_dir: Path) -> None:
     """Bootstrap-style flow: bind sockets, kill some "owners" by closing
     + naming them with dead PIDs, run reaper, assert only stale ones

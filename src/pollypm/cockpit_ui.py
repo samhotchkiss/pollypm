@@ -14217,6 +14217,11 @@ def _dashboard_inbox(
             "updated_at": item.get("updated_at"),
             "triage_label": item.get("triage_label", ""),
             "source": item.get("source", "task"),
+            # Carry ``needs_action`` so the project dashboard can
+            # split spillover into "action just didn't fit" (keep
+            # the ``Press i`` CTA) vs purely FYI/completed rows
+            # (suppress the redundant CTA, #1650).
+            "needs_action": bool(item.get("needs_action")),
         }
         for item in items[:3]
     ]
@@ -17726,10 +17731,13 @@ class PollyProjectDashboardApp(App[None]):
         # items, the line is redundant with the screen footer ("i
         # inbox") and just adds vertical noise. Keep it when the
         # inbox has spillover so the user knows where to look.
+        # FYI/info preview rows (completed updates, etc.) do *not*
+        # count as spillover: they're already visible under "Other
+        # open items" and there's no hidden user action behind them,
+        # so the CTA would just repeat the footer keybinding (#1650).
         has_spillover = (
             (count and count > displayed_actions)
             or bool(action_previews)
-            or bool(info_previews)
         )
         if has_spillover:
             lines.append("")

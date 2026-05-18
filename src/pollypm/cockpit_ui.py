@@ -14799,10 +14799,36 @@ def _resolve_project_key(
     return None
 
 
-def _gather_project_dashboard(
+def _gather_project_dashboard_fast(
     config_path: Path, project_key: str,
 ) -> ProjectDashboardData | None:
-    """Build the full ``ProjectDashboardData`` snapshot for one project."""
+    """Build the fast-paint slice of the dashboard snapshot.
+
+    #1643 — the full ``_gather_project_dashboard`` path takes ~1s on a
+    cold project (the activity-feed query + supervisor open_alerts each
+    pay 200–700ms on a fresh SQLite DB). That blew through the 500ms
+    first-paint budget #1290 set, and left the test pilot looking at
+    the loading skeleton after a single ``pilot.pause()``.
+
+    Split the snapshot into two passes:
+
+    * Fast (this function): tasks, inbox, plan, plan-task summary. Returns
+      a ``ProjectDashboardData`` with ``activity_entries=[]``,
+      ``active_worker=None``, ``alert_count=0``, ``alert_types=[]``. Empty
+      defaults are safe because every render path tolerates them — the
+      activity section shows "No recent activity" briefly, the banner
+      drops the worker line, and the pill falls back to inbox /
+      in_progress signals which are already populated.
+    * Secondary (:func:`_augment_project_dashboard_secondary`): folds the
+      activity entries + active-worker classification + alert count back
+      onto the existing snapshot so the second render fills in the
+      cosmetic fields without re-doing the work above.
+
+    Callers that want the full snapshot in one shot (CLI tests, the
+    ``_FORCE_RENDER_EVERY_N_TICKS`` poll path) keep using
+    :func:`_gather_project_dashboard` — it composes the fast + secondary
+    paths sequentially and is unchanged from the caller's perspective.
+    """
     try:
         config = load_config(config_path)
     except Exception:  # noqa: BLE001
@@ -14868,7 +14894,6 @@ def _gather_project_dashboard(
             )
         except Exception:  # noqa: BLE001
             plan_task_summary = None
-        activity_entries = _dashboard_activity(config_path, project_key)
     else:
         counts = {}
         buckets = {}
@@ -14883,11 +14908,15 @@ def _gather_project_dashboard(
         plan_mtime = None
         plan_stale_reason = None
         plan_task_summary = None
-        activity_entries = []
 
-    active_worker, alert_count, alert_types = _dashboard_active_worker(
-        config_path, project_key, action_items=action_items,
-    )
+    # #1643 — fast slice: skip ``_dashboard_active_worker`` (calls
+    # supervisor.open_alerts, ~200ms cold) and ``_dashboard_activity``
+    # (projects the messages table, ~700ms cold). Both are cosmetic for
+    # the first paint and arrive in the secondary pass.
+    active_worker = None
+    alert_count = 0
+    alert_types: list[str] = []
+    activity_entries: list[dict] = []
     blocker_count = int(counts.get("blocked", 0))
     on_hold_count = int(counts.get("on_hold", 0))
     in_progress_count = int(counts.get("in_progress", 0))
@@ -14949,6 +14978,71 @@ def _gather_project_dashboard(
         alert_types=alert_types,
         enforce_plan=enforce_plan,
     )
+
+
+def _augment_project_dashboard_secondary(
+    data: ProjectDashboardData,
+    config_path: Path,
+) -> ProjectDashboardData:
+    """Fold the slow secondary fields onto an existing fast snapshot.
+
+    #1643 — runs the two slow-path calls
+    (:func:`_dashboard_active_worker`, :func:`_dashboard_activity`) that
+    :func:`_gather_project_dashboard_fast` deliberately skipped, then
+    mutates ``data`` in place with the resulting fields. Recomputes the
+    status pill so the colour/label reflect the worker + alert state
+    the user expects once the secondary pass lands.
+
+    Returns ``data`` for chaining; ``data`` is mutated in place so any
+    existing reference (the dashboard's ``self.data``) reflects the
+    update.
+    """
+    project_key = data.project_key
+    activity_entries = _dashboard_activity(config_path, project_key)
+    active_worker, alert_count, alert_types = _dashboard_active_worker(
+        config_path, project_key, action_items=data.action_items,
+    )
+    counts = data.task_counts or {}
+    blocker_count = int(counts.get("blocked", 0))
+    on_hold_count = int(counts.get("on_hold", 0))
+    in_progress_count = int(counts.get("in_progress", 0))
+    status_dot, status_color, status_label = _dashboard_status(
+        active_worker,
+        data.inbox_count,
+        alert_count,
+        None,
+        blocker_count=blocker_count,
+        on_hold_count=on_hold_count,
+        in_progress_count=in_progress_count,
+        plan_task_summary=data.plan_task_summary,
+        alert_types=alert_types,
+    )
+    data.activity_entries = activity_entries
+    data.active_worker = active_worker
+    data.alert_count = alert_count
+    data.alert_types = alert_types
+    data.status_dot = status_dot
+    data.status_color = status_color
+    data.status_label = status_label
+    return data
+
+
+def _gather_project_dashboard(
+    config_path: Path, project_key: str,
+) -> ProjectDashboardData | None:
+    """Build the full ``ProjectDashboardData`` snapshot for one project.
+
+    Composes :func:`_gather_project_dashboard_fast` +
+    :func:`_augment_project_dashboard_secondary` so callers that want the
+    full snapshot in one call (CLI tests, periodic refresh) keep working
+    unchanged. The dashboard UI's first-paint path uses the two helpers
+    independently so the user sees content the moment the fast pass
+    completes, instead of waiting on the secondary DB queries.
+    """
+    fast = _gather_project_dashboard_fast(config_path, project_key)
+    if fast is None:
+        return None
+    return _augment_project_dashboard_secondary(fast, config_path)
 
 
 def _project_dashboard_signature(
@@ -15750,12 +15844,19 @@ class PollyProjectDashboardApp(App[None]):
         # actual gather runs on a worker thread (mirrors the workspace
         # dashboard's ``_refresh_dashboard_sync`` pattern) and the
         # first ``_render`` fires when it completes.
+        #
+        # #1643 — defer the first ``_refresh`` via ``call_after_refresh``
+        # so the skeleton paint flushes BEFORE the worker is dispatched.
+        # Mirrors the #1653 operator-dashboard fix: ``run_worker``
+        # initialization + lazy-import resolution can briefly delay the
+        # first frame on a cold cockpit-pane process even though the
+        # worker itself runs off-thread.
         self.topbar.update(
             f"[b]{_escape(self.project_key)}[/b]   "
             f"[dim]loading project dashboard…[/dim]"
         )
         self._first_refresh_running = False
-        self._refresh()
+        self.call_after_refresh(self._refresh)
         self.set_interval(self.REFRESH_INTERVAL_SECONDS, self._refresh)
         # Alert toast surface removed in #956 — ``a`` still opens the
         # alert list (Metrics drill-down).
@@ -16006,15 +16107,38 @@ class PollyProjectDashboardApp(App[None]):
         """Off-thread first-refresh: gather then hand back to the UI
         thread for render. Keeps the placeholder topbar visible
         instead of freezing the cockpit pane during cold-boot data
-        load."""
+        load.
+
+        #1643 — gather in two passes. The fast pass (tasks + inbox +
+        plan) lands first and is what the user sees on the very next
+        Textual repaint cycle, well under the 500ms first-useful-content
+        budget. The secondary pass (activity-feed projection +
+        supervisor open_alerts + worker-activity classification) folds
+        cosmetic fields back onto the snapshot a moment later. The two
+        slow-path calls each pay 200–700ms on a cold SQLite DB, and
+        running them inline made ``pilot.pause()`` resolve before the
+        worker completion, leaving the test pilot on the loading
+        skeleton.
+        """
         try:
-            data = _gather_project_dashboard(
+            fast = _gather_project_dashboard_fast(
                 self.config_path, self.project_key,
             )
         except Exception as exc:  # noqa: BLE001
             self.call_from_thread(self._first_refresh_failed, str(exc))
             return
-        self.call_from_thread(self._first_refresh_completed, data)
+        self.call_from_thread(self._first_refresh_completed, fast)
+        if fast is None:
+            return
+        try:
+            _augment_project_dashboard_secondary(fast, self.config_path)
+        except Exception:  # noqa: BLE001
+            # Secondary pass failures are non-fatal: the user has the
+            # fast snapshot rendered already; the cosmetic activity +
+            # worker-state fields just stay at their fast-pass defaults
+            # until the next periodic refresh.
+            return
+        self.call_from_thread(self._first_refresh_secondary_completed, fast)
 
     def _first_refresh_completed(self, data) -> None:
         self._first_refresh_running = False
@@ -16024,6 +16148,25 @@ class PollyProjectDashboardApp(App[None]):
         # gather resolved, not whatever the user typed at the rail.
         if data is not None and getattr(data, "project_key", None):
             self.project_key = data.project_key
+        self._last_render_signature = _project_dashboard_signature(data)
+        self._render()
+
+    def _first_refresh_secondary_completed(self, data) -> None:
+        """Re-render after the secondary (activity + worker) pass lands.
+
+        #1643 — ``data`` is the same ``ProjectDashboardData`` instance
+        the fast pass posted, now mutated in place with activity +
+        active_worker + alert state. Re-render so the cosmetic fields
+        (Current activity section, worker line on the banner, status
+        pill colour) reflect the secondary pass without forcing the
+        user to wait on it for the first paint.
+        """
+        if self.data is None or self.data is not data:
+            # A subsequent refresh tick replaced ``self.data`` between
+            # the fast and secondary completions. Trust the newer
+            # snapshot and skip the secondary render — the periodic
+            # tick will pick up the secondary state on its own.
+            return
         self._last_render_signature = _project_dashboard_signature(data)
         self._render()
 

@@ -1,10 +1,18 @@
-"""Per-heuristic unit tests for ``classify_legacy`` (#1570).
+"""Per-heuristic unit tests for ``classify_legacy`` (#1570, #1564 follow-up).
 
 Locks in the spec order so a refactor cannot silently shuffle
 priorities. Each heuristic gets a positive case (the canonical
 shape) and a negative case (a row that looks similar but should
 not match), plus a top-level test that an unmatched row returns
 ``None`` so the CLI's "leave it legacy" branch keeps working.
+
+Two surfaces:
+
+* :func:`classify_legacy` — messages-shaped rows (#1570). The first
+  six sections cover its heuristics.
+* :func:`classify_legacy_task` — work_tasks-shaped rows added in the
+  #1564 follow-up so the dashboard's "Watchdog escalated: …" task
+  rows can be retagged off ``legacy``.
 """
 
 from __future__ import annotations
@@ -14,6 +22,7 @@ import pytest
 from pollypm.inbox.backfill_heuristics import (
     Classification,
     classify_legacy,
+    classify_legacy_task,
 )
 from pollypm.inbox.kind import InboxItemKind
 
@@ -233,3 +242,107 @@ def test_classification_carries_heuristic_label() -> None:
     assert isinstance(out, Classification)
     assert out.heuristic
     assert out.kind is InboxItemKind.PLAN_REVIEW_PENDING
+
+
+# ---------------------------------------------------------------------------
+# classify_legacy_task — work_tasks-shaped rows (#1564 follow-up)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        # Verbatim watchdog finding shapes observed in the user's
+        # 2026-05-17 dashboard (queue_without_motion safety-net probe).
+        (
+            "Project savethenovel has 2 queued task(s) but no claim / "
+            "execution / status-change activity for the entire scan window."
+        ),
+        (
+            "Project coffeeboardnm has 4 queued task(s) but no claim / "
+            "execution / status-change activity for ~31 min."
+        ),
+        (
+            "Project pollypm has 1 queued task(s) but no claim / "
+            "execution / status-change activity for the entire scan window."
+        ),
+    ],
+)
+def test_watchdog_queue_without_motion_task_classifies_dispatch(
+    title: str,
+) -> None:
+    out = classify_legacy_task(title=title, created_by="audit_watchdog")
+    assert out is not None
+    assert out.kind is InboxItemKind.WATCHDOG_OPERATOR_DISPATCH
+    assert out.heuristic == "watchdog_queue_without_motion"
+
+
+def test_watchdog_escalated_prefix_classifies_dispatch() -> None:
+    """Defensive: any future producer using the cockpit's render copy is caught."""
+    out = classify_legacy_task(
+        title="Watchdog escalated: queue wedged on demo",
+        created_by="audit_watchdog",
+    )
+    assert out is not None
+    assert out.kind is InboxItemKind.WATCHDOG_OPERATOR_DISPATCH
+    assert out.heuristic == "watchdog_escalated_prefix"
+
+
+def test_queue_motion_pattern_only_matches_audit_watchdog_creator() -> None:
+    """Same title prose from a non-watchdog creator must not be misattributed."""
+    out = classify_legacy_task(
+        title=(
+            "Project demo has 3 queued task(s) but no claim / "
+            "execution / status-change activity for ~5 min."
+        ),
+        created_by="polly",
+    )
+    assert out is None
+
+
+def test_plan_ready_for_review_task_classifies_plan_review_pending() -> None:
+    """Watchdog-emitted plan-review tasks use the same prefix as messages."""
+    out = classify_legacy_task(
+        title="Plan ready for review: coffeeboardnm",
+        created_by="audit_watchdog",
+    )
+    assert out is not None
+    assert out.kind is InboxItemKind.PLAN_REVIEW_PENDING
+    assert out.heuristic == "title_prefix:plan_ready_for_review"
+
+
+def test_plan_ready_for_review_task_from_architect_classifies_too() -> None:
+    """Architect-authored plan-review tasks classify the same way."""
+    out = classify_legacy_task(
+        title="Plan ready for review: bikepath",
+        created_by="architect_bikepath",
+    )
+    assert out is not None
+    assert out.kind is InboxItemKind.PLAN_REVIEW_PENDING
+
+
+def test_unrelated_task_title_returns_none() -> None:
+    """Random task titles must not classify."""
+    out = classify_legacy_task(
+        title="Refactor session_runtime helper",
+        created_by="polly",
+    )
+    assert out is None
+
+
+def test_task_classifier_handles_missing_fields() -> None:
+    """Empty inputs are safe — return None."""
+    assert classify_legacy_task(title="", created_by="") is None
+
+
+def test_task_classifier_watchdog_pattern_is_case_insensitive() -> None:
+    """Capitalisation drift in the finding body shouldn't break the rule."""
+    out = classify_legacy_task(
+        title=(
+            "PROJECT DEMO HAS 5 QUEUED TASK(S) BUT NO CLAIM / "
+            "EXECUTION / STATUS-CHANGE ACTIVITY FOR ~5 MIN."
+        ),
+        created_by="audit_watchdog",
+    )
+    assert out is not None
+    assert out.kind is InboxItemKind.WATCHDOG_OPERATOR_DISPATCH

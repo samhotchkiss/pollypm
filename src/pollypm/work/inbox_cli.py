@@ -20,7 +20,11 @@ import typer
 
 from pollypm.cli_help import help_with_examples
 from pollypm.inbox import awaits_user
-from pollypm.inbox.backfill_heuristics import Classification, classify_legacy
+from pollypm.inbox.backfill_heuristics import (
+    Classification,
+    classify_legacy,
+    classify_legacy_task,
+)
 from pollypm.inbox.kind import InboxItemKind, coerce_kind as _coerce_inbox_kind
 from pollypm.inbox_message_refs import unknown_project_refs
 from pollypm.work.cli import (
@@ -1134,17 +1138,22 @@ def _apply_kind_update(
 def _emit_backfill_audit(
     *,
     project: str,
-    msg_id: int,
+    subject: str,
     new_kind: InboxItemKind,
     heuristic: str,
 ) -> None:
-    """Audit-log one reclassification. Best-effort — never raises."""
+    """Audit-log one reclassification. Best-effort — never raises.
+
+    ``subject`` is the audit-event subject (``msg:<id>`` for message
+    backfills, ``<project>/<task_number>`` for task backfills) so a
+    forensic read can tell which surface a row came from.
+    """
     from pollypm.audit.log import EVENT_INBOX_KIND_BACKFILLED, emit
 
     emit(
         event=EVENT_INBOX_KIND_BACKFILLED,
         project=project or "",
-        subject=f"msg:{msg_id}",
+        subject=subject,
         actor="user",
         status="ok",
         metadata={
@@ -1155,13 +1164,81 @@ def _emit_backfill_audit(
     )
 
 
+# ---------------------------------------------------------------------------
+# Task-side backfill (work_tasks.kind, #1564 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def _legacy_task_rows(
+    db_path: str,
+    *,
+    project: str | None,
+) -> list[Any]:
+    """Return every non-terminal task still tagged ``kind='legacy'``.
+
+    Mirrors the scope of :func:`_legacy_message_rows` (the population
+    the dashboard's "Waiting on you" section would otherwise lump
+    together). Terminal-state tasks (``done`` / ``cancelled``) are
+    intentionally included: the user's 2026-05-17 dashboard surfaced
+    cancelled ``audit_watchdog`` rows, and the awaits-user predicate
+    treats ``legacy`` as visible regardless of work_status.
+    """
+    from pollypm.work import create_work_service
+
+    from pathlib import Path
+
+    svc = create_work_service(
+        db_path=db_path,
+        project_path=Path(db_path).parent.parent,
+    )
+    try:
+        tasks = svc.list_tasks(project=project)
+    finally:
+        svc.close()
+
+    return [
+        task for task in tasks
+        if getattr(task, "kind", InboxItemKind.LEGACY) is InboxItemKind.LEGACY
+    ]
+
+
+def _task_classification(task: Any) -> Classification | None:
+    """Run the task-side heuristic against one row's title + creator."""
+    return classify_legacy_task(
+        title=str(getattr(task, "title", "") or ""),
+        created_by=str(getattr(task, "created_by", "") or ""),
+    )
+
+
+def _apply_task_kind_update(
+    db_path: str,
+    *,
+    task_id: str,
+    new_kind: InboxItemKind,
+) -> None:
+    """Persist a single ``work_tasks.kind`` reclassification."""
+    from pollypm.work import create_work_service
+
+    from pathlib import Path
+
+    svc = create_work_service(
+        db_path=db_path,
+        project_path=Path(db_path).parent.parent,
+    )
+    try:
+        svc.backfill_kind(task_id, new_kind=new_kind.value)
+    finally:
+        svc.close()
+
+
 @inbox_app.command(
     "backfill-kinds",
     help=(
         "One-time backfill of ``kind`` for inbox rows that still carry "
-        "``kind='legacy'`` (#1570). Dry-run by default — pass --commit "
-        "to actually mutate. Idempotent: rows already on a non-legacy "
-        "kind are skipped."
+        "``kind='legacy'`` (#1570, #1564 follow-up). Scans both the "
+        "messages table and the work_tasks table; dry-run by default — "
+        "pass --commit to actually mutate. Idempotent: rows already on "
+        "a non-legacy kind are skipped."
     ),
 )
 def backfill_kinds(
@@ -1189,9 +1266,12 @@ def backfill_kinds(
     """Reclassify legacy inbox rows by heuristic.
 
     Heuristics live in :mod:`pollypm.inbox.backfill_heuristics` and
-    are applied in spec order; unmatched rows stay legacy. Every
-    committed row emits one ``inbox.kind_backfilled`` audit event
-    with the old kind, new kind, and matched heuristic name.
+    are applied in spec order; unmatched rows stay legacy. Scans the
+    messages table and the work_tasks table; the dry-run report
+    breaks the counts down per surface so the operator can see what
+    each table contributes. Every committed row emits one
+    ``inbox.kind_backfilled`` audit event with the old kind, new
+    kind, and matched heuristic name.
     """
     if commit and dry_run:
         typer.echo(
@@ -1206,7 +1286,7 @@ def backfill_kinds(
     db_path = _resolve_db_path(db, project=project)
 
     try:
-        rows = _legacy_message_rows(db_path, project=project)
+        message_rows = _legacy_message_rows(db_path, project=project)
     except Exception as exc:  # noqa: BLE001
         typer.echo(
             f"Error: failed to read legacy inbox rows ({exc}).",
@@ -1214,77 +1294,151 @@ def backfill_kinds(
         )
         raise typer.Exit(code=1) from exc
 
-    if not rows:
+    try:
+        task_rows = _legacy_task_rows(db_path, project=project)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(
+            f"Error: failed to read legacy work_task rows ({exc}).",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    if not message_rows and not task_rows:
         typer.echo("No legacy inbox rows to reclassify.")
         return
 
     mode_label = "commit" if effective_commit else "dry-run"
     typer.echo(
-        f"Scanning {len(rows)} legacy inbox row(s) "
-        f"({mode_label})."
+        f"Scanning {len(message_rows)} legacy message row(s) and "
+        f"{len(task_rows)} legacy task row(s) ({mode_label})."
     )
-    typer.echo(
-        f"{'ID':<12} {'Project':<18} {'Heuristic → New kind':<48} Title"
-    )
-    typer.echo("-" * 110)
 
-    matched = 0
-    unmatched = 0
-    failures: list[tuple[int, str]] = []
-    for row in rows:
-        msg_id_raw = row.get("id")
-        if msg_id_raw is None:
-            continue
-        msg_id = int(msg_id_raw)
-        scope = str(row.get("scope") or "-")
-        title_preview = _title_preview(str(row.get("subject") or ""))
-        classification = _row_classification(row)
-        if classification is None:
-            unmatched += 1
-            typer.echo(
-                f"msg:{msg_id:<8} {scope:<18} {'(unmatched, stays legacy)':<48} "
-                f"{title_preview}"
-            )
-            continue
+    msg_matched = msg_unmatched = 0
+    task_matched = task_unmatched = 0
+    msg_failures: list[tuple[int, str]] = []
+    task_failures: list[tuple[str, str]] = []
 
-        matched += 1
-        action = (
-            f"{classification.heuristic} → {classification.kind.value}"
-        )
+    # Messages surface.
+    if message_rows:
+        typer.echo("")
+        typer.echo("Messages:")
         typer.echo(
-            f"msg:{msg_id:<8} {scope:<18} {action:<48} {title_preview}"
+            f"{'ID':<12} {'Project':<18} {'Heuristic → New kind':<48} Title"
         )
+        typer.echo("-" * 110)
+        for row in message_rows:
+            msg_id_raw = row.get("id")
+            if msg_id_raw is None:
+                continue
+            msg_id = int(msg_id_raw)
+            scope = str(row.get("scope") or "-")
+            title_preview = _title_preview(str(row.get("subject") or ""))
+            classification = _row_classification(row)
+            if classification is None:
+                msg_unmatched += 1
+                typer.echo(
+                    f"msg:{msg_id:<8} {scope:<18} {'(unmatched, stays legacy)':<48} "
+                    f"{title_preview}"
+                )
+                continue
 
-        if not effective_commit:
-            continue
-
-        try:
-            _apply_kind_update(
-                db_path, msg_id=msg_id, new_kind=classification.kind,
+            msg_matched += 1
+            action = (
+                f"{classification.heuristic} → {classification.kind.value}"
             )
-        except Exception as exc:  # noqa: BLE001
-            failures.append((msg_id, str(exc)))
-            continue
-        _emit_backfill_audit(
-            project=scope,
-            msg_id=msg_id,
-            new_kind=classification.kind,
-            heuristic=classification.heuristic,
+            typer.echo(
+                f"msg:{msg_id:<8} {scope:<18} {action:<48} {title_preview}"
+            )
+            if not effective_commit:
+                continue
+            try:
+                _apply_kind_update(
+                    db_path, msg_id=msg_id, new_kind=classification.kind,
+                )
+            except Exception as exc:  # noqa: BLE001
+                msg_failures.append((msg_id, str(exc)))
+                continue
+            _emit_backfill_audit(
+                project=scope,
+                subject=f"msg:{msg_id}",
+                new_kind=classification.kind,
+                heuristic=classification.heuristic,
+            )
+
+    # Tasks surface.
+    if task_rows:
+        typer.echo("")
+        typer.echo("Tasks:")
+        typer.echo(
+            f"{'ID':<18} {'Project':<18} {'Heuristic → New kind':<48} Title"
         )
+        typer.echo("-" * 110)
+        for task in task_rows:
+            task_id = str(getattr(task, "task_id", "") or "")
+            if not task_id:
+                continue
+            task_project = str(getattr(task, "project", "") or "-")
+            title_preview = _title_preview(
+                str(getattr(task, "title", "") or "")
+            )
+            classification = _task_classification(task)
+            if classification is None:
+                task_unmatched += 1
+                typer.echo(
+                    f"{task_id:<18} {task_project:<18} "
+                    f"{'(unmatched, stays legacy)':<48} {title_preview}"
+                )
+                continue
+
+            task_matched += 1
+            action = (
+                f"{classification.heuristic} → {classification.kind.value}"
+            )
+            typer.echo(
+                f"{task_id:<18} {task_project:<18} {action:<48} {title_preview}"
+            )
+            if not effective_commit:
+                continue
+            try:
+                _apply_task_kind_update(
+                    db_path,
+                    task_id=task_id,
+                    new_kind=classification.kind,
+                )
+            except Exception as exc:  # noqa: BLE001
+                task_failures.append((task_id, str(exc)))
+                continue
+            _emit_backfill_audit(
+                project=task_project,
+                subject=task_id,
+                new_kind=classification.kind,
+                heuristic=classification.heuristic,
+            )
 
     typer.echo("-" * 110)
+    matched = msg_matched + task_matched
+    unmatched = msg_unmatched + task_unmatched
     if effective_commit:
         typer.echo(
-            f"Reclassified {matched} row(s); {unmatched} unmatched."
+            f"Reclassified {matched} row(s) "
+            f"({msg_matched} message(s), {task_matched} task(s)); "
+            f"{unmatched} unmatched "
+            f"({msg_unmatched} message(s), {task_unmatched} task(s))."
         )
-        if failures:
+        if msg_failures or task_failures:
+            total_failures = len(msg_failures) + len(task_failures)
             typer.echo(
-                f"Failed to update {len(failures)} row(s):", err=True,
+                f"Failed to update {total_failures} row(s):", err=True,
             )
-            for mid, reason in failures[:5]:
+            for mid, reason in msg_failures[:5]:
                 typer.echo(f"  msg:{mid}: {reason}", err=True)
+            for tid, reason in task_failures[:5]:
+                typer.echo(f"  {tid}: {reason}", err=True)
     else:
         typer.echo(
-            f"Would reclassify {matched} row(s); {unmatched} unmatched."
+            f"Would reclassify {matched} row(s) "
+            f"({msg_matched} message(s), {task_matched} task(s)); "
+            f"{unmatched} unmatched "
+            f"({msg_unmatched} message(s), {task_unmatched} task(s))."
         )
     typer.echo(_BACKFILL_HINT)

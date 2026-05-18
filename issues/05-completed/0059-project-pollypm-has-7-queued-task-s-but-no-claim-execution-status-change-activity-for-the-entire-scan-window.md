@@ -1,4 +1,4 @@
-# Project pollypm has 7 queued task(s) but no claim / execution / status-change activity for the entire scan window.
+# [CANCELLED] Project pollypm has 7 queued task(s) but no claim / execution / status-change activity for the entire scan window.
 
 TIER HANDOFF
 

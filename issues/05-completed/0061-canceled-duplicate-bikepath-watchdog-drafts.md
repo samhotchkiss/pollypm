@@ -1,4 +1,4 @@
-# Canceled duplicate bikepath watchdog drafts
+# [CANCELLED] Canceled duplicate bikepath watchdog drafts
 
 **Action taken:** Canceled bikepath/31, bikepath/32, and bikepath/33.
 

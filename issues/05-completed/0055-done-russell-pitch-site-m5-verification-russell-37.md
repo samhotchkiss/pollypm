@@ -1,4 +1,4 @@
-# Done: Russell pitch site M5 verification (russell/37)
+# [CANCELLED] Done: Russell pitch site M5 verification (russell/37)
 
 **Verdict:** Pitch-ready. All 5 M5 acceptance criteria pass on the first run.
 

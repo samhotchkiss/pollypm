@@ -15,13 +15,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.widgets import Static
+from textual.widgets import ListItem, ListView, Static
 
 from pollypm.cockpit_markup import _escape
 from pollypm.cockpit_palette import _open_keyboard_help
 from pollypm.dashboard import (
+    OperatorDashboardRow,
     OperatorDashboardView,
     ProjectState,
     glyph_for_project_state,
@@ -40,6 +42,7 @@ class PollyOperatorDashboardApp(App[None]):
     BINDINGS = [
         Binding("r", "refresh", "Refresh"),
         Binding("i", "jump_inbox", "Inbox"),
+        Binding("enter", "open_focused", "Open"),
         Binding("question_mark", "show_keyboard_help", "Help", priority=True),
         Binding("j,down", "scroll_down", "Down", show=False),
         Binding("k,up", "scroll_up", "Up", show=False),
@@ -63,6 +66,32 @@ class PollyOperatorDashboardApp(App[None]):
         padding: 1 0 0 0;
     }
     .section-body { padding: 0 0 0 2; }
+    #waiting-list {
+        height: auto;
+        background: transparent;
+        border: none;
+        padding: 0 0 0 2;
+        margin: 0;
+        scrollbar-size: 0 0;
+    }
+    #waiting-list > .waiting-row {
+        height: 1;
+        padding: 0 0;
+        background: transparent;
+        color: #c9d1d9;
+    }
+    #waiting-list > .waiting-row.--highlight {
+        background: #1e2730;
+    }
+    #waiting-list:focus-within > .waiting-row.--highlight {
+        background: #243140;
+    }
+    #waiting-list > .waiting-empty {
+        height: 1;
+        padding: 0;
+        background: transparent;
+        color: #484f58;
+    }
     .footer { color: #484f58; padding: 1 0 0 0; }
     """
 
@@ -71,7 +100,7 @@ class PollyOperatorDashboardApp(App[None]):
         self.config_path = config_path
         self.header_w = Static("", classes="header", markup=True)
         self.waiting_title = Static("[b]Waiting on you[/b]", classes="section-title", markup=True)
-        self.waiting_body = Static("", classes="section-body", markup=True)
+        self.waiting_list = ListView(id="waiting-list")
         self.working_title = Static("[b]Working[/b]", classes="section-title", markup=True)
         self.working_body = Static("", classes="section-body", markup=True)
         self.idle_title = Static("[b]Idle[/b]", classes="section-title", markup=True)
@@ -86,7 +115,7 @@ class PollyOperatorDashboardApp(App[None]):
     def compose(self) -> ComposeResult:
         yield self.header_w
         yield self.waiting_title
-        yield self.waiting_body
+        yield self.waiting_list
         yield self.working_title
         yield self.working_body
         yield self.idle_title
@@ -98,6 +127,11 @@ class PollyOperatorDashboardApp(App[None]):
     def on_mount(self) -> None:
         self._refresh()
         self.set_interval(10, self._refresh)
+        # Focus the waiting list so j/k/enter work without an extra tab.
+        try:
+            self.waiting_list.focus()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             from pollypm.cockpit_input_bridge import start_input_bridge
             self._input_bridge_handle = start_input_bridge(
@@ -166,9 +200,7 @@ class PollyOperatorDashboardApp(App[None]):
                 counts += f"  ·  [dim]{len(view.paused)} paused[/dim]"
             self.header_w.update(f"  {counts}")
 
-        self.waiting_body.update(
-            _format_section(view.waiting, empty="Nothing waiting.")
-        )
+        self._populate_waiting(view.waiting)
         self.working_body.update(
             _format_section(view.working, empty="Nothing actively working.")
         )
@@ -182,35 +214,111 @@ class PollyOperatorDashboardApp(App[None]):
             self.paused_title.update("")
             self.paused_body.update("")
 
-        footer = "[dim]Press [b]r[/b] to refresh · [b]i[/b] to jump to inbox[/dim]"
+        footer = (
+            "[dim]Press [b]enter[/b] to open · [b]j[/b]/[b]k[/b] move"
+            " · [b]r[/b] refresh · [b]i[/b] inbox · [b]?[/b] help[/dim]"
+        )
         if self._refresh_error:
             footer += f"  ·  [#f85149]error: {_escape(self._refresh_error)}[/#f85149]"
         self.footer_w.update(footer)
 
     def action_jump_inbox(self) -> None:
+        self._jump_to_inbox(project_key=None)
+
+    def action_open_focused(self) -> None:
+        """Open the focused 'Waiting on you' row in the inbox.
+
+        Falls back to the global inbox jump when no row is focused (e.g. an
+        empty waiting list or focus on a non-row widget).
+        """
+        project_key = self._focused_waiting_project_key()
+        self._jump_to_inbox(project_key=project_key)
+
+    @on(ListView.Selected, "#waiting-list")
+    def _on_waiting_selected(self, event: ListView.Selected) -> None:
+        item = event.item
+        project_key = getattr(item, "project_key", None)
+        if isinstance(project_key, str) and project_key:
+            self._jump_to_inbox(project_key=project_key)
+
+    def _focused_waiting_project_key(self) -> str | None:
+        try:
+            highlighted = self.waiting_list.highlighted_child
+        except Exception:  # noqa: BLE001
+            return None
+        project_key = getattr(highlighted, "project_key", None)
+        if isinstance(project_key, str) and project_key:
+            return project_key
+        return None
+
+    def _jump_to_inbox(self, *, project_key: str | None) -> None:
         from pollypm.cockpit_navigation_client import file_navigation_client
 
         try:
             file_navigation_client(
                 self.config_path, client_id="polly-operator",
-            ).jump_to_inbox()
+            ).jump_to_inbox(project_key=project_key)
         except Exception as exc:  # noqa: BLE001
             self.notify(f"Jump to inbox failed: {exc}", severity="error")
+
+    def _populate_waiting(self, rows) -> None:
+        """Replace the waiting list's children with one ListItem per row."""
+        list_view = self.waiting_list
+        try:
+            list_view.clear()
+        except Exception:  # noqa: BLE001
+            return
+        if not rows:
+            list_view.append(
+                ListItem(
+                    Static("[dim]Nothing waiting.[/dim]", markup=True),
+                    classes="waiting-empty",
+                )
+            )
+            # The empty row should not be interactable.
+            try:
+                list_view.children[0].disabled = True  # type: ignore[attr-defined]
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        for row in rows:
+            list_view.append(_WaitingListItem(row))
 
     def _dashboard_screen(self):  # noqa: ANN202
         return self.screen
 
     def action_scroll_down(self) -> None:
+        if self._waiting_list_focused():
+            try:
+                self.waiting_list.action_cursor_down()
+                return
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self._dashboard_screen().scroll_down(animate=False)
         except Exception:  # noqa: BLE001
             pass
 
     def action_scroll_up(self) -> None:
+        if self._waiting_list_focused():
+            try:
+                self.waiting_list.action_cursor_up()
+                return
+            except Exception:  # noqa: BLE001
+                pass
         try:
             self._dashboard_screen().scroll_up(animate=False)
         except Exception:  # noqa: BLE001
             pass
+
+    def _waiting_list_focused(self) -> bool:
+        try:
+            focused = self.focused
+        except Exception:  # noqa: BLE001
+            return False
+        if focused is None:
+            return False
+        return focused is self.waiting_list or focused in list(self.waiting_list.walk_children())
 
     def action_scroll_home(self) -> None:
         try:
@@ -235,6 +343,28 @@ class PollyOperatorDashboardApp(App[None]):
             self._dashboard_screen().scroll_page_down(animate=False)
         except Exception:  # noqa: BLE001
             pass
+
+
+class _WaitingListItem(ListItem):
+    """One interactive row in the 'Waiting on you' section.
+
+    Carries the row's ``project_key`` so the dashboard's open action can
+    route to ``jump_to_inbox(project=key)`` without consulting an external
+    index.
+    """
+
+    def __init__(self, row: OperatorDashboardRow) -> None:
+        self.project_key: str = row.project_key
+        glyph = row.glyph if row.glyph else glyph_for_project_state(row.state)
+        color = _color_for_state(row.state)
+        glyph_markup = f"[{color}]{glyph}[/{color}]" if color else glyph
+        project = _escape(row.project_key)
+        detail = _escape(row.detail)
+        body = Static(
+            f"{glyph_markup} [b]{project}[/b]  {detail}",
+            markup=True,
+        )
+        super().__init__(body, classes="waiting-row")
 
 
 def _format_section(rows, *, empty: str) -> str:

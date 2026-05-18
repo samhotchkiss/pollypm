@@ -35,19 +35,33 @@ import logging
 import queue
 import signal
 import threading
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import Any, Protocol
 
 from sqlalchemy import insert
+from sqlalchemy.engine import Connection
 
 from pollypm.storage.sqlite_pragmas import retry_on_database_locked
 from pollypm.store.schema import messages
 
-if TYPE_CHECKING:  # pragma: no cover - import cycle guard
-    from pollypm.store.sqlalchemy_store import SQLAlchemyStore
-
 
 logger = logging.getLogger(__name__)
+
+
+class _TransactionalStore(Protocol):
+    """Structural type for the slice of the store the buffer actually uses.
+
+    The buffer only needs a writer-scoped ``transaction()`` context manager
+    yielding a SQLAlchemy :class:`~sqlalchemy.engine.Connection`. Declaring
+    that surface as a :class:`Protocol` lets ``event_buffer`` stay decoupled
+    from :class:`pollypm.store.sqlalchemy_store.SQLAlchemyStore` — the
+    previous TYPE_CHECKING back-reference is what put the two modules in a
+    static-graph 2-cycle (#1367). :class:`SQLAlchemyStore` satisfies this
+    protocol structurally; no runtime registration is required.
+    """
+
+    def transaction(self) -> AbstractContextManager[Connection]: ...
 
 
 # Module-level guard so multiple ``EventBuffer`` instances in the same
@@ -114,7 +128,7 @@ class EventBuffer:
 
     def __init__(
         self,
-        store: "SQLAlchemyStore",
+        store: _TransactionalStore,
         *,
         batch_size: int = 100,
         flush_interval: float = 0.1,

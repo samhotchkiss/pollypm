@@ -16,6 +16,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from pollypm.approval_notifications import register_default_os_adapter
 from pollypm.plugin_api.v1 import Capability, PluginAPI, PollyPMPlugin
 from pollypm.plugins_builtin.human_notify.cockpit import CockpitNotifyAdapter
 from pollypm.plugins_builtin.human_notify.dispatcher import dispatch
@@ -198,6 +199,11 @@ def _initialize(api: PluginAPI) -> None:
     global _ADAPTERS
     _ADAPTERS = _load_adapters(api)
     _task_assignment_bus.register_listener(_in_process_listener)
+    # Wire the macOS adapter as the default OS-banner channel for the
+    # core approval flow (see ``pollypm.approval_notifications``). Core
+    # used to import ``MacOsNotifyAdapter`` directly; the registration
+    # seam removes that import and keeps the plugin truly optional.
+    register_default_os_adapter(MacOsNotifyAdapter)
     n_adapters = len(_ADAPTERS)
     adapter_word = "adapter" if n_adapters == 1 else "adapters"
     logger.info(

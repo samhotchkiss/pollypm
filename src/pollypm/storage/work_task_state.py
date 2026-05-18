@@ -13,7 +13,7 @@ import sqlite3
 from pathlib import Path
 from typing import Iterable
 
-from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection | None:
     except OSError:
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         logger.debug("work_task_state: read-only connect failed for %s: %s", db_path, exc)
         return None
@@ -158,7 +158,7 @@ def project_task_total_fast(
     try:
         try:
             conn = sqlite3.connect(
-                f"file:{db_path}?mode=ro",
+                readonly_uri(db_path),
                 uri=True,
                 timeout=connect_timeout,
             )

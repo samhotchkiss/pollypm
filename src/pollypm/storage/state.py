@@ -33,6 +33,7 @@ from pathlib import Path
 from pollypm.storage.fts_query import normalize_fts_query
 from pollypm.storage.sqlite_pragmas import (
     apply_workspace_pragmas,
+    readonly_uri,
     retry_on_database_locked,
 )
 
@@ -608,7 +609,7 @@ class StateStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
         use_readonly_uri = readonly and path.exists()
-        db_target = f"file:{path}?mode=ro&immutable=1" if use_readonly_uri else str(path)
+        db_target = readonly_uri(path, immutable=True) if use_readonly_uri else str(path)
         self._conn = sqlite3.connect(db_target, check_same_thread=False, uri=use_readonly_uri)
         with self._lock:
             # #1018: centralised WAL + busy_timeout. We keep StateStore's

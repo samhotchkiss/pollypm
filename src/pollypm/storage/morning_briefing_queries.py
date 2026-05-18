@@ -7,6 +7,8 @@ import sqlite3
 from pathlib import Path
 from typing import Any, Iterable
 
+from pollypm.storage.sqlite_pragmas import readonly_uri
+
 logger = logging.getLogger(__name__)
 
 
@@ -31,7 +33,7 @@ def _open_readonly(db_path: Path) -> sqlite3.Connection | None:
     except OSError:
         return None
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         logger.debug("briefing: ro connect failed for %s: %s", db_path, exc)
         return None

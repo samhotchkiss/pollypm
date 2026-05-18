@@ -17,6 +17,8 @@ import sqlite3
 import tomllib
 from typing import Any
 
+from pollypm.storage.sqlite_pragmas import readonly_uri
+
 logger = logging.getLogger(__name__)
 
 
@@ -189,7 +191,7 @@ def _message_sources(
 
 def _query_message_rows(db_path: Path, *, limit: int) -> list[dict[str, object]]:
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.2)
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True, timeout=0.2)
     except Exception:  # noqa: BLE001
         # #1355: previously silent. A failed RO open here drops the source
         # from the preview entirely — log so DB perms / WAL drift surface

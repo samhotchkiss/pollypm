@@ -778,6 +778,7 @@ def _count_project_state_rows(
     but mirrors the same idea).
     """
     import sqlite3 as _sqlite3
+    from pollypm.storage.sqlite_pragmas import readonly_uri as _readonly_uri
 
     counts: dict[str, int] = {table: 0 for table, _w, _p in _STATE_PURGE_TABLES}
     counts["audit_tail"] = 0
@@ -785,7 +786,9 @@ def _count_project_state_rows(
     db_path = _workspace_db_path(config_path)
     if db_path and db_path.exists():
         try:
-            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            # #1674: percent-encode so URI metacharacters (``#``/``?``) in
+            # the workspace path don't get parsed as fragment/query.
+            conn = _sqlite3.connect(_readonly_uri(db_path), uri=True)
             try:
                 for table, where, ptype in _STATE_PURGE_TABLES:
                     params = (

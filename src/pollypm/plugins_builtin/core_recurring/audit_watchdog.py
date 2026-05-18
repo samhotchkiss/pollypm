@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pollypm.storage.sqlite_pragmas import readonly_uri
 from pollypm.inbox.kind import InboxItemKind
 from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
@@ -477,7 +478,7 @@ def _count_work_tasks_for_project(db_path: Path, project_key: str) -> int:
     if not db_path.exists():
         return 0
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
     except sqlite3.Error:
         return 0
     try:

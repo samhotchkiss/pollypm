@@ -15,6 +15,7 @@ import logging
 from typing import TYPE_CHECKING
 
 from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
+from pollypm.storage.sqlite_pragmas import readonly_uri
 from pollypm.work.models import Priority, Task, TaskType, WorkStatus
 from pollypm.work.role_validation import validate_role_assignments
 from pollypm.work.service_support import TaskNotFoundError, ValidationError, _now, _parse_task_id
@@ -155,7 +156,7 @@ def _enforce_product_state_gate(
     raw_value: str | None = None
     try:
         conn = sqlite3.connect(
-            f"file:{resolved_db_path}?mode=ro", uri=True,
+            readonly_uri(resolved_db_path), uri=True,
         )
     except sqlite3.Error:
         # File exists but can't open — record sentinel-healthy so we

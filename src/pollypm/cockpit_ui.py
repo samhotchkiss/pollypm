@@ -13140,7 +13140,8 @@ def _dashboard_discover_db_aliases(
 
     discovered: list[str] = []
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        from pollypm.storage.sqlite_pragmas import readonly_uri
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
     except Exception:  # noqa: BLE001
         return discovered
     try:

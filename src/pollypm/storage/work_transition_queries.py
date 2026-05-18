@@ -13,7 +13,7 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +39,7 @@ def _open_readonly(db_path: Path) -> sqlite3.Connection | None:
         return None
     try:
         conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro",
+            readonly_uri(db_path),
             uri=True,
             check_same_thread=False,
         )

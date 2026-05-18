@@ -25,6 +25,8 @@ from pollypm.cockpit_live_chat_notice import (
 )
 from pollypm.config import DEFAULT_CONFIG_PATH
 
+logger = logging.getLogger(__name__)
+
 _RIGHT_PANE_BRIDGE_BYPASS_ESCAPE_TOKENS = frozenset({"<esc>", "esc", "escape"})
 _LIVE_RIGHT_PANE_INPUT_STICKY = "live_right_pane_input_sticky"
 _HELP_MODAL_BRIDGE_KIND = "help_modal_bridge_kind"
@@ -164,6 +166,10 @@ def _remember_help_modal_bridge(
         state[_HELP_MODAL_OPENED_AT] = time.time()
         router._write_state(state)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to persist help-modal bridge state (#1355)",
+            exc_info=True,
+        )
         return
 
 
@@ -187,6 +193,10 @@ def _clear_help_modal_bridge(config_path: Path) -> None:
         if changed:
             router._write_state(state)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to clear help-modal bridge state (#1355)",
+            exc_info=True,
+        )
         return
 
 
@@ -435,6 +445,10 @@ def _set_live_right_pane_input_sticky(router: object, active: bool) -> None:
             state.pop(_LIVE_RIGHT_PANE_INPUT_STICKY, None)
         write_state(state)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to update live right-pane input sticky state (#1355)",
+            exc_info=True,
+        )
         return
 
 
@@ -543,6 +557,10 @@ def _install_cockpit_debug_log_handler(config_path: Path) -> None:
     except OSError:
         return
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to attach cockpit debug log rotating handler (#1355)",
+            exc_info=True,
+        )
         return
     handler.setLevel(logging.INFO)
     handler.setFormatter(
@@ -565,6 +583,10 @@ def _enforce_migration_gate(config_path: Path) -> None:
         from pollypm.config import load_config
         config = load_config(config_path)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to load config for cockpit migration gate (#1355)",
+            exc_info=True,
+        )
         return
     _migrations.require_no_pending_or_exit(config.project.state_db)
 
@@ -585,6 +607,10 @@ def _warn_on_plugin_load_errors(config_path: Path) -> None:
         from pollypm.service_api import collect_plugin_load_errors
         errors = collect_plugin_load_errors(config_path)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to collect plugin load errors for cockpit boot warning (#1355)",
+            exc_info=True,
+        )
         return
     if not errors:
         return

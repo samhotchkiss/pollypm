@@ -10,6 +10,7 @@ from pollypm.storage.work_task_state import (
     blocker_chain_statuses,
     has_work_task_rows,
     project_activity_probe,
+    project_task_total_fast,
     task_numbers_with_statuses,
     task_status_probe,
 )
@@ -73,6 +74,20 @@ def has_work_tasks_in_db(
 ) -> bool:
     """Return whether a work DB has task rows without exposing SQLite to callers."""
     return has_work_task_rows(Path(db_path), project_key=project_key)
+
+
+def project_task_total_fast_count(
+    db_path: Path,
+    *,
+    project_key: str,
+) -> int | None:
+    """Return a project's work-task count quickly, or ``None`` if the DB is busy.
+
+    The settings screen uses this to render a fast task total without
+    blocking the UI mount on a locked DB; ``None`` lets callers surface
+    a ``busy`` label instead of waiting on the writer.
+    """
+    return project_task_total_fast(Path(db_path), project_key=project_key)
 
 
 def project_activity(
@@ -179,6 +194,7 @@ __all__ = [
     "has_work_tasks_in_db",
     "parse_task_window_name",
     "project_activity",
+    "project_task_total_fast_count",
     "task_window_terminal_or_missing",
     "user_waiting_task_ids",
 ]

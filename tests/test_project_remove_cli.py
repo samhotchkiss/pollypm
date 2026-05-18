@@ -617,3 +617,349 @@ def test_count_active_tasks_does_not_leak_across_configs(
     # The clean config sees none — even though both use project key
     # "demo", the work DB lookup is keyed off the resolved workspace_root.
     assert _count_active_tasks("demo", other_config) == 0
+
+
+# --------------------------------------------------------------------------
+# --purge-state cascade: delete every project-scoped row from state.db
+# (#1561 wedge #3).
+# --------------------------------------------------------------------------
+
+
+def _seed_state_db_rows(
+    config_path: Path, project_key: str, *, task_count: int = 2
+) -> Path:
+    """Seed work_tasks, messages, and an audit-tail file for ``project_key``.
+
+    Returns the workspace state.db path. Uses the same factory the
+    production code uses so the test proves the wiring end-to-end. We
+    seed across multiple project-scoped tables so the test confirms
+    the sweep traverses more than just ``work_tasks``.
+    """
+    import sqlite3
+
+    from pollypm.config import load_config as _load
+    from pollypm.work import create_work_service
+
+    config = _load(config_path)
+    db_path_holder: list[Path] = []
+    with create_work_service(project_key=project_key, config=config) as svc:
+        db_path_holder.append(Path(svc._db_path))
+        for idx in range(task_count):
+            svc.create(
+                title=f"seed task {idx}",
+                description="seeded by test",
+                type="task",
+                project=project_key,
+                flow_template="standard",
+                roles={"worker": "agent-1", "reviewer": "agent-2"},
+                priority="normal",
+                created_by="test",
+            )
+    db_path = db_path_holder[0]
+
+    # Bootstrap the SQLAlchemy-managed core schema (``messages``) AND
+    # the legacy state-store schema (``worktrees``, ``architect_resume_tokens``,
+    # …). The work-service factory only materializes ``work_*`` tables;
+    # each of the other state.db tables has its own bootstrap path.
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.storage.state import StateStore
+
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        pass
+    finally:
+        store.close()
+    legacy = StateStore(db_path)
+    try:
+        pass
+    finally:
+        legacy.close()
+
+    # Seed messages + worktrees rows directly so the test exercises
+    # the cross-table sweep, not just the work_* surface.
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            "INSERT INTO messages "
+            "(scope, type, tier, recipient, sender, state, "
+            "subject, body, payload_json, labels, kind) "
+            "VALUES (?, 'event', 'immediate', 'user', 'system', 'open', "
+            "'seeded subj', 'seeded body', '{}', '[]', 'legacy')",
+            (project_key,),
+        )
+        # worktrees table — separate state.db surface, project_key col.
+        conn.execute(
+            "INSERT INTO worktrees "
+            "(project_key, lane_kind, lane_key, path, branch, status, "
+            "created_at, updated_at) "
+            "VALUES (?, 'feature', 'demo-lane', '/tmp/x', 'main', "
+            "'active', '2026-01-01', '2026-01-01')",
+            (project_key,),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    return db_path
+
+
+def _audit_tail_for(project_key: str, *, audit_home: Path) -> Path:
+    """Return the central audit-tail path for ``project_key`` under ``audit_home``.
+
+    Mirrors :func:`pollypm.audit.log.central_log_path` minus the env
+    plumbing — tests redirect via ``POLLYPM_AUDIT_HOME`` so the
+    production helper does the right thing.
+    """
+    return audit_home / f"{project_key}.jsonl"
+
+
+def test_count_project_state_rows_reports_seeded_rows(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_count_project_state_rows`` returns per-table counts for seeded data."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _count_project_state_rows,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=3)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+
+    counts = _count_project_state_rows(env["config_path"], "demo")
+
+    # work_tasks seeded above.
+    assert counts["work_tasks"] == 3
+    # messages seeded directly.
+    assert counts["messages"] >= 1
+    # worktrees seeded directly.
+    assert counts["worktrees"] == 1
+    # audit tail file is a single "row".
+    assert counts["audit_tail"] == 1
+
+
+def test_purge_project_state_deletes_rows_and_audit_tail(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_purge_project_state`` wipes every seeded row + the audit tail."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _count_project_state_rows,
+        _purge_project_state,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+    assert tail_path.exists()
+
+    removed = _purge_project_state(env["config_path"], "demo")
+
+    assert removed["work_tasks"] == 2
+    assert removed["audit_tail"] == 1
+
+    # Post-purge counts are all zero.
+    after = _count_project_state_rows(env["config_path"], "demo")
+    assert after["work_tasks"] == 0
+    assert after["messages"] == 0
+    assert after["worktrees"] == 0
+    assert after["audit_tail"] == 0
+    assert not tail_path.exists()
+
+
+def test_purge_project_state_dry_run_is_noop(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In dry-run mode counts mirror what WOULD be deleted; nothing mutated."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _count_project_state_rows,
+        _purge_project_state,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+
+    preview = _purge_project_state(env["config_path"], "demo", dry_run=True)
+    assert preview["work_tasks"] == 2
+    assert preview["audit_tail"] == 1
+
+    # Nothing actually deleted.
+    after = _count_project_state_rows(env["config_path"], "demo")
+    assert after["work_tasks"] == 2
+    assert after["audit_tail"] == 1
+    assert tail_path.exists()
+
+
+def test_purge_project_state_does_not_touch_other_projects(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A purge of project A leaves project B's rows intact (FK isolation)."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _count_project_state_rows,
+        _purge_project_state,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    # Add a second project to the same workspace so both seed into the
+    # same state.db. The purge must scope by project key — no spillover.
+    other_path = env["workspace_root"] / "other_proj"
+    other_path.mkdir()
+    (other_path / ".git").mkdir()
+    config_text = env["config_path"].read_text()
+    env["config_path"].write_text(
+        config_text
+        + f"\n[projects.other_proj]\n"
+        f'key = "other_proj"\n'
+        'name = "Other"\n'
+        f'path = "{other_path}"\n'
+    )
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    _seed_state_db_rows(env["config_path"], "other_proj", task_count=3)
+
+    _purge_project_state(env["config_path"], "demo")
+
+    # demo gone.
+    demo_after = _count_project_state_rows(env["config_path"], "demo")
+    assert demo_after["work_tasks"] == 0
+    assert demo_after["messages"] == 0
+
+    # other_proj intact.
+    other_after = _count_project_state_rows(env["config_path"], "other_proj")
+    assert other_after["work_tasks"] == 3
+    assert other_after["messages"] >= 1
+
+
+def test_cli_remove_purge_state_full_cascade(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end: ``pm project remove --purge-state --yes`` clears rows + removes the project."""
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+
+    result = runner.invoke(
+        project_app,
+        [
+            "remove", "demo", "--purge-state", "--yes",
+            "--config", str(env["config_path"]),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Deleted" in result.output and "state.db row" in result.output
+    assert "Removed central audit-tail JSONL" in result.output
+    assert "Removed project 'demo'" in result.output
+
+    config = _load_cfg(env["config_path"])
+    assert "demo" not in config.projects
+    assert not tail_path.exists()
+
+
+def test_cli_remove_purge_state_prompts_without_force(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without --yes / --force, --purge-state prompts before destructive action."""
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+
+    # Decline the destructive prompt. The active-task prompt also fires
+    # first because we seeded queued tasks — we accept that with "y"
+    # and decline the destructive purge prompt with "n".
+    result = runner.invoke(
+        project_app,
+        [
+            "remove", "demo", "--purge-state",
+            "--config", str(env["config_path"]),
+        ],
+        input="y\nn\n",
+    )
+
+    assert result.exit_code == 1, result.output
+    assert "Permanently delete state.db rows" in result.output
+    assert "Aborted" in result.output
+
+    # Nothing mutated.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_remove_dry_run_lists_state_rows_without_deleting(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--dry-run`` shows the row counts but never mutates state.db."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _count_project_state_rows,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+
+    result = runner.invoke(
+        project_app,
+        [
+            "remove", "demo", "--dry-run", "--purge-state",
+            "--config", str(env["config_path"]),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "state.db rows to purge:" in result.output
+    assert "work_tasks: 2 rows" in result.output
+    assert "audit_tail: 1 file" in result.output
+
+    # Nothing actually deleted.
+    after = _count_project_state_rows(env["config_path"], "demo")
+    assert after["work_tasks"] == 2
+    assert tail_path.exists()
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_remove_dry_run_warns_when_state_rows_present_without_purge(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``--dry-run`` without ``--purge-state`` flags the orphan-row footprint."""
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+
+    result = runner.invoke(
+        project_app,
+        [
+            "remove", "demo", "--dry-run",
+            "--config", str(env["config_path"]),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "use --purge-state to delete" in result.output
+    assert "NOT touched without --purge-state" in result.output

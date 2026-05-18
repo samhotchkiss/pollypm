@@ -12,6 +12,7 @@ Contract:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,8 @@ import typer
 
 from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH
+
+logger = logging.getLogger(__name__)
 
 
 # Alert taxonomy (#788):
@@ -111,7 +114,10 @@ def heartbeat(
     try:
         cli_mod._revive_rail_daemon_if_dead(config_path)
     except Exception:  # noqa: BLE001
-        pass
+        logger.warning(
+            "Failed to revive rail daemon during heartbeat sweep (#1355)",
+            exc_info=True,
+        )
     alerts = supervisor.run_heartbeat(snapshot_lines=snapshot_lines)
     tick_result = cli_mod._tick_core_rail_if_available(supervisor)
     cli_mod._drain_and_stop_core_rail_if_available(

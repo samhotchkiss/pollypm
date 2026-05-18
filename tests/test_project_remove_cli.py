@@ -1339,13 +1339,120 @@ def test_cli_remove_dry_run_warns_when_worktrees_present_without_purge(
 
 
 # --------------------------------------------------------------------------
+# Storage-facade unit tests (#1676): the bulk DELETE lives in
+# ``pollypm.storage.project_state_purge`` so the plugin CLI no longer
+# imports ``sqlite3`` directly. These exercises pin the facade contract.
+# --------------------------------------------------------------------------
+
+
+def test_storage_facade_count_rows_excludes_audit_tail(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facade returns DB-only keys; ``audit_tail`` is a CLI-layer concern."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _workspace_db_path,
+    )
+    from pollypm.storage.project_state_purge import (
+        count_project_state_rows,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    # Audit tail file present, but the facade must not surface it.
+    _audit_tail_for("demo", audit_home=audit_home).write_text("{}\n")
+
+    counts = count_project_state_rows(
+        _workspace_db_path(env["config_path"]), "demo",
+    )
+
+    # DB tables surface real counts.
+    assert counts["work_tasks"] == 2
+    assert counts["messages"] >= 1
+    assert counts["worktrees"] == 1
+    # Facade contract: no audit_tail key (that's the CLI shim's job).
+    assert "audit_tail" not in counts
+
+
+def test_storage_facade_purge_rows_is_transactional(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Facade bulk DELETE wipes every seeded row in one pass."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _workspace_db_path,
+    )
+    from pollypm.storage.project_state_purge import (
+        count_project_state_rows,
+        purge_project_state_rows,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=2)
+    db_path = _workspace_db_path(env["config_path"])
+
+    removed = purge_project_state_rows(db_path, "demo")
+    assert removed["work_tasks"] == 2
+
+    # Post-purge: zero rows everywhere.
+    after = count_project_state_rows(db_path, "demo")
+    assert all(n == 0 for n in after.values())
+
+
+def test_storage_facade_purge_rows_dry_run_is_noop(
+    env, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``dry_run=True`` returns would-delete counts without mutating."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _workspace_db_path,
+    )
+    from pollypm.storage.project_state_purge import (
+        count_project_state_rows,
+        purge_project_state_rows,
+    )
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    _seed_state_db_rows(env["config_path"], "demo", task_count=3)
+    db_path = _workspace_db_path(env["config_path"])
+
+    preview = purge_project_state_rows(db_path, "demo", dry_run=True)
+    assert preview["work_tasks"] == 3
+
+    # Nothing actually deleted.
+    after = count_project_state_rows(db_path, "demo")
+    assert after["work_tasks"] == 3
+
+
+def test_plugin_cli_does_not_import_sqlite3() -> None:
+    """Regression for #1676: the plugin CLI module must not touch ``sqlite3``.
+
+    Mirrors ``test_work_task_query_callers_do_not_open_sqlite_directly``
+    but lives next to the implementation so the wedge it protects is
+    obvious in the diff history.
+    """
+    from pollypm.plugins_builtin.project_planning.cli import project as cli_mod
+
+    text = Path(cli_mod.__file__).read_text(encoding="utf-8")
+    assert "import sqlite3" not in text
+    assert "sqlite3.connect" not in text
+
+
+# --------------------------------------------------------------------------
 # Regression: #1673 — DB purge failure must NOT strip the TOML project.
 # Before the fix, ``_purge_project_state`` caught ``sqlite3.Error`` and
 # returned the pre-purge counts, so ``remove_cmd`` happily printed
 # "Deleted N rows" and called ``remove_project`` — leaving rows in the
 # DB and the project gone from pollypm.toml. The fix raises a
-# ``_PurgeStateError`` on hard DB failures so the command aborts before
-# touching the config.
+# ``_PurgeStateError`` (translated from the facade's
+# ``ProjectStatePurgeError``) on hard DB failures so the command aborts
+# before touching the config.
 # --------------------------------------------------------------------------
 
 
@@ -1370,7 +1477,7 @@ def test_purge_project_state_raises_on_db_open_failure(
     def boom(*_args, **_kwargs):
         raise sqlite3.OperationalError("database is locked")
 
-    # Patch the sqlite3 module the function imports lazily.
+    # Patch the sqlite3 module the storage facade imports.
     monkeypatch.setattr(sqlite3, "connect", boom)
     try:
         with pytest.raises(project_mod._PurgeStateError):

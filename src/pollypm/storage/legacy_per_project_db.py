@@ -43,6 +43,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pollypm.storage.sqlite_pragmas import readonly_uri
+
 if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
 
@@ -92,7 +94,7 @@ def _open_ro(path: Path) -> sqlite3.Connection | None:
     if not path.exists():
         return None
     try:
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        return sqlite3.connect(readonly_uri(path), uri=True)
     except sqlite3.Error as exc:
         logger.warning("legacy_per_project_db: cannot open %s read-only: %s", path, exc)
         return None

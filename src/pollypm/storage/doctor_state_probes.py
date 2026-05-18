@@ -27,7 +27,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 logger = logging.getLogger(__name__)
 
@@ -41,7 +41,9 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection | None:
     """
     if not db_path.is_file():
         return None
-    uri = f"file:{db_path}?mode=ro"
+    # #1674: percent-encode so URI metacharacters in the workspace path
+    # don't break the read-only open.
+    uri = readonly_uri(db_path)
     try:
         conn = sqlite3.connect(uri, uri=True, timeout=1.0)
     except sqlite3.Error as exc:

@@ -97,8 +97,13 @@ def count_project_state_rows(
     if db_path is None or not db_path.exists():
         return counts
 
+    # #1674: percent-encode so URI metacharacters (``#``/``?``) in the
+    # workspace path don't get parsed as fragment/query and silently
+    # produce a no-rows result.
+    from pollypm.storage.sqlite_pragmas import readonly_uri
+
     try:
-        conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
     except sqlite3.Error as exc:
         logger.debug(
             "project_state_purge: read-only connect failed for %s: %s",

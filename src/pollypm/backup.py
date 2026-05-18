@@ -34,6 +34,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from pollypm.storage.sqlite_pragmas import readonly_uri
+
 # Retention only applies to plain DB snapshots (``state-db-*.db.gz``).
 # ``--full`` tar.gz archives are left alone because they are larger and
 # more precious — an operator who ran ``pm backup --full`` almost
@@ -121,7 +123,7 @@ def _is_valid_sqlite_file(path: Path) -> bool:
     if not header.startswith(b"SQLite format 3\x00"):
         return False
     try:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_uri(path), uri=True)
         try:
             conn.execute("PRAGMA schema_version").fetchone()
         finally:
@@ -178,7 +180,7 @@ def _online_backup_to_plain_file(source_db: Path, dest: Path) -> None:
     deadline = time.monotonic() + BACKUP_LOCK_RETRY_MAX_SECONDS
     while True:
         try:
-            src = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
+            src = sqlite3.connect(readonly_uri(source_db), uri=True)
             try:
                 dst = sqlite3.connect(dest)
                 try:

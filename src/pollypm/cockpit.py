@@ -490,7 +490,8 @@ def _resource_section(config) -> MetricsSection:
         freelist_ratio = 0.0
         try:
             import sqlite3
-            conn = sqlite3.connect(f"file:{state_db}?mode=ro", uri=True)
+            from pollypm.storage.sqlite_pragmas import readonly_uri
+            conn = sqlite3.connect(readonly_uri(state_db), uri=True)
             try:
                 page_size = int(
                     conn.execute("PRAGMA page_size").fetchone()[0] or 0,

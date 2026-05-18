@@ -15,7 +15,7 @@ import logging
 import sqlite3
 from pathlib import Path
 
-from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 logger = logging.getLogger(__name__)
 
@@ -46,8 +46,10 @@ def aggregate_project_session_tokens(
     # mode, write lock, etc.). Mirrors the doctor probe pattern from
     # #1625 (``doctor_state_probes._connect_readonly``) and the other
     # presentation-side read facades (``morning_briefing_queries``,
-    # ``inbox_action_preview``, ``work_task_state``).
-    uri = f"file:{db_path}?mode=ro"
+    # ``inbox_action_preview``, ``work_task_state``). #1674: percent-encode
+    # the path so ``#`` / ``?`` in the workspace dir don't get parsed as
+    # URI fragment / query syntax.
+    uri = readonly_uri(db_path)
     try:
         conn = sqlite3.connect(uri, uri=True)
     except sqlite3.Error as exc:

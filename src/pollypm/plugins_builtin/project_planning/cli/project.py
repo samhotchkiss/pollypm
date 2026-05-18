@@ -904,6 +904,224 @@ def _purge_project_sessions(
     return results
 
 
+# ---------------------------------------------------------------------------
+# Worktree directory teardown (#1561 wedge #4)
+# ---------------------------------------------------------------------------
+#
+# Each architect / reviewer / worker / advisor that touched the project got
+# an isolated git worktree under ``<project_path>/.pollypm/worktrees/``.
+# ``remove_project`` (TOML edit) + ``--purge-state`` (row teardown) leave
+# those directories on disk — they accumulate over the project's lifetime
+# and never get reclaimed automatically. This wedge sweeps them.
+#
+# Returned tuple semantics (per worktree entry):
+#   (path, is_git_worktree, dirty, removed_ok, reason)
+# * ``is_git_worktree`` is True when the path is registered with the parent
+#   git worktree list, so ``git worktree remove`` is the right teardown
+#   path. False means the directory is a stale leftover and we fall back
+#   to ``shutil.rmtree``.
+# * ``dirty`` is True when the worktree has uncommitted changes. Without
+#   ``--force-discard-worktree-changes`` we refuse to remove a dirty
+#   worktree; with it, ``git worktree remove --force`` discards them.
+# * ``removed_ok`` is True after a successful teardown. In dry-run mode
+#   we always report False for this and skip the actual delete.
+# * ``reason`` carries a short explanation when ``removed_ok`` is False
+#   ("dirty", "git-failed", "rmtree-failed", or "dry-run").
+
+
+def _worktree_is_git_registered(
+    project_path: Path, worktree_path: Path
+) -> bool:
+    """Return True if ``worktree_path`` is a registered git worktree.
+
+    Mirrors :func:`pollypm.work.session_manager._worktree_is_registered`
+    but kept private to this module so the CLI teardown is self-contained
+    and doesn't pull in the session_manager import surface.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_path),
+             "worktree", "list", "--porcelain"],
+            check=False, text=True, capture_output=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        target = worktree_path.resolve()
+    except OSError:
+        target = worktree_path
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        registered = line[len("worktree "):].strip()
+        try:
+            registered_resolved = Path(registered).resolve()
+        except OSError:
+            registered_resolved = Path(registered)
+        if registered_resolved == target:
+            return True
+    return False
+
+
+def _worktree_has_uncommitted_changes(worktree_path: Path) -> bool:
+    """Return True if the worktree has staged or unstaged changes.
+
+    Best-effort: a git failure (corrupt worktree, missing .git pointer)
+    reports False so we don't block teardown on a directory we can't
+    even inspect — ``shutil.rmtree`` will handle it.
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(worktree_path), "status", "--short"],
+            check=False, text=True, capture_output=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    return bool(result.stdout.strip())
+
+
+def _enumerate_project_worktree_dirs(project_path: Path) -> list[Path]:
+    """Return every subdirectory under ``<project>/.pollypm/worktrees/``.
+
+    Walks one level deep — the layout is ``worktrees/<session_id>/<wt>``
+    in practice but the session-id directories are themselves worktree
+    "containers" (the directory tree is created by session_scoped_dir).
+    We sweep both shapes: any leaf directory under the worktrees root
+    that looks like a worktree (has a ``.git`` file/dir) is a candidate.
+
+    Best-effort: a missing worktrees dir returns ``[]`` without raising.
+    """
+    from pollypm.projects import project_worktrees_dir
+
+    root = project_worktrees_dir(project_path)
+    if not root.exists():
+        return []
+    out: list[Path] = []
+    try:
+        for session_dir in sorted(root.iterdir()):
+            if not session_dir.is_dir():
+                continue
+            # Lock files live alongside the session dir; skip them.
+            if session_dir.name.startswith(".session."):
+                continue
+            # Two layouts:
+            #  * legacy flat:  worktrees/<wt-dir>/         (has .git)
+            #  * scoped:       worktrees/<session>/<wt-dir>/
+            # If the directory itself has a .git entry, it's a worktree.
+            if (session_dir / ".git").exists():
+                out.append(session_dir)
+                continue
+            # Otherwise descend one level.
+            try:
+                for child in sorted(session_dir.iterdir()):
+                    if child.is_dir() and (child / ".git").exists():
+                        out.append(child)
+            except OSError:
+                continue
+    except OSError:
+        return []
+    return out
+
+
+def _purge_project_worktrees(
+    config_path: Path,
+    project_key: str,
+    *,
+    dry_run: bool = False,
+    force_discard_changes: bool = False,
+) -> list[tuple[Path, bool, bool, bool, str]]:
+    """Tear down every worktree directory tied to ``project_key``.
+
+    Returns a list of ``(path, is_git_worktree, dirty, removed_ok,
+    reason)`` tuples. In ``dry_run`` mode no mutations happen and every
+    ``removed_ok`` is False with reason ``"dry-run"`` (the other flags
+    still reflect what WOULD happen).
+
+    Refuses to remove a dirty worktree unless ``force_discard_changes``
+    is set — that mirrors the existing ``cleanup_worktree`` invariant in
+    :mod:`pollypm.worktrees`. With the flag, registered worktrees use
+    ``git worktree remove --force`` (which also drops the branch ref);
+    unregistered stale directories fall back to :func:`shutil.rmtree`.
+
+    Best-effort throughout: a teardown failure on one entry never aborts
+    the rest of the sweep. The caller gets per-entry success/failure so
+    it can surface partial-failure to the operator.
+    """
+    import shutil as _shutil
+
+    config = load_config(config_path)
+    project = config.projects.get(project_key)
+    if project is None:
+        return []
+    project_path = project.path
+
+    entries = _enumerate_project_worktree_dirs(project_path)
+    results: list[tuple[Path, bool, bool, bool, str]] = []
+    for wt_path in entries:
+        is_git = _worktree_is_git_registered(project_path, wt_path)
+        dirty = _worktree_has_uncommitted_changes(wt_path) if is_git else False
+        if dry_run:
+            results.append((wt_path, is_git, dirty, False, "dry-run"))
+            continue
+        if dirty and not force_discard_changes:
+            # Operator hasn't opted into discarding changes — leave it.
+            results.append((wt_path, is_git, dirty, False, "dirty"))
+            continue
+        removed_ok = False
+        reason = ""
+        if is_git:
+            cmd = ["git", "-C", str(project_path), "worktree", "remove"]
+            if force_discard_changes or dirty:
+                cmd.append("--force")
+            cmd.extend(["--", str(wt_path)])
+            try:
+                proc = subprocess.run(
+                    cmd, check=False, text=True,
+                    capture_output=True, timeout=300,
+                )
+                if proc.returncode == 0 and not wt_path.exists():
+                    removed_ok = True
+                else:
+                    # ``git worktree remove`` can leave the directory if
+                    # the worktree was already half-detached. Fall back
+                    # to rmtree so the operator gets a clean slate.
+                    reason = "git-failed"
+            except (subprocess.TimeoutExpired, OSError):
+                reason = "git-failed"
+            # Best-effort fallback: if the directory is still there
+            # after a git remove (or if git failed), rmtree it.
+            if not removed_ok and wt_path.exists():
+                try:
+                    _shutil.rmtree(wt_path)
+                    removed_ok = True
+                    if reason == "":
+                        reason = "rmtree-fallback"
+                except OSError:
+                    reason = reason or "rmtree-failed"
+        else:
+            try:
+                _shutil.rmtree(wt_path)
+                removed_ok = True
+            except OSError:
+                reason = "rmtree-failed"
+        # After a successful removal, prune the git worktree admin data
+        # so ``git worktree list`` doesn't keep stale entries. Best-effort.
+        if removed_ok and is_git:
+            try:
+                subprocess.run(
+                    ["git", "-C", str(project_path), "worktree", "prune"],
+                    check=False, text=True, capture_output=True, timeout=60,
+                )
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+        results.append((wt_path, is_git, dirty, removed_ok, reason))
+    return results
+
+
 @project_app.command("remove")
 def remove_cmd(
     project_key: str = typer.Argument(
@@ -942,6 +1160,26 @@ def remove_cmd(
             "--yes / --force is supplied. See issue #1561."
         ),
     ),
+    purge_worktrees: bool = typer.Option(
+        False, "--purge-worktrees",
+        help=(
+            "Remove every git worktree directory under "
+            "``<project>/.pollypm/worktrees/``. Uses ``git worktree "
+            "remove`` for registered worktrees and ``shutil.rmtree`` "
+            "for stale leftovers. Refuses to touch a worktree with "
+            "uncommitted changes unless --force-discard-worktree-changes "
+            "is also passed. Prompts for confirmation before destructive "
+            "action unless --yes / --force is supplied. See issue #1561."
+        ),
+    ),
+    force_discard_worktree_changes: bool = typer.Option(
+        False, "--force-discard-worktree-changes",
+        help=(
+            "When used with --purge-worktrees, discard uncommitted "
+            "changes in worktrees instead of refusing to remove them. "
+            "Pairs with ``git worktree remove --force``."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help=(
@@ -976,9 +1214,18 @@ def remove_cmd(
     Prompts for confirmation before the destructive sweep unless
     ``--yes`` / ``--force`` is passed.
 
+    With ``--purge-worktrees`` this command also removes every git
+    worktree directory under ``<project>/.pollypm/worktrees/``
+    (architects / reviewers / workers had isolated checkouts there).
+    Refuses to remove a worktree with uncommitted changes unless
+    ``--force-discard-worktree-changes`` is also supplied. Prompts for
+    confirmation before destruction unless ``--yes`` / ``--force`` is
+    passed.
+
     With ``--dry-run`` the command prints the teardown plan
     (project + sessions that would be killed and removed + state-db
-    rows that would be deleted) and exits without mutating anything.
+    rows that would be deleted + worktree directories that would be
+    removed) and exits without mutating anything.
 
     If the project has queued or in-flight tasks in the work DB, prompts
     for confirmation. Pass ``--force`` to skip the prompt (e.g. for
@@ -1059,6 +1306,45 @@ def remove_cmd(
         if nonzero and not purge_state:
             typer.echo(
                 "Note: state.db rows are NOT touched without --purge-state."
+            )
+
+        # ------------------------------------------------------------------
+        # Worktree directory teardown preview. Same "show the orphan
+        # footprint even if the flag isn't set" pattern as --purge-state
+        # so the operator sees what they're leaving on disk.
+        # ------------------------------------------------------------------
+        wt_preview = _purge_project_worktrees(
+            path, project_key, dry_run=True,
+        )
+        if wt_preview:
+            if purge_worktrees:
+                typer.echo("  worktree directories to purge:")
+            else:
+                typer.echo(
+                    "  worktree directories under .pollypm/worktrees/ "
+                    "(use --purge-worktrees to remove):"
+                )
+            for wt_path, is_git, dirty, _ok, _reason in wt_preview:
+                kind = "git" if is_git else "stale"
+                dirty_marker = " [dirty]" if dirty else ""
+                typer.echo(f"    - {wt_path} ({kind}){dirty_marker}")
+            dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
+            if (
+                dirty_count > 0
+                and purge_worktrees
+                and not force_discard_worktree_changes
+            ):
+                typer.echo(
+                    f"Note: {dirty_count} worktree(s) have uncommitted "
+                    "changes and will be skipped. Pass "
+                    "--force-discard-worktree-changes to remove anyway."
+                )
+        else:
+            typer.echo("  worktree directories: (none)")
+        if wt_preview and not purge_worktrees:
+            typer.echo(
+                "Note: worktree directories are NOT touched without "
+                "--purge-worktrees."
             )
         typer.echo("Re-run without --dry-run to apply.")
         return
@@ -1167,6 +1453,63 @@ def remove_cmd(
                 typer.echo(
                     f"Removed central audit-tail JSONL for '{project_key}'."
                 )
+
+    # Worktree directory teardown. Runs BEFORE ``remove_project`` to
+    # match the pattern of --purge-state: clean up the on-disk debris
+    # while the project entry is still in the config (so the helpers
+    # can resolve the project path), then drop the TOML entry. A
+    # failure here leaves the rest of the cascade still recoverable —
+    # the operator can re-run with --purge-worktrees once they've
+    # resolved the underlying issue.
+    if purge_worktrees:
+        wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+        if wt_preview:
+            dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
+            if not (force or yes):
+                # Destructive — explicit confirm, default No. Same gate
+                # shape as --purge-state.
+                typer.echo(
+                    f"--purge-worktrees will remove {len(wt_preview)} "
+                    f"worktree director{'y' if len(wt_preview) == 1 else 'ies'} "
+                    f"under .pollypm/worktrees/ for '{project_key}'."
+                )
+                if dirty_count > 0 and not force_discard_worktree_changes:
+                    typer.echo(
+                        f"  ({dirty_count} have uncommitted changes and "
+                        "will be skipped without "
+                        "--force-discard-worktree-changes)"
+                    )
+                proceed = typer.confirm(
+                    f"Permanently remove worktree directories for '{project_key}'?",
+                    default=False,
+                )
+                if not proceed:
+                    typer.echo("Aborted. No changes made.")
+                    raise typer.Exit(code=1)
+            wt_results = _purge_project_worktrees(
+                path, project_key,
+                force_discard_changes=force_discard_worktree_changes,
+            )
+            removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
+            skipped_dirty = [
+                p for p, _g, _d, ok, reason in wt_results
+                if not ok and reason == "dirty"
+            ]
+            failed = [
+                (p, reason) for p, _g, _d, ok, reason in wt_results
+                if not ok and reason != "dirty"
+            ]
+            typer.echo(
+                f"Removed {removed_count} worktree director"
+                f"{'y' if removed_count == 1 else 'ies'} for '{project_key}'."
+            )
+            for p in skipped_dirty:
+                typer.echo(
+                    f"  Skipped (uncommitted changes): {p} — re-run with "
+                    "--force-discard-worktree-changes to discard."
+                )
+            for p, reason in failed:
+                typer.echo(f"  Failed to remove {p} ({reason}).")
 
     try:
         removed = remove_project(path, project_key)

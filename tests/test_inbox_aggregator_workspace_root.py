@@ -159,6 +159,7 @@ def _seed_message(
     subject: str = "[Action] notify title",
     payload: dict | None = None,
     labels: list[str] | None = None,
+    kind: str = "legacy",
 ) -> int:
     """Seed one user-recipient message directly into the unified store."""
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -176,6 +177,7 @@ def _seed_message(
             state=state,
             payload=payload,
             labels=labels,
+            kind=kind,
         )
     finally:
         store.close()
@@ -202,8 +204,17 @@ def test_aggregator_counts_actionable_messages_not_just_tasks(env) -> None:
 
 
 def test_aggregator_skips_fyi_messages(env) -> None:
-    """Completion/FYI notifications should not inflate the rail badge."""
-    _seed_message(env["workspace_db"], scope="inbox", subject="Demo shipped cleanly")
+    """Completion/FYI notifications should not inflate the rail badge.
+
+    Post-#1571 the rail reads from :func:`pollypm.inbox.awaits_user`,
+    which keys on the structured ``kind`` column rather than the old
+    subject regex. The FYI assertion now seeds ``kind=completion_fyi``
+    so the predicate (not heuristic) drops the row.
+    """
+    _seed_message(
+        env["workspace_db"], scope="inbox",
+        subject="Demo shipped cleanly", kind="completion_fyi",
+    )
 
     count = _count_inbox_tasks_for_label(_load_cfg(env["config_path"]))
     assert count == 0, f"expected no actionable messages, got {count}"

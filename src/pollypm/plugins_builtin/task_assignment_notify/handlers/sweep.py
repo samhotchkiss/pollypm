@@ -648,6 +648,10 @@ def _storage_closet_window_names(services: Any) -> set[str] | None:
         try:
             session_name = target_session()
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "task_assignment sweep: storage_closet_session_name() raised",
+                exc_info=True,
+            )
             return None
     else:
         session_name = "pollypm-storage-closet"
@@ -1438,6 +1442,11 @@ def _tmux_window_alive_for_task(
             session_name = "pollypm-storage-closet"
         windows = tmux.list_windows(session_name)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "task_assignment sweep: tmux window probe failed for %s/%s "
+            "— defaulting to alive",
+            project_key, task_number, exc_info=True,
+        )
         return True
     for window in windows or []:
         name = getattr(window, "name", "") or ""
@@ -1470,6 +1479,11 @@ def _consecutive_abandonments_at_active_node(task: Any) -> int:
             reverse=True,
         )
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "task_assignment sweep: execution-visit sort failed; "
+            "circuit-breaker streak treated as 0",
+            exc_info=True,
+        )
         return 0
     streak = 0
     abandoned_value = ExecutionStatus.ABANDONED.value
@@ -1634,6 +1648,11 @@ def _recover_dead_claims(
         try:
             active_tasks.extend(work.list_tasks(project=project_key, work_status=status))
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "task_assignment sweep: circuit-breaker list_tasks(%s, %s) "
+                "failed; skipping status",
+                project_key, status, exc_info=True,
+            )
             continue
     by_outcome = totals["by_outcome"]
     for task in active_tasks:
@@ -1722,7 +1741,11 @@ def _recover_dead_claims(
                     },
                 )
             except Exception:  # noqa: BLE001
-                pass
+                logger.warning(
+                    "task_auto_claim: append_event(worker_session_recovered) "
+                    "failed for %s",
+                    task_id, exc_info=True,
+                )
 
 
 def _auto_claim_next(
@@ -1756,6 +1779,11 @@ def _auto_claim_next(
         try:
             in_progress.extend(work.list_tasks(project=project_key, work_status=status))
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "task_auto_claim: capacity-probe list_tasks(%s, %s) failed; "
+                "treating as no active workers in that status",
+                project_key, status, exc_info=True,
+            )
             continue
     active = [
         task for task in in_progress
@@ -1771,6 +1799,11 @@ def _auto_claim_next(
             project=project_key, work_status=WorkStatus.QUEUED.value,
         )
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "task_auto_claim: queued list_tasks(%s) failed; "
+            "skipping auto-claim tick",
+            project_key, exc_info=True,
+        )
         return
     candidates = [
         task for task in queued
@@ -1812,6 +1845,11 @@ def _auto_claim_next(
                     plan_missing_projects.add(project_key)
                 return
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "task_auto_claim: plan-gate check failed for %s; "
+                "skipping auto-claim tick",
+                project_key, exc_info=True,
+            )
             return
 
     try:
@@ -1842,7 +1880,11 @@ def _auto_claim_next(
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "task_auto_claim: append_event(worker_auto_claimed) failed "
+                "for %s",
+                task_id, exc_info=True,
+            )
 
 
 def _wire_session_manager(svc: Any, project_root: Path, services: Any) -> None:

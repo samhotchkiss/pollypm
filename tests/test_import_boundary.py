@@ -204,6 +204,17 @@ _ACTIVITY_FEED_PLUGIN_MODULE = "pollypm.plugins_builtin.activity_feed.plugin"
 _ACTIVITY_FEED_SUMMARIES_PLUGIN_MODULE = (
     "pollypm.plugins_builtin.activity_feed.summaries"
 )
+# ``Supervisor`` resolves the default launch planner through the plugin
+# host, but the planner's context dataclass is fundamentally the host's
+# contract — it must be available from a core module so the supervisor
+# never has to reach into the optional plugin tree to build it. The
+# canonical home is :mod:`pollypm.launch_planner_protocol`; the plugin
+# re-exports for back-compat. (#1363, sibling of #1597 / #1621 / #1626 /
+# #1672 / #1682.)
+_SUPERVISOR_FILE = "src/pollypm/supervisor.py"
+_DEFAULT_LAUNCH_PLANNER_PLUGIN_PREFIX = (
+    "pollypm.plugins_builtin.default_launch_planner"
+)
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -369,6 +380,32 @@ def test_non_plugin_sources_do_not_import_activity_feed_summaries_shim() -> None
         "`activity_summary` from pollypm.events.summaries (the canonical "
         "path) instead so the plugin stays optional. Offenders:\n  - "
         + "\n  - ".join(offenders)
+    )
+
+
+def test_supervisor_does_not_import_default_launch_planner_plugin() -> None:
+    """``Supervisor`` builds the planner context from the core protocol module.
+
+    :class:`pollypm.launch_planner_protocol.DefaultLaunchPlannerContext`
+    is the sanctioned source. The default planner ships as a built-in
+    plugin and is resolved through the plugin host, but the *context*
+    dataclass is the host's contract — reaching into the plugin tree to
+    import it would re-couple ``Supervisor`` to an "optional" plugin and
+    break the seam. Fail loudly so the boundary stays clean.
+    """
+    root = _project_root()
+    source_file = root / _SUPERVISOR_FILE
+    assert source_file.exists(), (
+        f"Expected {_SUPERVISOR_FILE} to exist — boundary test "
+        "needs updating if the file moved."
+    )
+    assert not _imports_module_or_subpackage(
+        source_file, _DEFAULT_LAUNCH_PLANNER_PLUGIN_PREFIX
+    ), (
+        f"{_SUPERVISOR_FILE} must not import from "
+        f"{_DEFAULT_LAUNCH_PLANNER_PLUGIN_PREFIX}; import "
+        "DefaultLaunchPlannerContext from pollypm.launch_planner_protocol "
+        "instead so the plugin stays optional."
     )
 
 

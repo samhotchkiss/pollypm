@@ -372,3 +372,160 @@ def test_get_task_detail_still_404s_for_genuinely_missing_task(
     response = client.get("/api/v1/tasks/myproj/9999", headers=auth_headers)
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — queue endpoint (#1548)
+#
+# The queue route is the first write endpoint. Tests cover:
+#   * happy path: draft → queued, response carries ActionResult, DB
+#     state actually changed (we re-read through a fresh work-service
+#     so the assertion isn't trusting the API's own view).
+#   * unknown project → 404 not_found.
+#   * unknown task in known project → 404 not_found.
+#   * non-draft task → 409 invalid_state (per issue scope).
+#   * Idempotency-Key header accepted but not yet enforced (Phase 3).
+#   * Auth still required.
+# ---------------------------------------------------------------------------
+
+
+def test_queue_endpoint_transitions_draft_to_queued(
+    api_config, client, auth_headers, project_root
+) -> None:
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        # ``description`` must be non-empty for the ``has_description``
+        # gate to pass — same gate ``pm work queue`` runs.
+        task = make_task(
+            svc,
+            project="myproj",
+            title="Wedge task",
+            description="ship the queue endpoint",
+        )
+        assert task.work_status.value == "draft"
+
+    response = client.post(
+        f"/api/v1/tasks/myproj/{task.task_number}/queue",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    # Message is informational (operator-facing) but the issue scope
+    # leaves the exact wording open.
+    assert task.task_id in body.get("message", "")
+
+    # Re-read through a fresh service to prove the DB actually moved
+    # (the API's own ActionResult could lie; this would catch it).
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        refreshed = svc.get(task.task_id)
+    assert refreshed.work_status.value == "queued"
+
+
+def test_queue_endpoint_404_for_unknown_project(client, auth_headers) -> None:
+    response = client.post(
+        "/api/v1/tasks/no-such-project/1/queue", headers=auth_headers
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_queue_endpoint_404_for_unknown_task(client, auth_headers) -> None:
+    response = client.post("/api/v1/tasks/myproj/9999/queue", headers=auth_headers)
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
+
+
+def test_queue_endpoint_409_for_already_queued_task(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """Issue scope: 'Queue a non-draft task → 409 conflict with invalid_state'.
+
+    HTTP 409 + body ``error.code == "invalid_state"`` is the contract
+    clients route on; the state machine's message comes through
+    verbatim so cockpit / frontend can display it.
+    """
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(
+            svc,
+            project="myproj",
+            title="Already queued",
+            description="needs description to pass gate",
+        )
+        svc.queue(task.task_id, "tester")
+
+    response = client.post(
+        f"/api/v1/tasks/myproj/{task.task_number}/queue", headers=auth_headers
+    )
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_state"
+    # The hint should mention draft so the operator knows why the
+    # transition was refused.
+    assert "draft" in (body["error"].get("hint") or "").lower()
+
+
+def test_queue_endpoint_accepts_idempotency_key_header(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """Phase 2 accepts ``Idempotency-Key`` without yet deduping the
+    request (replay cache lands in Phase 3)."""
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(
+            svc,
+            project="myproj",
+            title="With idem key",
+            description="task with description",
+        )
+
+    headers = {**auth_headers, "Idempotency-Key": "client-supplied-uuid-123"}
+    response = client.post(
+        f"/api/v1/tasks/myproj/{task.task_number}/queue", headers=headers
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["ok"] is True
+
+
+def test_queue_endpoint_422_when_gate_fails(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """``has_description`` (and the rest of the queue gates) fire on
+    the work-service side; we surface them as 422 ``validation_error``
+    so clients can disambiguate "task data is incomplete" (fixable by
+    editing the task) from "state changed underneath you" (409)."""
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        # No description on purpose — has_description gate will fail.
+        task = make_task(svc, project="myproj", title="No description")
+
+    response = client.post(
+        f"/api/v1/tasks/myproj/{task.task_number}/queue", headers=auth_headers
+    )
+    assert response.status_code == 422, response.text
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    # Gate message bubbles through so the operator sees *which* gate
+    # failed.
+    assert "description" in body["error"]["message"].lower()
+
+
+def test_queue_endpoint_requires_auth(api_config, client, project_root) -> None:
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(
+            svc,
+            project="myproj",
+            title="Unauth attempt",
+            description="any description works",
+        )
+
+    # No Authorization header — bearer auth dependency rejects.
+    response = client.post(f"/api/v1/tasks/myproj/{task.task_number}/queue")
+    assert response.status_code == 401

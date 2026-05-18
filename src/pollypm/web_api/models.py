@@ -53,6 +53,24 @@ class HealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Action responses (write endpoints)
+# ---------------------------------------------------------------------------
+
+
+class ActionResult(BaseModel):
+    """Generic ``{ok, message?}`` envelope for write endpoints (spec §6).
+
+    Used by ``approveTask`` / ``rejectTask`` / ``queueTask`` and the
+    inbox reply / archive routes. ``message`` is operator-facing and
+    surfaces a short summary of the transition (e.g.
+    ``"queued myproj/3"``); clients should not parse it.
+    """
+
+    ok: bool
+    message: str | None = None
+
+
+# ---------------------------------------------------------------------------
 # Doctor (declared so the OpenAPI document carries the schema; route
 # itself is implemented in Phase 3).
 # ---------------------------------------------------------------------------
@@ -320,6 +338,7 @@ class Event(BaseModel):
 
 
 __all__ = [
+    "ActionResult",
     "Artifact",
     "ContextEntry",
     "DoctorCheck",

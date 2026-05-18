@@ -762,6 +762,11 @@ class ExtensionHost:
         try:
             from importlib.metadata import entry_points
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "plugin_host: importlib.metadata.entry_points import failed; "
+                "skipping entry-point plugin discovery",
+                exc_info=True,
+            )
             return found
         try:
             eps = entry_points(group="pollypm.plugins")
@@ -770,6 +775,11 @@ class ExtensionHost:
             try:
                 eps = entry_points().get("pollypm.plugins", [])  # type: ignore[assignment]
             except Exception:  # noqa: BLE001
+                logger.warning(
+                    "plugin_host: legacy entry_points() fallback failed; "
+                    "skipping entry-point plugin discovery",
+                    exc_info=True,
+                )
                 return found
         except Exception as exc:  # noqa: BLE001
             self._record_error(

@@ -543,7 +543,10 @@ class Supervisor:
                 payload={"message": message},
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "_record_persona_swap_event: record_event failed for scope=%r",
+                scope, exc_info=True,
+            )
 
     # ── Startable lifecycle (driven by CoreRail.start()/stop()) ────────────
 
@@ -1332,6 +1335,10 @@ class Supervisor:
         try:
             data = json.loads(state_path.read_text())
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_mounted_window_override: failed to read/parse %s",
+                state_path, exc_info=True,
+            )
             return None
         if not isinstance(data, dict):
             return None
@@ -1346,6 +1353,10 @@ class Supervisor:
         try:
             panes = self.session_service.tmux.list_panes(target)
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_mounted_window_override: list_panes(%s) failed",
+                target, exc_info=True,
+            )
             return None
         if len(panes) < 2:
             return None
@@ -2379,6 +2390,11 @@ class Supervisor:
                 self.config, self.store, launch.account.name,
             )
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_maybe_raise_capacity_low: "
+                "account_needs_proactive_rollover failed for %s",
+                launch.account.name, exc_info=True,
+            )
             return
         if not needs_roll:
             self._msg_store.clear_alert(launch.session.name, "capacity_low")
@@ -2534,6 +2550,11 @@ class Supervisor:
             health = self.recovery_policy.classify(signals)
             return self.recovery_policy.select_intervention(health, signals, history)
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_recovery_policy_select: classify/select_intervention "
+                "failed for session=%s failure_type=%s",
+                launch.session.name, failure_type, exc_info=True,
+            )
             return None
 
     def _maybe_recover_session(self, launch: SessionLaunchSpec, *, failure_type: str, failure_message: str) -> None:
@@ -2719,6 +2740,11 @@ class Supervisor:
                 project_key_from_task_id,
             )
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_maybe_clear_alert_for_terminal_task: "
+                "alert_task_lookup import failed",
+                exc_info=True,
+            )
             return False
 
         alert_type = str(getattr(alert, "alert_type", "") or "")
@@ -4140,6 +4166,11 @@ class Supervisor:
         try:
             pane = self.session_service.tmux.capture_pane(target, lines=120)
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_pane_already_bootstrapped_as_other_role: "
+                "capture_pane(%s) failed",
+                target, exc_info=True,
+            )
             return False
         if not pane or "CANONICAL ROLE:" not in pane:
             return False
@@ -4256,7 +4287,13 @@ class Supervisor:
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            # #1355: previously silent. Log so a failed audit-trail
+            # record_event doesn't quietly drop the persona-swap signal.
+            logger.warning(
+                "persona_swap_detected event record failed "
+                "(target-window guard): %s",
+                details, exc_info=True,
+            )
         return False
 
     def _assert_session_launch_matches(
@@ -4302,7 +4339,13 @@ class Supervisor:
                     },
                 )
             except Exception:  # noqa: BLE001
-                pass
+                # #1355: previously silent. Log before re-raising so a
+                # failed audit-trail emit doesn't quietly drop the signal.
+                logger.warning(
+                    "persona_swap_detected event record failed "
+                    "(no-launch path): session_name=%r",
+                    session_name, exc_info=True,
+                )
             raise RuntimeError(
                 f"persona_swap_detected: no launch for session_name={session_name!r}"
             ) from exc
@@ -4343,7 +4386,13 @@ class Supervisor:
                     payload={"message": details},
                 )
             except Exception:  # noqa: BLE001
-                pass
+                # #1355: previously silent. Log before re-raising so the
+                # diagnostic record_event failure isn't hidden.
+                logger.warning(
+                    "persona_swap_detected event record failed "
+                    "(session_name mismatch): %s",
+                    details, exc_info=True,
+                )
             raise RuntimeError(f"persona_swap_detected: {details}")
 
     def _assert_target_window_matches_session(
@@ -4389,6 +4438,11 @@ class Supervisor:
         try:
             panes = self.session_service.tmux.list_panes(target)
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_assert_target_window_matches_session: "
+                "list_panes(%s) failed for session_name=%r",
+                target, session_name, exc_info=True,
+            )
             return
         if not panes:
             return
@@ -4417,7 +4471,13 @@ class Supervisor:
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            # #1355: previously silent. Log before re-raising so a
+            # failed audit-trail emit doesn't quietly drop the signal.
+            logger.warning(
+                "persona_swap_detected event record failed "
+                "(prepare-target guard): %s",
+                details, exc_info=True,
+            )
         raise RuntimeError(f"persona_swap_detected: {details}")
 
     def _prepare_initial_input(

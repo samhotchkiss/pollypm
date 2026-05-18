@@ -4969,6 +4969,87 @@ def test_inbox_remainder_keeps_nag_with_no_blocker_signal(
     assert "ask the PM for a blocker summary" in body
 
 
+def test_inbox_body_clear_when_plan_ready_pill_active_with_blocked_task(
+    dashboard_app,
+) -> None:
+    """#1716 — when the dashboard's top banner already says ``Plan ready
+    — your turn`` (the #1715 state, ``status_label == "plan ready"``),
+    the Inbox section directly below it must not contradict it with the
+    ``Blocked, but summary missing / Press c to ask the PM`` nag. With
+    no other inbox signal, render the normal "Inbox is clear" copy."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        project_key="demo",
+        inbox_count=0,
+        status_label="plan ready",
+        plan_path=Path("/tmp/demo/docs/plan/plan.md"),
+        task_counts={"blocked": 1, "on_hold": 0},
+        task_buckets={
+            "blocked": [
+                {
+                    "task_id": "demo/3",
+                    "task_number": 3,
+                    "summary": "",
+                    "blocker_explicit": False,
+                    "hold_reason": "",
+                },
+            ],
+            "on_hold": [],
+        },
+        action_items=[],
+        inbox_top=[],
+    )
+    body = dashboard_app._render_inbox_body(fake_data)
+    assert "summary missing" not in body.lower()
+    assert "ask the PM for a blocker summary" not in body
+    assert "Inbox is clear for this project" in body
+
+
+def test_inbox_remainder_suppresses_blocked_nag_when_plan_ready_active(
+    dashboard_app,
+) -> None:
+    """#1716 — even when other signals push us past the early-return in
+    ``_render_inbox_body`` (e.g. an inbox top preview), the
+    ``_render_inbox_remainder`` blocked-summary-missing copy must still
+    be suppressed when the plan-ready pill is active."""
+    from types import SimpleNamespace
+
+    fake_data = SimpleNamespace(
+        project_key="demo",
+        inbox_count=1,
+        status_label="plan ready",
+        plan_path=Path("/tmp/demo/docs/plan/plan.md"),
+        task_counts={"blocked": 1, "on_hold": 0},
+        task_buckets={
+            "blocked": [
+                {
+                    "task_id": "demo/3",
+                    "task_number": 3,
+                    "summary": "",
+                    "blocker_explicit": False,
+                    "hold_reason": "",
+                },
+            ],
+            "on_hold": [],
+        },
+        action_items=[],
+        inbox_top=[
+            {
+                "task_id": "demo/note",
+                "primary_ref": "",
+                "title": "Status update",
+                "needs_action": False,
+                "updated_at": "2026-05-17T17:00:00",
+                "triage_label": "",
+            },
+        ],
+    )
+    body = dashboard_app._render_inbox_remainder(fake_data)
+    assert "summary missing" not in body.lower()
+    assert "ask the PM for a blocker summary" not in body
+
+
 def test_action_chat_pm_routes_to_existing_on_hold_task(
     dashboard_app,
 ) -> None:

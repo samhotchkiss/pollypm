@@ -378,11 +378,19 @@ def _spawn(
         )
         from pollypm.config import load_config
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "no_session_spawn: worker/config import failed for %s/%s",
+            role, project, exc_info=True,
+        )
         return False, f"import failed: {exc}"
 
     try:
         config = load_config(config_path)
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "no_session_spawn: load_config(%s) failed for %s/%s",
+            config_path, role, project, exc_info=True,
+        )
         return False, f"load_config failed: {exc}"
 
     # If a session for (role, project) already exists in config, just
@@ -408,11 +416,19 @@ def _spawn(
                 role=role,
             )
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "no_session_spawn: create_worker_session failed for %s/%s",
+            role, project, exc_info=True,
+        )
         return False, f"create_worker_session failed: {exc}"
 
     try:
         launch_worker_session(config_path, session.name)
     except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "no_session_spawn: launch_worker_session failed for %s",
+            session.name, exc_info=True,
+        )
         return False, f"launch_worker_session failed: {exc}"
 
     return True, f"session={session.name}"

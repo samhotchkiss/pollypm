@@ -650,6 +650,110 @@ def rename_cmd(
 
 
 # ---------------------------------------------------------------------------
+# pm project remove (#1561)
+# ---------------------------------------------------------------------------
+
+
+def _count_active_tasks(project_key: str, config_path: Path) -> int:
+    """Return the number of non-terminal work-service tasks for ``project_key``.
+
+    Best-effort: if the workspace work DB is missing or unreadable, we
+    return ``0`` rather than blocking removal — the user can still pass
+    ``--force`` to bypass the prompt either way, and refusing to remove
+    a TOML entry because we can't *read* the state DB would be worse
+    than letting the user proceed.
+    """
+    try:
+        from pollypm.work import create_work_service
+
+        with create_work_service(project_key=project_key) as svc:
+            return len(svc.list_nonterminal_tasks(project=project_key))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+@project_app.command("remove")
+def remove_cmd(
+    project_key: str = typer.Argument(
+        ...,
+        help="Project key to remove from the [projects] section.",
+    ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help=(
+            "Skip the active-task confirmation prompt. Required for "
+            "non-interactive removal when the project has queued or "
+            "in-flight tasks."
+        ),
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Non-interactive: auto-accept the confirmation prompt.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+) -> None:
+    """Remove a project from ``pollypm.toml``'s ``[projects]`` section.
+
+    Mirrors ``pm project new`` (#1561). The underlying core function
+    (:func:`pollypm.projects.remove_project`) only edits the TOML config —
+    work-service rows, tmux sessions, and worktree directories are NOT
+    touched. See issue #1561 for the full cascade-teardown plan; this
+    command is the narrow first step.
+
+    Refuses if the project is still referenced by enabled
+    ``[sessions.*]`` entries (the core function's invariant).
+
+    If the project has queued or in-flight tasks in the work DB, prompts
+    for confirmation. Pass ``--force`` to skip the prompt (e.g. for
+    scripted removal), or ``--yes`` to auto-accept it.
+    """
+    from pollypm.projects import remove_project
+
+    path = _require_config(config_path)
+    config = load_config(path)
+    if project_key not in config.projects:
+        typer.echo(f"Unknown project: {project_key}", err=True)
+        raise typer.Exit(code=1)
+
+    active = _count_active_tasks(project_key, path)
+    if active > 0 and not force:
+        task_word = "task" if active == 1 else "tasks"
+        typer.echo(
+            f"Project '{project_key}' has {active} queued or in-flight "
+            f"{task_word} in the work DB."
+        )
+        if yes:
+            proceed = True
+        else:
+            proceed = typer.confirm(
+                f"Remove '{project_key}' from pollypm.toml anyway? "
+                "(work-service rows will be left in place)",
+                default=False,
+            )
+        if not proceed:
+            typer.echo("Aborted. No changes made.")
+            raise typer.Exit(code=1)
+
+    try:
+        removed = remove_project(path, project_key)
+    except typer.BadParameter as exc:
+        typer.echo(f"Error: {exc.message}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"Removed project '{removed.key}' from {path}"
+    )
+    if active > 0:
+        typer.echo(
+            f"Note: {active} work-service task(s) for '{removed.key}' "
+            "were left in place. See issue #1561 for the full "
+            "teardown recipe."
+        )
+
+
+# ---------------------------------------------------------------------------
 # pm project plan
 # ---------------------------------------------------------------------------
 

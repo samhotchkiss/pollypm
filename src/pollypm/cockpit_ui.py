@@ -86,6 +86,11 @@ from pollypm.cockpit_inbox_items import (
     message_row_to_inbox_entry,
     task_to_inbox_entry,
 )
+from pollypm.cockpit_first_shipped import (  # noqa: F401  (re-exported)
+    _FIRST_SHIPPED_FRAMES,
+    _FirstShippedCelebrationModal,
+    _celebrate_first_shipped,
+)
 from pollypm.cockpit_inbox_project_picker import (  # noqa: F401  (re-exported)
     _InboxProjectPickerModal,
 )
@@ -249,86 +254,6 @@ ASCII_POLLY = "\n".join(
 )
 
 POLLY_TAGLINE = "Plans first.\nChaos later."
-
-
-_FIRST_SHIPPED_FRAMES = (
-    "  ✨   🎉   ✨\n🎊  First PR shipped  🎊\n  ✨   🎉   ✨",
-    "🎉   ✨   🎊   ✨\n  First PR shipped\n✨   🎊   ✨   🎉",
-    "  🎊   ✨   🎉\n🎉  First PR shipped  🎉\n  ✨   🎊   ✨",
-)
-
-
-class _FirstShippedCelebrationModal(ModalScreen[None]):
-    """Short-lived modal that celebrates the first shipped task."""
-
-    DEFAULT_CSS = """
-    #first-shipped-modal {
-        width: 60;
-        padding: 1 2;
-        border: round #6fcf97;
-        background: #102019;
-        color: #effaf3;
-    }
-    #first-shipped-title {
-        text-align: center;
-        margin-bottom: 1;
-    }
-    #first-shipped-confetti {
-        text-align: center;
-        color: #ffd166;
-        height: auto;
-    }
-    #first-shipped-hint {
-        text-align: center;
-        color: #93a7b3;
-        margin-top: 1;
-    }
-    """
-
-    BINDINGS = [Binding("escape", "dismiss", "Dismiss", show=False)]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._frame_index = 0
-
-    def compose(self) -> ComposeResult:  # pragma: no cover - Textual harness
-        with Vertical(id="first-shipped-modal"):
-            yield Static("First PR shipped", id="first-shipped-title")
-            yield Static(_FIRST_SHIPPED_FRAMES[0], id="first-shipped-confetti", markup=True)
-            yield Static(
-                "Recorded once and pinned in Activity.",
-                id="first-shipped-hint",
-            )
-
-    def on_mount(self) -> None:  # pragma: no cover - Textual harness
-        try:
-            self.set_interval(0.16, self._advance_frame)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            self.set_timer(2.0, self.dismiss)
-        except Exception:  # noqa: BLE001
-            pass
-
-    def _advance_frame(self) -> None:
-        self._frame_index = (self._frame_index + 1) % len(_FIRST_SHIPPED_FRAMES)
-        try:
-            self.query_one("#first-shipped-confetti", Static).update(
-                _FIRST_SHIPPED_FRAMES[self._frame_index],
-            )
-        except Exception:  # noqa: BLE001
-            pass
-
-
-def _celebrate_first_shipped(app) -> None:
-    """Announce the one-time shipped milestone in whichever cockpit view approved it."""
-    app.notify("🎉 First PR shipped. Nicely done.", severity="information", timeout=2.0)
-    if os.getenv("POLLY_NO_CONFETTI") == "1":
-        return
-    try:
-        app.push_screen(_FirstShippedCelebrationModal())
-    except Exception:  # noqa: BLE001
-        pass
 
 
 class _AlertDetailModal(ModalScreen[str | None]):
@@ -12974,6 +12899,144 @@ def _dashboard_deployment_decision(
     }
 
 
+def _dashboard_decision_prompt_from_body(
+    subject: str, body: str, steps: list[str],
+) -> str:
+    """Build a short "Decide:" / "Choose one:" prompt from a blocker body.
+
+    Extracted from ``_dashboard_inbox`` (issue #1356) so the
+    paragraph-scan + options-block branching can be exercised in
+    isolation. Pure function — only depends on module-level
+    ``_dashboard_plain_text`` / ``_dashboard_trim`` /
+    ``_ACTION_STEP_RE``.
+    """
+    paragraphs = [
+        _dashboard_plain_text(part)
+        for part in body.split("\n\n")
+        if _dashboard_plain_text(part)
+    ]
+    for paragraph in paragraphs:
+        lower = paragraph.lower()
+        if "ruling needed:" in lower:
+            prompt = paragraph.split(":", 1)[1].strip()
+            return _dashboard_trim(f"Decide: {prompt}", limit=260)
+    if len(steps) >= 2:
+        lower_body = body.lower()
+        lower_subject = subject.lower()
+        if (
+            "options:" in lower_body
+            or "this is your call" in lower_body
+            or "decision" in lower_subject
+            or "scope escalation" in lower_subject
+            or "blocked" in lower_subject
+        ):
+            option_steps: list[str] = []
+            in_options = False
+            for line in body.splitlines():
+                if "options:" in line.lower():
+                    in_options = True
+                    continue
+                if not in_options:
+                    continue
+                if line.strip().startswith("**") and option_steps:
+                    break
+                match = _ACTION_STEP_RE.match(line)
+                if match is not None:
+                    step = _dashboard_plain_text(match.group("step"))
+                    if step:
+                        option_steps.append(step)
+            if len(option_steps) >= 2:
+                return _dashboard_trim(
+                    f"Choose one: {option_steps[0]}; or {option_steps[1]}",
+                    limit=260,
+                )
+            return _dashboard_trim(
+                f"Choose one: {steps[0]}; or {steps[1]}",
+                limit=260,
+            )
+    for paragraph in paragraphs:
+        lower = paragraph.lower()
+        if "your call" in lower or "needs your call" in lower:
+            return _dashboard_trim(f"Decide: {paragraph}", limit=260)
+    if steps:
+        return _dashboard_trim(f"Next: {steps[0]}", limit=260)
+    return ""
+
+
+def _dashboard_plan_review_decision(
+    project_path: Path,
+    labels: list[str],
+    body: str,
+    *,
+    fallback_task_id: str | None = None,
+) -> dict[str, object] | None:
+    """Build a plan-review decision dict for a ``plan_review``-labelled item.
+
+    Returns ``None`` when ``labels`` does not include ``"plan_review"``.
+    Extracted from ``_dashboard_inbox`` (issue #1356) so the plan-text
+    loading + summary/judgment-call extraction can be tested directly.
+    ``project_path`` is passed explicitly (it was a closure capture in
+    the inner version).
+    """
+    if "plan_review" not in labels:
+        return None
+    meta = _extract_plan_review_meta(labels)
+    plan_task_id = str(meta.get("plan_task_id") or fallback_task_id or "")
+    steps = [
+        "Open the plan review surface.",
+        "Read the plan and any open decisions.",
+        "Approve the plan when it is ready, or discuss changes with the PM.",
+    ]
+    # #1397: load the plan markdown so the dashboard's action card +
+    # the cockpit drilldown can render the summary + judgment-call
+    # points inline. Falls back gracefully when the file isn't on
+    # disk yet (rare race window, or pre-#1408 plans without a
+    # ``## Summary`` block).
+    plan_text: str | None = None
+    plan_path_obj = _dashboard_plan_path(project_path)
+    if plan_path_obj is not None:
+        try:
+            plan_text = plan_path_obj.read_text(encoding="utf-8")
+        except OSError:
+            plan_text = None
+    plan_summary = (
+        _extract_plan_summary_block(plan_text or "") if plan_text else ""
+    )
+    judgment_calls = (
+        _extract_plan_judgment_calls(plan_text or "") if plan_text else []
+    )
+    plain_prompt = (
+        plan_summary if plan_summary
+        else "A full project plan is ready for your review."
+    )
+    return {
+        "plain_prompt": plain_prompt,
+        "unblock_steps": steps[:5],
+        "steps_heading": "What to do",
+        "decision_question": (
+            "Review the plan and decide whether it is ready to become "
+            "implementation tasks."
+        ),
+        "primary_label": "Review plan",
+        "secondary_label": "Open task",
+        "primary_action": {
+            "label": "Review plan",
+            "kind": "review_plan",
+            "task_id": fallback_task_id,
+            "plan_task_id": plan_task_id,
+        },
+        "secondary_action": {
+            "label": "Open task",
+            "kind": "open_task",
+            "task_id": plan_task_id or fallback_task_id,
+        },
+        "other_placeholder": "Reply with plan feedback...",
+        "plan_summary": plan_summary,
+        "judgment_calls": list(judgment_calls),
+        "plan_text": plan_text or "",
+    }
+
+
 def _dashboard_task_blocker_body(task: object) -> str:
     """Pick the clearest human-facing blocker text from a task."""
     body, _ = _dashboard_task_blocker_body_with_kind(task)
@@ -13718,7 +13781,7 @@ def _dashboard_inbox(
         from pollypm.store import SQLAlchemyStore
         from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.cockpit_inbox import _row_is_dev_channel
+        from pollypm.cockpit_inbox_sources import _row_is_dev_channel
     except Exception:  # noqa: BLE001
         return 0, [], []
     try:
@@ -13888,123 +13951,18 @@ def _dashboard_inbox(
             deduped.append(step)
         return deduped[:4]
 
-    def _decision_prompt_from_body(
-        subject: str, body: str, steps: list[str],
-    ) -> str:
-        paragraphs = [
-            _plain_text(part)
-            for part in body.split("\n\n")
-            if _plain_text(part)
-        ]
-        for paragraph in paragraphs:
-            lower = paragraph.lower()
-            if "ruling needed:" in lower:
-                prompt = paragraph.split(":", 1)[1].strip()
-                return _trim(f"Decide: {prompt}", limit=260)
-        if len(steps) >= 2:
-            lower_body = body.lower()
-            lower_subject = subject.lower()
-            if (
-                "options:" in lower_body
-                or "this is your call" in lower_body
-                or "decision" in lower_subject
-                or "scope escalation" in lower_subject
-                or "blocked" in lower_subject
-            ):
-                option_steps: list[str] = []
-                in_options = False
-                for line in body.splitlines():
-                    if "options:" in line.lower():
-                        in_options = True
-                        continue
-                    if not in_options:
-                        continue
-                    if line.strip().startswith("**") and option_steps:
-                        break
-                    match = _ACTION_STEP_RE.match(line)
-                    if match is not None:
-                        step = _plain_text(match.group("step"))
-                        if step:
-                            option_steps.append(step)
-                if len(option_steps) >= 2:
-                    return _trim(
-                        f"Choose one: {option_steps[0]}; or {option_steps[1]}",
-                        limit=260,
-                    )
-                return _trim(
-                    f"Choose one: {steps[0]}; or {steps[1]}",
-                    limit=260,
-                )
-        for paragraph in paragraphs:
-            lower = paragraph.lower()
-            if "your call" in lower or "needs your call" in lower:
-                return _trim(f"Decide: {paragraph}", limit=260)
-        if steps:
-            return _trim(f"Next: {steps[0]}", limit=260)
-        return ""
-
+    _decision_prompt_from_body = _dashboard_decision_prompt_from_body
     _user_prompt_decision = _dashboard_user_prompt_decision
 
     def _plan_review_decision(
         labels: list[str], body: str, *, fallback_task_id: str | None = None,
     ) -> dict[str, object] | None:
-        if "plan_review" not in labels:
-            return None
-        meta = _extract_plan_review_meta(labels)
-        plan_task_id = str(meta.get("plan_task_id") or fallback_task_id or "")
-        steps = [
-            "Open the plan review surface.",
-            "Read the plan and any open decisions.",
-            "Approve the plan when it is ready, or discuss changes with the PM.",
-        ]
-        # #1397: load the plan markdown so the dashboard's action card +
-        # the cockpit drilldown can render the summary + judgment-call
-        # points inline. Falls back gracefully when the file isn't on
-        # disk yet (rare race window, or pre-#1408 plans without a
-        # ``## Summary`` block).
-        plan_text: str | None = None
-        plan_path_obj = _dashboard_plan_path(project_path)
-        if plan_path_obj is not None:
-            try:
-                plan_text = plan_path_obj.read_text(encoding="utf-8")
-            except OSError:
-                plan_text = None
-        plan_summary = (
-            _extract_plan_summary_block(plan_text or "") if plan_text else ""
+        return _dashboard_plan_review_decision(
+            project_path,
+            labels,
+            body,
+            fallback_task_id=fallback_task_id,
         )
-        judgment_calls = (
-            _extract_plan_judgment_calls(plan_text or "") if plan_text else []
-        )
-        plain_prompt = (
-            plan_summary if plan_summary
-            else "A full project plan is ready for your review."
-        )
-        return {
-            "plain_prompt": plain_prompt,
-            "unblock_steps": steps[:5],
-            "steps_heading": "What to do",
-            "decision_question": (
-                "Review the plan and decide whether it is ready to become "
-                "implementation tasks."
-            ),
-            "primary_label": "Review plan",
-            "secondary_label": "Open task",
-            "primary_action": {
-                "label": "Review plan",
-                "kind": "review_plan",
-                "task_id": fallback_task_id,
-                "plan_task_id": plan_task_id,
-            },
-            "secondary_action": {
-                "label": "Open task",
-                "kind": "open_task",
-                "task_id": plan_task_id or fallback_task_id,
-            },
-            "other_placeholder": "Reply with plan feedback...",
-            "plan_summary": plan_summary,
-            "judgment_calls": list(judgment_calls),
-            "plan_text": plan_text or "",
-        }
 
     _deployment_decision = _dashboard_deployment_decision
 

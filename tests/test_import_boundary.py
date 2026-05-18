@@ -175,6 +175,11 @@ _TASK_ASSIGNMENT_NOTIFY_API_MODULE = (
 # instead of reaching into the optional plugin tree.
 _APPROVAL_NOTIFICATIONS_FILE = "src/pollypm/approval_notifications.py"
 _HUMAN_NOTIFY_PLUGIN_PREFIX = "pollypm.plugins_builtin.human_notify"
+# The dashboard reads briefings through the
+# :mod:`pollypm.briefings_registry` seam, not the morning_briefing
+# plugin directly (see #1363, sibling of #1597).
+_DASHBOARD_SECTION_FILE = "src/pollypm/cockpit_sections/dashboard.py"
+_MORNING_BRIEFING_PLUGIN_PREFIX = "pollypm.plugins_builtin.morning_briefing"
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -228,6 +233,31 @@ def test_non_plugin_sources_do_not_import_task_assignment_notify_api() -> None:
         if _imports_module(source_file, _TASK_ASSIGNMENT_NOTIFY_API_MODULE):
             offenders.append(rel)
     assert offenders == []
+
+
+def test_dashboard_does_not_import_morning_briefing_plugin() -> None:
+    """The dashboard surfaces briefings via the core registry seam.
+
+    :func:`pollypm.briefings_registry.list_briefings` is the sanctioned
+    read path. The ``morning_briefing`` plugin installs its real
+    ``list_briefings`` during ``initialize``; if the dashboard reaches
+    into the plugin tree directly we lose the "plugin is optional"
+    contract — fail loudly so the seam stays clean.
+    """
+    root = _project_root()
+    source_file = root / _DASHBOARD_SECTION_FILE
+    assert source_file.exists(), (
+        f"Expected {_DASHBOARD_SECTION_FILE} to exist — boundary test "
+        "needs updating if the file moved."
+    )
+    assert not _imports_module_or_subpackage(
+        source_file, _MORNING_BRIEFING_PLUGIN_PREFIX
+    ), (
+        f"{_DASHBOARD_SECTION_FILE} must not import from "
+        f"{_MORNING_BRIEFING_PLUGIN_PREFIX}; use "
+        "pollypm.briefings_registry.list_briefings instead so the "
+        "plugin stays optional."
+    )
 
 
 def test_approval_notifications_does_not_import_human_notify_plugin() -> None:

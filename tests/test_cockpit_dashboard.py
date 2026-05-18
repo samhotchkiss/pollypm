@@ -5,6 +5,9 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
+from pollypm.briefings_registry import register_briefing_provider
 from pollypm.cockpit import _build_cockpit_detail_dispatch
 from pollypm.cockpit_sections.dashboard import (
     DashboardAccountUsage,
@@ -21,11 +24,32 @@ from pollypm.cockpit_sections.dashboard import (
 from pollypm.plugins_builtin.morning_briefing.handlers.synthesize import (
     BriefingDraft,
 )
-from pollypm.plugins_builtin.morning_briefing.inbox import emit_briefing
+from pollypm.plugins_builtin.morning_briefing.inbox import (
+    emit_briefing,
+    list_briefings,
+)
 from pollypm.storage.state import AccountUsageRecord, TokenUsageHourlyRecord
 
 
 NOW = datetime(2026, 4, 21, 15, 0, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def _register_morning_briefing_provider():
+    """Install the morning_briefing inbox reader for dashboard tests.
+
+    Production wires this through the plugin's ``initialize`` hook
+    (see ``pollypm.plugins_builtin.morning_briefing.plugin``). The
+    plugin host doesn't run in these unit tests, so we register the
+    real reader directly so ``_briefing_banner`` resolves the same
+    way it does at runtime. Cleared after each test so a missing
+    registration doesn't leak across modules.
+    """
+    register_briefing_provider(list_briefings)
+    try:
+        yield
+    finally:
+        register_briefing_provider(None)
 
 
 @dataclass

@@ -10,11 +10,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import logging
 from pathlib import Path
 import re
 import sqlite3
 import tomllib
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 
 WORKSPACE_DB_KEY = "__workspace__"
@@ -106,6 +109,14 @@ def load_fast_inbox_action_preview(
     try:
         raw = tomllib.loads(config_path.read_text())
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A malformed config silently disables
+        # the fast preview path; log so config corruption is debuggable
+        # instead of "the cockpit just feels slow".
+        logger.warning(
+            "inbox_action_preview: failed to read config at %s",
+            config_path,
+            exc_info=True,
+        )
         return None
     sources, known_projects = _message_sources(raw, config_path=config_path)
     if not sources:
@@ -180,6 +191,14 @@ def _query_message_rows(db_path: Path, *, limit: int) -> list[dict[str, object]]
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=0.2)
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failed RO open here drops the source
+        # from the preview entirely — log so DB perms / WAL drift surface
+        # instead of silently shrinking the inbox.
+        logger.warning(
+            "inbox_action_preview: failed to open %s for preview",
+            db_path,
+            exc_info=True,
+        )
         return []
     conn.row_factory = sqlite3.Row
     try:

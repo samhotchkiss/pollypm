@@ -13,6 +13,7 @@ per-project DB so paused-with-work projects still surface.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -27,6 +28,8 @@ from pollypm.dashboard.categorization import (
     what_working,
     why_waiting,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,6 +93,13 @@ def _waiting_items_by_project(config) -> dict[str, list]:  # noqa: ANN001
     try:
         items = pm_inbox_awaits_user_list(config)
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failure here means the dashboard
+        # quietly shows zero waiting items for the whole workspace —
+        # log so a broken inbox query is debuggable.
+        logger.warning(
+            "operator_view: pm_inbox_awaits_user_list failed; dashboard will show no waiting items",
+            exc_info=True,
+        )
         items = []
     for item in items:
         key = (
@@ -125,10 +135,28 @@ def _open_work_service(scan: _ProjectScan):  # noqa: ANN202
                 db_path=db_path, project_path=scan.project_path,
             )
         except Exception:  # noqa: BLE001
+            # #1355: previously silent. A failed open here silently skips
+            # this DB candidate — log so a bad workspace/legacy path is
+            # debuggable instead of "the project just disappears".
+            logger.warning(
+                "operator_view: create_work_service failed for %s (project=%s)",
+                db_path,
+                scan.project_key,
+                exc_info=True,
+            )
             continue
         try:
             tasks = svc.list_tasks(project=scan.project_key)
         except Exception:  # noqa: BLE001
+            # #1355: previously silent. An empty task list here drops us
+            # to fallback selection; log so a broken list_tasks doesn't
+            # masquerade as "no work in this DB".
+            logger.warning(
+                "operator_view: list_tasks failed for project=%s db=%s",
+                scan.project_key,
+                db_path,
+                exc_info=True,
+            )
             tasks = []
         if tasks:
             if fallback is not None and fallback is not svc:

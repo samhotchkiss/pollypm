@@ -16,6 +16,9 @@ These tests pin the new contract:
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 from pollypm.cockpit_rail import CockpitRouter
 from pollypm.tmux.client import TmuxWindow
 
@@ -130,3 +133,48 @@ def test_cleanup_tolerates_list_windows_failure() -> None:
 
     # Must not raise.
     router._cleanup_duplicate_windows("pm-storage-closet")
+
+
+def test_emit_cockpit_audit_lands_in_workspace_central_tail(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#1593 — emits must land somewhere a `grep` can find them.
+
+    ``audit.log.emit`` skips the central-tail write when ``project`` is
+    falsy. ``_emit_cockpit_audit`` does not pass ``project_path``, so an
+    empty ``project`` silently drops the event. The fix is to use
+    ``"_workspace"`` (matching ``rail_daemon_supervisor`` /
+    ``rail_daemon_reaper``). This pins that landing path so the next
+    time someone "simplifies" the project key, the
+    overnight-protocol watch stays observable.
+    """
+    audit_home = tmp_path / "audit"
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router._emit_cockpit_audit(
+        event_name="cockpit.session_respawned",
+        subject="pm-operator",
+        status="warn",
+        metadata={"reason": "test"},
+    )
+
+    workspace_log = audit_home / "_workspace.jsonl"
+    assert workspace_log.exists(), (
+        f"cockpit audit emit must land in central tail; "
+        f"contents of {audit_home}: "
+        f"{[p.name for p in audit_home.iterdir()] if audit_home.exists() else 'missing'}"
+    )
+    lines = [
+        json.loads(line)
+        for line in workspace_log.read_text().splitlines()
+        if line.strip()
+    ]
+    assert len(lines) == 1
+    record = lines[0]
+    assert record["event"] == "cockpit.session_respawned"
+    assert record["project"] == "_workspace"
+    assert record["subject"] == "pm-operator"
+    assert record["status"] == "warn"
+    assert record["actor"] == "cockpit-rail"
+    assert record["metadata"] == {"reason": "test"}

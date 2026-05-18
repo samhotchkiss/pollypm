@@ -2354,6 +2354,15 @@ class CockpitRouter:
 
         Imported lazily so a missing/broken audit-log module never
         blocks rail navigation.
+
+        #1593 — uses the ``_workspace`` project key (mirroring
+        ``rail_daemon_supervisor._emit_revival_audit`` and
+        ``rail_daemon_reaper._emit_audit``) because the cockpit rail is
+        not scoped to a single project. ``audit.log.emit`` skips the
+        central-tail write when ``project`` is falsy, and these emits
+        pass ``project_path=None`` (no per-project log), so an empty
+        ``project`` silently drops the event entirely — which is what
+        caused the overnight protocol's #1562 watch to read zero.
         """
         try:
             from pollypm.audit.log import emit as audit_emit
@@ -2362,7 +2371,7 @@ class CockpitRouter:
         try:
             audit_emit(
                 event=event_name,
-                project="",
+                project="_workspace",
                 subject=subject,
                 actor="cockpit-rail",
                 status=status,

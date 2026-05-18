@@ -926,7 +926,9 @@ def _purge_project_sessions(
 # * ``removed_ok`` is True after a successful teardown. In dry-run mode
 #   we always report False for this and skip the actual delete.
 # * ``reason`` carries a short explanation when ``removed_ok`` is False
-#   ("dirty", "git-failed", "rmtree-failed", or "dry-run").
+#   ("dirty", "locked", "git-failed", "rmtree-failed", or "dry-run").
+#   "locked" means the worktree is git-locked and the caller didn't pass
+#   ``force_discard_changes`` to override (see issue #1693).
 
 
 def _worktree_is_git_registered(
@@ -982,6 +984,53 @@ def _worktree_has_uncommitted_changes(worktree_path: Path) -> bool:
     if result.returncode != 0:
         return False
     return bool(result.stdout.strip())
+
+
+def _worktree_is_locked(
+    project_path: Path, worktree_path: Path
+) -> bool:
+    """Return True if ``worktree_path`` is a locked git worktree.
+
+    Parses ``git worktree list --porcelain`` and looks for a ``locked``
+    record attached to the matching ``worktree`` entry. ``git worktree
+    remove`` refuses to remove a locked worktree, so we mirror that
+    check here — otherwise the rmtree fallback would silently bypass
+    git's safety net (see issue #1693, regression from #1685).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_path),
+             "worktree", "list", "--porcelain"],
+            check=False, text=True, capture_output=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        target = worktree_path.resolve()
+    except OSError:
+        target = worktree_path
+    current_match = False
+    for raw in result.stdout.splitlines():
+        line = raw.rstrip()
+        if line.startswith("worktree "):
+            registered = line[len("worktree "):].strip()
+            try:
+                registered_resolved = Path(registered).resolve()
+            except OSError:
+                registered_resolved = Path(registered)
+            current_match = registered_resolved == target
+            continue
+        if not line:
+            # Blank line terminates a porcelain record.
+            current_match = False
+            continue
+        # The ``locked`` token may stand alone or carry a reason
+        # ("locked <reason>"); either form means the worktree is locked.
+        if current_match and (line == "locked" or line.startswith("locked ")):
+            return True
+    return False
 
 
 def _enumerate_project_worktree_dirs(project_path: Path) -> list[Path]:
@@ -1047,6 +1096,18 @@ def _purge_project_worktrees(
     ``git worktree remove --force`` (which also drops the branch ref);
     unregistered stale directories fall back to :func:`shutil.rmtree`.
 
+    Locked worktrees are treated the same way: without
+    ``force_discard_changes`` they're skipped (reason ``"locked"``);
+    with the flag we ``git worktree unlock`` first and then
+    ``git worktree remove --force``. See issue #1693 — the rmtree
+    fallback used to silently bypass git's locked-worktree refusal.
+
+    For registered worktrees, a non-zero ``git worktree remove`` is
+    reported as ``"git-failed"`` and the directory is left alone. We do
+    NOT fall back to ``shutil.rmtree`` on registered worktrees because
+    that would bypass git's own safety checks (locks, submodule data,
+    etc.). Stale unregistered directories still use the rmtree path.
+
     Best-effort throughout: a teardown failure on one entry never aborts
     the rest of the sweep. The caller gets per-entry success/failure so
     it can surface partial-failure to the operator.
@@ -1064,8 +1125,20 @@ def _purge_project_worktrees(
     for wt_path in entries:
         is_git = _worktree_is_git_registered(project_path, wt_path)
         dirty = _worktree_has_uncommitted_changes(wt_path) if is_git else False
+        locked = (
+            _worktree_is_locked(project_path, wt_path) if is_git else False
+        )
         if dry_run:
             results.append((wt_path, is_git, dirty, False, "dry-run"))
+            continue
+        if locked and not force_discard_changes:
+            # Git refuses to remove a locked worktree and we mirror that:
+            # without an explicit override the locked worktree's contents
+            # stay on disk. Operators must pass
+            # ``--force-discard-worktree-changes`` to opt into removal
+            # (see issue #1693 — regression from #1685 where the rmtree
+            # fallback silently bypassed git's refusal).
+            results.append((wt_path, is_git, dirty, False, "locked"))
             continue
         if dirty and not force_discard_changes:
             # Operator hasn't opted into discarding changes — leave it.
@@ -1074,8 +1147,20 @@ def _purge_project_worktrees(
         removed_ok = False
         reason = ""
         if is_git:
+            if locked:
+                # Force override: unlock first so ``git worktree remove
+                # --force`` doesn't bounce off git's locked check.
+                try:
+                    subprocess.run(
+                        ["git", "-C", str(project_path),
+                         "worktree", "unlock", "--", str(wt_path)],
+                        check=False, text=True,
+                        capture_output=True, timeout=60,
+                    )
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
             cmd = ["git", "-C", str(project_path), "worktree", "remove"]
-            if force_discard_changes or dirty:
+            if force_discard_changes or dirty or locked:
                 cmd.append("--force")
             cmd.extend(["--", str(wt_path)])
             try:
@@ -1086,22 +1171,14 @@ def _purge_project_worktrees(
                 if proc.returncode == 0 and not wt_path.exists():
                     removed_ok = True
                 else:
-                    # ``git worktree remove`` can leave the directory if
-                    # the worktree was already half-detached. Fall back
-                    # to rmtree so the operator gets a clean slate.
                     reason = "git-failed"
             except (subprocess.TimeoutExpired, OSError):
                 reason = "git-failed"
-            # Best-effort fallback: if the directory is still there
-            # after a git remove (or if git failed), rmtree it.
-            if not removed_ok and wt_path.exists():
-                try:
-                    _shutil.rmtree(wt_path)
-                    removed_ok = True
-                    if reason == "":
-                        reason = "rmtree-fallback"
-                except OSError:
-                    reason = reason or "rmtree-failed"
+            # For registered worktrees we do NOT fall back to rmtree
+            # when git refused — that would bypass git's own safety
+            # checks (locked worktrees, submodules, etc.). See issue
+            # #1693. Stale leftover directories (is_git=False) still
+            # use the rmtree path below.
         else:
             try:
                 _shutil.rmtree(wt_path)
@@ -1176,8 +1253,10 @@ def remove_cmd(
         False, "--force-discard-worktree-changes",
         help=(
             "When used with --purge-worktrees, discard uncommitted "
-            "changes in worktrees instead of refusing to remove them. "
-            "Pairs with ``git worktree remove --force``."
+            "changes in worktrees instead of refusing to remove them, "
+            "AND unlock+remove git-locked worktrees that ``git worktree "
+            "remove`` would otherwise refuse. Pairs with ``git worktree "
+            "remove --force`` (see issue #1693)."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -1495,9 +1574,13 @@ def remove_cmd(
                 p for p, _g, _d, ok, reason in wt_results
                 if not ok and reason == "dirty"
             ]
+            skipped_locked = [
+                p for p, _g, _d, ok, reason in wt_results
+                if not ok and reason == "locked"
+            ]
             failed = [
                 (p, reason) for p, _g, _d, ok, reason in wt_results
-                if not ok and reason != "dirty"
+                if not ok and reason not in ("dirty", "locked")
             ]
             typer.echo(
                 f"Removed {removed_count} worktree director"
@@ -1507,6 +1590,11 @@ def remove_cmd(
                 typer.echo(
                     f"  Skipped (uncommitted changes): {p} — re-run with "
                     "--force-discard-worktree-changes to discard."
+                )
+            for p in skipped_locked:
+                typer.echo(
+                    f"  Skipped (locked worktree): {p} — re-run with "
+                    "--force-discard-worktree-changes to unlock and remove."
                 )
             for p, reason in failed:
                 typer.echo(f"  Failed to remove {p} ({reason}).")

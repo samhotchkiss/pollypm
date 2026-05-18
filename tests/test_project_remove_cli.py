@@ -1185,6 +1185,118 @@ def test_purge_project_worktrees_rmtrees_stale_dirs(env) -> None:
     assert not stale.exists()
 
 
+def _lock_worktree(project_path: Path, wt_path: Path) -> None:
+    """Run ``git worktree lock`` against ``wt_path``."""
+    import subprocess
+    subprocess.run(
+        ["git", "-C", str(project_path), "worktree", "lock",
+         "--", str(wt_path)],
+        check=True, capture_output=True,
+    )
+
+
+def test_purge_project_worktrees_refuses_locked_without_force(env) -> None:
+    """Locked worktrees are skipped (reason=locked) without force.
+
+    Regression coverage for #1693: the rmtree fallback used to silently
+    bypass ``git worktree remove``'s refusal on a locked worktree, which
+    discarded protected contents anyway.
+    """
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    results = _purge_project_worktrees(env["config_path"], "demo")
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    assert is_git is True
+    assert ok is False
+    assert reason == "locked"
+    # The locked worktree's contents are still on disk — git's refusal
+    # was honored end-to-end (no rmtree fallback).
+    assert wt_a.exists()
+    assert (wt_a / "README").exists()
+
+
+def test_purge_project_worktrees_force_discard_unlocks_and_removes(
+    env,
+) -> None:
+    """``force_discard_changes`` unlocks + removes a locked worktree."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    results = _purge_project_worktrees(
+        env["config_path"], "demo", force_discard_changes=True,
+    )
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    assert is_git is True
+    assert ok is True
+    assert not wt_a.exists()
+
+
+def test_cli_remove_purge_worktrees_skips_locked_without_force(env) -> None:
+    """CLI surfaces ``locked`` skip with a hint pointing at the override."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project."
+        "_count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Skipped (locked worktree)" in result.output
+    assert "--force-discard-worktree-changes" in result.output
+    # Locked worktree contents preserved.
+    assert wt_a.exists()
+
+
+def test_cli_remove_purge_worktrees_force_discard_removes_locked(env) -> None:
+    """With override, locked worktree is unlocked and removed."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project."
+        "_count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees",
+                "--force-discard-worktree-changes", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Removed 1 worktree directory" in result.output
+    assert not wt_a.exists()
+
+
 def test_cli_remove_purge_worktrees_full_cascade(env) -> None:
     """``pm project remove --purge-worktrees --yes`` removes worktree dirs."""
     _init_git_project(env["project_path"])

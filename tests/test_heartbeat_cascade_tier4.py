@@ -851,11 +851,19 @@ def test_system_helper_accepts_env_flag(
         tier4_mod, "_resolve_storage_closet_session",
         lambda: "polly-storage",
     )
-    # Stub the desktop notifier path.
+    # Install the cadence emitter through the registry seam (the CLI no
+    # longer reaches into the plugin tree directly per #1363). Stub the
+    # desktop notifier path so the test doesn't shell out to osascript.
     import pollypm.plugins_builtin.core_recurring.audit_watchdog as cadence
+    from pollypm import tier4_actions_registry
     monkeypatch.setattr(
         cadence, "_send_tier4_global_action_push",
         lambda **_kw: True,
+    )
+    monkeypatch.setattr(
+        tier4_actions_registry,
+        "_emit_tier4_global_action",
+        cadence.emit_tier4_global_action,
     )
     runner = CliRunner()
     result = runner.invoke(

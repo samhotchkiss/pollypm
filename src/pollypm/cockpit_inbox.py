@@ -1009,6 +1009,254 @@ def _worker_health_snapshot(
     return health, tooltip
 
 
+def _load_roster_tmux_state(config) -> tuple[object | None, dict[str, object]]:
+    """Best-effort load of the tmux client + storage-closet windows.
+
+    Pure setup — degrades to ``(None, {})`` when either the tmux client
+    can't be constructed or the storage-closet session is missing. The
+    roster stays useful (offline + empty turn labels) without it.
+    """
+    try:
+        from pollypm.session_services import create_tmux_client
+        tmux = create_tmux_client()
+        storage_session = f"{config.project.tmux_session}-storage-closet"
+        try:
+            storage_window_list = tmux.list_windows(storage_session)
+        except Exception:  # noqa: BLE001
+            storage_window_list = []
+        storage_windows = {w.name: w for w in storage_window_list}
+        return tmux, storage_windows
+    except Exception:  # noqa: BLE001
+        return None, {}
+
+
+def _supervisor_stuck_and_heartbeat(
+    supervisor: object | None, session_name: str,
+) -> tuple[bool, str | None, object | None]:
+    """Read state-drift + latest-heartbeat for a session from the supervisor.
+
+    Returns ``(stuck, last_heartbeat_iso, heartbeat)``.
+
+    ``stuck`` is ``True`` when a ``state_drift`` event landed in the last
+    30 minutes — older drift events are treated as historical noise.
+    Any store error degrades to ``False`` / ``None`` so a transient DB
+    blip doesn't sink the whole roster row.
+    """
+    if supervisor is None:
+        return False, None, None
+    try:
+        drift_at = supervisor.store.last_event_at(session_name, "state_drift")
+    except Exception:  # noqa: BLE001
+        drift_at = None
+    stuck = False
+    if drift_at:
+        try:
+            drift_dt: datetime | None = datetime.fromisoformat(drift_at)
+        except (TypeError, ValueError):
+            drift_dt = None
+        if drift_dt is not None:
+            if drift_dt.tzinfo is None:
+                drift_dt = drift_dt.replace(tzinfo=UTC)
+            if drift_dt >= datetime.now(UTC) - timedelta(minutes=30):
+                stuck = True
+    try:
+        heartbeat = supervisor.store.latest_heartbeat(session_name)
+    except Exception:  # noqa: BLE001
+        heartbeat = None
+    last_heartbeat_iso = (
+        getattr(heartbeat, "created_at", None) if heartbeat is not None else None
+    )
+    return stuck, last_heartbeat_iso, heartbeat
+
+
+def _classify_worker_status(
+    *,
+    has_window: bool,
+    pane_stopped: bool,
+    supervisor_stuck: bool,
+    is_turn_active: bool,
+) -> str:
+    """Reduce the four signal bits to one of working/idle/stuck/offline."""
+    if not has_window:
+        return "offline"
+    if pane_stopped or supervisor_stuck:
+        return "stuck"
+    if is_turn_active:
+        return "working"
+    return "idle"
+
+
+def _detect_pane_turn_active(
+    *,
+    tmux: object | None,
+    window: object | None,
+    heartbeat: object | None,
+    has_window: bool,
+    pane_stopped: bool,
+) -> bool:
+    """Decide whether a window's pane shows a live worker turn.
+
+    Prefers the recent heartbeat snapshot (cheap, no tmux roundtrip);
+    falls back to a 15-line pane capture. Returns ``False`` when the
+    window is missing/dead, the pane has a stopped descendant, or every
+    text source is empty.
+    """
+    if not has_window or pane_stopped:
+        return False
+    pane_text = read_recent_heartbeat_snapshot(heartbeat)
+    if pane_text is None and tmux is not None and window is not None:
+        try:
+            pane_text = tmux.capture_pane(window.pane_id, lines=15)
+        except Exception:  # noqa: BLE001
+            pane_text = ""
+    if not pane_text:
+        return False
+    return _pane_text_shows_active_turn(pane_text)
+
+
+def _build_synthetic_storage_row(
+    *,
+    window_name: str,
+    window: object,
+    projects: dict,
+    tmux: object | None,
+) -> WorkerRosterRow | None:
+    """Build a roster row for a storage-closet window not in any DB.
+
+    Two shapes land here:
+
+    * per-task worker windows (``task-<project>-<N>``) whose DB row
+      hasn't materialised yet (#996)
+    * long-running control sessions (``architect-*``, ``worker-*``,
+      ``pm-*``) that never get a ``work_sessions`` row by design (#871)
+
+    Returns ``None`` when the window is neither shape we recognise or
+    when a ``task-*`` name fails to parse.
+    """
+    is_dead = bool(getattr(window, "pane_dead", False))
+
+    if window_name.startswith("task-"):
+        suffix = window_name[len("task-") :]
+        project_key, sep, task_num_raw = suffix.rpartition("-")
+        if not sep or not project_key or not task_num_raw:
+            return None
+        try:
+            task_number: int | None = int(task_num_raw)
+        except ValueError:
+            return None
+        project = projects.get(project_key)
+        project_name = (
+            project.display_label() if project is not None and hasattr(project, "display_label")
+            else (getattr(project, "name", None) if project is not None else None)
+            or project_key
+        )
+        # Best-effort turn detection so the per-task row gets the same
+        # working/idle dot the DB-backed rows do.
+        pane_text = ""
+        pane_id = getattr(window, "pane_id", None)
+        pane_stopped = _tmux_window_has_stopped_descendant(tmux, window)
+        if not is_dead and not pane_stopped and tmux is not None and pane_id:
+            try:
+                pane_text = tmux.capture_pane(pane_id, lines=15) or ""
+            except Exception:  # noqa: BLE001
+                pane_text = ""
+        if is_dead:
+            status = "offline"
+        elif pane_stopped:
+            status = "stuck"
+        elif pane_text and _pane_text_shows_active_turn(pane_text):
+            status = "working"
+        else:
+            status = "idle"
+        health, health_tooltip = _worker_health_snapshot(
+            status=status,
+            last_heartbeat_iso=None,
+            token_total=0,
+            session_name=window_name,
+            current_node=None,
+        )
+        return WorkerRosterRow(
+            project_key=project_key,
+            project_name=str(project_name),
+            session_name=window_name,
+            status=status,
+            health=health,
+            health_tooltip=health_tooltip,
+            task_id=None,
+            task_number=task_number,
+            task_title="(per-task worker)",
+            current_node=None,
+            turn_label="",
+            last_commit_label="—",
+            token_total=0,
+            tmux_window=window_name,
+            last_heartbeat=None,
+            worktree_path=None,
+            branch_name=None,
+            just_shipped=False,
+            shipment_token=None,
+        )
+
+    if not (
+        window_name.startswith("architect-")
+        or window_name.startswith("worker-")
+        or window_name.startswith("pm-")
+    ):
+        return None
+    kind, _, label = window_name.partition("-")
+    project_key = label or "[workspace]"
+    pane_stopped = _tmux_window_has_stopped_descendant(tmux, window)
+    if is_dead:
+        status = "offline"
+    elif pane_stopped:
+        status = "stuck"
+    else:
+        status = "idle"
+    # Synthetic control-session rows have no per-task branch. Fall back
+    # to the project's HEAD so the "Last commit" column surfaces real
+    # activity instead of being empty for every control session (#997).
+    # Rows whose label doesn't match a configured project (e.g.
+    # workspace-level ``pm-heartbeat``) keep the empty dash.
+    synthetic_project = projects.get(project_key)
+    synthetic_path = getattr(synthetic_project, "path", None)
+    if isinstance(synthetic_path, Path):
+        synthetic_last_commit, synthetic_last_commit_seconds_ago = (
+            _last_commit_age_info(synthetic_path, None)
+        )
+    else:
+        synthetic_last_commit = "—"
+        synthetic_last_commit_seconds_ago = None
+    health, health_tooltip = _worker_health_snapshot(
+        status=status,
+        last_heartbeat_iso=None,
+        token_total=0,
+        session_name=window_name,
+        current_node=None,
+        last_commit_seconds_ago=synthetic_last_commit_seconds_ago,
+    )
+    return WorkerRosterRow(
+        project_key=project_key,
+        project_name=label or "[workspace]",
+        session_name=window_name,
+        status=status,
+        health=health,
+        health_tooltip=health_tooltip,
+        task_id=None,
+        task_number=None,
+        task_title=f"{kind.title()} session",
+        current_node=None,
+        turn_label="",
+        last_commit_label=synthetic_last_commit,
+        token_total=0,
+        tmux_window=window_name,
+        last_heartbeat=None,
+        worktree_path=None,
+        branch_name=None,
+        just_shipped=False,
+        shipment_token=None,
+    )
+
+
 def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     """Walk every tracked project's work-service + tmux state.
 
@@ -1030,20 +1278,7 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     # offline + empty turn labels when either one is unavailable.
     supervisor = _try_load_supervisor_for_config(config)
 
-    tmux = None
-    storage_windows: dict[str, object] = {}
-    try:
-        from pollypm.session_services import create_tmux_client
-        tmux = create_tmux_client()
-        storage_session = f"{config.project.tmux_session}-storage-closet"
-        try:
-            storage_window_list = tmux.list_windows(storage_session)
-        except Exception:  # noqa: BLE001
-            storage_window_list = []
-        storage_windows = {w.name: w for w in storage_window_list}
-    except Exception:  # noqa: BLE001
-        tmux = None
-        storage_windows = {}
+    tmux, storage_windows = _load_roster_tmux_state(config)
 
     rows: list[WorkerRosterRow] = []
 
@@ -1112,56 +1347,22 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
             )
             session_name = ws.agent_name or window_name
 
-            last_heartbeat_iso: str | None = None
-            heartbeat = None
-            is_turn_active = False
-
-            stuck = False
-            if supervisor is not None:
-                try:
-                    drift_at = supervisor.store.last_event_at(
-                        session_name, "state_drift",
-                    )
-                except Exception:  # noqa: BLE001
-                    drift_at = None
-                if drift_at:
-                    from datetime import UTC, datetime, timedelta
-                    try:
-                        drift_dt = datetime.fromisoformat(drift_at)
-                    except (TypeError, ValueError):
-                        drift_dt = None
-                    if drift_dt is not None:
-                        if drift_dt.tzinfo is None:
-                            drift_dt = drift_dt.replace(tzinfo=UTC)
-                        if drift_dt >= datetime.now(UTC) - timedelta(minutes=30):
-                            stuck = True
-                try:
-                    heartbeat = supervisor.store.latest_heartbeat(session_name)
-                except Exception:  # noqa: BLE001
-                    heartbeat = None
-                if heartbeat is not None:
-                    last_heartbeat_iso = getattr(heartbeat, "created_at", None)
-
-            if has_window and not pane_stopped:
-                pane_text = read_recent_heartbeat_snapshot(heartbeat)
-                if pane_text is None and tmux is not None:
-                    try:
-                        pane_text = tmux.capture_pane(window.pane_id, lines=15)
-                    except Exception:  # noqa: BLE001
-                        pane_text = ""
-                if pane_text:
-                    is_turn_active = _pane_text_shows_active_turn(pane_text)
-
-            if not has_window:
-                status = "offline"
-            elif pane_stopped:
-                status = "stuck"
-            elif stuck:
-                status = "stuck"
-            elif is_turn_active:
-                status = "working"
-            else:
-                status = "idle"
+            stuck, last_heartbeat_iso, heartbeat = (
+                _supervisor_stuck_and_heartbeat(supervisor, session_name)
+            )
+            is_turn_active = _detect_pane_turn_active(
+                tmux=tmux,
+                window=window,
+                heartbeat=heartbeat,
+                has_window=has_window,
+                pane_stopped=pane_stopped,
+            )
+            status = _classify_worker_status(
+                has_window=has_window,
+                pane_stopped=pane_stopped,
+                supervisor_stuck=stuck,
+                is_turn_active=is_turn_active,
+            )
 
             turn_label = _format_worker_turn_label(
                 last_heartbeat_iso=last_heartbeat_iso,
@@ -1223,134 +1424,14 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
         for window_name, window in storage_windows.items():
             if window_name in already_tracked:
                 continue
-            is_dead = bool(getattr(window, "pane_dead", False))
-            if window_name.startswith("task-"):
-                # task-<project>-<N> — parse so the row carries a real
-                # task_number (the action affordance routes by it).
-                suffix = window_name[len("task-") :]
-                project_key, sep, task_num_raw = suffix.rpartition("-")
-                if not sep or not project_key or not task_num_raw:
-                    continue
-                try:
-                    task_number: int | None = int(task_num_raw)
-                except ValueError:
-                    continue
-                project = projects.get(project_key)
-                project_name = (
-                    project.display_label() if project is not None and hasattr(project, "display_label")
-                    else (getattr(project, "name", None) if project is not None else None)
-                    or project_key
-                )
-                # Best-effort turn detection so the per-task row gets
-                # the same working/idle dot the DB-backed rows do.
-                pane_text = ""
-                pane_id = getattr(window, "pane_id", None)
-                pane_stopped = _tmux_window_has_stopped_descendant(tmux, window)
-                if not is_dead and not pane_stopped and tmux is not None and pane_id:
-                    try:
-                        pane_text = tmux.capture_pane(pane_id, lines=15) or ""
-                    except Exception:  # noqa: BLE001
-                        pane_text = ""
-                if is_dead:
-                    status = "offline"
-                elif pane_stopped:
-                    status = "stuck"
-                elif pane_text and _pane_text_shows_active_turn(pane_text):
-                    status = "working"
-                else:
-                    status = "idle"
-                health, health_tooltip = _worker_health_snapshot(
-                    status=status,
-                    last_heartbeat_iso=None,
-                    token_total=0,
-                    session_name=window_name,
-                    current_node=None,
-                )
-                rows.append(
-                    WorkerRosterRow(
-                        project_key=project_key,
-                        project_name=str(project_name),
-                        session_name=window_name,
-                        status=status,
-                        health=health,
-                        health_tooltip=health_tooltip,
-                        task_id=None,
-                        task_number=task_number,
-                        task_title="(per-task worker)",
-                        current_node=None,
-                        turn_label="",
-                        last_commit_label="—",
-                        token_total=0,
-                        tmux_window=window_name,
-                        last_heartbeat=None,
-                        worktree_path=None,
-                        branch_name=None,
-                        just_shipped=False,
-                        shipment_token=None,
-                    )
-                )
-                continue
-            if not (
-                window_name.startswith("architect-")
-                or window_name.startswith("worker-")
-                or window_name.startswith("pm-")
-            ):
-                continue
-            kind, _, label = window_name.partition("-")
-            project_key = label or "[workspace]"
-            pane_stopped = _tmux_window_has_stopped_descendant(tmux, window)
-            if is_dead:
-                status = "offline"
-            elif pane_stopped:
-                status = "stuck"
-            else:
-                status = "idle"
-            # Synthetic control-session rows have no per-task branch.
-            # Fall back to the project's HEAD so the "Last commit" column
-            # surfaces real activity instead of being empty for every
-            # control session (#997). Rows whose label doesn't match a
-            # configured project (e.g. workspace-level ``pm-heartbeat``)
-            # keep the empty dash.
-            synthetic_project = projects.get(project_key)
-            synthetic_path = getattr(synthetic_project, "path", None)
-            if isinstance(synthetic_path, Path):
-                synthetic_last_commit, synthetic_last_commit_seconds_ago = (
-                    _last_commit_age_info(synthetic_path, None)
-                )
-            else:
-                synthetic_last_commit = "—"
-                synthetic_last_commit_seconds_ago = None
-            health, health_tooltip = _worker_health_snapshot(
-                status=status,
-                last_heartbeat_iso=None,
-                token_total=0,
-                session_name=window_name,
-                current_node=None,
-                last_commit_seconds_ago=synthetic_last_commit_seconds_ago,
+            synthetic = _build_synthetic_storage_row(
+                window_name=window_name,
+                window=window,
+                projects=projects,
+                tmux=tmux,
             )
-            rows.append(
-                WorkerRosterRow(
-                    project_key=project_key,
-                    project_name=label or "[workspace]",
-                    session_name=window_name,
-                    status=status,
-                    health=health,
-                    health_tooltip=health_tooltip,
-                    task_id=None,
-                    task_number=None,
-                    task_title=f"{kind.title()} session",
-                    current_node=None,
-                    turn_label="",
-                    last_commit_label=synthetic_last_commit,
-                    token_total=0,
-                    tmux_window=window_name,
-                    last_heartbeat=None,
-                    worktree_path=None,
-                    branch_name=None,
-                    just_shipped=False,
-                    shipment_token=None,
-                )
-            )
+            if synthetic is not None:
+                rows.append(synthetic)
 
     if supervisor is not None:
         try:

@@ -1114,7 +1114,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         """Detect and react to mid-flight persona drift (#757).
 
         Kickoff-time swaps are caught by
-        ``supervisor._assert_session_launch_matches``; this catches sessions
+        :meth:`Supervisor._assert_session_launch_matches`; this catches sessions
         whose identity drifted AFTER kickoff (e.g. a prompt-injection loop,
         or a session reading a wrong-role control-prompts file). Conservative:
         only fires on strong identity-claim phrasings, never on casual

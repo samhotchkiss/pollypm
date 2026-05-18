@@ -484,6 +484,24 @@ def test_no_supervisor_private_reach_through() -> None:
     )
 
 
+def test_supervisor_reach_pattern_skips_capitalized_class_refs() -> None:
+    """Regression for #1677: docstring class references must not trip the gate.
+
+    The reach-through scanner is intended to flag *runtime* attribute access
+    like ``supervisor._foo``, not documentation that references the
+    :class:`Supervisor` class itself (e.g. ``Supervisor._assert_...`` in a
+    docstring ``:meth:`` cross-ref). The pattern is case-sensitive on the
+    leading ``s`` for exactly this reason; if that ever changes, every
+    Sphinx-style class reference would suddenly be an offender.
+    """
+    # Capitalized class references in docstrings — must NOT match.
+    assert _SUPERVISOR_REACH_PATTERN.search("Supervisor._assert_session_launch_matches") is None
+    assert _SUPERVISOR_REACH_PATTERN.search(":meth:`Supervisor._foo`") is None
+    # Lowercase variable reach-through — MUST match.
+    assert _SUPERVISOR_REACH_PATTERN.search("supervisor._assert_session_launch_matches(x)") is not None
+    assert _SUPERVISOR_REACH_PATTERN.search("self.supervisor._window_map()") is not None
+
+
 # ---------------------------------------------------------------------------
 # Guardrail 3: private SQLite connection reach-through
 # ---------------------------------------------------------------------------

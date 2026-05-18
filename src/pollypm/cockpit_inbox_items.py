@@ -17,7 +17,7 @@ from pathlib import Path
 import re
 from typing import Any
 
-from pollypm.cockpit_inbox import _inbox_db_sources, _row_is_dev_channel
+from pollypm.cockpit_inbox_sources import _inbox_db_sources, _row_is_dev_channel
 from pollypm.inbox.kind import InboxItemKind, coerce_kind
 from pollypm.rejection_feedback import (
     feedback_target_task_id,

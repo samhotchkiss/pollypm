@@ -1529,6 +1529,303 @@ def remove_cmd(
 
 
 # ---------------------------------------------------------------------------
+# pm project reinit (#1561)
+# ---------------------------------------------------------------------------
+
+
+@project_app.command("reinit")
+def reinit_cmd(
+    project_key: str = typer.Argument(
+        ...,
+        help="Project key to reinitialize (remove + re-register).",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help=(
+            "Non-interactive: auto-accept the destructive confirmation "
+            "prompt. Required when there are active tasks, state.db "
+            "rows, or worktrees to purge."
+        ),
+    ),
+    force_discard_worktree_changes: bool = typer.Option(
+        False, "--force-discard-worktree-changes",
+        help=(
+            "Discard uncommitted changes in worktrees instead of "
+            "refusing to remove them. Pairs with ``git worktree remove "
+            "--force``."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help=(
+            "Preview the reinit plan without mutating anything. Lists "
+            "what would be torn down and the path that would be "
+            "re-registered."
+        ),
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+) -> None:
+    """Remove + re-register a project in one step ("blow it away and start over").
+
+    Thin wrapper around ``pm project remove --purge-sessions --purge-state
+    --purge-worktrees`` followed by ``register_project`` with the same
+    slug and workspace path. The high-traffic use case (#1561): the
+    operator wiped & rebuilt the working tree by hand and now wants
+    PollyPM caught up cleanly without invariant orphans.
+
+    The cascade ordering mirrors ``pm project remove``:
+
+    1. Kill tmux sessions + drop ``[sessions.*]`` entries.
+    2. Delete state.db rows + audit-tail JSONL.
+    3. Remove ``<project>/.pollypm/worktrees/`` subdirs.
+    4. Remove the ``[projects.<key>]`` config entry.
+    5. Re-register the same path under the same slug.
+
+    Step 5 also re-runs ``ensure_project_scaffold`` on the path, so the
+    standard ``.pollypm/`` directory layout reappears after the wipe.
+
+    With ``--dry-run`` the plan is printed and nothing mutates. Pass
+    ``--yes`` for non-interactive use; without it, the cascade prompts
+    once before deleting state.db rows and once before removing
+    worktree directories (same gates as ``pm project remove``).
+    """
+    from pollypm.projects import register_project, remove_project
+
+    path = _require_config(config_path)
+    config = load_config(path)
+    if project_key not in config.projects:
+        typer.echo(f"Unknown project: {project_key}", err=True)
+        raise typer.Exit(code=1)
+
+    project_entry = config.projects[project_key]
+    project_path = Path(project_entry.path)
+    project_name = project_entry.name
+    active = _count_active_tasks(project_key, path)
+    session_names = _sessions_for_project(path, project_key)
+
+    # ------------------------------------------------------------------
+    # Dry-run: print the plan and exit 0 without mutating anything.
+    # The shape mirrors ``pm project remove --dry-run`` so an operator
+    # who reaches for ``reinit`` after experimenting with ``remove``
+    # sees a familiar layout.
+    # ------------------------------------------------------------------
+    if dry_run:
+        typer.echo(f"Dry run: would reinit project '{project_key}'.")
+        typer.echo(f"  path:    {project_path}")
+        if active > 0:
+            task_word = "task" if active == 1 else "tasks"
+            typer.echo(
+                f"  active:  {active} queued/in-flight work-service "
+                f"{task_word} (will be deleted)"
+            )
+        if session_names:
+            preview = _purge_project_sessions(path, project_key, dry_run=True)
+            typer.echo("  sessions to purge:")
+            for name, live, _killed in preview:
+                state = "live" if live else "stale"
+                typer.echo(f"    - {name} ({state})")
+        else:
+            typer.echo("  sessions: (none)")
+
+        state_counts = _count_project_state_rows(path, project_key)
+        nonzero = {
+            table: n for table, n in state_counts.items() if n > 0
+        }
+        if nonzero:
+            typer.echo("  state.db rows to purge:")
+            for table, n in sorted(nonzero.items()):
+                noun = (
+                    "file" if table == "audit_tail"
+                    else ("row" if n == 1 else "rows")
+                )
+                typer.echo(f"    - {table}: {n} {noun}")
+        else:
+            typer.echo("  state.db rows: (none)")
+
+        wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+        if wt_preview:
+            typer.echo("  worktree directories to purge:")
+            for wt_path, is_git, dirty, _ok, _reason in wt_preview:
+                kind = "git" if is_git else "stale"
+                dirty_marker = " [dirty]" if dirty else ""
+                typer.echo(f"    - {wt_path} ({kind}){dirty_marker}")
+            dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
+            if dirty_count > 0 and not force_discard_worktree_changes:
+                typer.echo(
+                    f"Note: {dirty_count} worktree(s) have uncommitted "
+                    "changes and will be skipped. Pass "
+                    "--force-discard-worktree-changes to remove anyway."
+                )
+        else:
+            typer.echo("  worktree directories: (none)")
+
+        typer.echo(
+            f"  re-register: {project_key} at {project_path}"
+        )
+        typer.echo("Re-run without --dry-run to apply.")
+        return
+
+    # ------------------------------------------------------------------
+    # Single destructive-action gate. ``reinit`` is unambiguously
+    # destructive — there's no "register fresh, leave the old around"
+    # variant — so one confirmation covers the whole cascade. Skipped
+    # with ``--yes``.
+    # ------------------------------------------------------------------
+    if not yes:
+        typer.echo(
+            f"Reinit will tear down project '{project_key}' "
+            f"(sessions, state.db rows, worktrees, config entry) "
+            f"and re-register it at {project_path}."
+        )
+        proceed = typer.confirm(
+            f"Permanently reinit '{project_key}'?",
+            default=False,
+        )
+        if not proceed:
+            typer.echo("Aborted. No changes made.")
+            raise typer.Exit(code=1)
+
+    # ------------------------------------------------------------------
+    # Step 1: kill tmux sessions + drop [sessions.*] entries.
+    # Mirrors ``remove_cmd``'s --purge-sessions branch.
+    # ------------------------------------------------------------------
+    if session_names:
+        purged = _purge_project_sessions(path, project_key)
+        for name, live, killed in purged:
+            if live and killed:
+                typer.echo(f"Killed tmux session {name} and dropped config entry.")
+            elif live and not killed:
+                typer.echo(
+                    f"Dropped [sessions.{name}] from config; tmux kill "
+                    "failed (session may still be running — run "
+                    "`tmux kill-session -t " + name + "` manually)."
+                )
+            else:
+                typer.echo(
+                    f"Dropped [sessions.{name}] from config "
+                    "(tmux session was not running)."
+                )
+
+    # ------------------------------------------------------------------
+    # Step 2: state.db row teardown + audit tail. Hard failure here
+    # aborts BEFORE ``remove_project`` (issue #1673 — keep the config
+    # in sync with the rows). Same exit code + message as
+    # ``remove_cmd``.
+    # ------------------------------------------------------------------
+    state_counts = _count_project_state_rows(path, project_key)
+    total_rows = sum(
+        n for table, n in state_counts.items() if table != "audit_tail"
+    )
+    if total_rows > 0 or state_counts.get("audit_tail", 0) > 0:
+        try:
+            state_summary = _purge_project_state(path, project_key)
+        except _PurgeStateError as exc:
+            typer.echo(
+                f"Error: state.db purge failed for '{project_key}': "
+                f"{exc}",
+                err=True,
+            )
+            typer.echo(
+                "Aborted. Project entry left in pollypm.toml so you "
+                "can retry once the DB is reachable.",
+                err=True,
+            )
+            raise typer.Exit(code=1) from exc
+        removed_total = sum(
+            n for table, n in state_summary.items()
+            if table != "audit_tail"
+        )
+        typer.echo(
+            f"Deleted {removed_total} state.db row(s) for "
+            f"'{project_key}' across "
+            f"{sum(1 for n in state_summary.values() if n > 0)} "
+            "table(s)."
+        )
+        if state_summary.get("audit_tail", 0) > 0:
+            typer.echo(
+                f"Removed central audit-tail JSONL for '{project_key}'."
+            )
+
+    # ------------------------------------------------------------------
+    # Step 3: worktree directory teardown. Same shape as
+    # ``remove_cmd``'s --purge-worktrees branch. Failures here don't
+    # abort — leftover worktree dirs are recoverable with a manual
+    # ``git worktree remove`` later.
+    # ------------------------------------------------------------------
+    wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+    if wt_preview:
+        wt_results = _purge_project_worktrees(
+            path, project_key,
+            force_discard_changes=force_discard_worktree_changes,
+        )
+        removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
+        skipped_dirty = [
+            p for p, _g, _d, ok, reason in wt_results
+            if not ok and reason == "dirty"
+        ]
+        failed = [
+            (p, reason) for p, _g, _d, ok, reason in wt_results
+            if not ok and reason != "dirty"
+        ]
+        typer.echo(
+            f"Removed {removed_count} worktree director"
+            f"{'y' if removed_count == 1 else 'ies'} for '{project_key}'."
+        )
+        for p in skipped_dirty:
+            typer.echo(
+                f"  Skipped (uncommitted changes): {p} — re-run with "
+                "--force-discard-worktree-changes to discard."
+            )
+        for p, reason in failed:
+            typer.echo(f"  Failed to remove {p} ({reason}).")
+
+    # ------------------------------------------------------------------
+    # Step 4: remove [projects.<key>] from the config.
+    # ------------------------------------------------------------------
+    try:
+        removed = remove_project(path, project_key)
+    except typer.BadParameter as exc:
+        typer.echo(f"Error: {exc.message}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Removed project '{removed.key}' from {path}")
+
+    # ------------------------------------------------------------------
+    # Step 5: re-register the project under the same slug + path. The
+    # path must still exist on disk — ``reinit`` is "blow away PollyPM
+    # state, keep the working tree". If the operator also wiped the
+    # repo directory, they should use ``pm project new`` instead.
+    # ------------------------------------------------------------------
+    if not project_path.exists() or not project_path.is_dir():
+        typer.echo(
+            f"Error: project path {project_path} no longer exists. "
+            f"The project was removed; re-create the directory and run "
+            f"`pm project new {project_path}` to register from scratch.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        reregistered = register_project(
+            path, project_path, name=project_name, slug=project_key,
+        )
+    except typer.BadParameter as exc:
+        typer.echo(f"Error: {exc.message}", err=True)
+        typer.echo(
+            "The project was removed but re-registration failed. Run "
+            f"`pm project new {project_path}` to finish.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"Reinit complete: re-registered '{reregistered.key}' at "
+        f"{reregistered.path}."
+    )
+
+
+# ---------------------------------------------------------------------------
 # pm project plan
 # ---------------------------------------------------------------------------
 

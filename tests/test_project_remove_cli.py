@@ -1580,3 +1580,292 @@ def test_cli_remove_purge_state_aborts_when_db_purge_fails(
 
     # Audit tail untouched (purge bailed before audit cleanup too).
     assert tail_path.exists()
+
+
+# --------------------------------------------------------------------------
+# pm project reinit (#1561 wedge #5)
+#
+# ``reinit`` is the "blow it away and start over" shorthand: it runs the
+# same destructive cascade as ``pm project remove --purge-sessions
+# --purge-state --purge-worktrees`` and then re-registers the same path
+# under the same slug. Tests mirror the remove tests, with an extra
+# assertion that the re-registered project is present in the post-state.
+# --------------------------------------------------------------------------
+
+
+def test_cli_reinit_happy_path_reregisters(env) -> None:
+    """No sessions/rows/worktrees → reinit removes and re-adds cleanly."""
+    target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert "Removed project 'demo'" in result.output
+    assert "Reinit complete" in result.output
+    assert "re-registered 'demo'" in result.output
+
+    # Project entry is back under the same slug + path.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+    assert Path(config.projects["demo"].path).resolve() == (
+        env["project_path"].resolve()
+    )
+
+
+def test_cli_reinit_unknown_project_errors_cleanly(env) -> None:
+    result = runner.invoke(
+        project_app,
+        ["reinit", "does_not_exist", "--config", str(env["config_path"])],
+    )
+    assert result.exit_code == 1, result.output
+    assert "Unknown project" in result.output
+
+
+def test_cli_reinit_aborts_without_yes(env) -> None:
+    """Default prompt rejects → no mutation."""
+    target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            ["reinit", "demo", "--config", str(env["config_path"])],
+            input="n\n",
+        )
+    assert result.exit_code == 1, result.output
+    assert "Permanently reinit 'demo'?" in result.output
+    assert "Aborted" in result.output
+
+    # Project entry still present.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_reinit_dry_run_mutates_nothing(env) -> None:
+    target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--dry-run",
+                "--config", str(env["config_path"]),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert "Dry run: would reinit project 'demo'" in result.output
+    assert "re-register: demo at" in result.output
+    assert "Re-run without --dry-run to apply." in result.output
+
+    # Nothing mutated.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_reinit_cascades_sessions_state_and_worktrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reinit tears down every wedge surface and then re-registers."""
+    # Build a config with sessions referencing the project.
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(
+        config_path,
+        workspace_root=workspace_root,
+        project_path=project_path,
+        slug="demo",
+        extra_sessions=(
+            "[sessions.architect_demo]\n"
+            'role = "architect"\n'
+            'provider = "claude"\n'
+            'account = "claude_main"\n'
+            'cwd = "."\n'
+            'project = "demo"\n'
+            'window_name = "architect-demo"\n'
+            "\n[accounts.claude_main]\n"
+            'provider = "claude"\n'
+            'home = "/tmp/claude_home"\n'
+        ),
+    )
+    _init_git_project(project_path)
+    wt_a = _seed_worktree(project_path, "architect-demo", "demo-arch")
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+    _seed_state_db_rows(config_path, "demo", task_count=2)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+
+    fake_tmux = type(
+        "FakeTmux", (), {
+            "has_session": lambda self, name: True,
+            "kill_session": lambda self, name: True,
+        },
+    )()
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with (
+        patch(count_target, return_value=0),
+        patch(
+            "pollypm.session_services.create_tmux_client",
+            return_value=fake_tmux,
+        ),
+    ):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--yes",
+                "--config", str(config_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    # Sessions purged.
+    assert "Killed tmux session architect_demo" in result.output
+    # State rows purged.
+    assert "Deleted" in result.output
+    assert "state.db row" in result.output
+    # Worktrees purged.
+    assert "Removed 1 worktree director" in result.output
+    assert not wt_a.exists()
+    # Audit tail purged.
+    assert not tail_path.exists()
+    # Project removed THEN re-registered.
+    assert "Removed project 'demo'" in result.output
+    assert "Reinit complete" in result.output
+
+    config = _load_cfg(config_path)
+    assert "demo" in config.projects
+    assert "architect_demo" not in config.sessions
+
+
+def test_cli_reinit_aborts_when_project_path_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the project directory is gone, reinit refuses to re-register."""
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(
+        config_path,
+        workspace_root=workspace_root,
+        project_path=project_path,
+        slug="demo",
+    )
+
+    # Wipe the directory AFTER config write but BEFORE invocation, so the
+    # remove phase finds the entry but the re-register phase trips on the
+    # missing path.
+    import shutil
+    shutil.rmtree(project_path)
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--yes",
+                "--config", str(config_path),
+            ],
+        )
+
+    assert result.exit_code == 1, result.output
+    assert "no longer exists" in result.output
+    assert "pm project new" in result.output
+
+    # The remove phase still ran — project entry is gone.
+    config = _load_cfg(config_path)
+    assert "demo" not in config.projects
+
+
+def test_cli_reinit_dry_run_lists_full_cascade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dry-run surfaces sessions, state rows, and worktrees in one preview."""
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(
+        config_path,
+        workspace_root=workspace_root,
+        project_path=project_path,
+        slug="demo",
+        extra_sessions=(
+            "[sessions.architect_demo]\n"
+            'role = "architect"\n'
+            'provider = "claude"\n'
+            'account = "claude_main"\n'
+            'cwd = "."\n'
+            'project = "demo"\n'
+            'window_name = "architect-demo"\n'
+            "\n[accounts.claude_main]\n"
+            'provider = "claude"\n'
+            'home = "/tmp/claude_home"\n'
+        ),
+    )
+    _init_git_project(project_path)
+    _seed_worktree(project_path, "architect-demo", "demo-arch")
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+    _seed_state_db_rows(config_path, "demo", task_count=1)
+
+    fake_tmux = type(
+        "FakeTmux", (), {
+            "has_session": lambda self, name: True,
+            # Dry-run must not actually kill.
+            "kill_session": lambda self, name: (_ for _ in ()).throw(
+                AssertionError("kill_session must not run in --dry-run")
+            ),
+        },
+    )()
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with (
+        patch(count_target, return_value=2),
+        patch(
+            "pollypm.session_services.create_tmux_client",
+            return_value=fake_tmux,
+        ),
+    ):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--dry-run",
+                "--config", str(config_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "sessions to purge:" in result.output
+    assert "architect_demo (live)" in result.output
+    assert "state.db rows to purge:" in result.output
+    assert "worktree directories to purge:" in result.output
+    assert "re-register: demo at" in result.output
+
+    # Nothing mutated.
+    config = _load_cfg(config_path)
+    assert "demo" in config.projects
+    assert "architect_demo" in config.sessions

@@ -320,20 +320,163 @@ def _count_inbox_tasks_for_label(config) -> int:
     The cockpit rail is a notification surface, not an activity feed.
     It should badge work that requires the user, while completion
     updates and FYI messages stay discoverable inside the inbox's
-    all-messages lens.
+    archive lenses.
+
+    **Three surfaces, one predicate (intentional, load-bearing).** The
+    rail badge, the operator dashboard's "Waiting on you" section
+    (#1572), AND the inbox UI's default lens (#1573) all read from
+    :func:`pollypm.inbox.awaits_user` via :func:`pm_inbox_awaits_user_list`.
+    The badge count, the dashboard section length, and the default
+    inbox row count MUST agree on every config; ``tests/test_inbox_default_lens.py``
+    pins that invariant. Any new "what's waiting on the user?" surface
+    MUST import the predicate rather than redefining one — three
+    competing predicates with no canonical answer is the exact failure
+    mode that motivated the #1564 epic.
 
     Rewired in #1571 to read from the canonical
-    :func:`pollypm.inbox.awaits_user` predicate (#1566) via
-    :func:`pm_inbox_awaits_user_list` instead of the legacy
-    ``triage_bucket == "action"`` regex heuristic. Same answer as
-    ``pm inbox --awaits-user`` and the upcoming dashboard "Waiting on
-    you" surface — one predicate, three surfaces.
+    :func:`pollypm.inbox.awaits_user` predicate (#1566) instead of the
+    legacy ``triage_bucket == "action"`` regex heuristic.
 
     The function name is kept for backward compatibility with existing
     callers; the return value is now an item count, not just a task
     count.
     """
     return len(pm_inbox_awaits_user_list(config))
+
+
+def pm_inbox_filtered_list(
+    config, *, kind_filter: "InboxItemKind | None" = None,
+) -> list[object]:
+    """Return inbox entries across the config, optionally filtered by kind.
+
+    Sibling of :func:`pm_inbox_awaits_user_list` for the archive lenses
+    in the inbox UI (#1573). When ``kind_filter`` is ``None``, returns
+    every loadable inbox entry across tracked projects + the workspace
+    root (the "all" lens). When set, returns only entries whose
+    ``InboxItemKind`` matches — used by the ``completion-fyi``,
+    ``activity-events``, ``self-bug-reports``, and ``legacy`` lenses.
+
+    Reuses the same storage-access pattern as
+    :func:`pm_inbox_awaits_user_list` so the two helpers can't drift on
+    source enumeration, dedupe, or plan-review phantom filtering. The
+    awaits-user lens still goes through :func:`pm_inbox_awaits_user_list`
+    (the canonical predicate is more specific than any single kind).
+    """
+    from pollypm.inbox.kind import InboxItemKind, coerce_kind
+
+    try:
+        from pollypm.work import create_work_service
+        from pollypm.work.inbox_view import inbox_tasks
+        from pollypm.cockpit_inbox_items import (
+            _WORKSPACE_DB_KEY,
+            _filter_approved_plan_reviews,
+            annotate_inbox_entry,
+            message_row_to_inbox_entry,
+            task_to_inbox_entry,
+        )
+    except Exception:  # noqa: BLE001
+        return []
+
+    try:
+        from pollypm.store import SQLAlchemyStore
+    except Exception:  # noqa: BLE001
+        SQLAlchemyStore = None  # type: ignore[assignment]
+
+    def _matches(item: object) -> bool:
+        if kind_filter is None:
+            return True
+        return coerce_kind(getattr(item, "kind", None)) is kind_filter
+
+    task_entries: dict[str, object] = {}
+    message_entries: dict[tuple[str, object], object] = {}
+    project_db_paths: dict[str, tuple[Path, Path]] = {}
+    known_projects = set(getattr(config, "projects", {}).keys())
+
+    for project_key, db_path, project_path in _inbox_db_sources(config):
+        if not db_path.exists():
+            continue
+        if project_key:
+            project_db_paths[project_key] = (db_path, project_path)
+        else:
+            project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
+        try:
+            with create_work_service(
+                db_path=db_path, project_path=project_path,
+            ) as svc:
+                for task in inbox_tasks(svc, project=project_key):
+                    item = annotate_inbox_entry(
+                        task_to_inbox_entry(task, db_path=db_path),
+                        known_projects=known_projects,
+                    )
+                    if _matches(item):
+                        task_entries.setdefault(task.task_id, item)
+        except Exception:  # noqa: BLE001
+            pass
+
+        if SQLAlchemyStore is None:
+            continue
+        try:
+            store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        except Exception:  # noqa: BLE001
+            continue
+        try:
+            filters: dict[str, object] = dict(
+                recipient="user",
+                state="open",
+                type=["notify", "inbox_task", "alert"],
+            )
+            if project_key:
+                filters["scope"] = project_key
+            try:
+                rows = store.query_messages(**filters)
+            except Exception:  # noqa: BLE001
+                rows = []
+            for row in rows:
+                if isinstance(row, dict):
+                    row_id = row.get("id") or row.get("message_id")
+                    scope = row.get("scope", "") or ""
+                    labels_raw = row.get("labels")
+                else:
+                    row_id = (
+                        getattr(row, "id", None)
+                        or getattr(row, "message_id", None)
+                    )
+                    scope = getattr(row, "scope", "") or ""
+                    labels_raw = getattr(row, "labels", None)
+                if row_id is None:
+                    continue
+                if scope and scope != "inbox" and scope not in known_projects:
+                    continue
+                refs = _row_project_refs(row)
+                if any(ref not in known_projects for ref in refs):
+                    continue
+                if _row_is_dev_channel(labels_raw):
+                    continue
+                item = annotate_inbox_entry(
+                    message_row_to_inbox_entry(
+                        row,
+                        source_key=project_key or "__workspace__",
+                        db_path=db_path,
+                    ),
+                    known_projects=known_projects,
+                )
+                if _matches(item):
+                    msg_key = (str(scope), row_id)
+                    message_entries.setdefault(msg_key, item)
+        finally:
+            try:
+                store.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    collected = list(task_entries.values()) + list(message_entries.values())
+    if collected and project_db_paths:
+        return list(
+            _filter_approved_plan_reviews(
+                collected, project_db_paths=project_db_paths,
+            )
+        )
+    return collected
 
 
 @dataclass(slots=True, frozen=True)

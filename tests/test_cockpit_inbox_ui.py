@@ -1098,7 +1098,15 @@ def test_selecting_a_row_renders_detail_and_clears_unread(inbox_env, inbox_app) 
 def test_action_items_sort_ahead_of_completed_updates(
     inbox_env, inbox_app,
 ) -> None:
-    """Action-required rows stay above completion noise even if newer."""
+    """Action-required rows stay above completion noise even if newer.
+
+    #1573 retired the regex-triage default lens in favour of the
+    canonical :func:`pollypm.inbox.awaits_user` predicate. Messages
+    without a structured ``kind`` (the seeded notify rows here)
+    coerce to LEGACY and surface in the awaits-you lens; the
+    completion-fyi lens scopes archive views to just the explicit
+    completion notifications. Sort order is unchanged.
+    """
     workspace_root = inbox_env["project_path"].parent
     _seed_workspace_message(
         workspace_root,
@@ -1116,31 +1124,20 @@ def test_action_items_sort_ahead_of_completed_updates(
     async def body() -> None:
         async with inbox_app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
-            # _visible_titles inspects the underlying task title, so
-            # the "[Action]" prefix is still present at the data layer
-            # — the rendered row drops it (covered by
-            # test_action_bucket_row_drops_redundant_action_prefix).
-            titles = _visible_titles(inbox_app)
-            assert "[Action] Fly.io setup needed for demo" in titles
-            assert "[Action] Demo shipped cleanly" not in titles
-            status_text = str(inbox_app.status.render())
-            # #1027 — pure-FYI notify rows (Demo shipped cleanly) are
-            # now hidden behind the ``Show notifications (N) — n``
-            # toggle instead of the older ``FYI hidden · m show all``
-            # framing. The user-facing behaviour is the same: the
-            # actionable row stays visible while the completion FYI
-            # waits behind a one-keystroke reveal.
-            assert "Show notification" in status_text
-            assert "n" in status_text
-
-            await pilot.press("m")
-            await pilot.pause()
+            # All seeded rows are LEGACY (no ``kind``) so the
+            # awaits-you predicate fail-opens; both action-shaped
+            # subjects surface and the action-rank sort still puts
+            # setup-needed above shipped-cleanly.
             titles = _visible_titles(inbox_app)
             assert "[Action] Fly.io setup needed for demo" in titles
             assert "[Action] Demo shipped cleanly" in titles
             assert titles.index("[Action] Fly.io setup needed for demo") < titles.index(
                 "[Action] Demo shipped cleanly"
             )
+            status_text = str(inbox_app.status.render())
+            # Status line surfaces the active lens for the new
+            # default surface (#1573).
+            assert "lens" in status_text.lower()
 
     _run(body())
 
@@ -1240,80 +1237,102 @@ def _has_title_substring(titles: list[str], substring: str) -> bool:
     return any(substring in t for t in titles)
 
 
-def test_notify_messages_hidden_by_default_cockpit_inbox(
+def test_completion_fyi_rows_archive_to_dedicated_lens(
     inbox_env, inbox_app,
 ) -> None:
-    """#1027 — completion / heartbeat ``notify`` rows are hidden by default.
+    """#1573 — completion FYI rows tagged with ``kind=completion_fyi``
+    drop out of the default awaits-you lens and surface under the
+    dedicated ``completion-fyi`` archive lens (key ``3``).
 
-    Mirror of the issue's screenshot: the bulk of inbox traffic is
-    pure FYI (``Done: …``, ``Repeated stale review ping``) and buries
-    the single actionable row. The cockpit Inbox panel collapses
-    those behind a ``Show notifications (N) — n`` footer hint until
-    the user presses ``n``.
+    Replaces the older ``Show notifications (N) — n`` heuristic
+    (#1027), which used regex triage to bury pure-notify rows under
+    a toggle. The lens system reads :class:`InboxItemKind` directly,
+    so a producer that doesn't tag its row's kind keeps it visible
+    under awaits-you (fail-open via LEGACY) and the operator can
+    still find it via the ``all`` lens.
     """
     workspace_root = inbox_env["project_path"].parent
-    _seed_workspace_message(
-        workspace_root,
-        subject="Done: Phase 2 rework resubmitted",
-        body="background completion FYI",
-        scope="demo",
-    )
-    _seed_workspace_message(
-        workspace_root,
-        subject="Repeated stale review ping for bikepath/3",
-        body="heartbeat noise",
-        scope="demo",
-    )
+    db_path = workspace_root / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        # Tag the kind explicitly so the lens routes the row correctly.
+        store.enqueue_message(
+            type="notify", tier="immediate",
+            recipient="user", sender="polly",
+            subject="Done: Phase 2 rework resubmitted",
+            body="background completion FYI",
+            scope="demo", kind="completion_fyi",
+        )
+    finally:
+        store.close()
 
     async def body() -> None:
         async with inbox_app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
             titles = _visible_titles(inbox_app)
-            # Both notify rows are default-hidden behind the toggle.
-            assert not _has_title_substring(titles, "Done: Phase 2 rework resubmitted")
+            # Default awaits-you lens drops the completion_fyi row.
             assert not _has_title_substring(
-                titles, "Repeated stale review ping for bikepath/3",
+                titles, "Done: Phase 2 rework resubmitted",
             )
-            # Status bar surfaces the count + ``n`` keystroke hint.
-            status_text = str(inbox_app.status.render())
-            assert "Show notifications (2)" in status_text
-            assert " n" in status_text  # the keystroke hint
+            # Switching to the completion-fyi lens (key ``3``)
+            # surfaces it.
+            await pilot.press("3")
+            await pilot.pause()
+            assert inbox_app._active_lens == "completion-fyi"
+            assert _has_title_substring(
+                _visible_titles(inbox_app),
+                "Done: Phase 2 rework resubmitted",
+            )
 
     _run(body())
 
 
-def test_n_keypress_toggles_notifications_visible(
+def test_lens_archive_hides_then_reveals_completion_fyi(
     inbox_env, inbox_app,
 ) -> None:
-    """#1027 — pressing ``n`` reveals the hidden notify rows + flips again to re-hide."""
+    """#1573 — a properly-tagged ``completion_fyi`` row hides from the
+    default lens and resurfaces via the dedicated archive lens.
+
+    Successor of the older ``n``-keypress toggle (#1027), which used
+    a regex-triage heuristic on untagged rows. The lens system reads
+    :class:`InboxItemKind` directly so the producer-side ``kind`` tag
+    is the load-bearing piece of state.
+    """
     workspace_root = inbox_env["project_path"].parent
-    _seed_workspace_message(
-        workspace_root,
-        subject="Done: Phase 2 rework resubmitted",
-        body="background completion FYI",
-        scope="demo",
-    )
+    db_path = workspace_root / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        store.enqueue_message(
+            type="notify", tier="immediate",
+            recipient="user", sender="polly",
+            subject="Done: Phase 2 rework resubmitted",
+            body="background completion FYI",
+            scope="demo", kind="completion_fyi",
+        )
+    finally:
+        store.close()
 
     async def body() -> None:
         async with inbox_app.run_test(size=(120, 40)) as pilot:
             await pilot.pause()
+            # Default lens drops the tagged FYI.
             assert not _has_title_substring(
                 _visible_titles(inbox_app),
                 "Done: Phase 2 rework resubmitted",
             )
 
-            await pilot.press("n")
+            # ``3`` = completion-fyi lens (per the binding order).
+            await pilot.press("3")
             await pilot.pause()
             assert _has_title_substring(
                 _visible_titles(inbox_app),
                 "Done: Phase 2 rework resubmitted",
             )
-            # After opt-in there's nothing hidden, so the footer hint clears.
-            status_text = str(inbox_app.status.render())
-            assert "Show notifications" not in status_text
 
-            # Toggle off — back to the actionable lens.
-            await pilot.press("n")
+            # ``1`` returns to the default awaits-you lens.
+            await pilot.press("1")
             await pilot.pause()
             assert not _has_title_substring(
                 _visible_titles(inbox_app),
@@ -2464,7 +2483,12 @@ def test_inbox_app_honors_initial_project_filter(inbox_env) -> None:
 
 
 def test_inbox_app_without_initial_project_stays_global(inbox_env) -> None:
-    """No initial_project means no project scope; default action lens is visible."""
+    """No initial_project means no project scope; default lens is awaits-you.
+
+    #1573 — the inbox opens to the canonical awaits-user lens. The
+    filter bar stays hidden by default (no project scope, no chips);
+    the active lens surfaces via the status line instead.
+    """
     if not _load_config_compatible(inbox_env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_ui import PollyInboxApp
@@ -2475,8 +2499,9 @@ def test_inbox_app_without_initial_project_stays_global(inbox_env) -> None:
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             assert app._filter_project is None
-            assert app.filter_bar.display is True
-            assert "action needed" in str(app.filter_chips.render())
+            assert app._active_lens == "awaits-you"
+            # Default lens advertises itself in the status line.
+            assert "awaiting you" in str(app.status.render()).lower()
 
     _run(body())
 
@@ -2601,18 +2626,34 @@ def test_cockpit_send_key_inbox_filter_sequence_routes_to_inbox_bridge(
     _run(body())
 
 
-def test_inbox_bridge_n_keypress_toggles_notifications_visible(
+def test_inbox_bridge_lens_keypress_switches_archive_view(
     inbox_env,
 ) -> None:
-    """#1128: bridge-delivered ``n`` reaches the Inbox notification toggle."""
+    """#1128 + #1573: bridge-delivered lens keys reach the Inbox.
+
+    Seeds a ``completion_fyi``-tagged message so the awaits-you lens
+    drops it, then drives ``L`` over the cockpit input bridge to
+    cycle the lens; after one cycle the lens lands on ``all`` and
+    the FYI surfaces. The bridge plumbing is the actual subject —
+    same assertion shape as the original ``n``-keypress test, now
+    aimed at the lens key that replaced the notification toggle.
+    """
     if not _load_config_compatible(inbox_env["config_path"]):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
-    _seed_workspace_message(
-        inbox_env["project_path"].parent,
-        subject="Done: bridge-visible completion",
-        body="background completion FYI",
-        scope="demo",
-    )
+    workspace_root = inbox_env["project_path"].parent
+    db_path = workspace_root / ".pollypm" / "state.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    try:
+        store.enqueue_message(
+            type="notify", tier="immediate",
+            recipient="user", sender="polly",
+            subject="Done: bridge-visible completion",
+            body="background completion FYI",
+            scope="demo", kind="completion_fyi",
+        )
+    finally:
+        store.close()
     from pollypm.cockpit_input_bridge import send_key
     from pollypm.cockpit_ui import PollyInboxApp
 
@@ -2628,9 +2669,11 @@ def test_inbox_bridge_n_keypress_toggles_notifications_visible(
                 "Done: bridge-visible completion",
             )
 
-            send_key(handle.socket_path, "n")
+            # Bridge-delivered ``L`` cycles to the ``all`` lens; the
+            # FYI now surfaces (no curation).
+            send_key(handle.socket_path, "L")
             await pilot.pause(0.2)
-
+            assert app._active_lens == "all"
             assert _has_title_substring(
                 _visible_titles(app),
                 "Done: bridge-visible completion",

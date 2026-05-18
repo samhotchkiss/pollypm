@@ -3668,6 +3668,112 @@ def test_now_body_keeps_in_action_for_working_worker() -> None:
     assert "standing by" not in rendered
 
 
+def test_now_body_surfaces_activity_for_working_worker_without_claimed_task() -> None:
+    """#1545 — coffeeboardnm had ``architect_coffeeboardnm`` heartbeat-alive
+    and actively building for ~8 minutes, but the "Current activity" panel
+    rendered as just the identity line because the architect hadn't claimed
+    an ``in_progress`` task (architects rarely own work-service tasks).
+    Surface the most-recent activity-feed summary so the operator sees
+    what the session is actually doing.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    app.project_key = "coffeeboardnm"
+    fake_data = SimpleNamespace(
+        active_worker={
+            "session_name": "architect_coffeeboardnm",
+            "role": "architect",
+            "last_heartbeat": "2026-05-17T22:30:00+00:00",
+            "activity": "working",
+        },
+        action_items=[],
+        task_buckets={
+            "queued": [], "in_progress": [], "review": [],
+            "blocked": [], "on_hold": [], "done": [],
+        },
+        task_counts={},
+        activity_entries=[
+            {
+                "timestamp": "2026-05-17T22:29:30+00:00",
+                "actor": "architect",
+                "verb": "noted",
+                "summary": "Added Phase-1 Week-1 ingestion scaffold",
+                "kind": "note",
+            },
+        ],
+    )
+    rendered = app._render_now_body(fake_data)
+    # Working classification → green dot stays.
+    assert "[#3ddc84]●[/#3ddc84]" in rendered
+    # The most-recent activity summary is surfaced as a context line.
+    assert "Phase-1 Week-1 ingestion scaffold" in rendered
+    # No mistaken "Idle" or "standing by" copy.
+    assert "Idle" not in rendered
+    assert "standing by" not in rendered
+
+
+def test_now_body_falls_back_when_working_worker_has_no_activity_feed() -> None:
+    """If the activity feed is empty (fresh project) but the worker is
+    actively progressing, the panel still says something concrete instead
+    of leaving the identity line alone.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    app.project_key = "coffeeboardnm"
+    fake_data = SimpleNamespace(
+        active_worker={
+            "session_name": "architect_coffeeboardnm",
+            "role": "architect",
+            "last_heartbeat": "2026-05-17T22:30:00+00:00",
+            "activity": "working",
+        },
+        action_items=[],
+        task_buckets={
+            "queued": [], "in_progress": [], "review": [],
+            "blocked": [], "on_hold": [], "done": [],
+        },
+        task_counts={},
+        activity_entries=[],
+    )
+    rendered = app._render_now_body(fake_data)
+    assert "Working ahead" in rendered
+
+
+def test_now_body_says_plan_ready_when_plan_task_summary_present() -> None:
+    """#1545 — when the banner advertises ``Plan's ready — Press → to
+    review`` but no worker is heartbeat-alive (e.g. the architect session
+    ended after emitting the plan), the now-section used to read
+    ``Idle. No tasks in flight`` which contradicted the banner. Mirror the
+    banner instead so both surfaces tell the same story.
+    """
+    from types import SimpleNamespace
+    from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+    app = PollyProjectDashboardApp.__new__(PollyProjectDashboardApp)
+    app.project_key = "coffeeboardnm"
+    fake_data = SimpleNamespace(
+        active_worker=None,
+        action_items=[],
+        task_buckets={
+            "queued": [], "in_progress": [], "review": [],
+            "blocked": [], "on_hold": [], "done": [],
+        },
+        task_counts={},
+        plan_task_summary={
+            "task_id": "coffeeboardnm/3",
+            "title": "POC plan: ingest every NM event May-Jul 2026",
+        },
+    )
+    rendered = app._render_now_body(fake_data)
+    assert "Idle" not in rendered
+    assert "Plan's ready" in rendered
+    assert "POC plan: ingest every NM event May-Jul 2026" in rendered
+
+
 def test_status_pill_uses_activity_classification() -> None:
     """The pill colour / label reads the classifier, not just liveness.
 

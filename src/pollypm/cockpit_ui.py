@@ -16945,6 +16945,34 @@ class PollyProjectDashboardApp(App[None]):
                     "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
                     "response \u2014 a permission prompt is open."
                 )
+            elif activity == "working":
+                # #1545 \u2014 architect / worker is heartbeat-alive and the
+                # pane is moving, but no task is claimed in_progress in
+                # the work-service DB (architects rarely own tasks;
+                # workers can work ahead of a queued claim). Without a
+                # context line the panel reads as just "\u25cf architect 30s"
+                # which feels empty \u2014 coffeeboardnm hit exactly this
+                # while ``architect_coffeeboardnm`` had been building
+                # for 8 minutes. Surface the most recent activity-feed
+                # entry so the operator sees what the session is doing
+                # right now; fall back to a plain "working ahead" note
+                # if the feed is empty.
+                entries = getattr(data, "activity_entries", None) or []
+                latest = entries[0] if entries else None
+                summary = ""
+                if latest:
+                    summary = self._sanitize_activity_summary(
+                        str(latest.get("summary") or "").strip(),
+                    )
+                if summary:
+                    lines.append(
+                        f"  [dim]\u21b3 {_escape(summary)}[/dim]",
+                    )
+                else:
+                    lines.append(
+                        "  [dim]Working ahead \u2014 no claimed task "
+                        "yet.[/dim]",
+                    )
             return "\n".join(lines)
         if data.action_items:
             item = data.action_items[0]
@@ -16997,6 +17025,21 @@ class PollyProjectDashboardApp(App[None]):
             return (
                 "[dim]No worker active right now.[/dim]\n"
                 "  Work is on hold — see Task pipeline for the hold reason."
+            )
+        # #1545 — when a plan-shaped done task is awaiting review the
+        # banner advertises ``Plan's ready — Press → to review`` but
+        # the now-section used to fall through to "Idle" which directly
+        # contradicted the banner. Mirror the banner so both surfaces
+        # tell the same story.
+        plan_task_summary = getattr(data, "plan_task_summary", None) or None
+        if plan_task_summary:
+            title = (
+                str(plan_task_summary.get("title") or "").strip()
+                or "the plan"
+            )
+            return (
+                "[#f0c45a]◆[/#f0c45a] Plan's ready for your review.\n"
+                f"  [dim]↳ {_escape(title)}[/dim]"
             )
         return "[dim]Idle. No tasks in flight and no user action needed.[/dim]"
 

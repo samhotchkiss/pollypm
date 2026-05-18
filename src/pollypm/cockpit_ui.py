@@ -105,6 +105,9 @@ from pollypm.cockpit_settings_confirm import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_inbox_rollup_item import (  # noqa: F401  (re-exported)
     _RollupItem,
 )
+from pollypm.cockpit_inbox_list_item import (  # noqa: F401  (re-exported)
+    _InboxListItem,
+)
 from pollypm.cockpit_settings_data import (  # noqa: F401  (re-exported)
     SettingsData,
 )
@@ -7297,86 +7300,6 @@ def _extract_proposal_spec(task, *, labels: list[str] | None = None) -> dict:
     else:
         spec["description"] = body
     return spec
-
-
-class _InboxListItem(ListItem):
-    """One message in the inbox list — carries the task_id + unread flag."""
-
-    def __init__(
-        self,
-        row: InboxThreadRow,
-        *,
-        is_unread: bool,
-        config_path: object | None = None,
-    ) -> None:
-        self.row_ref = row
-        self.task_id = row.task_id
-        self.task_ref = row.task
-        self.is_unread = is_unread
-        self._config_path = config_path
-        row_classes = "inbox-row reply-row" if row.is_reply else "inbox-row"
-        # Plan-review approval rows get a distinct class so the CSS can
-        # render a heavier border / background — these are decision
-        # cards, not informational pings (#1400).
-        self._is_plan_review = row.is_task and _is_plan_review_task(row.task)
-        if self._is_plan_review:
-            row_classes = f"{row_classes} plan-review-row"
-        self._body = Static(
-            _format_inbox_thread_row(
-                row,
-                is_unread=is_unread,
-                config_path=config_path,
-                show_judgment_calls=False,
-            ),
-            markup=False,
-        )
-        super().__init__(self._body, classes=row_classes)
-        if is_unread:
-            self.add_class("unread")
-        if row.is_task and is_rejection_feedback_task(row.task):
-            self.add_class("rejection-feedback")
-        triage_bucket = _triage_bucket(row.task)
-        if triage_bucket == "action":
-            self.add_class("action-required")
-        elif triage_bucket == "orphaned":
-            self.add_class("orphaned")
-        else:
-            self.add_class("informational")
-
-    def mark_read(self, row: InboxThreadRow | None = None) -> None:
-        """Flip the row to read styling in place (no reflow of the list)."""
-        if self.is_unread is False:
-            return
-        self.is_unread = False
-        self.remove_class("unread")
-        if row is not None:
-            self.row_ref = row
-            self.task_ref = row.task
-        self._body.update(
-            _format_inbox_thread_row(
-                self.row_ref,
-                is_unread=False,
-                config_path=self._config_path,
-            )
-        )
-
-    def set_show_judgment_calls(self, show: bool) -> None:
-        """Re-render the plan_review row with judgment calls toggled.
-
-        No-op on non-plan_review rows — the regular inbox row renderer
-        ignores the flag so calling this on every selection is safe and
-        keeps the rendering pipeline uniform across row kinds.
-        """
-        if not self._is_plan_review:
-            return
-        self._body.update(
-            _format_inbox_thread_row(
-                self.row_ref,
-                is_unread=self.is_unread,
-                config_path=self._config_path,
-                show_judgment_calls=show,
-            )
-        )
 
 
 # Inbox lens taxonomy (#1573). The default lens is ``awaits-you`` —

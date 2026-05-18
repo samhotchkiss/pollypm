@@ -94,6 +94,9 @@ from pollypm.cockpit_first_shipped import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_inbox_project_picker import (  # noqa: F401  (re-exported)
     _InboxProjectPickerModal,
 )
+from pollypm.cockpit_settings_confirm import (  # noqa: F401  (re-exported)
+    _SettingsConfirmModal,
+)
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
     clear_live_chat_network_dead_notice,
@@ -6638,63 +6641,6 @@ class _SettingsAccountReassignModal(ModalScreen[str | None]):
 
     def action_cancel(self) -> None:
         self.dismiss(None)
-
-
-class _SettingsConfirmModal(ModalScreen[bool]):
-    CSS = """
-    Screen {
-        align: center middle;
-    }
-    #settings-confirm {
-        width: 72;
-        height: auto;
-        padding: 1 2;
-        background: $panel;
-        border: heavy $warning;
-    }
-    #settings-confirm-title {
-        padding-bottom: 1;
-        text-style: bold;
-    }
-    #settings-confirm-buttons {
-        height: auto;
-        align-horizontal: right;
-        padding-top: 1;
-    }
-    #settings-confirm-buttons Button {
-        margin-left: 1;
-    }
-    """
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def __init__(
-        self,
-        *,
-        title: str,
-        prompt: str,
-        confirm_label: str = "Confirm",
-        cancel_label: str = "Cancel",
-    ) -> None:
-        super().__init__()
-        self._title = title
-        self._prompt = prompt
-        self._confirm_label = confirm_label
-        self._cancel_label = cancel_label
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="settings-confirm"):
-            yield Static(self._title, id="settings-confirm-title")
-            yield Static(self._prompt)
-            with Horizontal(id="settings-confirm-buttons"):
-                yield Button(self._cancel_label, id="cancel")
-                yield Button(self._confirm_label, variant="primary", id="confirm")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "confirm")
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)
 
 
 # ---------------------------------------------------------------------------

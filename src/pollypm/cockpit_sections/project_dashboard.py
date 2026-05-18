@@ -25,6 +25,9 @@ from pollypm.cockpit_sections.health import format_project_health_scorecard
 from pollypm.cockpit_sections.in_flight import _section_in_flight
 from pollypm.cockpit_sections.insights import _section_insights
 from pollypm.cockpit_sections.plan import _section_plan
+from pollypm.cockpit_sections.plan_ready_banner import (
+    maybe_render_plan_ready_banner,
+)
 from pollypm.cockpit_sections.plan_review import (
     find_actionable_plan_review_task,
     load_plan_text,
@@ -221,6 +224,17 @@ def _render_project_dashboard(
         format_project_health_scorecard(name, counts, tasks),
         "",
     ]
+    # #1633 Rule 3 \u2014 plan-ready banner. Fires when a plan_project task
+    # is in ``done`` but ``find_actionable_plan_review_task`` returned
+    # None (i.e. the regular dashboard is rendering). Today the
+    # dashboard would show "no summary" for such projects because the
+    # plan-review surface didn't trigger; the banner says "the plan IS
+    # the summary \u2014 review and approve." Secondary to the full
+    # plan-review surface; doesn't fire when that surface is up.
+    out.extend(maybe_render_plan_ready_banner(
+        tasks=tasks,
+        plan_review_surface_active=False,
+    ))
     # ``_section_velocity`` now always returns a divider + body (with
     # an empty-state placeholder when no shipped tasks), and emits its
     # own trailing blank line — see audit UX #9. No outer ``if``

@@ -4,20 +4,20 @@ Step-by-step procedures for common operations.
 
 ## Table of Contents
 
-| Procedure | Line |
-|-----------|------|
-| Delegate Work to a Worker | 20 |
-| Review Worker Output | 42 |
-| Switch a Worker's Provider (Claude ↔ Codex) | 58 |
-| Start a New Worker | 76 |
-| Restart a Stuck Worker | 85 |
-| Add a New Project | 97 |
-| Send a Message to the User | 108 |
-| Respond to an Inbox Item | 124 |
-| Deploy a Site with ItsAlive | 134 |
-| Handle a Heartbeat Escalation | 152 |
-| Check System Health | 166 |
-| Understand Background Maintenance | 202 |
+- Delegate Work to a Worker
+- Review Worker Output
+- Switch a Worker's Provider (Claude ↔ Codex)
+- Start a New Worker
+- Restart a Stuck Worker
+- Add a New Project
+- Remove a Project
+- Reinitialize a Project (blow it away and start over)
+- Send a Message to the User
+- Respond to an Inbox Item
+- Deploy a Site with ItsAlive
+- Handle a Heartbeat Escalation
+- Check System Health
+- Understand Background Maintenance
 
 ## Delegate Work to a Worker
 
@@ -129,6 +129,117 @@ pm task create "<title>" -p <project_key> -d "<description>" -f standard
 pm task queue <project_key>/<number>
 # A worker session spawns automatically when the task is claimed.
 ```
+
+## Remove a Project
+
+`pm project remove <key>` tears down a project end-to-end. The default form
+only edits `pollypm.toml`; the `--purge-*` flags cascade through the
+adjacent state surfaces. Always start with `--dry-run` to confirm the
+plan.
+
+```bash
+# 1. Preview what would be torn down.
+pm project remove russell --dry-run \
+    --purge-sessions --purge-state --purge-worktrees
+```
+
+The dry-run output lists each surface separately so you can see exactly
+what will be deleted before you commit:
+
+- `sessions to purge:` — `[sessions.*]` blocks tied to this project,
+  with a `(live)` or `(stale)` marker per tmux session.
+- `state.db rows to purge:` — per-table counts in the workspace
+  `state.db` (work_tasks, messages, worktrees, audit history, …).
+- `worktree directories to purge:` — `<project>/.pollypm/worktrees/`
+  subdirs, with a `[dirty]` marker on any worktree with uncommitted
+  changes.
+
+Once the plan looks right, re-run without `--dry-run` and pass `--yes`
+(or `--force`) to skip the destructive-action prompts:
+
+```bash
+# 2. Apply the cascade.
+pm project remove russell --yes \
+    --purge-sessions --purge-state --purge-worktrees
+```
+
+### What each flag does
+
+| Flag | Effect |
+|------|--------|
+| (no flags) | Only removes the `[projects.<key>]` config entry. Refuses while `[sessions.*]` blocks reference the project. State.db rows, audit history, and worktree dirs are left in place. |
+| `--purge-sessions` | Kills every tmux session tied to the project and drops the matching `[sessions.*]` entries. Required when sessions reference the project — otherwise `remove_project` refuses. |
+| `--purge-state` | Deletes every state.db row tied to the project (work_tasks, messages, audit_outbox, notification_staging, worktrees, architect_resume_tokens, token_usage, …) and removes the central audit-tail JSONL at `~/.pollypm/audit/<key>.jsonl`. |
+| `--purge-worktrees` | Removes every git worktree under `<project>/.pollypm/worktrees/`. Uses `git worktree remove` for registered worktrees, `shutil.rmtree` for stale dirs. Refuses dirty worktrees unless `--force-discard-worktree-changes` is also set. |
+| `--force-discard-worktree-changes` | Pairs with `--purge-worktrees`. Runs `git worktree remove --force` so dirty worktrees are removed and the local branch ref is dropped. |
+| `--force` | Skips the active-task confirmation prompt (queued or in-flight work-service tasks). Does NOT auto-accept the `--purge-state` or `--purge-worktrees` destructive prompts — use `--yes` for those. |
+| `--yes` / `-y` | Auto-accepts every confirmation prompt. Required for fully scripted removal. |
+
+### Destructive-action ordering
+
+The cascade always runs in this order, with each step gating the next:
+
+1. **Active-task gate.** Refuses (or prompts) when there are queued or
+   in-flight work-service tasks. `--force` bypasses the prompt.
+2. **Sessions.** With `--purge-sessions`, tmux sessions are killed first
+   so workers don't keep writing to a project that's about to disappear.
+   `[sessions.*]` entries drop next.
+3. **State.db rows.** With `--purge-state`, the SQLite sweep runs BEFORE
+   the TOML edit. A failure here aborts without touching the config so
+   the rows-vs-config asymmetry can only point one way (issue #1673).
+4. **Worktree directories.** With `--purge-worktrees`, dirs under
+   `.pollypm/worktrees/` are removed. Dirty worktrees are skipped unless
+   `--force-discard-worktree-changes` is set.
+5. **Config entry.** `remove_project` strips `[projects.<key>]` last.
+
+If any earlier step fails, the project entry stays in `pollypm.toml` so
+you can investigate and retry. The reverse is never true — the config
+is the last surface to mutate.
+
+### When to use `pm project remove` vs `pm project reinit`
+
+- Use **`pm project remove`** when the directory is also going away (you
+  archived the repo, moved it, or are migrating to a different
+  workspace_root). Pair with the `--purge-*` flags for a clean teardown.
+- Use **`pm project reinit`** (next section) when the directory stays
+  but PollyPM's local state for it is broken or stale. Skips the manual
+  re-`pm project new` step.
+
+## Reinitialize a Project (blow it away and start over)
+
+`pm project reinit <key>` is the shorthand for "remove + re-register with
+the same path and slug". The high-traffic case: the working tree was
+wiped & rebuilt by hand and PollyPM's local state is out of sync.
+
+```bash
+# Preview first.
+pm project reinit russell --dry-run
+
+# Apply.
+pm project reinit russell --yes
+```
+
+This is equivalent to:
+
+```bash
+pm project remove russell --yes \
+    --purge-sessions --purge-state --purge-worktrees
+pm project new <path-from-the-removed-entry> \
+    --slug russell --skip-planner
+```
+
+The full cascade — sessions, state.db rows, worktrees, config entry —
+runs in the same order documented in **Destructive-action ordering**
+above. Step 5 (re-register) re-runs `ensure_project_scaffold` on the
+path so the standard `.pollypm/` directory layout reappears.
+
+`reinit` refuses to re-register when the project directory no longer
+exists on disk; in that case it leaves the project removed and points
+you at `pm project new`.
+
+`--force-discard-worktree-changes` is supported for the same reason as
+`pm project remove`: dirty worktrees are skipped by default, set this
+flag to remove them anyway.
 
 ## Send a Message to the User
 

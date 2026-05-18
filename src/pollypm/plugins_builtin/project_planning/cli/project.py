@@ -926,7 +926,9 @@ def _purge_project_sessions(
 # * ``removed_ok`` is True after a successful teardown. In dry-run mode
 #   we always report False for this and skip the actual delete.
 # * ``reason`` carries a short explanation when ``removed_ok`` is False
-#   ("dirty", "git-failed", "rmtree-failed", or "dry-run").
+#   ("dirty", "locked", "git-failed", "rmtree-failed", or "dry-run").
+#   "locked" means the worktree is git-locked and the caller didn't pass
+#   ``force_discard_changes`` to override (see issue #1693).
 
 
 def _worktree_is_git_registered(
@@ -984,6 +986,53 @@ def _worktree_has_uncommitted_changes(worktree_path: Path) -> bool:
     return bool(result.stdout.strip())
 
 
+def _worktree_is_locked(
+    project_path: Path, worktree_path: Path
+) -> bool:
+    """Return True if ``worktree_path`` is a locked git worktree.
+
+    Parses ``git worktree list --porcelain`` and looks for a ``locked``
+    record attached to the matching ``worktree`` entry. ``git worktree
+    remove`` refuses to remove a locked worktree, so we mirror that
+    check here — otherwise the rmtree fallback would silently bypass
+    git's safety net (see issue #1693, regression from #1685).
+    """
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(project_path),
+             "worktree", "list", "--porcelain"],
+            check=False, text=True, capture_output=True, timeout=60,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return False
+    if result.returncode != 0:
+        return False
+    try:
+        target = worktree_path.resolve()
+    except OSError:
+        target = worktree_path
+    current_match = False
+    for raw in result.stdout.splitlines():
+        line = raw.rstrip()
+        if line.startswith("worktree "):
+            registered = line[len("worktree "):].strip()
+            try:
+                registered_resolved = Path(registered).resolve()
+            except OSError:
+                registered_resolved = Path(registered)
+            current_match = registered_resolved == target
+            continue
+        if not line:
+            # Blank line terminates a porcelain record.
+            current_match = False
+            continue
+        # The ``locked`` token may stand alone or carry a reason
+        # ("locked <reason>"); either form means the worktree is locked.
+        if current_match and (line == "locked" or line.startswith("locked ")):
+            return True
+    return False
+
+
 def _enumerate_project_worktree_dirs(project_path: Path) -> list[Path]:
     """Return every subdirectory under ``<project>/.pollypm/worktrees/``.
 
@@ -1027,6 +1076,31 @@ def _enumerate_project_worktree_dirs(project_path: Path) -> list[Path]:
     return out
 
 
+class _PurgeWorktreesError(RuntimeError):
+    """Raised when ``_purge_project_worktrees`` left a dirty worktree behind.
+
+    Signals that one or more worktrees were skipped because they had
+    uncommitted changes and ``--force-discard-worktree-changes`` was not
+    supplied. The caller MUST abort before ``remove_project`` so the
+    TOML config doesn't drift relative to the still-on-disk worktree
+    debris (see issue #1692 — previously this case silently stripped
+    the project entry while leaving the dirty directories behind, so
+    re-running the same command couldn't resolve the project path).
+
+    Carries the partial result list on ``.results`` so the caller can
+    still surface the per-entry summary (rows removed, rows failed)
+    before exiting.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        results: list[tuple[Path, bool, bool, bool, str]],
+    ) -> None:
+        super().__init__(message)
+        self.results = results
+
+
 def _purge_project_worktrees(
     config_path: Path,
     project_key: str,
@@ -1047,6 +1121,18 @@ def _purge_project_worktrees(
     ``git worktree remove --force`` (which also drops the branch ref);
     unregistered stale directories fall back to :func:`shutil.rmtree`.
 
+    Locked worktrees are treated the same way: without
+    ``force_discard_changes`` they're skipped (reason ``"locked"``);
+    with the flag we ``git worktree unlock`` first and then
+    ``git worktree remove --force``. See issue #1693 — the rmtree
+    fallback used to silently bypass git's locked-worktree refusal.
+
+    For registered worktrees, a non-zero ``git worktree remove`` is
+    reported as ``"git-failed"`` and the directory is left alone. We do
+    NOT fall back to ``shutil.rmtree`` on registered worktrees because
+    that would bypass git's own safety checks (locks, submodule data,
+    etc.). Stale unregistered directories still use the rmtree path.
+
     Best-effort throughout: a teardown failure on one entry never aborts
     the rest of the sweep. The caller gets per-entry success/failure so
     it can surface partial-failure to the operator.
@@ -1064,8 +1150,20 @@ def _purge_project_worktrees(
     for wt_path in entries:
         is_git = _worktree_is_git_registered(project_path, wt_path)
         dirty = _worktree_has_uncommitted_changes(wt_path) if is_git else False
+        locked = (
+            _worktree_is_locked(project_path, wt_path) if is_git else False
+        )
         if dry_run:
             results.append((wt_path, is_git, dirty, False, "dry-run"))
+            continue
+        if locked and not force_discard_changes:
+            # Git refuses to remove a locked worktree and we mirror that:
+            # without an explicit override the locked worktree's contents
+            # stay on disk. Operators must pass
+            # ``--force-discard-worktree-changes`` to opt into removal
+            # (see issue #1693 — regression from #1685 where the rmtree
+            # fallback silently bypassed git's refusal).
+            results.append((wt_path, is_git, dirty, False, "locked"))
             continue
         if dirty and not force_discard_changes:
             # Operator hasn't opted into discarding changes — leave it.
@@ -1074,8 +1172,20 @@ def _purge_project_worktrees(
         removed_ok = False
         reason = ""
         if is_git:
+            if locked:
+                # Force override: unlock first so ``git worktree remove
+                # --force`` doesn't bounce off git's locked check.
+                try:
+                    subprocess.run(
+                        ["git", "-C", str(project_path),
+                         "worktree", "unlock", "--", str(wt_path)],
+                        check=False, text=True,
+                        capture_output=True, timeout=60,
+                    )
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
             cmd = ["git", "-C", str(project_path), "worktree", "remove"]
-            if force_discard_changes or dirty:
+            if force_discard_changes or dirty or locked:
                 cmd.append("--force")
             cmd.extend(["--", str(wt_path)])
             try:
@@ -1086,22 +1196,14 @@ def _purge_project_worktrees(
                 if proc.returncode == 0 and not wt_path.exists():
                     removed_ok = True
                 else:
-                    # ``git worktree remove`` can leave the directory if
-                    # the worktree was already half-detached. Fall back
-                    # to rmtree so the operator gets a clean slate.
                     reason = "git-failed"
             except (subprocess.TimeoutExpired, OSError):
                 reason = "git-failed"
-            # Best-effort fallback: if the directory is still there
-            # after a git remove (or if git failed), rmtree it.
-            if not removed_ok and wt_path.exists():
-                try:
-                    _shutil.rmtree(wt_path)
-                    removed_ok = True
-                    if reason == "":
-                        reason = "rmtree-fallback"
-                except OSError:
-                    reason = reason or "rmtree-failed"
+            # For registered worktrees we do NOT fall back to rmtree
+            # when git refused — that would bypass git's own safety
+            # checks (locked worktrees, submodules, etc.). See issue
+            # #1693. Stale leftover directories (is_git=False) still
+            # use the rmtree path below.
         else:
             try:
                 _shutil.rmtree(wt_path)
@@ -1119,6 +1221,26 @@ def _purge_project_worktrees(
             except (subprocess.TimeoutExpired, OSError):
                 pass
         results.append((wt_path, is_git, dirty, removed_ok, reason))
+
+    # Hard refusal: any worktree skipped because it was dirty (and the
+    # operator hadn't passed --force-discard-worktree-changes) means
+    # the on-disk debris is NOT gone. Raise so the caller aborts BEFORE
+    # ``remove_project`` strips the project entry from pollypm.toml —
+    # otherwise the dirty worktrees become orphans the operator can't
+    # reach via the config (issue #1692). Dry-run never raises.
+    if not dry_run:
+        skipped_dirty = [
+            p for p, _g, _d, ok, reason in results
+            if not ok and reason == "dirty"
+        ]
+        if skipped_dirty:
+            joined = ", ".join(str(p) for p in skipped_dirty)
+            raise _PurgeWorktreesError(
+                f"refusing to strip project entry: {len(skipped_dirty)} "
+                f"worktree(s) with uncommitted changes were skipped "
+                f"({joined})",
+                results,
+            )
     return results
 
 
@@ -1176,8 +1298,10 @@ def remove_cmd(
         False, "--force-discard-worktree-changes",
         help=(
             "When used with --purge-worktrees, discard uncommitted "
-            "changes in worktrees instead of refusing to remove them. "
-            "Pairs with ``git worktree remove --force``."
+            "changes in worktrees instead of refusing to remove them, "
+            "AND unlock+remove git-locked worktrees that ``git worktree "
+            "remove`` would otherwise refuse. Pairs with ``git worktree "
+            "remove --force`` (see issue #1693)."
         ),
     ),
     dry_run: bool = typer.Option(
@@ -1486,18 +1610,32 @@ def remove_cmd(
                 if not proceed:
                     typer.echo("Aborted. No changes made.")
                     raise typer.Exit(code=1)
-            wt_results = _purge_project_worktrees(
-                path, project_key,
-                force_discard_changes=force_discard_worktree_changes,
-            )
+            wt_purge_failed = False
+            try:
+                wt_results = _purge_project_worktrees(
+                    path, project_key,
+                    force_discard_changes=force_discard_worktree_changes,
+                )
+            except _PurgeWorktreesError as exc:
+                # Dirty worktrees were skipped. Surface the same
+                # per-entry summary as the happy path, then abort BEFORE
+                # ``remove_project`` so the project entry survives in
+                # pollypm.toml and the operator can retry (issue #1692).
+                wt_results = exc.results
+                wt_purge_failed = True
+
             removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
             skipped_dirty = [
                 p for p, _g, _d, ok, reason in wt_results
                 if not ok and reason == "dirty"
             ]
+            skipped_locked = [
+                p for p, _g, _d, ok, reason in wt_results
+                if not ok and reason == "locked"
+            ]
             failed = [
                 (p, reason) for p, _g, _d, ok, reason in wt_results
-                if not ok and reason != "dirty"
+                if not ok and reason not in ("dirty", "locked")
             ]
             typer.echo(
                 f"Removed {removed_count} worktree director"
@@ -1508,8 +1646,28 @@ def remove_cmd(
                     f"  Skipped (uncommitted changes): {p} — re-run with "
                     "--force-discard-worktree-changes to discard."
                 )
+            for p in skipped_locked:
+                typer.echo(
+                    f"  Skipped (locked worktree): {p} — re-run with "
+                    "--force-discard-worktree-changes to unlock and remove."
+                )
             for p, reason in failed:
                 typer.echo(f"  Failed to remove {p} ({reason}).")
+
+            if wt_purge_failed:
+                typer.echo(
+                    f"Error: --purge-worktrees left {len(skipped_dirty)} "
+                    f"dirty worktree(s) in place for '{project_key}'.",
+                    err=True,
+                )
+                typer.echo(
+                    "Aborted. Project entry left in pollypm.toml so you "
+                    "can retry once the worktrees are clean (or re-run "
+                    "with --force-discard-worktree-changes to discard "
+                    "the changes).",
+                    err=True,
+                )
+                raise typer.Exit(code=1)
 
     try:
         removed = remove_project(path, project_key)
@@ -1526,6 +1684,303 @@ def remove_cmd(
             "were left in place. See issue #1561 for the full "
             "teardown recipe."
         )
+
+
+# ---------------------------------------------------------------------------
+# pm project reinit (#1561)
+# ---------------------------------------------------------------------------
+
+
+@project_app.command("reinit")
+def reinit_cmd(
+    project_key: str = typer.Argument(
+        ...,
+        help="Project key to reinitialize (remove + re-register).",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help=(
+            "Non-interactive: auto-accept the destructive confirmation "
+            "prompt. Required when there are active tasks, state.db "
+            "rows, or worktrees to purge."
+        ),
+    ),
+    force_discard_worktree_changes: bool = typer.Option(
+        False, "--force-discard-worktree-changes",
+        help=(
+            "Discard uncommitted changes in worktrees instead of "
+            "refusing to remove them. Pairs with ``git worktree remove "
+            "--force``."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help=(
+            "Preview the reinit plan without mutating anything. Lists "
+            "what would be torn down and the path that would be "
+            "re-registered."
+        ),
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
+    ),
+) -> None:
+    """Remove + re-register a project in one step ("blow it away and start over").
+
+    Thin wrapper around ``pm project remove --purge-sessions --purge-state
+    --purge-worktrees`` followed by ``register_project`` with the same
+    slug and workspace path. The high-traffic use case (#1561): the
+    operator wiped & rebuilt the working tree by hand and now wants
+    PollyPM caught up cleanly without invariant orphans.
+
+    The cascade ordering mirrors ``pm project remove``:
+
+    1. Kill tmux sessions + drop ``[sessions.*]`` entries.
+    2. Delete state.db rows + audit-tail JSONL.
+    3. Remove ``<project>/.pollypm/worktrees/`` subdirs.
+    4. Remove the ``[projects.<key>]`` config entry.
+    5. Re-register the same path under the same slug.
+
+    Step 5 also re-runs ``ensure_project_scaffold`` on the path, so the
+    standard ``.pollypm/`` directory layout reappears after the wipe.
+
+    With ``--dry-run`` the plan is printed and nothing mutates. Pass
+    ``--yes`` for non-interactive use; without it, the cascade prompts
+    once before deleting state.db rows and once before removing
+    worktree directories (same gates as ``pm project remove``).
+    """
+    from pollypm.projects import register_project, remove_project
+
+    path = _require_config(config_path)
+    config = load_config(path)
+    if project_key not in config.projects:
+        typer.echo(f"Unknown project: {project_key}", err=True)
+        raise typer.Exit(code=1)
+
+    project_entry = config.projects[project_key]
+    project_path = Path(project_entry.path)
+    project_name = project_entry.name
+    active = _count_active_tasks(project_key, path)
+    session_names = _sessions_for_project(path, project_key)
+
+    # ------------------------------------------------------------------
+    # Dry-run: print the plan and exit 0 without mutating anything.
+    # The shape mirrors ``pm project remove --dry-run`` so an operator
+    # who reaches for ``reinit`` after experimenting with ``remove``
+    # sees a familiar layout.
+    # ------------------------------------------------------------------
+    if dry_run:
+        typer.echo(f"Dry run: would reinit project '{project_key}'.")
+        typer.echo(f"  path:    {project_path}")
+        if active > 0:
+            task_word = "task" if active == 1 else "tasks"
+            typer.echo(
+                f"  active:  {active} queued/in-flight work-service "
+                f"{task_word} (will be deleted)"
+            )
+        if session_names:
+            preview = _purge_project_sessions(path, project_key, dry_run=True)
+            typer.echo("  sessions to purge:")
+            for name, live, _killed in preview:
+                state = "live" if live else "stale"
+                typer.echo(f"    - {name} ({state})")
+        else:
+            typer.echo("  sessions: (none)")
+
+        state_counts = _count_project_state_rows(path, project_key)
+        nonzero = {
+            table: n for table, n in state_counts.items() if n > 0
+        }
+        if nonzero:
+            typer.echo("  state.db rows to purge:")
+            for table, n in sorted(nonzero.items()):
+                noun = (
+                    "file" if table == "audit_tail"
+                    else ("row" if n == 1 else "rows")
+                )
+                typer.echo(f"    - {table}: {n} {noun}")
+        else:
+            typer.echo("  state.db rows: (none)")
+
+        wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+        if wt_preview:
+            typer.echo("  worktree directories to purge:")
+            for wt_path, is_git, dirty, _ok, _reason in wt_preview:
+                kind = "git" if is_git else "stale"
+                dirty_marker = " [dirty]" if dirty else ""
+                typer.echo(f"    - {wt_path} ({kind}){dirty_marker}")
+            dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
+            if dirty_count > 0 and not force_discard_worktree_changes:
+                typer.echo(
+                    f"Note: {dirty_count} worktree(s) have uncommitted "
+                    "changes and will be skipped. Pass "
+                    "--force-discard-worktree-changes to remove anyway."
+                )
+        else:
+            typer.echo("  worktree directories: (none)")
+
+        typer.echo(
+            f"  re-register: {project_key} at {project_path}"
+        )
+        typer.echo("Re-run without --dry-run to apply.")
+        return
+
+    # ------------------------------------------------------------------
+    # Single destructive-action gate. ``reinit`` is unambiguously
+    # destructive — there's no "register fresh, leave the old around"
+    # variant — so one confirmation covers the whole cascade. Skipped
+    # with ``--yes``.
+    # ------------------------------------------------------------------
+    if not yes:
+        typer.echo(
+            f"Reinit will tear down project '{project_key}' "
+            f"(sessions, state.db rows, worktrees, config entry) "
+            f"and re-register it at {project_path}."
+        )
+        proceed = typer.confirm(
+            f"Permanently reinit '{project_key}'?",
+            default=False,
+        )
+        if not proceed:
+            typer.echo("Aborted. No changes made.")
+            raise typer.Exit(code=1)
+
+    # ------------------------------------------------------------------
+    # Step 1: kill tmux sessions + drop [sessions.*] entries.
+    # Mirrors ``remove_cmd``'s --purge-sessions branch.
+    # ------------------------------------------------------------------
+    if session_names:
+        purged = _purge_project_sessions(path, project_key)
+        for name, live, killed in purged:
+            if live and killed:
+                typer.echo(f"Killed tmux session {name} and dropped config entry.")
+            elif live and not killed:
+                typer.echo(
+                    f"Dropped [sessions.{name}] from config; tmux kill "
+                    "failed (session may still be running — run "
+                    "`tmux kill-session -t " + name + "` manually)."
+                )
+            else:
+                typer.echo(
+                    f"Dropped [sessions.{name}] from config "
+                    "(tmux session was not running)."
+                )
+
+    # ------------------------------------------------------------------
+    # Step 2: state.db row teardown + audit tail. Hard failure here
+    # aborts BEFORE ``remove_project`` (issue #1673 — keep the config
+    # in sync with the rows). Same exit code + message as
+    # ``remove_cmd``.
+    # ------------------------------------------------------------------
+    state_counts = _count_project_state_rows(path, project_key)
+    total_rows = sum(
+        n for table, n in state_counts.items() if table != "audit_tail"
+    )
+    if total_rows > 0 or state_counts.get("audit_tail", 0) > 0:
+        try:
+            state_summary = _purge_project_state(path, project_key)
+        except _PurgeStateError as exc:
+            typer.echo(
+                f"Error: state.db purge failed for '{project_key}': "
+                f"{exc}",
+                err=True,
+            )
+            typer.echo(
+                "Aborted. Project entry left in pollypm.toml so you "
+                "can retry once the DB is reachable.",
+                err=True,
+            )
+            raise typer.Exit(code=1) from exc
+        removed_total = sum(
+            n for table, n in state_summary.items()
+            if table != "audit_tail"
+        )
+        typer.echo(
+            f"Deleted {removed_total} state.db row(s) for "
+            f"'{project_key}' across "
+            f"{sum(1 for n in state_summary.values() if n > 0)} "
+            "table(s)."
+        )
+        if state_summary.get("audit_tail", 0) > 0:
+            typer.echo(
+                f"Removed central audit-tail JSONL for '{project_key}'."
+            )
+
+    # ------------------------------------------------------------------
+    # Step 3: worktree directory teardown. Same shape as
+    # ``remove_cmd``'s --purge-worktrees branch. Failures here don't
+    # abort — leftover worktree dirs are recoverable with a manual
+    # ``git worktree remove`` later.
+    # ------------------------------------------------------------------
+    wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+    if wt_preview:
+        wt_results = _purge_project_worktrees(
+            path, project_key,
+            force_discard_changes=force_discard_worktree_changes,
+        )
+        removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
+        skipped_dirty = [
+            p for p, _g, _d, ok, reason in wt_results
+            if not ok and reason == "dirty"
+        ]
+        failed = [
+            (p, reason) for p, _g, _d, ok, reason in wt_results
+            if not ok and reason != "dirty"
+        ]
+        typer.echo(
+            f"Removed {removed_count} worktree director"
+            f"{'y' if removed_count == 1 else 'ies'} for '{project_key}'."
+        )
+        for p in skipped_dirty:
+            typer.echo(
+                f"  Skipped (uncommitted changes): {p} — re-run with "
+                "--force-discard-worktree-changes to discard."
+            )
+        for p, reason in failed:
+            typer.echo(f"  Failed to remove {p} ({reason}).")
+
+    # ------------------------------------------------------------------
+    # Step 4: remove [projects.<key>] from the config.
+    # ------------------------------------------------------------------
+    try:
+        removed = remove_project(path, project_key)
+    except typer.BadParameter as exc:
+        typer.echo(f"Error: {exc.message}", err=True)
+        raise typer.Exit(code=1) from exc
+    typer.echo(f"Removed project '{removed.key}' from {path}")
+
+    # ------------------------------------------------------------------
+    # Step 5: re-register the project under the same slug + path. The
+    # path must still exist on disk — ``reinit`` is "blow away PollyPM
+    # state, keep the working tree". If the operator also wiped the
+    # repo directory, they should use ``pm project new`` instead.
+    # ------------------------------------------------------------------
+    if not project_path.exists() or not project_path.is_dir():
+        typer.echo(
+            f"Error: project path {project_path} no longer exists. "
+            f"The project was removed; re-create the directory and run "
+            f"`pm project new {project_path}` to register from scratch.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    try:
+        reregistered = register_project(
+            path, project_path, name=project_name, slug=project_key,
+        )
+    except typer.BadParameter as exc:
+        typer.echo(f"Error: {exc.message}", err=True)
+        typer.echo(
+            "The project was removed but re-registration failed. Run "
+            f"`pm project new {project_path}` to finish.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+
+    typer.echo(
+        f"Reinit complete: re-registered '{reregistered.key}' at "
+        f"{reregistered.path}."
+    )
 
 
 # ---------------------------------------------------------------------------

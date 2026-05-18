@@ -1122,9 +1122,15 @@ def test_purge_project_worktrees_dry_run_is_noop(env) -> None:
 
 
 def test_purge_project_worktrees_refuses_dirty_without_force(env) -> None:
-    """Dirty worktrees are skipped unless ``force_discard_changes`` is set."""
+    """Dirty worktrees raise ``_PurgeWorktreesError`` so the caller aborts.
+
+    See issue #1692 — pre-fix this returned ``[(…, "dirty")]`` and the
+    CLI still went on to strip the project entry from pollypm.toml,
+    leaving the dirty worktree directories orphaned.
+    """
     from pollypm.plugins_builtin.project_planning.cli.project import (
         _purge_project_worktrees,
+        _PurgeWorktreesError,
     )
 
     _init_git_project(env["project_path"])
@@ -1132,8 +1138,10 @@ def test_purge_project_worktrees_refuses_dirty_without_force(env) -> None:
     # Mutate a tracked file so git status reports dirty.
     (wt_a / "README").write_text("dirty\n")
 
-    results = _purge_project_worktrees(env["config_path"], "demo")
+    with pytest.raises(_PurgeWorktreesError) as exc_info:
+        _purge_project_worktrees(env["config_path"], "demo")
 
+    results = exc_info.value.results
     assert len(results) == 1
     path, is_git, dirty, ok, reason = results[0]
     assert dirty is True
@@ -1183,6 +1191,118 @@ def test_purge_project_worktrees_rmtrees_stale_dirs(env) -> None:
     assert is_git is False
     assert ok is True
     assert not stale.exists()
+
+
+def _lock_worktree(project_path: Path, wt_path: Path) -> None:
+    """Run ``git worktree lock`` against ``wt_path``."""
+    import subprocess
+    subprocess.run(
+        ["git", "-C", str(project_path), "worktree", "lock",
+         "--", str(wt_path)],
+        check=True, capture_output=True,
+    )
+
+
+def test_purge_project_worktrees_refuses_locked_without_force(env) -> None:
+    """Locked worktrees are skipped (reason=locked) without force.
+
+    Regression coverage for #1693: the rmtree fallback used to silently
+    bypass ``git worktree remove``'s refusal on a locked worktree, which
+    discarded protected contents anyway.
+    """
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    results = _purge_project_worktrees(env["config_path"], "demo")
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    assert is_git is True
+    assert ok is False
+    assert reason == "locked"
+    # The locked worktree's contents are still on disk — git's refusal
+    # was honored end-to-end (no rmtree fallback).
+    assert wt_a.exists()
+    assert (wt_a / "README").exists()
+
+
+def test_purge_project_worktrees_force_discard_unlocks_and_removes(
+    env,
+) -> None:
+    """``force_discard_changes`` unlocks + removes a locked worktree."""
+    from pollypm.plugins_builtin.project_planning.cli.project import (
+        _purge_project_worktrees,
+    )
+
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    results = _purge_project_worktrees(
+        env["config_path"], "demo", force_discard_changes=True,
+    )
+
+    assert len(results) == 1
+    path, is_git, dirty, ok, reason = results[0]
+    assert is_git is True
+    assert ok is True
+    assert not wt_a.exists()
+
+
+def test_cli_remove_purge_worktrees_skips_locked_without_force(env) -> None:
+    """CLI surfaces ``locked`` skip with a hint pointing at the override."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project."
+        "_count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Skipped (locked worktree)" in result.output
+    assert "--force-discard-worktree-changes" in result.output
+    # Locked worktree contents preserved.
+    assert wt_a.exists()
+
+
+def test_cli_remove_purge_worktrees_force_discard_removes_locked(env) -> None:
+    """With override, locked worktree is unlocked and removed."""
+    _init_git_project(env["project_path"])
+    wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
+    _lock_worktree(env["project_path"], wt_a)
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project."
+        "_count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees",
+                "--force-discard-worktree-changes", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "Removed 1 worktree directory" in result.output
+    assert not wt_a.exists()
 
 
 def test_cli_remove_purge_worktrees_full_cascade(env) -> None:
@@ -1240,7 +1360,13 @@ def test_cli_remove_purge_worktrees_prompts_without_force(env) -> None:
 
 
 def test_cli_remove_purge_worktrees_skips_dirty_without_force(env) -> None:
-    """Dirty worktrees are reported as skipped, not removed."""
+    """Dirty worktrees abort the cascade and the project entry survives.
+
+    Issue #1692 — previously the CLI reported the skipped worktree but
+    still called ``remove_project`` afterward, stripping the project
+    entry while leaving the dirty worktree on disk. The recoverable
+    behaviour is: exit 1, keep the project entry, surface the skip.
+    """
     _init_git_project(env["project_path"])
     wt_a = _seed_worktree(env["project_path"], "architect-demo", "demo-arch")
     (wt_a / "README").write_text("local changes\n")
@@ -1257,11 +1383,53 @@ def test_cli_remove_purge_worktrees_skips_dirty_without_force(env) -> None:
             ],
         )
 
-    assert result.exit_code == 0, result.output
+    assert result.exit_code == 1, result.output
     assert "Skipped (uncommitted changes)" in result.output
     assert "--force-discard-worktree-changes" in result.output
     # Dirty worktree still exists.
     assert wt_a.exists()
+    # And the project entry must still be in the config so the operator
+    # can retry — that's the whole point of the abort (issue #1692).
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+    # The TOML-strip line from ``remove_project`` must not have fired.
+    assert "Removed project 'demo'" not in result.output
+
+
+def test_cli_remove_purge_worktrees_mixed_clean_and_dirty_aborts(env) -> None:
+    """Mixed cohort: clean worktrees still removed, dirty trip the abort.
+
+    Regression for issue #1692. The clean worktree must still get cleaned
+    up (best-effort row sweep is preserved) but the project entry stays
+    in ``pollypm.toml`` so the operator can retry — and the second pass
+    can still resolve the project path off the surviving entry.
+    """
+    _init_git_project(env["project_path"])
+    wt_clean = _seed_worktree(env["project_path"], "architect-clean", "clean")
+    wt_dirty = _seed_worktree(env["project_path"], "architect-dirty", "dirty")
+    (wt_dirty / "README").write_text("local changes\n")
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "remove", "demo", "--purge-worktrees", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+
+    assert result.exit_code == 1, result.output
+    # Clean one got swept.
+    assert not wt_clean.exists()
+    # Dirty one survived.
+    assert wt_dirty.exists()
+    # Project entry survives — re-run is possible.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+    assert "Removed project 'demo'" not in result.output
 
 
 def test_cli_remove_purge_worktrees_force_discard_removes_dirty(env) -> None:
@@ -1580,3 +1748,292 @@ def test_cli_remove_purge_state_aborts_when_db_purge_fails(
 
     # Audit tail untouched (purge bailed before audit cleanup too).
     assert tail_path.exists()
+
+
+# --------------------------------------------------------------------------
+# pm project reinit (#1561 wedge #5)
+#
+# ``reinit`` is the "blow it away and start over" shorthand: it runs the
+# same destructive cascade as ``pm project remove --purge-sessions
+# --purge-state --purge-worktrees`` and then re-registers the same path
+# under the same slug. Tests mirror the remove tests, with an extra
+# assertion that the re-registered project is present in the post-state.
+# --------------------------------------------------------------------------
+
+
+def test_cli_reinit_happy_path_reregisters(env) -> None:
+    """No sessions/rows/worktrees → reinit removes and re-adds cleanly."""
+    target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--yes",
+                "--config", str(env["config_path"]),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert "Removed project 'demo'" in result.output
+    assert "Reinit complete" in result.output
+    assert "re-registered 'demo'" in result.output
+
+    # Project entry is back under the same slug + path.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+    assert Path(config.projects["demo"].path).resolve() == (
+        env["project_path"].resolve()
+    )
+
+
+def test_cli_reinit_unknown_project_errors_cleanly(env) -> None:
+    result = runner.invoke(
+        project_app,
+        ["reinit", "does_not_exist", "--config", str(env["config_path"])],
+    )
+    assert result.exit_code == 1, result.output
+    assert "Unknown project" in result.output
+
+
+def test_cli_reinit_aborts_without_yes(env) -> None:
+    """Default prompt rejects → no mutation."""
+    target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            ["reinit", "demo", "--config", str(env["config_path"])],
+            input="n\n",
+        )
+    assert result.exit_code == 1, result.output
+    assert "Permanently reinit 'demo'?" in result.output
+    assert "Aborted" in result.output
+
+    # Project entry still present.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_reinit_dry_run_mutates_nothing(env) -> None:
+    target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--dry-run",
+                "--config", str(env["config_path"]),
+            ],
+        )
+    assert result.exit_code == 0, result.output
+    assert "Dry run: would reinit project 'demo'" in result.output
+    assert "re-register: demo at" in result.output
+    assert "Re-run without --dry-run to apply." in result.output
+
+    # Nothing mutated.
+    config = _load_cfg(env["config_path"])
+    assert "demo" in config.projects
+
+
+def test_cli_reinit_cascades_sessions_state_and_worktrees(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reinit tears down every wedge surface and then re-registers."""
+    # Build a config with sessions referencing the project.
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(
+        config_path,
+        workspace_root=workspace_root,
+        project_path=project_path,
+        slug="demo",
+        extra_sessions=(
+            "[sessions.architect_demo]\n"
+            'role = "architect"\n'
+            'provider = "claude"\n'
+            'account = "claude_main"\n'
+            'cwd = "."\n'
+            'project = "demo"\n'
+            'window_name = "architect-demo"\n'
+            "\n[accounts.claude_main]\n"
+            'provider = "claude"\n'
+            'home = "/tmp/claude_home"\n'
+        ),
+    )
+    _init_git_project(project_path)
+    wt_a = _seed_worktree(project_path, "architect-demo", "demo-arch")
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+    _seed_state_db_rows(config_path, "demo", task_count=2)
+    tail_path = _audit_tail_for("demo", audit_home=audit_home)
+    tail_path.write_text('{"event": "seeded"}\n')
+
+    fake_tmux = type(
+        "FakeTmux", (), {
+            "has_session": lambda self, name: True,
+            "kill_session": lambda self, name: True,
+        },
+    )()
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with (
+        patch(count_target, return_value=0),
+        patch(
+            "pollypm.session_services.create_tmux_client",
+            return_value=fake_tmux,
+        ),
+    ):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--yes",
+                "--config", str(config_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    # Sessions purged.
+    assert "Killed tmux session architect_demo" in result.output
+    # State rows purged.
+    assert "Deleted" in result.output
+    assert "state.db row" in result.output
+    # Worktrees purged.
+    assert "Removed 1 worktree director" in result.output
+    assert not wt_a.exists()
+    # Audit tail purged.
+    assert not tail_path.exists()
+    # Project removed THEN re-registered.
+    assert "Removed project 'demo'" in result.output
+    assert "Reinit complete" in result.output
+
+    config = _load_cfg(config_path)
+    assert "demo" in config.projects
+    assert "architect_demo" not in config.sessions
+
+
+def test_cli_reinit_aborts_when_project_path_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If the project directory is gone, reinit refuses to re-register."""
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    (project_path / ".git").mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(
+        config_path,
+        workspace_root=workspace_root,
+        project_path=project_path,
+        slug="demo",
+    )
+
+    # Wipe the directory AFTER config write but BEFORE invocation, so the
+    # remove phase finds the entry but the re-register phase trips on the
+    # missing path.
+    import shutil
+    shutil.rmtree(project_path)
+
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with patch(count_target, return_value=0):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--yes",
+                "--config", str(config_path),
+            ],
+        )
+
+    assert result.exit_code == 1, result.output
+    assert "no longer exists" in result.output
+    assert "pm project new" in result.output
+
+    # The remove phase still ran — project entry is gone.
+    config = _load_cfg(config_path)
+    assert "demo" not in config.projects
+
+
+def test_cli_reinit_dry_run_lists_full_cascade(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dry-run surfaces sessions, state rows, and worktrees in one preview."""
+    workspace_root = tmp_path / "dev"
+    workspace_root.mkdir()
+    project_path = workspace_root / "demo"
+    project_path.mkdir()
+    config_path = tmp_path / "pollypm.toml"
+    _write_config(
+        config_path,
+        workspace_root=workspace_root,
+        project_path=project_path,
+        slug="demo",
+        extra_sessions=(
+            "[sessions.architect_demo]\n"
+            'role = "architect"\n'
+            'provider = "claude"\n'
+            'account = "claude_main"\n'
+            'cwd = "."\n'
+            'project = "demo"\n'
+            'window_name = "architect-demo"\n'
+            "\n[accounts.claude_main]\n"
+            'provider = "claude"\n'
+            'home = "/tmp/claude_home"\n'
+        ),
+    )
+    _init_git_project(project_path)
+    _seed_worktree(project_path, "architect-demo", "demo-arch")
+
+    audit_home = tmp_path / "audit"
+    audit_home.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+    _seed_state_db_rows(config_path, "demo", task_count=1)
+
+    fake_tmux = type(
+        "FakeTmux", (), {
+            "has_session": lambda self, name: True,
+            # Dry-run must not actually kill.
+            "kill_session": lambda self, name: (_ for _ in ()).throw(
+                AssertionError("kill_session must not run in --dry-run")
+            ),
+        },
+    )()
+    count_target = (
+        "pollypm.plugins_builtin.project_planning.cli.project._count_active_tasks"
+    )
+    with (
+        patch(count_target, return_value=2),
+        patch(
+            "pollypm.session_services.create_tmux_client",
+            return_value=fake_tmux,
+        ),
+    ):
+        result = runner.invoke(
+            project_app,
+            [
+                "reinit", "demo", "--dry-run",
+                "--config", str(config_path),
+            ],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert "sessions to purge:" in result.output
+    assert "architect_demo (live)" in result.output
+    assert "state.db rows to purge:" in result.output
+    assert "worktree directories to purge:" in result.output
+    assert "re-register: demo at" in result.output
+
+    # Nothing mutated.
+    config = _load_cfg(config_path)
+    assert "demo" in config.projects
+    assert "architect_demo" in config.sessions

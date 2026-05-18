@@ -591,6 +591,57 @@ def _enforce_migration_gate(config_path: Path) -> None:
     _migrations.require_no_pending_or_exit(config.project.state_db)
 
 
+def _initialize_plugin_host_for_pane(config_path: Path) -> None:
+    """Bootstrap the plugin host in a standalone ``pm cockpit-pane`` process.
+
+    Cockpit panes launched as right-pane children (``pm cockpit-pane
+    activity``, ``pm cockpit-pane project <key>``, ...) run in their own
+    Python process. Per-process registration seams — e.g.
+    :mod:`pollypm.activity_projector_registry` (#1363),
+    :mod:`pollypm.approval_notifications` (#1597),
+    :mod:`pollypm.briefings_registry` (#1621),
+    :mod:`pollypm.maintenance_handlers_registry` (#1626) — keep their
+    ``_factory`` in module state, so initializing the plugin host in the
+    rail process does not populate a child cockpit-pane process.
+
+    Without this call a fresh ``pm cockpit-pane activity`` starts with
+    no projector registered and the activity feed / project-dashboard
+    activity panel render empty even when the built-in plugin is
+    installed (#1694).
+
+    Mirrors :meth:`pollypm.cockpit_rail.CockpitRail._rail_registry` —
+    swallows config-load + initialize failures so a broken plugin can
+    never block the standalone pane from starting.
+    """
+    try:
+        from pollypm.config import load_config
+        from pollypm.plugin_host import extension_host_for_root
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to import plugin host for cockpit-pane init (#1694)",
+            exc_info=True,
+        )
+        return
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "Failed to load config for cockpit-pane plugin init (#1694)",
+            exc_info=True,
+        )
+        return
+    try:
+        host = extension_host_for_root(str(config.project.root_dir.resolve()))
+        host.initialize_plugins(config=config)
+    except Exception:  # noqa: BLE001
+        # Mirror the rail's tolerance: degraded plugins surface via
+        # ``pm plugins show``; don't block the pane from launching.
+        logger.warning(
+            "Plugin host initialization failed in cockpit-pane (#1694)",
+            exc_info=True,
+        )
+
+
 def _warn_on_plugin_load_errors(config_path: Path) -> None:
     """Emit a stderr WARNING at cockpit boot if any plugin failed to load.
 
@@ -707,6 +758,13 @@ def register_ui_commands(app: typer.Typer) -> None:
     ) -> None:
         _enforce_migration_gate(config_path)
         _install_cockpit_debug_log_handler(config_path)
+        # #1694 — standalone cockpit panes run in their own process, so
+        # registration seams (activity projector, approval notifications,
+        # briefings, maintenance handlers) need the plugin host
+        # initialized here. Without this, panes like ``activity`` and
+        # ``project`` render empty even when their backing plugin is
+        # installed.
+        _initialize_plugin_host_for_pane(config_path)
         if kind == "settings" and target:
             from pollypm.cockpit_ui import PollyProjectSettingsApp
 

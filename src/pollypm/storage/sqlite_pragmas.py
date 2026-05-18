@@ -335,5 +335,6 @@ __all__ = [
     "diagnose_unable_to_open",
     "is_database_locked_error",
     "open_workspace_db",
+    "readonly_uri",
     "retry_on_database_locked",
 ]

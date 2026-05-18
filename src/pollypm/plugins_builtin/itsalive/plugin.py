@@ -66,7 +66,11 @@ def _resolve_project_root(payload: dict[str, Any]) -> Path:
         if config_path.exists():
             return load_config(config_path).project.root_dir
     except Exception:  # noqa: BLE001
-        pass
+        logger.warning(
+            "itsalive: project root resolution from config failed; "
+            "falling back to cwd",
+            exc_info=True,
+        )
     return Path.cwd()
 
 

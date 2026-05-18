@@ -363,7 +363,11 @@ def create_blocking_question_inbox_item(
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "worker_turn_end: blocking_question audit emit failed for %s",
+                session_name,
+                exc_info=True,
+            )
     elif state_store is not None:
         try:
             state_store.record_event(
@@ -372,7 +376,12 @@ def create_blocking_question_inbox_item(
                 message,
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "worker_turn_end: blocking_question state_store.record_event "
+                "failed for %s",
+                session_name,
+                exc_info=True,
+            )
     return inbox_task
 
 
@@ -418,14 +427,23 @@ def send_standard_reprompt(
                 payload={"message": message, "task_id": task_id},
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "worker_turn_end: worker_reprompted audit emit failed for %s",
+                session_name,
+                exc_info=True,
+            )
     elif state_store is not None:
         try:
             state_store.record_event(
                 session_name, "inbox.worker_reprompted", message,
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "worker_turn_end: worker_reprompted state_store.record_event "
+                "failed for %s",
+                session_name,
+                exc_info=True,
+            )
     return True
 
 
@@ -467,7 +485,12 @@ def load_transcript_tail(
             if isinstance(text, str):
                 return text[-tail_chars:]
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "worker_turn_end: pane capture failed for %s; "
+                "falling back to transcript file",
+                session_name,
+                exc_info=True,
+            )
     # Transcript-file fallback.
     transcript_fn = getattr(session_service, "transcript", None)
     if callable(transcript_fn):

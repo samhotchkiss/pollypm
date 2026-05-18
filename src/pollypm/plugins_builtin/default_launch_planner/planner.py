@@ -16,12 +16,13 @@ stays a clean seam we can swap later.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 import logging
 import os
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING
 
+from pollypm.launch_planner_protocol import DefaultLaunchPlannerContext
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
 from pollypm.projects import ensure_session_lock
 from pollypm.providers import get_provider
@@ -132,23 +133,13 @@ def _first_account_for_provider(
     return None
 
 
-@dataclass(slots=True)
-class DefaultLaunchPlannerContext:
-    """Callables the default planner needs from its host.
-
-    The planner doesn't own auth-sync, worker sandboxing, or agent
-    profile resolution — those live elsewhere (Supervisor today). The
-    context threads the relevant callables through so the planner can
-    call them without a hard Supervisor dependency.
-    """
-
-    config: "PollyPMConfig"
-    store: "StateStore"
-    readonly_state: bool
-    effective_account: Callable[[SessionConfig, AccountConfig], AccountConfig]
-    apply_role_launch_restrictions: Callable[[SessionConfig, LaunchCommand], LaunchCommand]
-    resolve_profile_prompt: Callable[[SessionConfig, AccountConfig], str | None]
-    storage_closet_session_name: Callable[[], str]
+# ``DefaultLaunchPlannerContext`` is owned by the core protocol module
+# (:mod:`pollypm.launch_planner_protocol`) and re-exported here for
+# back-compat — historical callers (and out-of-tree planners that
+# subclassed off this surface) imported the dataclass from this module.
+# Re-imported at module top so the public name remains
+# ``pollypm.plugins_builtin.default_launch_planner.planner.DefaultLaunchPlannerContext``.
+# See #1363 for the boundary roll-up.
 
 
 class DefaultLaunchPlanner:
@@ -294,7 +285,12 @@ class DefaultLaunchPlanner:
                     try:
                         ctx.store.set_session_runtime(session.name, effective_account="")
                     except Exception:  # noqa: BLE001
-                        pass
+                        _log.warning(
+                            "default_launch_planner: clearing stale "
+                            "effective_account for %s failed",
+                            session.name,
+                            exc_info=True,
+                        )
         if session.role in _ROUTED_ROLES:
             project_key = None if session.role == "operator-pm" else session.project
             routed_assignment = resolve_role_assignment(

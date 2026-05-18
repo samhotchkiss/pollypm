@@ -427,7 +427,7 @@ class Supervisor:
         name (``"default"``). Future work can thread a config-driven
         planner name through here.
         """
-        from pollypm.plugins_builtin.default_launch_planner.planner import (
+        from pollypm.launch_planner_protocol import (
             DefaultLaunchPlannerContext,
         )
 

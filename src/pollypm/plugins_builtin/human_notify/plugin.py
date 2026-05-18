@@ -107,6 +107,11 @@ def _read_webhook_from_toml(config: Any) -> dict:
         with open(config_path, "rb") as fh:
             raw = tomllib.load(fh)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "human_notify: failed to read webhook config from %s",
+            config_path,
+            exc_info=True,
+        )
         return {}
     section = raw.get("human_notify", {})
     if not isinstance(section, dict):
@@ -128,7 +133,11 @@ def _resolve_store(api: PluginAPI) -> Any | None:
         if config is not None:
             return get_store(config)
     except Exception:  # noqa: BLE001
-        pass
+        logger.warning(
+            "human_notify: unified Store lookup failed; falling back to "
+            "legacy StateStore",
+            exc_info=True,
+        )
     try:
         from pollypm.storage.state import StateStore
 
@@ -137,6 +146,10 @@ def _resolve_store(api: PluginAPI) -> Any | None:
             return None
         return StateStore(config.project.state_db)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "human_notify: legacy StateStore fallback failed",
+            exc_info=True,
+        )
         return None
 
 

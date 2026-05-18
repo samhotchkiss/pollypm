@@ -28,6 +28,7 @@ import pytest
 
 from pollypm.storage.doctor_state_probes import count_work_tasks_ro
 from pollypm.storage.legacy_per_project_db import _open_ro
+from pollypm.storage.project_state_purge import count_project_state_rows
 from pollypm.storage.sqlite_pragmas import readonly_uri
 from pollypm.storage.work_session_queries import (
     aggregate_project_session_tokens,
@@ -159,3 +160,29 @@ def test_legacy_per_project_open_ro_handles_metacharacter_paths(
         assert row[0] == 1
     finally:
         conn.close()
+
+
+@pytest.mark.parametrize(
+    "subdir",
+    [
+        "with#hash",
+        "with?query",
+        "mix#and?both",
+    ],
+)
+def test_project_state_purge_count_handles_metacharacter_paths(
+    tmp_path: Path,
+    subdir: str,
+) -> None:
+    """#1691 regression — ``count_project_state_rows`` is the gate for
+    ``pm project remove --purge-state``; if the read-only probe returns
+    zero rows because the workspace path contains ``#``/``?``, the CLI
+    skips the actual DELETE and silently leaves orphaned rows behind.
+    """
+    root = tmp_path / subdir
+    root.mkdir()
+    db = root / "state.db"
+    _seed_state_db(db, project="demo")
+
+    counts = count_project_state_rows(db, "demo")
+    assert counts["work_tasks"] == 1

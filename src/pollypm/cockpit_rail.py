@@ -2342,6 +2342,79 @@ class CockpitRouter:
                     },
                 )
 
+    def _select_storage_window_for_mount(
+        self,
+        storage_windows: list,
+        window_name: str,
+        session_name: str,
+    ):
+        """Pick which storage-closet window to mount when duplicates exist.
+
+        #1631 — the rail historically used ``next(w for w in windows if
+        w.name == window_name)``, which deterministically picked the
+        lowest-index window. When park-collisions left two ``pm-operator``
+        windows in the closet (one stale, one with the user's live Polly
+        conversation), the lowest-index pick was often the wrong one —
+        the user clicked Polly and got a fresh ``claude`` session while
+        their in-progress conversation was left orphaned in the second
+        window. #1563's conservative cleanup correctly refused to kill
+        either (both live), so the orphan persisted but the user-visible
+        damage was already done.
+
+        Selection rules:
+          * No matches → ``None``. Caller falls back to spawning fresh.
+          * Exactly one match → return it. Common path, no audit noise.
+          * Multiple matches → prefer the window whose pane is currently
+            running a live provider (``claude`` / ``codex`` / ``node``).
+            Ties broken by lowest index (deterministic). Emit a
+            ``cockpit.duplicate_resolution`` event explaining the choice
+            so forensics can trace which window won and why. **Do not**
+            kill the loser — #1563's conservative cleanup will reap it
+            once its pane dies.
+        """
+        matches = [w for w in storage_windows if getattr(w, "name", None) == window_name]
+        if not matches:
+            return None
+        if len(matches) == 1:
+            return matches[0]
+        live_provider = {"claude", "codex", "node"}
+        live_matches = [
+            w for w in matches
+            if (getattr(w, "pane_current_command", "") or "") in live_provider
+            and not getattr(w, "pane_dead", False)
+        ]
+        # Prefer live provider panes; fall back to any non-dead pane;
+        # last-resort fall back to the first match (caller still gets a
+        # usable target rather than a hard failure).
+        candidates = (
+            live_matches
+            or [w for w in matches if not getattr(w, "pane_dead", False)]
+            or matches
+        )
+        chosen = min(candidates, key=lambda w: getattr(w, "index", 0))
+        self._emit_cockpit_audit(
+            event_name="cockpit.duplicate_resolution",
+            subject=window_name,
+            status="warn",
+            metadata={
+                "session_name": session_name,
+                "window_name": window_name,
+                "all_indices": [getattr(w, "index", None) for w in matches],
+                "live_provider_indices": [getattr(w, "index", None) for w in live_matches],
+                "chosen_index": getattr(chosen, "index", None),
+                "chosen_pane_id": getattr(chosen, "pane_id", None),
+                "chosen_command": getattr(chosen, "pane_current_command", None),
+                "reason": (
+                    "live_provider_pane"
+                    if chosen in live_matches
+                    else "non_dead_fallback"
+                    if not getattr(chosen, "pane_dead", False)
+                    else "first_match_fallback"
+                ),
+            },
+        )
+        return chosen
+
     def _emit_cockpit_audit(
         self,
         *,
@@ -2677,7 +2750,13 @@ class CockpitRouter:
             storage = supervisor.storage_closet_session_name()
             try:
                 storage_windows = self.tmux.list_windows(storage)
-                target_win = next((w for w in storage_windows if w.name == window_name), None)
+                # #1631 — same duplicate-window logic as ``_show_live_session``.
+                # Task windows can also accumulate park-collision duplicates;
+                # the user clicking a task expects their in-progress worker,
+                # not a fresh placeholder.
+                target_win = self._select_storage_window_for_mount(
+                    storage_windows, window_name, window_name,
+                )
                 if target_win is not None:
                     self._park_mounted_session(supervisor, window_target)
                     self._cleanup_extra_panes(window_target)
@@ -3277,12 +3356,14 @@ class CockpitRouter:
                     item for item in launches
                     if item.session.name == session_name
                 )
-                target_window = next(
-                    (
-                        window for window in self.tmux.list_windows(storage_session)
-                        if window.name == launch.window_name
-                    ),
-                    None,
+                # #1631 — duplicate-aware selection. Freshly-created
+                # workers are unlikely to collide, but a stale window
+                # of the same name (e.g. from a prior aborted launch)
+                # would silently misroute the mount.
+                target_window = self._select_storage_window_for_mount(
+                    self.tmux.list_windows(storage_session),
+                    launch.window_name,
+                    session_name,
                 )
                 if target_window is not None:
                     source_pane_id = getattr(target_window, "pane_id", None)
@@ -3510,10 +3591,13 @@ class CockpitRouter:
                         # Look up the freshly-spawned window's index so
                         # the persisted identity records the
                         # disambiguating index, not just the name.
+                        # #1631 — if a duplicate exists (e.g. an orphan
+                        # left from a park-collision), prefer the live
+                        # provider pane so we don't mount onto the empty
+                        # placeholder and lose the user's conversation.
                         live_windows = self.tmux.list_windows(storage_session)
-                        target_window_for_identity = next(
-                            (w for w in live_windows if w.name == launch.window_name),
-                            None,
+                        target_window_for_identity = self._select_storage_window_for_mount(
+                            live_windows, launch.window_name, session_name,
                         )
                         source_pane_id = (
                             getattr(target_window_for_identity, "pane_id", None)
@@ -3590,11 +3674,17 @@ class CockpitRouter:
             state["right_pane_id"] = self._right_pane_id(window_target)
             self._write_state(state)
             return
-        # Use window index to avoid ambiguity with duplicate window names
+        # Use window index to avoid ambiguity with duplicate window names.
+        # #1631 — when duplicates exist (park-collisions can leave two
+        # ``pm-operator`` windows in the closet, one stale empty and one
+        # with the user's live Polly conversation), pick the one whose
+        # pane is actually running ``claude``/``codex``. The naive
+        # ``next(...)`` here used to grab whatever tmux returned first
+        # (lowest index), which silently mounted onto the empty
+        # placeholder and the user saw a fresh standing-by prompt.
         storage_windows = self.tmux.list_windows(storage_session)
-        target_window = next(
-            (w for w in storage_windows if w.name == launch.window_name),
-            None,
+        target_window = self._select_storage_window_for_mount(
+            storage_windows, launch.window_name, session_name,
         )
         if target_window is None:
             fallback_kind = "polly" if session_name == "operator" else "project"

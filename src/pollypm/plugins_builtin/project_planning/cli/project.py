@@ -672,6 +672,81 @@ def _count_active_tasks(project_key: str, config_path: Path) -> int:
         return 0
 
 
+def _sessions_for_project(config_path: Path, project_key: str) -> list[str]:
+    """Return all ``[sessions.*]`` names whose ``project`` matches ``project_key``.
+
+    Includes both enabled and disabled sessions — ``--purge-sessions``
+    sweeps the whole project namespace regardless, so a user who toggled
+    a session off without deleting it still gets a clean teardown.
+    """
+    config = load_config(config_path)
+    return [
+        session.name
+        for session in config.sessions.values()
+        if session.project == project_key
+    ]
+
+
+def _purge_project_sessions(
+    config_path: Path,
+    project_key: str,
+    *,
+    dry_run: bool = False,
+) -> list[tuple[str, bool, bool]]:
+    """Kill + delete every ``[sessions.*]`` entry tied to ``project_key``.
+
+    Returns a list of ``(session_name, tmux_was_live, killed_ok)`` tuples
+    in config order. Best-effort throughout — a missing tmux server,
+    already-dead session, or write failure on one session never aborts
+    the rest of the sweep. In ``dry_run`` mode no mutations are made;
+    the live/kill flags reflect what *would* happen.
+
+    Why kill at the tmux layer first: ``remove_project`` refuses while
+    enabled ``[sessions.*]`` entries reference the project (see
+    ``projects.py:remove_project``). Pulling the config entry without
+    killing tmux first would leave orphan worker processes attached to
+    a project that no longer exists in the config — exactly the
+    leaked-worker mode #1561's issue body calls out.
+    """
+    from pollypm.config import write_config
+    from pollypm.session_services import create_tmux_client
+
+    config = load_config(config_path)
+    matches = [
+        s for s in config.sessions.values() if s.project == project_key
+    ]
+    if not matches:
+        return []
+
+    tmux = create_tmux_client()
+    results: list[tuple[str, bool, bool]] = []
+    for session in matches:
+        try:
+            live = tmux.has_session(session.name)
+        except Exception:  # noqa: BLE001
+            live = False
+        killed = False
+        if not dry_run and live:
+            try:
+                killed = bool(tmux.kill_session(session.name))
+            except Exception:  # noqa: BLE001
+                killed = False
+        results.append((session.name, live, killed))
+
+    if dry_run:
+        return results
+
+    # Mutate the config: drop every session we just killed (or attempted
+    # to). We do this even when the tmux kill failed so a stuck/missing
+    # tmux server doesn't block the config cleanup — the user can always
+    # re-run ``pm reset`` to mop up tmux state, but they can't recover
+    # if the [sessions.*] entries stay and block ``remove_project``.
+    for session in matches:
+        config.sessions.pop(session.name, None)
+    write_config(config, config_path, force=True)
+    return results
+
+
 @project_app.command("remove")
 def remove_cmd(
     project_key: str = typer.Argument(
@@ -690,6 +765,23 @@ def remove_cmd(
         False, "--yes", "-y",
         help="Non-interactive: auto-accept the confirmation prompt.",
     ),
+    purge_sessions: bool = typer.Option(
+        False, "--purge-sessions",
+        help=(
+            "Kill every tmux session tied to this project and drop the "
+            "corresponding [sessions.*] entries before removal. Without "
+            "this flag, ``remove_project`` refuses when any session "
+            "references the project (see issue #1561)."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help=(
+            "Preview the teardown plan without mutating anything. "
+            "Lists the project, any [sessions.*] entries that would be "
+            "torn down, and whether each tmux session is currently live."
+        ),
+    ),
     config_path: Path = typer.Option(
         DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path.",
     ),
@@ -698,12 +790,18 @@ def remove_cmd(
 
     Mirrors ``pm project new`` (#1561). The underlying core function
     (:func:`pollypm.projects.remove_project`) only edits the TOML config —
-    work-service rows, tmux sessions, and worktree directories are NOT
-    touched. See issue #1561 for the full cascade-teardown plan; this
-    command is the narrow first step.
+    work-service rows and worktree directories are NOT touched. See
+    issue #1561 for the full cascade-teardown plan.
 
-    Refuses if the project is still referenced by enabled
-    ``[sessions.*]`` entries (the core function's invariant).
+    With ``--purge-sessions`` this command also kills every tmux session
+    tied to the project (architect/reviewer/worker/advisor/…) and drops
+    the matching ``[sessions.*]`` entries so ``remove_project`` no
+    longer refuses on session references. Without ``--purge-sessions``,
+    the core function's session-reference invariant still applies.
+
+    With ``--dry-run`` the command prints the teardown plan
+    (project + sessions that would be killed and removed) and exits
+    without mutating anything.
 
     If the project has queued or in-flight tasks in the work DB, prompts
     for confirmation. Pass ``--force`` to skip the prompt (e.g. for
@@ -717,7 +815,46 @@ def remove_cmd(
         typer.echo(f"Unknown project: {project_key}", err=True)
         raise typer.Exit(code=1)
 
+    project_entry = config.projects[project_key]
     active = _count_active_tasks(project_key, path)
+    session_names = _sessions_for_project(path, project_key)
+
+    # ------------------------------------------------------------------
+    # Dry-run: print the plan and exit 0 without mutating anything.
+    # ------------------------------------------------------------------
+    if dry_run:
+        typer.echo(f"Dry run: would remove project '{project_key}'.")
+        typer.echo(f"  path:    {project_entry.path}")
+        if active > 0:
+            task_word = "task" if active == 1 else "tasks"
+            typer.echo(
+                f"  active:  {active} queued/in-flight work-service "
+                f"{task_word} (would be left in place)"
+            )
+        if session_names:
+            preview = _purge_project_sessions(
+                path, project_key, dry_run=True,
+            )
+            if purge_sessions:
+                typer.echo("  sessions to purge:")
+            else:
+                typer.echo(
+                    "  sessions referencing project "
+                    "(use --purge-sessions to tear down):"
+                )
+            for name, live, _killed in preview:
+                state = "live" if live else "stale"
+                typer.echo(f"    - {name} ({state})")
+        else:
+            typer.echo("  sessions: (none)")
+        if session_names and not purge_sessions:
+            typer.echo(
+                "Note: remove_project will refuse while sessions are "
+                "enabled. Re-run with --purge-sessions to tear them down."
+            )
+        typer.echo("Re-run without --dry-run to apply.")
+        return
+
     if active > 0 and not force:
         task_word = "task" if active == 1 else "tasks"
         typer.echo(
@@ -735,6 +872,27 @@ def remove_cmd(
         if not proceed:
             typer.echo("Aborted. No changes made.")
             raise typer.Exit(code=1)
+
+    # Kill + drop project-scoped sessions BEFORE calling
+    # ``remove_project`` so its session-reference invariant doesn't
+    # refuse the removal. Best-effort — see ``_purge_project_sessions``.
+    purged: list[tuple[str, bool, bool]] = []
+    if purge_sessions and session_names:
+        purged = _purge_project_sessions(path, project_key)
+        for name, live, killed in purged:
+            if live and killed:
+                typer.echo(f"Killed tmux session {name} and dropped config entry.")
+            elif live and not killed:
+                typer.echo(
+                    f"Dropped [sessions.{name}] from config; tmux kill "
+                    "failed (session may still be running — run "
+                    "`tmux kill-session -t " + name + "` manually)."
+                )
+            else:
+                typer.echo(
+                    f"Dropped [sessions.{name}] from config "
+                    "(tmux session was not running)."
+                )
 
     try:
         removed = remove_project(path, project_key)

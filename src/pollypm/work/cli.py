@@ -1523,13 +1523,109 @@ def task_validate_advance(
 @task_app.command("context")
 def task_context(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
-    text: str = typer.Argument(..., help="Context message text"),
+    text: str | None = typer.Argument(
+        None,
+        help=(
+            "Context message text. When omitted, list existing context "
+            "entries instead of adding a new one."
+        ),
+    ),
     actor: str = typer.Option("worker", "--actor", help="Actor"),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        help="(list mode) Cap the number of entries returned.",
+    ),
+    entry_type: str | None = typer.Option(
+        None,
+        "--entry-type",
+        help=(
+            "(list mode) Filter by entry_type (e.g. note, reply, read, "
+            "sweeper_ping)."
+        ),
+    ),
+    show_internal: bool = typer.Option(
+        False,
+        "--show-internal",
+        help=(
+            "(list mode) Include infrastructure context entries "
+            "(sweeper pings, etc.) that are filtered by default."
+        ),
+    ),
     db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
-    """Add a context entry to a task."""
+    """Add or list context entries on a task.
+
+    When ``text`` is provided, the entry is appended (legacy behaviour).
+    When omitted, the command prints the task's context log so operators
+    and agents can inspect ``work_context_entries`` without dropping into
+    sqlite3.
+    """
     svc = _svc(db, project=_project_from_task_id(task_id))
+
+    if text is None:
+        # Inspection mode — list entries.
+        entries = _run(
+            svc.get_context, task_id, limit=limit, entry_type=entry_type,
+        )
+        # ``get_context`` returns DESC (most-recent first); reverse to
+        # render chronologically so readers can follow the conversation.
+        entries = list(reversed(entries))
+        visible = _filter_visible_context(
+            entries, show_internal=show_internal,
+        )
+        hidden_count = len(entries) - len(visible)
+
+        if output_json:
+            payload = {
+                "task_id": task_id,
+                "entries": [
+                    {
+                        "actor": e.actor,
+                        "text": e.text,
+                        "timestamp": str(e.timestamp),
+                        "entry_type": e.entry_type,
+                    }
+                    for e in visible
+                ],
+            }
+            if hidden_count:
+                payload["hidden_internal_context_count"] = hidden_count
+            typer.echo(json.dumps(payload, indent=2))
+            return
+
+        if not visible:
+            if hidden_count:
+                typer.echo(
+                    f"No visible context entries on {task_id} "
+                    f"({hidden_count} internal "
+                    f"{'entry' if hidden_count == 1 else 'entries'} "
+                    f"hidden — pass --show-internal to see)."
+                )
+            else:
+                typer.echo(f"No context entries on {task_id}.")
+            return
+
+        typer.echo(
+            f"{'Timestamp':<26} {'Actor':<14} {'Type':<14} Text"
+        )
+        typer.echo("-" * 80)
+        for e in visible:
+            typer.echo(
+                f"{str(e.timestamp):<26} {e.actor:<14} "
+                f"{e.entry_type:<14} {e.text}"
+            )
+        if hidden_count:
+            typer.echo(
+                f"  ({hidden_count} internal "
+                f"{'entry' if hidden_count == 1 else 'entries'} "
+                f"hidden — pass --show-internal to see)"
+            )
+        return
+
+    # Add mode (legacy positional API).
     entry = svc.add_context(task_id, actor, text)
     if output_json:
         typer.echo(json.dumps({
@@ -1539,6 +1635,69 @@ def task_context(
         }, indent=2))
     else:
         typer.echo(f"Added context to {task_id}")
+
+
+@task_app.command("transitions")
+def task_transitions(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    limit: int | None = typer.Option(
+        None,
+        "--limit",
+        min=1,
+        help="Cap the number of transitions returned (most recent first).",
+    ),
+    db: str = _DB_OPTION,
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """List work_status transitions for a task.
+
+    Replaces ``sqlite3 ... SELECT * FROM work_transitions WHERE ...`` so
+    Polly and autonomous agents can audit task lifecycle without falling
+    through to the raw DB.
+    """
+    svc = _svc(db, project=_project_from_task_id(task_id))
+    task = _run(svc.get, task_id)
+    transitions = list(task.transitions or [])
+
+    # Service hydrates transitions ASC (chronological). Default render is
+    # chronological too; ``--limit`` slices the most recent tail so a
+    # capped view still shows the latest activity.
+    if limit is not None and limit < len(transitions):
+        transitions = transitions[-limit:]
+
+    if output_json:
+        payload = {
+            "task_id": task_id,
+            "transitions": [
+                {
+                    "from_state": t.from_state,
+                    "to_state": t.to_state,
+                    "actor": t.actor,
+                    "timestamp": str(t.timestamp),
+                    "reason": t.reason,
+                }
+                for t in transitions
+            ],
+        }
+        typer.echo(json.dumps(payload, indent=2))
+        return
+
+    if not transitions:
+        typer.echo(f"No transitions recorded on {task_id}.")
+        return
+
+    typer.echo(
+        f"{'Timestamp':<26} {'From':<14} {'To':<14} "
+        f"{'Actor':<14} Reason"
+    )
+    typer.echo("-" * 90)
+    for t in transitions:
+        reason = t.reason or ""
+        from_state = t.from_state or "(none)"
+        typer.echo(
+            f"{str(t.timestamp):<26} {from_state:<14} "
+            f"{t.to_state:<14} {t.actor:<14} {reason}"
+        )
 
 
 @task_app.command("backfill-review-summaries")

@@ -17336,7 +17336,30 @@ class PollyProjectDashboardApp(App[None]):
             for item in data.action_items[:2]
             if _PROJECT_TASK_REF_RE.fullmatch(str(item.get("primary_ref") or ""))
         ]
-        if count == 0 and not data.action_items and not blocked_total and not on_hold_total:
+        # #1716 — when the top-of-page banner already says "Plan ready —
+        # your turn" (#1715), the plan-ready pill IS the unblock; the
+        # Inbox section directly underneath used to still render the
+        # "Blocked, but summary missing / Press c to ask the PM" nag for
+        # projects that also had a blocked task on disk. That contradicts
+        # the banner and tells Sam to do something the plan-ready handoff
+        # already answers. Treat plan-ready state as making ``blocked``
+        # an inert byproduct for the inbox copy: the user just needs to
+        # review/approve the plan via the banner CTA. Suppress the
+        # blocked-rooted Inbox copy and render the normal "Inbox is
+        # clear" placeholder when nothing else is pending.
+        plan_ready_active = (
+            (getattr(data, "status_label", "") == "plan ready")
+            or (
+                bool(getattr(data, "plan_path", None))
+                and not any(
+                    item.get("is_plan_review")
+                    for item in (data.action_items or [])
+                )
+            )
+        )
+        if count == 0 and not data.action_items and not on_hold_total and (
+            not blocked_total or plan_ready_active
+        ):
             return "[dim]Inbox is clear for this project.[/dim]"
         lines: list[str] = []
         if data.action_items:
@@ -17450,8 +17473,25 @@ class PollyProjectDashboardApp(App[None]):
             # behind #10 (review) and #13 (in_progress); the project
             # is moving, not halted. Don't claim "summary missing" for
             # what is actually healthy dep ordering.
+            # #1716 — likewise suppress when the plan-ready pill from
+            # #1715 is showing: the banner's "Plan ready — your turn"
+            # CTA already tells Sam the project's next step, and
+            # rendering the blocked-summary-missing nag directly under
+            # it reads as the panel contradicting itself.
+            plan_ready_active = (
+                (getattr(data, "status_label", "") == "plan ready")
+                or (
+                    bool(getattr(data, "plan_path", None))
+                    and not any(
+                        item.get("is_plan_review")
+                        for item in (getattr(data, "action_items", []) or [])
+                    )
+                )
+            )
             existing_blocker = _existing_blocker_context(data)
-            if (
+            if plan_ready_active:
+                pass
+            elif (
                 existing_blocker is None
                 and not _blocked_only_on_progressing_deps(data)
             ):

@@ -1300,6 +1300,24 @@ class PollyCockpitApp(App[None]):
         self._update_pill_dismissed = False
         self.spinner_index = 0
         self._ticker_started_at = time.monotonic()
+        # #1587 — Ticker SQLite read moved off the asyncio main thread.
+        # ``_cached_ticker_events`` is populated by the worker spawned
+        # in ``_update_ticker``; the paint path consumes the cache
+        # without touching SQLite.
+        self._cached_ticker_events: list = []
+        self._ticker_refresh_in_flight: bool = False
+        # Sentinel so the first ``_update_ticker`` call schedules an
+        # immediate cache refresh on the next event-loop turn.
+        self._last_ticker_refresh_tick: int = -10**9
+        # #1587 — Pill release-check moved off the main thread so the
+        # cache file read + version compare can never block keystrokes.
+        self._cached_release_check: Any = None
+        self._release_check_refresh_in_flight: bool = False
+        # Sentinel ``-∞`` so the first ``_update_pill_refresh`` always
+        # triggers a refresh — both in tests (which call this method
+        # once and assert visible state) and on the first cockpit
+        # tick after mount.
+        self._last_release_check_refresh_tick: int = -10**9
         self.selected_key = "dashboard"
         self._last_router_selected_key = "dashboard"
         self._items: list[CockpitItem] = []
@@ -2499,24 +2517,43 @@ class PollyCockpitApp(App[None]):
     }
 
     def _event_ticker_text(self) -> str:
-        # Gate on real tmux-client attachment (not just isatty). When the
-        # user detaches from tmux, animation should stop — see #656.
+        """Synchronous ticker-text builder, used by unit tests.
+
+        Production code goes through :meth:`_update_ticker`, which
+        refreshes the event cache on a worker thread first and then
+        calls :meth:`_event_ticker_text_from_cache`. This direct path
+        still performs the SQLite read inline and is retained as a
+        test seam — unit tests that drive the method directly bypass
+        the Textual scheduler and want a deterministic result.
+        """
         try:
             if not self.router._presence().is_tmux_attached():
                 return ""
         except Exception:  # noqa: BLE001
             pass  # fall through — render as if attached if gate fails
+        events = self._fetch_ticker_events_sync()
+        return self._compose_ticker_text(events)
+
+    def _event_ticker_text_from_cache(self) -> str:
+        """Like :meth:`_event_ticker_text` but uses the cached events.
+
+        Cheap — no SQLite. Used by :meth:`_update_ticker` on the
+        asyncio main thread; the cache is populated off-thread by
+        :meth:`_refresh_ticker_events_worker`. #1587.
+        """
         try:
-            supervisor = self.router._load_supervisor()
-            # Pull a wider window than we display so we still have signal
-            # after suppressing infra ticks.
-            raw_events = list(supervisor.store.recent_events(limit=48))
+            if not self.router._presence().is_tmux_attached():
+                return ""
         except Exception:  # noqa: BLE001
-            return ""
-        events = [
-            e for e in raw_events
-            if getattr(e, "event_type", "") not in self._TICKER_SUPPRESSED_EVENT_TYPES
-        ]
+            pass
+        return self._compose_ticker_text(self._cached_ticker_events)
+
+    def _compose_ticker_text(self, events: list) -> str:
+        """Compose the ticker line from a pre-fetched event list.
+
+        Pure UI-thread work — no SQLite, no subprocess. Receives the
+        events fetched off-thread by ``_refresh_ticker_events_worker``.
+        """
         if not events:
             return ""
         # #667 acceptance: show the 3 newest events, cycle the window so
@@ -2540,10 +2577,73 @@ class PollyCockpitApp(App[None]):
 
         return _format_event_ticker(labels)
 
+    # #1587 — Keep the SQLite read off the asyncio main thread.
+    # ``_update_ticker`` now repaints from the cached event list every
+    # tick (cheap, pure-Python), and a worker thread refreshes the
+    # cache every ``_TICKER_EVENT_REFRESH_TICKS`` ticks. Before this
+    # split, ``supervisor.store.recent_events(limit=48)`` ran inside
+    # ``_tick`` on the main thread every 0.8s; under SQLite write
+    # contention the SELECT blocked the event loop for seconds at a
+    # time, dropping rail keystrokes (#1587).
+    _TICKER_EVENT_REFRESH_TICKS = 3  # ~2.4s at 0.8s/tick
+
     def _update_ticker(self) -> None:
-        ticker_text = self._event_ticker_text()
+        # Refresh cached events off-thread on a slower cadence than
+        # the spinner tick. The paint itself runs every tick so the
+        # 10s cycle offset remains smooth.
+        if (
+            not self._ticker_refresh_in_flight
+            and (self._tick_count - self._last_ticker_refresh_tick)
+            >= self._TICKER_EVENT_REFRESH_TICKS
+        ):
+            self._last_ticker_refresh_tick = self._tick_count
+            try:
+                self._ticker_refresh_in_flight = True
+                self.run_worker(
+                    self._refresh_ticker_events_worker,
+                    thread=True,
+                    exclusive=True,
+                    group="rail_ticker_refresh",
+                )
+            except Exception:  # noqa: BLE001
+                # No event loop (unit tests) — populate inline so
+                # legacy tests that drive ``_update_ticker`` directly
+                # still see the SQLite-backed event list.
+                self._ticker_refresh_in_flight = False
+                try:
+                    self._cached_ticker_events = self._fetch_ticker_events_sync()
+                except Exception:  # noqa: BLE001
+                    self._cached_ticker_events = []
+        ticker_text = self._event_ticker_text_from_cache()
         self.ticker.update(ticker_text)
         self.ticker.display = bool(ticker_text)
+
+    def _fetch_ticker_events_sync(self) -> list:
+        """Synchronous SQLite read — only safe off the main thread."""
+        try:
+            supervisor = self.router._load_supervisor()
+            raw_events = list(supervisor.store.recent_events(limit=48))
+        except Exception:  # noqa: BLE001
+            return []
+        return [
+            e for e in raw_events
+            if getattr(e, "event_type", "") not in self._TICKER_SUPPRESSED_EVENT_TYPES
+        ]
+
+    def _refresh_ticker_events_worker(self) -> None:
+        """Worker-thread entry: pull events, hand back to the UI thread."""
+        try:
+            events = self._fetch_ticker_events_sync()
+        except Exception:  # noqa: BLE001
+            events = []
+        try:
+            self.call_from_thread(self._apply_ticker_events, events)
+        except Exception:  # noqa: BLE001
+            self._apply_ticker_events(events)
+
+    def _apply_ticker_events(self, events: list) -> None:
+        self._cached_ticker_events = events
+        self._ticker_refresh_in_flight = False
 
     def _update_transient_notice(self) -> bool:
         try:
@@ -2566,6 +2666,11 @@ class PollyCockpitApp(App[None]):
         self.update_pill.display = True
         return True
 
+    # #1587 — Release-check file I/O moved off the main thread. The
+    # cache file is read at most every ``_RELEASE_CHECK_REFRESH_TICKS``
+    # ticks; the paint path is pure dict/attr access on a cached object.
+    _RELEASE_CHECK_REFRESH_TICKS = 13  # ~10s at 0.8s/tick
+
     def _update_pill_refresh(self) -> None:
         """Refresh the update-available pill in the rail top area.
 
@@ -2574,18 +2679,79 @@ class PollyCockpitApp(App[None]):
         active channel. Hidden otherwise — including when dismissed for
         this session, when the check is cached as "up-to-date", and
         when the check is offline or raised.
+
+        #1587 — ``check_latest`` reads (and occasionally writes) a JSON
+        cache file under ``~/.pollypm``; during cache misses it issues
+        a network request. None of those should run on the asyncio
+        main thread, so the actual fetch happens in a worker and this
+        method just repaints from the cached result.
         """
         if self._update_pill_dismissed:
             self.update_pill.display = False
             return
+        # Kick off a background refresh on a slow cadence. The check
+        # is cached for ~24h so most calls are a dict lookup, but the
+        # file read + parse still costs ~ms and we don't want it
+        # accumulating with SQLite contention elsewhere.
+        if (
+            not self._release_check_refresh_in_flight
+            and (self._tick_count - self._last_release_check_refresh_tick)
+            >= self._RELEASE_CHECK_REFRESH_TICKS
+        ):
+            self._last_release_check_refresh_tick = self._tick_count
+            if self._has_running_event_loop():
+                try:
+                    self._release_check_refresh_in_flight = True
+                    self.run_worker(
+                        self._refresh_release_check_worker,
+                        thread=True,
+                        exclusive=True,
+                        group="rail_release_check",
+                    )
+                except Exception:  # noqa: BLE001
+                    # Textual rejected the worker (mocked driver, etc.)
+                    # — fall back to inline so the pill still paints.
+                    self._release_check_refresh_in_flight = False
+                    self._cached_release_check = self._fetch_release_check_sync()
+            else:
+                # No event loop (tests calling this method directly).
+                # Run inline so the existing unit-test contract holds.
+                self._cached_release_check = self._fetch_release_check_sync()
+        self._paint_release_check_pill(self._cached_release_check)
+
+    @staticmethod
+    def _has_running_event_loop() -> bool:
+        try:
+            asyncio.get_running_loop()
+            return True
+        except RuntimeError:
+            return False
+
+    def _fetch_release_check_sync(self) -> Any:
         try:
             from pollypm.release_check import _resolve_channel, check_latest
             channel = _resolve_channel(None)
-            check = check_latest(channel)
+            return check_latest(channel)
         except Exception:  # noqa: BLE001
+            return None
+
+    def _refresh_release_check_worker(self) -> None:
+        check = self._fetch_release_check_sync()
+        try:
+            self.call_from_thread(self._apply_release_check, check)
+        except Exception:  # noqa: BLE001
+            self._apply_release_check(check)
+
+    def _apply_release_check(self, check: Any) -> None:
+        self._cached_release_check = check
+        self._release_check_refresh_in_flight = False
+        self._paint_release_check_pill(check)
+
+    def _paint_release_check_pill(self, check: Any) -> None:
+        if self._update_pill_dismissed:
             self.update_pill.display = False
             return
-        if check is None or not check.upgrade_available:
+        if check is None or not getattr(check, "upgrade_available", False):
             self.update_pill.display = False
             return
         channel_label = (

@@ -31,12 +31,15 @@ app, CLI, tests).
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Iterable, Protocol
 
 from pollypm.inbox import awaits_user
 from pollypm.inbox.kind import InboxItemKind, coerce_kind
+
+logger = logging.getLogger(__name__)
 
 
 class ProjectState(Enum):
@@ -193,6 +196,14 @@ def categorize_project(
     try:
         tasks = work_service.list_tasks(project=project_key)
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failed list_tasks here drops the
+        # project into IDLE — log so a broken work-service stops
+        # masquerading as "quiet".
+        logger.warning(
+            "categorize_project: list_tasks failed for %s",
+            project_key,
+            exc_info=True,
+        )
         tasks = []
 
     # #1542 — an ``on_hold`` task makes the project ◆ "needs attention"
@@ -211,6 +222,14 @@ def categorize_project(
             project=project_key, active_only=True,
         )
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failed worker query here means the
+        # project is mis-categorized as IDLE while workers are running —
+        # log so the live-worker probe doesn't silently break.
+        logger.warning(
+            "categorize_project: list_worker_sessions failed for %s",
+            project_key,
+            exc_info=True,
+        )
         live_workers = []
     if live_workers:
         return ProjectState.WORKING
@@ -345,6 +364,14 @@ def what_working(
             project=project_key, active_only=True,
         ))
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failed worker query here drops the
+        # dashboard line to "Active" without a name — log so the
+        # what_working probe doesn't silently degrade.
+        logger.warning(
+            "what_working: list_worker_sessions failed for %s",
+            project_key,
+            exc_info=True,
+        )
         workers = []
 
     if workers:
@@ -358,6 +385,15 @@ def what_working(
                 task = work_service.get(f"{project_key}/{task_number}")
                 title = _task_title(task)
             except Exception:  # noqa: BLE001
+                # #1355: previously silent. A failed task fetch here just
+                # drops the title from the dashboard line — log so a
+                # broken get() doesn't silently strip context.
+                logger.warning(
+                    "what_working: get(%s/%s) failed",
+                    project_key,
+                    task_number,
+                    exc_info=True,
+                )
                 title = ""
         if title:
             return _truncate(f"{agent}: {title}")
@@ -366,6 +402,14 @@ def what_working(
     try:
         tasks = list(work_service.list_tasks(project=project_key))
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. The no-worker branch falls through to
+        # "Active" when list_tasks fails — log so the working-task
+        # fallback doesn't silently lose status detail.
+        logger.warning(
+            "what_working: list_tasks failed for %s",
+            project_key,
+            exc_info=True,
+        )
         tasks = []
     for task in tasks:
         status = _task_status(task)
@@ -424,6 +468,14 @@ def _project_last_activity(
     try:
         tasks = list(work_service.list_tasks(project=project_key))
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failed list_tasks here means the
+        # Idle row shows no last-activity timestamp — log so the empty
+        # cell isn't masking a broken query.
+        logger.warning(
+            "last_activity: list_tasks failed for %s",
+            project_key,
+            exc_info=True,
+        )
         tasks = []
     best = ""
     for task in tasks:

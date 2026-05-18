@@ -4217,6 +4217,289 @@ def test_cockpit_router_parks_mounted_task_worker(monkeypatch, tmp_path: Path) -
     assert calls["released"] == ("task-demo-7", "cockpit")
 
 
+def test_cockpit_router_park_skips_when_live_duplicate_exists(monkeypatch, tmp_path: Path) -> None:
+    """#1635 — ``_park_mounted_session`` must NOT call ``tmux break-pane``
+    when the storage closet already holds a live window of the same
+    name. Prior behavior unconditionally broke the cockpit's right
+    pane into storage as a fresh ``pm-operator`` window, leaving two
+    same-named windows in storage; #1632's mount selector then often
+    picked the wrong one and the user saw a fresh Polly re-asking the
+    same onboarding questions.
+
+    Regression contract:
+      * ``break_pane`` is never called when a live duplicate exists.
+      * ``rename_window`` is never called.
+      * mounted-session state and cockpit lease are still released.
+      * A ``cockpit.park_skipped_existing`` audit event fires with the
+        live-duplicate indices captured in metadata.
+      * Calling ``_park_mounted_session`` a second time is still a
+        no-op — only one ``pm-operator`` window remains in storage
+        (park → park again → still one window).
+    """
+    calls: dict[str, object] = {}
+    audit_events: list[dict[str, object]] = []
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeSupervisor:
+        def plan_launches(self):
+            return []
+
+        def storage_closet_session_name(self) -> str:
+            return "pollypm-storage-closet"
+
+        def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
+            calls.setdefault("released", []).append((session_name, expected_owner))
+
+    class FakeWindow:
+        def __init__(
+            self,
+            index: int,
+            name: str,
+            command: str = "",
+            pane_dead: bool = False,
+        ) -> None:
+            self.index = index
+            self.name = name
+            self.pane_current_command = command
+            self.pane_dead = pane_dead
+
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+            self.pane_dead = False
+
+    storage_state = {
+        "windows": [
+            # The persistent home — a live Polly conversation already
+            # parked in the closet from a prior session.
+            FakeWindow(1, "pm-operator", command="claude"),
+        ],
+    }
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", 0, "uv"),
+                FakePane("%2", 30, "node"),
+            ]
+
+        def list_windows(self, target: str):
+            assert target == "pollypm-storage-closet"
+            return list(storage_state["windows"])
+
+        def break_pane(self, source: str, target_session: str, window_name: str) -> None:
+            # Mirror real tmux: append a new window with the requested name.
+            calls.setdefault("break", []).append((source, target_session, window_name))
+            next_index = max(
+                (w.index for w in storage_state["windows"]),
+                default=0,
+            ) + 1
+            storage_state["windows"].append(
+                FakeWindow(next_index, window_name, command="claude")
+            )
+
+        def rename_window(self, target: str, name: str) -> None:
+            calls.setdefault("renamed", []).append((target, name))
+
+        def kill_window(self, target: str) -> None:
+            calls.setdefault("killed", []).append(target)
+            # Drop matching window by "session:index" suffix.
+            suffix = target.split(":", 1)[1]
+            try:
+                idx = int(suffix)
+            except ValueError:
+                return
+            storage_state["windows"] = [
+                w for w in storage_state["windows"] if w.index != idx
+            ]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    monkeypatch.setattr(
+        router,
+        "_mounted_window_name",
+        lambda supervisor, session_name: "pm-operator",
+    )
+    monkeypatch.setattr(
+        router,
+        "_emit_cockpit_audit",
+        lambda *, event_name, subject, status, metadata: audit_events.append(
+            {
+                "event_name": event_name,
+                "subject": subject,
+                "status": status,
+                "metadata": metadata,
+            }
+        ),
+    )
+    router._write_state({"mounted_session": "operator-pm", "right_pane_id": "%2"})
+
+    # First park: storage already has a LIVE pm-operator window. The
+    # park must be a no-op (no break-pane, no rename) to prevent the
+    # upstream duplicate creation.
+    router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
+
+    assert "break" not in calls, "break-pane must not run when a live duplicate exists"
+    assert "renamed" not in calls
+    assert calls["released"] == [("operator-pm", "cockpit")]
+    assert len(storage_state["windows"]) == 1
+    assert storage_state["windows"][0].name == "pm-operator"
+
+    skip_events = [e for e in audit_events if e["event_name"] == "cockpit.park_skipped_existing"]
+    assert len(skip_events) == 1
+    skip = skip_events[0]
+    assert skip["subject"] == "operator-pm"
+    assert skip["status"] == "warn"
+    assert skip["metadata"]["live_duplicate_indices"] == [1]
+    assert skip["metadata"]["window_name"] == "pm-operator"
+    assert skip["metadata"]["storage_session"] == "pollypm-storage-closet"
+
+    # State is cleared so the next mount won't think we still own the
+    # cockpit right pane.
+    state = router._load_state()
+    assert "mounted_session" not in state
+    assert "mounted_identity" not in state
+
+    # Park again — same conditions, still a no-op, still ONE window.
+    router._write_state({"mounted_session": "operator-pm", "right_pane_id": "%2"})
+    router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
+
+    assert "break" not in calls
+    assert len(storage_state["windows"]) == 1, (
+        "park → park again must leave exactly one pm-operator window — "
+        "regression for #1635 duplicate-window creation"
+    )
+
+
+def test_cockpit_router_park_reoccupies_dead_storage_window(monkeypatch, tmp_path: Path) -> None:
+    """#1635 — when the storage closet has a stale (pane-dead) window
+    of the same name, ``_park_mounted_session`` kills the dead window
+    BEFORE calling ``tmux break-pane`` so the freshly-parked pane
+    re-occupies the canonical name instead of landing as a second,
+    duplicate-named window.
+    """
+    calls: dict[str, object] = {}
+    audit_events: list[dict[str, object]] = []
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeSupervisor:
+        def plan_launches(self):
+            return []
+
+        def storage_closet_session_name(self) -> str:
+            return "pollypm-storage-closet"
+
+        def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
+            calls["released"] = (session_name, expected_owner)
+
+    class FakeWindow:
+        def __init__(
+            self,
+            index: int,
+            name: str,
+            command: str = "",
+            pane_dead: bool = False,
+        ) -> None:
+            self.index = index
+            self.name = name
+            self.pane_current_command = command
+            self.pane_dead = pane_dead
+
+    class FakePane:
+        def __init__(self, pane_id: str, pane_left: int, command: str) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+            self.pane_dead = False
+
+    storage_state = {
+        "windows": [
+            FakeWindow(1, "pm-operator", command="zsh", pane_dead=True),
+        ],
+    }
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            return [
+                FakePane("%1", 0, "uv"),
+                FakePane("%2", 30, "node"),
+            ]
+
+        def list_windows(self, target: str):
+            return list(storage_state["windows"])
+
+        def break_pane(self, source: str, target_session: str, window_name: str) -> None:
+            calls["break"] = (source, target_session, window_name)
+            next_index = max(
+                (w.index for w in storage_state["windows"]),
+                default=0,
+            ) + 1
+            storage_state["windows"].append(
+                FakeWindow(next_index, window_name, command="claude")
+            )
+
+        def rename_window(self, target: str, name: str) -> None:
+            calls.setdefault("renamed", []).append((target, name))
+
+        def kill_window(self, target: str) -> None:
+            calls.setdefault("killed", []).append(target)
+            suffix = target.split(":", 1)[1]
+            try:
+                idx = int(suffix)
+            except ValueError:
+                return
+            storage_state["windows"] = [
+                w for w in storage_state["windows"] if w.index != idx
+            ]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(router, "_load_supervisor", lambda fresh=False: FakeSupervisor())
+    monkeypatch.setattr(
+        router,
+        "_mounted_window_name",
+        lambda supervisor, session_name: "pm-operator",
+    )
+    monkeypatch.setattr(
+        router,
+        "_emit_cockpit_audit",
+        lambda *, event_name, subject, status, metadata: audit_events.append(
+            {
+                "event_name": event_name,
+                "subject": subject,
+                "status": status,
+                "metadata": metadata,
+            }
+        ),
+    )
+    router._write_state({"mounted_session": "operator-pm", "right_pane_id": "%2"})
+
+    router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
+
+    # The dead storage window must be killed first.
+    assert calls["killed"] == ["pollypm-storage-closet:1"]
+    # Then break-pane proceeds with the canonical name.
+    assert calls["break"] == ("%2", "pollypm-storage-closet", "pm-operator")
+    # And only one pm-operator window remains.
+    names = [w.name for w in storage_state["windows"]]
+    assert names.count("pm-operator") == 1
+
+    park_events = [e for e in audit_events if e["event_name"] == "cockpit.session_parked"]
+    assert len(park_events) == 1
+    assert park_events[0]["metadata"]["reoccupied_dead_indices"] == [1]
+    # No skip event fires when there are no live duplicates.
+    assert not any(e["event_name"] == "cockpit.park_skipped_existing" for e in audit_events)
+
+
 def test_cockpit_router_validation_releases_stale_cockpit_lease(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
     config_path = tmp_path / "pollypm.toml"

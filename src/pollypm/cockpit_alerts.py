@@ -19,7 +19,6 @@ import enum
 from textual.app import App
 
 from pollypm.cli_features.alerts import is_surfaceable_operational_alert
-from pollypm.cockpit_palette import _palette_nav
 
 
 # #765 — Operational alert types never become toasts. They're heartbeat
@@ -166,7 +165,19 @@ def alert_should_toast(alert_type: str) -> bool:
 
 
 def _resolve_palette_nav():
-    """Preserve the legacy ``pollypm.cockpit_ui`` monkeypatch seam."""
+    """Preserve the legacy ``pollypm.cockpit_ui`` monkeypatch seam.
+
+    ``_palette_nav`` is imported lazily here (rather than at module load)
+    to keep this module a leaf of the cockpit import graph — the
+    previous top-level import closed the
+    ``cockpit_palette -> cockpit -> ... -> signal_routing ->
+    cockpit_alerts -> cockpit_palette`` cycle tracked by #1367.
+    """
+    # Local import: this function is only ever called at runtime
+    # (from ``_action_view_alerts``), so deferring the import has no
+    # cost while severing the static cycle.
+    from pollypm.cockpit_palette import _palette_nav
+
     try:
         from pollypm import cockpit_ui
     except Exception:  # noqa: BLE001

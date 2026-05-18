@@ -3663,6 +3663,34 @@ class CockpitRouter:
                 ):
                     return  # tmux confirms the persisted identity
                 # Mismatch — fall through to tear-down + remount fresh.
+                # #1647 — emit forensics so future rail-latency triage
+                # can see *which* predicate failed (pane gone vs. dead
+                # shell vs. storage-window reindex) instead of guessing
+                # from a stopwatch.
+                try:
+                    self._emit_cockpit_audit(
+                        event_name="cockpit.mount_verify_failed",
+                        subject=session_name,
+                        status="info",
+                        metadata={
+                            "session_name": session_name,
+                            "rail_key": persisted.rail_key,
+                            "expected_window_name": (
+                                persisted.expected_window_name
+                            ),
+                            "recorded_right_pane_id": persisted.right_pane_id,
+                            "recorded_window_index": persisted.window_index,
+                            "cockpit_pane_ids": [
+                                getattr(p, "pane_id", None) for p in panes
+                            ],
+                            "storage_window_names": [
+                                getattr(w, "name", None)
+                                for w in storage_windows
+                            ],
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         self._park_mounted_session(supervisor, window_target)
         self._cleanup_extra_panes(window_target)
         left_pane_id = self._left_pane_id(window_target)

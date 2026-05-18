@@ -6,9 +6,9 @@ The Web API never reaches into ``state.db`` or ``audit.jsonl`` directly
 from those internal types to the Pydantic shapes declared in
 :mod:`pollypm.web_api.models`.
 
-Phase 1 is read-only, so every function here is pure data shaping;
-write paths land in Phase 2 (#1548) and stay in
-``pollypm.web_api.routes``.
+Phase 1 was read-only; Phase 2 (#1548) layers in write helpers
+(``queue_task`` is the first wedge) that go through the same factory
+so there is exactly one writer surface.
 """
 
 from __future__ import annotations
@@ -27,7 +27,11 @@ import sqlite3
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
-from pollypm.web_api.errors import service_unavailable
+from pollypm.web_api.errors import (
+    APIError,
+    not_found,
+    service_unavailable,
+)
 from pollypm.web_api.models import (
     ContextEntry as APIContextEntry,
     Event as APIEvent,
@@ -422,6 +426,113 @@ def get_task_detail(
         )
         raise service_unavailable(
             f"Backing store unavailable for task {project_key}/{task_number}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
+# Write helpers (Phase 2)
+#
+# Each helper opens a fresh work-service via :func:`create_work_service`
+# — the same canonical writer the cockpit uses (#1389). The Web API is
+# never a second writer surface; it's a thin adapter that translates
+# work-service exceptions into the API's typed error envelope (§6).
+# ---------------------------------------------------------------------------
+
+
+def queue_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str = "api",
+) -> APITaskDetail:
+    """Transition a draft task to ``queued`` via the work-service.
+
+    Mirrors ``pm work queue`` (`pollypm.work.cli.queue_cmd`) so the
+    cockpit and the API share the same state machine. Returns the
+    updated :class:`TaskDetail` so the client can refresh its UI
+    without a follow-up ``GET``.
+
+    Errors map onto the spec §6 codes:
+
+    * Project not registered → ``not_found`` (404)
+    * Task not found in DB → ``not_found`` (404)
+    * Task not in ``draft`` (or transition rejected by the state
+      machine for any other reason) → ``conflict`` (409,
+      ``invalid_state``)
+    * Backing-store unavailable → ``service_unavailable`` (503)
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                svc.queue(task_id, actor)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                # Issue #1548 tests call for "Queue a non-draft task →
+                # 409 conflict with invalid_state": HTTP 409 (the verb
+                # cockpit users associate with "the state changed
+                # underneath you") plus the stable ``invalid_state``
+                # code from spec §6 so clients can route on it. The
+                # state machine's message is the most informative
+                # thing to surface; clients can show it verbatim.
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=(
+                        str(exc)
+                        or f"Task {task_id} cannot be queued from its current state."
+                    ),
+                    hint="Only draft tasks can be queued; refresh the task to see the current work_status.",
+                ) from exc
+            except WorkValidationError as exc:
+                # Gate failures (e.g. ``has_description``) raise
+                # ``ValidationError`` from the work service. Spec §6
+                # maps that to 422 ``validation_error`` — the body
+                # shape was fine, but the underlying task's data
+                # failed validation. We surface the gate's reason
+                # verbatim so clients can show it (cockpit does the
+                # same with ``--skip-gates``-style overrides).
+                raise APIError(
+                    status_code=422,
+                    code="validation_error",
+                    message=str(exc) or f"Task {task_id} failed pre-queue gates.",
+                    hint="Fix the failing gate (e.g. add a description) before queueing.",
+                ) from exc
+            # Re-read so the response carries the post-transition
+            # snapshot the client would see on a follow-up GET.
+            task = svc.get(task_id)
+            plan: APIPlan | None = None
+            if _is_plan_task(task) and _is_in_review(task):
+                try:
+                    plan = _build_plan(svc, task)
+                except Exception:  # noqa: BLE001
+                    plan = None
+            return _task_to_detail(task, plan=plan)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "queue_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while queueing {task_id}",
             hint="Retry shortly; check `pm doctor` if the failure persists.",
         ) from exc
 

@@ -662,11 +662,24 @@ def _count_active_tasks(project_key: str, config_path: Path) -> int:
     ``--force`` to bypass the prompt either way, and refusing to remove
     a TOML entry because we can't *read* the state DB would be worse
     than letting the user proceed.
+
+    The ``config_path`` is plumbed through to ``create_work_service`` so
+    the active-task lookup honors ``pm project remove --config <path>``
+    (#1645). Without it, an alternate config would silently fall through
+    to the default-resolver workspace DB, hiding or fabricating active
+    work relative to the config being edited.
     """
     try:
         from pollypm.work import create_work_service
 
-        with create_work_service(project_key=project_key) as svc:
+        try:
+            config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            config = None
+
+        with create_work_service(
+            project_key=project_key, config=config
+        ) as svc:
             return len(svc.list_nonterminal_tasks(project=project_key))
     except Exception:  # noqa: BLE001
         return 0
@@ -685,6 +698,208 @@ def _sessions_for_project(config_path: Path, project_key: str) -> list[str]:
         for session in config.sessions.values()
         if session.project == project_key
     ]
+
+
+# ---------------------------------------------------------------------------
+# State-DB row teardown (#1561 wedge #3)
+# ---------------------------------------------------------------------------
+#
+# Tables that carry project-scoped rows. Listed in delete order so any
+# child-row foreign-key chains (work_tasks references in dependencies /
+# executions / context / transitions / sessions / sync) are pruned BEFORE
+# the parent ``work_tasks`` rows themselves. SQLite enforces FKs only
+# when ``PRAGMA foreign_keys=ON`` is set on the connection — the work
+# service opens connections without it, but we still respect the order
+# so a future enable doesn't bite us.
+#
+# Each entry: (table, where_clause, params_factory). ``params_factory``
+# is called with ``project_key`` and returns the SQL parameter tuple. We
+# keep this as data so the count + delete passes traverse the same list.
+_STATE_PURGE_TABLES: tuple[tuple[str, str, str], ...] = (
+    # Work-service children of work_tasks (FK to work_tasks(project,
+    # task_number)) — these MUST go first or a future FK-enabled
+    # connection would refuse the parent delete.
+    ("work_task_dependencies",
+     "from_project = ? OR to_project = ?", "pair"),
+    ("work_node_executions", "task_project = ?", "single"),
+    ("work_context_entries", "task_project = ?", "single"),
+    ("work_transitions", "task_project = ?", "single"),
+    ("work_sessions", "task_project = ?", "single"),
+    ("work_sync_state", "task_project = ?", "single"),
+    # Parent work_tasks row. The delete trigger fires
+    # ``work_task_delete_audit_outbox`` rows; we drop those next so the
+    # outbox doesn't dangle once the project is gone.
+    ("work_tasks", "project = ?", "single"),
+    ("work_task_delete_audit_outbox", "project = ?", "single"),
+    # Other work-service / notification rows keyed off project.
+    ("notification_staging", "project = ?", "single"),
+    # state.db core tables that scope by project key.
+    ("messages", "scope = ?", "single"),
+    ("worktrees", "project_key = ?", "single"),
+    ("architect_resume_tokens", "project_key = ?", "single"),
+    ("token_samples", "project_key = ?", "single"),
+    ("token_usage_hourly", "project_key = ?", "single"),
+)
+
+
+def _workspace_db_path(config_path: Path) -> Path | None:
+    """Return the workspace ``state.db`` path for ``config_path``, or None.
+
+    Mirrors the resolver in :mod:`pollypm.work.db_resolver` but keeps the
+    teardown self-contained — we want the CLI to find the DB by config,
+    not by ambient cwd. Returns ``None`` when the config has no
+    ``workspace_root`` (which means there's no canonical state DB to
+    sweep — pre-#339 isolated layouts that never matter for ``pm project
+    remove``).
+    """
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return None
+    workspace_root = getattr(config.project, "workspace_root", None)
+    if workspace_root is None:
+        return None
+    return Path(workspace_root) / ".pollypm" / "state.db"
+
+
+def _count_project_state_rows(
+    config_path: Path, project_key: str
+) -> dict[str, int]:
+    """Return per-table row counts for ``project_key`` in the workspace DB.
+
+    Best-effort: a missing DB, missing table, or read failure yields
+    zero for that table. Used both by the dry-run preview and the
+    post-purge "removed N rows" summary so the two views agree on
+    scope.
+
+    Keys: every table in :data:`_STATE_PURGE_TABLES` plus
+    ``audit_tail`` for the ``~/.pollypm/audit/<key>.jsonl`` file (1
+    when present, 0 when absent — file teardown is not a row count
+    but mirrors the same idea).
+    """
+    import sqlite3 as _sqlite3
+
+    counts: dict[str, int] = {table: 0 for table, _w, _p in _STATE_PURGE_TABLES}
+    counts["audit_tail"] = 0
+
+    db_path = _workspace_db_path(config_path)
+    if db_path and db_path.exists():
+        try:
+            conn = _sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+            try:
+                for table, where, ptype in _STATE_PURGE_TABLES:
+                    params = (
+                        (project_key, project_key) if ptype == "pair"
+                        else (project_key,)
+                    )
+                    try:
+                        cur = conn.execute(
+                            f"SELECT COUNT(*) FROM {table} WHERE {where}",
+                            params,
+                        )
+                        row = cur.fetchone()
+                        counts[table] = int(row[0]) if row else 0
+                    except _sqlite3.Error:
+                        # Table doesn't exist yet (fresh DB, pre-migration,
+                        # or schema drift). Counts as zero — there's
+                        # nothing to delete.
+                        counts[table] = 0
+            finally:
+                conn.close()
+        except _sqlite3.Error:
+            pass
+
+    try:
+        from pollypm.audit.log import central_log_path
+
+        if central_log_path(project_key).exists():
+            counts["audit_tail"] = 1
+    except Exception:  # noqa: BLE001
+        pass
+
+    return counts
+
+
+def _purge_project_state(
+    config_path: Path,
+    project_key: str,
+    *,
+    dry_run: bool = False,
+) -> dict[str, int]:
+    """Delete every project-scoped row from the workspace state DB.
+
+    Returns a ``{table: removed_count}`` dict (plus ``audit_tail`` for
+    the central-tail JSONL file). In ``dry_run`` mode no mutations
+    happen; the returned counts reflect what WOULD be deleted (the
+    same numbers :func:`_count_project_state_rows` returns).
+
+    Best-effort throughout: a missing DB, missing table, or write
+    failure on one table never aborts the rest of the sweep. The
+    deletes run in a single transaction so a mid-sweep crash leaves
+    state.db in a consistent state.
+
+    Why a single bulk SQL sweep instead of routing through
+    ``work_service.delete_task``: per-task deletes would fire
+    cascade-aware audit emits + sync hooks for every row, which is
+    exactly the noise the user is trying to clear. Bulk DELETE
+    silences the side-channels and matches the operator's mental
+    model ("tear it all down, fast").
+    """
+    import sqlite3 as _sqlite3
+
+    counts = _count_project_state_rows(config_path, project_key)
+    if dry_run:
+        return counts
+
+    db_path = _workspace_db_path(config_path)
+    if db_path and db_path.exists():
+        try:
+            conn = _sqlite3.connect(db_path)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                for table, where, ptype in _STATE_PURGE_TABLES:
+                    params = (
+                        (project_key, project_key) if ptype == "pair"
+                        else (project_key,)
+                    )
+                    try:
+                        conn.execute(
+                            f"DELETE FROM {table} WHERE {where}", params
+                        )
+                    except _sqlite3.Error:
+                        # Missing table — skip silently. We already
+                        # counted 0 for it above so the summary line
+                        # stays accurate.
+                        pass
+                conn.commit()
+            finally:
+                conn.close()
+        except _sqlite3.Error:
+            # Pathological case (locked DB, corrupted file). Counts
+            # remain as the pre-sweep estimate so the caller can warn
+            # the user; we don't fabricate success.
+            pass
+
+    # Audit tail file — central-tail JSONL at
+    # ~/.pollypm/audit/<project>.jsonl. The per-project log inside
+    # ``<project_path>/.pollypm/audit.jsonl`` lives in the project
+    # directory, which ``pm project remove`` deliberately leaves on
+    # disk (worktree teardown is a separate wedge, see #1561).
+    try:
+        from pollypm.audit.log import central_log_path
+
+        tail_path = central_log_path(project_key)
+        if tail_path.exists():
+            try:
+                tail_path.unlink()
+            except OSError:
+                # Best-effort. Leave the count as 1 so the summary
+                # reports "would have removed" but we couldn't.
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+    return counts
 
 
 def _purge_project_sessions(
@@ -774,6 +989,17 @@ def remove_cmd(
             "references the project (see issue #1561)."
         ),
     ),
+    purge_state: bool = typer.Option(
+        False, "--purge-state",
+        help=(
+            "Delete every state.db row tied to this project (work_tasks, "
+            "messages, audit outbox, notification staging, worktrees, "
+            "token samples, …) AND the central audit-tail JSONL. "
+            "Pairs with --purge-sessions for a full row-level teardown. "
+            "Prompts for confirmation before destructive action unless "
+            "--yes / --force is supplied. See issue #1561."
+        ),
+    ),
     dry_run: bool = typer.Option(
         False, "--dry-run",
         help=(
@@ -799,9 +1025,18 @@ def remove_cmd(
     longer refuses on session references. Without ``--purge-sessions``,
     the core function's session-reference invariant still applies.
 
+    With ``--purge-state`` this command also wipes every state.db row
+    tied to the project (work_tasks + dependencies/executions/context/
+    transitions/sessions/sync, messages, notification staging,
+    worktrees, architect resume tokens, token usage) and the central
+    audit-tail JSONL at ``~/.pollypm/audit/<project>.jsonl``. This is
+    the row-level cascade #1561 calls for once sessions are torn down.
+    Prompts for confirmation before the destructive sweep unless
+    ``--yes`` / ``--force`` is passed.
+
     With ``--dry-run`` the command prints the teardown plan
-    (project + sessions that would be killed and removed) and exits
-    without mutating anything.
+    (project + sessions that would be killed and removed + state-db
+    rows that would be deleted) and exits without mutating anything.
 
     If the project has queued or in-flight tasks in the work DB, prompts
     for confirmation. Pass ``--force`` to skip the prompt (e.g. for
@@ -852,6 +1087,37 @@ def remove_cmd(
                 "Note: remove_project will refuse while sessions are "
                 "enabled. Re-run with --purge-sessions to tear them down."
             )
+
+        # ------------------------------------------------------------------
+        # state.db row teardown preview. We always sum the rows so the
+        # operator sees the magnitude of orphan state, even when they
+        # don't pass --purge-state — that's exactly the "left in place"
+        # surface area #1561 wants to make visible.
+        # ------------------------------------------------------------------
+        state_counts = _count_project_state_rows(path, project_key)
+        nonzero = {
+            table: n for table, n in state_counts.items() if n > 0
+        }
+        if nonzero:
+            if purge_state:
+                typer.echo("  state.db rows to purge:")
+            else:
+                typer.echo(
+                    "  state.db rows referencing project "
+                    "(use --purge-state to delete):"
+                )
+            for table, n in sorted(nonzero.items()):
+                noun = (
+                    "file" if table == "audit_tail"
+                    else ("row" if n == 1 else "rows")
+                )
+                typer.echo(f"    - {table}: {n} {noun}")
+        else:
+            typer.echo("  state.db rows: (none)")
+        if nonzero and not purge_state:
+            typer.echo(
+                "Note: state.db rows are NOT touched without --purge-state."
+            )
         typer.echo("Re-run without --dry-run to apply.")
         return
 
@@ -894,6 +1160,54 @@ def remove_cmd(
                     "(tmux session was not running)."
                 )
 
+    # state.db row teardown. Runs BEFORE ``remove_project`` so the
+    # post-removal config doesn't drift relative to the rows: if
+    # ``remove_project`` failed for some other reason after we'd
+    # already deleted the rows, the project would still be in
+    # pollypm.toml but with an empty work view — confusing. By
+    # purging first and removing second, a failure on the second
+    # step leaves the user with a clearly-orphaned project entry
+    # they can retry the remove on; a failure on the first step
+    # exits before touching the config.
+    state_summary: dict[str, int] | None = None
+    if purge_state:
+        state_counts = _count_project_state_rows(path, project_key)
+        total_rows = sum(
+            n for table, n in state_counts.items() if table != "audit_tail"
+        )
+        if total_rows > 0 or state_counts.get("audit_tail", 0) > 0:
+            if not (force or yes):
+                # Destructive — explicit confirm, default No. The
+                # active-task prompt above only covers queued / in-flight
+                # rows; --purge-state also nukes completed / archived
+                # rows and audit history, so we need a second gate.
+                typer.echo(
+                    f"--purge-state will delete {total_rows} state.db "
+                    f"row(s) for '{project_key}' plus the audit tail."
+                )
+                proceed = typer.confirm(
+                    f"Permanently delete state.db rows for '{project_key}'?",
+                    default=False,
+                )
+                if not proceed:
+                    typer.echo("Aborted. No changes made.")
+                    raise typer.Exit(code=1)
+            state_summary = _purge_project_state(path, project_key)
+            removed_total = sum(
+                n for table, n in state_summary.items()
+                if table != "audit_tail"
+            )
+            typer.echo(
+                f"Deleted {removed_total} state.db row(s) for "
+                f"'{project_key}' across "
+                f"{sum(1 for n in state_summary.values() if n > 0)} "
+                "table(s)."
+            )
+            if state_summary.get("audit_tail", 0) > 0:
+                typer.echo(
+                    f"Removed central audit-tail JSONL for '{project_key}'."
+                )
+
     try:
         removed = remove_project(path, project_key)
     except typer.BadParameter as exc:
@@ -903,7 +1217,7 @@ def remove_cmd(
     typer.echo(
         f"Removed project '{removed.key}' from {path}"
     )
-    if active > 0:
+    if active > 0 and not purge_state:
         typer.echo(
             f"Note: {active} work-service task(s) for '{removed.key}' "
             "were left in place. See issue #1561 for the full "

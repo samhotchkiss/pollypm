@@ -47,9 +47,22 @@ def _spawn_sentinel() -> subprocess.Popen:
     )
 
 
-def _ps_line(pid: int, etime: str, cmdline: str) -> str:
-    """Format a synthetic ``ps -o pid,etime,command`` line."""
-    return f"  {pid} {etime} {cmdline}"
+def _ps_line(
+    pid: int,
+    etime: str,
+    cmdline: str,
+    *,
+    uid: int | None = None,
+) -> str:
+    """Format a synthetic ``ps -o pid,uid,etime,command`` line.
+
+    Defaults ``uid`` to :func:`os.geteuid` so existing tests get a
+    matching ownership row without the ownership guard rejecting them
+    (#1644). Pass an explicit ``uid`` to model another user's row.
+    """
+    if uid is None:
+        uid = os.geteuid()
+    return f"  {pid} {uid} {etime} {cmdline}"
 
 
 def _make_ps_runner(lines: list[str]):
@@ -287,16 +300,141 @@ def test_reaps_multiple_orphans() -> None:
                 pass
 
 
+def test_skips_rows_owned_by_other_uid(sentinel: subprocess.Popen) -> None:
+    """A ``ps`` row whose ``uid`` column does not match the current
+    user is filtered out before any signal is sent (#1644).
+
+    Multi-user safety guard: even if the kernel would permit the
+    signal (e.g. root-owned reset, or a same-group race), the reaper
+    must not target processes outside the invoking user's UID.
+    """
+    foreign_uid = os.geteuid() + 1000  # Synthetic non-matching uid.
+    ps_runner = _make_ps_runner(
+        [
+            _ps_line(
+                sentinel.pid,
+                "00:01:00",
+                "python -m pollypm cockpit-pane activity",
+                uid=foreign_uid,
+            ),
+        ]
+    )
+
+    reaped = reap_orphan_cockpit_panes(ps_runner=ps_runner)
+
+    assert reaped == []
+    # Sentinel must NOT have been signalled — still running.
+    assert sentinel.poll() is None
+
+
+def test_only_signals_current_user_rows_with_mixed_owners() -> None:
+    """Mixed-owner ``ps`` output reaps only the current-user rows.
+
+    Models a shared host with multiple logins running pollypm: the
+    reaper sees foreign-uid rows but must not signal them.
+    """
+    own = _spawn_sentinel()
+    foreign = _spawn_sentinel()  # Real PID, but we'll label it as foreign uid.
+    try:
+        foreign_uid = os.geteuid() + 1000
+        ps_runner = _make_ps_runner(
+            [
+                _ps_line(
+                    own.pid,
+                    "00:00:05",
+                    "python -m pollypm cockpit-pane activity",
+                ),
+                _ps_line(
+                    foreign.pid,
+                    "00:00:05",
+                    "python -m pollypm cockpit-pane inbox",
+                    uid=foreign_uid,
+                ),
+            ]
+        )
+
+        reaped = reap_orphan_cockpit_panes(ps_runner=ps_runner)
+
+        assert len(reaped) == 1
+        assert reaped[0].pid == own.pid
+        assert reaped[0].pane_kind == "activity"
+
+        own.wait(timeout=5)
+        # Foreign-uid PID must still be alive — the reaper never
+        # signalled it.
+        assert foreign.poll() is None
+    finally:
+        for proc in (own, foreign):
+            if proc.poll() is None:
+                try:
+                    proc.kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+
+
+def test_current_uid_override_filters_to_supplied_uid() -> None:
+    """The ``current_uid`` kwarg is honoured (covers callers / tests
+    that want to assert without depending on the real geteuid)."""
+    ps_runner = _make_ps_runner(
+        [
+            _ps_line(
+                99990,
+                "00:00:05",
+                "python -m pollypm cockpit-pane activity",
+                uid=4242,
+            ),
+            _ps_line(
+                99991,
+                "00:00:05",
+                "python -m pollypm cockpit-pane inbox",
+                uid=9999,
+            ),
+        ]
+    )
+
+    # current_uid=4242 → only the first row is even considered for
+    # signalling. Neither real PID exists, so both should fall through
+    # the ``already_gone`` path and the result is [], but the key
+    # assertion is that this does NOT raise (i.e. the foreign row
+    # never reaches the signal code).
+    reaped = reap_orphan_cockpit_panes(
+        ps_runner=ps_runner,
+        current_uid=4242,
+    )
+    assert reaped == []
+
+
+def test_malformed_uid_column_skips_row() -> None:
+    """A row with a non-integer ``uid`` column (e.g. the literal
+    ``ps`` header) is dropped — we never signal a row we can't
+    confirm ownership for."""
+    ps_runner = _make_ps_runner(
+        [
+            "  PID   UID     ELAPSED COMMAND",
+            "  123  not_an_int  00:00:05  python -m pollypm cockpit-pane activity",
+        ]
+    )
+
+    reaped = reap_orphan_cockpit_panes(ps_runner=ps_runner)
+    assert reaped == []
+
+
 def test_pane_process_dataclass_is_frozen() -> None:
     """``_PaneProcess`` is the parsed-row snapshot — verify shape so
     future fields don't silently break the parser contract."""
     proc = _PaneProcess(
         pid=1234,
+        uid=501,
         age_s=42,
         cmdline="python -m pollypm cockpit-pane activity",
         pane_kind="activity",
     )
     assert proc.pid == 1234
+    assert proc.uid == 501
     assert proc.pane_kind == "activity"
     with pytest.raises(Exception):  # frozen dataclass → FrozenInstanceError
         proc.pid = 9999  # type: ignore[misc]

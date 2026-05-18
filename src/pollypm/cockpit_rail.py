@@ -797,8 +797,16 @@ class CockpitRouter:
     _COCKPIT_WINDOW = "PollyPM"
     _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
     _STATE_WRITE_DEBOUNCE_SECONDS = 0.25
+    # #1642 — TTL for the project-state categorization sweep. Pre-#1642
+    # every rail refresh re-opened every project DB + every inbox source
+    # to recompute glyphs; with 0.8s ticks + state-mtime debouncing, a
+    # navigation burst could stack ~5-10 sweeps inside ``rail_refresh``.
+    # Picked at ~1 tick so a freshly-completed task still surfaces on
+    # the next refresh; callers that need stronger freshness clear via
+    # ``_clear_rail_caches`` (which the supervisor reload already does).
+    _PROJECT_CATEGORIZATIONS_TTL_SECONDS = 2.0
     _SUPERVISOR_FREE_STATIC_KEYS = frozenset(
-        {"dashboard", "inbox", "workers", "metrics", "activity", "settings"},
+        {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "operator"},
     )
 
     def __init__(self, config_path: Path) -> None:
@@ -824,6 +832,20 @@ class CockpitRouter:
         # value: (db_mtime, git_mtime, is_active, has_working_task)
         # Skips re-opening SQLite on every 0.8s cockpit tick when nothing changed.
         self._project_activity_cache: dict[str, tuple[float, float, bool, bool]] = {}
+        # #1642 — short-TTL cache for the operator-state categorization that
+        # the rail glyph draws. ``project_state_map_from_config`` opens every
+        # project DB + walks every inbox source; running that on every
+        # rail-refresh tick (or every burst of state-bumps) stacks a
+        # multi-second sweep into the ``rail_refresh`` worker and contends
+        # with route workers / pane loaders. The cache key is
+        # ``(config_identity, dirty_marker)`` so a config reload (which
+        # ``_load_config`` already routes through ``_clear_rail_caches``)
+        # always misses; within a config lifetime entries expire after
+        # ``_PROJECT_CATEGORIZATIONS_TTL_SECONDS`` so freshly-completed work
+        # still surfaces within ~1 tick.
+        self._project_categorizations_cache_key: int | None = None
+        self._project_categorizations_cache: dict[str, str] | None = None
+        self._project_categorizations_cached_at: float = 0.0
 
     def _presence(self) -> CockpitPresence:
         presence = getattr(self, "presence", None)
@@ -854,6 +876,11 @@ class CockpitRouter:
         self._collapsed_sections_cache = None
         self._grouped_rail_cache_key = None
         self._grouped_rail_cache = None
+        # #1642 — also drop the project-state categorization cache so a
+        # supervisor / config reload doesn't keep painting stale glyphs.
+        self._project_categorizations_cache_key = None
+        self._project_categorizations_cache = None
+        self._project_categorizations_cached_at = 0.0
 
     def _config_identity(self, config: object) -> int:
         return id(config)
@@ -1786,7 +1813,27 @@ class CockpitRouter:
         Best-effort: a project whose DB can't be opened falls through
         to the tracked / paused IDLE classification rather than
         raising, mirroring the rest of the rail render path.
+
+        #1642 — Cached with a short TTL keyed on the config identity
+        (which already rolls forward on every config-file mtime change
+        via ``_load_config`` → ``_clear_rail_caches``). The underlying
+        ``project_state_map_from_config`` opens every project DB and
+        every inbox source on each call; running it on every 0.8s
+        rail-refresh tick stacked a multi-second sweep into the
+        ``rail_refresh`` worker and contended with route workers + pane
+        loaders. The TTL collapses navigation-burst refreshes into a
+        single sweep while keeping glyph staleness bounded.
         """
+        cache_key = self._config_identity(config)
+        now = time.monotonic()
+        cached = self._project_categorizations_cache
+        if (
+            cached is not None
+            and self._project_categorizations_cache_key == cache_key
+            and now - self._project_categorizations_cached_at
+            < self._PROJECT_CATEGORIZATIONS_TTL_SECONDS
+        ):
+            return dict(cached)
         try:
             from pollypm.dashboard.operator_view import (
                 project_state_map_from_config,
@@ -1794,8 +1841,18 @@ class CockpitRouter:
 
             states = project_state_map_from_config(config)
         except Exception:  # noqa: BLE001
+            # Best-effort: cache the empty result too so a hard failure
+            # doesn't re-trigger the (expensive, failing) sweep on every
+            # tick until the TTL elapses.
+            self._project_categorizations_cache_key = cache_key
+            self._project_categorizations_cache = {}
+            self._project_categorizations_cached_at = now
             return {}
-        return {key: state.value for key, state in states.items()}
+        result = {key: state.value for key, state in states.items()}
+        self._project_categorizations_cache_key = cache_key
+        self._project_categorizations_cache = result
+        self._project_categorizations_cached_at = now
+        return dict(result)
 
     def _project_state_rollups(
         self,
@@ -3174,15 +3231,26 @@ class CockpitRouter:
             return False
         state = self._load_state()
         config = self._load_config()
+        window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         has_mount_state = (
             isinstance(state.get("mounted_session"), str)
             or isinstance(state.get("mounted_identity"), dict)
         )
+        # #1646 — list panes ONCE up front and reuse the result for
+        # both the mounted-live-pane check and the fast-path layout
+        # probe inside the window manager. Without this, the static
+        # route blocked the user-visible ``respawn_pane`` paint behind
+        # multiple synchronous tmux subprocess calls (list_panes +
+        # ensure_layout's repair chain), each gated by the 15s default
+        # timeout. In the common case (cockpit layout is already
+        # healthy), reusing this single ``list_panes`` keeps the
+        # static route at two tmux subprocess calls total.
+        try:
+            panes = self.tmux.list_panes(window_target)
+        except Exception:  # noqa: BLE001
+            panes = None
         if has_mount_state:
-            window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
-            try:
-                panes = self.tmux.list_panes(window_target)
-            except Exception:  # noqa: BLE001
+            if panes is None:
                 return False
             right_pane_id = state.get("right_pane_id")
             right_pane = next(
@@ -3211,12 +3279,26 @@ class CockpitRouter:
             self.tmux,
         )
         right_pane_id = state.get("right_pane_id")
-        result = manager.show_static(
-            self._right_pane_command(key),
-            CockpitWindowState(
-                right_pane_id=right_pane_id if isinstance(right_pane_id, str) else None,
-            ),
+        window_state = CockpitWindowState(
+            right_pane_id=right_pane_id if isinstance(right_pane_id, str) else None,
         )
+        command = self._right_pane_command(key)
+        # #1646 — fast path: when the existing panes already form a
+        # valid two-pane layout (rail on left, content on right, no
+        # dead panes, persisted right pane id matches), respawn the
+        # right pane immediately rather than gating the user-visible
+        # paint on ``ensure_layout``'s repair chain. The slow
+        # ``show_static`` path stays available for genuinely degraded
+        # layouts (and for safety when ``list_panes`` itself failed).
+        result = None
+        if panes is not None:
+            result = manager.try_show_static_fast(
+                command,
+                window_state,
+                panes=panes,
+            )
+        if result is None:
+            result = manager.show_static(command, window_state)
         if not result.ok:
             self._handle_invalid_static_route(result)
         self._write_window_state(result.state, base=state)
@@ -3663,6 +3745,34 @@ class CockpitRouter:
                 ):
                     return  # tmux confirms the persisted identity
                 # Mismatch — fall through to tear-down + remount fresh.
+                # #1647 — emit forensics so future rail-latency triage
+                # can see *which* predicate failed (pane gone vs. dead
+                # shell vs. storage-window reindex) instead of guessing
+                # from a stopwatch.
+                try:
+                    self._emit_cockpit_audit(
+                        event_name="cockpit.mount_verify_failed",
+                        subject=session_name,
+                        status="info",
+                        metadata={
+                            "session_name": session_name,
+                            "rail_key": persisted.rail_key,
+                            "expected_window_name": (
+                                persisted.expected_window_name
+                            ),
+                            "recorded_right_pane_id": persisted.right_pane_id,
+                            "recorded_window_index": persisted.window_index,
+                            "cockpit_pane_ids": [
+                                getattr(p, "pane_id", None) for p in panes
+                            ],
+                            "storage_window_names": [
+                                getattr(w, "name", None)
+                                for w in storage_windows
+                            ],
+                        },
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
         self._park_mounted_session(supervisor, window_target)
         self._cleanup_extra_panes(window_target)
         left_pane_id = self._left_pane_id(window_target)

@@ -56,12 +56,12 @@ def test_cache_short_circuits_on_repeat_call(tmp_path: Path) -> None:
         return None
 
     with patch("pollypm.cockpit_ui.load_config", lambda _: _config(project)), patch(
-        "pollypm.plugins_builtin.activity_feed.plugin.build_projector", boom,
+        "pollypm.activity_projector_registry.build_activity_projector", boom,
     ):
         result = _dashboard_activity(config_path, "demo", limit=10)
 
     assert result == [{"summary": "cached"}]
-    assert build_count["n"] == 0, "cache hit must skip build_projector"
+    assert build_count["n"] == 0, "cache hit must skip build_activity_projector"
 
 
 def test_cache_invalidates_when_db_mtime_changes(tmp_path: Path) -> None:

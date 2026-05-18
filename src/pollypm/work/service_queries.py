@@ -11,6 +11,7 @@ Contract:
 from __future__ import annotations
 
 import json
+import logging
 from typing import TYPE_CHECKING
 
 from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
@@ -22,6 +23,9 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from pollypm.work.sqlite_service import SQLiteWorkService
+
+
+logger = logging.getLogger(__name__)
 
 
 # #1546 — labels that bypass the product-broken gate. The watchdog's
@@ -377,7 +381,15 @@ def create_task(
                 project_path=service._project_path,
             )
     except Exception:  # noqa: BLE001 — audit must never break creates
-        pass
+        # #1355: previously silent. A failing audit emit on task
+        # creation breaks the forensic reconstruction trail this
+        # block exists to provide. Log so the gap is visible.
+        logger.warning(
+            "task.created audit emit failed for %s/%s",
+            project,
+            task.task_number,
+            exc_info=True,
+        )
     if service._sync:
         external_refs_before_sync = dict(task.external_refs)
         service._sync.on_create(task)

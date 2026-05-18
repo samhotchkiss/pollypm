@@ -41,15 +41,22 @@ def aggregate_project_session_tokens(
             return None
     except OSError:
         return None
+    # #1652: open read-only via the ``file:<path>?mode=ro`` URI so the
+    # render-side aggregate cannot mutate the workspace DB (journal
+    # mode, write lock, etc.). Mirrors the doctor probe pattern from
+    # #1625 (``doctor_state_probes._connect_readonly``) and the other
+    # presentation-side read facades (``morning_briefing_queries``,
+    # ``inbox_action_preview``, ``work_task_state``).
+    uri = f"file:{db_path}?mode=ro"
     try:
-        conn = sqlite3.connect(str(db_path))
+        conn = sqlite3.connect(uri, uri=True)
     except sqlite3.Error as exc:
         logger.debug(
             "work_session_queries: connect failed for %s: %s", db_path, exc,
         )
         return None
     try:
-        apply_workspace_pragmas(conn)
+        apply_workspace_pragmas(conn, readonly=True)
         try:
             row = conn.execute(
                 "SELECT COALESCE(SUM(total_input_tokens), 0), "

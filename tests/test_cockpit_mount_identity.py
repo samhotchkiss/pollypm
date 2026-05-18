@@ -190,9 +190,32 @@ def test_verify_against_tmux_fails_when_pane_killed() -> None:
     )
 
 
-def test_verify_against_tmux_fails_when_window_renamed() -> None:
-    """Storage closet window expected to be ``pm-operator`` is gone
-    (renamed or never spawned). Caller must remount."""
+def test_verify_against_tmux_passes_when_storage_window_absent() -> None:
+    """#1647 — a mounted live session lives in the cockpit window, not
+    the storage closet. ``join-pane`` typically destroys the
+    now-empty source window; requiring it to remain would force every
+    repeat click on the already-mounted session through park→remount
+    (~10s of tmux churn). When the right pane id + live-provider
+    command both agree with the persisted record, the mount is valid
+    even with the storage window absent."""
+    mounted = MountedIdentity(
+        rail_key="polly", session_name="operator",
+        role="operator-pm", expected_window_name="pm-operator",
+        right_pane_id="%5", window_index=3, mounted_at="2026-04-26T15:00:00+00:00",
+    )
+    panes = [_pane("%5", "claude")]
+    storage_windows = [_window("pm-reviewer", 4)]  # pm-operator absent
+    assert verify_mount_against_tmux(
+        mounted, panes=panes, storage_windows=storage_windows,
+    )
+
+
+def test_verify_against_tmux_passes_when_storage_window_renamed() -> None:
+    """Twin of the absent-window case: after ``join-pane`` destroys the
+    empty source window, a *different* window may end up bearing a
+    similar-but-not-matching name. The mounted pane is still live in
+    the cockpit, so the mount is valid (no rename of the joined pane
+    occurred). #1647."""
     mounted = MountedIdentity(
         rail_key="polly", session_name="operator",
         role="operator-pm", expected_window_name="pm-operator",
@@ -200,7 +223,7 @@ def test_verify_against_tmux_fails_when_window_renamed() -> None:
     )
     panes = [_pane("%5", "claude")]
     storage_windows = [_window("pm-operator-renamed", 3)]
-    assert not verify_mount_against_tmux(
+    assert verify_mount_against_tmux(
         mounted, panes=panes, storage_windows=storage_windows,
     )
 
@@ -208,7 +231,11 @@ def test_verify_against_tmux_fails_when_window_renamed() -> None:
 def test_verify_against_tmux_fails_when_window_reindexed() -> None:
     """Window name still matches but it's at a different index — tmux
     reindexed after another window was killed. The recorded mount no
-    longer corresponds to the right window number."""
+    longer corresponds to the right window number.
+
+    Distinct from "window absent" (#1647 carve-out): a *present*
+    window at the wrong index implies a duplicate/orphan storage
+    window we should not silently endorse, so we remount fresh."""
     mounted = MountedIdentity(
         rail_key="polly", session_name="operator",
         role="operator-pm", expected_window_name="pm-operator",
@@ -218,6 +245,39 @@ def test_verify_against_tmux_fails_when_window_reindexed() -> None:
     storage_windows = [_window("pm-operator", 5)]  # was 3, now 5
     assert not verify_mount_against_tmux(
         mounted, panes=panes, storage_windows=storage_windows,
+    )
+
+
+def test_verify_against_tmux_passes_for_repeat_click_on_mounted_session() -> None:
+    """#1647 end-to-end shape — the exact scenario from the issue:
+
+    The user has already mounted Polly (or Russell, or PM Chat). The
+    persisted ``mounted_identity`` agrees with the request. The
+    cockpit right pane is live with ``claude``/``codex``. The source
+    storage window is gone because ``join-pane`` consumed it.
+
+    Verification must succeed so ``_show_live_session`` short-circuits
+    instead of calling ``_park_mounted_session`` + a fresh remount
+    (which costs multiple ``list-windows`` / ``break-pane`` /
+    ``join-pane`` / resize / state-write round-trips against tmux).
+    """
+    mounted = MountedIdentity(
+        rail_key="polly", session_name="operator",
+        role="operator-pm", expected_window_name="pm-operator",
+        right_pane_id="%5", window_index=3,
+        mounted_at="2026-04-26T15:00:00+00:00",
+    )
+    cockpit_panes = [_pane("%4", "tmux"), _pane("%5", "claude")]
+    # The storage closet has every *other* window — operator's was
+    # consumed by join-pane when the mount completed.
+    storage_windows_after_join = [
+        _window("pm-reviewer", 4),
+        _window("pm-worker", 6),
+    ]
+    assert verify_mount_against_tmux(
+        mounted,
+        panes=cockpit_panes,
+        storage_windows=storage_windows_after_join,
     )
 
 

@@ -327,6 +327,35 @@ def load_operator_view_from_config(config) -> OperatorDashboardView:  # noqa: AN
     )
 
 
+def _scan_to_state(
+    scan: _ProjectScan, items: list,
+) -> tuple[str, ProjectState]:
+    """Per-project worker for :func:`project_state_map_from_config`.
+
+    Mirrors :func:`_scan_to_row` but returns only the classification —
+    callers that just want the state map (e.g. the rail's glyph
+    selector) shouldn't pay for ``what_working`` / ``why_waiting``
+    string assembly that the dashboard view consumes.
+    """
+    svc = _open_work_service(scan)
+    try:
+        if svc is None:
+            if items:
+                return scan.project_key, ProjectState.WAITING
+            if not scan.tracked:
+                return scan.project_key, ProjectState.PAUSED
+            return scan.project_key, ProjectState.IDLE
+        return scan.project_key, categorize_project(
+            scan.project_key,
+            work_service=svc,
+            inbox_items=items,
+            tracked=scan.tracked,
+        )
+    finally:
+        if svc is not None:
+            _safe_close(svc)
+
+
 def project_state_map_from_config(config) -> dict[str, ProjectState]:  # noqa: ANN001
     """Return ``{project_key: ProjectState}`` for every project in ``config``.
 
@@ -335,36 +364,40 @@ def project_state_map_from_config(config) -> dict[str, ProjectState]:  # noqa: A
     matches the glyph drawn next to it. The function is best-effort:
     a project whose DB can't be opened falls through to a tracked /
     paused IDLE classification rather than raising.
+
+    #1642 — Per-project sqlite opens run in parallel via the same
+    bounded pool the dashboard loader uses. The rail invokes this
+    inside its ``rail_refresh`` worker and the prior serial loop was
+    the dominant cost on multi-project workspaces; mirroring
+    :func:`load_operator_view_from_config`'s parallel sweep keeps the
+    rail-refresh path within a single project's DB-open latency
+    regardless of project count. The router additionally TTL-caches
+    the result so navigation bursts collapse into one sweep.
     """
     scans = _collect_project_scans(config)
     waiting_by_project = _waiting_items_by_project(config)
-    states: dict[str, ProjectState] = {}
-    for scan in scans:
-        svc = _open_work_service(scan)
-        items = waiting_by_project.get(scan.project_key, [])
-        try:
-            if svc is None:
-                if items:
-                    states[scan.project_key] = ProjectState.WAITING
-                elif not scan.tracked:
-                    states[scan.project_key] = ProjectState.PAUSED
-                else:
-                    states[scan.project_key] = ProjectState.IDLE
-                continue
-            states[scan.project_key] = categorize_project(
-                scan.project_key,
-                work_service=svc,
-                inbox_items=items,
-                tracked=scan.tracked,
+    if not scans:
+        return {}
+    if len(scans) <= 1:
+        pairs = [
+            _scan_to_state(scan, waiting_by_project.get(scan.project_key, []))
+            for scan in scans
+        ]
+    else:
+        max_workers = min(_MAX_PARALLEL_PROJECT_SCANS, len(scans))
+        with ThreadPoolExecutor(
+            max_workers=max_workers,
+            thread_name_prefix="operator-state",
+        ) as pool:
+            pairs = list(
+                pool.map(
+                    lambda scan: _scan_to_state(
+                        scan, waiting_by_project.get(scan.project_key, []),
+                    ),
+                    scans,
+                )
             )
-        finally:
-            close = getattr(svc, "close", None) if svc is not None else None
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # noqa: BLE001
-                    pass
-    return states
+    return {key: state for key, state in pairs}
 
 
 def view_as_ascii(view: OperatorDashboardView) -> str:

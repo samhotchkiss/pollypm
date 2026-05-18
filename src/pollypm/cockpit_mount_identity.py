@@ -226,16 +226,21 @@ def verify_mount_against_tmux(
 ) -> bool:
     """Return True iff tmux state matches the mounted identity.
 
-    Three checks, all must pass:
+    Two required checks plus a *conditional* third:
 
     1. The recorded ``right_pane_id`` still appears in the cockpit
        window's pane list.
     2. The pane's current command looks like a live provider — not a
        dead shell.
-    3. The expected storage-closet window with name
-       ``expected_window_name`` exists and (if recorded) sits at
-       ``window_index``. This catches the case where a window was
-       renamed or re-indexed under us.
+    3. *Conditional* — if a storage-closet window with name
+       ``expected_window_name`` is present, it must sit at the
+       recorded ``window_index`` (when one was recorded). When the
+       window is **absent**, that's accepted: a mounted pane lives
+       in the cockpit, not the storage closet, so ``join-pane``
+       typically destroys the now-empty source window. Requiring
+       its continued presence would force every repeat click on an
+       already-mounted session through the slow park→remount path
+       (#1647).
 
     Returns False on any mismatch, signalling "tear down and remount".
     """
@@ -254,10 +259,18 @@ def verify_mount_against_tmux(
         if not cmd or not all(c.isdigit() or c == "." for c in cmd):
             return False
 
-    # 3. Expected storage-closet window present (and at the recorded
-    # index, when one was recorded). The window_index check guards
-    # against tmux reindexing after a window was killed earlier in
-    # the list.
+    # 3. Storage-closet window check (conditional).
+    #
+    # When the session is currently mounted into the cockpit via
+    # ``join-pane``, the source storage window is normally gone —
+    # tmux destroys windows with no remaining panes. Treat "window
+    # absent" as consistent with "the pane is in the cockpit", and
+    # only reject when the window is *present at a different index*
+    # than the one we recorded (config-edit / manual rename /
+    # reindex after another window was killed). #1647 — without
+    # this carve-out a repeat click on an already-mounted session
+    # took the slow park→remount path because check 3 always
+    # failed once the source window was joined away.
     window = next(
         (
             w for w in storage_windows
@@ -265,9 +278,7 @@ def verify_mount_against_tmux(
         ),
         None,
     )
-    if window is None:
-        return False
-    if mounted.window_index is not None:
+    if window is not None and mounted.window_index is not None:
         actual_index = getattr(window, "index", None)
         if actual_index is not None and actual_index != mounted.window_index:
             return False

@@ -29,8 +29,9 @@ Fix
 After the tmux teardown and rail-daemon stop in ``pm reset``, walk
 ``ps -A`` for any ``pollypm cockpit-pane`` cmdline owned by the current
 user and SIGTERM-then-SIGKILL it. The current-user check
-(``effective_uid == os.geteuid()``) is the multi-user safety guard —
-we never signal another login's processes.
+(``uid == os.geteuid()``, taken from the ``ps -o uid`` column) is the
+multi-user safety guard — we never signal another login's processes,
+even when the kernel would permit it (#1644).
 
 Idempotency
 -----------
@@ -95,6 +96,7 @@ class _PaneProcess:
     """Internal: parsed snapshot of a ``ps`` row pointing at a pane."""
 
     pid: int
+    uid: int | None
     age_s: int | None
     cmdline: str
     pane_kind: str | None
@@ -145,6 +147,7 @@ def _extract_pane_kind(cmdline: str) -> str | None:
 def _list_cockpit_pane_procs(
     *,
     ps_runner: "PsRunner | None" = None,
+    current_uid: int | None = None,
 ) -> list[_PaneProcess]:
     """Run ``ps`` and parse out every ``pollypm cockpit-pane`` process.
 
@@ -152,7 +155,16 @@ def _list_cockpit_pane_procs(
     user typing ``pm cockpit-pane --help`` in a shell doesn't get picked
     up as a target (their ``ps`` row would still show ``pm`` as the
     binary, not ``pollypm``).
+
+    Ownership guard (#1644): rows whose ``uid`` column does not match
+    ``current_uid`` (defaulting to :func:`os.geteuid`) are filtered out
+    before they reach the signal path. ``PermissionError`` handling in
+    :func:`_terminate_with_grace` is preserved as defense-in-depth, but
+    this is the primary multi-user safety check — we never even
+    attempt to signal another login's processes.
     """
+    if current_uid is None:
+        current_uid = os.geteuid()
     runner = ps_runner or _default_ps_runner
     try:
         raw = runner()
@@ -166,14 +178,25 @@ def _list_cockpit_pane_procs(
             continue
         if _POLLYPM_NEEDLE not in line or _COCKPIT_PANE_NEEDLE not in line:
             continue
-        # Two splits: pid, etime, then cmdline-as-rest.
-        parts = line.split(None, 2)
-        if len(parts) < 3:
+        # Three splits: pid, uid, etime, then cmdline-as-rest.
+        parts = line.split(None, 3)
+        if len(parts) < 4:
             continue
-        pid_text, etime_text, cmdline = parts
+        pid_text, uid_text, etime_text, cmdline = parts
         try:
             pid = int(pid_text)
         except ValueError:
+            continue
+        try:
+            uid = int(uid_text)
+        except ValueError:
+            # Header row ("PID UID ELAPSED COMMAND") or a malformed
+            # row: drop. We never signal a row whose owner we can't
+            # confirm.
+            continue
+        # Ownership guard: only signal our own user's processes.
+        # This is the documented multi-user safety invariant (#1644).
+        if uid != current_uid:
             continue
         # Skip ourselves — defensive even though the reset CLI is not
         # itself a cockpit-pane process.
@@ -190,6 +213,7 @@ def _list_cockpit_pane_procs(
         out.append(
             _PaneProcess(
                 pid=pid,
+                uid=uid,
                 age_s=_parse_etime(etime_text),
                 cmdline=cmdline,
                 pane_kind=_extract_pane_kind(cmdline),
@@ -201,12 +225,14 @@ def _list_cockpit_pane_procs(
 def _default_ps_runner() -> str:
     """Invoke ``ps`` and return its decoded stdout.
 
-    ``-A`` lists every process; ``-o pid,etime,command`` keeps the
-    output narrow and stable across BSD/Linux. Mirrors
-    :func:`pollypm.rail_daemon_reaper._default_ps_runner`.
+    ``-A`` lists every process; ``-o pid,uid,etime,command`` keeps the
+    output narrow and stable across BSD (macOS) and Linux. The ``uid``
+    column is the numeric real UID and is the ownership signal used by
+    :func:`_list_cockpit_pane_procs` to filter to the current user
+    (#1644).
     """
     completed = subprocess.run(
-        ["ps", "-A", "-o", "pid,etime,command"],
+        ["ps", "-A", "-o", "pid,uid,etime,command"],
         capture_output=True,
         text=True,
         timeout=5.0,
@@ -322,6 +348,7 @@ def reap_orphan_cockpit_panes(
     *,
     ps_runner: PsRunner | None = None,
     sleep_fn: Callable[[float], None] = time.sleep,
+    current_uid: int | None = None,
 ) -> list[ReapedCockpitPane]:
     """Sweep ``ps`` for orphan ``pollypm cockpit-pane`` processes and kill them.
 
@@ -334,12 +361,15 @@ def reap_orphan_cockpit_panes(
         ps_runner: callable returning ``ps`` output. Tests inject a
             fake; production uses :func:`_default_ps_runner`.
         sleep_fn: injectable sleep for the SIGTERM grace window.
+        current_uid: override for the ownership-guard UID (#1644).
+            Defaults to :func:`os.geteuid`. Tests inject a synthetic
+            uid so they can assert on the filter behaviour.
 
     Returns:
         The list of :class:`ReapedCockpitPane` records for processes
         that were signalled, so the caller can log / count.
     """
-    procs = _list_cockpit_pane_procs(ps_runner=ps_runner)
+    procs = _list_cockpit_pane_procs(ps_runner=ps_runner, current_uid=current_uid)
     reaped: list[ReapedCockpitPane] = []
     for proc in procs:
         signal_used = _terminate_with_grace(proc.pid, sleep_fn=sleep_fn)

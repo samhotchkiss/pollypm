@@ -103,6 +103,15 @@ def _resolve_handler_timeouts() -> dict[str, float]:
         from pollypm.config import DEFAULT_CONFIG_PATH, resolve_config_path
         from pollypm.plugin_host import extension_host_for_root
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. Falling back to the 600s floor
+        # for every handler is a real degradation (slower stuck-claim
+        # recovery, no per-handler precision); log so an import-time
+        # break doesn't silently widen the sweep's blast radius.
+        logger.warning(
+            "stuck_claims.sweep: handler-timeout imports failed; "
+            "using fallback floor",
+            exc_info=True,
+        )
         return {}
     try:
         config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
@@ -112,10 +121,24 @@ def _resolve_handler_timeouts() -> dict[str, float]:
         host = extension_host_for_root(str(config_path.parent))
         registry = host.job_handler_registry()
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. An unreachable plugin host means
+        # the sweep uses the 600s floor for every job. Log so a
+        # broken host wiring stops hiding behind quiet degradation.
+        logger.warning(
+            "stuck_claims.sweep: plugin host unreachable; "
+            "using fallback floor",
+            exc_info=True,
+        )
         return {}
     try:
         snapshot = registry.snapshot()
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. Same degradation as above.
+        logger.warning(
+            "stuck_claims.sweep: registry.snapshot() failed; "
+            "using fallback floor",
+            exc_info=True,
+        )
         return {}
     result: dict[str, float] = {}
     for name, spec in snapshot.items():

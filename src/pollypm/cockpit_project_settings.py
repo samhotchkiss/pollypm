@@ -20,11 +20,11 @@ from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
-from textual.screen import ModalScreen
 from textual.widgets import Button, DataTable, Input, RadioButton, RadioSet, Select, Static
 
 from pollypm.account_usage_sampler import load_cached_account_usage
 from pollypm.config import load_config, write_config
+from pollypm.cockpit_settings_confirm import _SettingsConfirmModal
 from pollypm.cockpit_settings_history import (
     UndoAction,
     consume_settings_history,
@@ -954,60 +954,3 @@ class PollyProjectSettingsApp(App[None]):
 
     def action_show_keyboard_help(self) -> None:
         self._notify("j/k move, Enter apply preview target, u undo, r refresh.")
-
-
-class _SettingsConfirmModal(ModalScreen[bool]):
-    CSS = """
-    Screen {
-        align: center middle;
-    }
-    #settings-confirm {
-        width: 72;
-        height: auto;
-        padding: 1 2;
-        background: $panel;
-        border: heavy $warning;
-    }
-    #settings-confirm-title {
-        padding-bottom: 1;
-        text-style: bold;
-    }
-    #settings-confirm-buttons {
-        height: auto;
-        align-horizontal: right;
-        padding-top: 1;
-    }
-    #settings-confirm-buttons Button {
-        margin-left: 1;
-    }
-    """
-
-    BINDINGS = [Binding("escape", "cancel", "Cancel")]
-
-    def __init__(
-        self,
-        *,
-        title: str,
-        prompt: str,
-        confirm_label: str = "Confirm",
-        cancel_label: str = "Cancel",
-    ) -> None:
-        super().__init__()
-        self._title = title
-        self._prompt = prompt
-        self._confirm_label = confirm_label
-        self._cancel_label = cancel_label
-
-    def compose(self) -> ComposeResult:
-        with Vertical(id="settings-confirm"):
-            yield Static(self._title, id="settings-confirm-title")
-            yield Static(self._prompt)
-            with Horizontal(id="settings-confirm-buttons"):
-                yield Button(self._cancel_label, id="cancel")
-                yield Button(self._confirm_label, variant="primary", id="confirm")
-
-    def on_button_pressed(self, event: Button.Pressed) -> None:
-        self.dismiss(event.button.id == "confirm")
-
-    def action_cancel(self) -> None:
-        self.dismiss(False)

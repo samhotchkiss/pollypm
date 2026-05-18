@@ -10,12 +10,9 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
 
 from pollypm.plugin_api.v1 import PollyPMPlugin
-
-if TYPE_CHECKING:
-    from pollypm.plugin_host import ExtensionHost
+from pollypm.plugin_host_protocol import ExtensionHostLike
 
 logger = logging.getLogger(__name__)
 
@@ -396,7 +393,7 @@ def validate_plugin(plugin: PollyPMPlugin) -> ValidationResult:
     return result
 
 
-def validate_all_plugins(host: ExtensionHost) -> ValidationReport:
+def validate_all_plugins(host: ExtensionHostLike) -> ValidationReport:
     """Validate all loaded plugins and disable failing ones."""
     report = ValidationReport()
 
@@ -424,7 +421,7 @@ def validate_all_plugins(host: ExtensionHost) -> ValidationReport:
     return report
 
 
-def validate_plugin_by_name(host: ExtensionHost, name: str) -> ValidationResult | None:
+def validate_plugin_by_name(host: ExtensionHostLike, name: str) -> ValidationResult | None:
     """Validate a single plugin by name. Returns None if not found."""
     plugins = host.plugins()
     plugin = plugins.get(name)

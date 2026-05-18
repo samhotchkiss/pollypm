@@ -356,6 +356,66 @@ class CockpitWindowManager:
         state = state.cleared_mount().with_right(right_id)
         return self._result(state, actions)
 
+    def try_show_static_fast(
+        self,
+        command: str,
+        state: CockpitWindowState | None = None,
+        *,
+        panes: Sequence[Any] | None = None,
+    ) -> CockpitWindowResult | None:
+        """#1646 — paint the right pane FIRST when the layout is already healthy.
+
+        Returns a ``CockpitWindowResult`` with action
+        ``respawn_static_fast:<id>`` when the existing cockpit panes
+        already form a valid two-pane layout (rail on left, content on
+        right, no dead panes, persisted right pane id matches the
+        rightmost live pane). In that common case we skip the
+        :meth:`ensure_layout` repair chain (1-4 extra ``list_panes``
+        subprocess calls plus possible repair/swap/resize calls) and
+        dispatch only the single ``respawn_pane`` that the user
+        actually perceives.
+
+        Returns ``None`` when fast-path preconditions are not met; the
+        caller should fall back to :meth:`show_static`, which performs
+        the full layout repair before respawning.
+        """
+        state = state or CockpitWindowState()
+        right_pane_id = state.right_pane_id
+        if not right_pane_id:
+            return None
+        if panes is None:
+            panes = self.tmux.list_panes(self.spec.window_target)
+        classification = self.classify_panes(panes)
+        if classification.dead_panes:
+            return None
+        if len(classification.live_panes) != 2:
+            return None
+        if classification.rail_pane is None:
+            return None
+        if classification.left_pane is not classification.rail_pane:
+            return None
+        if classification.content_pane is None:
+            return None
+        if classification.right_pane is not classification.content_pane:
+            return None
+        content_id = _pane_id(classification.content_pane)
+        if content_id != right_pane_id:
+            return None
+        self.tmux.respawn_pane(right_pane_id, command)
+        actions = (f"respawn_static_fast:{right_pane_id}",)
+        new_state = state.cleared_mount().with_right(right_pane_id)
+        postcondition = CockpitPostcondition(
+            valid=True,
+            errors=(),
+            left_pane_id=_pane_id(classification.left_pane),
+            right_pane_id=right_pane_id,
+        )
+        return CockpitWindowResult(
+            state=new_state,
+            actions=actions,
+            postcondition=postcondition,
+        )
+
     def join_live_from_storage(
         self,
         live: LivePaneSpec,

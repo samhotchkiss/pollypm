@@ -614,6 +614,14 @@ def _record_first_shipped_activity(
     try:
         from pollypm.store import SQLAlchemyStore
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failed SQLAlchemyStore import
+        # drops the first-shipment celebration without a trace; log
+        # so a broken store package stops masking the milestone.
+        logger.warning(
+            "first_shipped: SQLAlchemyStore import failed for %s",
+            project_key,
+            exc_info=True,
+        )
         return
 
     state_db = project_path / ".pollypm" / "state.db"
@@ -677,6 +685,14 @@ def task_landed_commit(service: _HasExecutions, task_id: str) -> bool:
     try:
         executions = service.get_execution(task_id)
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A broken get_execution call
+        # forces the "first PR shipped" celebration to skip; log
+        # so we stop swallowing the underlying query failure.
+        logger.warning(
+            "task_landed_commit: get_execution failed for %s",
+            task_id,
+            exc_info=True,
+        )
         return False
     for execution in reversed(executions):
         work_output = getattr(execution, "work_output", None)
@@ -891,6 +907,13 @@ class SQLiteWorkService:
             self._conn.commit()
             return len(rows)
         except Exception:  # noqa: BLE001
+            # #1355: previously silent. A failed audit-outbox flush
+            # leaves rows on disk and rolls back without a trace,
+            # so an ongoing emit-side break never surfaces. Log.
+            logger.warning(
+                "task_delete_audit_outbox flush failed; rolling back",
+                exc_info=True,
+            )
             self._conn.rollback()
             return 0
 

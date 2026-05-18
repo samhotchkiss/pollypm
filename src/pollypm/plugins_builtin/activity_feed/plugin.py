@@ -24,6 +24,9 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from pollypm.activity_projector_registry import (
+    register_activity_projector_factory,
+)
 from pollypm.plugin_api.v1 import (
     Capability,
     PanelSpec,
@@ -157,7 +160,18 @@ def _initialize(api: Any) -> None:
     so the plugin manifest does NOT need the reserved-section flag.
     Per spec §3 precedence: core_rail_items owns 0-99, plugins start at
     100 — we take index 30 in ``workflows`` which is open territory.
+
+    Also installs :func:`build_projector` in
+    :mod:`pollypm.activity_projector_registry` so cockpit surfaces
+    (dashboard panel, full-screen activity view) can resolve a projector
+    without importing from the optional plugin tree (#1363).
     """
+    # #1363 — expose the projector factory to core via the registration
+    # seam. With this plugin disabled, the dashboard / activity-panel
+    # callers get ``None`` and render an empty feed (their existing
+    # graceful-degrade path).
+    register_activity_projector_factory(build_projector)
+
     config = api.config
     state_db = None
     if config is not None:

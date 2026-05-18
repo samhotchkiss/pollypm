@@ -1449,11 +1449,14 @@ def _gather_activity_feed(
     empty list rather than propagating the error. The Textual screen
     surfaces the empty state as a friendly placeholder.
     """
+    # #1363 — resolve the projector via the core registration seam so
+    # this surface stays plugin-agnostic. ``build_activity_projector``
+    # returns ``None`` when the ``activity_feed`` plugin isn't loaded.
     try:
-        from pollypm.plugins_builtin.activity_feed.plugin import build_projector
+        from pollypm.activity_projector_registry import build_activity_projector
     except Exception:  # noqa: BLE001
         return []
-    projector = build_projector(config)
+    projector = build_activity_projector(config)
     if projector is None:
         return []
     try:

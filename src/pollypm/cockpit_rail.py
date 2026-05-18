@@ -3231,15 +3231,26 @@ class CockpitRouter:
             return False
         state = self._load_state()
         config = self._load_config()
+        window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
         has_mount_state = (
             isinstance(state.get("mounted_session"), str)
             or isinstance(state.get("mounted_identity"), dict)
         )
+        # #1646 — list panes ONCE up front and reuse the result for
+        # both the mounted-live-pane check and the fast-path layout
+        # probe inside the window manager. Without this, the static
+        # route blocked the user-visible ``respawn_pane`` paint behind
+        # multiple synchronous tmux subprocess calls (list_panes +
+        # ensure_layout's repair chain), each gated by the 15s default
+        # timeout. In the common case (cockpit layout is already
+        # healthy), reusing this single ``list_panes`` keeps the
+        # static route at two tmux subprocess calls total.
+        try:
+            panes = self.tmux.list_panes(window_target)
+        except Exception:  # noqa: BLE001
+            panes = None
         if has_mount_state:
-            window_target = f"{config.project.tmux_session}:{self._COCKPIT_WINDOW}"
-            try:
-                panes = self.tmux.list_panes(window_target)
-            except Exception:  # noqa: BLE001
+            if panes is None:
                 return False
             right_pane_id = state.get("right_pane_id")
             right_pane = next(
@@ -3268,12 +3279,26 @@ class CockpitRouter:
             self.tmux,
         )
         right_pane_id = state.get("right_pane_id")
-        result = manager.show_static(
-            self._right_pane_command(key),
-            CockpitWindowState(
-                right_pane_id=right_pane_id if isinstance(right_pane_id, str) else None,
-            ),
+        window_state = CockpitWindowState(
+            right_pane_id=right_pane_id if isinstance(right_pane_id, str) else None,
         )
+        command = self._right_pane_command(key)
+        # #1646 — fast path: when the existing panes already form a
+        # valid two-pane layout (rail on left, content on right, no
+        # dead panes, persisted right pane id matches), respawn the
+        # right pane immediately rather than gating the user-visible
+        # paint on ``ensure_layout``'s repair chain. The slow
+        # ``show_static`` path stays available for genuinely degraded
+        # layouts (and for safety when ``list_panes`` itself failed).
+        result = None
+        if panes is not None:
+            result = manager.try_show_static_fast(
+                command,
+                window_state,
+                panes=panes,
+            )
+        if result is None:
+            result = manager.show_static(command, window_state)
         if not result.ok:
             self._handle_invalid_static_route(result)
         self._write_window_state(result.state, base=state)

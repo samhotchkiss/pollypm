@@ -451,6 +451,101 @@ def test_show_static_respawns_right_and_clears_mounted_state() -> None:
     assert ("respawn_pane", (right_id, "pm cockpit-pane project demo")) in tmux.calls
 
 
+def test_try_show_static_fast_skips_ensure_layout_when_layout_is_healthy() -> None:
+    # #1646 — when the cockpit already has a healthy two-pane layout,
+    # the static route must paint the right pane immediately via a
+    # single ``respawn_pane`` call rather than running
+    # ``ensure_layout``'s multi-step repair chain first.
+    tmux = FakeTmux()
+    window = tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("pm", 100)])
+    right_id = window.panes[1].pane_id
+    manager = _manager(tmux)
+    panes = tmux.list_panes("pollypm:PollyPM")
+    tmux.calls.clear()  # Only count subprocess calls made by the fast path.
+
+    result = manager.try_show_static_fast(
+        "pm cockpit-pane settings",
+        CockpitWindowState(right_pane_id=right_id),
+        panes=panes,
+    )
+
+    assert result is not None
+    assert result.ok
+    assert result.actions == (f"respawn_static_fast:{right_id}",)
+    assert result.state == CockpitWindowState(right_pane_id=right_id)
+    # Only one tmux subprocess call — the user-visible respawn_pane.
+    # No extra list_panes / resize / swap chain from ensure_layout.
+    assert tmux.calls == [
+        ("respawn_pane", (right_id, "pm cockpit-pane settings")),
+    ]
+
+
+def test_try_show_static_fast_returns_none_when_right_pane_id_missing() -> None:
+    # Without a persisted right_pane_id we cannot guarantee that the
+    # rightmost pane is the one the user thinks they're updating;
+    # caller must fall back to the full show_static repair chain.
+    tmux = FakeTmux()
+    tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("pm", 100)])
+    manager = _manager(tmux)
+
+    result = manager.try_show_static_fast(
+        "pm cockpit-pane settings",
+        CockpitWindowState(right_pane_id=None),
+    )
+
+    assert result is None
+
+
+def test_try_show_static_fast_returns_none_when_right_pane_id_stale() -> None:
+    # If the persisted right_pane_id no longer matches any live pane,
+    # the layout is desynced and the fast path must defer to the full
+    # ensure_layout repair.
+    tmux = FakeTmux()
+    tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("pm", 100)])
+    manager = _manager(tmux)
+
+    result = manager.try_show_static_fast(
+        "pm cockpit-pane settings",
+        CockpitWindowState(right_pane_id="%stale"),
+    )
+
+    assert result is None
+
+
+def test_try_show_static_fast_returns_none_when_dead_pane_present() -> None:
+    # Dead panes mean the layout needs repair; respawning the right
+    # pane alone would leave the dead one behind. Defer to show_static.
+    tmux = FakeTmux()
+    window = tmux.add_window(
+        "pollypm",
+        "PollyPM",
+        [("uv", 0, 30, False), ("pm", 40, 80, False), ("bash", 130, 80, True)],
+    )
+    right_id = window.panes[1].pane_id
+    manager = _manager(tmux)
+
+    result = manager.try_show_static_fast(
+        "pm cockpit-pane settings",
+        CockpitWindowState(right_pane_id=right_id),
+    )
+
+    assert result is None
+
+
+def test_try_show_static_fast_returns_none_when_only_one_pane() -> None:
+    tmux = FakeTmux()
+    window = tmux.add_window("pollypm", "PollyPM", [("uv", 0, 180, False)])
+    only_id = window.panes[0].pane_id
+    manager = _manager(tmux)
+
+    result = manager.try_show_static_fast(
+        "pm cockpit-pane settings",
+        CockpitWindowState(right_pane_id=only_id),
+    )
+
+    assert result is None
+
+
 def test_join_live_from_storage_uses_window_index_and_sets_mount_state() -> None:
     tmux = FakeTmux()
     cockpit = tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("pm", 100)])

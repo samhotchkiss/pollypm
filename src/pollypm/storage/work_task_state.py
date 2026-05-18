@@ -135,6 +135,67 @@ def task_numbers_with_statuses(
     return []
 
 
+def project_task_total_fast(
+    db_path: Path,
+    *,
+    project_key: str,
+    connect_timeout: float = 0.05,
+    busy_timeout_ms: int = 50,
+) -> int | None:
+    """Return the work-task count for ``project_key`` quickly.
+
+    The settings screen needs a non-blocking probe: ``None`` means the
+    DB is locked/busy and the caller should surface a ``busy`` indicator
+    rather than wait. Any other SQLite error is treated as ``0`` to
+    preserve the previous best-effort UI behavior.
+    """
+    try:
+        if not db_path.exists():
+            return 0
+    except OSError:
+        return 0
+    conn: sqlite3.Connection | None = None
+    try:
+        try:
+            conn = sqlite3.connect(
+                f"file:{db_path}?mode=ro",
+                uri=True,
+                timeout=connect_timeout,
+            )
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" in message or "busy" in message:
+                return None
+            return 0
+        except sqlite3.Error:
+            return 0
+        try:
+            conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        except sqlite3.Error:
+            pass
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM work_tasks WHERE project = ?",
+                (project_key,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if "locked" in message or "busy" in message:
+                return None
+            return 0
+        except sqlite3.Error:
+            return 0
+        if row is None:
+            return 0
+        try:
+            return int(row[0] or 0)
+        except (TypeError, ValueError):
+            return 0
+    finally:
+        if conn is not None:
+            conn.close()
+
+
 def has_work_task_rows(
     db_path: Path,
     *,

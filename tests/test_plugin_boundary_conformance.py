@@ -95,6 +95,7 @@ def test_transition_query_plugin_handlers_do_not_open_sqlite_directly() -> None:
 def test_work_task_query_callers_do_not_open_sqlite_directly() -> None:
     """Issue #1376: UI/plugin callers route work-task reads via facades."""
     rels = (
+        "src/pollypm/cockpit_settings_projects.py",
         "src/pollypm/dashboard_data.py",
         "src/pollypm/plugins_builtin/project_planning/cli/project.py",
     )

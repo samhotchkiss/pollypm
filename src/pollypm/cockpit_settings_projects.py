@@ -3,9 +3,9 @@
 Contract:
 - Inputs: the loaded PollyPM config plus a relative-age formatter.
 - Outputs: normalized project rows for the settings UI.
-- Side effects: reads project-path metadata and does read-only SQLite
-  queries with a very short timeout so busy project DBs do not stall UI
-  mount.
+- Side effects: reads project-path metadata and a fast, non-blocking
+  task-count probe via the work-service facade so busy project DBs do
+  not stall UI mount.
 - Invariants: callers get best-effort task totals; a locked DB surfaces
   as ``task_total_label='busy'`` instead of blocking the screen.
 """
@@ -14,7 +14,8 @@ from __future__ import annotations
 
 from datetime import datetime as _dt
 from pathlib import Path
-import sqlite3
+
+from pollypm.work.task_state import project_task_total_fast_count
 
 
 def collect_settings_projects(config, *, format_relative_age) -> list[dict]:
@@ -37,7 +38,9 @@ def collect_settings_projects(config, *, format_relative_age) -> list[dict]:
                     last_activity = _project_last_activity(
                         db_path, format_relative_age=format_relative_age
                     )
-                    task_total = _project_task_total(db_path, project_key=key)
+                    task_total = project_task_total_fast_count(
+                        db_path, project_key=key
+                    )
                     if task_total is None:
                         task_total_label = "busy"
                     else:
@@ -70,34 +73,6 @@ def _project_last_activity(db_path: Path, *, format_relative_age) -> str:
     except OSError:
         return ""
     return format_relative_age(_dt.fromtimestamp(mtime).isoformat())
-
-
-def _project_task_total(db_path: Path, *, project_key: str) -> int | None:
-    """Return a task count quickly, or ``None`` if the DB is busy."""
-
-    conn: sqlite3.Connection | None = None
-    try:
-        conn = sqlite3.connect(
-            f"file:{db_path}?mode=ro",
-            uri=True,
-            timeout=0.05,
-        )
-        conn.execute("PRAGMA busy_timeout=50")
-        row = conn.execute(
-            "SELECT COUNT(*) FROM work_tasks WHERE project = ?",
-            (project_key,),
-        ).fetchone()
-        return int(row[0] or 0) if row is not None else 0
-    except sqlite3.OperationalError as exc:
-        message = str(exc).lower()
-        if "locked" in message or "busy" in message:
-            return None
-        return 0
-    except sqlite3.Error:
-        return 0
-    finally:
-        if conn is not None:
-            conn.close()
 
 
 __all__ = ["collect_settings_projects"]

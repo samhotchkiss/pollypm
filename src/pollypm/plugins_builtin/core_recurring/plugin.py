@@ -11,6 +11,11 @@ from pollypm.maintenance_handlers_registry import (
     LOG_ROTATE,
     register_maintenance_handler,
 )
+from pollypm.tier4_actions_registry import (
+    register_dispatch_to_operator_tier4,
+    register_emit_tier4_demoted,
+    register_emit_tier4_global_action,
+)
 from pollypm.plugin_api.v1 import (
     Capability,
     JobHandlerAPI,
@@ -46,7 +51,10 @@ from pollypm.plugins_builtin.core_recurring.shared import (  # noqa: F401
 from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
     AUDIT_WATCHDOG_HANDLER_NAME,
     AUDIT_WATCHDOG_SCHEDULE,
+    _dispatch_to_operator_tier4,
+    _emit_tier4_demoted,
     audit_watchdog_handler,
+    emit_tier4_global_action,
 )
 from pollypm.plugins_builtin.core_recurring.blocked_chain import (
     blocked_chain_sweep_handler,
@@ -568,21 +576,26 @@ def _register_roster(api: RosterAPI) -> None:
 
 
 def _initialize(api: PluginAPI) -> None:
-    """Expose one-off entry points for the maintenance handlers (#1363).
+    """Expose one-off entry points for maintenance + tier-4 actions (#1363).
 
     ``doctor.py`` invokes ``agent_worktree.prune`` and ``log.rotate``
     directly as ``--fix`` actions instead of waiting for the next
-    cadence tick. Registering them in
-    :mod:`pollypm.maintenance_handlers_registry` lets the doctor resolve
-    them without importing from the optional plugin tree — when this
-    plugin isn't loaded the doctor reports the fix as "unavailable" and
-    keeps working.
+    cadence tick. ``cli_features/tier4.py`` (the ``pm tier4`` /
+    ``pm system`` command groups) invokes the tier-4 dispatch + audit
+    emit helpers. Registering all of them via core seams lets the
+    callers resolve them without importing from the optional plugin
+    tree — when this plugin isn't loaded the doctor reports the fix as
+    "unavailable" and ``pm tier4`` / ``pm system`` surface a clear
+    "tier-4 actions unavailable" message instead of crashing on import.
 
     Idempotent — safe to call again if the rail re-initializes plugins.
     """
-    del api  # unused — the registry is module-level state
+    del api  # unused — the registries are module-level state
     register_maintenance_handler(AGENT_WORKTREE_PRUNE, agent_worktree_prune_handler)
     register_maintenance_handler(LOG_ROTATE, log_rotate_handler)
+    register_dispatch_to_operator_tier4(_dispatch_to_operator_tier4)
+    register_emit_tier4_demoted(_emit_tier4_demoted)
+    register_emit_tier4_global_action(emit_tier4_global_action)
 
 
 plugin = PollyPMPlugin(

@@ -214,6 +214,12 @@ _SUPERVISOR_FILE = "src/pollypm/supervisor.py"
 _DEFAULT_LAUNCH_PLANNER_PLUGIN_PREFIX = (
     "pollypm.plugins_builtin.default_launch_planner"
 )
+# The ``pm tier4`` / ``pm system`` CLI surfaces resolve tier-4 dispatch
+# and audit-emit helpers through :mod:`pollypm.tier4_actions_registry`
+# instead of reaching into the optional ``core_recurring`` plugin
+# directly. (#1363, sibling of #1597 / #1621 / #1626 / #1672 / #1682 /
+# #1702.)
+_TIER4_CLI_FILE = "src/pollypm/cli_features/tier4.py"
 
 
 def _imports_module(source_file: Path, module: str) -> bool:
@@ -405,6 +411,34 @@ def test_supervisor_does_not_import_default_launch_planner_plugin() -> None:
         f"{_DEFAULT_LAUNCH_PLANNER_PLUGIN_PREFIX}; import "
         "DefaultLaunchPlannerContext from pollypm.launch_planner_protocol "
         "instead so the plugin stays optional."
+    )
+
+
+def test_tier4_cli_does_not_import_core_recurring_plugin() -> None:
+    """``pm tier4`` / ``pm system`` resolve tier-4 actions via the core seam.
+
+    :mod:`pollypm.tier4_actions_registry` is the sanctioned read path for
+    ``dispatch_to_operator_tier4``, ``emit_tier4_demoted``, and
+    ``emit_tier4_global_action``. The ``core_recurring`` plugin installs
+    the real callables during ``initialize``; if ``cli_features/tier4.py``
+    reaches into the plugin tree directly we re-couple core to an
+    "optional" plugin and the CLI stops degrading cleanly when the
+    plugin is disabled. Fail loudly so the seam stays clean.
+    """
+    root = _project_root()
+    source_file = root / _TIER4_CLI_FILE
+    assert source_file.exists(), (
+        f"Expected {_TIER4_CLI_FILE} to exist — boundary test "
+        "needs updating if the file moved."
+    )
+    assert not _imports_module_or_subpackage(
+        source_file, _CORE_RECURRING_PLUGIN_PREFIX
+    ), (
+        f"{_TIER4_CLI_FILE} must not import from "
+        f"{_CORE_RECURRING_PLUGIN_PREFIX}; use "
+        "pollypm.tier4_actions_registry (dispatch_to_operator_tier4, "
+        "emit_tier4_demoted, emit_tier4_global_action) instead so the "
+        "plugin stays optional."
     )
 
 

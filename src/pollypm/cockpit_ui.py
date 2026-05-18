@@ -12485,6 +12485,161 @@ def _dashboard_steps_from_body(body: str) -> list[str]:
     return deduped[:4]
 
 
+def _dashboard_user_prompt_decision(
+    prompt: object, *, fallback_task_id: str | None = None,
+) -> dict[str, object] | None:
+    """Build a decision dict from a structured ``user_prompt`` payload.
+
+    Returns ``None`` if ``prompt`` is not a dict. Extracted from
+    ``_dashboard_inbox`` so each branch can be exercised directly in
+    tests (issue #1356).
+    """
+    if not isinstance(prompt, dict):
+        return None
+    summary = _dashboard_plain_text(prompt.get("summary"))
+    question = _dashboard_plain_text(prompt.get("question"))
+    raw_steps = prompt.get("steps") or prompt.get("required_actions") or []
+    if not isinstance(raw_steps, list):
+        raw_steps = []
+    steps = [
+        _dashboard_plain_text(step).rstrip(".") + "."
+        for step in raw_steps
+        if _dashboard_plain_text(step)
+    ][:5]
+    raw_actions = prompt.get("actions") or []
+    if not isinstance(raw_actions, list):
+        raw_actions = []
+    actions: list[dict[str, object]] = []
+    for raw_action in raw_actions[:2]:
+        if not isinstance(raw_action, dict):
+            continue
+        label = _dashboard_plain_text(raw_action.get("label"))
+        # ``kind`` is a structured dispatch identifier — values like
+        # ``approve_task``, ``review_plan``, ``open_inbox``. We MUST
+        # NOT route it through ``_dashboard_plain_text`` because that
+        # strips the underscores out of markdown-decoration tokens,
+        # leaving ``approvetask`` / ``reviewplan`` etc., which then
+        # fail to match every branch in ``_perform_dashboard_action``.
+        # That was the silent root cause of "buttons record replies
+        # but don't drive the underlying task transition" — every
+        # custom action fell through to the generic record path.
+        kind = str(raw_action.get("kind") or "").strip()
+        if not label or not kind:
+            continue
+        action = dict(raw_action)
+        action["label"] = label
+        action["kind"] = kind
+        actions.append(action)
+    if not actions:
+        actions = [
+            {
+                "label": "Open task",
+                "kind": "open_task",
+                "task_id": fallback_task_id,
+            }
+        ]
+    primary_action = actions[0]
+    secondary_action = actions[1] if len(actions) > 1 else {
+        "label": "Open task",
+        "kind": "open_task",
+        "task_id": fallback_task_id,
+    }
+    return {
+        "plain_prompt": summary or "Polly needs your input before this project can continue.",
+        "unblock_steps": steps,
+        "steps_heading": _dashboard_plain_text(prompt.get("steps_heading")) or "What to do",
+        "decision_question": question or "Choose how Polly should proceed.",
+        "primary_label": str(primary_action.get("label") or "Open task"),
+        "secondary_label": str(secondary_action.get("label") or "Open task"),
+        "primary_action": primary_action,
+        "secondary_action": secondary_action,
+        "other_placeholder": _dashboard_plain_text(prompt.get("other_placeholder"))
+        or "Tell Polly what to do instead...",
+    }
+
+
+def _dashboard_deployment_decision(
+    body: str, steps: list[str],
+) -> dict[str, object]:
+    """Build a "deployment required" decision dict from a blocker body.
+
+    Extracted from ``_dashboard_inbox`` so the token-driven branch
+    table can be tested in isolation (issue #1356).
+    """
+    lower = body.lower()
+    setup_steps: list[str] = []
+    if any(token in lower for token in ("fly.io", "fly ", "live fly")):
+        setup_steps.append("Set up the Fly.io app for this project.")
+    if any(token in lower for token in ("deploy token", "org cred", "credential", "creds", "fly-enabled", "access")):
+        setup_steps.append(
+            "Give Polly deployment access, including the Fly.io org/app credentials or deploy token."
+        )
+    if any(token in lower for token in ("postgres", "redis", "database")):
+        setup_steps.append("Provision the required Postgres and Redis services.")
+    if any(token in lower for token in ("pipeline", "fly deploy", "deploy can run", "live environment")):
+        setup_steps.append("Confirm the deployment pipeline can run against the live environment.")
+    if any(token in lower for token in ("rollback", "smoke", "/v1/ping", "walkthrough", "clean laptop")):
+        setup_steps.append("Make the live app reachable so Polly can run the smoke test and rollback walkthrough.")
+    for step in steps:
+        clean = _dashboard_plain_text(step).rstrip(".")
+        if not clean:
+            continue
+        if not clean.lower().startswith(
+            (
+                "add ",
+                "create ",
+                "grant ",
+                "provision ",
+                "set up ",
+                "setup ",
+                "provide ",
+                "enable ",
+                "configure ",
+            )
+        ):
+            continue
+        normalized = clean.casefold()
+        if any(normalized == existing.rstrip(".").casefold() for existing in setup_steps):
+            continue
+        setup_steps.append(clean + ".")
+    deduped_steps: list[str] = []
+    seen: set[str] = set()
+    for step in setup_steps:
+        key = step.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped_steps.append(step)
+    if not deduped_steps:
+        deduped_steps = [
+            "Set up the deployment environment Polly needs for end-to-end testing."
+        ]
+    return {
+        "plain_prompt": (
+            "The first batch of code is done, but Polly cannot fully test it "
+            "until the deployment environment exists."
+        ),
+        "unblock_steps": deduped_steps[:5],
+        "steps_heading": "What you need to set up",
+        "decision_question": (
+            "Do you want to approve the code work now and make deployment "
+            "testing a follow-up, or wait until the environment is set?"
+        ),
+        "primary_label": "Approve it anyway",
+        "secondary_label": "Wait until environment is set",
+        "primary_response": (
+            "Approve it anyway. Treat the code work as accepted now and create "
+            "a follow-up task for deployment, smoke testing, and rollback once "
+            "the environment is ready."
+        ),
+        "secondary_response": (
+            "Wait until the environment is set. Do not approve this work until "
+            "Polly can deploy and test it end to end."
+        ),
+        "other_placeholder": "Tell Polly what to do instead...",
+    }
+
+
 def _dashboard_task_blocker_body(task: object) -> str:
     """Pick the clearest human-facing blocker text from a task."""
     body, _ = _dashboard_task_blocker_body_with_kind(task)
@@ -13454,71 +13609,7 @@ def _dashboard_inbox(
             return _trim(f"Next: {steps[0]}", limit=260)
         return ""
 
-    def _user_prompt_decision(
-        prompt: object, *, fallback_task_id: str | None = None,
-    ) -> dict[str, object] | None:
-        if not isinstance(prompt, dict):
-            return None
-        summary = _plain_text(prompt.get("summary"))
-        question = _plain_text(prompt.get("question"))
-        raw_steps = prompt.get("steps") or prompt.get("required_actions") or []
-        if not isinstance(raw_steps, list):
-            raw_steps = []
-        steps = [
-            _plain_text(step).rstrip(".") + "."
-            for step in raw_steps
-            if _plain_text(step)
-        ][:5]
-        raw_actions = prompt.get("actions") or []
-        if not isinstance(raw_actions, list):
-            raw_actions = []
-        actions: list[dict[str, object]] = []
-        for raw_action in raw_actions[:2]:
-            if not isinstance(raw_action, dict):
-                continue
-            label = _plain_text(raw_action.get("label"))
-            # ``kind`` is a structured dispatch identifier — values like
-            # ``approve_task``, ``review_plan``, ``open_inbox``. We MUST
-            # NOT route it through ``_plain_text`` because that strips
-            # the underscores out of markdown-decoration tokens, leaving
-            # ``approvetask`` / ``reviewplan`` etc., which then fail to
-            # match every branch in ``_perform_dashboard_action``. That
-            # was the silent root cause of "buttons record replies but
-            # don't drive the underlying task transition" — every
-            # custom action fell through to the generic record path.
-            kind = str(raw_action.get("kind") or "").strip()
-            if not label or not kind:
-                continue
-            action = dict(raw_action)
-            action["label"] = label
-            action["kind"] = kind
-            actions.append(action)
-        if not actions:
-            actions = [
-                {
-                    "label": "Open task",
-                    "kind": "open_task",
-                    "task_id": fallback_task_id,
-                }
-            ]
-        primary_action = actions[0]
-        secondary_action = actions[1] if len(actions) > 1 else {
-            "label": "Open task",
-            "kind": "open_task",
-            "task_id": fallback_task_id,
-        }
-        return {
-            "plain_prompt": summary or "Polly needs your input before this project can continue.",
-            "unblock_steps": steps,
-            "steps_heading": _plain_text(prompt.get("steps_heading")) or "What to do",
-            "decision_question": question or "Choose how Polly should proceed.",
-            "primary_label": str(primary_action.get("label") or "Open task"),
-            "secondary_label": str(secondary_action.get("label") or "Open task"),
-            "primary_action": primary_action,
-            "secondary_action": secondary_action,
-            "other_placeholder": _plain_text(prompt.get("other_placeholder"))
-            or "Tell Polly what to do instead...",
-        }
+    _user_prompt_decision = _dashboard_user_prompt_decision
 
     def _plan_review_decision(
         labels: list[str], body: str, *, fallback_task_id: str | None = None,
@@ -13581,79 +13672,7 @@ def _dashboard_inbox(
             "plan_text": plan_text or "",
         }
 
-    def _deployment_decision(body: str, steps: list[str]) -> dict[str, object]:
-        lower = body.lower()
-        setup_steps: list[str] = []
-        if any(token in lower for token in ("fly.io", "fly ", "live fly")):
-            setup_steps.append("Set up the Fly.io app for this project.")
-        if any(token in lower for token in ("deploy token", "org cred", "credential", "creds", "fly-enabled", "access")):
-            setup_steps.append(
-                "Give Polly deployment access, including the Fly.io org/app credentials or deploy token."
-            )
-        if any(token in lower for token in ("postgres", "redis", "database")):
-            setup_steps.append("Provision the required Postgres and Redis services.")
-        if any(token in lower for token in ("pipeline", "fly deploy", "deploy can run", "live environment")):
-            setup_steps.append("Confirm the deployment pipeline can run against the live environment.")
-        if any(token in lower for token in ("rollback", "smoke", "/v1/ping", "walkthrough", "clean laptop")):
-            setup_steps.append("Make the live app reachable so Polly can run the smoke test and rollback walkthrough.")
-        for step in steps:
-            clean = _plain_text(step).rstrip(".")
-            if not clean:
-                continue
-            if not clean.lower().startswith(
-                (
-                    "add ",
-                    "create ",
-                    "grant ",
-                    "provision ",
-                    "set up ",
-                    "setup ",
-                    "provide ",
-                    "enable ",
-                    "configure ",
-                )
-            ):
-                continue
-            normalized = clean.casefold()
-            if any(normalized == existing.rstrip(".").casefold() for existing in setup_steps):
-                continue
-            setup_steps.append(clean + ".")
-        deduped_steps: list[str] = []
-        seen: set[str] = set()
-        for step in setup_steps:
-            key = step.casefold()
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped_steps.append(step)
-        if not deduped_steps:
-            deduped_steps = [
-                "Set up the deployment environment Polly needs for end-to-end testing."
-            ]
-        return {
-            "plain_prompt": (
-                "The first batch of code is done, but Polly cannot fully test it "
-                "until the deployment environment exists."
-            ),
-            "unblock_steps": deduped_steps[:5],
-            "steps_heading": "What you need to set up",
-            "decision_question": (
-                "Do you want to approve the code work now and make deployment "
-                "testing a follow-up, or wait until the environment is set?"
-            ),
-            "primary_label": "Approve it anyway",
-            "secondary_label": "Wait until environment is set",
-            "primary_response": (
-                "Approve it anyway. Treat the code work as accepted now and create "
-                "a follow-up task for deployment, smoke testing, and rollback once "
-                "the environment is ready."
-            ),
-            "secondary_response": (
-                "Wait until the environment is set. Do not approve this work until "
-                "Polly can deploy and test it end to end."
-            ),
-            "other_placeholder": "Tell Polly what to do instead...",
-        }
+    _deployment_decision = _dashboard_deployment_decision
 
     def _plain_decision_from_body(
         subject: str, body: str, steps: list[str],

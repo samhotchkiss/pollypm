@@ -105,6 +105,9 @@ from pollypm.cockpit_settings_confirm import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_inbox_rollup_item import (  # noqa: F401  (re-exported)
     _RollupItem,
 )
+from pollypm.cockpit_settings_data import (  # noqa: F401  (re-exported)
+    SettingsData,
+)
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
     clear_live_chat_network_dead_notice,
@@ -3764,45 +3767,6 @@ def _format_recent_task(task: object) -> str:
         bits.append(f"[dim]{_escape(str(status))}[/dim]")
     bits.append(f"[dim]{_escape(title)}[/dim]")
     return " · ".join(bits)
-
-
-class SettingsData:
-    """Snapshot of everything the settings screen renders — gathered once."""
-
-    __slots__ = (
-        "accounts",
-        "projects",
-        "roles",
-        "heartbeat",
-        "plugins",
-        "planner",
-        "inbox",
-        "about",
-        "errors",
-    )
-
-    def __init__(
-        self,
-        *,
-        accounts: list[dict],
-        projects: list[dict],
-        roles: list[dict],
-        heartbeat: list[tuple[str, str]],
-        plugins: list[dict],
-        planner: list[tuple[str, str]],
-        inbox: list[tuple[str, str]],
-        about: list[tuple[str, str]],
-        errors: list[str],
-    ) -> None:
-        self.accounts = accounts
-        self.projects = projects
-        self.roles = roles
-        self.heartbeat = heartbeat
-        self.plugins = plugins
-        self.planner = planner
-        self.inbox = inbox
-        self.about = about
-        self.errors = errors
 
 
 def _collect_recent_tasks_by_account(
@@ -12112,6 +12076,7 @@ def _dashboard_status(
     in_progress_count: int = 0,
     plan_task_summary: dict | None = None,
     alert_types: list[str] | None = None,
+    plan_on_disk: bool = False,
 ) -> tuple[str, str, str]:
     """Return (dot, colour, label) for the top-bar project status light.
 
@@ -12141,6 +12106,23 @@ def _dashboard_status(
         and plan_task_summary
         and alert_types
         and "plan_missing" in alert_types
+    ):
+        return ("\u25c6", "#3ddc84", "plan ready")
+    # #1710 \u2014 the plan file is on disk (canonical path OR the worktree
+    # fallback from #1709) but no ``plan_task_summary`` reached the
+    # backstop matcher (e.g. the plan task is a ``plan_project`` flow
+    # which the backstop intentionally excludes). The previous predicate
+    # routed this to ``\u25c7 next step`` + "Press c to plan", telling Sam to
+    # plan a project that already has a plan ready. Treat a plan on
+    # disk as the same teammate-handoff signal a ``plan_task_summary``
+    # provides so the pill reads ``\u25c6 plan ready`` and the banner CTA
+    # celebrates instead of nagging.
+    if (
+        alert_count
+        and plan_on_disk
+        and alert_types
+        and "plan_missing" in alert_types
+        and not plan_task_summary
     ):
         return ("\u25c6", "#3ddc84", "plan ready")
     # #1540 \u2014 a fresh project with no plan yet is the *default* early
@@ -14618,6 +14600,7 @@ def _gather_project_dashboard_fast(
         in_progress_count=in_progress_count,
         plan_task_summary=plan_task_summary,
         alert_types=alert_types,
+        plan_on_disk=plan_path is not None,
     )
 
     # Resolve effective enforce_plan with the same precedence the rail
@@ -14703,6 +14686,7 @@ def _augment_project_dashboard_secondary(
         in_progress_count=in_progress_count,
         plan_task_summary=data.plan_task_summary,
         alert_types=alert_types,
+        plan_on_disk=getattr(data, "plan_path", None) is not None,
     )
     data.activity_entries = activity_entries
     data.active_worker = active_worker
@@ -14806,6 +14790,9 @@ def _alert_banner_copy(
     *,
     plan_task_summary: dict | None = None,
     persona_name: str | None = None,
+    plan_on_disk: bool = False,
+    queued_count: int = 0,
+    blocked_count: int = 0,
 ) -> str | None:
     """Return banner copy describing the alerts waiting on the user.
 
@@ -14877,6 +14864,34 @@ def _alert_banner_copy(
             return (
                 f"Plan's ready — {title}. Press → to review together"
                 f"{other_part}"
+            )
+        # #1710 — the plan file is on disk (canonical or worktree-
+        # fallback path from #1709) but the backstop matcher didn't
+        # see a ``plan_task_summary`` (typically because the plan was
+        # produced by a ``plan_project`` flow that's excluded from
+        # backstop emission). Telling Sam to "Press c to plan this"
+        # at that point sends him to chat about planning a project
+        # that's already planned. Celebrate the handoff and route him
+        # to the plan-viewer (``p``) + approve (``A``) keystrokes
+        # instead.
+        if plan_on_disk:
+            pm_label = (persona_name or "").strip() or "the PM"
+            task_parts: list[str] = []
+            if queued_count:
+                task_parts.append(
+                    f"{queued_count} task"
+                    + ("s" if queued_count != 1 else "")
+                    + " queued"
+                )
+            if blocked_count:
+                task_parts.append(
+                    f"{blocked_count} blocked"
+                )
+            task_tail = (" · " + ", ".join(task_parts)) if task_parts else ""
+            return (
+                f"Plan ready — your turn. {pm_label} has finished "
+                f"planning{task_tail}. Press p to review · A to "
+                f"approve and kick off"
             )
         # #1540 — name the PM (Archie/Cole/...) when one is configured
         # so the banner reads as an invitation to a teammate, not a
@@ -15206,7 +15221,10 @@ class PollyProjectDashboardApp(App[None]):
         # this drilldown. When one is present we run the plan-approval
         # celebration flow (10s undo + persona toast). Otherwise we
         # fall through to the legacy alerts view.
+        # #1710 — the plan-on-disk banner CTA advertises capital ``A``
+        # (mirrors the inbox plan-review surface), so bind both.
         Binding("a", "approve_or_alerts", "Approve / Alerts", show=False),
+        Binding("A", "approve_or_alerts", "Approve / Alerts", show=False),
         # #1531 — ``→`` opens the plan-review surface (full plan body
         # inline) when a plan-shaped done task is awaiting review. The
         # banner CTA advertises this keystroke (mirrors the inbox →
@@ -15567,10 +15585,65 @@ class PollyProjectDashboardApp(App[None]):
         10s undo + persona celebration toast the inbox uses. When no
         plan_review card is present we fall back to the legacy alert
         list view that ``a`` historically opened.
+
+        #1710 — when the banner's plan-on-disk celebratory CTA is
+        showing (plan file exists, no actionable plan_review task), the
+        plan has already been approved at some point — the
+        ``plan_missing`` alert is stale relative to the work the
+        architect already shipped. Surface a notify that names that
+        state so Sam isn't dropped into the alert list with no context.
         """
         if self._approve_first_plan_review_if_present():
             return
+        if self._notify_plan_already_approved_if_applicable():
+            return
         self.action_view_alerts()
+
+    def _notify_plan_already_approved_if_applicable(self) -> bool:
+        """Surface a 'plan already approved' notify in the #1710 state.
+
+        Fires when the banner's "Plan ready — your turn" copy is
+        showing — i.e. the alert family is exclusively ``plan_missing``,
+        no ``plan_task_summary`` reached the dashboard, but the plan
+        file IS on disk (canonical path OR the worktree fallback from
+        #1709). In that state the plan has already been approved and
+        the alert is stale; ``A`` should explain that rather than open
+        the alert list.
+
+        Returns True iff a notify was emitted (caller should stop).
+        """
+        data = getattr(self, "data", None)
+        if data is None:
+            return False
+        alert_types = list(getattr(data, "alert_types", []) or [])
+        plan_summary = getattr(data, "plan_task_summary", None)
+        plan_on_disk = bool(getattr(data, "plan_path", None))
+        if not (
+            alert_types == ["plan_missing"]
+            and not plan_summary
+            and plan_on_disk
+        ):
+            return False
+        counts = getattr(data, "task_counts", {}) or {}
+        queued = int(counts.get("queued", 0))
+        blocked = int(counts.get("blocked", 0))
+        tail_parts: list[str] = []
+        if queued:
+            tail_parts.append(
+                f"{queued} task" + ("s" if queued != 1 else "") + " queued"
+            )
+        if blocked:
+            tail_parts.append(
+                f"{blocked} blocked on required inputs"
+            )
+        tail = (" · " + ", ".join(tail_parts)) if tail_parts else ""
+        self.notify(
+            f"Plan already approved{tail}. Press p to review the plan, "
+            "c to chat with the PM about required inputs.",
+            severity="information",
+            timeout=6.0,
+        )
+        return True
 
     def action_undo_plan_approval_or_refresh(self) -> None:
         """``u`` — undo a pending plan approval, or fall back to refresh."""
@@ -16232,11 +16305,24 @@ class PollyProjectDashboardApp(App[None]):
                 getattr(data, "pm_persona", None)
                 or getattr(data, "persona_name", None)
             )
+            # #1710 — plumb the on-disk plan signal into the banner so a
+            # ``plan_missing`` alert with no ``plan_task_summary`` but
+            # an actual plan file (canonical OR worktree-fallback path
+            # from #1709) can switch from the "Press c to plan" nag to
+            # the "Plan ready — press p to review" celebration. Without
+            # this branch a project whose plan_project flow finished
+            # ``done`` reads as "go plan this project" because the
+            # backstop matcher intentionally excludes that flow.
+            plan_on_disk = bool(getattr(data, "plan_path", None))
+            counts = getattr(data, "task_counts", {}) or {}
             specific = _alert_banner_copy(
                 getattr(data, "alert_types", []) or [],
                 int(data.alert_count),
                 plan_task_summary=getattr(data, "plan_task_summary", None),
                 persona_name=pm_persona,
+                plan_on_disk=plan_on_disk,
+                queued_count=int(counts.get("queued", 0)),
+                blocked_count=int(counts.get("blocked", 0)),
             )
             if specific:
                 # #1540 — drop the trailing ``· 1 alert`` for the
@@ -16245,6 +16331,9 @@ class PollyProjectDashboardApp(App[None]):
                 # not an alert the user should be chastised for. The
                 # action-bar pill still surfaces the count for users
                 # who want it; the banner stays clean.
+                # #1710 — same suppression for the plan-on-disk
+                # celebratory CTA so the banner doesn't trail "· 1
+                # alert" after a Plan-ready handoff.
                 alert_types = list(getattr(data, "alert_types", []) or [])
                 plan_summary = getattr(data, "plan_task_summary", None)
                 if (

@@ -4,19 +4,55 @@ import json
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any, Protocol
 
 from pollypm.atomic_io import atomic_write_json
 from pollypm.checkpoints import record_checkpoint, snapshot_hash, write_mechanical_checkpoint
 from pollypm.heartbeats.base import HeartbeatCursor, HeartbeatSessionContext, HeartbeatUnmanagedWindow
 from pollypm.heartbeats.types import Alert
 
-if TYPE_CHECKING:
-    from pollypm.supervisor import Supervisor
+
+class _SupervisorHost(Protocol):
+    """Structural type for the slice of the Supervisor the heartbeat API uses.
+
+    The heartbeat API only needs a small, stable surface on its host
+    (launch plan + tmux window enumeration, snapshot writing, store /
+    msg_store routing, recovery dispatch, and session-input delivery).
+    Declaring that surface as a :class:`Protocol` lets ``heartbeats.api``
+    stay decoupled from :mod:`pollypm.supervisor` — the previous
+    TYPE_CHECKING back-reference is what put the two modules in a
+    static-graph 2-cycle (#1367). :class:`pollypm.supervisor.Supervisor`
+    satisfies this protocol structurally; no runtime registration is
+    required.
+
+    Returns are typed as :class:`typing.Any` so concrete dataclass /
+    runtime types (``SessionLaunchSpec``, ``TmuxWindow``, ``StateStore``,
+    ``MessageStore``, ``PollyPMConfig`` …) do not need to be re-imported
+    here — that would just push the cycle elsewhere.
+    """
+
+    # Attribute access used by the heartbeat API.
+    store: Any
+    msg_store: Any
+    config: Any
+    session_service: Any
+
+    # Method surface.
+    def plan_launches(self) -> Any: ...
+    def console_window_name(self) -> str: ...
+    def window_map(self) -> Any: ...
+    def launch_by_session(self, session_name: str) -> Any: ...
+    def tmux_session_for_launch(self, launch: Any) -> str: ...
+    def write_snapshot(self, window: Any, snapshot_lines: int) -> tuple[Path, str]: ...
+    def open_alerts(self) -> Any: ...
+    def maybe_recover_session(
+        self, launch: Any, *, failure_type: str, failure_message: str
+    ) -> None: ...
+    def send_input(self, session_name: str, text: str, *, owner: str = ...) -> None: ...
 
 
 class SupervisorHeartbeatAPI:
-    def __init__(self, supervisor: Supervisor, *, snapshot_lines: int = 200) -> None:
+    def __init__(self, supervisor: _SupervisorHost, *, snapshot_lines: int = 200) -> None:
         self.supervisor = supervisor
         self.snapshot_lines = snapshot_lines
         self._contexts = self._build_contexts()

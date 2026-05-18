@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pollypm.inbox.kind import InboxItemKind
 from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
     OPERATOR_DISPATCH_THROTTLE_SECONDS,
@@ -1662,6 +1663,7 @@ def _create_operator_inbox_task(
                 labels=["notify", "watchdog"],
                 payload=seeded_payload,
                 state="closed",
+                kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
     finally:
         store.close()
@@ -1689,6 +1691,7 @@ def _create_operator_inbox_task(
             priority="high",
             created_by="audit_watchdog",
             labels=task_labels,
+            kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
         )
         inbox_task_id = task.task_id
         store2 = SQLAlchemyStore(f"sqlite:///{db_path}")
@@ -1835,6 +1838,7 @@ def _create_operator_tier4_inbox_task(
                 labels=["notify", "watchdog", "tier4"],
                 payload=seeded_payload,
                 state="closed",
+                kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
     finally:
         store.close()
@@ -1863,6 +1867,7 @@ def _create_operator_tier4_inbox_task(
             priority="high",
             created_by="audit_watchdog",
             labels=task_labels,
+            kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
         )
         inbox_task_id = task.task_id
         store2 = SQLAlchemyStore(f"sqlite:///{db_path}")
@@ -2305,6 +2310,7 @@ def _route_tier4_to_terminal(
                 "forensics_path": handoff.forensics_path,
             },
             state="closed",
+            kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
         )
         return bool(message_id)
     except Exception:  # noqa: BLE001

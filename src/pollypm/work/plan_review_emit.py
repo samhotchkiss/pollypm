@@ -47,6 +47,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from pollypm.inbox.kind import InboxItemKind
 from pollypm.work.models import WorkStatus
 
 logger = logging.getLogger(__name__)
@@ -325,6 +326,7 @@ def emit_plan_review_for_task(
                     "backstop_source": "plan_review_emit",
                 },
                 state="closed",  # mirrors session_runtime.notify for immediate tier
+                kind=InboxItemKind.PLAN_REVIEW_PENDING.value,
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug(
@@ -371,6 +373,7 @@ def emit_plan_review_for_task(
             priority="high",
             created_by=actor or "audit_watchdog",
             labels=deduped,
+            kind=InboxItemKind.PLAN_REVIEW_PENDING.value,
         )
         inbox_task_id = getattr(new_task, "task_id", None)
     except Exception as exc:  # noqa: BLE001

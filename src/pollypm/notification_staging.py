@@ -49,6 +49,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pollypm.inbox.kind import InboxItemKind
+
 logger = logging.getLogger(__name__)
 
 
@@ -326,6 +328,7 @@ def flush_milestone_digest(
         priority="normal",
         created_by=actor,
         labels=labels,
+        kind=InboxItemKind.MANUAL_DECISION.value,
     )
 
     # Persist each staged row as a ``rollup_item`` context entry so the
@@ -587,6 +590,7 @@ def check_regression_on_reopen(
             roles={"requester": "user", "operator": actor},
             priority="high",
             created_by=actor,
+            kind=InboxItemKind.MANUAL_DECISION.value,
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("regression notify failed for %s: %s", task_id, exc)

@@ -36,6 +36,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from pollypm.inbox.kind import InboxItemKind
+
 logger = logging.getLogger(__name__)
 
 
@@ -314,6 +316,10 @@ def create_blocking_question_inbox_item(
     labels = [label for label in labels if label]
 
     try:
+        # operator is the PM persona (default ``polly``), not the user
+        # — Polly resolves the blocker; she only escalates to the user
+        # if she can't. Tag as activity_event so it stays out of the
+        # user-facing "Waiting on you" list.
         inbox_task = work_service.create(
             title=title,
             description=body,
@@ -324,6 +330,7 @@ def create_blocking_question_inbox_item(
             priority="normal",
             created_by=session_name,
             labels=labels,
+            kind=InboxItemKind.ACTIVITY_EVENT.value,
         )
     except Exception:  # noqa: BLE001
         logger.exception(

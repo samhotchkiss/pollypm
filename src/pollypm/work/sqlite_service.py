@@ -60,7 +60,7 @@ from pollypm.signal_routing import (  # noqa: E402
 register_routed_emitter("work_service")
 
 from pollypm.atomic_io import atomic_write_json
-from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
+from pollypm.inbox.kind import InboxItemKind, coerce_kind as _coerce_inbox_kind
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates
 from pollypm.work.models import (
@@ -667,6 +667,7 @@ def _record_first_shipped_activity(
             body=body,
             scope="polly",
             payload=payload,
+            kind=InboxItemKind.COMPLETION_FYI.value,
         )
     finally:
         store.close()
@@ -1906,6 +1907,7 @@ class SQLiteWorkService:
                 label,
             ],
             requires_human_review=False,
+            kind=InboxItemKind.APPROVAL_REQUEST.value,
         )
 
     def approve_human_review(

@@ -6,6 +6,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from pollypm.inbox.kind import InboxItemKind
+
 from .shared import (
     _close_msg_store,
     _load_config_and_store,
@@ -693,6 +695,9 @@ def _emit_pane_pattern_inbox_item(
     ]
 
     try:
+        # Pane-pattern findings (zombie sessions, idle prompts, …) go
+        # to Polly to recover, not to the user. Activity-event tier on
+        # the user-facing surface.
         inbox_task = work_service.create(
             title=title,
             description=body,
@@ -703,6 +708,7 @@ def _emit_pane_pattern_inbox_item(
             priority="normal",
             created_by=session_name,
             labels=labels,
+            kind=InboxItemKind.ACTIVITY_EVENT.value,
         )
     except Exception:  # noqa: BLE001
         logger.debug(

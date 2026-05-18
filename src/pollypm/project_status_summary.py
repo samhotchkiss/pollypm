@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
 
+from pollypm.inbox.kind import InboxItemKind
+
 
 @dataclass(slots=True)
 class ProjectBlockerSummary:
@@ -211,6 +213,7 @@ def record_project_blocker_summary(
                 f"blocker_event:{event_id}",
             ],
             requires_human_review=False,
+            kind=InboxItemKind.MANUAL_DECISION.value,
         )
         task_id = task.task_id
         store.update_message(event_id, payload={**payload, "task_id": task_id})

@@ -30,6 +30,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
+from pollypm.inbox.kind import InboxItemKind
+
 
 # Severity values accepted on a proposal. Kept deliberately short so the
 # label suffix stays readable in the inbox row.
@@ -200,6 +202,7 @@ def emit_proposals(
             priority="normal",
             created_by="architect",
             labels=labels,
+            kind=InboxItemKind.APPROVAL_REQUEST.value,
         )
         created.append(task.task_id)
     return created

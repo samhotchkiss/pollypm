@@ -7873,12 +7873,71 @@ class _InboxListItem(ListItem):
         )
 
 
+# Inbox lens taxonomy (#1573). The default lens is ``awaits-you`` —
+# the same curated set the dashboard "Waiting on you" section shows
+# (rail badge count == default-view count == dashboard section length;
+# pinned by ``tests/test_inbox_default_lens.py``). The remaining
+# lenses are archive views over the historical data, scoped by
+# :class:`InboxItemKind`. Order here drives the cycle order on ``L``
+# and the digit mapping for direct ``1``/``2``/``…`` selection.
+_INBOX_LENSES: tuple[tuple[str, str, str], ...] = (
+    # (slug, label, empty-state copy)
+    (
+        "awaits-you",
+        "Awaiting you",
+        "Nothing awaiting your action. Check the operator dashboard "
+        "for working/idle projects.",
+    ),
+    (
+        "all",
+        "All messages",
+        "Inbox is empty.",
+    ),
+    (
+        "completion-fyi",
+        "Completion FYI",
+        "No completion notifications.",
+    ),
+    (
+        "activity-events",
+        "Activity events",
+        "No activity events recorded.",
+    ),
+    (
+        "self-bug-reports",
+        "Self bug reports",
+        "No self-reported bugs. (Use `pm bug-report` to file one.)",
+    ),
+    (
+        "legacy",
+        "Legacy (unclassified)",
+        "All legacy rows have been classified. (Or backfill hasn't run "
+        "yet — try `pm inbox backfill-kinds --dry-run`.)",
+    ),
+)
+
+# Slug -> :class:`InboxItemKind` for the kind-scoped lenses. ``awaits-you``
+# and ``all`` are handled separately (predicate vs. no-filter); the rest
+# are direct kind matches.
+_INBOX_LENS_KINDS: dict[str, str] = {
+    "completion-fyi": "completion_fyi",
+    "activity-events": "activity_event",
+    "self-bug-reports": "self_bug_report",
+    "legacy": "legacy",
+}
+
+_INBOX_DEFAULT_LENS_SLUG = "awaits-you"
+
+
 class PollyInboxApp(App[None]):
     """Interactive cockpit inbox — two-pane list + detail with reply/archive.
 
-    Opened via ``pm cockpit-pane inbox``. Replaces the previous read-only
-    text dump so the user can drive the inbox entirely from the TUI
-    without falling back to the CLI.
+    Opened via ``pm cockpit-pane inbox``. Default lens is the curated
+    ``awaits-you`` set (#1573) — the same predicate the rail badge and
+    the operator dashboard's "Waiting on you" section use. Archive
+    lenses (``all``, ``completion-fyi``, ``activity-events``,
+    ``self-bug-reports``, ``legacy``) are reachable via ``L`` (cycle)
+    or ``1``…``6`` (direct selection).
     """
 
     TITLE = "PollyPM"
@@ -8172,6 +8231,19 @@ class PollyInboxApp(App[None]):
         # buried under 30 historical FYIs.
         Binding("n", "toggle_show_notifications", "Show notifications", show=False),
         Binding("c", "clear_filters", "Clear filters", show=False),
+        # Lens toggle (#1573). ``L`` cycles through the lens list, and
+        # ``1``..``6`` jump straight to a specific lens. The default
+        # lens (``awaits-you``) reads from the canonical
+        # :func:`pollypm.inbox.awaits_user` predicate so it always
+        # matches the rail badge + the dashboard "Waiting on you"
+        # section. Archive lenses surface the historical kind buckets.
+        Binding("L", "cycle_lens", "Cycle lens", show=False),
+        Binding("1", "select_lens_1", "Lens: awaits-you", show=False),
+        Binding("2", "select_lens_2", "Lens: all", show=False),
+        Binding("3", "select_lens_3", "Lens: completion-fyi", show=False),
+        Binding("4", "select_lens_4", "Lens: activity-events", show=False),
+        Binding("5", "select_lens_5", "Lens: self-bug-reports", show=False),
+        Binding("6", "select_lens_6", "Lens: legacy", show=False),
         # Refresh: ``u`` re-bound to filter, so refresh moves to ``ctrl+r``
         # (palette 'session.refresh' still works from any screen).
         Binding("ctrl+r", "refresh", "Refresh", show=False),
@@ -8278,6 +8350,11 @@ class PollyInboxApp(App[None]):
         # announces the hidden count whenever any are present.
         self._show_notifications: bool = False
         self._filter_bar_visible: bool = False
+        # #1573 — lens state. Defaults to ``awaits-you`` so the
+        # interactive inbox opens to the same curated set the rail
+        # badge counts and the dashboard "Waiting on you" section
+        # surfaces. Cycled via ``L``; direct-selected via ``1``…``6``.
+        self._active_lens: str = _INBOX_DEFAULT_LENS_SLUG
         # Rollup state — populated on each rollup render. Index-keyed so
         # the click handler can look up which item was expanded.
         self._rollup_items: list[dict] = []
@@ -8638,24 +8715,33 @@ class PollyInboxApp(App[None]):
         visible = self._filtered_tasks(self._tasks)
         total = len(self._tasks)
         if not visible:
-            # Friendly empty-match copy so a fully-filtered list isn't a
-            # blank pane. The list stays in the tree (one disabled row)
-            # so cursor focus has somewhere to land without crashing.
+            # Empty-state copy depends on what caused the empty result:
+            # an explicit chip filter or just the active lens (#1573).
+            # The lens-specific copy points the user at the right
+            # affordance ("press L to switch lens" vs "press c to clear
+            # filters").
             self._selected_task_id = None
             self._selected_row_key = None
+            if self._has_active_filters():
+                row_text = "No matches. Press c to clear filters."
+                detail_text = (
+                    "[dim]No matches for the current filter set.\n\n"
+                    "Press [b]c[/b] to clear filters and see every message.[/dim]"
+                )
+            else:
+                row_text = self._active_lens_empty_message()
+                detail_text = (
+                    f"[dim]{_escape(self._active_lens_empty_message())}"
+                    "\n\nPress [b]L[/b] to cycle lenses or [b]2[/b] for "
+                    "the full archive.[/dim]"
+                )
             self.list_view.append(
                 ListItem(
-                    Static(
-                        "No matches. Press c to clear filters.",
-                        classes="inbox-empty",
-                    ),
+                    Static(row_text, classes="inbox-empty"),
                     disabled=True,
                 )
             )
-            self.detail.update(
-                "[dim]No matches for the current filter set.\n\n"
-                "Press [b]c[/b] to clear filters and see every message.[/dim]"
-            )
+            self.detail.update(detail_text)
             self._update_status(total=total, shown=0)
             return
         restore_index: int | None = 0 if select_first else None
@@ -8707,37 +8793,26 @@ class PollyInboxApp(App[None]):
         """
         unread_n = len(self._unread_ids)
         candidates = self._explicitly_filtered_tasks(self._tasks)
-        using_action_lens = self._uses_action_lens_for(candidates)
-        actionable_n = sum(1 for item in candidates if getattr(item, "needs_action", False))
-        hidden_fyi_n = max(0, len(candidates) - shown) if using_action_lens else 0
         hidden_orphaned_n = 0 if self._show_orphaned else sum(
             1 for item in self._tasks if getattr(item, "is_orphaned", False)
         )
-        # #1027 \u2014 count notify-only FYI rows the default lens hid so the
-        # status line can offer the ``n`` toggle. Already zero when the
-        # user has opted in via ``_show_notifications`` /
-        # ``_show_all_messages``.
-        hidden_notification_n = self._hidden_notification_count()
         bits: list[str] = []
-        if using_action_lens:
+        # #1573 \u2014 the active lens is always part of the status line so
+        # the user can tell at a glance which slice they're looking at.
+        lens_label = self._active_lens_label()
+        if self._active_lens == _INBOX_DEFAULT_LENS_SLUG:
             verb = "needs" if shown == 1 else "need"
             bits.append(f"{shown} {verb} action")
-        elif (self._has_active_filters() or hidden_orphaned_n) and shown != total:
-            bits.append(f"{shown} of {total} shown")
+            bits.append(f"lens: {lens_label} (L)")
         else:
             msg_word = "message" if shown == 1 else "messages"
-            bits.append(f"{shown} {msg_word}")
+            if shown != total:
+                bits.append(f"{shown} of {total} {msg_word}")
+            else:
+                bits.append(f"{shown} {msg_word}")
+            bits.append(f"lens: {lens_label} (L \u00b7 1 awaits-you)")
         if unread_n:
             bits.append(f"{unread_n} unread")
-        if actionable_n and not using_action_lens:
-            verb = "needs" if actionable_n == 1 else "need"
-            bits.append(f"{actionable_n} {verb} action")
-        if hidden_fyi_n:
-            bits.append(f"{hidden_fyi_n} FYI hidden")
-            bits.append("m show all")
-        if hidden_notification_n:
-            word = "notification" if hidden_notification_n == 1 else "notifications"
-            bits.append(f"Show {word} ({hidden_notification_n}) \u2014 n")
         if hidden_orphaned_n:
             bits.append(f"{hidden_orphaned_n} orphaned hidden")
         desc = self._describe_filters()
@@ -8822,7 +8897,7 @@ class PollyInboxApp(App[None]):
     # ------------------------------------------------------------------
 
     def _reset_filter_state(self) -> None:
-        """Clear filters back to the action-focused inbox baseline."""
+        """Clear filters back to the inbox baseline + default lens."""
         self._filter_text = ""
         self._filter_unread_only = False
         self._filter_project = None
@@ -8832,9 +8907,13 @@ class PollyInboxApp(App[None]):
         self._show_orphaned = False
         self._show_all_messages = False
         # #1027 — notifications stay hidden on filter reset; the
-        # default surface is the actionable lens.
+        # default surface is the canonical awaits-user lens.
         self._show_notifications = False
         self._filter_bar_visible = False
+        # #1573 — restore the awaits-you lens on reset so each fresh
+        # mount lands on the curated default rather than whatever the
+        # last session was scrolling.
+        self._active_lens = _INBOX_DEFAULT_LENS_SLUG
 
     def _has_active_filters(self) -> bool:
         return any(
@@ -8855,46 +8934,67 @@ class PollyInboxApp(App[None]):
         )
 
     def _hidden_notification_count(self) -> int:
-        """Count notify-only entries hidden by the default lens (#1027).
+        """Legacy notify-only counter (#1027), retired by the lens
+        system (#1573).
 
-        Returned independent of any other filter so the footer can
-        announce ``Show notifications (N)`` even when the user has
-        narrowed the list with text or project filters. Returns ``0``
-        when the user has explicitly opted in to seeing notifications.
-        Mirrors the predicate in :meth:`_explicitly_filtered_tasks` so
-        the count matches what the toggle would actually surface — a
-        notify-shaped row that triages as ``needs_action`` (e.g. an
-        ``[Action]`` notify) stays visible by default and shouldn't
-        inflate the hidden count.
+        Returns ``0`` unconditionally — the lens system is now the
+        canonical way to scope by kind. Retained as a vestigial hook
+        for any caller that still reads it; the status line no longer
+        renders the "Show notifications (N) — n" affordance.
         """
-        from pollypm.notify_task import is_notify_only_inbox_entry
-
-        if self._show_notifications or self._show_all_messages:
-            return 0
-        return sum(
-            1 for item in self._tasks
-            if is_notify_only_inbox_entry(item)
-            and not getattr(item, "needs_action", False)
-        )
+        return 0
 
     def _filtered_tasks(self, tasks: list) -> list:
-        """Apply the AND-combined filter stack to ``tasks``.
+        """Apply the AND-combined filter stack + active lens to ``tasks``.
 
-        Cheap O(N * filters) — the inbox is at most a few hundred rows
-        and the chips short-circuit, so we don't need anything fancier.
+        Two passes: the explicit chip filters (text, project, plan_review,
+        blocking, …) narrow first, then the active lens (#1573) keeps
+        only items matching its predicate. Cheap O(N * filters) — the
+        inbox is at most a few hundred rows and the chips short-circuit,
+        so we don't need anything fancier.
         """
         candidates = self._explicitly_filtered_tasks(tasks)
-        if self._uses_action_lens_for(candidates):
-            return [
-                item for item in candidates
-                if getattr(item, "needs_action", False)
-            ]
-        return candidates
+        return self._apply_lens(candidates)
+
+    def _apply_lens(self, candidates: list) -> list:
+        """Filter ``candidates`` down to the active lens (#1573).
+
+        ``awaits-you`` reads the canonical
+        :func:`pollypm.inbox.awaits_user` predicate so the rail badge,
+        the dashboard "Waiting on you" section, and the inbox default
+        view return the same set. ``all`` returns the candidates
+        unchanged. Every other lens scopes to a single
+        :class:`InboxItemKind`.
+        """
+        lens = self._active_lens
+        if lens == "all":
+            return list(candidates)
+        if lens == _INBOX_DEFAULT_LENS_SLUG:
+            from pollypm.inbox import awaits_user
+            return [item for item in candidates if awaits_user(item)]
+        kind_value = _INBOX_LENS_KINDS.get(lens)
+        if kind_value is None:
+            return list(candidates)
+        from pollypm.inbox.kind import InboxItemKind, coerce_kind
+        try:
+            target = InboxItemKind(kind_value)
+        except ValueError:
+            return list(candidates)
+        return [
+            item for item in candidates
+            if coerce_kind(getattr(item, "kind", None)) is target
+        ]
 
     def _explicitly_filtered_tasks(self, tasks: list) -> list:
-        """Apply user-selected filters, excluding the default action lens."""
-        from pollypm.notify_task import is_notify_only_inbox_entry
+        """Apply user-selected filters, excluding the active lens.
 
+        Lens application moved to :meth:`_apply_lens` (#1573); the
+        per-row noise heuristics (hide pure ``notify`` rows by default
+        per #1027) were also retired since the lens system is the
+        canonical way to scope the inbox. The pre-lens ``n``/``m``
+        toggles still set their boolean state for chip-bookkeeping
+        backward compatibility, but no longer hide rows on their own.
+        """
         if not self._has_active_filters() and self._show_orphaned:
             return list(tasks)
         text_q = self._filter_text.strip().lower()
@@ -8907,32 +9007,11 @@ class PollyInboxApp(App[None]):
             # explicit "find this thing" intent. If we silently drop a
             # row whose title contains their literal query, the filter
             # looks broken — they get an empty list with no hint that the
-            # match is hidden behind the orphaned lens. Reveal orphaned
-            # rows whenever a text query is active so the search lands
-            # the same way the action-lens / notify-only filters already
-            # bow out under an explicit query.
+            # match is hidden behind the orphaned lens.
             if (
                 not self._show_orphaned
                 and not text_q
                 and getattr(t, "is_orphaned", False)
-            ):
-                continue
-            # #1027 — pure ``notify``-type FYI rows (completion
-            # announcements, heartbeat alerts) bury actionable items;
-            # default-hide them unless the user asks via ``n``. We only
-            # hide rows triage already classified as info — an
-            # ``[Action] Fly.io setup`` row sent through the notify
-            # channel still triages as ``needs_action`` and stays
-            # visible. ``--show all messages``, an active text filter,
-            # or the orphaned lens also reveal them so the user's
-            # explicit search isn't silently truncated.
-            if (
-                not self._show_notifications
-                and not self._show_all_messages
-                and not self._show_orphaned
-                and not text_q
-                and is_notify_only_inbox_entry(t)
-                and not getattr(t, "needs_action", False)
             ):
                 continue
             if self._filter_unread_only and t.task_id not in self._unread_ids:
@@ -8956,18 +9035,17 @@ class PollyInboxApp(App[None]):
         return out
 
     def _uses_action_lens_for(self, tasks: list) -> bool:
-        """Default inbox view: show actionable work, hide FYI noise."""
-        if (
-            self._show_all_messages
-            or self._show_orphaned
-            or self._filter_text
-            # #1027 — when the user opts in to notifications they want
-            # to see them, not have the action-lens triage hide them
-            # again under "FYI hidden".
-            or self._show_notifications
-        ):
-            return False
-        return any(getattr(item, "needs_action", False) for item in tasks)
+        """Legacy default-action heuristic (#1027); superseded by the
+        explicit lens system (#1573).
+
+        Always False now — the active lens drives the filter pipeline
+        directly via :meth:`_apply_lens`. Retained as a vestigial hook
+        so the status / chips bookkeeping that still reads it doesn't
+        report a phantom "action needed" lens chip on top of the lens
+        label.
+        """
+        del tasks
+        return False
 
     def _task_haystack(self, task) -> str:
         """Concatenate searchable fields for fuzzy matching."""
@@ -9001,9 +9079,7 @@ class PollyInboxApp(App[None]):
             bits.append("show_orphaned")
         if self._show_notifications:
             bits.append("notifications")
-        if self._uses_action_lens_for(self._explicitly_filtered_tasks(self._tasks)):
-            bits.append("action_needed")
-        elif self._show_all_messages:
+        if self._show_all_messages:
             bits.append("all_messages")
         if self._filter_text:
             bits.append(f'"{self._filter_text}"')
@@ -9035,13 +9111,21 @@ class PollyInboxApp(App[None]):
             chip_bits.append("[on #1e2730] show orphaned [/on #1e2730]")
         if self._show_notifications:
             chip_bits.append("[on #1e2730] notifications [/on #1e2730]")
-        if self._uses_action_lens_for(self._explicitly_filtered_tasks(self._tasks)):
-            chip_bits.append("[on #1e2730] action needed [/on #1e2730]")
-        elif self._show_all_messages:
+        if self._show_all_messages:
             chip_bits.append("[on #1e2730] all messages [/on #1e2730]")
         if self._filter_text:
             chip_bits.append(
                 f'[on #1e2730] "{_escape(self._filter_text)}" [/on #1e2730]'
+            )
+        # #1573 — surface a chip for non-default lenses so the user
+        # sees which slice they're scoped to without needing to read
+        # the status line. The default ``awaits-you`` lens stays chip-
+        # less; that lens IS the inbox's baseline (mirrors the rail
+        # badge), so showing a chip for it would imply a non-default
+        # state that the user could clear.
+        if self._active_lens != _INBOX_DEFAULT_LENS_SLUG:
+            chip_bits.append(
+                f"[on #1e2730] lens: {_escape(self._active_lens_label())} [/on #1e2730]"
             )
         if chip_bits:
             self.filter_chips.update("  ".join(chip_bits))
@@ -9126,6 +9210,88 @@ class PollyInboxApp(App[None]):
         self._reset_filter_state()
         self.filter_input.value = ""
         self._render_list(select_first=True)
+
+    # ------------------------------------------------------------------
+    # Lens toggle (#1573)
+    # ------------------------------------------------------------------
+
+    def _switch_lens(self, slug: str) -> None:
+        """Activate ``slug`` and re-render, preserving focus where it lands.
+
+        Focus preservation: when the previously-selected row is also in
+        the new lens it stays focused; otherwise the cursor jumps to the
+        top of the new lens. The post-render selection is re-asserted
+        explicitly to defeat any stale ``ListView.Highlighted`` event
+        from the cleared OLD rows mid-transition.
+        """
+        valid_slugs = {spec[0] for spec in _INBOX_LENSES}
+        if slug not in valid_slugs or slug == self._active_lens:
+            return
+        if self.reply_input.has_focus or self.filter_input.has_focus:
+            return
+        preserved_task_id = self._selected_task_id
+        preserved_row_key = self._selected_row_key
+        self._active_lens = slug
+        self._render_list(select_first=True)
+        # Re-assert the selection that ``_render_list`` chose, defending
+        # against late-arriving Highlighted events from the OLD row set
+        # that the list-view clear+append cycle can stir up. The render
+        # already prefers the survived row when ``previous_row_key`` is
+        # present in the new visible set; we just lock that decision in.
+        if preserved_row_key is None:
+            return
+        for idx, row_ref in enumerate(self._visible_rows):
+            if row_ref.key == preserved_row_key or (
+                preserved_task_id and row_ref.task_id == preserved_task_id
+            ):
+                self.list_view.index = idx
+                self._selected_task_id = row_ref.task_id
+                self._selected_row_key = row_ref.key
+                return
+
+    def action_cycle_lens(self) -> None:
+        """``L`` — advance the lens to the next entry in :data:`_INBOX_LENSES`."""
+        slugs = [spec[0] for spec in _INBOX_LENSES]
+        try:
+            idx = slugs.index(self._active_lens)
+        except ValueError:
+            idx = 0
+        next_slug = slugs[(idx + 1) % len(slugs)]
+        self._switch_lens(next_slug)
+
+    def _select_lens_index(self, index: int) -> None:
+        if 0 <= index < len(_INBOX_LENSES):
+            self._switch_lens(_INBOX_LENSES[index][0])
+
+    def action_select_lens_1(self) -> None:
+        self._select_lens_index(0)
+
+    def action_select_lens_2(self) -> None:
+        self._select_lens_index(1)
+
+    def action_select_lens_3(self) -> None:
+        self._select_lens_index(2)
+
+    def action_select_lens_4(self) -> None:
+        self._select_lens_index(3)
+
+    def action_select_lens_5(self) -> None:
+        self._select_lens_index(4)
+
+    def action_select_lens_6(self) -> None:
+        self._select_lens_index(5)
+
+    def _active_lens_spec(self) -> tuple[str, str, str]:
+        for spec in _INBOX_LENSES:
+            if spec[0] == self._active_lens:
+                return spec
+        return _INBOX_LENSES[0]
+
+    def _active_lens_label(self) -> str:
+        return self._active_lens_spec()[1]
+
+    def _active_lens_empty_message(self) -> str:
+        return self._active_lens_spec()[2]
 
     def action_pick_filter_project(self) -> None:
         """`p` — open a small modal listing project keys for selection."""
@@ -9990,6 +10156,14 @@ class PollyInboxApp(App[None]):
         row = event.item
         if not isinstance(row, _InboxListItem):
             return
+        # #1573 — drop stale Highlighted events whose row predates the
+        # current ``_visible_rows`` set. A lens swap clears the OLD
+        # list-view children and re-appends NEW ones; events queued
+        # against the old items can still fire AFTER the swap and
+        # silently overwrite the freshly-restored selection. Skip any
+        # event whose row_ref isn't in the current visible set.
+        if row.row_ref not in self._visible_rows:
+            return
         # #1400 — expand the judgment-calls sub-section on the newly
         # highlighted plan_review row, and collapse it on every other
         # plan_review row so only one card carries the extra detail.
@@ -10628,12 +10802,12 @@ class PollyInboxApp(App[None]):
     _DEFAULT_HINT = (
         "j/k move \u00b7 \u21b5 open \u00b7 r reply \u00b7 A approve "
         "\u00b7 a archive \u00b7 d discuss \u00b7 / filter "
-        "\u00b7 n notifications \u00b7 m all \u00b7 c clear \u00b7 q close"
+        "\u00b7 L lens \u00b7 c clear \u00b7 q close"
     )
     _MESSAGE_HINT = (
         "j/k move \u00b7 \u21b5 open \u00b7 A approve \u00b7 a archive "
-        "\u00b7 d discuss \u00b7 / filter \u00b7 n notifications "
-        "\u00b7 m all \u00b7 c clear \u00b7 q close"
+        "\u00b7 d discuss \u00b7 / filter \u00b7 L lens "
+        "\u00b7 c clear \u00b7 q close"
     )
     _PROPOSAL_HINT = (
         "A accept \u00b7 X reject \u00b7 r reply \u00b7 q close"

@@ -176,7 +176,11 @@ def test_slash_opens_filter_input_and_typing_filters_list(
         async with filter_app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             initial = len(_visible_titles(filter_app))
-            assert initial == 3
+            # #1573 — fixture rows have no ``kind`` so they coerce to
+            # LEGACY, which ``awaits_user`` returns True for (fail-open
+            # for pre-migration rows). All 5 fixture rows surface in
+            # the default awaits-you lens.
+            assert initial == 5
 
             await pilot.press("slash")
             await pilot.pause()
@@ -300,10 +304,22 @@ def test_unread_only_filter_chip(filter_env, filter_app) -> None:
 
             assert filter_app._filter_unread_only is True
             visible = _visible_titles(filter_app)
-            # Unread combines with the default action lens, so FYI
-            # unread items stay hidden until ``m`` shows all messages.
-            assert len(visible) == 2
-            assert visible == ["Plan review request", "Worker stuck on auth"]
+            # #1573 — fixture rows have no ``kind``; LEGACY-coerced
+            # rows are awaits_user=True, so the default lens shows
+            # everything. Unread filter then narrows by read marker:
+            # 4 unread remain after the first row was opened above.
+            assert len(visible) == 4
+            # All five fixture titles are valid; the opened one is
+            # filtered out — assert the unread set is a subset, not
+            # the exact membership (open order depends on sort key).
+            fixture_titles = {
+                "shipped: cookie banner",
+                "shipped: rollup of merges",
+                "Deploy blocked on staging",
+                "Plan review request",
+                "Worker stuck on auth",
+            }
+            assert set(visible).issubset(fixture_titles)
             # The chip strip shows 'unread'.
             assert "unread" in str(filter_app.filter_chips.render()).lower()
     _run(body())
@@ -420,8 +436,9 @@ def test_c_clears_all_filters(filter_env, filter_app) -> None:
             assert filter_app._filter_unread_only is False
             assert filter_app._filter_plan_review is False
             assert filter_app._filter_text == ""
-            # Clear returns to the action-focused baseline.
-            assert len(_visible_titles(filter_app)) == 3
+            # #1573 — clear returns to the awaits-you default lens
+            # (every fixture row coerces to LEGACY → awaits_user=True).
+            assert len(_visible_titles(filter_app)) == 5
     _run(body())
 
 
@@ -477,6 +494,8 @@ def test_filters_session_scoped_across_remounts(filter_env) -> None:
             assert app2._filter_text == ""
             assert app2._filter_project is None
             assert app2._has_active_filters() is False
-            # Fresh mounts return to the action-focused baseline.
-            assert len(_visible_titles(app2)) == 3
+            # #1573 — fresh mounts return to the awaits-you lens
+            # default (LEGACY rows fail-open in the predicate).
+            assert app2._active_lens == "awaits-you"
+            assert len(_visible_titles(app2)) == 5
     _run(body())

@@ -105,6 +105,9 @@ from pollypm.cockpit_settings_confirm import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_inbox_rollup_item import (  # noqa: F401  (re-exported)
     _RollupItem,
 )
+from pollypm.cockpit_settings_data import (  # noqa: F401  (re-exported)
+    SettingsData,
+)
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
     clear_live_chat_network_dead_notice,
@@ -3764,45 +3767,6 @@ def _format_recent_task(task: object) -> str:
         bits.append(f"[dim]{_escape(str(status))}[/dim]")
     bits.append(f"[dim]{_escape(title)}[/dim]")
     return " · ".join(bits)
-
-
-class SettingsData:
-    """Snapshot of everything the settings screen renders — gathered once."""
-
-    __slots__ = (
-        "accounts",
-        "projects",
-        "roles",
-        "heartbeat",
-        "plugins",
-        "planner",
-        "inbox",
-        "about",
-        "errors",
-    )
-
-    def __init__(
-        self,
-        *,
-        accounts: list[dict],
-        projects: list[dict],
-        roles: list[dict],
-        heartbeat: list[tuple[str, str]],
-        plugins: list[dict],
-        planner: list[tuple[str, str]],
-        inbox: list[tuple[str, str]],
-        about: list[tuple[str, str]],
-        errors: list[str],
-    ) -> None:
-        self.accounts = accounts
-        self.projects = projects
-        self.roles = roles
-        self.heartbeat = heartbeat
-        self.plugins = plugins
-        self.planner = planner
-        self.inbox = inbox
-        self.about = about
-        self.errors = errors
 
 
 def _collect_recent_tasks_by_account(

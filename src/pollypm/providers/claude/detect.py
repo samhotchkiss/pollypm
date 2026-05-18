@@ -23,11 +23,14 @@ delegate here; the behavior is identical.
 from __future__ import annotations
 
 import json
+import logging
 import re
 import subprocess
 from pathlib import Path
 
 from .env import isolated_env_with_os_environ
+
+logger = logging.getLogger(__name__)
 
 
 _EMAIL_PATTERN = re.compile(
@@ -76,7 +79,11 @@ def detect_claude_email(home: Path) -> str | None:
             sub = data.get("subscriptionType") or "unknown"
             return f"{method}:{sub}".lower()
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "claude.detect: failed to parse `claude auth status --json`; "
+                "falling back to text mode",
+                exc_info=True,
+            )
 
     text_result = subprocess.run(
         ["claude", "auth", "status", "--text"],

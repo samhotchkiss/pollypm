@@ -177,6 +177,10 @@ def _live_chat_network_dead_state(ctx: RailContext) -> str | None:
 
         notice = current_live_chat_network_dead_notice(ctx.cockpit_state)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "core_rail_items: live_chat_network_dead notice probe raised",
+            exc_info=True,
+        )
         return None
     return f"! {notice}" if notice else None
 

@@ -335,6 +335,10 @@ class EventProjector:
         try:
             from pollypm.store.registry import get_store_by_url
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "activity_feed: failed to import store registry",
+                exc_info=True,
+            )
             return []
 
         try:

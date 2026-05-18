@@ -294,7 +294,12 @@ class DefaultLaunchPlanner:
                     try:
                         ctx.store.set_session_runtime(session.name, effective_account="")
                     except Exception:  # noqa: BLE001
-                        pass
+                        _log.warning(
+                            "default_launch_planner: clearing stale "
+                            "effective_account for %s failed",
+                            session.name,
+                            exc_info=True,
+                        )
         if session.role in _ROUTED_ROLES:
             project_key = None if session.role == "operator-pm" else session.project
             routed_assignment = resolve_role_assignment(

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from textual.app import App, ComposeResult
 from textual.widgets import Static
 
 from pollypm.cockpit import build_cockpit_detail
+
+logger = logging.getLogger(__name__)
 
 
 class PollyCockpitPaneApp(App[None]):
@@ -50,6 +53,12 @@ class PollyCockpitPaneApp(App[None]):
                 config_path=self.config_path,
             )
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "Failed to start cockpit pane input bridge (kind=%s); "
+                "automation key-send disabled (#1355)",
+                self.kind,
+                exc_info=True,
+            )
             self._input_bridge_handle = None
 
     def on_unmount(self) -> None:

@@ -1,19 +1,29 @@
 """Dependency manager for the SQLite work service.
 
 Contract:
-- Inputs: a ``SQLiteWorkService`` and task identifiers for dependency
-  relationships and blocker resolution.
+- Inputs: a work-service collaborator (see :class:`_WorkService` below)
+  and task identifiers for dependency relationships and blocker
+  resolution.
 - Outputs: dependency-mutating side effects and dependent-task reads.
 - Side effects: groups the dependency boundary behind one service-owned
   facade so callers do not need to know the helper layout.
 - Invariants: behavior stays delegated to the existing dependency
   helpers; the manager only centralizes the service-facing orchestration.
+
+The facade is parameterised over a structural :class:`typing.Protocol`
+rather than the concrete ``pollypm.work.sqlite_service.SQLiteWorkService``
+class. This breaks the import cycle flagged in #1367 (the service
+top-imports this module, so a reverse type-annotation import — even
+guarded with ``TYPE_CHECKING`` — registers as a cycle in the AST
+boundary scan). ``SQLiteWorkService`` satisfies :class:`_WorkService`
+structurally; no runtime registration or subclass change is required.
 """
 
 from __future__ import annotations
 
+import sqlite3
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import Any, Protocol
 
 from pollypm.work.models import Task
 from pollypm.work.service_dependencies import (
@@ -28,15 +38,44 @@ from pollypm.work.service_dependencies import (
     would_create_cycle,
 )
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+
+class _WorkService(Protocol):
+    """Structural view of the SQLite work service used by the dependency facade.
+
+    Captures the exact slice the underlying dependency helpers reach
+    into so the ``service_dependency_manager <-> sqlite_service`` cycle
+    can be broken without pulling the full concrete class into this
+    module's type graph (#1367 wedge).
+    """
+
+    _conn: sqlite3.Connection
+
+    def _record_transition(
+        self,
+        project: str,
+        task_number: int,
+        from_state: str,
+        to_state: str,
+        actor: str,
+        reason: str,
+    ) -> None: ...
+
+    def _load_task_token_sums_bulk(self) -> Any: ...
+
+    def _row_to_task(self, row: Any, *, token_sums: Any) -> Task: ...
+
+    def _sync_transition(self, task: Task, from_state: str, to_state: str) -> None: ...
+
+    def get(self, task_id: str) -> Task: ...
+
+    def add_context(self, task_id: str, actor: str, body: str) -> None: ...
 
 
 @dataclass(slots=True)
 class WorkDependencyManager:
     """Facade for the dependency/blocking service boundary."""
 
-    service: "SQLiteWorkService"
+    service: _WorkService
 
     def link(self, from_id: str, to_id: str, kind: str) -> None:
         link_tasks(self.service, from_id, to_id, kind)

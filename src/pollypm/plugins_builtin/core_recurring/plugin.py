@@ -15,6 +15,7 @@ from pollypm.plugins_builtin.core_recurring.maintenance import (
     account_usage_refresh_handler,
     agent_worktree_prune_handler,
     capacity_probe_handler,
+    cockpit_socket_reap_handler,
     db_vacuum_handler,
     log_rotate_handler,
     memory_ttl_sweep_handler,
@@ -429,6 +430,16 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         "log.rotate", log_rotate_handler,
         max_attempts=1, timeout_seconds=120.0,
     )
+    # #1592 — periodic socket reaper so a long-lived cockpit doesn't
+    # accumulate stale ``cockpit_inputs/*.sock`` entries between boots.
+    # The bootstrap call only fires at ``pm up``; without this handler
+    # a cockpit that survives many per-task worker crash + restart
+    # cycles ends up with dozens of orphaned socket files (#1592 saw
+    # 17 in 78+ min). Cheap (single directory walk, ~O(N) syscalls).
+    api.register_handler(
+        "cockpit_socket.reap", cockpit_socket_reap_handler,
+        max_attempts=1, timeout_seconds=60.0,
+    )
     api.register_handler(
         "worktree.state_audit", worktree_state_audit_handler,
         max_attempts=1, timeout_seconds=120.0,
@@ -512,6 +523,13 @@ def _register_roster(api: RosterAPI) -> None:
         "31 * * * *", "log.rotate", {},
         dedupe_key="log.rotate",
     )
+    # #1592 — every 5 min sweep of stale cockpit-input sockets so a
+    # long-lived cockpit doesn't accumulate orphans between boots.
+    # Dedupe so a contended rail tick doesn't pile up identical claims.
+    api.register_recurring(
+        "@every 5m", "cockpit_socket.reap", {},
+        dedupe_key="cockpit_socket.reap",
+    )
     api.register_recurring(
         "@every 10m", "worktree.state_audit", {},
         dedupe_key="worktree.state_audit",
@@ -562,6 +580,7 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="notification_staging.prune"),
         Capability(kind="job_handler", name="agent_worktree.prune"),
         Capability(kind="job_handler", name="log.rotate"),
+        Capability(kind="job_handler", name="cockpit_socket.reap"),
         Capability(kind="job_handler", name="worktree.state_audit"),
         Capability(kind="job_handler", name="stuck_claims.sweep"),
         Capability(kind="job_handler", name="blocked_chain.sweep"),

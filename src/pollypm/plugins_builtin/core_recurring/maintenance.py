@@ -651,6 +651,36 @@ def log_rotate_handler(payload: dict[str, Any]) -> dict[str, Any]:
     return {"rotated": rotated, "deleted": deleted, "errors": errors}
 
 
+def cockpit_socket_reap_handler(payload: dict[str, Any]) -> dict[str, Any]:
+    """Periodically reap stale ``cockpit_inputs/*.sock`` whose owner PID is dead.
+
+    The bootstrap-time call from ``Supervisor._bootstrap_clear_markers``
+    only fires once per ``pm up``. A long-lived cockpit that survives many
+    per-task worker crash + restart cycles accumulates stale sockets
+    (one per crashed pane) until shutdown (#1592). Running the reaper as
+    a recurring handler on the ``rail_daemon`` / heartbeat thread keeps
+    the directory bounded across the lifetime of a single boot.
+
+    Safe to run concurrently with live cockpits and panes: the reaper
+    only unlinks entries whose name encodes a PID that no longer exists,
+    so a live bridge's socket (whose owner PID is alive by definition)
+    is never touched. The same audit + log surfaces fire as at bootstrap.
+
+    ``payload`` accepts an optional ``base_dir`` override (tests). When
+    absent, the active config's ``project.base_dir`` is used.
+    """
+    from pollypm.cockpit_socket_reaper import reap_stale_cockpit_sockets
+
+    base_override = payload.get("base_dir") if isinstance(payload, dict) else None
+    if base_override:
+        base_dir = Path(base_override)
+    else:
+        config = _load_config(payload)
+        base_dir = config.project.base_dir
+    reaped = reap_stale_cockpit_sockets(base_dir)
+    return {"reaped": len(reaped)}
+
+
 def notification_staging_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop flushed + silent notification_staging rows older than 30d."""
     from pollypm.work import create_work_service

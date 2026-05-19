@@ -15,16 +15,17 @@ kept side-by-side so accidental writes from read-side facades crash loudly:
 DSN resolution order (highest priority wins):
 
 1. ``POLLYPM_PG_DSN`` env var — operator override / one-shot test runs.
-2. ``[storage] url`` in ``pollypm.toml`` — only when it looks like a pg DSN
-   (``postgresql://...`` / ``postgres://...``); otherwise treated as a
-   sqlite URL and ignored here.
-3. The built-in default ``postgresql://localhost:5432/pollypm``.
+2. ``[storage.pg] dsn`` in ``pollypm.toml`` — the canonical pg DSN knob
+   when ``[storage] backend = "postgres"``. Only consulted when it
+   looks like a pg DSN (``postgresql://...`` / ``postgres://...``).
+3. ``[storage] url`` in ``pollypm.toml`` — only when it looks like a pg
+   DSN; otherwise treated as a sqlite URL and ignored here.
+4. The built-in default ``postgresql://localhost:5432/pollypm``.
 
-Note: :class:`~pollypm.models.PgStorageSettings` exposes a ``dsn`` field
-that :mod:`pollypm.config` parses from ``[storage.pg] dsn``, but
-:func:`resolve_dsn` does **not** read it yet — operators who want to
-override the DSN should use ``POLLYPM_PG_DSN`` or ``[storage] url``.
-Wiring ``[storage.pg].dsn`` is tracked as a post-RC follow-up.
+Both ``[storage.pg] dsn`` and ``[storage] url`` are honoured so an
+operator who already migrated to the nested section (#1754) and one
+who carries the legacy shared URL both see their config respected
+(#1819).
 
 The pools are lazy module-level singletons. :func:`pg_pool_shutdown` is the
 graceful close used by ``pm reset`` / test teardown — calling it is safe
@@ -107,22 +108,26 @@ def resolve_dsn(config: "PollyPMConfig | None" = None) -> str:
     Priority (highest wins):
 
     1. ``POLLYPM_PG_DSN`` env var.
-    2. ``config.storage.url`` — only when it parses as a pg DSN.
-    3. The built-in :data:`DEFAULT_DSN`.
+    2. ``config.storage.pg.dsn`` — the canonical pg DSN knob from
+       ``[storage.pg] dsn``. Only consulted when it parses as a pg DSN.
+    3. ``config.storage.url`` — the legacy shared URL knob. Only
+       consulted when it parses as a pg DSN.
+    4. The built-in :data:`DEFAULT_DSN`.
 
-    Note: ``config.storage.pg.dsn`` is parsed by :mod:`pollypm.config`
-    but **not** read here. Operators who set ``[storage.pg] dsn`` in
-    ``pollypm.toml`` are currently silently ignored; wiring that
-    source is tracked as a post-RC follow-up.
+    Both ``[storage.pg] dsn`` (#1754) and ``[storage] url`` are read
+    here so the production entry points (``PgStore``, ``JobQueue``,
+    the boot migration applier) honour whichever knob the operator
+    set — silently falling back to the localhost default when the
+    config carries a non-default DSN was the #1819 regression.
 
     Parameters
     ----------
     config:
         Optional :class:`pollypm.models.PollyPMConfig`. When provided,
-        ``config.storage.url`` is consulted as the second-priority
-        source. Pass ``None`` to resolve purely from env + the built-in
-        default (used by ``pm doctor`` before a config is loaded, and
-        by the tests).
+        ``config.storage.pg.dsn`` and ``config.storage.url`` are
+        consulted as the second/third priority sources. Pass ``None``
+        to resolve purely from env + the built-in default (used by
+        ``pm doctor`` before a config is loaded, and by the tests).
 
     Returns
     -------
@@ -135,6 +140,15 @@ def resolve_dsn(config: "PollyPMConfig | None" = None) -> str:
         return env_dsn
 
     if config is not None:
+        # ``[storage.pg] dsn`` first — it's the dedicated pg knob and
+        # was the one operators reach for when the legacy shared
+        # ``[storage] url`` already holds a sqlite URL.
+        pg_section = getattr(config.storage, "pg", None)
+        if pg_section is not None:
+            pg_dsn = getattr(pg_section, "dsn", "") or ""
+            if _looks_like_pg_dsn(pg_dsn):
+                return pg_dsn.strip()
+
         url = getattr(config.storage, "url", "") or ""
         if _looks_like_pg_dsn(url):
             return url.strip()

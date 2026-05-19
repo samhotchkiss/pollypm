@@ -65,7 +65,13 @@ def set_queue_factory(factory: _QueueFactory | None) -> None:
 
 
 def build_queue_for_config(config_path: Path) -> JobQueue:
-    """Default factory: open a ``JobQueue`` against the project's state DB."""
+    """Default factory: open a ``JobQueue`` against the loaded config.
+
+    Threads the loaded ``PollyPMConfig`` into the queue constructor so
+    the pg pool resolves ``[storage.pg] dsn`` / ``[storage] url``
+    rather than silently falling back to the localhost default (the
+    #1819 regression).
+    """
     resolved = resolve_config_path(config_path)
     if not resolved.exists():
         from pollypm.errors import format_config_not_found_error
@@ -74,7 +80,7 @@ def build_queue_for_config(config_path: Path) -> JobQueue:
     config = load_config(resolved)
     db_path = config.project.state_db
     db_path.parent.mkdir(parents=True, exist_ok=True)
-    return JobQueue(db_path=db_path)
+    return JobQueue(db_path=db_path, config=config)
 
 
 def _open_queue(config_path: Path) -> JobQueue:

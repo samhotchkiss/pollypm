@@ -656,6 +656,32 @@ INITIAL_SCHEMA_DDL = "\n".join(
 
 
 # --------------------------------------------------------------------- #
+# Migration 0002 — align alert dedupe index with sqlite semantics (#1737).
+# --------------------------------------------------------------------- #
+# Slice I lands a real :class:`pollypm.store.backends.pg_store.PgStore`,
+# whose :meth:`upsert_alert` / :meth:`upsert_message` rely on the partial
+# unique index that enforces "one open alert per ``(scope, sender,
+# recipient, type)``". The sqlite shadow at
+# :data:`pollypm.store.schema.FTS_DDL_STATEMENTS` is keyed on those four
+# columns; migration 0001 accidentally keyed the pg index on
+# ``(scope, subject)`` instead — which mis-dedupes whenever two
+# different alert subjects share a project, and over-dedupes when the
+# same alert is re-emitted with a freshly-stamped subject.
+#
+# Forward fix: drop the wrong index (idempotently — ``IF EXISTS``) and
+# recreate it on the canonical tuple. Closed rows are unconstrained
+# because their lifecycle has ended; only ``state='open'`` matters.
+
+_MIGRATION_0002_ALERT_DEDUPE = """
+DROP INDEX IF EXISTS messages_open_alert_uniq;
+
+CREATE UNIQUE INDEX IF NOT EXISTS messages_open_alert_uniq
+    ON messages(scope, sender, recipient, type)
+    WHERE state = 'open' AND type = 'alert';
+"""
+
+
+# --------------------------------------------------------------------- #
 # Migration list — forward-only, append-only.
 # --------------------------------------------------------------------- #
 
@@ -664,6 +690,7 @@ INITIAL_SCHEMA_DDL = "\n".join(
 # migration file can't silently skip schema state).
 MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "0001_initial", INITIAL_SCHEMA_DDL),
+    (2, "0002_alert_dedupe_tuple", _MIGRATION_0002_ALERT_DEDUPE),
 ]
 
 

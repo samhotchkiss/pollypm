@@ -345,11 +345,14 @@ def applied_pg_pool(pg_schema_pool):
 
 def test_preflight_ok_after_schema_applied(applied_pg_pool):
     from pollypm.storage.pg_migration_tool import preflight
+    from pollypm.storage.pg_schema import MIGRATIONS
 
     result = preflight(applied_pg_pool)
     assert result.ok, result.message
     assert result.vector_installed
-    assert result.migration_version == 1
+    # Tracks the head migration so new ``MIGRATIONS`` entries don't
+    # require a parallel test update.
+    assert result.migration_version == max(v for v, _, _ in MIGRATIONS)
 
 
 def test_dry_run_does_not_mutate_pg(applied_pg_pool, sqlite_workspace):

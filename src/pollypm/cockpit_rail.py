@@ -1635,44 +1635,73 @@ class CockpitRouter:
     def _project_session_map(self, launches) -> dict[str, str]:
         """Resolve ``project_key -> session_name`` for project PM Chat routing.
 
-        Per Sam's clarification (project PM == project architect):
-        ``architect_<project>`` is the canonical per-project PM persona.
-        It already runs as a long-lived session primed with the project
-        persona; "Chat PM" should attach to that conversation rather
-        than a sibling worker / advisor / generic operator.
+        The map drives ``project:<key>:session`` (a.k.a. the rail's PM
+        Chat sub-item) and the dashboard's ``c chat`` keystroke.
 
-        Selection rules (priority order, control roles skipped):
-          1. ``architect`` — the canonical project PM persona.
-          2. ``worker``    — per-task worker (PM persona only when no
-             architect exists for the project).
+        Per-project-pm rollout: ``pm_<project>`` (an ``operator-pm``
+        session scoped to the project) is the canonical per-project
+        PM persona. These sessions are auto-injected by the launch
+        planner so existing installs pick them up without a config
+        migration; when present they ALWAYS win for project chat —
+        that's the conversation surface the user expects "Chat PM for
+        project X" to attach to.
+
+        Selection rules (priority order, ties broken by launch index
+        for deterministic first-wins behavior within a tier):
+
+          0. ``operator-pm`` (per-project, name != ``"operator"``) —
+             dedicated per-project PM, the canonical answer post-
+             per-project-pm-rollout.
+          1. ``architect`` — historical PM persona for non-Polly
+             projects (#1861). Stays as the next-best option for
+             installs without a per-project PM yet (no compatible
+             account, etc.).
+          2. ``worker`` — per-task worker; PM persona only when no
+             architect / per-project PM exists.
           3. Anything else (``advisor``, custom roles) — last-resort
-             fallback so projects that ship without an architect still
-             have a routable PM target.
+             fallback so projects that ship without architect / PM
+             still have a routable target.
 
-        Within a priority tier the first launch wins (deterministic on
-        ``plan_launches`` ordering). Control roles (operator-pm,
-        reviewer, etc.) remain excluded — they are routed through the
-        workspace-level rail keys, never as a project's PM.
+        Control roles other than the per-project operator-pm
+        (workspace ``operator``, ``reviewer``, ``heartbeat-supervisor``,
+        ``triage``) are excluded — they're routed through workspace-
+        level rail keys, never as a project's PM.
         """
         from pollypm.models import CONTROL_ROLES
 
-        _ROLE_PRIORITY = {"architect": 0, "worker": 1}
-        _DEFAULT_PRIORITY = 2
+        # Per-project operator-pm wins outright (priority 0). The
+        # historical architect / worker / default priorities follow
+        # #1861's deterministic-tier ordering so installs without a
+        # per-project PM keep their architect-first routing.
+        _ROLE_PRIORITY = {"architect": 1, "worker": 2}
+        _DEFAULT_PRIORITY = 3
+        _PROJECT_PM_PRIORITY = 0
 
         ranked: dict[str, tuple[int, int, str]] = {}
         for index, launch in enumerate(launches):
-            role = getattr(launch.session, "role", "") or ""
-            if role in CONTROL_ROLES:
-                continue
-            project = getattr(launch.session, "project", None)
-            name = getattr(launch.session, "name", None)
+            session = getattr(launch, "session", None)
+            role = getattr(session, "role", "") or ""
+            project = getattr(session, "project", None)
+            name = getattr(session, "name", None)
             if not project or not name:
                 continue
-            priority = _ROLE_PRIORITY.get(role, _DEFAULT_PRIORITY)
+            if role == "operator-pm":
+                # Workspace-level Polly owns the workspace rail row,
+                # not per-project Chat PM. Skip it here regardless of
+                # its ``project`` field (historically ``"pollypm"``).
+                if name == "operator":
+                    continue
+                priority = _PROJECT_PM_PRIORITY
+            elif role in CONTROL_ROLES:
+                # Reviewers / heartbeat-supervisors / triage are
+                # control-plane; they don't own a project's Chat PM.
+                continue
+            else:
+                priority = _ROLE_PRIORITY.get(role, _DEFAULT_PRIORITY)
             existing = ranked.get(project)
-            # Strictly lower priority wins; on ties keep the earlier launch
-            # so behavior stays deterministic and matches the prior
-            # first-wins semantics inside a priority tier.
+            # Strictly lower priority wins; on ties keep the earlier
+            # launch so behavior stays deterministic and matches
+            # #1861's first-wins semantics inside a priority tier.
             if existing is None or priority < existing[0]:
                 ranked[project] = (priority, index, name)
         return {project: entry[2] for project, entry in ranked.items()}
@@ -2322,9 +2351,15 @@ class CockpitRouter:
     # bikepath repro shows the architect window is what holds the
     # ongoing conversation while a stale or never-launched worker
     # session entry can make the literal lookup return None.
+    # Per-project-pm rollout: ``pm-<project>`` is now the canonical
+    # per-project PM persona window (auto-injected by the launch
+    # planner). Try it first; architect / worker fallbacks are kept
+    # for installs that haven't picked up the per-project PM yet, and
+    # for the historical pattern where the architect window held the
+    # ongoing PM conversation for non-Polly projects (#1636).
     _PROJECT_PM_WINDOW_PREFIXES: tuple[str, ...] = (
-        "architect-",
         "pm-",
+        "architect-",
         "worker-",
     )
 

@@ -166,11 +166,15 @@ def test_project_pm_fallback_skips_dead_sibling() -> None:
 
 
 def test_project_pm_fallback_walks_priority_order() -> None:
-    """Architect > pm > worker.
+    """PM > architect > worker.
 
-    Worker-name patterns can outnumber architect/pm in a busy project,
-    but the PM persona by convention lives in ``architect-<project>``
-    for non-Polly projects. The ordering test pins that contract.
+    Per-project-pm rollout: ``pm-<project>`` is now the canonical
+    per-project PM persona window (auto-injected by the launch
+    planner), so it wins over the historical ``architect-<project>``
+    fallback. The architect/worker fallbacks remain for installs that
+    haven't picked up the per-project PM yet (no compatible account
+    routing, etc.) and for legacy non-Polly projects where the
+    architect window held the ongoing PM conversation pre-#1636.
     """
     router = _bare_router()
     _capture_audit(router)
@@ -185,25 +189,34 @@ def test_project_pm_fallback_walks_priority_order() -> None:
     )
     result = router._select_storage_window_for_mount(
         [worker, pm, architect],
-        "worker-bikepath",  # literal would match worker, but we want architect
+        "worker-bikepath",  # literal would match worker, but we want pm
         "worker_bikepath",
         project_key="bikepath",
     )
     # The literal lookup matched ``worker-bikepath`` directly (single
     # match), so the sibling fallback never fired — this asserts the
-    # fallback only triggers when the literal lookup fails. To force
-    # the architect pick, drop the worker name from storage.
+    # fallback only triggers when the literal lookup fails.
     assert result is worker
 
     # Now remove the worker window entirely — the literal lookup fails
-    # and the fallback walks the priority order, picking architect.
+    # and the fallback walks the priority order, picking ``pm-bikepath``
+    # (the canonical per-project PM persona).
     result_no_worker = router._select_storage_window_for_mount(
         [pm, architect],
         "worker-bikepath",
         "worker_bikepath",
         project_key="bikepath",
     )
-    assert result_no_worker is architect
+    assert result_no_worker is pm
+
+    # Drop the pm window too — fall through to architect-<project>.
+    result_no_pm = router._select_storage_window_for_mount(
+        [architect],
+        "worker-bikepath",
+        "worker_bikepath",
+        project_key="bikepath",
+    )
+    assert result_no_pm is architect
 
 
 def test_project_pm_fallback_falls_through_to_pm_when_no_architect() -> None:

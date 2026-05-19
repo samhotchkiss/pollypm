@@ -20,7 +20,7 @@ from dataclasses import replace
 import logging
 import os
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pollypm.launch_planner_protocol import DefaultLaunchPlannerContext
 from pollypm.models import AccountConfig, ProviderKind, SessionConfig, SessionLaunchSpec
@@ -43,6 +43,23 @@ _ROUND_START_ENV_KEYS = (
     "ROUND_START_HBFAIL",
     "ROUND_START_MISSING_WINDOW",
 )
+# Synthetic per-project PM session entries are named ``pm_<project>``
+# with the persona-named tmux window ``pm-<project>``. The launch planner
+# auto-injects one entry per tracked project that doesn't already carry a
+# project-scoped ``operator-pm`` session in the static config — see
+# :meth:`DefaultLaunchPlanner._synthesize_project_pm_sessions`. This
+# parallels how reviewer sessions are auto-provisioned at bootstrap
+# (#1413 / ``recovery.reviewer_provisioning``) but keeps the per-project
+# PM purely synthetic so we don't have to mutate ``pollypm.toml`` on
+# every ``pm up`` for an existing install (Sam's deployed config stays
+# untouched per the per-project PM rollout migration plan).
+_PROJECT_PM_SESSION_PREFIX = "pm_"
+_PROJECT_PM_WINDOW_PREFIX = "pm-"
+# The workspace-level Polly session is uniquely identified by name
+# ``"operator"`` (the onboarding flow hard-codes this); the workspace
+# operator-pm exists for cross-project / non-project chat and stays
+# active regardless of the per-project PMs added below.
+_WORKSPACE_OPERATOR_SESSION_NAME = "operator"
 _log = logging.getLogger(__name__)
 
 
@@ -164,7 +181,19 @@ class DefaultLaunchPlanner:
             return self._cached_launches
         launches: list[SessionLaunchSpec] = []
         worker_projects: dict[str, str] = {}
-        for session in ctx.config.sessions.values():
+        # Compose the static-config sessions with the synthetic
+        # per-project PM sessions auto-injected for every tracked
+        # project that doesn't already carry an enabled project-scoped
+        # ``operator-pm`` entry. The synthetic entries are appended in
+        # a stable (project-key sorted) order so the launch plan is
+        # deterministic across runs even though dict iteration in
+        # ``ctx.config.sessions`` is insertion-ordered.
+        composed_sessions = list(ctx.config.sessions.values())
+        synthetic_pm_sessions = self._synthesize_project_pm_sessions(
+            existing_sessions=composed_sessions,
+        )
+        composed_sessions.extend(synthetic_pm_sessions)
+        for session in composed_sessions:
             effective = self.effective_session(session, controller_account)
             if not effective.enabled:
                 continue
@@ -294,7 +323,23 @@ class DefaultLaunchPlanner:
                             exc_info=True,
                         )
         if session.role in _ROUTED_ROLES:
-            project_key = None if session.role == "operator-pm" else session.project
+            # ``operator-pm`` covers two distinct lanes today: the
+            # workspace-level Polly (``session.name == "operator"``) and
+            # the per-project PM sessions auto-injected by
+            # ``_synthesize_project_pm_sessions``. The workspace lane
+            # explicitly ignores per-project role overrides — Polly is
+            # the workspace operator and her routing is global by
+            # design. The per-project lane must consult per-project
+            # ``role_assignments`` so users can pin (say) Codex for
+            # ``operator-pm`` on a single project without flipping the
+            # global default. Mirrors how worker / architect / reviewer
+            # already consult per-project routing.
+            if session.role == "operator-pm" and session.name == _WORKSPACE_OPERATOR_SESSION_NAME:
+                project_key = None
+            elif session.role == "operator-pm":
+                project_key = session.project
+            else:
+                project_key = session.project
             routed_assignment = resolve_role_assignment(
                 session.role,
                 project_key,
@@ -461,6 +506,189 @@ class DefaultLaunchPlanner:
     def invalidate_cache(self) -> None:
         """Drop the cached launch plan."""
         self._cached_launches = None
+
+    # ── Per-project PM session synthesis ──────────────────────────────────
+
+    def _synthesize_project_pm_sessions(
+        self, *, existing_sessions: list[SessionConfig],
+    ) -> list[SessionConfig]:
+        """Return synthetic ``pm_<project>`` SessionConfigs for tracked projects.
+
+        Each tracked project gets a dedicated per-project PM session so
+        clicking "Chat PM" for a project routes to its OWN long-lived
+        Claude conversation rather than a single shared ``pm-operator``
+        window with persona swaps. The single shared window is the
+        documented architectural bug closed by the per-project PM PR:
+        when ``pm-operator`` was respawned (during ``pm install`` /
+        restart / window-mount churn) the conversation history for every
+        project was wiped because there was no per-project conversation
+        persistence — just persona primes on top of one shared session.
+
+        The synthetic entries are NEVER written to ``pollypm.toml`` —
+        they exist purely in the launch plan so existing installs pick
+        up per-project PMs on the next ``pm up`` without an explicit
+        config migration. Projects that already carry an explicit
+        ``operator-pm`` session entry for the same project key win — the
+        synthesizer skips them, leaving the static config authoritative.
+
+        The workspace-level ``operator`` session (Polly for non-project
+        / cross-project chat) is excluded from the "already has an
+        operator-pm" check because its ``project`` field points at the
+        workspace project (``"pollypm"``) but it owns the workspace-level
+        rail row, not the project-PM lane. See
+        :func:`pollypm.cockpit_rail._project_session_map` for the rail
+        side of this contract.
+
+        Selection rules per project:
+
+        * ``project.tracked == True`` is the only auto-inject gate;
+          untracked projects opt out of every auto-provision sweep
+          (matches reviewer auto-provisioning in
+          :mod:`pollypm.recovery.reviewer_provisioning`).
+        * The workspace project (``"pollypm"``) is skipped — the
+          workspace-level ``operator`` session already serves it.
+        * Provider/account routing goes through
+          :func:`pollypm.role_routing.resolve_role_assignment` for the
+          ``"operator-pm"`` role with the project key, so per-project
+          ``role_assignments`` overrides win. Without a compatible
+          account configured the project is silently skipped (matches
+          the existing routed-role behavior — no compatible account →
+          warn-and-skip, surface friendlier failure modes at use time).
+
+        Failures in any per-project step are logged and swallowed so a
+        single misconfigured project can't block planner output for the
+        rest of the workspace.
+        """
+        ctx = self._ctx
+        existing_by_project: dict[str, str] = {}
+        for session in existing_sessions:
+            if (
+                session.role == "operator-pm"
+                and session.name != _WORKSPACE_OPERATOR_SESSION_NAME
+                and session.enabled
+            ):
+                existing_by_project.setdefault(session.project, session.name)
+        projects = getattr(ctx.config, "projects", {}) or {}
+        synthesized: list[SessionConfig] = []
+        # Sort by project key for deterministic launch order — dict
+        # iteration of ``config.projects`` is insertion-ordered, but
+        # the order in which projects were added to the user's config
+        # is incidental and we don't want it influencing launch plan
+        # diffs in tests / forensics.
+        for project_key in sorted(projects.keys()):
+            project = projects[project_key]
+            if not getattr(project, "tracked", False):
+                continue
+            if project_key == "pollypm":
+                # Workspace project — served by the workspace-level
+                # ``operator`` session entry already in the static
+                # config. Auto-injecting a duplicate would create two
+                # rail rows pointing at the same conceptual surface.
+                continue
+            if project_key in existing_by_project:
+                # An explicit project-scoped operator-pm session in the
+                # static config wins. Don't overwrite the user's choice.
+                continue
+            try:
+                synthetic = self._build_project_pm_session(project_key, project)
+            except Exception:  # noqa: BLE001
+                _log.warning(
+                    "default_launch_planner: per-project PM synthesis "
+                    "failed for %s",
+                    project_key,
+                    exc_info=True,
+                )
+                continue
+            if synthetic is None:
+                continue
+            synthesized.append(synthetic)
+        return synthesized
+
+    def _build_project_pm_session(
+        self,
+        project_key: str,
+        project: Any,
+    ) -> SessionConfig | None:
+        """Build a synthetic ``pm_<project>`` SessionConfig.
+
+        Returns ``None`` when no compatible account is available for
+        the routed ``operator-pm`` provider — the project is left
+        without a per-project PM rather than crashing the planner.
+
+        The CWD points at the project's actual on-disk path (not a
+        worktree) because the per-project PM observes / coordinates;
+        it does not write code. Workers + architects keep their
+        worktree CWDs unchanged.
+        """
+        ctx = self._ctx
+        accounts = getattr(ctx.config, "accounts", {}) or {}
+        if not accounts:
+            return None
+        try:
+            assignment = resolve_role_assignment(
+                "operator-pm", project_key, config=ctx.config,
+            )
+            provider = resolved_provider_kind(assignment)
+        except Exception:  # noqa: BLE001
+            # Role routing failed; fall back to the workspace
+            # operator's provider/account so the per-project PM at
+            # least lands somewhere reasonable.
+            controller = ctx.config.pollypm.controller_account
+            if not controller or controller not in accounts:
+                return None
+            provider = accounts[controller].provider
+            account_name: str | None = controller
+        else:
+            account_name = self._account_for_pm_provider(provider)
+            if account_name is None:
+                # No compatible account; skip cleanly.
+                return None
+        project_path = getattr(project, "path", None)
+        if project_path is None:
+            return None
+        session_name = f"{_PROJECT_PM_SESSION_PREFIX}{project_key}"
+        window_name = f"{_PROJECT_PM_WINDOW_PREFIX}{project_key}"
+        return SessionConfig(
+            name=session_name,
+            role="operator-pm",
+            provider=provider,
+            account=account_name,
+            cwd=project_path,
+            project=project_key,
+            window_name=window_name,
+            # Profile is "polly" — the persona name (Archie / Sage /
+            # etc.) is layered on at jump-to-PM time via the cockpit's
+            # ``_maybe_prime_project_pm_session`` re-anchoring primer
+            # so the agent recovers project identity across re-mounts
+            # (see #958 / cockpit_rail._build_project_pm_primer).
+            agent_profile="polly",
+        )
+
+    def _account_for_pm_provider(self, provider: ProviderKind) -> str | None:
+        """Return the first account whose provider matches.
+
+        Walks the controller / failover / accounts list in priority
+        order (same shape as ``_preferred_account_names``) so the
+        per-project PM lands on the operator's preferred account when
+        possible.
+        """
+        ctx = self._ctx
+        accounts = ctx.config.accounts
+        controller = ctx.config.pollypm.controller_account
+        candidates: list[str] = []
+        if controller:
+            candidates.append(controller)
+        for name in ctx.config.pollypm.failover_accounts:
+            if name and name not in candidates:
+                candidates.append(name)
+        for name in accounts:
+            if name not in candidates:
+                candidates.append(name)
+        for name in candidates:
+            account = accounts.get(name)
+            if account is not None and account.provider is provider:
+                return name
+        return None
 
     # ── Per-task launch synthesis (#924) ──────────────────────────────────
 

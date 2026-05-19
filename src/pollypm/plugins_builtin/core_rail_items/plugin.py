@@ -361,7 +361,13 @@ def _project_chat_persona(project: Any, session_role: Any) -> str:
         try:
             from pollypm.role_contract import canonical_role, persona_for
 
-            if canonical_role(session_role) == "architect":
+            canonical = canonical_role(session_role)
+            # ``operator-pm`` per-project sessions carry the project's
+            # configured persona name (Archie / Sage / etc.). Fall
+            # through to the persona_name lookup below so we surface
+            # the project-specific name rather than the generic
+            # "Polly" persona.
+            if canonical == "architect":
                 return persona_for("architect")
         except ValueError:
             pass
@@ -389,18 +395,35 @@ def _project_rows(ctx: RailContext) -> list[RailRow]:
     selected = _selected_key(ctx)
     config = _config(ctx)
 
-    # Map project -> session name/role for session_state fallback and label copy.
+    # Map project -> (session name, role) for session_state fallback
+    # and the PM Chat label persona pick. Mirrors
+    # ``CockpitRouter._project_session_map`` selection priority — the
+    # per-project ``operator-pm`` session (when present) wins over
+    # worker/architect for label/state purposes so the rail PM Chat
+    # row shows the dedicated per-project PM's state, not whichever
+    # worker happens to be live.
     from pollypm.models import CONTROL_ROLES
 
-    project_session_map: dict[str, tuple[str, str]] = {}
+    pm_session_map: dict[str, tuple[str, str]] = {}
+    other_session_map: dict[str, tuple[str, str]] = {}
     for launch in _launches(ctx):
         role = getattr(launch.session, "role", "")
+        name = getattr(launch.session, "name", "")
+        project = getattr(launch.session, "project", "")
+        if not project or not name:
+            continue
+        if role == "operator-pm":
+            # Skip the workspace-level Polly — she owns the workspace
+            # rail row, not per-project Chat PM (#per-project-pm).
+            if name == "operator":
+                continue
+            pm_session_map.setdefault(project, (name, role))
+            continue
         if role in CONTROL_ROLES:
             continue
-        project_session_map.setdefault(
-            launch.session.project,
-            (launch.session.name, role),
-        )
+        other_session_map.setdefault(project, (name, role))
+    project_session_map: dict[str, tuple[str, str]] = dict(other_session_map)
+    project_session_map.update(pm_session_map)
 
     rows: list[RailRow] = []
 

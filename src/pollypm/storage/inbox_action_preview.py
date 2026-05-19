@@ -13,12 +13,8 @@ import json
 import logging
 from pathlib import Path
 import re
-import sqlite3
 import tomllib
-from typing import TYPE_CHECKING, Any
-
-from pollypm.storage._backend_dispatch import is_pg_backend
-from pollypm.storage.sqlite_pragmas import readonly_uri
+from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from pollypm.models import PollyPMConfig
@@ -126,57 +122,27 @@ def load_fast_inbox_action_preview(
         )
         return None
 
-    if is_pg_backend(config):
-        # Postgres branch: one unified ``messages`` table — collapse the
-        # per-state.db scan into a single query against the shared pool.
-        projects_raw = raw.get("projects")
-        projects = projects_raw if isinstance(projects_raw, dict) else {}
-        known_projects = {str(key) for key in projects}
-        rows_per_source = max(preview_limit * 4, 48)
-        pg_rows = _pg_query_message_rows(limit=rows_per_source, config=config)
-        items: list[FastInboxPreviewEntry] = []
-        for row in pg_rows:
-            item = _row_to_entry(
-                row,
-                source_key=WORKSPACE_DB_KEY,
-                known_projects=known_projects,
-            )
-            if item is None:
-                continue
-            if project and item.project != project:
-                continue
-            items.append(item)
-        if not items:
-            return None
-        items = _dedupe_replayed_plan_reviews(items)
-        items.sort(key=_entry_sort_value, reverse=True)
-        preview = items[:preview_limit]
-        return preview, {item.task_id for item in preview}, len(items)
-
-    sources, known_projects = _message_sources(raw, config_path=config_path)
-    if not sources:
-        return None
-
-    items = []
+    # Postgres backend: one unified ``messages`` table — single query
+    # against the shared pool replaces the per-state.db scan.
+    projects_raw = raw.get("projects")
+    projects = projects_raw if isinstance(projects_raw, dict) else {}
+    known_projects = {str(key) for key in projects}
     rows_per_source = max(preview_limit * 4, 48)
-    for source_key, db_path in sources:
-        if not db_path.exists():
+    pg_rows = _pg_query_message_rows(limit=rows_per_source, config=config)
+    items: list[FastInboxPreviewEntry] = []
+    for row in pg_rows:
+        item = _row_to_entry(
+            row,
+            source_key=WORKSPACE_DB_KEY,
+            known_projects=known_projects,
+        )
+        if item is None:
             continue
-        for row in _query_message_rows(db_path, limit=rows_per_source):
-            item = _row_to_entry(
-                row,
-                source_key=source_key,
-                known_projects=known_projects,
-            )
-            if item is None:
-                continue
-            if project and item.project != project:
-                continue
-            items.append(item)
-
+        if project and item.project != project:
+            continue
+        items.append(item)
     if not items:
         return None
-
     items = _dedupe_replayed_plan_reviews(items)
     items.sort(key=_entry_sort_value, reverse=True)
     preview = items[:preview_limit]
@@ -188,11 +154,10 @@ def _pg_query_message_rows(
     limit: int,
     config: "PollyPMConfig | None",
 ) -> list[dict[str, object]]:
-    """Postgres branch for :func:`_query_message_rows`.
+    """Query qualifying ``messages`` rows from the pg RO pool.
 
-    Returns one row per qualifying ``messages`` row; the dict shape
-    matches the sqlite branch (same column names) so ``_row_to_entry``
-    is backend-agnostic.
+    Returns one dict per row keyed on the column names so
+    ``_row_to_entry`` is backend-agnostic.
     """
     try:
         from pollypm.storage.pg_pool import get_ro_pool
@@ -228,86 +193,6 @@ def _pg_query_message_rows(
         )
         return []
     return [dict(zip(cols, row, strict=False)) for row in rows]
-
-
-def _message_sources(
-    raw: dict[str, Any], *, config_path: Path,
-) -> tuple[list[tuple[str, Path]], set[str]]:
-    base = config_path.parent
-    projects_raw = raw.get("projects")
-    projects = projects_raw if isinstance(projects_raw, dict) else {}
-    known_projects = {str(key) for key in projects}
-    sources: list[tuple[str, Path]] = []
-    seen: set[Path] = set()
-
-    def _add(source_key: str, db_path: Path) -> None:
-        resolved = db_path.resolve() if db_path.exists() else db_path
-        if resolved in seen:
-            return
-        seen.add(resolved)
-        sources.append((source_key, db_path))
-
-    for project_key, project_raw in projects.items():
-        if not isinstance(project_raw, dict):
-            continue
-        path_raw = project_raw.get("path")
-        if not isinstance(path_raw, str) or not path_raw.strip():
-            continue
-        project_path = Path(path_raw).expanduser()
-        if not project_path.is_absolute():
-            project_path = base / project_path
-        _add(str(project_key), project_path / ".pollypm" / "state.db")
-
-    project_settings = raw.get("project")
-    if isinstance(project_settings, dict):
-        workspace_raw = project_settings.get("workspace_root")
-        if isinstance(workspace_raw, str) and workspace_raw.strip():
-            workspace = Path(workspace_raw).expanduser()
-            if not workspace.is_absolute():
-                workspace = base / workspace
-            _add(WORKSPACE_DB_KEY, workspace / ".pollypm" / "state.db")
-    return sources, known_projects
-
-
-def _query_message_rows(db_path: Path, *, limit: int) -> list[dict[str, object]]:
-    try:
-        conn = sqlite3.connect(readonly_uri(db_path), uri=True, timeout=0.2)
-    except Exception:  # noqa: BLE001
-        # #1355: previously silent. A failed RO open here drops the source
-        # from the preview entirely — log so DB perms / WAL drift surface
-        # instead of silently shrinking the inbox.
-        logger.warning(
-            "inbox_action_preview: failed to open %s for preview",
-            db_path,
-            exc_info=True,
-        )
-        return []
-    conn.row_factory = sqlite3.Row
-    try:
-        try:
-            rows = conn.execute(
-                """
-                SELECT
-                    id, scope, type, tier, recipient, sender, state, parent_id,
-                    subject, body, payload_json, labels, created_at, updated_at,
-                    closed_at
-                FROM messages
-                WHERE recipient = ?
-                  AND state = ?
-                  AND type IN (?, ?, ?)
-                ORDER BY created_at DESC, id DESC
-                LIMIT ?
-                """,
-                ("user", "open", "notify", "inbox_task", "alert", int(limit)),
-            ).fetchall()
-        except sqlite3.Error:
-            return []
-        return [dict(row) for row in rows]
-    finally:
-        try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def _row_to_entry(

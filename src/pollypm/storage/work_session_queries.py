@@ -1,34 +1,19 @@
-"""Read-only ``work_sessions`` aggregate queries.
+"""Read-only ``work_sessions`` aggregate queries (Postgres-only).
 
-Presentation/plugin code should not open workspace SQLite files
-directly; this module owns the schema/connection details for small
-projection reads against ``work_sessions``.
+Presentation/plugin code should not open workspace databases directly;
+this module owns the schema/connection details for small projection
+reads against ``work_sessions``.
 
-The aggregate used by the per-project dashboard's Tokens line lives
-here so the rendering layer (``cockpit_sections``) no longer has to
-``import sqlite3`` or know the table name.
-
-Backend dispatch (#1737, Slice C)
----------------------------------
-
-When ``[storage] backend = "postgres"`` is active, the same aggregate
-runs against the process-wide read-only pool keyed on the
-``task_project`` column (the pg schema uses the same column name as the
-sqlite shape — see :mod:`pollypm.storage.pg_schema`). The sqlite branch
-is preserved verbatim so first-run installs keep their existing
-``file:<path>?mode=ro`` semantics, including the ``apply_workspace_pragmas``
-busy-timeout setup that #1018 introduced.
+Following Slice K-state-callers-port (#1737), this module talks to the
+Postgres RO pool only. The ``db_path`` parameter is kept for caller
+compatibility but is unused.
 """
 
 from __future__ import annotations
 
 import logging
-import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-from pollypm.storage._backend_dispatch import is_pg_backend
-from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 if TYPE_CHECKING:
     from pollypm.models import PollyPMConfig
@@ -44,70 +29,13 @@ def aggregate_project_session_tokens(
 ) -> tuple[int, int] | None:
     """Return ``(SUM(total_input_tokens), SUM(total_output_tokens))`` for ``project_key``.
 
-    Returns ``None`` if the DB is missing or the query fails (e.g. the
-    ``work_sessions`` table does not exist on an old workspace) so the
-    Tokens line in the per-project dashboard can degrade to ``(n/a)``
-    instead of breaking the render.
-
-    A short ``busy_timeout`` is applied via the standard workspace
-    pragmas because the cockpit reader runs alongside JobWorkerPool +
-    heartbeat writers on the same DB (#1018).
+    Returns ``None`` if the pool / query can't be reached so the Tokens
+    line in the per-project dashboard can degrade to ``(n/a)`` instead
+    of breaking the render. The ``COALESCE(SUM(...), 0)`` form yields
+    ``(0, 0)`` consistently for the empty-table case. ``db_path`` is
+    unused on the pg backend.
     """
-    if is_pg_backend(config):
-        return _aggregate_pg(project_key=project_key, config=config)
-
-    try:
-        if not db_path.exists():
-            return None
-    except OSError:
-        return None
-    # #1652: open read-only via the ``file:<path>?mode=ro`` URI so the
-    # render-side aggregate cannot mutate the workspace DB (journal
-    # mode, write lock, etc.). Mirrors the doctor probe pattern from
-    # #1625 (``doctor_state_probes._connect_readonly``) and the other
-    # presentation-side read facades (``morning_briefing_queries``,
-    # ``inbox_action_preview``, ``work_task_state``). #1674: percent-encode
-    # the path so ``#`` / ``?`` in the workspace dir don't get parsed as
-    # URI fragment / query syntax.
-    uri = readonly_uri(db_path)
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as exc:
-        logger.debug(
-            "work_session_queries: connect failed for %s: %s", db_path, exc,
-        )
-        return None
-    try:
-        apply_workspace_pragmas(conn, readonly=True)
-        try:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(total_input_tokens), 0), "
-                "       COALESCE(SUM(total_output_tokens), 0) "
-                "FROM work_sessions WHERE task_project = ?",
-                (project_key,),
-            ).fetchone()
-        except sqlite3.Error:
-            return None
-    finally:
-        conn.close()
-    if row is None:
-        return 0, 0
-    return int(row[0] or 0), int(row[1] or 0)
-
-
-def _aggregate_pg(
-    *,
-    project_key: str,
-    config: "PollyPMConfig | None",
-) -> tuple[int, int] | None:
-    """Postgres branch for :func:`aggregate_project_session_tokens`.
-
-    Same shape as the sqlite branch: returns ``(in, out)`` tuple
-    (zero-filled on empty rows) or ``None`` when the pool / query
-    can't be reached. The ``COALESCE(SUM(...), 0)`` form mirrors the
-    sqlite query so the empty-table case yields ``(0, 0)`` consistently
-    across both backends.
-    """
+    del db_path  # unused on pg backend
     try:
         from pollypm.storage.pg_pool import get_ro_pool
     except Exception as exc:  # noqa: BLE001

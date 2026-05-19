@@ -1,13 +1,27 @@
 """Notification staging ownership for the SQLite work service.
 
 Contract:
-- Inputs: a ``SQLiteWorkService`` plus typed notification metadata.
+- Inputs: a work-service collaborator (see :class:`_WorkService` below)
+  plus typed notification metadata.
 - Outputs: staged notification ids, typed digest candidates, and prune
   summaries.
 - Side effects: writes the legacy ``notification_staging`` table and
   closes staged rows in the unified ``messages`` table.
 - Invariants: callers never need ``svc._conn`` or ad-hoc DB URL
   reconstruction to manage staged digest state.
+
+The helpers in this module are parameterised over a structural
+:class:`typing.Protocol` rather than the concrete
+``pollypm.work.sqlite_service.SQLiteWorkService`` class. This breaks
+the import cycle flagged in #1367 (the service top-imports this module,
+so a reverse type-annotation import — even guarded with
+``TYPE_CHECKING`` — registers as a cycle in the AST boundary scan).
+The corrupt-payload-defense helper ``_safe_json_dict`` previously
+imported lazily from ``sqlite_service`` now lives in the leaf
+``pollypm.work._safe_json`` module, so the top-level dependency edge
+can be removed entirely. ``SQLiteWorkService`` satisfies
+:class:`_WorkService` structurally; no runtime registration or subclass
+change is required.
 """
 
 from __future__ import annotations
@@ -15,14 +29,32 @@ from __future__ import annotations
 import json
 import sqlite3
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any, Protocol
 
 from pollypm.store import SQLAlchemyStore
 from pollypm.store.registry import get_store_by_url
+from pollypm.work._safe_json import _safe_json_dict
 from pollypm.work.models import DigestRollupCandidate
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+
+class _WorkService(Protocol):
+    """Structural view of the SQLite work service used by notification helpers.
+
+    Captures the exact slice these helpers reach into so the
+    ``service_notifications <-> sqlite_service`` cycle can be broken
+    without pulling the full concrete class into this module's type
+    graph (#1367 wedge).
+
+    - ``_conn`` — every helper drives ``execute``/``commit`` against
+      the work-DB connection.
+    - ``_db_path`` — ``_message_store`` reconstructs the ``sqlite:///``
+      URL to fetch the SQLAlchemy store for the unified ``messages``
+      table.
+    """
+
+    _conn: sqlite3.Connection
+    _db_path: Path
 
 
 def _ensure_staging_table(conn: sqlite3.Connection) -> None:
@@ -49,12 +81,12 @@ def _ensure_staging_table(conn: sqlite3.Connection) -> None:
     )
 
 
-def _message_store(service: "SQLiteWorkService") -> SQLAlchemyStore:
+def _message_store(service: _WorkService) -> SQLAlchemyStore:
     return get_store_by_url(f"sqlite:///{service._db_path}")  # type: ignore[return-value]
 
 
 def stage_notification_row(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     *,
     project: str,
     subject: str,
@@ -94,7 +126,7 @@ def stage_notification_row(
 
 
 def list_digest_rollup_candidates(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     *,
     project: str,
     milestone_key: str | None,
@@ -117,7 +149,6 @@ def list_digest_rollup_candidates(
             (project, milestone_key),
         ).fetchall()
 
-    from pollypm.work.sqlite_service import _safe_json_dict
     merged = [
         DigestRollupCandidate(
             source="legacy",
@@ -170,7 +201,7 @@ def list_digest_rollup_candidates(
 
 
 def mark_rollup_candidates_flushed(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     candidates: list[DigestRollupCandidate],
     *,
     rollup_task_id: str,
@@ -198,7 +229,7 @@ def mark_rollup_candidates_flushed(
 
 
 def has_old_pending_digest_rows(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     *,
     project: str,
     milestone_key: str | None,
@@ -224,7 +255,7 @@ def has_old_pending_digest_rows(
 
 
 def find_flushed_rollup_milestone(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     *,
     task_id: str,
 ) -> str | None:
@@ -244,7 +275,7 @@ def find_flushed_rollup_milestone(
 
 
 def prune_staged_notifications(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     *,
     retain_days: int = 30,
 ) -> dict[str, int]:

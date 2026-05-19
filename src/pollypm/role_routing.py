@@ -208,6 +208,45 @@ def resolve_role_assignment(
     return fallback
 
 
+def rewrite_assignment_for_provider(
+    role: str,
+    provider: ProviderKind | str,
+    config: PollyPMConfig | None,
+    *,
+    registry: Registry | None = None,
+) -> ResolvedAssignment | None:
+    """Return a ``ResolvedAssignment`` whose provider matches ``provider``.
+
+    Used by the launch planner (#1879) when a runtime account override
+    has pinned the session's provider but the role-routing fallback
+    table named a different provider. Picks the alias from the
+    matching single-provider table so the launch argv still carries
+    a sensible ``--model`` flag.
+    """
+    try:
+        canonical = _canonical_role(role)
+    except ValueError:
+        return None
+    provider_value = getattr(provider, "value", provider)
+    if not isinstance(provider_value, str) or not provider_value:
+        return None
+    if provider_value == "claude":
+        assignment = _CLAUDE_ONLY_DEFAULTS.get(canonical)
+    elif provider_value == "codex":
+        assignment = _CODEX_ONLY_DEFAULTS.get(canonical)
+    else:
+        assignment = None
+    if assignment is None:
+        return None
+    resolved_registry = registry or load_registry()
+    return _resolved_from_assignment(
+        canonical,
+        assignment,
+        source="fallback",
+        registry=resolved_registry,
+    )
+
+
 class RoleRoutingFacade:
     def __init__(self, config_path: Path) -> None:
         self._config_path = config_path
@@ -229,4 +268,5 @@ __all__ = [
     "RoleRoutingFacade",
     "resolved_provider_kind",
     "resolve_role_assignment",
+    "rewrite_assignment_for_provider",
 ]

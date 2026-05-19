@@ -290,6 +290,86 @@ def test_stuck_draft_silenced_by_cancellation(now: datetime) -> None:
     assert findings == []
 
 
+def test_stuck_draft_event_path_cross_checks_open_tasks_status(now: datetime) -> None:
+    """#1869: when ``open_tasks`` is supplied, the event-based fallback
+    must not fire for tasks that are no longer in draft state.
+
+    Reproduces the false-positive sweep that was raising stuck_draft
+    against tasks that the canonical store shows as ``done`` /
+    ``cancelled`` — the event-window can lose the matching
+    ``task.status_changed`` after a log rotation while still re-reading
+    an old ``task.created``. The state cross-check is the safety net.
+    """
+    class _FakeTaskMin:
+        class _Status:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        def __init__(self, project: str, task_number: int, work_status: str) -> None:
+            self.project = project
+            self.task_number = task_number
+            self.work_status = self._Status(work_status)
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_CREATED,
+            subject="pollypm/9",
+            project="pollypm",
+            ts=now - timedelta(minutes=30),
+        ),
+    ]
+    open_tasks = [_FakeTaskMin("pollypm", 9, "done")]
+    findings = [
+        f
+        for f in scan_events(events, now=now, open_tasks=open_tasks)
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings == []
+
+
+def test_stuck_draft_event_path_still_fires_for_actual_draft_in_open_tasks(
+    now: datetime,
+) -> None:
+    """#1869: a task still in draft state (and present in open_tasks)
+    must still surface via either path. State path is authoritative,
+    but the event path acting on the same subject must not be
+    suppressed when the task is genuinely draft."""
+    class _FakeTaskMin:
+        class _Status:
+            def __init__(self, value: str) -> None:
+                self.value = value
+
+        def __init__(self, project: str, task_number: int, work_status: str,
+                     created_at: datetime | None = None) -> None:
+            self.project = project
+            self.task_number = task_number
+            self.work_status = self._Status(work_status)
+            self.created_at = created_at
+            self.created_by = "polly"
+            self.title = "draft test"
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_CREATED,
+            subject="demo/2",
+            project="demo",
+            ts=now - timedelta(minutes=30),
+        ),
+    ]
+    # State-based path fires (created_at supplied, status draft, older
+    # than cutoff). Event path would dedupe to one finding.
+    open_tasks = [
+        _FakeTaskMin("demo", 2, "draft", created_at=now - timedelta(minutes=30)),
+    ]
+    findings = [
+        f
+        for f in scan_events(events, now=now, open_tasks=open_tasks)
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert len(findings) == 1
+    assert findings[0].subject == "demo/2"
+
+
 # ---------------------------------------------------------------------------
 # Rule 4: cancellation without promotion
 # ---------------------------------------------------------------------------

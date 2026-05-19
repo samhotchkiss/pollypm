@@ -219,9 +219,15 @@ def enqueue_advisor_review(
         # ``resolve_work_db_path`` and always lands on the workspace-root
         # state.db, so advisor tasks are visible to every engine that
         # reads canonical (the throttle in particular).
+        #
+        # #1881 — thread ``config`` so the factory picks the configured
+        # backend (postgres on pg workspaces). Without it the factory
+        # defaulted to sqlite and advisor reviews landed in stale
+        # per-project state.db files instead of pg.
         work_service = create_work_service(
             project_path=project_path,
             project_key=project_key,
+            config=config,
         )
         close_service = True
 
@@ -238,6 +244,7 @@ def enqueue_advisor_review(
                 project_key=project_key,
                 work_service=work_service,
                 project_path=project_path,
+                config=config,
             ):
                 logger.debug(
                     "advisor: enqueue skipped for %s — sibling tick "
@@ -283,6 +290,7 @@ def has_in_progress_advisor_task(
     project_key: str,
     work_service: Any,
     project_path: Path | None = None,
+    config: Any | None = None,
 ) -> bool:
     """Return True if any advisor task is currently active for the project.
 
@@ -315,9 +323,12 @@ def has_in_progress_advisor_task(
         try:
             from pollypm.work import create_work_service
 
+            # #1881 — thread ``config`` so the throttle reads from the
+            # configured backend (pg on pg workspaces).
             work_service = create_work_service(
                 project_path=project_path,
                 project_key=project_key,
+                config=config,
             )
             close_service = True
         except Exception as exc:  # noqa: BLE001
@@ -364,6 +375,7 @@ def has_project_stagnation_candidate(
     project_key: str,
     project_path: Path,
     work_service: Any,
+    config: Any | None = None,
 ) -> bool:
     """Return True when a quiet project still has non-terminal work.
 
@@ -378,9 +390,12 @@ def has_project_stagnation_candidate(
             from pollypm.work import create_work_service
 
             # Canonical resolver only — see #1004 / advisor.tick spam fix.
+            # #1881 — thread ``config`` so the stagnation probe reads
+            # the configured backend (pg on pg workspaces).
             work_service = create_work_service(
                 project_path=project_path,
                 project_key=project_key,
+                config=config,
             )
             close_service = True
         except Exception:  # noqa: BLE001
@@ -473,6 +488,7 @@ def _should_review(
     settings: AdvisorSettings,
     now_utc: datetime,
     work_service: Any,
+    config: Any | None = None,
 ) -> tuple[bool, str]:
     """Return (review?, reason). Reason is a short machine-parseable tag."""
     if not settings.enabled:
@@ -511,6 +527,7 @@ def _should_review(
             project_key=project_key,
             project_path=project_path,
             work_service=work_service,
+            config=config,
         ):
             return False, "no-changes"
         reason = "stagnation-candidate"
@@ -521,6 +538,7 @@ def _should_review(
         project_key=project_key,
         work_service=work_service,
         project_path=project_path,
+        config=config,
     ):
         return False, "in-progress"
 
@@ -624,6 +642,7 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
             settings=settings,
             now_utc=now_utc,
             work_service=work_service,
+            config=config,
         )
 
         entry: dict[str, Any] = {

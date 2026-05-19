@@ -735,6 +735,31 @@ def _detect_stuck_drafts(
                 continue
             created_events.append(ev)
 
+    # #1869 — when ``open_tasks`` is supplied (production cadence
+    # path), cross-check the event-based candidates against the
+    # live task state. The state-based path is authoritative; the
+    # event-based path was firing on tasks long since promoted to
+    # ``done``/``cancelled`` because the audit-event window can
+    # miss the corresponding ``task.status_changed`` event (the
+    # window read for the watchdog is narrower than a long-lived
+    # task's lifecycle, so an old ``task.created`` re-read after a
+    # log rotation or pg backfill arrived without its matching
+    # status-change history). Build a current-state index from
+    # ``open_tasks`` and skip event-based findings whose task is
+    # not actually in ``draft`` right now.
+    current_status_by_subject: dict[str, str] = {}
+    if open_tasks:
+        for task in open_tasks:
+            project = getattr(task, "project", "") or ""
+            task_number = getattr(task, "task_number", None)
+            if not project or task_number is None:
+                continue
+            subject_key = f"{project}/{task_number}"
+            status = getattr(task, "work_status", None)
+            status_value = getattr(status, "value", status)
+            if isinstance(status_value, str):
+                current_status_by_subject[subject_key] = status_value
+
     for ev in created_events:
         if ev.subject in promoted_subjects:
             continue
@@ -743,6 +768,12 @@ def _detect_stuck_drafts(
         key = _task_subject_key(ev.subject)
         if key is None:
             continue
+        # #1869 — when open_tasks is supplied, only fire on tasks
+        # actually in ``draft`` right now. A task that's known to the
+        # canonical store but not in draft must not be flagged stuck.
+        if open_tasks is not None and ev.subject in current_status_by_subject:
+            if current_status_by_subject[ev.subject] != "draft":
+                continue
         project, task_number = key
         seen_subjects.add(ev.subject)
         findings.append(Finding(

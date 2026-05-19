@@ -12,7 +12,17 @@ Use the docs in this order:
 
 ## Install
 
-PollyPM needs Python 3.13+, `tmux`, `git`, and at least one of the `claude` or `codex` CLIs on your PATH. Install those first if you don't have them.
+PollyPM needs Python 3.13+, `tmux`, `git`, **Postgres 16+ with the `pgvector` extension**, and at least one of the `claude` or `codex` CLIs on your PATH. Install those first if you don't have them.
+
+> **Why Postgres?** The state backend is Postgres-only as of the
+> [#1737 cutover](https://github.com/samhotchkiss/pollypm/issues/1737).
+> Sqlite is no longer supported — PollyPM stores task state, embeddings
+> (via `pgvector`), and audit history in a single shared database so
+> multiple cockpit / worker processes can coordinate. On a fresh
+> machine the fastest path is `pm bootstrap-pg` (see below), which
+> installs `postgresql@17` + `pgvector`, starts the service, creates
+> the database, registers the extension, applies the schema, and
+> writes a `[storage]` block to your config.
 
 ```bash
 # Clone the repo wherever you keep code
@@ -21,9 +31,20 @@ cd ~/dev/pollypm
 
 # Editable install so `git pull` upgrades you in place
 uv pip install -e .
+
+# Guided Postgres install (preview first, then apply). macOS Homebrew
+# is the fully-orchestrated path; Linux / other platforms get a hint.
+pm bootstrap-pg              # dry-run: shows the plan, no system changes
+pm bootstrap-pg --yes        # actually install: brew + pgvector + db + schema + config
 ```
 
 After this, `pm` and `pollypm` are on your PATH. They're the same command.
+
+If `pm bootstrap-pg` reports that pgvector is missing, install it
+explicitly (`brew install pgvector` on macOS; see
+[pgvector/pgvector](https://github.com/pgvector/pgvector#installation-notes)
+for other platforms) and re-run — the command is idempotent and will
+skip the steps it already completed.
 
 ## First run
 

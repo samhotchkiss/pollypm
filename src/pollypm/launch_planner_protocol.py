@@ -47,11 +47,12 @@ class DefaultLaunchPlannerContext:
 
     ``store`` is typed as :class:`typing.Any` during the pg cutover
     (#1737, Slice K-state-port). Historically this was a
-    ``StateStore`` instance; consumers are migrating to per-table pg
-    facades (e.g. :mod:`pollypm.storage.pg_workspace_state`), and the
-    handful of remaining callers that still need the sqlite StateStore
-    pass it through transparently. Once all consumers are off
-    StateStore the field is expected to be removed entirely.
+    sqlite-backed state-store instance; consumers are migrating to
+    per-table pg facades (e.g.
+    :mod:`pollypm.storage.pg_workspace_state`), and the handful of
+    remaining callers that still need the legacy state-store pass it
+    through transparently. Once all consumers are off the legacy
+    accessor the field is expected to be removed entirely.
     """
 
     config: "PollyPMConfig"

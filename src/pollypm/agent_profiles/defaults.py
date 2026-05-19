@@ -464,7 +464,6 @@ def reviewer_prompt() -> str:
 def _render_operator_state_brief(context: AgentProfileContext) -> str:
     """Return a compact JSON snapshot for operator-style prompts."""
     from pollypm.storage.state import StateStore
-
     session_rows: dict[str, object] = {}
     runtime_rows: dict[str, object] = {}
     try:
@@ -663,7 +662,6 @@ def _read_active_issue(project_root: Path) -> str:
 
 def _read_latest_checkpoint(context: AgentProfileContext) -> str:
     from pollypm.storage.state import StateStore
-
     store = StateStore(context.config.project.state_db)
     runtime = store.get_session_runtime(context.session.name)
     if runtime is None or not runtime.last_checkpoint_path:

@@ -248,7 +248,6 @@ def pg_state_store(tmp_path: Path):
     migration slice merges.
     """
     from pollypm.storage.state import StateStore
-
     db_path = tmp_path / "state.db"
     store = StateStore(db_path)
     try:

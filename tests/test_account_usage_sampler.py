@@ -24,8 +24,6 @@ from pollypm.models import (
 )
 from pollypm.provider_sdk import ProviderUsageSnapshot
 from pollypm.storage.state import StateStore
-
-
 class _FakeTmux:
     def __init__(self) -> None:
         self.created: list[tuple[str, str, str]] = []

@@ -141,7 +141,6 @@ def _unavailable_account_names(config: object) -> frozenset[str]:
     try:
         from pollypm.accounts import is_account_runtime_unavailable
         from pollypm.storage.state import StateStore
-
         unavailable: set[str] = set()
         accounts = getattr(config, "accounts", {}) or {}
         with StateStore(state_db) as store:

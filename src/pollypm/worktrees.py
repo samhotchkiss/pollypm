@@ -14,8 +14,8 @@ from pollypm.projects import (
     release_session_lock,
     session_scoped_dir,
 )
-from pollypm.storage.state import StateStore, WorktreeRecord
-
+from pollypm.storage.records import WorktreeRecord
+from pollypm.storage.state import StateStore
 _SAFE_WORKTREE_KEY_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 
 

@@ -41,7 +41,6 @@ def _load_config_and_store(payload: dict[str, Any]):
     config = load_config(config_path)
 
     from pollypm.storage.state import StateStore
-
     store = StateStore(config.project.state_db)
     return config, store
 

@@ -22,7 +22,6 @@ if TYPE_CHECKING:
     from pollypm.heartbeat.boot import HeartbeatRail
     from pollypm.plugin_host import ExtensionHost
     from pollypm.storage.state import StateStore
-
 logger = logging.getLogger(__name__)
 
 

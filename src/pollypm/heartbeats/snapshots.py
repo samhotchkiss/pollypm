@@ -5,8 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from pollypm.storage.state import HeartbeatRecord
-
+from pollypm.storage.records import HeartbeatRecord
 RECENT_HEARTBEAT_MAX_AGE_SECONDS = 30
 
 

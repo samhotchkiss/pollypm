@@ -143,8 +143,8 @@ def test_costs_collapses_case_variant_project_keys(tmp_path: Path) -> None:
     from datetime import UTC, datetime
     from types import SimpleNamespace
 
-    from pollypm.storage.state import StateStore, TokenUsageHourlyRecord
-
+    from pollypm.storage.records import TokenUsageHourlyRecord
+    from pollypm.storage.state import StateStore
     app = _build_app()
     runner = CliRunner()
 

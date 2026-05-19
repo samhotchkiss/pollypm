@@ -38,10 +38,7 @@ from pollypm.memory_backends import (
     VALID_SCOPE_TIERS,
     validate_typed_memory,
 )
-from pollypm.storage.state import StateStore
-
-
-# ---------------------------------------------------------------------------
+from pollypm.storage.state import StateStore  # ---------------------------------------------------------------------------
 # Migration — fresh schema + upgrade path
 # ---------------------------------------------------------------------------
 

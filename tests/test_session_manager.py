@@ -966,7 +966,6 @@ class TestWorkerLaunchBundleAccountFilter:
         unconditionally, so a heartbeat-marked auth break could not
         clear without manual ``pm reset``."""
         from pollypm.storage.state import StateStore
-
         primary_home = tmp_path / "claude-main-home"
         fallback_home = tmp_path / "claude-backup-home"
         config = self._multi_account_config(
@@ -1016,7 +1015,6 @@ class TestWorkerLaunchBundleAccountFilter:
         """Legacy rows (or UI writes) may still use ``"auth-broken"``
         with a hyphen — the filter must skip them too."""
         from pollypm.storage.state import StateStore
-
         primary_home = tmp_path / "claude-main-home"
         fallback_home = tmp_path / "claude-backup-home"
         config = self._multi_account_config(

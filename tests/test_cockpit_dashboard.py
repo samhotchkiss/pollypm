@@ -28,9 +28,7 @@ from pollypm.plugins_builtin.morning_briefing.inbox import (
     emit_briefing,
     list_briefings,
 )
-from pollypm.storage.state import AccountUsageRecord, TokenUsageHourlyRecord
-
-
+from pollypm.storage.records import AccountUsageRecord, TokenUsageHourlyRecord
 NOW = datetime(2026, 4, 21, 15, 0, tzinfo=UTC)
 
 
@@ -706,8 +704,7 @@ def test_dashboard_activity_line_pluralises_singular_counts(
     ``Today: 1 commits · 1 messages · 1 recoveries`` — three copy
     bugs on one line. Mirrors cycles 57–63 across other surfaces.
     """
-    from pollypm.storage.state import EventRecord
-
+    from pollypm.storage.records import EventRecord
     monkeypatch.setattr(
         "pollypm.cockpit_sections.dashboard._dashboard_project_tasks",
         lambda project_key, project_path: ({}, {}),

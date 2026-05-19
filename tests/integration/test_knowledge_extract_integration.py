@@ -5,8 +5,6 @@ from pollypm.config import write_config
 from pollypm.knowledge_extract import KNOWLEDGE_LEDGER_DIR, extract_knowledge_once
 from pollypm.models import AccountConfig, KnownProject, PollyPMConfig, PollyPMSettings, ProjectKind, ProjectSettings, ProviderKind, SessionConfig
 from pollypm.storage.state import StateStore
-
-
 def _config(tmp_path: Path) -> PollyPMConfig:
     project_root = tmp_path / "repo"
     project_root.mkdir()

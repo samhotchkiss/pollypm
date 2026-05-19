@@ -41,7 +41,6 @@ if TYPE_CHECKING:
     from pollypm.acct.protocol import ProviderAdapter
     from pollypm.acct.model import AccountConfig
     from pollypm.storage.state import StateStore
-
 logger = logging.getLogger(__name__)
 
 DEFAULT_IDLE_THRESHOLD = timedelta(hours=2)

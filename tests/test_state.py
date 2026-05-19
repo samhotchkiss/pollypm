@@ -5,10 +5,8 @@ from pathlib import Path
 import pytest
 
 import pollypm.storage.state as state_module
-from pollypm.storage.state import TokenUsageHourlyRecord
+from pollypm.storage.records import TokenUsageHourlyRecord
 from pollypm.storage.state import StateStore
-
-
 def test_state_store_has_no_silent_broad_exception_passes() -> None:
     source = Path(state_module.__file__).read_text()
     tree = ast.parse(source)

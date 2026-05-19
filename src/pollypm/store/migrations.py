@@ -109,7 +109,6 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 def _declared_state_migrations() -> list[tuple[int, str]]:
     from pollypm.storage.state import StateStore
-
     return [(version, desc) for version, desc, _ in StateStore._MIGRATIONS]
 
 

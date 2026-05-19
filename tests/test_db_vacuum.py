@@ -23,8 +23,6 @@ from pathlib import Path
 
 import pollypm.storage.state as state_mod
 from pollypm.storage.state import StateStore
-
-
 def test_auto_vacuum_incremental_on_fresh_db(tmp_path: Path) -> None:
     """Fresh DB must be created with auto_vacuum=INCREMENTAL (mode 2)."""
     store = StateStore(tmp_path / "state.db")

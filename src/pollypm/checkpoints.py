@@ -14,8 +14,6 @@ from pollypm.models import PollyPMConfig, SessionLaunchSpec
 from pollypm.memory_backends import get_memory_backend
 from pollypm.projects import ensure_project_scaffold, ensure_session_lock, project_checkpoints_dir, session_scoped_dir
 from pollypm.storage.state import StateStore
-
-
 HAIKU_MODEL = "claude-3-5-haiku-latest"
 TRANSCRIPT_CAP_CHARS = 16000  # ~4000 tokens
 

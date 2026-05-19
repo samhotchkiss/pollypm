@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -250,6 +251,277 @@ def stuck_claims_sweep_handler(
     state_db = config.project.state_db
     with JobQueue(db_path=state_db) as q:
         return _do_sweep(q)
+
+
+# ---------------------------------------------------------------------------
+# #1815 — audit_watchdog liveness auto-heal probe
+# ---------------------------------------------------------------------------
+
+# Cadence handlers must fire on their schedule for the system to be safe.
+# ``audit.watchdog`` is the most safety-critical of those — its 5 min sweep
+# is what catches stuck_draft / task_progress_stale / role_session_missing /
+# worker_session_dead_loop / cancellation_no_promotion / queue_without_motion /
+# advisor-priming-gaps. When it silently stops firing the operator-visible
+# surface (``pm alerts``, the rail badge) still looks healthy because
+# everything else is alive. #1815 documents the wedge symptom: last
+# ``heartbeat.tick`` 9+ hours stale while the heartbeat process itself is
+# alive and respawning.
+#
+# The probe runs once a minute and:
+#   1. Reads the freshest ``heartbeat.tick`` from the central audit tail.
+#   2. If the gap exceeds ``LIVENESS_STALE_THRESHOLD_SECONDS`` (default 3x
+#      the ``AUDIT_WATCHDOG_SCHEDULE``), force-recovers the queue
+#      (clears orphaned ``claimed`` rows that may be holding the
+#      ``audit.watchdog`` dedupe slot open) and re-enqueues the
+#      cadence job so the watchdog re-arms within ~60 s of detection.
+#   3. Emits an explicit ``audit_watchdog`` alert via the unified
+#      message store so ``pm alerts`` shows the heal action — an
+#      operator scanning the inbox sees "watchdog was wedged; auto-
+#      healed at <ts>" instead of silent recovery.
+#
+# This is the prong-2 self-heal rule called out by
+# ``project_heartbeat_cascade``: manual patches without a self-heal rule
+# are incomplete.
+
+# 3x the audit_watchdog schedule (5 min). A single missed fire is fine;
+# three in a row is the wedge.
+LIVENESS_STALE_THRESHOLD_SECONDS: float = 900.0
+# Floor on the heal cadence so the auto-heal can never spin: at most one
+# re-arm + alert per HEAL_THROTTLE_SECONDS. Keeps the probe idempotent
+# under contention if the watchdog handler is genuinely broken (in which
+# case the alert sticks around in ``pm alerts`` until the operator
+# acknowledges it).
+HEAL_THROTTLE_SECONDS: float = 300.0
+
+
+def audit_watchdog_liveness_probe_handler(
+    payload: dict[str, Any],
+    *,
+    queue: Any | None = None,
+    now: Any | None = None,
+    stale_threshold_seconds: float | None = None,
+) -> dict[str, Any]:
+    """Detect and auto-heal a wedged ``audit.watchdog`` scheduler (#1815).
+
+    The ``queue`` / ``now`` / ``stale_threshold_seconds`` keyword
+    arguments are test seams — production callers pass only ``payload``.
+
+    Returns a summary dict with:
+
+    * ``freshest_tick_ts``: ISO timestamp of the most recent
+      ``heartbeat.tick`` event found in the central tail, or ``None``.
+    * ``age_seconds``: how stale that event is relative to ``now``,
+      or ``None`` when no tick exists.
+    * ``stale``: bool — True iff age exceeds the threshold (or no
+      tick exists at all).
+    * ``action``: one of ``"none"``, ``"healed"``, ``"throttled"``.
+    """
+    from datetime import UTC, datetime
+
+    from pollypm.audit.watchdog import (
+        freshest_heartbeat_tick_ts,
+    )
+    from pollypm.jobs import JobQueue
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        AUDIT_WATCHDOG_HANDLER_NAME as _WATCHDOG_HANDLER_NAME,
+    )
+
+    resolved_now = now if isinstance(now, datetime) else datetime.now(UTC)
+    if resolved_now.tzinfo is None:
+        resolved_now = resolved_now.replace(tzinfo=UTC)
+
+    threshold = (
+        float(stale_threshold_seconds)
+        if stale_threshold_seconds is not None
+        else LIVENESS_STALE_THRESHOLD_SECONDS
+    )
+
+    freshest = freshest_heartbeat_tick_ts()
+    if freshest is None:
+        age_seconds: float | None = None
+        stale = True
+    else:
+        age_seconds = (resolved_now - freshest).total_seconds()
+        stale = age_seconds >= threshold
+
+    summary: dict[str, Any] = {
+        "freshest_tick_ts": freshest.isoformat() if freshest is not None else None,
+        "age_seconds": age_seconds,
+        "stale": stale,
+        "action": "none",
+        "threshold_seconds": threshold,
+    }
+
+    if not stale:
+        return summary
+
+    def _do_heal(q: Any) -> None:
+        # 1. Throttle: if we already healed inside the last
+        # HEAL_THROTTLE_SECONDS, leave the existing alert in place
+        # and bail. ``has_recent_or_active_dedupe`` is the cheapest
+        # observable proxy: re-enqueue uses dedupe_key="audit.watchdog",
+        # so a recent fire keeps that flag set.
+        recently = getattr(q, "has_recent_or_active_dedupe", None)
+        if callable(recently):
+            since = resolved_now - timedelta(seconds=HEAL_THROTTLE_SECONDS)
+            try:
+                if recently(_WATCHDOG_HANDLER_NAME, since=since):
+                    summary["action"] = "throttled"
+                    return
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "audit_watchdog.liveness_probe: "
+                    "has_recent_or_active_dedupe failed",
+                    exc_info=True,
+                )
+
+        # 2. Release any orphaned ``claimed`` rows. The most likely
+        # wedge under the new pg queue is that the previous
+        # ``audit.watchdog`` claim is still held by a dead /
+        # GC'd worker thread, and the dedupe-on-status='claimed'
+        # short-circuit at JobQueue.enqueue blocks every new fire.
+        try:
+            recovered, pruned = q.recover_orphaned_claims()
+            summary["recovered_claims"] = recovered
+            summary["pruned_claims"] = pruned
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "audit_watchdog.liveness_probe: "
+                "recover_orphaned_claims failed",
+                exc_info=True,
+            )
+            summary["recovered_claims"] = 0
+            summary["pruned_claims"] = 0
+
+        # 3. Re-enqueue the cadence job with the canonical dedupe
+        # key. If a prior row is queued / claimed at this point the
+        # enqueue is a no-op (returns the existing id), which is the
+        # correct behaviour — the heal already cleared the wedge,
+        # and a clean schedule on the cadence is enough.
+        try:
+            job_id = q.enqueue(
+                _WATCHDOG_HANDLER_NAME,
+                {},
+                dedupe_key=_WATCHDOG_HANDLER_NAME,
+            )
+            summary["enqueued_job_id"] = int(job_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "audit_watchdog.liveness_probe: re-enqueue failed",
+                exc_info=True,
+            )
+
+        summary["action"] = "healed"
+
+        # 4. Audit + alert so the heal action is observable. Audit
+        # emit is best-effort; the alert is the operator-visible
+        # surface.
+        try:
+            from pollypm.audit.log import emit as _audit_emit
+
+            _audit_emit(
+                event="audit_watchdog.liveness_probe.healed",
+                project="",
+                subject="audit_watchdog",
+                actor="audit_watchdog.liveness_probe",
+                status="warn",
+                metadata={
+                    "freshest_tick_ts": summary["freshest_tick_ts"],
+                    "age_seconds": age_seconds,
+                    "threshold_seconds": threshold,
+                    "recovered_claims": summary.get("recovered_claims", 0),
+                },
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "audit_watchdog.liveness_probe: audit emit failed",
+                exc_info=True,
+            )
+
+        _emit_liveness_probe_alert(
+            payload=payload,
+            age_seconds=age_seconds,
+            freshest_ts=summary["freshest_tick_ts"],
+            threshold_seconds=threshold,
+        )
+
+    if queue is not None:
+        _do_heal(queue)
+        return summary
+
+    try:
+        config = _load_config(payload)
+        state_db = config.project.state_db
+    except Exception:  # noqa: BLE001
+        # If config can't be resolved, we can't construct the queue
+        # without explicit injection. Still record the stale signal
+        # — the audit emit alone is useful for forensics.
+        logger.warning(
+            "audit_watchdog.liveness_probe: config resolution failed; "
+            "cannot heal",
+            exc_info=True,
+        )
+        summary["action"] = "config_unavailable"
+        return summary
+
+    with JobQueue(db_path=state_db) as q:
+        _do_heal(q)
+    return summary
+
+
+def _emit_liveness_probe_alert(
+    *,
+    payload: dict[str, Any],
+    age_seconds: float | None,
+    freshest_ts: str | None,
+    threshold_seconds: float,
+) -> None:
+    """Best-effort: upsert a ``watchdog_silent`` alert into ``pm alerts``.
+
+    The alert is keyed on a synthetic session name so repeat heals
+    fold into the same row instead of accumulating duplicates. We
+    use ``upsert_alert`` (the same channel the watchdog itself uses
+    for its findings) so ``pm alerts`` lists it under the same
+    actor surface.
+    """
+    try:
+        config = _load_config(payload)
+    except Exception:  # noqa: BLE001
+        return
+    msg_store = _open_msg_store(config)
+    if msg_store is None:
+        return
+    upsert = getattr(msg_store, "upsert_alert", None)
+    if not callable(upsert):
+        _close_msg_store(msg_store)
+        return
+    if age_seconds is None:
+        body = (
+            f"audit_watchdog liveness probe: no heartbeat.tick events "
+            f"found in central audit tail. Threshold {threshold_seconds:.0f}s. "
+            f"Auto-heal re-enqueued the cadence job."
+        )
+    else:
+        body = (
+            f"audit_watchdog wedged: last heartbeat.tick was "
+            f"{age_seconds:.0f}s ago ({freshest_ts}); threshold "
+            f"{threshold_seconds:.0f}s. Auto-heal recovered orphan claims "
+            f"and re-enqueued the cadence job."
+        )
+    try:
+        upsert(
+            "audit_watchdog/liveness",
+            "watchdog_silent",
+            "error",
+            body,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit_watchdog.liveness_probe: upsert_alert failed",
+            exc_info=True,
+        )
+    finally:
+        _close_msg_store(msg_store)
 
 
 AUDIT_EVENT_SUBJECTS: frozenset[str] = frozenset({

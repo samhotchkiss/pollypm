@@ -502,6 +502,43 @@ class Supervisor:
             return pg_last_event_at(session_name, event_type)
         return self.store.last_event_at(session_name, event_type)
 
+    # --- Cluster D (leases) dispatch helpers -------------------------- #
+    # Same pattern as the cluster-A helpers above: route through
+    # ``pollypm.storage.pg_leases`` on the pg backend, stay on the
+    # legacy StateStore on sqlite. Centralising the dispatch here keeps
+    # the supervisor's lease call sites short and the backend probe in
+    # one place.
+
+    def _list_leases(self):
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_leases import list_leases as pg_list_leases
+
+            return pg_list_leases()
+        return self.store.list_leases()
+
+    def _get_lease(self, session_name: str):
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_leases import get_lease as pg_get_lease
+
+            return pg_get_lease(session_name)
+        return self.store.get_lease(session_name)
+
+    def _set_lease(self, session_name: str, owner: str, note: str = "") -> None:
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_leases import set_lease as pg_set_lease
+
+            pg_set_lease(session_name, owner, note)
+            return
+        self.store.set_lease(session_name, owner, note)
+
+    def _clear_lease(self, session_name: str) -> None:
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_leases import clear_lease as pg_clear_lease
+
+            pg_clear_lease(session_name)
+            return
+        self.store.clear_lease(session_name)
+
     def _build_launch_planner(self):
         """Resolve the launch planner via the plugin host.
 
@@ -1483,7 +1520,7 @@ class Supervisor:
             errors.append(f"store.open_alerts: {exc}")
             alerts = []
         try:
-            leases = self.store.list_leases()
+            leases = self._list_leases()
         except Exception as exc:  # noqa: BLE001
             errors.append(f"store.list_leases: {exc}")
             leases = []
@@ -2106,7 +2143,7 @@ class Supervisor:
     def release_expired_leases(self, *, now: datetime | None = None) -> list[LeaseRecord]:
         current_time = now or datetime.now(UTC)
         released: list[LeaseRecord] = []
-        for lease in self.store.list_leases():
+        for lease in self._list_leases():
             try:
                 updated_at = datetime.fromisoformat(lease.updated_at)
             except ValueError:
@@ -2116,7 +2153,7 @@ class Supervisor:
             age = current_time - updated_at.astimezone(UTC)
             if age < self._lease_timeout():
                 continue
-            self.store.clear_lease(lease.session_name)
+            self._clear_lease(lease.session_name)
             # Sync — lease state transitions are transactional audit events.
             timeout_minutes = self.config.pollypm.lease_timeout_minutes
             minute_word = "minute" if timeout_minutes == 1 else "minutes"
@@ -2141,7 +2178,7 @@ class Supervisor:
             owner=owner,
             action="claim a lease for",
         )
-        self.store.set_lease(session_name, owner, note)
+        self._set_lease(session_name, owner, note)
         message = f"Lease claimed by {owner}"
         if note:
             message = f"{message}: {note}"
@@ -2170,10 +2207,10 @@ class Supervisor:
     def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
         self._require_session(session_name)
         if expected_owner is not None:
-            current = self.store.get_lease(session_name)
+            current = self._get_lease(session_name)
             if current is None or current.owner != expected_owner:
                 return  # Lease was already released or reclaimed by someone else
-        self.store.clear_lease(session_name)
+        self._clear_lease(session_name)
         # Sync — lease state transitions are transactional audit events.
         self._msg_store.record_event(
             scope=session_name,
@@ -2297,7 +2334,7 @@ class Supervisor:
         if press_enter:
             self._verify_input_submitted(target, text, launch)
         if owner == "human":
-            self.store.set_lease(session_name, "human", "automatic lease from direct human input")
+            self._set_lease(session_name, "human", "automatic lease from direct human input")
         self._msg_store.append_event(
             scope=session_name,
             sender=owner,
@@ -2387,7 +2424,7 @@ class Supervisor:
         return out
 
     def leases(self) -> list[LeaseRecord]:
-        return self.store.list_leases()
+        return self._list_leases()
 
     def pane_has_auth_failure(self, lowered_pane: str) -> bool:
         """Public alert-boundary detector for authentication failures."""
@@ -3444,12 +3481,12 @@ class Supervisor:
                 },
             )
 
-        lease = self.store.get_lease(launch.session.name)
+        lease = self._get_lease(launch.session.name)
         if lease is not None and lease.owner != "pollypm":
             if failure_type in self._DEAD_SESSION_FAILURES:
                 # Session is dead — the lease is protecting nothing.  Release it
                 # so recovery can proceed immediately.
-                self.store.clear_lease(launch.session.name)
+                self._clear_lease(launch.session.name)
                 self._msg_store.clear_alert(launch.session.name, "recovery_waiting_on_human")
                 self._msg_store.append_event(
                     scope=launch.session.name,
@@ -3921,7 +3958,7 @@ class Supervisor:
         action: str,
         force: bool = False,
     ) -> None:
-        lease = self.store.get_lease(session_name)
+        lease = self._get_lease(session_name)
         if lease is None or lease.owner == owner or force:
             return
         raise RuntimeError(

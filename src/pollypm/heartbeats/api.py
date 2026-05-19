@@ -189,6 +189,9 @@ class SupervisorHeartbeatAPI:
             artifact=artifact,
             snapshot_path=Path(context.snapshot_path),
             memory_backend_name=self.supervisor.config.memory.backend,
+            # #1830: thread the config so pg-mode last_checkpoint_path
+            # writes go to pg.session_runtime, not the legacy StateStore.
+            config=self.supervisor.config,
         )
         # Knowledge extraction now happens in session_intelligence (unified Haiku call)
         # instead of per-checkpoint snapshot learning.
@@ -228,7 +231,9 @@ class SupervisorHeartbeatAPI:
         ]
 
     def set_session_status(self, session_name: str, status: str, *, reason: str = "") -> None:
-        self.supervisor.store.upsert_session_runtime(
+        # #1830: route through the supervisor facade so pg-mode writes
+        # land on pg.session_runtime rather than legacy SQLite.
+        self.supervisor.upsert_session_runtime(
             session_name=session_name,
             status=status,
             last_failure_message=reason or None,

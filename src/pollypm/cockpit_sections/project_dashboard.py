@@ -193,7 +193,8 @@ def _render_project_dashboard(
         project_alerts = []
 
     try:
-        system_events = supervisor.store.recent_events(limit=200)
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        system_events = supervisor.recent_events(limit=200)
     except Exception:  # noqa: BLE001
         system_events = []
     system_events = [

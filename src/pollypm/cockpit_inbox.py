@@ -1198,7 +1198,8 @@ def _supervisor_stuck_and_heartbeat(
     if supervisor is None:
         return False, None, None
     try:
-        drift_at = supervisor.store.last_event_at(session_name, "state_drift")
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        drift_at = supervisor.last_event_at(session_name, "state_drift")
     except Exception:  # noqa: BLE001
         drift_at = None
     stuck = False

@@ -693,7 +693,8 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
         if not is_operational_alert(alert.alert_type)
     ]
     try:
-        recent = supervisor.store.recent_events(limit=300)
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        recent = supervisor.recent_events(limit=300)
     except Exception:  # noqa: BLE001
         recent = []
     cutoff_24h = (now - timedelta(hours=24)).isoformat()

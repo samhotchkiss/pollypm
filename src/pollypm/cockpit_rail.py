@@ -1434,7 +1434,8 @@ class CockpitRouter:
         launches, windows, alerts, _leases, _errors = supervisor.status()
         recent_events = []
         try:
-            recent_events = list(supervisor.store.recent_events(limit=300))
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            recent_events = list(supervisor.recent_events(limit=300))
         except Exception:  # noqa: BLE001
             recent_events = []
 
@@ -5133,7 +5134,8 @@ class PollyCockpitRail:
             pass
         try:
             supervisor = self.router._load_supervisor()
-            raw_events = list(supervisor.store.recent_events(limit=48))
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            raw_events = list(supervisor.recent_events(limit=48))
         except Exception:  # noqa: BLE001
             return ""
         events = [

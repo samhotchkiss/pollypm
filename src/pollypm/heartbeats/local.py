@@ -748,7 +748,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         # Skip disabled sessions (decommissioned via pm worker-stop)
         # Also skip if the operator recently managed workers (avoid race with Polly)
         try:
-            rt = api.supervisor.store.get_session_runtime(context.session_name)
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            rt = api.supervisor.get_session_runtime(context.session_name)
             if rt and rt.status in ("disabled", "switching"):
                 return
         except (AttributeError, Exception):  # noqa: BLE001
@@ -856,7 +857,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         ):
             runtime = None
             try:
-                runtime = api.supervisor.store.get_session_runtime(
+                # #1830: route through supervisor facade for pg/sqlite parity.
+                runtime = api.supervisor.get_session_runtime(
                     context.session_name
                 )
             except (AttributeError, Exception):  # noqa: BLE001
@@ -1088,7 +1090,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             try:
                 signals = self._context_to_signals(context, api)
                 health = _classify_session_health(signals)
-                runtime = api.supervisor.store.get_session_runtime(context.session_name)
+                # #1830: route through supervisor facade for pg/sqlite parity.
+                runtime = api.supervisor.get_session_runtime(context.session_name)
                 prev = runtime.recovery_attempts if runtime else 0
                 intervention = _select_intervention(health, signals, previous_interventions=prev)
                 # #249 — work-aware interventions. These dispatch before

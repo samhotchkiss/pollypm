@@ -207,7 +207,8 @@ def register_worker_commands(app: typer.Typer) -> None:
                 )
                 local_path.write_text(local_content)
                 typer.echo(f"  Updated project-local config with new args: {new_args}")
-        supervisor.store.upsert_session_runtime(
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        supervisor.upsert_session_runtime(
             session_name=session_name,
             status="switching",
             effective_account=account,
@@ -254,7 +255,8 @@ def register_worker_commands(app: typer.Typer) -> None:
         except Exception:  # noqa: BLE001
             typer.echo(f"Session {session_name} was not running")
 
-        supervisor.store.upsert_session_runtime(
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        supervisor.upsert_session_runtime(
             session_name=session_name,
             status="disabled",
         )

@@ -839,6 +839,12 @@ def test_session_status_surfaces_per_task_workers(monkeypatch, tmp_path: Path) -
     class FakeSupervisor:
         store = FakeStore()
 
+        # #1830: session_status now routes runtime reads through the
+        # supervisor facade. The fake mirrors the dispatch by deferring
+        # to its FakeStore on the sqlite branch.
+        def get_session_runtime(self, session_name: str):
+            return self.store.get_session_runtime(session_name)
+
         def status(self):
             # No configured launches; only a per-task window in tmux.
             return ([], [task_window], [], [], [])
@@ -891,6 +897,12 @@ def test_session_status_filter_by_per_task_window_name(monkeypatch, tmp_path: Pa
 
     class FakeSupervisor:
         store = FakeStore()
+
+        # #1830: session_status now routes runtime reads through the
+        # supervisor facade. The fake mirrors the dispatch by deferring
+        # to its FakeStore on the sqlite branch.
+        def get_session_runtime(self, session_name: str):
+            return self.store.get_session_runtime(session_name)
 
         def status(self):
             return ([], windows, [], [], [])

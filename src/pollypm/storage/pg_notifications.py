@@ -118,6 +118,35 @@ def record_notification(
         )
 
 
+def _advisory_lock_keys(
+    session_name: str, task_id: str, execution_version: int, scope: str
+) -> tuple[int, int]:
+    """Hash the claim tuple into a two-int key for ``pg_advisory_xact_lock``.
+
+    Postgres's two-int advisory-lock variant takes ``(int4, int4)``;
+    we derive both halves from a stable SHA-1 of the dedupe tuple so
+    two concurrent callers with the same ``(session, task, version,
+    scope)`` always collide on the same lock, while distinct tuples
+    are virtually guaranteed not to. Collisions across distinct
+    tuples are harmless (one waits a few ms on a key that doesn't
+    apply to it); the safety property we need is that the *same*
+    tuple always serialises.
+    """
+    import hashlib
+
+    blob = (
+        f"pollypm:notif:{session_name}\x00{task_id}\x00"
+        f"{int(execution_version)}\x00{scope}"
+    ).encode("utf-8")
+    digest = hashlib.sha1(blob).digest()
+    # Two signed 32-bit ints — that's what pg_advisory_xact_lock(int4, int4)
+    # wants. ``int.from_bytes(..., signed=True)`` keeps us inside the
+    # accepted range without an extra modulo.
+    a = int.from_bytes(digest[0:4], "big", signed=True)
+    b = int.from_bytes(digest[4:8], "big", signed=True)
+    return a, b
+
+
 def claim_notification_slot(
     *,
     session_name: str,
@@ -132,8 +161,10 @@ def claim_notification_slot(
     """Atomically claim a dedupe slot for a ``(session, task, version)`` ping.
 
     Mirrors the sqlite implementation's TOCTOU-safe check-and-insert
-    (#952). The check + insert run inside one transaction so a
-    concurrent caller sees the pending row and returns ``None``.
+    (#952). The check + insert run inside one transaction, gated by a
+    transaction-scoped advisory lock keyed on the dedupe tuple so a
+    concurrent caller blocks until we commit instead of racing past
+    the empty SELECT.
 
     * Returns ``None`` when a row already exists for
       ``(session, task, execution_version, dedupe_scope)`` inside the
@@ -147,6 +178,19 @@ def claim_notification_slot(
     also throttles ordinary follow-up sweeps; scoped claims only
     match the same scope so a stale normal row can't suppress the
     forced kickoff.
+
+    Why an advisory lock (#1821)
+    ----------------------------
+    The previous implementation relied on ``SELECT ... FOR UPDATE`` to
+    serialise the check + insert. That only locks rows that already
+    exist — when no row matches (the common cold-path on the first
+    ping for a task), two concurrent callers both see an empty result
+    and both insert a ``pending`` row, defeating the #952 dedupe
+    guarantee. ``pg_advisory_xact_lock`` blocks the second caller
+    until the first commits, so the second one's SELECT then sees the
+    just-inserted row and returns ``None``. The lock is released
+    automatically on COMMIT/ROLLBACK (the ``_xact`` variant), so we
+    never leak a held lock across connection reuse.
     """
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
@@ -163,13 +207,25 @@ def claim_notification_slot(
             "dedupe_scope": scope,
         }
     )
+    # For ``normal`` claims, the dedupe predicate matches any scope, so
+    # the lock must collapse on a single ``normal`` key per tuple —
+    # otherwise two normal-scope callers could pick different ``scope``
+    # values (they can't here, both pass ``"normal"``, but a future
+    # caller wrapping this fn must not be able to bypass dedupe by
+    # varying scope). For non-normal claims we key on the scope so a
+    # forced kickoff and a normal sweep don't block each other.
+    lock_scope = scope if scope != "normal" else "normal"
+    key_a, key_b = _advisory_lock_keys(
+        session_name, task_id, int(execution_version), lock_scope
+    )
     with pool.connection() as conn, conn.cursor() as cur:
-        # The check + insert run inside the same psycopg transaction
-        # (one ``with conn`` block, no explicit COMMIT until exit) so a
-        # concurrent claim either sees our row and returns None, or
-        # gets blocked on the pg row lock until we commit. The unique
-        # constraint is enforced logically by the dedupe-scope match
-        # rather than a partial index because the window is dynamic.
+        # Acquire a transaction-scoped advisory lock keyed on the
+        # dedupe tuple. The lock is released at COMMIT/ROLLBACK; no
+        # explicit unlock needed. This is the load-bearing line that
+        # fixes the #1821 race — without it, two concurrent callers
+        # with no existing row would both pass the SELECT and both
+        # INSERT.
+        cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (key_a, key_b))
         cur.execute(
             """
             SELECT 1 FROM messages
@@ -186,7 +242,6 @@ def claim_notification_slot(
               )
               AND created_at >= %s
             LIMIT 1
-            FOR UPDATE
             """,
             (
                 session_name,

@@ -156,6 +156,7 @@ class HeartbeatRail:
         state_db: Path,
         plugin_host: Any,
         config_path: Path | None = None,
+        config: Any = None,
         concurrency: int | None = None,
         tick_interval_seconds: float = DEFAULT_TICK_INTERVAL_SECONDS,
     ) -> "HeartbeatRail":
@@ -163,6 +164,12 @@ class HeartbeatRail:
 
         The plugin host must expose ``build_roster()`` and
         ``job_handler_registry()`` (see :class:`pollypm.plugin_host.ExtensionHost`).
+
+        ``config`` is the already-loaded :class:`PollyPMConfig`. When
+        provided, it's threaded into the pg pool resolution and into
+        the ``JobQueue`` so the configured ``[storage.pg] dsn`` /
+        ``[storage] url`` is honoured rather than silently falling
+        back to the localhost default (#1819).
         """
         worker_settings = (
             load_worker_settings(config_path) if config_path else WorkerSettings()
@@ -195,18 +202,22 @@ class HeartbeatRail:
         # contract. ``state_db`` is retained in the signature for
         # source-compat with the legacy caller (``from_config``);
         # the queue itself reads its DSN from the process-wide pool.
+        # ``config`` is threaded into ``get_rw_pool`` so the migration
+        # applier opens the pool against the configured DSN (#1819)
+        # — passing ``None`` here was the regression where a non-
+        # default ``[storage.pg] dsn`` silently hit localhost.
         try:
             from pollypm.storage.pg_migrations import apply_migrations
             from pollypm.storage.pg_pool import get_rw_pool
 
-            apply_migrations(get_rw_pool())
+            apply_migrations(get_rw_pool(config))
         except Exception:  # noqa: BLE001 — schema is a best-effort here
             logger.exception(
                 "HeartbeatRail.from_plugin_host: pg migration applier "
                 "raised; continuing — the queue will surface "
                 "UndefinedTable on first use if schema is genuinely missing",
             )
-        queue = JobQueue(db_path=state_db)
+        queue = JobQueue(db_path=state_db, config=config)
         pool = JobWorkerPool(
             queue, registry=registry, poll_interval=worker_settings.poll_interval,
         )
@@ -227,6 +238,7 @@ class HeartbeatRail:
             state_db=config.project.state_db,
             plugin_host=plugin_host,
             config_path=config_path,
+            config=config,
         )
 
     # ------------------------------------------------------------------

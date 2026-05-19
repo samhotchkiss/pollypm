@@ -587,13 +587,22 @@ class JobQueue:
           1. UPDATE every ``claimed`` row back to ``queued`` with
              ``run_after = now()`` and rewind attempt by 1 since no
              handler body ever ran.
-          2. DELETE duplicate queued rows per ``handler_name``, keeping
-             only the newest. Pre-#1052 rows had no dedupe_key so the
+          2. Collapse the *legacy* cadence backlog only: rows with
+             ``dedupe_key IS NULL`` whose ``handler_name`` was just
+             requeued in step 1 *and* has more than one queued row
+             remaining. Pre-#1052 rows had no dedupe_key so the
              previous daemon's cadence ticks accumulated thousands of
              identical session.health_sweep / task_assignment.sweep
-             rows in ``claimed``; without this dedupe pass the worker
-             pool would spend hours grinding through the legacy pile
-             before it could fire freshly-scheduled handlers.
+             rows in ``claimed``; collapsing those keeps the worker
+             pool from grinding through the legacy pile before it can
+             fire freshly-scheduled handlers.
+
+             Critically, this prune is scoped to:
+               * the handlers actually recovered by *this* invocation,
+                 so a stale queued backlog from a healthy queue is left
+                 alone (#1822); and
+               * NULL-``dedupe_key`` rows only, so legitimate distinct
+                 payload/dedupe-keyed jobs are never collapsed (#1822).
 
         Returns ``(recovered, pruned)`` — the count of orphaned-claim
         rows we requeued, and the count of duplicate queued rows we
@@ -603,6 +612,22 @@ class JobQueue:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                # Step 1 — capture the handler set we're recovering
+                # *before* we mutate ``status`` so the prune in step 2
+                # can scope to "handlers this boot just recovered".
+                # Without the capture-then-update split, the prune
+                # would see every queued handler (including untouched
+                # ones) and drop legitimate work — the #1822
+                # regression.
+                cur.execute(
+                    """
+                    SELECT DISTINCT handler_name
+                    FROM work_jobs
+                    WHERE status = 'claimed'
+                    """,
+                )
+                recovered_handlers = [row[0] for row in cur.fetchall()]
+
                 cur.execute(
                     """
                     UPDATE work_jobs
@@ -620,18 +645,32 @@ class JobQueue:
                 )
                 recovered = int(cur.rowcount or 0)
 
-                cur.execute(
-                    """
-                    DELETE FROM work_jobs
-                    WHERE status = 'queued'
-                      AND id NOT IN (
-                        SELECT MAX(id) FROM work_jobs
+                pruned = 0
+                if recovered_handlers:
+                    # Step 2 — collapse the legacy NULL-dedupe-key
+                    # backlog for the handlers we just recovered. We
+                    # keep the newest row per handler (so the cadence
+                    # can still fire) and drop the older duplicates.
+                    # Distinct dedupe_keyed rows are filtered out by
+                    # the ``dedupe_key IS NULL`` clause, so payload-
+                    # differentiated work survives untouched.
+                    cur.execute(
+                        """
+                        DELETE FROM work_jobs
                         WHERE status = 'queued'
-                        GROUP BY handler_name
-                      )
-                    """,
-                )
-                pruned = int(cur.rowcount or 0)
+                          AND dedupe_key IS NULL
+                          AND handler_name = ANY(%s)
+                          AND id NOT IN (
+                            SELECT MAX(id) FROM work_jobs
+                            WHERE status = 'queued'
+                              AND dedupe_key IS NULL
+                              AND handler_name = ANY(%s)
+                            GROUP BY handler_name
+                          )
+                        """,
+                        (recovered_handlers, recovered_handlers),
+                    )
+                    pruned = int(cur.rowcount or 0)
             conn.commit()
         return recovered, pruned
 

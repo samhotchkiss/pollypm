@@ -362,6 +362,81 @@ def test_recover_orphaned_claims_collapses_legacy_duplicates(
     assert q.get(other).status is JobStatus.QUEUED
 
 
+def test_recover_orphaned_claims_preserves_queued_rows_when_nothing_claimed(
+    pg_job_queue: JobQueue,
+) -> None:
+    """#1822 — a boot with NO orphaned claims must not prune queued rows.
+
+    Two queued jobs share a handler. ``recover_orphaned_claims`` runs
+    when no row is in the ``claimed`` state. The old pg port deleted
+    the older queued row unconditionally; the fixed implementation
+    leaves both untouched because no recovery happened.
+    """
+    q = pg_job_queue
+    a = q.enqueue("sweep", {"p": "a"})
+    b = q.enqueue("sweep", {"p": "b"})
+
+    recovered, pruned = q.recover_orphaned_claims()
+    assert recovered == 0
+    assert pruned == 0
+
+    # Both rows must still exist and be queued.
+    job_a = q.get(a)
+    job_b = q.get(b)
+    assert job_a is not None and job_a.status is JobStatus.QUEUED
+    assert job_b is not None and job_b.status is JobStatus.QUEUED
+
+
+def test_recover_orphaned_claims_preserves_distinct_dedupe_keys(
+    pg_job_queue: JobQueue,
+) -> None:
+    """#1822 — distinct-dedupe-key rows survive recovery even when claimed.
+
+    Three rows for handler ``h`` with distinct dedupe_keys all wind up
+    in the ``claimed`` state (a crashed worker that claimed three rows
+    in one boot). Recovery requeues all three; the prune step must
+    NOT collapse them because they carry distinct dedupe keys — the
+    fix scopes the prune to ``dedupe_key IS NULL`` only.
+    """
+    q = pg_job_queue
+    a = q.enqueue("h", {"p": "a"}, dedupe_key="h:a")
+    b = q.enqueue("h", {"p": "b"}, dedupe_key="h:b")
+    c = q.enqueue("h", {"p": "c"}, dedupe_key="h:c")
+    # Crashed worker claimed all three rows before dying.
+    q.claim("crashed-worker", limit=3)
+
+    recovered, pruned = q.recover_orphaned_claims()
+    assert recovered == 3
+    # All three have distinct (non-NULL) dedupe_keys, so the prune
+    # leaves them alone.
+    assert pruned == 0
+
+    assert q.get(a) is not None and q.get(a).status is JobStatus.QUEUED
+    assert q.get(b) is not None and q.get(b).status is JobStatus.QUEUED
+    assert q.get(c) is not None and q.get(c).status is JobStatus.QUEUED
+
+
+def test_recover_orphaned_claims_preserves_distinct_payloads_same_handler(
+    pg_job_queue: JobQueue,
+) -> None:
+    """#1822 — two queued rows with the same handler + different payloads.
+
+    Both rows have ``dedupe_key=None`` (the legacy shape), but no
+    ``claimed`` row exists — there's nothing to recover, so the prune
+    step must NOT collapse them. The pre-fix code dropped the older
+    one unconditionally.
+    """
+    q = pg_job_queue
+    a = q.enqueue("user.handler", {"p": "first"})
+    b = q.enqueue("user.handler", {"p": "second"})
+
+    recovered, pruned = q.recover_orphaned_claims()
+    assert recovered == 0
+    assert pruned == 0
+    assert q.get(a) is not None and q.get(a).status is JobStatus.QUEUED
+    assert q.get(b) is not None and q.get(b).status is JobStatus.QUEUED
+
+
 def test_null_dedupe_key_does_not_deduplicate(pg_job_queue: JobQueue) -> None:
     q = pg_job_queue
     jid1 = q.enqueue("sweep", {"p": "a"})

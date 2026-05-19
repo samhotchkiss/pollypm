@@ -74,13 +74,15 @@ class PgStore:
     Parameters
     ----------
     url:
-        The pg DSN. Accepted for protocol parity with
-        :class:`SQLAlchemyStore`; the value is stored for ``self.url``
-        but ignored when resolving the pool — the process-wide pg pool
-        already resolves its DSN via :func:`pollypm.storage.pg_pool.resolve_dsn`
-        (env > config > built-in default). Passing a DSN here that
-        disagrees with what the pool already opened is a no-op; the
-        pool wins.
+        The pg DSN. The entry-point registry passes the resolved
+        ``config.storage.url`` here. The store builds a thin config
+        shim from ``url`` (when it looks like a pg DSN) and passes it
+        to :func:`pollypm.storage.pg_pool.get_rw_pool` so the
+        process-wide pool opens against the operator-configured DSN
+        rather than silently falling back to localhost (#1819). When
+        the pool is already open against a different DSN, that pool
+        wins — the call site that opens the pool first sets the DSN
+        for the lifetime of the process.
     """
 
     def __init__(self, url: str) -> None:
@@ -96,6 +98,49 @@ class PgStore:
         # database. Slice A's migration applier is idempotent on a
         # fully-applied schema, so the cost amortizes to one pg round-trip.
         self._ensure_schema()
+
+    def _pool_config(self):
+        """Build a minimal config-shaped object carrying ``self._url``.
+
+        The pg pool's :func:`resolve_dsn` reads
+        ``config.storage.pg.dsn`` and ``config.storage.url`` — passing
+        the store's constructor URL through both fields covers the
+        case where the registry handed us either the legacy
+        ``[storage] url`` or the canonical ``[storage.pg] dsn`` (the
+        registry resolves them into one ``url`` string before
+        construction, and we can't tell which knob it came from).
+        """
+        url = (self._url or "").strip()
+        if not url:
+            return None
+        # Only proxy a pg-shaped URL; sqlite URLs would be filtered
+        # out by ``_looks_like_pg_dsn`` anyway, but skipping the build
+        # avoids a useless shim object on sqlite-backed installs.
+        from pollypm.storage.pg_pool import _looks_like_pg_dsn
+
+        if not _looks_like_pg_dsn(url):
+            return None
+
+        class _PgSection:
+            __slots__ = ("dsn",)
+
+            def __init__(self, dsn: str) -> None:
+                self.dsn = dsn
+
+        class _Storage:
+            __slots__ = ("url", "pg")
+
+            def __init__(self, url: str) -> None:
+                self.url = url
+                self.pg = _PgSection(url)
+
+        class _Config:
+            __slots__ = ("storage",)
+
+            def __init__(self, url: str) -> None:
+                self.storage = _Storage(url)
+
+        return _Config(url)
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -129,7 +174,7 @@ class PgStore:
     def _rw_pool(self) -> "ConnectionPool":
         from pollypm.storage.pg_pool import get_rw_pool
 
-        return get_rw_pool(None)
+        return get_rw_pool(self._pool_config())
 
     def _ro_pool(self) -> "ConnectionPool":
         # Read-side queries can run on the rw pool if the ro pool is
@@ -138,10 +183,11 @@ class PgStore:
         # write fails fast, which is the only reason to prefer it.
         from pollypm.storage.pg_pool import get_ro_pool, get_rw_pool
 
+        cfg = self._pool_config()
         try:
-            return get_ro_pool(None)
+            return get_ro_pool(cfg)
         except Exception:  # noqa: BLE001 - degrade to rw on ro errors
-            return get_rw_pool(None)
+            return get_rw_pool(cfg)
 
     def _ensure_schema(self) -> None:
         """Apply the canonical pg migration pack on first use.

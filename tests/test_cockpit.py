@@ -1706,6 +1706,49 @@ def test_cockpit_router_decorates_project_items_with_sparkline_and_pin() -> None
     assert decorated[-1].key == "system"
 
 
+def test_project_session_map_prefers_architect_over_worker_and_advisor() -> None:
+    """The project PM == project architect (Sam's clarification, 2026-05).
+
+    When a project has both an architect and another non-control session
+    (worker, advisor), ``_project_session_map`` must surface the
+    architect so PM Chat lands on the long-lived per-project PM
+    conversation rather than a sibling worker or advisor. Without this
+    rule the resolver picked whichever launch ``plan_launches`` returned
+    first, which can vary by config ordering and made "Chat PM" routing
+    nondeterministic.
+    """
+
+    def _launch(name: str, project: str, role: str):
+        return SimpleNamespace(
+            session=SimpleNamespace(name=name, role=role, project=project),
+        )
+
+    router = CockpitRouter.__new__(CockpitRouter)
+
+    # Architect listed AFTER worker + advisor in the launches list; the
+    # priority rule must still pick architect.
+    launches = [
+        _launch("advisor_samblog", "samblog", "advisor"),
+        _launch("worker_samblog", "samblog", "worker"),
+        _launch("architect_samblog", "samblog", "architect"),
+        # An architect-free project keeps the prior first-wins behaviour
+        # for non-architect tiers.
+        _launch("worker_demo", "demo", "worker"),
+        _launch("advisor_demo", "demo", "advisor"),
+        # An architect-only project surfaces the architect.
+        _launch("architect_bikepath", "bikepath", "architect"),
+        # Control roles are never selectable.
+        _launch("reviewer_samblog", "samblog", "reviewer"),
+        _launch("operator", None, "operator-pm"),
+    ]
+
+    result = router._project_session_map(launches)
+
+    assert result["samblog"] == "architect_samblog"
+    assert result["demo"] == "worker_demo"
+    assert result["bikepath"] == "architect_bikepath"
+
+
 def test_cockpit_router_decorates_and_sorts_project_rollup_status() -> None:
     router = CockpitRouter.__new__(CockpitRouter)
     router.is_project_pinned = lambda key: key == "alpha"  # type: ignore[assignment]

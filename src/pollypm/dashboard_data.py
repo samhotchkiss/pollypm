@@ -4,12 +4,12 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
-from pollypm.config import load_config
-from pollypm.config import PollyPMConfig
+from pollypm.config import PollyPMConfig, load_config
 from pollypm.storage.state import StateStore
 
 logger = logging.getLogger(__name__)
@@ -209,10 +209,7 @@ _COMMIT_CACHE_TTL_SECONDS = 60.0
 _COMMIT_PER_PROJECT_TIMEOUT_SECONDS = 2.0
 
 
-from dataclasses import dataclass as _dataclass
-
-
-@_dataclass(slots=True, frozen=True)
+@dataclass(slots=True, frozen=True)
 class _CachedCommitRow:
     """git-log row stored in the cache — converted to CommitInfo on read.
 
@@ -227,11 +224,9 @@ class _CachedCommitRow:
 
 def _git_log_rows_cached(project_path: Path, hours: int) -> list[_CachedCommitRow]:
     """Return cached git-log rows for ``project_path``, refreshing on TTL."""
-    import time as _time
-
     cache_key = (str(project_path), hours)
     cached = _COMMIT_CACHE.get(cache_key)
-    now_mono = _time.monotonic()
+    now_mono = time.monotonic()
     if cached is not None and (now_mono - cached[0]) < _COMMIT_CACHE_TTL_SECONDS:
         return cached[1]
 

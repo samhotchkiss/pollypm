@@ -71,6 +71,10 @@ def _latest_work_output(svc: _TaskShippedSvc, task_id: str) -> Any | None:
     try:
         executions = svc.get_execution(task_id)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "task_shipped: get_execution(%s) failed; treating as no work_output",
+            task_id, exc_info=True,
+        )
         return None
     for execution in reversed(executions):
         wo = getattr(execution, "work_output", None)
@@ -186,6 +190,10 @@ def emit_task_shipped_card(
         try:
             task = svc.get(task_id)
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "task_shipped: svc.get(%s) failed; skipping shipped card",
+                task_id, exc_info=True,
+            )
             return None
 
         summary = (getattr(work_output, "summary", "") or "").strip()

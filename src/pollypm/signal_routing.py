@@ -50,6 +50,7 @@ from __future__ import annotations
 
 import enum
 import hashlib
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping
@@ -60,6 +61,8 @@ from pollypm.cockpit_alerts import (
     alert_should_toast,
     is_operational_alert,
 )
+
+logger = logging.getLogger(__name__)
 
 
 __all__ = [
@@ -498,10 +501,18 @@ def shared_inbox_count(config: object) -> int:
     try:
         from pollypm.cockpit_inbox import _count_inbox_tasks_for_label
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "shared_inbox_count: failed to import _count_inbox_tasks_for_label",
+            exc_info=True,
+        )
         return 0
     try:
         return _count_inbox_tasks_for_label(config)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "shared_inbox_count: _count_inbox_tasks_for_label failed",
+            exc_info=True,
+        )
         return 0
 
 

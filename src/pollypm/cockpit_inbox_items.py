@@ -683,6 +683,11 @@ def load_inbox_entries(
         try:
             store = SQLAlchemyStore(f"sqlite:///{db_path}")
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "load_inbox_entries: SQLAlchemyStore(%s) init failed; "
+                "skipping message rows for this source",
+                db_path, exc_info=True,
+            )
             store = None
         if store is not None:
             try:
@@ -693,6 +698,11 @@ def load_inbox_entries(
                         type=["notify", "inbox_task", "alert"],
                     )
                 except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "load_inbox_entries: query_messages on %s failed; "
+                        "treating as empty",
+                        db_path, exc_info=True,
+                    )
                     rows = []
                 for row in rows:
                     if _row_is_dev_channel(row.get("labels")):
@@ -716,11 +726,21 @@ def load_inbox_entries(
         try:
             svc = create_work_service(db_path=db_path, project_path=project_path)
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "load_inbox_entries: create_work_service(%s) failed; "
+                "skipping task rows for project=%s",
+                db_path, project_key, exc_info=True,
+            )
             continue
         try:
             try:
                 project_tasks = inbox_tasks(svc, project=project_key)
             except Exception:  # noqa: BLE001
+                logger.warning(
+                    "load_inbox_entries: inbox_tasks(project=%s) failed; "
+                    "treating as empty",
+                    project_key, exc_info=True,
+                )
                 project_tasks = []
             # N+1 escape: pre-fetch read-markers and replies for every
             # task in this project in one query each, then bucket
@@ -731,10 +751,20 @@ def load_inbox_entries(
                     project=project_for_query, entry_type="read",
                 )
             except Exception:  # noqa: BLE001
+                logger.warning(
+                    "load_inbox_entries: task_numbers_with_context_entry"
+                    "(project=%s) failed; treating as empty read-marker set",
+                    project_for_query, exc_info=True,
+                )
                 read_marker_numbers = set()
             try:
                 replies_by_number = svc.bulk_list_replies(project=project_for_query)
             except Exception:  # noqa: BLE001
+                logger.warning(
+                    "load_inbox_entries: bulk_list_replies(project=%s) failed; "
+                    "treating as empty replies map",
+                    project_for_query, exc_info=True,
+                )
                 replies_by_number = {}
             for task in project_tasks:
                 if task.task_id in seen_task_ids:

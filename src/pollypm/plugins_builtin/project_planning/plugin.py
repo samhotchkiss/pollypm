@@ -79,6 +79,25 @@ class MarkdownPromptProfile:
                     "architect",
                     fallback_text=prompt,
                 )
+        # Substitute the ``{persona_name}`` placeholder so the architect's
+        # baked-in identity matches the project's configured persona.
+        # Pre-fix the profile was a static "You are Archie, the architect"
+        # — when the project's chat-open primer greeted the agent as
+        # "Sage" (samblog's configured persona_name), the agent's system
+        # prompt and the user-facing greeting contradicted each other.
+        # The fallback keeps the historical role default ("Archie") for
+        # projects that never picked a persona, mirroring the precedence
+        # used by ``_resolve_project_chat_persona`` for the rail label
+        # and the per-project primer (#1866 follow-up).
+        if "{persona_name}" in prompt:
+            persona = "Archie"
+            if context is not None:
+                project = context.config.projects.get(context.session.project)
+                if project is not None:
+                    persona_raw = getattr(project, "persona_name", None)
+                    if isinstance(persona_raw, str) and persona_raw.strip():
+                        persona = persona_raw.strip()
+            prompt = prompt.replace("{persona_name}", persona)
         return prompt or None
 
 

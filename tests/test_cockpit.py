@@ -2047,6 +2047,151 @@ def test_project_pm_primer_falls_back_to_architect_default_when_persona_unset() 
     assert "Hey Bea" not in sent[0][1]
 
 
+def test_project_pm_primer_suppressed_when_pane_has_existing_conversation() -> None:
+    """First-attach gate for the chat-open primer (#1867).
+
+    Pre-fix, the per-project PM primer fired whenever the persisted
+    ``pm_primed_sessions`` marker was missing — including after a
+    state-cache reset that left a real, in-progress conversation on the
+    pane. Sam's screenshot in #1867 caught exactly that: the primer
+    landed AFTER he had already asked the agent "who are you?" twice,
+    parsing as a system-authority reset on top of an active turn.
+
+    The fix gates the primer on pane content: if a 200-line capture of
+    the target pane shows substantive output (>= 40 non-empty lines),
+    treat the session as already established and suppress the primer.
+    The session is still marked as primed so the next attach hits the
+    fast early-return.
+    """
+    sent: list[tuple[str, str]] = []
+    primed_state: dict[str, object] = {}
+
+    # Substantive conversation: well over the 40 non-empty-line bar.
+    pane_text = "\n".join(f"line {n}: agent or user turn" for n in range(60))
+
+    class _FakeTmux:
+        def send_keys(self, target, text, press_enter=True):  # noqa: ARG002
+            sent.append((target, text))
+
+        def capture_pane(self, target, lines=200):  # noqa: ARG002
+            return pane_text
+
+    class _Project:
+        key = "samblog"
+        name = "samblog"
+        path = Path("/tmp/samblog-no-db")
+        persona_name = "Sage"
+
+    class _FakeConfig:
+        projects = {"samblog": _Project()}
+
+    class _FakeSupervisor:
+        config = _FakeConfig()
+
+        def plan_launches(self):
+            class _Sess:
+                name = "architect_samblog"
+                role = "architect"
+                project = "samblog"
+
+            class _L:
+                session = _Sess()
+
+            return [_L()]
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.config_path = Path("/tmp/pollypm.toml")
+    router.tmux = _FakeTmux()
+    router._right_pane_id = lambda window_target: "%right"  # type: ignore[assignment]
+    router._load_state = lambda: dict(primed_state)  # type: ignore[assignment]
+
+    def _write(data):
+        primed_state.clear()
+        primed_state.update(data)
+
+    router._write_state = _write  # type: ignore[assignment]
+
+    router._maybe_prime_project_pm_session(  # type: ignore[attr-defined]
+        _FakeSupervisor(),
+        "samblog",
+        "architect_samblog",
+        "pollypm:PollyPM",
+    )
+
+    # No primer was injected, but the session was marked primed so the
+    # next attach short-circuits on the fast-path.
+    assert sent == []
+    assert "architect_samblog" in primed_state.get("pm_primed_sessions", [])
+
+
+def test_project_pm_primer_still_fires_on_fresh_pane() -> None:
+    """The first-attach gate (#1867) must not regress fresh sessions.
+
+    A pane that just launched (a baseline Claude/Codex banner, ~20
+    non-empty lines) is still well under the 40-line "established
+    conversation" threshold, so the primer fires exactly once and the
+    persisted ``pm_primed_sessions`` marker is updated.
+    """
+    sent: list[tuple[str, str]] = []
+    primed_state: dict[str, object] = {}
+
+    # Baseline banner: well under the 40 non-empty-line bar.
+    pane_text = "\n".join(f"banner line {n}" for n in range(15))
+
+    class _FakeTmux:
+        def send_keys(self, target, text, press_enter=True):  # noqa: ARG002
+            sent.append((target, text))
+
+        def capture_pane(self, target, lines=200):  # noqa: ARG002
+            return pane_text
+
+    class _Project:
+        key = "samblog"
+        name = "samblog"
+        path = Path("/tmp/samblog-no-db")
+        persona_name = "Sage"
+
+    class _FakeConfig:
+        projects = {"samblog": _Project()}
+
+    class _FakeSupervisor:
+        config = _FakeConfig()
+
+        def plan_launches(self):
+            class _Sess:
+                name = "architect_samblog"
+                role = "architect"
+                project = "samblog"
+
+            class _L:
+                session = _Sess()
+
+            return [_L()]
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.config_path = Path("/tmp/pollypm.toml")
+    router.tmux = _FakeTmux()
+    router._right_pane_id = lambda window_target: "%right"  # type: ignore[assignment]
+    router._load_state = lambda: dict(primed_state)  # type: ignore[assignment]
+
+    def _write(data):
+        primed_state.clear()
+        primed_state.update(data)
+
+    router._write_state = _write  # type: ignore[assignment]
+
+    router._maybe_prime_project_pm_session(  # type: ignore[attr-defined]
+        _FakeSupervisor(),
+        "samblog",
+        "architect_samblog",
+        "pollypm:PollyPM",
+    )
+
+    assert len(sent) == 1
+    assert "Hey Sage" in sent[0][1]
+    assert "architect_samblog" in primed_state.get("pm_primed_sessions", [])
+
+
 class _PersonaProject:
     def __init__(self, key: str, persona_name: str | None) -> None:
         self.key = key

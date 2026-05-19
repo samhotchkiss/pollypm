@@ -2435,6 +2435,40 @@ def test_initial_input_roles_excludes_heartbeat_supervisor() -> None:
     assert "reviewer" in Supervisor._INITIAL_INPUT_ROLES
     assert "worker" in Supervisor._INITIAL_INPUT_ROLES
     assert "architect" in Supervisor._INITIAL_INPUT_ROLES
+    # #1809 — advisor was previously missing here, so the
+    # post-stabilisation send-keys kickoff never fired for advisor panes.
+    # Combined with the planner's Codex AGENTS.md gate (also previously
+    # excluding advisor), both delivery paths were off and 9-of-9
+    # advisor windows sat idle at the Codex placeholder.
+    assert "advisor" in Supervisor._INITIAL_INPUT_ROLES
+
+
+def test_advisor_default_agent_profile_resolves_to_advisor(tmp_path: Path) -> None:
+    """#1809 — ``_default_agent_profile`` must return ``"advisor"`` for
+    advisor sessions so the planner's ``_resolve_profile_prompt`` lands
+    a non-None body for the advisor profile. Pre-fix advisor was
+    missing from the mapping, so the planner saw an empty
+    ``effective.prompt``, the Codex AGENTS.md write path had nothing
+    to write, and the pane booted into the bare Codex placeholder.
+    """
+    from pollypm.models import (
+        AccountConfig,
+        ProviderKind,
+        SessionConfig,
+    )
+
+    config = _config(tmp_path)
+    sup = Supervisor(config)
+    advisor_session = SessionConfig(
+        name="advisor_pollypm",
+        role="advisor",
+        provider=ProviderKind.CODEX,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="advisor-pollypm",
+    )
+    assert sup._default_agent_profile(advisor_session) == "advisor"
 
 
 def test_restart_session_skips_recovery_prompt_for_heartbeat(

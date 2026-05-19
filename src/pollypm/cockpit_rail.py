@@ -2287,6 +2287,16 @@ class CockpitRouter:
         standing-by prompt, prior history gone." Only ``pane_dead=True``
         candidates are killed now; if multiple live duplicates exist,
         emit a ``warn`` audit event and bail without killing anyone.
+
+        #1809 — extends the reaping behaviour to advisor-* duplicates.
+        Advisors are internal background machinery (no user-facing
+        conversation), so when two same-named ``advisor-<project>``
+        windows are live, kill the higher-index duplicate. This is safe
+        because: (1) the advisor profile is loaded from disk on every
+        launch — no per-session conversational state to preserve, and
+        (2) the next ``advisor.tick`` will re-spawn the survivor if
+        somehow both got killed. The conservative pane-dead-only branch
+        is preserved for every other role.
         """
         try:
             windows = self.tmux.list_windows(storage_session)
@@ -2301,6 +2311,34 @@ class CockpitRouter:
             dead = [w for w in dupes if getattr(w, "pane_dead", False)]
             live = [w for w in dupes if not getattr(w, "pane_dead", False)]
             if len(live) > 1:
+                # #1809 — advisor windows are reapable when duplicated
+                # because they carry no conversational state. Keep the
+                # lowest-index live window and kill the rest.
+                if name.startswith("advisor-"):
+                    sorted_live = sorted(live, key=lambda w: w.index)
+                    keep = sorted_live[0]
+                    reap = sorted_live[1:]
+                    killed_indices: list[int] = []
+                    for window in reap:
+                        try:
+                            self.tmux.kill_window(f"{storage_session}:{window.index}")
+                        except Exception:  # noqa: BLE001
+                            continue
+                        killed_indices.append(window.index)
+                    self._emit_cockpit_audit(
+                        event_name="cockpit.duplicate_window_killed",
+                        subject=name,
+                        status="ok",
+                        metadata={
+                            "storage_session": storage_session,
+                            "window_name": name,
+                            "killed_indices": killed_indices,
+                            "kept_index": keep.index,
+                            "rule": "advisor_duplicate_reaped",
+                            "action": "killed_advisor_duplicate",
+                        },
+                    )
+                    continue
                 self._emit_cockpit_audit(
                     event_name="cockpit.duplicate_window_killed",
                     subject=name,

@@ -111,6 +111,56 @@ def test_cleanup_kills_multiple_dead_duplicates_when_one_live_survivor() -> None
     assert surviving == {2}
 
 
+def test_cleanup_reaps_live_advisor_duplicate() -> None:
+    """#1809 — advisor windows are reapable when duplicated.
+
+    The conservative pane-dead-only behaviour preserves operator /
+    architect / worker conversations, but advisor sessions carry no
+    user-facing conversational state — the persona is loaded from
+    ``profiles/advisor.md`` on every launch. When two ``advisor-media``
+    windows landed in the storage closet (the #1809 reproduction), the
+    plain ``skipped_live_duplicates`` warn left the duplicate idle
+    forever; the next advisor.tick couldn't reach it because both panes
+    sat at the Codex placeholder. The advisor-specific reaper kills the
+    higher-index duplicate so the cadence has a single, primable window
+    to address.
+    """
+    tmux = _FakeTmux([
+        _window(index=31, name="advisor-media", pane_dead=False),
+        _window(index=32, name="advisor-media", pane_dead=False),
+        _window(index=33, name="worker-media", pane_dead=False),
+    ])
+    router = _bare_router(tmux)
+
+    router._cleanup_duplicate_windows("pm-storage-closet")
+
+    # The higher-index duplicate was killed; the canonical low-index
+    # advisor window survived. Worker windows are untouched.
+    assert tmux.killed == ["pm-storage-closet:32"]
+    surviving = {w.index: w.name for w in tmux._windows}
+    assert surviving == {31: "advisor-media", 33: "worker-media"}
+
+
+def test_cleanup_preserves_live_pm_operator_duplicates() -> None:
+    """Worker/operator/architect duplicates must still bail conservatively.
+
+    The #1809 advisor-specific reaper is gated on the ``advisor-``
+    window-name prefix. This guard ensures we didn't accidentally
+    broaden it to a generic kill-the-higher-index policy that would
+    take out the operator's conversation pane (#1562).
+    """
+    tmux = _FakeTmux([
+        _window(index=0, name="pm-operator", pane_dead=False),
+        _window(index=1, name="pm-operator", pane_dead=False),
+    ])
+    router = _bare_router(tmux)
+
+    router._cleanup_duplicate_windows("pm-storage-closet")
+
+    assert tmux.killed == []
+    assert {w.index for w in tmux._windows} == {0, 1}
+
+
 def test_cleanup_no_op_when_no_duplicates() -> None:
     tmux = _FakeTmux([
         _window(index=0, name="pm-operator", pane_dead=False),

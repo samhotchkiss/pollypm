@@ -550,6 +550,11 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
         else resolve_config_path(DEFAULT_CONFIG_PATH)
     )
     if not config_path.exists():
+        _emit_tick_audit(
+            event="advisor.tick.skipped",
+            reason="no-config",
+            metadata={"config_path": str(config_path)},
+        )
         return {
             "fired": False,
             "reason": "no-config",
@@ -560,11 +565,21 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
         config = load_config(config_path)
     except Exception as exc:  # noqa: BLE001
         logger.warning("advisor: failed to load config %s: %s", config_path, exc)
+        _emit_tick_audit(
+            event="advisor.tick.skipped",
+            reason="config-error",
+            metadata={"error": str(exc)},
+        )
         return {"fired": False, "reason": "config-error", "error": str(exc)}
 
     settings = load_advisor_settings(config_path)
 
     if not settings.enabled:
+        _emit_tick_audit(
+            event="advisor.tick.skipped",
+            reason="plugin-disabled",
+            metadata={},
+        )
         return {"fired": False, "reason": "plugin-disabled"}
 
     override_now = payload.get("now_utc") if isinstance(payload, dict) else None
@@ -684,6 +699,24 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
     # Persist the state (last_tick_at, plus anything mutated per project).
     save_state(base_dir, state)
 
+    # #1809 — emit a forensic event so operators can grep the workspace
+    # audit log for cadence evidence (``advisor.tick.fired``). Without
+    # this an operator cannot tell from grep whether the half-hourly
+    # tick is running at all — the only signals were the per-task
+    # ``Advisor review for <project>`` rows enqueued downstream, and
+    # if ``_should_review`` skips every project the tick was completely
+    # silent.
+    _emit_tick_audit(
+        event="advisor.tick.fired",
+        reason="ok",
+        metadata={
+            "now_utc": now_utc.isoformat(),
+            "tracked": [p for p, _ in projects],
+            "enqueued": enqueued_projects,
+            "skipped_reasons": _summarise_skip_reasons(results),
+        },
+    )
+
     return {
         "fired": True,
         "reason": "ok",
@@ -692,6 +725,50 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
         "enqueued": enqueued_projects,
         "results": results,
     }
+
+
+def _emit_tick_audit(
+    *,
+    event: str,
+    reason: str,
+    metadata: dict[str, Any],
+) -> None:
+    """Best-effort audit emit for the half-hourly tick.
+
+    Audit-log writes are best-effort: an emit failure (e.g. workspace
+    not configured, audit dir missing, disk full) must NEVER block the
+    tick — losing forensics is strictly better than losing cadence.
+    """
+    try:
+        from pollypm.audit import emit as _audit_emit
+
+        merged = dict(metadata)
+        merged.setdefault("reason", reason)
+        _audit_emit(
+            event=event,
+            project="_workspace",
+            subject="advisor.tick",
+            actor="advisor.tick",
+            status="ok" if event.endswith(".fired") else "warn",
+            metadata=merged,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("advisor: tick-audit emit failed", exc_info=True)
+
+
+def _summarise_skip_reasons(results: list[dict[str, Any]]) -> dict[str, int]:
+    """Roll per-project ``reason`` strings up into a small counter dict.
+
+    Keeps the audit metadata compact for grep without dropping the
+    "why didn't this fire?" diagnostic.
+    """
+    counts: dict[str, int] = {}
+    for entry in results:
+        reason = entry.get("reason") if isinstance(entry, dict) else None
+        if not isinstance(reason, str) or not reason:
+            continue
+        counts[reason] = counts.get(reason, 0) + 1
+    return counts
 
 
 # ---------------------------------------------------------------------------

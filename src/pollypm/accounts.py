@@ -25,52 +25,35 @@ from pollypm.onboarding import (
 )
 from pollypm.runtime_env import claude_config_dir, codex_home_dir, provider_profile_env
 from pollypm.session_services import create_tmux_client
-from pollypm.storage.state import StateStore
 
 
 class _AccountReader:
-    """Context-manager wrapper that reads account_usage/account_runtime via the active backend.
+    """Context-manager wrapper that reads account_usage/account_runtime via pg.
 
-    On the pg backend this is a thin wrapper around :mod:`pollypm.storage.pg_accounts`
-    that exposes the same ``get_account_usage`` / ``get_account_runtime`` methods
-    as :class:`pollypm.storage.state.StateStore`. On the sqlite backend it opens
-    a short-lived StateStore. Used by the cached + live status helpers below
-    so they can iterate over ``config.accounts`` without growing per-call
-    backend probes.
+    Thin wrapper around :mod:`pollypm.storage.pg_accounts` that exposes the
+    same ``get_account_usage`` / ``get_account_runtime`` shape the cached
+    + live status helpers rely on so they can iterate over
+    ``config.accounts`` without growing per-call backend probes.
     """
 
     def __init__(self, config) -> None:
         self._config = config
-        self._sqlite_store: "StateStore | None" = None
-        from pollypm.storage._backend_dispatch import is_pg_backend
-
-        self._is_pg = is_pg_backend(config)
 
     def __enter__(self) -> "_AccountReader":
-        if not self._is_pg:
-            self._sqlite_store = StateStore(self._config.project.state_db)
         return self
 
     def __exit__(self, *exc) -> None:
-        if self._sqlite_store is not None:
-            self._sqlite_store.close()
-            self._sqlite_store = None
+        return None
 
     def get_account_usage(self, account_name: str):
-        if self._is_pg:
-            from pollypm.storage.pg_accounts import get_account_usage
+        from pollypm.storage.pg_accounts import get_account_usage
 
-            return get_account_usage(account_name)
-        assert self._sqlite_store is not None
-        return self._sqlite_store.get_account_usage(account_name)
+        return get_account_usage(account_name)
 
     def get_account_runtime(self, account_name: str):
-        if self._is_pg:
-            from pollypm.storage.pg_accounts import get_account_runtime
+        from pollypm.storage.pg_accounts import get_account_runtime
 
-            return get_account_runtime(account_name)
-        assert self._sqlite_store is not None
-        return self._sqlite_store.get_account_runtime(account_name)
+        return get_account_runtime(account_name)
 
 
 @dataclass(slots=True)

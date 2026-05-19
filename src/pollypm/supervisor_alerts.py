@@ -32,7 +32,6 @@ from pollypm.signal_routing import (
     route_signal as _route_signal,
 )
 from pollypm.store.protocol import Store
-from pollypm.storage.state import StateStore
 from pollypm.tmux.client import TmuxWindow
 
 _logger = logging.getLogger(__name__)
@@ -49,7 +48,7 @@ _register_routed_emitter("supervisor_alerts")
 
 class SupervisorAlertBoundary(Protocol):
     config: PollyPMConfig
-    store: StateStore
+    store: object  # legacy StateStore-shaped facade; pg cutover keeps signature
     msg_store: Store
     _STALL_NUDGE_MESSAGE: str
 

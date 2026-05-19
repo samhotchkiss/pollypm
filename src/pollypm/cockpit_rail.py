@@ -542,105 +542,50 @@ def _build_project_pm_primer(
             all_tasks_grouped,
             inbox_tasks_for_project,
             inbox_tasks_grouped,
-            is_pg_backend,
         )
-        from pollypm.work import create_work_service
-        from pollypm.work.inbox_view import inbox_tasks
         from pollypm.work.models import WorkStatus
 
-        pg_tasks: list | None = None
-        pg_inbox: list | None = None
-        if is_pg_backend(supervisor.config):
-            all_grouped = all_tasks_grouped(supervisor.config)
-            inbox_grouped = inbox_tasks_grouped(supervisor.config)
-            if all_grouped is not None:
-                pg_tasks = all_tasks_for_project(
-                    all_grouped, supervisor.config, project_key,
-                )
-            if inbox_grouped is not None:
-                pg_inbox = inbox_tasks_for_project(
-                    inbox_grouped, supervisor.config, project_key,
-                )
-
-        if pg_tasks is not None and pg_inbox is not None:
-            tasks = pg_tasks
-            inbox_items = pg_inbox
-            for task in tasks:
-                status = task.work_status
-                if status == WorkStatus.QUEUED:
-                    queued += 1
-                elif status == WorkStatus.IN_PROGRESS:
-                    in_progress += 1
-                elif status == WorkStatus.REVIEW:
-                    review += 1
-                elif status == WorkStatus.DONE:
-                    done_recent += 1
-            inbox_total = len(inbox_items)
-            for task in inbox_items[:3]:
-                title = (task.title or "").strip()
-                if title:
-                    inbox_titles.append(f"{task.task_id}: {title}")
-            has_plan_done = any(
-                "plan" in (t.labels or [])
-                and t.work_status == WorkStatus.DONE
-                for t in tasks
-            )
-            has_plan_open = any(
-                "plan_review" in (t.labels or [])
-                or "plan" in (t.labels or [])
-                for t in tasks
-            )
-            if has_plan_done:
-                plan_status = "approved"
-            elif has_plan_open:
-                plan_status = "in review"
-            else:
-                plan_status = "missing"
+        all_grouped = all_tasks_grouped(supervisor.config)
+        inbox_grouped = inbox_tasks_grouped(supervisor.config)
+        if all_grouped is None or inbox_grouped is None:
+            raise RuntimeError("pg aggregates unavailable")
+        tasks = all_tasks_for_project(
+            all_grouped, supervisor.config, project_key,
+        )
+        inbox_items = inbox_tasks_for_project(
+            inbox_grouped, supervisor.config, project_key,
+        )
+        for task in tasks:
+            status = task.work_status
+            if status == WorkStatus.QUEUED:
+                queued += 1
+            elif status == WorkStatus.IN_PROGRESS:
+                in_progress += 1
+            elif status == WorkStatus.REVIEW:
+                review += 1
+            elif status == WorkStatus.DONE:
+                done_recent += 1
+        inbox_total = len(inbox_items)
+        for task in inbox_items[:3]:
+            title = (task.title or "").strip()
+            if title:
+                inbox_titles.append(f"{task.task_id}: {title}")
+        has_plan_done = any(
+            "plan" in (t.labels or [])
+            and t.work_status == WorkStatus.DONE
+            for t in tasks
+        )
+        has_plan_open = any(
+            "plan_review" in (t.labels or [])
+            or "plan" in (t.labels or [])
+            for t in tasks
+        )
+        if has_plan_done:
+            plan_status = "approved"
+        elif has_plan_open:
+            plan_status = "in review"
         else:
-            db_path = project.path / ".pollypm" / "state.db"
-            if db_path.exists():
-                with create_work_service(
-                    db_path=db_path,
-                    project_path=project.path,
-                    config=supervisor.config,
-                ) as svc:
-                    tasks = list(svc.list_tasks(project=project_key))
-                    for task in tasks:
-                        status = task.work_status
-                        if status == WorkStatus.QUEUED:
-                            queued += 1
-                        elif status == WorkStatus.IN_PROGRESS:
-                            in_progress += 1
-                        elif status == WorkStatus.REVIEW:
-                            review += 1
-                        elif status == WorkStatus.DONE:
-                            done_recent += 1
-                    inbox_items = inbox_tasks(svc, project=project_key)
-                    inbox_total = len(inbox_items)
-                    for task in inbox_items[:3]:
-                        title = (task.title or "").strip()
-                        if title:
-                            inbox_titles.append(f"{task.task_id}: {title}")
-                    # Plan status — look for a plan_review or plan_approved
-                    # marker in the task list. A project with at least one
-                    # done plan task counts as approved; otherwise the plan
-                    # is missing.
-                    has_plan_done = any(
-                        "plan" in (t.labels or [])
-                        and t.work_status == WorkStatus.DONE
-                        for t in tasks
-                    )
-                    has_plan_open = any(
-                        "plan_review" in (t.labels or [])
-                        or "plan" in (t.labels or [])
-                        for t in tasks
-                    )
-                    if has_plan_done:
-                        plan_status = "approved"
-                    elif has_plan_open:
-                        plan_status = "in review"
-                    else:
-                        plan_status = "missing"
+            plan_status = "missing"
     except Exception:  # noqa: BLE001 — primer is best-effort
         pass
 
@@ -709,28 +654,15 @@ def _build_operator_primer(supervisor) -> str | None:
     inbox_total = 0
     inbox_titles: list[tuple[str, str]] = []
     project_count = 0
-    try:
-        from pollypm.work import create_work_service
-        from pollypm.work.inbox_view import inbox_tasks
-    except Exception:  # noqa: BLE001
-        inbox_tasks = None  # type: ignore[assignment]
-        create_work_service = None  # type: ignore[assignment]
 
-    # Slice H (#1737): pg backend → one bulk query for every project's
-    # inbox slice. Loop below partitions in Python instead of opening N
-    # sqlite DBs.
+    # Slice H (#1737): one pg bulk query for every project's inbox
+    # slice. Loop below partitions in Python.
     from pollypm.cockpit_pg_aggregates import (
         inbox_tasks_for_project,
         inbox_tasks_grouped,
-        is_pg_backend,
     )
 
-    pg_inbox_grouped: dict[str, list[object]] | None = None
-    pg_active_operator = is_pg_backend(supervisor.config)
-    if pg_active_operator:
-        pg_inbox_grouped = inbox_tasks_grouped(supervisor.config)
-        if pg_inbox_grouped is None:
-            pg_active_operator = False
+    pg_inbox_grouped = inbox_tasks_grouped(supervisor.config)
 
     projects = getattr(supervisor.config, "projects", {}) or {}
     for project_key, project in projects.items():
@@ -743,7 +675,7 @@ def _build_operator_primer(supervisor) -> str | None:
                 "_", "-"
             )
         project_lines.append(f"  - {project_name}")
-        if pg_active_operator and pg_inbox_grouped is not None:
+        if pg_inbox_grouped is not None:
             items = inbox_tasks_for_project(
                 pg_inbox_grouped, supervisor.config, project_key,
             )
@@ -752,26 +684,6 @@ def _build_operator_primer(supervisor) -> str | None:
                 title = (task.title or "").strip()
                 if title:
                     inbox_titles.append((project_name, title))
-            continue
-        if inbox_tasks is None or create_work_service is None:
-            continue
-        db_path = project.path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            continue
-        try:
-            with create_work_service(
-                db_path=db_path,
-                project_path=project.path,
-                config=supervisor.config,
-            ) as svc:
-                items = list(inbox_tasks(svc, project=project_key))
-                inbox_total += len(items)
-                for task in items[:2]:
-                    title = (task.title or "").strip()
-                    if title:
-                        inbox_titles.append((project_name, title))
-        except Exception:  # noqa: BLE001 — primer is best-effort
-            continue
 
     # #1007: previous wording ("You are Polly, the PollyPM operator.
     # Re-anchor on this identity for the rest of this session: …" +
@@ -1952,19 +1864,13 @@ class CockpitRouter:
         projects = getattr(config, "projects", {}) or {}
         rollups: dict[str, ProjectStateRollup] = {}
 
-        # Slice H (#1737): under pg, one bulk query feeds every
-        # per-project rollup. ``pg_all_grouped`` is None when the
-        # backend is sqlite (or pg is unreachable) — the per-project
-        # walk in :meth:`_project_tasks_for_rollup` then falls through
-        # to its legacy DB-resolution order.
-        from pollypm.cockpit_pg_aggregates import (
-            all_tasks_grouped,
-            is_pg_backend,
-        )
+        # Slice H (#1737): one bulk pg query feeds every per-project
+        # rollup. ``pg_all_grouped`` is ``None`` only when the pg pool
+        # itself is unreachable — :meth:`_project_tasks_for_rollup`
+        # short-circuits to an empty list in that case.
+        from pollypm.cockpit_pg_aggregates import all_tasks_grouped
 
-        pg_all_grouped: dict[str, list[object]] | None = None
-        if is_pg_backend(config):
-            pg_all_grouped = all_tasks_grouped(config)
+        pg_all_grouped = all_tasks_grouped(config)
 
         for project_key, project in projects.items():
             tasks, plan_blocked = self._project_tasks_for_rollup(
@@ -1997,189 +1903,30 @@ class CockpitRouter:
         if not isinstance(project_path, Path):
             return [], False
         from pollypm.notify_task import is_notify_inbox_task
-        from pollypm.plan_presence import has_acceptable_plan
-        from pollypm.work import create_work_service
         from pollypm.work.project_aliases import project_storage_aliases
 
-        # Slice H (#1737): pg fast path. The caller already paid for
-        # one bulk task fetch; partition it here and skip the sqlite
-        # candidate walk entirely.
+        # Slice H (#1737): pg path. The caller already paid for one
+        # bulk task fetch; partition it here.
         #
-        # The plan-acceptability gate (#281) is intentionally skipped
-        # on the pg path until Slice B lands ``executions`` / context
-        # entry reads on :class:`PgWorkService` — those reads are what
-        # ``has_acceptable_plan`` consumes. Skipping is the same
-        # behaviour the sqlite path takes when ``enforce_plan`` is
-        # falsey, and Slice A's pg backend is a transitional flag the
-        # default sqlite config doesn't reach yet.
-        if pg_all_grouped is not None:
-            tasks: list = []
-            seen_ids: set[str] = set()
-            for alias in project_storage_aliases(config, project_key):
-                for task in pg_all_grouped.get(alias, []):
-                    tid = getattr(task, "task_id", None)
-                    if tid and tid in seen_ids:
-                        continue
-                    if is_notify_inbox_task(task):
-                        continue
-                    if tid:
-                        seen_ids.add(tid)
-                    tasks.append(task)
-            return tasks, False
-
-        # #1542 — mirror the dashboard's DB-resolution order. Pre-#1542
-        # the rail rollup only looked at the legacy per-project DB
-        # (``<project>/.pollypm/state.db``) — the dashboard's task
-        # gather (``_dashboard_task_db_paths``) walks the workspace-root
-        # canonical DB FIRST and falls back to the per-project legacy
-        # DB only if the canonical query came up empty. A project whose
-        # tasks live in the canonical workspace DB (the post-#1519 norm)
-        # rolled up to ``ProjectRailState.NONE`` here, even though the
-        # dashboard correctly painted ``◆ needs attention`` from the
-        # same data. The result was the rail glyph (``○``) and dashboard
-        # banner contradicting on the same project key — cf. #1542's
-        # ``media`` repro: rail says quiet, dashboard says please-look-
-        # at-me. We now walk both DBs in the canonical-first order and
-        # union the rows so the rail picks up paused-with-work projects.
-        candidate_db_paths: list[Path] = []
-        seen_paths: set[Path] = set()
-
-        def _add_candidate(path: object) -> None:
-            try:
-                candidate = Path(path)
-            except TypeError:
-                return
-            if candidate in seen_paths:
-                return
-            try:
-                if not candidate.exists():
-                    return
-            except OSError:
-                return
-            seen_paths.add(candidate)
-            candidate_db_paths.append(candidate)
-
-        project_settings = getattr(config, "project", None)
-        workspace_root = getattr(project_settings, "workspace_root", None)
-        if workspace_root is not None:
-            _add_candidate(Path(workspace_root) / ".pollypm" / "state.db")
-        _add_candidate(project_path / ".pollypm" / "state.db")
-        state_db = getattr(project_settings, "state_db", None)
-        if state_db is not None:
-            _add_candidate(state_db)
-
-        if not candidate_db_paths:
+        # The plan-acceptability gate (#281) is intentionally skipped:
+        # ``has_acceptable_plan`` consumes ``executions`` / context
+        # entry reads that the pg work service does not yet surface.
+        # The historical sqlite branch is gone (Slice K-state-callers-port).
+        if pg_all_grouped is None:
             return [], False
-
-        aliases = project_storage_aliases(config, project_key)
-        planner = getattr(config, "planner", None)
-        plan_dir = str(getattr(planner, "plan_dir", "docs/plan") or "docs/plan")
-        global_enforce = bool(getattr(planner, "enforce_plan", True))
-        project_enforce = getattr(project, "enforce_plan", None)
-        enforce_plan = (
-            project_enforce if project_enforce is not None else global_enforce
-        )
-
-        seen_ids: set[str] = set()
         tasks: list = []
-        plan_blocked = False
-        used_any_db = False
-        # Codex review (PR #1557) — "first DB with matching rows wins".
-        # Mirror ``cockpit_ui._dashboard_gather_tasks``'s iteration shape:
-        # walk candidates in order (canonical → legacy) and STOP as soon
-        # as one yields any real-work rows, only falling back to the next
-        # candidate when the current DB is empty (or notify-only). The
-        # earlier #1542 fix walked every candidate and unioned rows,
-        # which reintroduced the same split-brain it was trying to
-        # repair: a clean canonical workspace DB padded by stale
-        # ``on_hold`` rows still sitting in the legacy per-project DB →
-        # wrong rail glyph.
-        #
-        # Codex re-review of PR #1557 — notify-only canonical DBs must
-        # not latch the gate. ``is_notify_inbox_task`` (rejection
-        # feedback, plan-review handoff, supervisor alerts, …) marks
-        # rows that are addressed to the user and carry no node-level
-        # transition affordance. The dashboard already filters them
-        # BEFORE deciding whether a DB has pipeline rows
-        # (cf. ``cockpit_ui._dashboard_gather_tasks`` lines ~12283 /
-        # ~12367). The rail must mirror that filter: a canonical DB
-        # holding only notify rows + a legacy DB with real paused work
-        # would otherwise have the dashboard fall back (correct
-        # ``on_hold`` glyph) while the rail stops at canonical and
-        # rolls up ``WORKING`` — mismatched glyph and dashboard.
-        for db_path in candidate_db_paths:
-            try:
-                work = create_work_service(
-                    db_path=db_path, project_path=project_path, config=config,
-                )
-            except Exception:  # noqa: BLE001
-                continue
-            db_tasks: list = []
-            try:
-                # #1092 — alias-aware lookup. The work DB stores tasks
-                # under the display name (``booktalk``) while the rollup
-                # receives the slugified config key, so a single
-                # ``list_tasks(project=project_key)`` silently returned
-                # zero tasks for projects whose key and display name
-                # diverge.
-                for alias in aliases:
-                    try:
-                        for task in work.list_tasks(project=alias):
-                            tid = getattr(task, "task_id", None)
-                            if tid and tid in seen_ids:
-                                continue
-                            # Skip notify-shaped rows BEFORE the gate /
-                            # ``seen_ids``. Mirrors the dashboard: notify
-                            # tids are intentionally NOT added to the
-                            # dedup set so a same-tid real-work row in a
-                            # later DB can still surface (defensive
-                            # against legacy/canonical drift).
-                            if is_notify_inbox_task(task):
-                                continue
-                            if tid:
-                                seen_ids.add(tid)
-                            db_tasks.append(task)
-                    except Exception:  # noqa: BLE001
-                        continue
-                if db_tasks:
-                    used_any_db = True
-                    tasks.extend(db_tasks)
-                    if enforce_plan and not plan_blocked:
-                        try:
-                            acceptable = has_acceptable_plan(
-                                project_key,
-                                project_path,
-                                work,
-                                plan_dir=plan_dir,
-                            )
-                        except Exception:  # noqa: BLE001
-                            acceptable = True
-                        if not acceptable:
-                            plan_blocked = True
-            except Exception:  # noqa: BLE001
-                db_tasks = []
-            finally:
-                close = getattr(work, "close", None)
-                if callable(close):
-                    try:
-                        close()
-                    except Exception:  # noqa: BLE001
-                        pass
-            # First DB with matching real-work rows wins — break only
-            # AFTER the service is closed so the legacy candidate
-            # doesn't pad the canonical row set on the next loop
-            # iteration. ``db_tasks`` already excludes notify-shaped
-            # rows (see filter above), so a canonical DB holding only
-            # inbox notifications will fall through to legacy — matching
-            # the dashboard's "filtered rows only" gate.
-            if db_tasks:
-                break
-
-        if not used_any_db:
-            return [], False
-        if not enforce_plan:
-            return tasks, False
-        return tasks, plan_blocked
+        seen_ids: set[str] = set()
+        for alias in project_storage_aliases(config, project_key):
+            for task in pg_all_grouped.get(alias, []):
+                tid = getattr(task, "task_id", None)
+                if tid and tid in seen_ids:
+                    continue
+                if is_notify_inbox_task(task):
+                    continue
+                if tid:
+                    seen_ids.add(tid)
+                tasks.append(task)
+        return tasks, False
 
     def _inject_mounted_task_rows(
         self,

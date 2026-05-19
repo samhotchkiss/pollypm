@@ -153,22 +153,12 @@ def store_snapshot_learnings(
 
 
 def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -> int:
-    """Store extracted knowledge as memory entries (pg or sqlite, per config)."""
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    """Store extracted knowledge as memory entries through the pg facade."""
+    del config  # pg memory store is process-wide
+    from pollypm.storage.pg_memory import PgMemoryStore
 
-    if is_pg_backend(config):
-        from pollypm.storage.pg_memory import PgMemoryStore
-
-        store: object = PgMemoryStore()
-        close_after = False
-    else:
-        from pollypm.storage.state import StateStore
-
-        try:
-            store = StateStore(config.project.state_db)
-            close_after = True
-        except Exception:  # noqa: BLE001
-            return 0
+    store: object = PgMemoryStore()
+    close_after = False
     count = 0
     project_key = project_root.name
     kind_map = {

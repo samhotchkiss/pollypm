@@ -35,31 +35,16 @@ def get_memory_backend(project_path: Path, backend_name: str = "file") -> Memory
         # a few paths).
         from pollypm.plugin_host import extension_host_for_root
         from pollypm.projects import ensure_project_scaffold, project_artifacts_dir, project_dossier_dir
-        from pollypm.storage._backend_dispatch import is_pg_backend
+        from pollypm.storage.pg_memory import PgMemoryStore
+
         resolved = project_path.expanduser().resolve()
         # Scaffold the project up-front so the backend can assume memory
         # roots exist (it used to call ensure_project_scaffold itself).
         ensure_project_scaffold(resolved)
         state_db = resolved / ".pollypm" / "state.db"
-        # Slice K-state-port phase 2d (#1737): on the pg backend wire
-        # FileMemoryBackend to a stateless PgMemoryStore adapter that
-        # routes every memory_* call through pollypm.storage.pg_memory.
-        # On sqlite we keep the legacy StateStore handle.
-        state_store: object
-        try:
-            from pollypm.config import load_config
-
-            config = load_config()
-        except Exception:  # noqa: BLE001
-            config = None
-        if is_pg_backend(config):
-            from pollypm.storage.pg_memory import PgMemoryStore
-
-            state_store = PgMemoryStore()
-        else:
-            from pollypm.storage.state import StateStore
-
-            state_store = StateStore(state_db)
+        # FileMemoryBackend is wired to a stateless PgMemoryStore adapter
+        # that routes every memory_* call through pollypm.storage.pg_memory.
+        state_store: object = PgMemoryStore()
         return FileMemoryBackend(
             resolved,
             state_store=state_store,

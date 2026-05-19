@@ -598,9 +598,16 @@ check_disk_space = _doctor_filesystem.check_disk_space
 
 
 def _latest_state_migration_version() -> int | None:
-    """Return the highest declared migration version for the state DB."""
+    """Return the highest declared migration version for the state DB.
+
+    TODO(pg-callers-port): the sqlite ``StateStore._MIGRATIONS`` table
+    is still the source of truth for the latest expected migration
+    version. The pg backend uses a ``schema_migrations`` table — but
+    the doctor check that consumes this value compares it against
+    sqlite-only ``schema_version``. Filed as pg-gap; revisit when the
+    pg doctor checks land.
+    """
     try:
-        from pollypm.storage.state import StateStore  # noqa: F401
         # The migrations live on the class; avoid instantiating (that opens
         # a real DB). Walk the class var directly.
         from pollypm.storage import state as _state_mod
@@ -747,29 +754,17 @@ def check_product_state() -> CheckResult:
     The check is a soft warning — the flag itself is what gates new
     task queueing; this is just observability.
     """
-    db_path = _workspace_state_db_path()
-    if db_path is None or not db_path.exists():
-        return _skip("product_state probe skipped (no workspace state.db)")
     try:
         from pollypm.storage.product_state import (
             PRODUCT_STATE_BROKEN,
             get_product_state,
         )
-        from pollypm.storage.state import StateStore
     except Exception as exc:  # noqa: BLE001
         return _skip(f"product_state probe skipped (import failed: {exc})")
-    store: StateStore | None = None
     try:
-        store = StateStore(db_path, readonly=True)
-        state = get_product_state(store)
+        state = get_product_state(None)
     except Exception as exc:  # noqa: BLE001
         return _skip(f"product_state probe skipped (read failed: {exc})")
-    finally:
-        if store is not None:
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001
-                pass
     if state is None:
         return _ok("product_state=healthy (no flag set)")
     if state.state == PRODUCT_STATE_BROKEN:
@@ -784,12 +779,8 @@ def check_product_state() -> CheckResult:
             fix=(
                 "Drill into the forensics path above, address the "
                 "underlying failure, then clear the flag —\n"
-                "  python -c 'from pollypm.storage.state import "
-                "StateStore; from pollypm.storage.product_state "
-                "import clear_product_state; from pathlib import "
-                "Path; s = StateStore("
-                f"Path({str(db_path)!r})); clear_product_state(s); "
-                "s.close()'\n"
+                "  python -c 'from pollypm.storage.product_state "
+                "import clear_product_state; clear_product_state(None)'\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
@@ -2669,19 +2660,21 @@ def check_project_local_guide_drift() -> CheckResult:
 def _initialize_project_state_db(db_path: Path) -> tuple[bool, str]:
     """Create an initialized ``state.db`` at ``db_path`` via StateStore.
 
-    Running StateStore's constructor creates the parent directory,
-    applies the full schema, and runs every pending migration, so the
-    resulting file is the same shape the sweeper expects. Safe to call
-    on a path whose DB already exists — the open is a no-op for schema
-    creation (CREATE TABLE IF NOT EXISTS) and a re-run of pending
-    migrations.
+    TODO(pg-callers-port): this fix helper still touches sqlite
+    directly — it's invoked by ``check_task_assignment_sweeper_dbs``
+    which probes for legacy per-project state.db files. The pg
+    backend has no per-project DB, so the check itself becomes a
+    no-op under pg; the helper is kept (via deferred import) until
+    the corresponding doctor check is rewired to the pg world.
     """
+    # Deferred import: only sqlite installs reach this code path.
+    from pollypm.storage import state as _state_mod
+
+    _cls = getattr(_state_mod, "StateStore", None)
+    if _cls is None:
+        return (False, "StateStore unavailable")
     try:
-        from pollypm.storage.state import StateStore
-    except Exception as exc:  # noqa: BLE001
-        return (False, f"import failed: {exc}")
-    try:
-        store = StateStore(db_path)
+        store = _cls(db_path)
         try:
             pass
         finally:
@@ -3185,12 +3178,17 @@ def check_state_db_size() -> CheckResult:
     mb = size / (1024 * 1024)
 
     def _fix() -> tuple[bool, str]:
+        # TODO(pg-callers-port): sqlite-only fix helper —
+        # ``incremental_vacuum`` is meaningless on pg. Deferred import
+        # keeps the legacy path callable for sqlite installs until the
+        # check itself is rewired.
+        from pollypm.storage import state as _state_mod
+
+        _cls = getattr(_state_mod, "StateStore", None)
+        if _cls is None:
+            return (False, "StateStore unavailable")
         try:
-            from pollypm.storage.state import StateStore
-        except Exception as exc:  # noqa: BLE001
-            return (False, f"import failed: {exc}")
-        try:
-            store = StateStore(biggest)
+            store = _cls(biggest)
             try:
                 reclaimed = store.incremental_vacuum()
             finally:

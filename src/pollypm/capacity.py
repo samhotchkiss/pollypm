@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from pollypm.models import PollyPMConfig, ProviderKind
-from pollypm.storage.state import StateStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,17 +93,15 @@ class FailoverDecision:
 
 def probe_capacity(
     config: PollyPMConfig,
-    store: "StateStore | None",
+    store: object | None,
     account_name: str,
 ) -> CapacityProbeResult:
     """Probe the capacity state for a single account from stored data.
 
-    Reads from the per-backend account_usage / account_runtime tables
-    (populated by the usage probe in accounts.py). When ``store`` is a
-    legacy :class:`StateStore` we use it directly; when ``store`` is
-    ``None`` and the active backend is postgres, we read through
-    :mod:`pollypm.storage.pg_accounts` so callers can drop the
-    StateStore handle entirely.
+    Reads from the pg ``account_usage`` / ``account_runtime`` tables
+    (populated by the usage probe in accounts.py). The ``store``
+    parameter is retained for caller compatibility but is no longer
+    used — every read goes through :mod:`pollypm.storage.pg_accounts`.
     """
     account = config.accounts.get(account_name)
     if account is None:
@@ -152,12 +150,12 @@ def probe_capacity(
 
 def probe_all_accounts(
     config: PollyPMConfig,
-    store: "StateStore | None",
+    store: object | None,
 ) -> list[CapacityProbeResult]:
     """Probe capacity for all configured accounts.
 
-    ``store`` may be ``None`` on the pg backend — the per-account
-    helpers dispatch to :mod:`pollypm.storage.pg_accounts` in that case.
+    ``store`` is unused (kept for caller compatibility) — every read
+    goes through :mod:`pollypm.storage.pg_accounts`.
     """
     return [
         probe_capacity(config, store, name)
@@ -167,31 +165,31 @@ def probe_all_accounts(
 
 def _read_account_state(
     config: PollyPMConfig,
-    store: "StateStore | None",
+    store: object | None,
     account_name: str,
 ):
-    """Return (usage, runtime) rows for ``account_name`` via the active backend.
+    """Return (usage, runtime) rows for ``account_name`` from the backend.
 
-    Lets ``probe_capacity`` callers pass either a legacy
-    :class:`StateStore` handle or ``None`` (when pg is active).
+    Production callers pass ``store=None`` and the reads go through
+    :mod:`pollypm.storage.pg_accounts`. Tests may pass a legacy
+    StateStore handle directly for unit isolation — when ``store``
+    exposes ``get_account_usage`` / ``get_account_runtime``, those
+    methods are used as-is (the read shape is identical).
     """
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    del config  # unused on pg backend
+    if store is not None and hasattr(store, "get_account_usage") and hasattr(store, "get_account_runtime"):
+        return (
+            store.get_account_usage(account_name),
+            store.get_account_runtime(account_name),
+        )
+    from pollypm.storage.pg_accounts import get_account_runtime, get_account_usage
 
-    if store is not None:
-        return store.get_account_usage(account_name), store.get_account_runtime(account_name)
-    if is_pg_backend(config):
-        from pollypm.storage.pg_accounts import get_account_runtime, get_account_usage
-
-        return get_account_usage(account_name), get_account_runtime(account_name)
-    # No store + sqlite backend — open a short-lived one. Rare path:
-    # callers with sqlite typically already own a StateStore handle.
-    with StateStore(config.project.state_db) as fallback:
-        return fallback.get_account_usage(account_name), fallback.get_account_runtime(account_name)
+    return get_account_usage(account_name), get_account_runtime(account_name)
 
 
 def account_needs_proactive_rollover(
     config: PollyPMConfig,
-    store: StateStore,
+    store: object | None,
     account_name: str,
     *,
     threshold_pct: int = PROACTIVE_ROLLOVER_THRESHOLD_PCT,
@@ -218,7 +216,7 @@ def account_needs_proactive_rollover(
 
 def select_failover_account(
     config: PollyPMConfig,
-    store: StateStore,
+    store: object | None,
     failed_account: str,
 ) -> FailoverDecision:
     """Select the best failover account when one fails.
@@ -313,11 +311,21 @@ def select_failover_account(
 
 
 def can_failover_session(
-    store: StateStore,
+    store: object | None,
     session_name: str,
 ) -> tuple[bool, str]:
-    """Check if a session can be failed over (not blocked by human lease)."""
-    lease = store.get_lease(session_name)
+    """Check if a session can be failed over (not blocked by human lease).
+
+    Production callers pass ``store=None`` and the lease read goes
+    through :mod:`pollypm.storage.pg_leases`. Tests may pass a legacy
+    StateStore-shaped handle.
+    """
+    if store is not None and hasattr(store, "get_lease"):
+        lease = store.get_lease(session_name)
+    else:
+        from pollypm.storage.pg_leases import get_lease
+
+        lease = get_lease(session_name)
     if lease is None:
         return True, ""
 
@@ -334,7 +342,7 @@ def can_failover_session(
 
 def recovery_order(
     config: PollyPMConfig,
-    store: StateStore,
+    store: object | None,
 ) -> list[tuple[str, str]]:
     """Determine recovery order for sessions when capacity returns.
 
@@ -346,20 +354,16 @@ def recovery_order(
     3. human-interrupted - sessions that were using human lease
     4. preempted - sessions that were preempted by failover
     5. new-work - sessions waiting for capacity
-    """
-    # Slice K-state-port phase 2c (#1737): pg backend reads the cluster-A
-    # session_runtime row through the pg_sessions facade; sqlite path
-    # keeps the legacy StateStore reader.
-    from pollypm.storage._backend_dispatch import is_pg_backend
 
-    pg_active = is_pg_backend(config)
-    if pg_active:
+    Production callers pass ``store=None`` and session_runtime rows
+    come from the pg facade; tests may pass a legacy StateStore handle.
+    """
+    if store is not None and hasattr(store, "get_session_runtime"):
+        _get_session_runtime = store.get_session_runtime
+    else:
         from pollypm.storage.pg_sessions import (
             get_session_runtime as _get_session_runtime,
         )
-    else:
-        def _get_session_runtime(name: str):
-            return store.get_session_runtime(name)
 
     sessions: list[tuple[str, str, int]] = []
 
@@ -394,11 +398,16 @@ def recovery_order(
 
 
 def persist_capacity_probe(
-    store: StateStore,
+    store: object | None,
     result: CapacityProbeResult,
 ) -> None:
-    """Write probe results to the SQLite capacity registry."""
-    store.upsert_account_usage(
+    """Write probe results to the capacity registry.
+
+    Production callers pass ``store=None`` and the write goes through
+    :mod:`pollypm.storage.pg_accounts`. Tests may pass a legacy
+    StateStore-shaped handle for unit isolation.
+    """
+    kwargs = dict(
         account_name=result.account_name,
         provider=result.provider.value,
         plan="",
@@ -413,6 +422,12 @@ def persist_capacity_probe(
         ),
         reset_at=result.reset_time,
     )
+    if store is not None and hasattr(store, "upsert_account_usage"):
+        store.upsert_account_usage(**kwargs)
+        return
+    from pollypm.storage.pg_accounts import upsert_account_usage
+
+    upsert_account_usage(**kwargs)
 
 
 # ---------------------------------------------------------------------------

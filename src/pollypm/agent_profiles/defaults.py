@@ -463,30 +463,17 @@ def reviewer_prompt() -> str:
 
 def _render_operator_state_brief(context: AgentProfileContext) -> str:
     """Return a compact JSON snapshot for operator-style prompts."""
-    # Slice K-state-port phase 2c (#1737): pg backend reads sessions /
-    # session_runtime through the cluster-A facade so we skip a sqlite
-    # open per render; sqlite backend uses the short-lived StateStore.
-    from pollypm.storage._backend_dispatch import is_pg_backend
-
+    # Reads sessions / session_runtime through the pg cluster-A facade.
     session_rows: dict[str, object] = {}
     runtime_rows: dict[str, object] = {}
     try:
-        if is_pg_backend(context.config):
-            from pollypm.storage.pg_sessions import (
-                list_session_runtimes as _pg_list_runtimes,
-                list_sessions as _pg_list_sessions,
-            )
+        from pollypm.storage.pg_sessions import (
+            list_session_runtimes as _pg_list_runtimes,
+            list_sessions as _pg_list_sessions,
+        )
 
-            session_rows = {row.name: row for row in _pg_list_sessions()}
-            runtime_rows = {row.session_name: row for row in _pg_list_runtimes()}
-        else:
-            from pollypm.storage.state import StateStore
-
-            with StateStore(context.config.project.state_db) as store:
-                session_rows = {row.name: row for row in store.list_sessions()}
-                runtime_rows = {
-                    row.session_name: row for row in store.list_session_runtimes()
-                }
+        session_rows = {row.name: row for row in _pg_list_sessions()}
+        runtime_rows = {row.session_name: row for row in _pg_list_runtimes()}
     except Exception:  # noqa: BLE001
         session_rows = {}
         runtime_rows = {}
@@ -678,22 +665,12 @@ def _read_active_issue(project_root: Path) -> str:
 
 
 def _read_latest_checkpoint(context: AgentProfileContext) -> str:
-    # Slice K-state-port phase 2c (#1737): on the pg backend, the
-    # session_runtime row lives in postgres; the sqlite branch keeps a
-    # short-lived StateStore for back-compat.
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    """Return the latest checkpoint blob for ``context.session``."""
+    from pollypm.storage.pg_sessions import (
+        get_session_runtime as _pg_get_runtime,
+    )
 
-    if is_pg_backend(context.config):
-        from pollypm.storage.pg_sessions import (
-            get_session_runtime as _pg_get_runtime,
-        )
-
-        runtime = _pg_get_runtime(context.session.name)
-    else:
-        from pollypm.storage.state import StateStore
-
-        store = StateStore(context.config.project.state_db)
-        runtime = store.get_session_runtime(context.session.name)
+    runtime = _pg_get_runtime(context.session.name)
     if runtime is None or not runtime.last_checkpoint_path:
         return ""
     path = Path(runtime.last_checkpoint_path)

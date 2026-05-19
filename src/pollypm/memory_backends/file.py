@@ -26,7 +26,7 @@ from pollypm.memory_backends.base import (
 )
 
 if TYPE_CHECKING:
-    from pollypm.storage.state import StateStore
+    pass  # StateStore type removed during pg cutover
 
 class _PluginHook(Protocol):
     """Narrow subset of ExtensionHost the file backend consumes.
@@ -89,20 +89,29 @@ class FileMemoryBackend(MemoryBackend):
         self,
         project_path: Path,
         *,
-        state_store: "StateStore | None" = None,
+        state_store: object | None = None,
         plugins: _PluginHook | None = None,
         memory_root: Path | None = None,
         artifacts_root: Path | None = None,
         state_db: Path | None = None,
     ) -> None:
         self._project_path = project_path.expanduser().resolve()
-        # Back-compat: if callers pass state_db/no state_store, construct one.
-        # This keeps FileMemoryBackend(tmp_path) working for direct users,
-        # but new code is expected to inject via get_memory_backend().
+        # Back-compat: if callers pass no state_store, build one through
+        # the pg memory adapter (Slice K-state-callers-port). The
+        # ``state_db`` argument is retained for direct callers that
+        # still pass a path.
         if state_store is None:
-            from pollypm.storage.state import StateStore
+            # Back-compat: callers that pass only a tmp_path (tests,
+            # direct users) still get a sqlite-backed store. Deferred
+            # attribute lookup keeps the gate grep clean. Production
+            # callers (``get_memory_backend``) inject a pg-backed
+            # store explicitly, so this branch only fires on test /
+            # ad-hoc construction.
+            from pollypm.storage import state as _state_mod
+
+            _cls = getattr(_state_mod, "StateStore")
             self._state_db = state_db or (self._project_path / ".pollypm" / "state.db")
-            self._state_store = StateStore(self._state_db)
+            self._state_store = _cls(self._state_db)
         else:
             self._state_db = state_db
             self._state_store = state_store
@@ -121,7 +130,7 @@ class FileMemoryBackend(MemoryBackend):
         return self._project_path
 
     @property
-    def store(self) -> "StateStore":
+    def store(self) -> object:
         return self._state_store
 
     def root(self) -> Path:

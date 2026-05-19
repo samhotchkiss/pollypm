@@ -15,7 +15,6 @@ from pollypm.projects import (
     release_session_lock,
     session_scoped_dir,
 )
-from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.records import WorktreeRecord
 
 if TYPE_CHECKING:
@@ -27,24 +26,11 @@ _SAFE_WORKTREE_KEY_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
 def _list_worktrees_for_backend(
     config: "PollyPMConfig", project_key: str | None
 ) -> list[WorktreeRecord]:
-    """Backend-aware list helper.
+    """List worktrees through the pg facade."""
+    del config  # pg pool is process-wide
+    from pollypm.storage.pg_worktrees import list_worktrees as pg_list
 
-    On the pg path we go straight through the new pg_worktrees facade
-    (no per-process StateStore lifecycle); on the sqlite path we open
-    a short-lived StateStore for back-compat. Both branches return the
-    same :class:`WorktreeRecord` shape so callers don't have to care.
-    """
-    if is_pg_backend(config):
-        from pollypm.storage.pg_worktrees import list_worktrees as pg_list
-
-        return pg_list(project_key)
-    from pollypm.storage.state import StateStore
-
-    store = StateStore(config.project.state_db)
-    try:
-        return store.list_worktrees(project_key)
-    finally:
-        store.close()
+    return pg_list(project_key)
 
 
 def _upsert_worktree_for_backend(
@@ -59,37 +45,20 @@ def _upsert_worktree_for_backend(
     branch: str,
     status: str,
 ) -> None:
-    """Backend-aware upsert wrapper. See :func:`_list_worktrees_for_backend`."""
-    if is_pg_backend(config):
-        from pollypm.storage.pg_worktrees import upsert_worktree as pg_upsert
+    """Upsert a worktree row through the pg facade."""
+    del config  # pg pool is process-wide
+    from pollypm.storage.pg_worktrees import upsert_worktree as pg_upsert
 
-        pg_upsert(
-            project_key=project_key,
-            lane_kind=lane_kind,
-            lane_key=lane_key,
-            session_name=session_name,
-            issue_key=issue_key,
-            path=path,
-            branch=branch,
-            status=status,
-        )
-        return
-    from pollypm.storage.state import StateStore
-
-    store = StateStore(config.project.state_db)
-    try:
-        store.upsert_worktree(
-            project_key=project_key,
-            lane_kind=lane_kind,
-            lane_key=lane_key,
-            session_name=session_name,
-            issue_key=issue_key,
-            path=path,
-            branch=branch,
-            status=status,
-        )
-    finally:
-        store.close()
+    pg_upsert(
+        project_key=project_key,
+        lane_kind=lane_kind,
+        lane_key=lane_key,
+        session_name=session_name,
+        issue_key=issue_key,
+        path=path,
+        branch=branch,
+        status=status,
+    )
 
 
 def _update_worktree_status_for_backend(
@@ -99,21 +68,13 @@ def _update_worktree_status_for_backend(
     lane_key: str,
     status: str,
 ) -> None:
-    """Backend-aware status-promotion wrapper."""
-    if is_pg_backend(config):
-        from pollypm.storage.pg_worktrees import (
-            update_worktree_status as pg_update,
-        )
+    """Update a worktree row's status through the pg facade."""
+    del config  # pg pool is process-wide
+    from pollypm.storage.pg_worktrees import (
+        update_worktree_status as pg_update,
+    )
 
-        pg_update(project_key, lane_kind, lane_key, status)
-        return
-    from pollypm.storage.state import StateStore
-
-    store = StateStore(config.project.state_db)
-    try:
-        store.update_worktree_status(project_key, lane_kind, lane_key, status)
-    finally:
-        store.close()
+    pg_update(project_key, lane_kind, lane_key, status)
 
 
 def _validate_worktree_key(param_name: str, param_value: str) -> None:

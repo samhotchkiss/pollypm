@@ -43,7 +43,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.sqlite_pragmas import readonly_uri
 
 if TYPE_CHECKING:
@@ -327,52 +326,11 @@ def migrate_legacy_per_project_dbs(
     ``workspace_root``). Idempotent — safe to run repeatedly; a re-run
     is a no-op once each project is migrated and archived.
     """
-    if config is None:
-        try:
-            from pollypm.config import load_config
-
-            config = load_config()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("legacy_per_project_db: load_config failed: %s", exc)
-            return []
-
-    # #1737, Slice C: on the postgres backend there are no per-project
-    # state.db files — the unified ``messages`` + ``work_*`` tables live
-    # in the shared pg DB. Skip the migration entirely so an install with
-    # ``backend = "postgres"`` never tries to open sqlite shards that
-    # don't exist.
-    if is_pg_backend(config):
-        return []
-
-    workspace_root_raw = getattr(config.project, "workspace_root", None)
-    if workspace_root_raw is None:
-        return []
-    workspace_db = Path(workspace_root_raw) / ".pollypm" / "state.db"
-    workspace_db.parent.mkdir(parents=True, exist_ok=True)
-
-    reports: list[PerProjectMigrationReport] = []
-    known: dict[str, Any] = getattr(config, "projects", {}) or {}
-    for project_key, project_cfg in known.items():
-        project_path_raw = getattr(project_cfg, "path", None)
-        if project_path_raw is None:
-            continue
-        report = migrate_one(
-            project_key=project_key,
-            project_path=Path(project_path_raw),
-            workspace_db=workspace_db,
-        )
-        reports.append(report)
-        if report.succeeded and any(
-            v for v in report.rows_copied.values()
-        ):
-            logger.info(
-                "legacy_per_project_db: migrated %s → workspace (%s); "
-                "archived to %s",
-                project_key,
-                {k: v for k, v in report.rows_copied.items() if v},
-                report.archived_to,
-            )
-    return reports
+    # #1737, Slice K: on postgres there are no per-project state.db
+    # files — the unified ``messages`` + ``work_*`` tables live in the
+    # shared pg DB. The legacy per-project migration is a no-op.
+    del config  # config retained for caller compatibility only
+    return []
 
 
 __all__ = [

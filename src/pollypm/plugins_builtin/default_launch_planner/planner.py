@@ -260,20 +260,13 @@ class DefaultLaunchPlanner:
 
         effective = session
         routed_assignment = None
-        # Slice K-state-port phase 2c (#1737): when the pg backend is
-        # active, route the session_runtime read through the pg_sessions
-        # facade rather than the (sqlite-only) StateStore reader on ctx.
-        from pollypm.storage._backend_dispatch import is_pg_backend
+        # Route the session_runtime read through the pg_sessions facade.
+        from pollypm.storage.pg_sessions import (
+            get_session_runtime as _pg_get_runtime,
+        )
 
         try:
-            if is_pg_backend(ctx.config):
-                from pollypm.storage.pg_sessions import (
-                    get_session_runtime as _pg_get_runtime,
-                )
-
-                runtime = _pg_get_runtime(session.name)
-            else:
-                runtime = ctx.store.get_session_runtime(session.name)
+            runtime = _pg_get_runtime(session.name)
         except Exception:  # noqa: BLE001
             runtime = None
         override_account: str | None = None

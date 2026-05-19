@@ -166,7 +166,7 @@ def compute_used_pct(config: Any, store: Any) -> int | None:
         from pollypm.capacity import probe_all_accounts
     except Exception:  # noqa: BLE001
         return None
-    if config is None or store is None:
+    if config is None:
         return None
     try:
         probes = probe_all_accounts(config, store)
@@ -300,17 +300,9 @@ def downtime_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
             "pause_until": state.pause_until,
         }
 
-    # 3. Capacity.
-    store = None
-    try:
-        from pollypm.storage.state import StateStore
-        state_db = getattr(config.project, "state_db", None)
-        if state_db is not None:
-            store = StateStore(Path(state_db))
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("downtime: state store unavailable: %s", exc)
-
-    used_pct = compute_used_pct(config, store)
+    # 3. Capacity. (pg cutover: ``store`` is unused by compute_used_pct
+    # which now routes through pg_accounts via capacity.probe_all_accounts.)
+    used_pct = compute_used_pct(config, None)
     if used_pct is not None and used_pct >= settings.threshold_pct:
         return {
             "scheduled": None,

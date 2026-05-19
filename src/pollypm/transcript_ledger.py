@@ -9,7 +9,6 @@ from pollypm.config import load_config
 from pollypm.models import AccountConfig, ProviderKind
 from pollypm.projects import slugify_project_key
 from pollypm.storage.records import TokenUsageHourlyRecord
-from pollypm.storage.state import StateStore
 
 @dataclass(slots=True)
 class TranscriptTokenSample:
@@ -299,65 +298,57 @@ def _scan_account_transcripts(config, account_name: str) -> list[TranscriptScanR
 
 
 def sync_token_ledger_for_config(config, *, account: str | None = None) -> list[TranscriptTokenSample]:
-    # #1019 — close the StateStore on exit. Each call opened a fresh
-    # SQLite connection (which in WAL mode allocates db + -wal + -shm
-    # file descriptors) without ever calling ``store.close()``. Because
-    # this function runs every heartbeat tick, three fds-per-minute
-    # accumulated and exhausted ``RLIMIT_NOFILE`` within hours, surfacing
-    # as ``Errno 24 Too many open files`` against whichever ``open()``
-    # crossed the limit (typically ``transcripts/.ingestion-state.lock``).
-    store = StateStore(config.project.state_db)
-    try:
-        account_names = [account] if account else list(config.accounts)
-        ingested: list[TranscriptTokenSample] = []
-        rollups: dict[tuple[str, str, str, str, str], int] = {}
-        updated_at = datetime.now(UTC).isoformat()
+    """Ingest fresh transcript samples through the pg token-usage facade."""
+    from pollypm.storage.pg_token_usage import (
+        replace_token_usage_hourly,
+        upsert_token_sample,
+    )
 
-        for account_name in account_names:
-            for result in _scan_account_transcripts(config, account_name):
-                sample = result.final_sample
-                store.upsert_token_sample(
-                    session_name=sample.session_name,
-                    account_name=sample.account_name,
-                    provider=sample.provider,
-                    model_name=sample.model_name,
-                    project_key=sample.project_key,
-                    cumulative_tokens=sample.cumulative_tokens,
-                    observed_at=sample.observed_at.isoformat(),
-                )
-                ingested.append(sample)
-                for event in result.usage_events:
-                    hour_bucket = event.observed_at.astimezone(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
-                    key = (
-                        hour_bucket,
-                        sample.account_name,
-                        sample.provider,
-                        event.model_name,
-                        event.project_key,
-                    )
-                    rollups[key] = rollups.get(key, 0) + event.tokens_used
+    account_names = [account] if account else list(config.accounts)
+    ingested: list[TranscriptTokenSample] = []
+    rollups: dict[tuple[str, str, str, str, str], int] = {}
+    updated_at = datetime.now(UTC).isoformat()
 
-        store.replace_token_usage_hourly(
-            [
-                TokenUsageHourlyRecord(
-                    hour_bucket=hour_bucket,
-                    account_name=account_name,
-                    provider=provider,
-                    model_name=model_name,
-                    project_key=project_key,
-                    tokens_used=tokens_used,
-                    updated_at=updated_at,
+    for account_name in account_names:
+        for result in _scan_account_transcripts(config, account_name):
+            sample = result.final_sample
+            upsert_token_sample(
+                session_name=sample.session_name,
+                account_name=sample.account_name,
+                provider=sample.provider,
+                model_name=sample.model_name,
+                project_key=sample.project_key,
+                cumulative_tokens=sample.cumulative_tokens,
+                observed_at=sample.observed_at.isoformat(),
+            )
+            ingested.append(sample)
+            for event in result.usage_events:
+                hour_bucket = event.observed_at.astimezone(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+                key = (
+                    hour_bucket,
+                    sample.account_name,
+                    sample.provider,
+                    event.model_name,
+                    event.project_key,
                 )
-                for (hour_bucket, account_name, provider, model_name, project_key), tokens_used in sorted(rollups.items())
-            ],
-            account_names=account_names,
-        )
-        return ingested
-    finally:
-        try:
-            store.close()
-        except Exception:  # noqa: BLE001
-            pass
+                rollups[key] = rollups.get(key, 0) + event.tokens_used
+
+    replace_token_usage_hourly(
+        [
+            TokenUsageHourlyRecord(
+                hour_bucket=hour_bucket,
+                account_name=account_name,
+                provider=provider,
+                model_name=model_name,
+                project_key=project_key,
+                tokens_used=tokens_used,
+                updated_at=updated_at,
+            )
+            for (hour_bucket, account_name, provider, model_name, project_key), tokens_used in sorted(rollups.items())
+        ],
+        account_names=account_names,
+    )
+    return ingested
 
 
 def sync_token_ledger(config_path: Path, *, account: str | None = None) -> list[TranscriptTokenSample]:
@@ -366,19 +357,13 @@ def sync_token_ledger(config_path: Path, *, account: str | None = None) -> list[
 
 
 def recent_token_usage(config_path: Path, *, limit: int = 24) -> list[TokenUsageHourlyRecord]:
-    # #1019 — close the StateStore on exit (see sibling comment in
-    # ``sync_token_ledger_for_config``). The StateStore here was leaking
-    # the same way; every CLI/UI lookup of recent usage left a sqlite
-    # connection (and its WAL/SHM fds) dangling.
-    config = load_config(config_path)
-    store = StateStore(config.project.state_db)
-    try:
-        return store.recent_token_usage(limit=limit)
-    finally:
-        try:
-            store.close()
-        except Exception:  # noqa: BLE001
-            pass
+    """Return recent hourly token-usage rows from the pg facade."""
+    del config_path  # config is not needed; pg pool is process-wide
+    from pollypm.storage.pg_token_usage import (
+        recent_token_usage as pg_recent_token_usage,
+    )
+
+    return pg_recent_token_usage(limit=limit)
 
 
 def token_usage_costs(
@@ -387,28 +372,27 @@ def token_usage_costs(
     project: str | None = None,
     days: int = 7,
 ) -> list[TokenCostSummary]:
-    """Return token usage aggregated by normalized project key."""
-    config = load_config(config_path)
-    store = StateStore(config.project.state_db)
+    """Return token usage aggregated by normalized project key (pg backend)."""
+    del config_path  # pg pool is process-wide
+    from pollypm.storage.pg_pool import get_ro_pool
+
+    pool = get_ro_pool()
+    sql = (
+        "SELECT LOWER(project_key) AS project_key, "
+        "       SUM(tokens_used) AS total, "
+        "       SUM(cache_read_tokens) AS cache_total, "
+        "       COUNT(DISTINCT substr(hour_bucket, 1, 10)) AS days_active "
+        "FROM token_usage_hourly "
+        "WHERE hour_bucket >= (NOW() - (%s || ' days')::interval)::text "
+        "GROUP BY LOWER(project_key) "
+        "ORDER BY total DESC"
+    )
     try:
-        rows = store.execute(
-            """
-            SELECT LOWER(project_key) AS project_key,
-                   SUM(tokens_used) as total,
-                   SUM(cache_read_tokens) as cache_total,
-                   COUNT(DISTINCT substr(hour_bucket, 1, 10)) as days_active
-            FROM token_usage_hourly
-            WHERE hour_bucket >= date('now', ?)
-            GROUP BY LOWER(project_key)
-            ORDER BY total DESC
-            """,
-            (f"-{days} days",),
-        ).fetchall()
-    finally:
-        try:
-            store.close()
-        except Exception:  # noqa: BLE001
-            pass
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, (int(days),))
+            rows = cur.fetchall()
+    except Exception:  # noqa: BLE001
+        return []
     project_filter = project.lower() if project else None
     out: list[TokenCostSummary] = []
     for row in rows:

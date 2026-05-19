@@ -13,7 +13,6 @@ from pollypm.onboarding import default_session_args
 from pollypm.models import ProviderKind, SessionConfig
 from pollypm.role_routing import resolved_provider_kind, resolve_role_assignment
 from pollypm.supervisor import Supervisor
-from pollypm.storage.state import StateStore
 from pollypm.worktrees import ensure_worktree
 
 
@@ -23,25 +22,13 @@ _log = logging.getLogger(__name__)
 def _effective_control_accounts(config_path: Path) -> set[str]:
     config = load_config(config_path)
     accounts = {config.pollypm.controller_account}
-    # Slice K-state-port phase 2c (#1737): on the pg backend, skip the
-    # short-lived StateStore open and go straight through pg_sessions —
-    # the cluster-A facade owns session_runtime under postgres. The
-    # sqlite branch is unchanged for back-compat.
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    # session_runtime lives on the pg cluster-A facade.
+    from pollypm.storage.pg_sessions import get_session_runtime
 
-    if is_pg_backend(config):
-        from pollypm.storage.pg_sessions import get_session_runtime
-
-        for session_name in ("heartbeat", "operator"):
-            runtime = get_session_runtime(session_name)
-            if runtime is not None and runtime.effective_account:
-                accounts.add(runtime.effective_account)
-    else:
-        with StateStore(config.project.state_db) as store:
-            for session_name in ("heartbeat", "operator"):
-                runtime = store.get_session_runtime(session_name)
-                if runtime is not None and runtime.effective_account:
-                    accounts.add(runtime.effective_account)
+    for session_name in ("heartbeat", "operator"):
+        runtime = get_session_runtime(session_name)
+        if runtime is not None and runtime.effective_account:
+            accounts.add(runtime.effective_account)
     return {name for name in accounts if name}
 
 
@@ -50,15 +37,9 @@ def _account_is_available(config_path: Path, account_name: str) -> bool:
     account = config.accounts[account_name]
     if not detect_logged_in(account):
         return False
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    from pollypm.storage.pg_accounts import get_account_runtime
 
-    if is_pg_backend(config):
-        from pollypm.storage.pg_accounts import get_account_runtime
-
-        runtime = get_account_runtime(account_name)
-    else:
-        with StateStore(config.project.state_db) as store:
-            runtime = store.get_account_runtime(account_name)
+    runtime = get_account_runtime(account_name)
     # Accept both ``auth_broken`` (canonical, written by heartbeats/api.py
     # and supervisor.py) and the legacy hyphenated ``auth-broken`` form
     # so a runtime row written by either side correctly excludes the

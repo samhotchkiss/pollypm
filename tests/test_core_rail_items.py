@@ -139,7 +139,13 @@ def test_polly_state_ignores_expired_live_chat_network_dead_notice(
 @pytest.mark.parametrize(
     ("session_role", "expected_label"),
     [
-        ("architect", "  PM Chat (Archie)"),
+        # Follow-up to #1866: the project's configured ``persona_name``
+        # wins over the architect-role default ("Archie"). Bikepath
+        # explicitly picked "Bea", so the rail must surface "Bea"
+        # regardless of which control-role session backs the PM Chat
+        # window. (Worker-role sessions never carried a baked-in name,
+        # so this column was already correct pre-fix.)
+        ("architect", "  PM Chat (Bea)"),
         ("worker", "  PM Chat (Bea)"),
     ],
 )
@@ -224,6 +230,60 @@ def test_pm_chat_label_uses_project_pm_fallback(monkeypatch, tmp_path: Path) -> 
 
     session_row = next(row for row in rows if row.key == "project:booktalk:session")
     assert session_row.label == "  PM Chat (Project PM)"
+
+
+def test_pm_chat_label_falls_back_to_architect_default_when_persona_unset(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Follow-up to #1866: projects without an explicit ``persona_name``
+    still surface the architect-role default ("Archie") when their PM
+    Chat is backed by an architect session. The fix only changes
+    *precedence* — it must not regress projects that relied on the
+    role-default label.
+    """
+    project = KnownProject(
+        key="booktalk",
+        path=tmp_path,
+        name="Booktalk",
+        persona_name=None,
+        kind=ProjectKind.GIT,
+    )
+    config = type("Config", (), {"projects": {"booktalk": project}})()
+
+    class _Router:
+        def _session_state(self, *args, **kwargs):  # noqa: ANN002, ANN003
+            return "idle"
+
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "_classify_projects",
+        lambda ctx: ([("booktalk", project)], [], {"booktalk": False}),
+    )
+    monkeypatch.setattr(
+        core_rail_items_plugin,
+        "active_task_numbers",
+        lambda project, *, config=None: [],
+    )
+    ctx = RailContext(
+        router=_Router(),
+        config=config,
+        launches=[
+            _FakeLaunch(
+                "architect_booktalk",
+                "architect",
+                "booktalk",
+                "architect-booktalk",
+            ),
+        ],
+        cockpit_state={"selected": "project:booktalk"},
+    )
+
+    rows = core_rail_items_plugin._project_rows(ctx)
+
+    session_row = next(
+        row for row in rows if row.key == "project:booktalk:session"
+    )
+    assert session_row.label == "  PM Chat (Archie)"
 
 
 def _fake_supervisor(

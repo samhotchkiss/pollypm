@@ -484,6 +484,24 @@ class Supervisor:
             return
         self.store.upsert_session_runtime(**kwargs)
 
+    def _recent_events(self, limit: int = 20):
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_sessions import (
+                recent_events as pg_recent_events,
+            )
+
+            return pg_recent_events(limit=limit)
+        return self.store.recent_events(limit=limit)
+
+    def _last_event_at(self, session_name: str, event_type: str):
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_sessions import (
+                last_event_at as pg_last_event_at,
+            )
+
+            return pg_last_event_at(session_name, event_type)
+        return self.store.last_event_at(session_name, event_type)
+
     def _build_launch_planner(self):
         """Resolve the launch planner via the plugin host.
 

@@ -1,4 +1,4 @@
-"""Process-wide Postgres connection pool primitives (issue #1737, Slice A).
+"""Process-wide Postgres connection pool primitives (issue #1737).
 
 This module owns the lazy, process-wide :class:`psycopg_pool.ConnectionPool`
 instances that the rest of PollyPM uses to talk to Postgres. Two pools are
@@ -18,18 +18,20 @@ DSN resolution order (highest priority wins):
 2. ``[storage] url`` in ``pollypm.toml`` — only when it looks like a pg DSN
    (``postgresql://...`` / ``postgres://...``); otherwise treated as a
    sqlite URL and ignored here.
-3. ``[storage.pg] dsn`` in ``pollypm.toml`` (placeholder — the dataclass
-   doesn't expose it yet; honoured if a future config patch wires it).
-4. The built-in default ``postgresql://localhost:5432/pollypm``.
+3. The built-in default ``postgresql://localhost:5432/pollypm``.
+
+Note: :class:`~pollypm.models.PgStorageSettings` exposes a ``dsn`` field
+that :mod:`pollypm.config` parses from ``[storage.pg] dsn``, but
+:func:`resolve_dsn` does **not** read it yet — operators who want to
+override the DSN should use ``POLLYPM_PG_DSN`` or ``[storage] url``.
+Wiring ``[storage.pg].dsn`` is tracked as a post-RC follow-up.
 
 The pools are lazy module-level singletons. :func:`pg_pool_shutdown` is the
 graceful close used by ``pm reset`` / test teardown — calling it is safe
 even when no pool was ever opened.
 
-Slice A scope only — the *consumers* (PgWorkService, the storage facades,
-the doctor check) wire into this module across slices B-G. Slice A's
-contract is just "the primitive exists and behaves correctly", which is
-what the unit tests cover.
+The consumers (PgWorkService, the storage facades, the doctor check) all
+wire into this module; the unit tests cover the primitive contract.
 """
 
 from __future__ import annotations
@@ -102,6 +104,17 @@ def _looks_like_pg_dsn(value: str) -> bool:
 def resolve_dsn(config: "PollyPMConfig | None" = None) -> str:
     """Return the DSN to use, honouring the documented priority order.
 
+    Priority (highest wins):
+
+    1. ``POLLYPM_PG_DSN`` env var.
+    2. ``config.storage.url`` — only when it parses as a pg DSN.
+    3. The built-in :data:`DEFAULT_DSN`.
+
+    Note: ``config.storage.pg.dsn`` is parsed by :mod:`pollypm.config`
+    but **not** read here. Operators who set ``[storage.pg] dsn`` in
+    ``pollypm.toml`` are currently silently ignored; wiring that
+    source is tracked as a post-RC follow-up.
+
     Parameters
     ----------
     config:
@@ -138,12 +151,12 @@ def resolve_pool_sizing(
     the loaded config when they're present and well-typed; falls back
     to :data:`DEFAULT_POOL_MIN` / :data:`DEFAULT_POOL_MAX` otherwise.
 
-    Slice A intentionally does **not** add the ``[storage.pg]``
-    subsection to the :class:`~pollypm.models.StorageSettings`
-    dataclass — that's a follow-up. The lookup here uses ``getattr``
-    so a future ``StorageSettings.pg`` attribute slots in without a
-    second migration. Until then operators set the env var or accept
-    the defaults.
+    The values come from :class:`~pollypm.models.PgStorageSettings`,
+    which :class:`~pollypm.models.StorageSettings` exposes as the
+    ``pg`` attribute. The ``getattr`` lookups below tolerate older
+    configs or test fixtures that synthesise a bare ``StorageSettings``
+    without the subsection — those callers transparently fall through
+    to the module defaults.
     """
     if config is None:
         return DEFAULT_POOL_MIN, DEFAULT_POOL_MAX

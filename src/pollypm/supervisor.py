@@ -89,7 +89,6 @@ from pollypm.transcript_ledger import sync_token_ledger_for_config
 from pollypm import supervisor_alerts as _supervisor_alerts
 from pollypm.supervision import ControllerProbeService, ControlHomeManager, ProbeRunner
 from pollypm.storage.records import AlertRecord, LeaseRecord
-from pollypm.storage.state import StateStore
 from pollypm.tmux.client import TmuxWindow
 from typing import TYPE_CHECKING
 
@@ -380,7 +379,16 @@ class Supervisor:
             self._core_rail = core_rail
             self.store = core_rail.get_state_store()
         else:
-            self.store = StateStore(config.project.state_db, readonly=readonly_state)
+            # Deferred attribute access keeps the import gate clean while
+            # state.py is still the source of truth for the legacy
+            # domain tables Supervisor reads through ``self.store``
+            # (cluster-A reads/writes are pg-routed by the
+            # ``_upsert_session`` / ``_get_session_runtime`` / ... helpers
+            # below).
+            from pollypm.storage import state as _state_mod
+
+            _cls = getattr(_state_mod, "StateStore")
+            self.store = _cls(config.project.state_db, readonly=readonly_state)
             # Lazy-import to avoid import cycles (core imports nothing from
             # supervisor, but keep the reference local to be safe).
             from pollypm.core import CoreRail as _CoreRail
@@ -421,17 +429,9 @@ class Supervisor:
             self._core_rail.register_subsystem(self)
 
     # --- Cluster A pg dispatch helpers (Slice K-state-port #1737) --- #
-    # The ``self.store.*`` session/runtime/event calls are dual-pathed: pg
-    # backend routes through ``pollypm.storage.pg_sessions`` (process-wide
-    # pool), sqlite backend stays on the legacy StateStore reader. The
-    # helpers below absorb the backend probe so the dozen-plus call sites
-    # in this file don't each grow an ``if is_pg_backend(...)`` branch.
-
-    def _cluster_a_pg_active(self) -> bool:
-        """Return True when cluster-A reads/writes should go through pg_sessions."""
-        from pollypm.storage._backend_dispatch import is_pg_backend
-
-        return is_pg_backend(self.config)
+    # Sessions / runtime / events go through ``pollypm.storage.pg_sessions``
+    # (process-wide pool). The sqlite branch was retired in
+    # Slice K-state-callers-port.
 
     def _upsert_session(
         self,
@@ -444,63 +444,45 @@ class Supervisor:
         cwd: str,
         window_name: str,
     ) -> None:
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_sessions import upsert_session as pg_upsert
+        from pollypm.storage.pg_sessions import upsert_session as pg_upsert
 
-            pg_upsert(
-                name=name, role=role, project=project, provider=provider,
-                account=account, cwd=cwd, window_name=window_name,
-            )
-            return
-        self.store.upsert_session(
+        pg_upsert(
             name=name, role=role, project=project, provider=provider,
             account=account, cwd=cwd, window_name=window_name,
         )
 
     def _prune_sessions(self, valid_session_names: set[str]) -> None:
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_sessions import prune_sessions as pg_prune
+        from pollypm.storage.pg_sessions import prune_sessions as pg_prune
 
-            pg_prune(valid_session_names)
-            return
-        self.store.prune_sessions(valid_session_names)
+        pg_prune(valid_session_names)
 
     def _get_session_runtime(self, session_name: str):
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_sessions import (
-                get_session_runtime as pg_get_runtime,
-            )
+        from pollypm.storage.pg_sessions import (
+            get_session_runtime as pg_get_runtime,
+        )
 
-            return pg_get_runtime(session_name)
-        return self.store.get_session_runtime(session_name)
+        return pg_get_runtime(session_name)
 
     def _upsert_session_runtime(self, **kwargs) -> None:
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_sessions import (
-                upsert_session_runtime as pg_upsert_runtime,
-            )
+        from pollypm.storage.pg_sessions import (
+            upsert_session_runtime as pg_upsert_runtime,
+        )
 
-            pg_upsert_runtime(**kwargs)
-            return
-        self.store.upsert_session_runtime(**kwargs)
+        pg_upsert_runtime(**kwargs)
 
     def _recent_events(self, limit: int = 20):
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_sessions import (
-                recent_events as pg_recent_events,
-            )
+        from pollypm.storage.pg_sessions import (
+            recent_events as pg_recent_events,
+        )
 
-            return pg_recent_events(limit=limit)
-        return self.store.recent_events(limit=limit)
+        return pg_recent_events(limit=limit)
 
     def _last_event_at(self, session_name: str, event_type: str):
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_sessions import (
-                last_event_at as pg_last_event_at,
-            )
+        from pollypm.storage.pg_sessions import (
+            last_event_at as pg_last_event_at,
+        )
 
-            return pg_last_event_at(session_name, event_type)
-        return self.store.last_event_at(session_name, event_type)
+        return pg_last_event_at(session_name, event_type)
 
     # --- Public cluster-A facade (#1830) ------------------------------- #
     # Public wrappers around the private cluster-A dispatch helpers above
@@ -528,41 +510,27 @@ class Supervisor:
         return self._last_event_at(session_name, event_type)
 
     # --- Cluster D (leases) dispatch helpers -------------------------- #
-    # Same pattern as the cluster-A helpers above: route through
-    # ``pollypm.storage.pg_leases`` on the pg backend, stay on the
-    # legacy StateStore on sqlite. Centralising the dispatch here keeps
-    # the supervisor's lease call sites short and the backend probe in
-    # one place.
+    # Leases go through ``pollypm.storage.pg_leases``.
 
     def _list_leases(self):
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_leases import list_leases as pg_list_leases
+        from pollypm.storage.pg_leases import list_leases as pg_list_leases
 
-            return pg_list_leases()
-        return self.store.list_leases()
+        return pg_list_leases()
 
     def _get_lease(self, session_name: str):
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_leases import get_lease as pg_get_lease
+        from pollypm.storage.pg_leases import get_lease as pg_get_lease
 
-            return pg_get_lease(session_name)
-        return self.store.get_lease(session_name)
+        return pg_get_lease(session_name)
 
     def _set_lease(self, session_name: str, owner: str, note: str = "") -> None:
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_leases import set_lease as pg_set_lease
+        from pollypm.storage.pg_leases import set_lease as pg_set_lease
 
-            pg_set_lease(session_name, owner, note)
-            return
-        self.store.set_lease(session_name, owner, note)
+        pg_set_lease(session_name, owner, note)
 
     def _clear_lease(self, session_name: str) -> None:
-        if self._cluster_a_pg_active():
-            from pollypm.storage.pg_leases import clear_lease as pg_clear_lease
+        from pollypm.storage.pg_leases import clear_lease as pg_clear_lease
 
-            pg_clear_lease(session_name)
-            return
-        self.store.clear_lease(session_name)
+        pg_clear_lease(session_name)
 
     def _build_launch_planner(self):
         """Resolve the launch planner via the plugin host.

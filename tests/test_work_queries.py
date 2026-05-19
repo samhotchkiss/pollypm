@@ -7,7 +7,6 @@ import time
 import pytest
 
 from pollypm.work.models import Priority, WorkStatus
-from pollypm.work.sqlite_service import SQLiteWorkService
 
 
 # ---------------------------------------------------------------------------
@@ -16,9 +15,8 @@ from pollypm.work.sqlite_service import SQLiteWorkService
 
 
 @pytest.fixture
-def svc(tmp_path):
-    db_path = tmp_path / "work.db"
-    return SQLiteWorkService(db_path=db_path)
+def svc(pg_work_service):
+    return pg_work_service
 
 
 def _create_task(svc, project="proj", title="Task", description="desc", priority="normal", roles=None, **kwargs):
@@ -149,6 +147,15 @@ class TestNext:
         assert result is not None
         assert result.task_id == winner.task_id
 
+    @pytest.mark.xfail(
+        reason=(
+            "Test monkeypatches sqlite-internal `_row_to_task` / "
+            "`derive_owner` to assert a hydration-count optimization; "
+            "PgWorkService has different internals. Sqlite-implementation-"
+            "detail test, deferred from pg parity."
+        ),
+        strict=False,
+    )
     def test_next_hydrates_only_selected_matching_task(self, svc, monkeypatch):
         blocker = _create_task(svc, title="Blocker")
         blocked = _create_task(
@@ -251,6 +258,15 @@ class TestMyTasks:
         assert [t.task_id for t in svc.my_tasks("alice")] == [task.task_id]
         assert [t.task_id for t in svc.my_tasks("bob")] == []
 
+    @pytest.mark.xfail(
+        reason=(
+            "Test monkeypatches sqlite-internal `_row_to_task` / "
+            "`derive_owner` to assert a hydration-count optimization; "
+            "PgWorkService has different internals. Sqlite-implementation-"
+            "detail test, deferred from pg parity."
+        ),
+        strict=False,
+    )
     def test_my_tasks_filters_rows_before_hydration(self, svc, monkeypatch):
         tasks = [
             _create_task(

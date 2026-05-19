@@ -15,9 +15,9 @@ from pollypm.work.models import (
     WorkStatus,
 )
 from pollypm.work.mock_service import MockWorkService
+from pollypm.work.pg_service import PgWorkService
 from pollypm.work.plugin_registry import PluginNotRegisteredError, PluginRegistry, configure_work_plugins
 from pollypm.work.service import WorkService
-from pollypm.work.sqlite_service import SQLiteWorkService
 from pollypm.work.sync import SyncAdapter, SyncManager
 
 
@@ -100,9 +100,9 @@ class TestProtocolSatisfaction:
             assert hasattr(svc, method), f"MockWorkService missing method: {method}"
             assert callable(getattr(svc, method)), f"MockWorkService.{method} is not callable"
 
-    def test_sqlite_service_satisfies_protocol(self, tmp_path):
-        """SQLiteWorkService must structurally satisfy the WorkService protocol."""
-        svc = SQLiteWorkService(db_path=tmp_path / "work.db")
+    def test_pg_service_satisfies_protocol(self, pg_work_service):
+        """PgWorkService must structurally satisfy the WorkService protocol."""
+        svc = pg_work_service
         protocol_methods = [
             "create", "get", "list_tasks", "queue", "claim", "next",
             "update", "cancel", "hold", "resume",
@@ -114,8 +114,8 @@ class TestProtocolSatisfaction:
             "state_counts", "my_tasks", "blocked_tasks",
         ]
         for method in protocol_methods:
-            assert hasattr(svc, method), f"SQLiteWorkService missing method: {method}"
-            assert callable(getattr(svc, method)), f"SQLiteWorkService.{method} is not callable"
+            assert hasattr(svc, method), f"PgWorkService missing method: {method}"
+            assert callable(getattr(svc, method)), f"PgWorkService.{method} is not callable"
 
 
 # ---------------------------------------------------------------------------
@@ -130,9 +130,9 @@ class TestConsumerInterop:
         task = _lifecycle_through_flow(svc)
         assert task.work_status == WorkStatus.DONE
 
-    def test_consumer_works_with_sqlite(self, tmp_path):
-        """A consumer function works identically with SQLiteWorkService."""
-        svc = SQLiteWorkService(db_path=tmp_path / "work.db")
+    def test_consumer_works_with_pg(self, pg_work_service):
+        """A consumer function works identically with PgWorkService."""
+        svc = pg_work_service
         task = _lifecycle_through_flow(svc)
         assert task.work_status == WorkStatus.DONE
 
@@ -283,6 +283,12 @@ class TestSyncAdapterIntegration:
 class TestPluginConfigDefaults:
     def test_plugin_config_loads_defaults(self, tmp_path):
         """Loading config with no custom settings selects built-in plugins."""
+        # Local import — the default-backend assertion below is the only
+        # use of the sqlite class in this file, and is itself a
+        # transitional check that will swap to PgWorkService once the
+        # factory default flips per #1737.
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
         registry = configure_work_plugins(db_path=tmp_path / "work.db")
 
         # Work service should be SQLiteWorkService

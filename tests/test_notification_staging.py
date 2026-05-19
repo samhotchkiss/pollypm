@@ -13,7 +13,7 @@ covered by the in-memory mocks in
 directly, so they're backend-agnostic and don't need a pg fixture.
 
 The legacy ``tests/test_notification_tiering.py`` still exercises the
-sqlite path via :class:`SQLiteWorkService`; that file belongs to the
+sqlite path via the CLI ``--db`` flag; that file belongs to the
 K-deletion sweep (separate PR) which collapses the sqlite stack
 entirely.
 """

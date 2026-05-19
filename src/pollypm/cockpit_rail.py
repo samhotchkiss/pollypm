@@ -444,8 +444,6 @@ def _visibility_passes(reg, ctx) -> bool:
       ``reg.feature_name`` (or ``reg.item_key`` as fallback).
     * ``Callable`` — invoked; exceptions treat as hidden-and-logged.
     """
-    import logging
-
     visibility = reg.visibility
     if visibility == "always":
         return True
@@ -462,7 +460,7 @@ def _visibility_passes(reg, ctx) -> bool:
         try:
             return bool(visibility(ctx))
         except Exception:  # noqa: BLE001
-            logging.getLogger(__name__).exception(
+            logger.exception(
                 "Rail item %s visibility predicate raised — hiding item",
                 reg.item_key,
             )
@@ -815,10 +813,7 @@ def _rows_for_registration(reg, ctx) -> list:
     handy for sections like ``projects`` where one registration fans
     out into N rows.
     """
-    import logging
     from pollypm.plugin_api.v1 import RailRow
-
-    logger = logging.getLogger(__name__)
 
     if reg.rows_provider is not None:
         try:
@@ -4335,8 +4330,7 @@ class CockpitRouter:
             f"window_name={getattr(launch, 'window_name', None)!r}"
         )
         try:
-            import logging as _logging
-            _logging.getLogger("pollypm.cockpit_rail").error(
+            logger.error(
                 "persona_swap_detected (rail-mount): %s — refusing to "
                 "join a pane whose content shows a different role's banner",
                 details,

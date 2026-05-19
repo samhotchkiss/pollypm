@@ -207,7 +207,7 @@ Load-bearing surfaces:
 - Worker protocol injection: `src/pollypm/memory_prompts.py`
 - Per-task worker bootstrap: `src/pollypm/work/session_manager.py`
 - Session orchestration: `src/pollypm/supervisor.py`
-- Work state machine: `src/pollypm/work/sqlite_service.py`
+- Work state machine: `src/pollypm/work/pg_service.py` (Postgres-backed `WorkService` impl)
 - Cockpit shell: `src/pollypm/cockpit_ui.py`
 
 Contributor rules of thumb:

@@ -154,26 +154,37 @@ def _brew_service_running(svc: str) -> bool:
 
 
 def _pg_db_exists(db_name: str) -> bool:
-    """Return True if ``psql`` reports ``db_name`` already created."""
-    psql = _which("psql")
-    if psql is None:
+    """Return True if the local Postgres reports ``db_name`` already created.
+
+    Uses psycopg with a parameter-bound ``%s`` placeholder against the
+    ``postgres`` admin database. The previous implementation f-string'd
+    ``db_name`` directly into a SQL literal passed to ``psql -c`` — that
+    would let a hostile ``--db`` value inject SQL against the local
+    superuser session (#1890). Parameter binding makes the input data,
+    not code, regardless of what characters it contains.
+
+    Returns False on any connection / import / runtime error: the
+    bootstrap planner treats False as "assume the db doesn't exist
+    yet, plan a createdb step" which is the safe default for first run.
+    """
+    try:
+        import psycopg
+    except ImportError:
         return False
     try:
-        result = subprocess.run(  # noqa: S603
-            [
-                psql,
-                "-tAc",
-                f"SELECT 1 FROM pg_database WHERE datname='{db_name}'",
-                "postgres",
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=20,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        with psycopg.connect(
+            "postgresql://localhost:5432/postgres",
+            connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM pg_database WHERE datname = %s",
+                    (db_name,),
+                )
+                row = cur.fetchone()
+                return row is not None and row[0] == 1
+    except Exception:  # noqa: BLE001 — any failure means "unknown, plan createdb"
         return False
-    return result.returncode == 0 and result.stdout.strip() == "1"
 
 
 def _plan_steps(
@@ -258,15 +269,15 @@ def _plan_steps(
             ),
         )
     )
+    # Pure-Python step: routed through ``_create_vector_extension`` so a
+    # missing pgvector contrib package surfaces the same friendly hint
+    # ``apply_migrations`` would raise (issue #1889). The previous
+    # implementation shelled out to ``psql -c`` here, which bypassed
+    # the ``PgVectorExtensionMissing`` wrapper entirely.
     steps.append(
         _Step(
             label="CREATE EXTENSION IF NOT EXISTS vector",
-            cmd=[
-                "psql",
-                db_name,
-                "-c",
-                "CREATE EXTENSION IF NOT EXISTS vector",
-            ],
+            cmd=None,
         )
     )
     steps.append(
@@ -294,6 +305,13 @@ def _print_plan(steps: list[_Step], *, dry_run: bool) -> None:
             continue
         if step.cmd is None:
             typer.echo(f"  {idx}. {step.label}")
+            if step.label.startswith("CREATE EXTENSION"):
+                # Pure-Python equivalent of ``psql -c "CREATE EXTENSION
+                # ..."`` — surface the SQL so the plan stays scrutable
+                # even though there's no literal shell command behind it.
+                typer.echo(
+                    "       psycopg: CREATE EXTENSION IF NOT EXISTS vector"
+                )
         else:
             typer.echo(f"  {idx}. {step.label}")
             typer.echo(f"       $ {' '.join(step.cmd)}")
@@ -316,29 +334,78 @@ def _run_cmd(cmd: list[str]) -> None:
         raise typer.Exit(code=exc.returncode) from exc
 
 
-def _write_storage_block(config_path: Path, dsn: str) -> bool:
-    """Append a ``[storage]`` block to ``config_path`` if absent.
+def _create_vector_extension(db_name: str) -> None:
+    """Run ``CREATE EXTENSION IF NOT EXISTS vector`` on ``db_name``.
 
-    Returns True if the block was written, False if it was already
-    there. Idempotent: a second run is a no-op.
+    Routes the DDL through psycopg + the ``PgVectorExtensionMissing``
+    wrapper from ``pg_migrations`` so the friendly install hint fires
+    on every first-run path — not just the ``apply_migrations`` step.
+    The previous implementation shelled out to ``psql -c`` here, which
+    surfaced the bare server-side ``feature_not_supported`` error and
+    bypassed the #1750 wrapper entirely (#1889).
     """
+    from pollypm.storage.pg_migrations import PgVectorExtensionMissing
+
+    import psycopg
+
+    dsn = f"postgresql://localhost:5432/{db_name}"
+    typer.echo(f"  $ psycopg.execute(\"CREATE EXTENSION IF NOT EXISTS vector\") @ {dsn}")
+    try:
+        with psycopg.connect(dsn, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 — re-raise as friendly
+        raise PgVectorExtensionMissing(
+            "Could not install the `vector` extension on this Postgres "
+            "instance. PollyPM requires pgvector for semantic recall "
+            "and embeddings (see issue #1737).\n\n"
+            "Fix (macOS/Homebrew):\n"
+            "  brew install pgvector\n"
+            "  brew services restart postgresql@17\n"
+            "  # then re-run `pm bootstrap-pg --yes`\n\n"
+            "Other platforms: https://github.com/pgvector/pgvector "
+            "#installation-notes\n\n"
+            f"Underlying error: {exc}"
+        ) from exc
+
+
+def _write_storage_block(config_path: Path, dsn: str) -> bool:
+    """Write or append a ``[storage]`` block to ``config_path``.
+
+    Returns True if the block was written (either as new file or
+    appended to an existing one), False if the block was already
+    present. Idempotent: a second run on a configured file is a no-op.
+
+    On a brand-new install ``~/.pollypm/pollypm.toml`` does not yet
+    exist (``pm bootstrap-pg`` is meant to be the FIRST command an
+    operator runs). The previous implementation bailed in that case
+    and left the runtime without a DSN; we now scaffold a minimal
+    config containing just the ``[storage]`` block (#1888). ``pm
+    example-config`` can still backfill the richer defaults later.
+    """
+    snippet = (
+        "[storage]\n"
+        f'url = "{dsn}"\n'
+        "# Postgres is the required backend (sqlite was removed in "
+        "the #1737 cutover).\n"
+    )
     if not config_path.exists():
-        typer.echo(
-            f"  config {config_path} does not exist; create it with "
-            "`pm example-config` first.",
-            err=True,
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        header = (
+            "# pollypm.toml — created by `pm bootstrap-pg` on first "
+            "run.\n"
+            "# Run `pm example-config --force` later to backfill the "
+            "full default config.\n\n"
         )
-        return False
+        config_path.write_text(header + snippet, encoding="utf-8")
+        return True
     current = config_path.read_text(encoding="utf-8")
     if "\n[storage]\n" in current or current.startswith("[storage]\n"):
         return False
-    snippet = (
-        "\n[storage]\n"
-        f'url = "{dsn}"\n'
-        '# Postgres is the required backend (sqlite was removed in '
-        "the #1737 cutover).\n"
+    config_path.write_text(
+        current.rstrip() + "\n\n" + snippet, encoding="utf-8"
     )
-    config_path.write_text(current.rstrip() + "\n" + snippet, encoding="utf-8")
     return True
 
 
@@ -442,6 +509,19 @@ def bootstrap_pg(
             continue
 
         # Pure-Python steps. Labels are stable keys for now.
+        if step.label.startswith("CREATE EXTENSION"):
+            from pollypm.storage.pg_migrations import (
+                PgVectorExtensionMissing,
+            )
+
+            try:
+                _create_vector_extension(db_name)
+            except PgVectorExtensionMissing as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(code=3) from exc
+            typer.echo("  extension `vector` ready")
+            continue
+
         if step.label.startswith("apply_migrations"):
             from pollypm.storage import pg_migrations, pg_pool
 

@@ -1043,4 +1043,100 @@ def test_config_match_handles_equals_form(monkeypatch: pytest.MonkeyPatch):
         lambda pid: "/usr/bin/python -m pollypm.rail_daemon --config=/x/pollypm.toml",
     )
     assert _REAL_PID_MATCHES(12345, Path("/x/pollypm.toml")) is True
+
+
+# ---------------------------------------------------------------------------
+# _short_circuit_for_diagnosis — pure helper
+# ---------------------------------------------------------------------------
+
+
+def _decision(state: str, *, reason: str = "x") -> RevivalDecision:
+    return RevivalDecision(
+        state=state, pid=None, last_tick_age_seconds=None, reason=reason,
+    )
+
+
+def test_short_circuit_returns_noop_result_for_alive_decision():
+    """A non-revival decision short-circuits to a recorded RevivalResult."""
+    decision = _decision("alive", reason="recent tick")
+    result = _supervisor_mod._short_circuit_for_diagnosis(decision, cron=False)
+    assert result is not None
+    assert result.revived is False
+    assert result.spawn_error is None
+    assert result.killed_pid is None
+    assert result.kill_signal is None
+    assert result.decision is decision
+
+
+def test_short_circuit_returns_noop_result_for_throttled_decision():
+    """A throttled decision is treated the same as a healthy one — no spawn."""
+    decision = _decision("throttled", reason="within window")
+    result = _supervisor_mod._short_circuit_for_diagnosis(decision, cron=False)
+    assert result is not None
+    assert result.revived is False
+
+
+def test_short_circuit_cron_skips_missing_pid():
+    """Cron callers stand down on missing_pid (cockpit may host rail in-proc)."""
+    decision = _decision("missing_pid")
+    result = _supervisor_mod._short_circuit_for_diagnosis(decision, cron=True)
+    assert result is not None
+    assert result.revived is False
+    assert result.spawn_error is None
+    assert result.decision is decision
+
+
+def test_short_circuit_non_cron_does_not_skip_missing_pid():
+    """Non-cron callers must proceed to spawn on missing_pid."""
+    decision = _decision("missing_pid")
+    result = _supervisor_mod._short_circuit_for_diagnosis(decision, cron=False)
+    assert result is None
+
+
+def test_short_circuit_cron_still_revives_dead_process():
+    """Cron only opts out of ``missing_pid``; ``dead_process`` still proceeds."""
+    decision = _decision("dead_process")
+    result = _supervisor_mod._short_circuit_for_diagnosis(decision, cron=True)
+    assert result is None
+
+
+def test_short_circuit_cron_still_revives_stuck_no_tick():
+    decision = _decision("stuck_no_tick")
+    result = _supervisor_mod._short_circuit_for_diagnosis(decision, cron=True)
+    assert result is None
+
+
+# ---------------------------------------------------------------------------
+# _classify_kill_outcome — pure helper
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "label", ["SIGTERM", "SIGKILL", "already_gone"],
+)
+def test_classify_kill_outcome_success_labels(label: str):
+    """SIGTERM / SIGKILL / already_gone all mean: process is gone, no abort."""
+    killed, abort = _supervisor_mod._classify_kill_outcome(label)
+    assert killed is True
+    assert abort is None
+
+
+def test_classify_kill_outcome_denied_aborts_with_signal_denied():
+    killed, abort = _supervisor_mod._classify_kill_outcome("denied")
+    assert killed is False
+    assert abort == "signal_denied"
+
+
+def test_classify_kill_outcome_identity_mismatch_aborts():
+    killed, abort = _supervisor_mod._classify_kill_outcome("identity_mismatch")
+    assert killed is False
+    assert abort == "identity_mismatch"
+
+
+@pytest.mark.parametrize("label", [None, "none", "unknown"])
+def test_classify_kill_outcome_neutral_labels(label: str | None):
+    """``None``, ``"none"``, or an unrecognised label produces no kill + no abort."""
+    killed, abort = _supervisor_mod._classify_kill_outcome(label)
+    assert killed is False
+    assert abort is None
     assert _REAL_PID_MATCHES(12345, Path("/y/pollypm.toml")) is False

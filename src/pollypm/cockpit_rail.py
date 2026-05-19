@@ -3358,6 +3358,15 @@ class CockpitRouter:
                 pass
             self._end_layout_mutation(token)
 
+    # #1832 — timing-log threshold for the static route's tmux sub-steps.
+    # When any of ``list_panes`` / ``try_show_static_fast`` / ``show_static``
+    # blocks longer than this, log the path + elapsed ms at WARNING so a
+    # wedged tmux server is identifiable from logs without enabling debug
+    # tracing. Picked at 250ms because the static fast path normally
+    # completes in <50ms; anything past 250ms means the user perceives
+    # the click as sluggish.
+    _ROUTE_TIMING_WARN_SECONDS: float = 0.25
+
     def _route_supervisor_free_static(self, key: str) -> bool:
         if key not in self._SUPERVISOR_FREE_STATIC_KEYS:
             return False
@@ -3377,10 +3386,16 @@ class CockpitRouter:
         # timeout. In the common case (cockpit layout is already
         # healthy), reusing this single ``list_panes`` keeps the
         # static route at two tmux subprocess calls total.
+        #
+        # #1832 — wrap each tmux sub-step in a timing probe so a slow
+        # subprocess shows up in logs without users needing to enable
+        # debug tracing. The probe is a no-op below the warn threshold.
+        t_start = time.monotonic()
         try:
             panes = self.tmux.list_panes(window_target)
         except Exception:  # noqa: BLE001
             panes = None
+        self._maybe_log_route_step("list_panes", key, t_start)
         if has_mount_state:
             if panes is None:
                 return False
@@ -3424,17 +3439,47 @@ class CockpitRouter:
         # layouts (and for safety when ``list_panes`` itself failed).
         result = None
         if panes is not None:
+            t_fast = time.monotonic()
             result = manager.try_show_static_fast(
                 command,
                 window_state,
                 panes=panes,
             )
+            self._maybe_log_route_step("try_show_static_fast", key, t_fast)
         if result is None:
+            t_slow = time.monotonic()
             result = manager.show_static(command, window_state)
+            # show_static covers list_panes + ensure_layout + respawn_pane;
+            # a slow result here pins blame on the layout-repair chain.
+            self._maybe_log_route_step("show_static", key, t_slow)
         if not result.ok:
             self._handle_invalid_static_route(result)
         self._write_window_state(result.state, base=state)
         return True
+
+    def _maybe_log_route_step(
+        self, step: str, key: str, start_monotonic: float,
+    ) -> None:
+        """#1832 — log a warning when a static-route tmux sub-step
+        blocks the route worker for more than
+        :attr:`_ROUTE_TIMING_WARN_SECONDS`.
+
+        The route worker runs off the Textual main thread, so this
+        does not affect cockpit responsiveness — but a slow subprocess
+        still delays the user-visible ``respawn_pane`` paint. Logging
+        the elapsed ms per step makes it possible to identify which
+        tmux call is wedged (list-panes, ensure-layout, etc.) from
+        ``~/.pollypm/audit/*.log`` after a slow click.
+        """
+        elapsed = time.monotonic() - start_monotonic
+        if elapsed < self._ROUTE_TIMING_WARN_SECONDS:
+            return
+        logger.warning(
+            "Cockpit static route step %s for key=%s took %.0fms",
+            step,
+            key,
+            elapsed * 1000.0,
+        )
 
     def _handle_invalid_static_route(self, result) -> None:
         errors = "; ".join(result.postcondition.errors)

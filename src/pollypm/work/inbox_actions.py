@@ -19,9 +19,17 @@ def open_work_service_for_task(config: Any, task_id: str) -> Any | None:
     if not db_path.exists():
         return None
     try:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work.factory import create_work_service
 
-        return SQLiteWorkService(db_path=db_path, project_path=project.path)
+        # Forward ``config`` so ``[storage] backend`` is honoured (#1369,
+        # #1737). ``db_path`` is ignored on the pg backend per the factory
+        # docstring; on sqlite the per-project file is used as before.
+        return create_work_service(
+            config=config,
+            db_path=db_path,
+            project_path=project.path,
+            project_key=project_key,
+        )
     except Exception:  # noqa: BLE001
         return None
 
@@ -66,9 +74,10 @@ def resolve_inbox_work_service(config: Any, item: Any, task_id: str) -> Any | No
             )
     if db_path is not None:
         try:
-            from pollypm.work.sqlite_service import SQLiteWorkService
+            from pollypm.work.factory import create_work_service
 
-            return SQLiteWorkService(
+            return create_work_service(
+                config=config,
                 db_path=db_path,
                 project_path=Path(db_path).parent.parent,
             )

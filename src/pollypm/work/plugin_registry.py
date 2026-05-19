@@ -126,8 +126,8 @@ def configure_work_plugins(
     from pathlib import Path
     import tempfile
 
+    from pollypm.work.factory import create_work_service
     from pollypm.work.gates import GateRegistry
-    from pollypm.work.sqlite_service import SQLiteWorkService
     from pollypm.work.sync import SyncManager
 
     registry = PluginRegistry()
@@ -145,8 +145,14 @@ def configure_work_plugins(
     if project_path is not None:
         resolved_project = Path(str(project_path))
 
-    # WorkService
-    svc = SQLiteWorkService(db_path=resolved_db, project_path=resolved_project)
+    # WorkService — route through the factory so ``[storage] backend``
+    # decides sqlite vs postgres (#1369, #1737). ``db_path`` is ignored
+    # on the pg backend per the factory docstring.
+    svc = create_work_service(
+        config=config,
+        db_path=resolved_db,
+        project_path=resolved_project,
+    )
     registry.register_work_service(svc)
 
     # GateRegistry

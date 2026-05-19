@@ -80,6 +80,22 @@ install_hint() {
     python3:brew) echo "brew install python@3.12" ;;
     python3:apt)  echo "sudo apt install python3.12" ;;
     python3:*)    echo "install Python 3.11+ from https://www.python.org/" ;;
+    # Postgres + pgvector (issue #1752) — PollyPM is pg-only since the
+    # #1737 cutover. ``pm bootstrap-pg`` is the one-shot install but the
+    # binaries still have to be on PATH for it to run, so we surface
+    # the per-platform install commands here.
+    psql:brew)      echo "brew install postgresql@17 && brew services start postgresql@17" ;;
+    psql:apt)       echo "sudo apt install postgresql-16 postgresql-contrib" ;;
+    psql:dnf)       echo "sudo dnf install postgresql postgresql-server postgresql-contrib" ;;
+    psql:pacman)    echo "sudo pacman -S postgresql" ;;
+    pg_isready:brew)   echo "brew install postgresql@17 && brew services start postgresql@17" ;;
+    pg_isready:apt)    echo "sudo apt install postgresql-16" ;;
+    pg_isready:dnf)    echo "sudo dnf install postgresql-server" ;;
+    pg_isready:pacman) echo "sudo pacman -S postgresql" ;;
+    pgvector:brew)  echo "brew install pgvector && brew services restart postgresql@17" ;;
+    pgvector:apt)   echo "sudo apt install postgresql-16-pgvector" ;;
+    pgvector:dnf)   echo "see https://github.com/pgvector/pgvector#installation-notes" ;;
+    pgvector:pacman) echo "see https://github.com/pgvector/pgvector#installation-notes" ;;
     *) echo "" ;;
   esac
 }
@@ -117,6 +133,69 @@ check "python 3.11+"    python3 1
 check "uv"              uv 1
 check "tmux"            tmux 1
 check "git"             git 1
+
+# -- Postgres + pgvector (issue #1752) --------------------------------------
+# PollyPM is Postgres-only since the #1737 cutover. ``psql`` and
+# ``pg_isready`` must be on PATH; ``pgvector`` must be installed as a
+# contrib package so ``CREATE EXTENSION vector`` succeeds against the
+# bootstrap database. The vector-extension probe is best-effort — if
+# pg isn't running yet we can't query a live server, so we fall back
+# to checking the brew formula / apt package on disk.
+echo
+echo "Postgres (required since the #1737 cutover — use \`pm bootstrap-pg\` to install):"
+check "psql"            psql 1
+check "pg_isready"      pg_isready 1
+
+# pgvector check — we do NOT shell command -v here (pgvector ships as
+# a Postgres extension, not a CLI). Instead we look for the extension
+# control file in standard install locations, then fall back to
+# package-manager presence.
+PGVECTOR_FOUND=0
+PGVECTOR_HINT=""
+for candidate in \
+  /opt/homebrew/share/postgresql@17/extension/vector.control \
+  /usr/local/share/postgresql@17/extension/vector.control \
+  /opt/homebrew/share/postgresql/extension/vector.control \
+  /usr/local/share/postgresql/extension/vector.control \
+  /usr/share/postgresql/16/extension/vector.control \
+  /usr/share/postgresql/17/extension/vector.control; do
+  if [ -f "$candidate" ]; then
+    PGVECTOR_FOUND=1
+    PGVECTOR_HINT="$candidate"
+    break
+  fi
+done
+if [ "$PGVECTOR_FOUND" -eq 0 ] && command -v brew >/dev/null 2>&1; then
+  if brew list --versions pgvector >/dev/null 2>&1; then
+    PGVECTOR_FOUND=1
+    PGVECTOR_HINT="brew formula installed"
+  fi
+fi
+if [ "$PGVECTOR_FOUND" -eq 1 ]; then
+  printf "  ${C_GREEN}✓${C_RESET} %-18s ${C_DIM}%s${C_RESET}\n" \
+    "pgvector" "$PGVECTOR_HINT"
+else
+  printf "  ${C_RED}✗${C_RESET} %-18s ${C_RED}MISSING${C_RESET}  — %s\n" \
+    "pgvector" "$(install_hint pgvector)"
+  MISSING=$((MISSING + 1))
+fi
+
+# Best-effort live probe: if pg_isready is on PATH AND pg is running,
+# also try `psql -c "SELECT extversion FROM pg_extension WHERE
+# extname='vector'"` on the default db. A miss here is informational
+# only — ``pm bootstrap-pg`` will run `CREATE EXTENSION` for the user.
+if command -v pg_isready >/dev/null 2>&1 && pg_isready -q 2>/dev/null; then
+  if command -v psql >/dev/null 2>&1; then
+    VEC_VER="$(psql -tAc "SELECT extversion FROM pg_extension WHERE extname='vector'" postgres 2>/dev/null || true)"
+    if [ -n "$VEC_VER" ]; then
+      printf "  ${C_GREEN}✓${C_RESET} %-18s ${C_DIM}vector extension registered (v%s)${C_RESET}\n" \
+        "pgvector (live)" "$VEC_VER"
+    else
+      printf "  ${C_DIM}○${C_RESET} %-18s ${C_DIM}vector not yet CREATE EXTENSION'd — \`pm bootstrap-pg\` will register it${C_RESET}\n" \
+        "pgvector (live)"
+    fi
+  fi
+fi
 
 echo
 echo "Providers (at least one required for any real work):"
@@ -167,5 +246,6 @@ echo
 echo "Ready to install PollyPM:"
 printf "  ${C_BOLD}git clone https://github.com/samhotchkiss/pollypm ~/dev/pollypm${C_RESET}\n"
 printf "  ${C_BOLD}cd ~/dev/pollypm && uv pip install -e .${C_RESET}\n"
+printf "  ${C_BOLD}pm bootstrap-pg --yes${C_RESET}   ${C_DIM}# create the pollypm db + register pgvector + write [storage] block${C_RESET}\n"
 printf "  ${C_BOLD}pm doctor${C_RESET}\n"
 printf "  ${C_BOLD}pm${C_RESET}\n"

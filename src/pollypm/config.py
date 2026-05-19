@@ -1185,6 +1185,21 @@ def _build_example_config(root: Path, *, tmux_session: str = "pollypm") -> Polly
             heartbeat_backend="local",
             scheduler_backend="inline",
             lease_timeout_minutes=30,
+            # #1737 — when both a Claude and a Codex account are
+            # configured, brand-new sessions route per these defaults:
+            # Opus drives PM/operator/reviewer (judgment-heavy roles),
+            # Codex drives worker/architect/advisor (tool-heavy roles).
+            # The fallback resolver in pollypm.role_routing computes
+            # the same table at runtime, so these entries are
+            # informational documentation that survives `pm
+            # example-config` round-trips — delete any line to opt back
+            # into the computed fallback.
+            role_assignments={
+                "operator_pm": ModelAssignment(alias="opus-4.7"),
+                "architect": ModelAssignment(alias="codex-gpt-5.4"),
+                "worker": ModelAssignment(alias="codex-gpt-5.4"),
+                "reviewer": ModelAssignment(alias="opus-4.7"),
+            },
         ),
         accounts={
             "codex_primary": AccountConfig(

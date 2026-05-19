@@ -12,6 +12,42 @@ from pollypm.models import ModelAssignment, PollyPMConfig, ProviderKind
 
 _log = logging.getLogger(__name__)
 _ROLE_KEYS = ("operator_pm", "architect", "worker", "reviewer", "advisor")
+
+# Default role -> alias table when BOTH Claude and Codex accounts are
+# configured. Opus drives the PM-style roles (operator, reviewer) where
+# nuanced project judgment matters; Codex drives the heavy tool-use
+# roles (worker, architect, advisor) where its tool dispatch shines.
+# See #1737.
+_DUAL_PROVIDER_DEFAULTS: dict[str, ModelAssignment] = {
+    "operator_pm": ModelAssignment(alias="opus-4.7"),
+    "architect": ModelAssignment(alias="codex-gpt-5.4"),
+    "worker": ModelAssignment(alias="codex-gpt-5.4"),
+    "reviewer": ModelAssignment(alias="opus-4.7"),
+    "advisor": ModelAssignment(alias="codex-gpt-5.4"),
+}
+
+# Single-provider defaults — when only Claude (or only Codex) accounts
+# are configured, every role falls back to that provider's strongest
+# alias. Preserves the "config still works with one provider" invariant.
+_CLAUDE_ONLY_DEFAULTS: dict[str, ModelAssignment] = {
+    "operator_pm": ModelAssignment(alias="opus-4.7"),
+    "architect": ModelAssignment(alias="opus-4.7"),
+    "worker": ModelAssignment(alias="opus-4.7"),
+    "reviewer": ModelAssignment(alias="opus-4.7"),
+    "advisor": ModelAssignment(alias="opus-4.7"),
+}
+_CODEX_ONLY_DEFAULTS: dict[str, ModelAssignment] = {
+    "operator_pm": ModelAssignment(alias="codex-gpt-5.4"),
+    "architect": ModelAssignment(alias="codex-gpt-5.4"),
+    "worker": ModelAssignment(alias="codex-gpt-5.4"),
+    "reviewer": ModelAssignment(alias="codex-gpt-5.4"),
+    "advisor": ModelAssignment(alias="codex-gpt-5.4"),
+}
+
+# Static safety net used when no PollyPMConfig is in hand or no
+# accounts are configured (e.g. some unit tests). Matches the historical
+# table that shipped before #1737 so anything reaching this branch
+# behaves like the pre-#1737 system.
 _FALLBACK_ASSIGNMENTS: dict[str, ModelAssignment] = {
     "operator_pm": ModelAssignment(alias="codex-gpt-5.4"),
     "architect": ModelAssignment(alias="opus-4.7"),
@@ -19,6 +55,51 @@ _FALLBACK_ASSIGNMENTS: dict[str, ModelAssignment] = {
     "reviewer": ModelAssignment(alias="sonnet-4.6"),
     "advisor": ModelAssignment(alias="opus-4.7"),
 }
+
+
+def _configured_providers(config: PollyPMConfig | None) -> frozenset[str]:
+    """Return the set of provider names with at least one account configured."""
+    if config is None:
+        return frozenset()
+    providers: set[str] = set()
+    for account in getattr(config, "accounts", {}).values():
+        provider = getattr(account, "provider", None)
+        # ProviderKind enum has a .value attribute; coerce defensively
+        # so tests that pass raw strings keep working.
+        if provider is None:
+            continue
+        value = getattr(provider, "value", provider)
+        if isinstance(value, str) and value:
+            providers.add(value)
+    return frozenset(providers)
+
+
+def _select_fallback_assignment(
+    canonical_role: str,
+    config: PollyPMConfig | None,
+) -> ModelAssignment:
+    """Pick the fallback assignment for ``canonical_role``.
+
+    Selection rule (#1737):
+
+    * Both Claude and Codex accounts configured -> dual-provider table
+      (Opus for PM/operator/reviewer, Codex for worker/architect/advisor).
+    * Only Claude accounts -> Opus across the board.
+    * Only Codex accounts -> Codex across the board.
+    * Neither (no config or empty accounts) -> legacy static table.
+    """
+    providers = _configured_providers(config)
+    has_claude = "claude" in providers
+    has_codex = "codex" in providers
+    if has_claude and has_codex:
+        table = _DUAL_PROVIDER_DEFAULTS
+    elif has_claude:
+        table = _CLAUDE_ONLY_DEFAULTS
+    elif has_codex:
+        table = _CODEX_ONLY_DEFAULTS
+    else:
+        table = _FALLBACK_ASSIGNMENTS
+    return table[canonical_role]
 
 
 @dataclass(slots=True, frozen=True)
@@ -105,12 +186,23 @@ def resolve_role_assignment(
         if resolved is not None:
             return resolved
 
+    fallback_assignment = _select_fallback_assignment(canonical_role, current_config)
     fallback = _resolved_from_assignment(
         canonical_role,
-        _FALLBACK_ASSIGNMENTS[canonical_role],
+        fallback_assignment,
         source="fallback",
         registry=resolved_registry,
     )
+    if fallback is None:
+        # Resolved alias miss against the live registry — fall back to
+        # the static legacy table, which is hand-aligned with the
+        # baked-in registry in :mod:`pollypm.model_registry`.
+        fallback = _resolved_from_assignment(
+            canonical_role,
+            _FALLBACK_ASSIGNMENTS[canonical_role],
+            source="fallback",
+            registry=resolved_registry,
+        )
     if fallback is None:
         raise RuntimeError(f"Fallback role assignment for {canonical_role} is invalid")
     return fallback

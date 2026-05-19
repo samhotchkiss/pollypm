@@ -631,6 +631,25 @@ def _latest_work_migration_version() -> int | None:
         return None
 
 
+def _doctor_config_or_none() -> "PollyPMConfig | None":
+    """Best-effort loader for the operator config inside doctor checks.
+
+    Used by the probe shims below so each check forwards the active
+    config to :mod:`pollypm.storage.doctor_state_probes` — that's what
+    drives the pg-vs-sqlite routing fix in #1856. Loader failures are
+    swallowed so a missing / unreadable config keeps the legacy sqlite
+    probe path active.
+    """
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+        if not DEFAULT_CONFIG_PATH.exists():
+            return None
+        return load_config(DEFAULT_CONFIG_PATH)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _applied_version_from_sqlite(db_path: Path, table: str) -> int | None:
     """Return ``MAX(version)`` from a schema-version table, or ``None``.
 
@@ -638,8 +657,14 @@ def _applied_version_from_sqlite(db_path: Path, table: str) -> int | None:
     :func:`pollypm.storage.doctor_state_probes.applied_schema_version_ro` —
     kept for backwards compatibility with anything that imported the
     private helper. New callers should use the storage facade directly.
+
+    #1856: forwards the active operator config so a pg-mode install
+    reads ``schema_migrations`` from the pg pool instead of a stale
+    sqlite file at ``db_path``.
     """
-    return applied_schema_version_ro(db_path, table)
+    return applied_schema_version_ro(
+        db_path, table, config=_doctor_config_or_none(),
+    )
 
 
 def _workspace_state_db_path(config: PollyPMConfig | None = None) -> Path | None:

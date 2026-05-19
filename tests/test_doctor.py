@@ -514,6 +514,12 @@ def test_state_migrations_pluralises_db_word(
     flip to the singular ``state DB`` at count=1 — the boundary that
     fires when the user has exactly one tracked project.
     """
+    # #1856: ``_applied_version_from_sqlite`` now forwards the operator
+    # config so pg-mode installs read pg instead of stale sqlite. This
+    # test is a pure sqlite-path test — stub the config loader to keep
+    # the legacy sqlite probe path active regardless of the host's real
+    # pollypm.toml.
+    monkeypatch.setattr(doctor, "_doctor_config_or_none", lambda: None)
     one_behind = tmp_path / "behind.db"
     conn = sqlite3.connect(one_behind)
     try:
@@ -549,6 +555,9 @@ def test_work_migrations_pluralises_db_word(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
     """Same shape as state-migrations: ``work DB`` / ``work DBs`` per count."""
+    # #1856: stub the config loader so this sqlite-path test isn't
+    # diverted to the operator's real pg pool when run on a pg-mode host.
+    monkeypatch.setattr(doctor, "_doctor_config_or_none", lambda: None)
     one_behind = tmp_path / "behind.db"
     conn = sqlite3.connect(one_behind)
     try:

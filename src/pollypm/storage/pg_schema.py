@@ -690,6 +690,37 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_open_alert_uniq
 
 
 # --------------------------------------------------------------------- #
+# 0003 — account_usage.reset_at + account_runtime.available_at /
+# access_expires_at converted from ``timestamptz`` to ``text``.
+# --------------------------------------------------------------------- #
+#
+# #1850: PR #1848 fixed the INITIAL_SCHEMA_DDL so these three columns
+# are ``text`` on fresh installs (they carry provider display strings
+# like "Monday 1am" — never ISO-8601 timestamps). Existing deployed pg
+# databases were left on the old ``timestamptz`` columns and silently
+# reject every upsert with a parse error.
+#
+# Forward fix: ``ALTER COLUMN ... TYPE text USING <col>::text``. The
+# ``USING`` clause coerces any pre-existing timestamp rows into their
+# ISO-8601 text form so no data is lost (best-effort — the columns are
+# nullable and most deployed rows are NULL). ``IF EXISTS`` keeps the
+# migration idempotent against fresh installs where 0001's schema
+# already declared ``text``: pg's ALTER COLUMN is a no-op when the
+# target type matches the current type.
+
+_MIGRATION_0003_ACCOUNT_COLUMNS_TEXT = """
+ALTER TABLE IF EXISTS account_usage
+    ALTER COLUMN reset_at TYPE text USING reset_at::text;
+
+ALTER TABLE IF EXISTS account_runtime
+    ALTER COLUMN available_at TYPE text USING available_at::text;
+
+ALTER TABLE IF EXISTS account_runtime
+    ALTER COLUMN access_expires_at TYPE text USING access_expires_at::text;
+"""
+
+
+# --------------------------------------------------------------------- #
 # Migration list — forward-only, append-only.
 # --------------------------------------------------------------------- #
 
@@ -699,6 +730,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS messages_open_alert_uniq
 MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "0001_initial", INITIAL_SCHEMA_DDL),
     (2, "0002_alert_dedupe_tuple", _MIGRATION_0002_ALERT_DEDUPE),
+    (3, "0003_account_columns_text", _MIGRATION_0003_ACCOUNT_COLUMNS_TEXT),
 ]
 
 

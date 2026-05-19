@@ -89,3 +89,117 @@ def _reset_store_cache_between_tests():
 # (``pytest_plugins`` is registered up-front but the fixtures within
 # only do their import work when actually invoked by a test).
 pytest_plugins = ["tests.conftest_pg"]
+
+
+# ----------------------------------------------------------------------
+# Work-service backend dispatch (issue #1737, Slice F)
+# ----------------------------------------------------------------------
+#
+# The ``work_service`` fixture below is the single entry point tests
+# should reach for when they want a work-service instance and don't care
+# which backend is providing it. Behaviour is controlled by an opt-in
+# ``@pytest.mark.backend(...)`` marker:
+#
+# * ``@pytest.mark.backend("sqlite")`` — force the sqlite path.
+# * ``@pytest.mark.backend("postgres")`` — force the pg path (requires
+#   the ``pg_schema_pool`` machinery in ``conftest_pg.py``; skipped if
+#   Docker / a local pg is unavailable).
+# * ``@pytest.mark.backend("both")`` — parameterise the test against
+#   both backends; the test runs twice and the active backend is
+#   identifiable via ``request.node.callspec.id``.
+# * No marker — sqlite. Slice K (the ripout) flips this default to pg
+#   and deletes the sqlite branch.
+#
+# Tests that need the concrete service class (i.e. that today instantiate
+# ``SQLiteWorkService(...)`` directly) should migrate to the dispatch
+# fixture incrementally as their owners port them. The fixture is
+# intentionally not auto-applied — Slice F is plumbing, not a rewrite.
+
+
+def _build_sqlite_work_service(tmp_path):
+    """Build a fresh ``SQLiteWorkService`` against a tmp-path DB."""
+    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    return SQLiteWorkService(db_path=tmp_path / "work.db")
+
+
+def _build_pg_work_service(request):
+    """Pull the per-test ``pg_work_service`` fixture via ``request``.
+
+    The pg fixture chain may ``pytest.skip`` if Docker / a local pg with
+    pgvector isn't reachable; we let that propagate so tests pinned to
+    the pg backend skip cleanly on dev machines without Docker.
+    """
+    return request.getfixturevalue("pg_work_service")
+
+
+def _resolve_backend_marker(request) -> str:
+    """Read the ``@pytest.mark.backend(...)`` marker, default ``sqlite``.
+
+    Returns the marker argument as a lowercase string. Unknown values
+    fall back to sqlite so a typo doesn't silently route to the wrong
+    backend — the dispatch path logs a warning when this happens.
+    """
+    marker = request.node.get_closest_marker("backend")
+    if marker is None:
+        return "sqlite"
+    if not marker.args:
+        return "sqlite"
+    raw = str(marker.args[0]).strip().lower()
+    if raw not in {"sqlite", "postgres", "both"}:
+        import warnings
+
+        warnings.warn(
+            f"Unknown @pytest.mark.backend({marker.args[0]!r}); "
+            "defaulting to 'sqlite'. Valid values: 'sqlite', 'postgres', 'both'.",
+            stacklevel=2,
+        )
+        return "sqlite"
+    return raw
+
+
+@pytest.fixture
+def work_service(request, tmp_path):
+    """Dispatch fixture returning a work-service backed by the marker.
+
+    See the comment block above for marker semantics. Tests that need
+    a backend-specific service (e.g. they assert on pg row counts or
+    sqlite pragmas) should reach for the concrete fixtures
+    (``pg_work_service`` or build a ``SQLiteWorkService`` directly)
+    instead.
+    """
+    backend = _resolve_backend_marker(request)
+    if backend == "both":
+        # ``both`` is implemented via the ``_work_service_backend``
+        # parametrize hook below — when this fixture is invoked under a
+        # ``both`` marker, the parametrize layer has already picked one
+        # of ``sqlite`` / ``postgres`` and stashed it on the request.
+        chosen = getattr(request, "param", "sqlite")
+        backend = chosen
+    if backend == "postgres":
+        return _build_pg_work_service(request)
+    return _build_sqlite_work_service(tmp_path)
+
+
+def pytest_generate_tests(metafunc):
+    """Parameterise ``work_service`` against both backends when marked.
+
+    Implements the ``@pytest.mark.backend('both')`` half of the dispatch
+    contract: when the marker is present AND the test asks for the
+    ``work_service`` fixture, expand into two test items — one per
+    backend. The ``work_service`` fixture above reads ``request.param``
+    to pick the right side.
+    """
+    if "work_service" not in metafunc.fixturenames:
+        return
+    backend_marker = metafunc.definition.get_closest_marker("backend")
+    if backend_marker is None or not backend_marker.args:
+        return
+    if str(backend_marker.args[0]).strip().lower() != "both":
+        return
+    metafunc.parametrize(
+        "work_service",
+        ["sqlite", "postgres"],
+        indirect=True,
+        ids=["sqlite", "postgres"],
+    )

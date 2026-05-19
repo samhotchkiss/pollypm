@@ -25,14 +25,17 @@ dev = [
   # dev installs always pull both so `pytest tests/test_pg_*` runs.
   "psycopg[binary]>=3.2.0",
   "psycopg-pool>=3.2.0",
+  "pgvector>=0.3.0",
   "testcontainers[postgres]>=4.8.0",
 ]
 # Runtime extra for the postgres backend. Operators flipping
 # ``[storage] backend = "postgres"`` in pollypm.toml must
-# ``uv pip install 'pollypm[postgres]'`` (#1737).
+# ``uv pip install 'pollypm[postgres]'`` (#1737). pgvector ships
+# the psycopg type adapter for the recall path (Slice D).
 postgres = [
   "psycopg[binary]>=3.2.0",
   "psycopg-pool>=3.2.0",
+  "pgvector>=0.3.0",
 ]
 
 [project.scripts]
@@ -89,4 +92,10 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
   "benchmark: performance benchmark tests (recall latency, etc.)",
+  # #1737 Slice F: the ``work_service`` dispatch fixture in
+  # ``tests/conftest.py`` reads this marker to decide whether a test runs
+  # against ``SQLiteWorkService`` (default), ``PgWorkService``, or both.
+  # Usage: ``@pytest.mark.backend('postgres')`` / ``('sqlite')`` /
+  # ``('both')``. Unmarked tests stay on sqlite until Slice K cuts over.
+  "backend(name): pin a test to a work-service backend ('sqlite', 'postgres', or 'both')",
 ]

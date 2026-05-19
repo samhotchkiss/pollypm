@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pollypm.models import (
     AccountConfig,
+    EmbeddingScoreWeights,
     EmbeddingSettings,
     EventsRetentionSettings,
     LoggingSettings,
@@ -627,10 +628,37 @@ def _parse_storage_settings(
     api_key_env_raw = embed_raw.get("api_key_env", embed_defaults.api_key_env)
     if not isinstance(api_key_env_raw, str) or not api_key_env_raw.strip():
         api_key_env_raw = embed_defaults.api_key_env
+
+    # ``[storage.embedding] score_weights`` — hybrid-recall blend
+    # (#1737 Slice D). Knob is a sub-table; one fat-fingered value
+    # falls back individually so the whole blend doesn't void.
+    weight_defaults = embed_defaults.score_weights
+    weights_raw = embed_raw.get("score_weights", {})
+    if not isinstance(weights_raw, dict):
+        weights_raw = {}
+
+    def _coerce_weight(key: str, default: float) -> float:
+        raw = weights_raw.get(key, default)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return default
+        if value < 0:
+            return default
+        return value
+
+    score_weights = EmbeddingScoreWeights(
+        semantic=_coerce_weight("semantic", weight_defaults.semantic),
+        fts=_coerce_weight("fts", weight_defaults.fts),
+        importance=_coerce_weight("importance", weight_defaults.importance),
+        recency=_coerce_weight("recency", weight_defaults.recency),
+    )
+
     embedding_settings = EmbeddingSettings(
         model=model_raw.strip(),
         provider=provider_raw.strip(),
         api_key_env=api_key_env_raw.strip(),
+        score_weights=score_weights,
     )
 
     return StorageSettings(

@@ -16,8 +16,6 @@ extension is available — see ``tests/conftest_pg.py``.
 
 from __future__ import annotations
 
-import pytest
-
 
 def _apply_initial_migrations(pg_schema_pool) -> None:
     """Apply the canonical schema migrations onto the per-test pool."""
@@ -339,3 +337,52 @@ def test_pg_session_runtime_explicit_none_clears_column(pg_schema_pool):
     assert row is not None
     assert row.last_failure_type is None
     assert row.last_failure_message is None
+
+
+# --------------------------------------------------------------------- #
+# #1830 — cluster-A caller migration parity
+# --------------------------------------------------------------------- #
+
+
+def test_no_external_supervisor_store_session_callsites() -> None:
+    """#1830: cluster-A session/runtime/event ops must not bypass the facade.
+
+    PR #1828 introduced backend-aware dispatch helpers on Supervisor
+    but left several external call sites (heartbeats, service_api,
+    cockpit, checkpoints, cli) reading & writing session_runtime
+    and events directly on ``supervisor.store`` (the legacy
+    StateStore). In pg mode that splits cluster-A state between
+    Postgres and SQLite — heartbeat recovery status and recent event
+    feeds can drift apart.
+
+    This guard asserts that no caller outside ``supervisor.py``
+    reaches through ``supervisor.store.*`` for cluster-A surface.
+    The supervisor module itself is allowed to keep the SQLite path
+    inside its private ``_upsert_session`` / ``_get_session_runtime``
+    / ``_recent_events`` / ``_last_event_at`` helpers — those are the
+    sqlite branch of the dispatcher.
+    """
+    import subprocess
+
+    pattern = (
+        r"supervisor\.store\.(upsert_session|list_sessions|prune_sessions|"
+        r"get_session_window|record_event|last_event_at|recent_events|"
+        r"upsert_session_runtime|get_session_runtime|list_session_runtimes)\("
+    )
+    result = subprocess.run(
+        ["git", "grep", "-nE", pattern, "--", "src/"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    # ``supervisor.py`` is the dispatcher itself and is allowed to
+    # call ``self.store.*`` on the sqlite branch — filter those out.
+    leaked = [
+        line for line in result.stdout.splitlines()
+        if line and not line.startswith("src/pollypm/supervisor.py:")
+    ]
+    assert not leaked, (
+        "Unmigrated cluster-A call sites (#1830) — must go through "
+        "supervisor.get_session_runtime / .upsert_session_runtime / "
+        ".recent_events / .last_event_at:\n" + "\n".join(leaked)
+    )

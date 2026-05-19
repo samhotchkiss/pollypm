@@ -534,7 +534,8 @@ def debug_command(
         )
 
     typer.echo("")
-    events_list = supervisor.store.recent_events(limit=5)
+    # #1830: route through supervisor facade for pg/sqlite parity.
+    events_list = supervisor.recent_events(limit=5)
     if session is not None:
         events_list = [event for event in events_list if event.session_name == session]
     typer.echo(f"Recent events: {len(events_list)}")
@@ -558,7 +559,8 @@ def events(
     # as the next-step diagnostic; that hint must work without
     # ``pm up``). ``recent_events`` is a pure DB read.
     supervisor = helpers._load_supervisor(config_path)
-    items = supervisor.store.recent_events(limit=limit)
+    # #1830: route through supervisor facade for pg/sqlite parity.
+    items = supervisor.recent_events(limit=limit)
     if not items:
         typer.echo("No events recorded.")
         return

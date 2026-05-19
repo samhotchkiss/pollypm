@@ -363,30 +363,18 @@ def audit_watchdog_liveness_probe_handler(
         return summary
 
     def _do_heal(q: Any) -> None:
-        # 1. Throttle: if we already healed inside the last
-        # HEAL_THROTTLE_SECONDS, leave the existing alert in place
-        # and bail. ``has_recent_or_active_dedupe`` is the cheapest
-        # observable proxy: re-enqueue uses dedupe_key="audit.watchdog",
-        # so a recent fire keeps that flag set.
-        recently = getattr(q, "has_recent_or_active_dedupe", None)
-        if callable(recently):
-            since = resolved_now - timedelta(seconds=HEAL_THROTTLE_SECONDS)
-            try:
-                if recently(_WATCHDOG_HANDLER_NAME, since=since):
-                    summary["action"] = "throttled"
-                    return
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "audit_watchdog.liveness_probe: "
-                    "has_recent_or_active_dedupe failed",
-                    exc_info=True,
-                )
-
-        # 2. Release any orphaned ``claimed`` rows. The most likely
-        # wedge under the new pg queue is that the previous
+        # 1. Release any orphaned ``claimed`` rows FIRST. The most
+        # likely wedge under the new pg queue is that the previous
         # ``audit.watchdog`` claim is still held by a dead /
         # GC'd worker thread, and the dedupe-on-status='claimed'
         # short-circuit at JobQueue.enqueue blocks every new fire.
+        #
+        # #1829 ordering fix: we used to throttle before this step,
+        # but ``has_recent_or_active_dedupe`` returns true on any
+        # ``claimed`` row — including the orphaned one we are about
+        # to recover — so the throttle would skip recovery and the
+        # wedge would persist. Recovering first lets the throttle
+        # see the post-heal queue state.
         try:
             recovered, pruned = q.recover_orphaned_claims()
             summary["recovered_claims"] = recovered
@@ -399,6 +387,30 @@ def audit_watchdog_liveness_probe_handler(
             )
             summary["recovered_claims"] = 0
             summary["pruned_claims"] = 0
+
+        # 2. Anti-loop throttle: skip the re-enqueue / alert path if
+        # we *already* re-enqueued a heal inside the last
+        # HEAL_THROTTLE_SECONDS. We only consider rows that point at a
+        # prior heal attempt (``status IN ('queued', 'done')`` enqueued
+        # since the window), not a stale ``claimed`` row — that was
+        # the #1829 bug. ``has_recent_or_active_dedupe`` still returns
+        # true on stale ``claimed`` rows, so we additionally require
+        # that ``recovered_claims == 0`` for this iteration (if we
+        # just recovered something, the previous "active dedupe" was
+        # the wedge we're recovering, not a recent legitimate heal).
+        recently = getattr(q, "has_recent_or_active_dedupe", None)
+        if callable(recently) and summary.get("recovered_claims", 0) == 0:
+            since = resolved_now - timedelta(seconds=HEAL_THROTTLE_SECONDS)
+            try:
+                if recently(_WATCHDOG_HANDLER_NAME, since=since):
+                    summary["action"] = "throttled"
+                    return
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "audit_watchdog.liveness_probe: "
+                    "has_recent_or_active_dedupe failed",
+                    exc_info=True,
+                )
 
         # 3. Re-enqueue the cadence job with the canonical dedupe
         # key. If a prior row is queued / claimed at this point the

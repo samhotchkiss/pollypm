@@ -87,8 +87,14 @@ def _write_tick(
 class _FakeQueue:
     """In-memory queue stub that mirrors the parts of ``JobQueue`` the probe uses."""
 
-    def __init__(self, *, dedupe_active: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        dedupe_active: bool = False,
+        recovered_claims: int = 1,
+    ) -> None:
         self._dedupe_active = dedupe_active
+        self._recovered_claims = recovered_claims
         self.recover_calls: int = 0
         self.enqueued: list[tuple[str, str | None]] = []
         self.dedupe_checks: list[tuple[str, datetime]] = []
@@ -104,10 +110,13 @@ class _FakeQueue:
 
     def recover_orphaned_claims(self) -> tuple[int, int]:
         self.recover_calls += 1
-        # Simulate one orphaned claim being recovered — that's the
-        # observable signal the wedge described in #1815 leaves behind
-        # when ``audit.watchdog`` itself was the stuck handler.
-        return (1, 0)
+        # Simulate ``self._recovered_claims`` orphaned claims being
+        # recovered — that's the observable signal the wedge described
+        # in #1815 leaves behind when ``audit.watchdog`` itself was the
+        # stuck handler. #1829 added the recovered-count knob so we can
+        # distinguish "stale claim wedge" (recovered > 0) from "recent
+        # legitimate heal" (recovered == 0).
+        return (self._recovered_claims, 0)
 
     def enqueue(
         self,
@@ -252,25 +261,108 @@ def test_probe_throttles_when_recent_heal_already_landed(
 ) -> None:
     """A recent ``audit.watchdog`` re-enqueue suppresses a second heal.
 
-    The probe checks ``has_recent_or_active_dedupe`` before
-    re-enqueueing. A True return there means a previous probe
-    (within HEAL_THROTTLE_SECONDS) already healed; the alert
-    that probe raised remains open, so this run is a no-op.
+    The probe checks ``has_recent_or_active_dedupe`` after recovering
+    orphaned claims. A True return there means a previous probe
+    (within HEAL_THROTTLE_SECONDS) already healed; the alert that
+    probe raised remains open, so this run is a no-op.
+
+    #1829 invariant: the throttle only suppresses when there's nothing
+    new to recover. ``recovered_claims=0`` here keeps that test
+    consistent with the post-#1829 ordering (recover first, then
+    throttle).
     """
     _write_tick(_isolate_audit_home, ts=now - timedelta(hours=9))
-    queue = _FakeQueue(dedupe_active=True)
+    queue = _FakeQueue(dedupe_active=True, recovered_claims=0)
     summary = audit_watchdog_liveness_probe_handler(
         {}, queue=queue, now=now,
     )
     assert summary["stale"] is True
     assert summary["action"] == "throttled"
-    assert queue.recover_calls == 0
+    # Recovery always runs first now (#1829); the throttle blocks the
+    # subsequent re-enqueue + alert, not the recovery itself.
+    assert queue.recover_calls == 1
     assert queue.enqueued == []
     # The throttle window is HEAL_THROTTLE_SECONDS back from now.
     assert len(queue.dedupe_checks) == 1
     key, since = queue.dedupe_checks[0]
     assert key == AUDIT_WATCHDOG_HANDLER_NAME
     assert abs((now - since).total_seconds() - HEAL_THROTTLE_SECONDS) < 1.0
+
+
+# ---------------------------------------------------------------------------
+# #1829 — throttle must not block the orphaned-claim it should recover
+# ---------------------------------------------------------------------------
+
+
+def test_probe_recovers_orphaned_claim_even_when_dedupe_active(
+    _isolate_audit_home: Path,
+    now: datetime,
+) -> None:
+    """#1829: stale ``claimed`` row must not throttle its own recovery.
+
+    Pre-#1829 the probe consulted ``has_recent_or_active_dedupe``
+    BEFORE recovering orphaned claims. That helper returns True on
+    any row in ``status IN ('queued', 'claimed')`` — including the
+    exact stale claim the probe was trying to clear. Result: the
+    probe blocked itself and the wedge from #1815 persisted.
+
+    The fix recovers first, then throttles only when there was
+    nothing to recover. This test pins the new ordering: even with
+    ``dedupe_active=True`` (because of the wedged claim), as long as
+    ``recover_orphaned_claims`` returns a non-zero count we must
+    proceed to re-enqueue.
+    """
+    _write_tick(_isolate_audit_home, ts=now - timedelta(hours=9))
+    queue = _FakeQueue(dedupe_active=True, recovered_claims=1)
+    summary = audit_watchdog_liveness_probe_handler(
+        {}, queue=queue, now=now,
+    )
+    assert summary["stale"] is True
+    # Recovery ran AND re-enqueue ran — the throttle did not fire.
+    assert summary["action"] == "healed"
+    assert queue.recover_calls == 1
+    assert summary["recovered_claims"] == 1
+    assert queue.enqueued == [
+        (AUDIT_WATCHDOG_HANDLER_NAME, AUDIT_WATCHDOG_HANDLER_NAME),
+    ]
+
+
+def test_probe_fires_twice_when_wedge_re_emerges(
+    _isolate_audit_home: Path,
+    now: datetime,
+) -> None:
+    """#1829: a second wedge in the same throttle window still heals.
+
+    Two consecutive probe runs both encounter an orphaned claim;
+    both must recover + re-enqueue. The anti-loop throttle is only
+    meant to suppress *idle* repeats, never a fresh stale-claim
+    condition.
+    """
+    _write_tick(_isolate_audit_home, ts=now - timedelta(hours=9))
+
+    # First run — wedge present, dedupe slot looks "active" because
+    # the wedged claim itself holds it.
+    queue1 = _FakeQueue(dedupe_active=True, recovered_claims=1)
+    summary1 = audit_watchdog_liveness_probe_handler(
+        {}, queue=queue1, now=now,
+    )
+    assert summary1["action"] == "healed"
+    assert queue1.recover_calls == 1
+    assert len(queue1.enqueued) == 1
+
+    # Second run, well inside the HEAL_THROTTLE_SECONDS window. A
+    # NEW orphaned claim has appeared. The throttle must NOT block
+    # this; it is the exact #1829 failure mode where the probe
+    # would skip recovery because its own prior heal made the
+    # dedupe slot look active.
+    queue2 = _FakeQueue(dedupe_active=True, recovered_claims=1)
+    later = now + timedelta(seconds=HEAL_THROTTLE_SECONDS / 2)
+    summary2 = audit_watchdog_liveness_probe_handler(
+        {}, queue=queue2, now=later,
+    )
+    assert summary2["action"] == "healed"
+    assert queue2.recover_calls == 1
+    assert len(queue2.enqueued) == 1
 
 
 def test_probe_respects_custom_stale_threshold(

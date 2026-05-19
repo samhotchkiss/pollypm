@@ -201,7 +201,8 @@ class PollyPMService:
             configured_window_names.add(launch.window_name)
             if session_name is not None and launch.session.name != session_name:
                 continue
-            runtime = supervisor.store.get_session_runtime(launch.session.name)
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            runtime = supervisor.get_session_runtime(launch.session.name)
             window = window_map.get(launch.window_name)
             lease = lease_map.get(launch.session.name)
             sessions.append(
@@ -236,7 +237,8 @@ class PollyPMService:
             project, _task_number = parsed
             if session_name is not None and window.name != session_name:
                 continue
-            runtime = supervisor.store.get_session_runtime(window.name)
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            runtime = supervisor.get_session_runtime(window.name)
             lease = lease_map.get(window.name)
             sessions.append(
                 {
@@ -444,7 +446,8 @@ class PollyPMService:
         """Override a session's runtime status with an optional failure reason."""
         supervisor = self.load_supervisor()
         supervisor.require_session(session_name)
-        supervisor.store.upsert_session_runtime(
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        supervisor.upsert_session_runtime(
             session_name=session_name,
             status=status,
             last_failure_message=reason or None,
@@ -466,7 +469,8 @@ class PollyPMService:
                 "reason": reason or None,
             },
         )
-        runtime = supervisor.store.get_session_runtime(session_name)
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        runtime = supervisor.get_session_runtime(session_name)
         if runtime is None:
             raise RuntimeError(f"Session runtime for {session_name} was not updated")
         return runtime
@@ -855,6 +859,9 @@ class PollyPMService:
             artifact=checkpoint_artifact,
             snapshot_path=moved.path,
             memory_backend_name=config.memory.backend,
+            # #1830: thread config so pg-mode session_runtime writes
+            # route through pg_sessions instead of legacy StateStore.
+            config=config,
         )
         # #349: audit event lands on the unified ``messages`` table via Store.
         from pollypm.store.registry import get_store

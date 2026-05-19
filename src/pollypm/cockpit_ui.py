@@ -1113,7 +1113,8 @@ class PollyCockpitApp(App[None]):
             # Reset the recovery-attempt counter so the next failure
             # gets ``_RECOVERY_LIMIT`` retries again instead of slamming
             # straight back into ``recovery_limit``.
-            supervisor.store.upsert_session_runtime(
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            supervisor.upsert_session_runtime(
                 session_name=session_name,
                 status="idle",
                 recovery_attempts=0,
@@ -1158,7 +1159,8 @@ class PollyCockpitApp(App[None]):
                 "recovery_limit",
                 who_cleared="manual:cockpit-restart-session",
             )
-            supervisor.store.upsert_session_runtime(
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            supervisor.upsert_session_runtime(
                 session_name=session_name,
                 status="recovering",
                 recovery_attempts=0,
@@ -2052,7 +2054,7 @@ class PollyCockpitApp(App[None]):
     # ``_update_ticker`` now repaints from the cached event list every
     # tick (cheap, pure-Python), and a worker thread refreshes the
     # cache every ``_TICKER_EVENT_REFRESH_TICKS`` ticks. Before this
-    # split, ``supervisor.store.recent_events(limit=48)`` ran inside
+    # split, ``supervisor.recent_events(limit=48)`` ran inside
     # ``_tick`` on the main thread every 0.8s; under SQLite write
     # contention the SELECT blocked the event loop for seconds at a
     # time, dropping rail keystrokes (#1587).
@@ -2093,7 +2095,8 @@ class PollyCockpitApp(App[None]):
         """Synchronous SQLite read — only safe off the main thread."""
         try:
             supervisor = self.router._load_supervisor()
-            raw_events = list(supervisor.store.recent_events(limit=48))
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            raw_events = list(supervisor.recent_events(limit=48))
         except Exception:  # noqa: BLE001
             return []
         return [

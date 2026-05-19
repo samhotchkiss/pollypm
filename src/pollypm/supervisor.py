@@ -502,6 +502,31 @@ class Supervisor:
             return pg_last_event_at(session_name, event_type)
         return self.store.last_event_at(session_name, event_type)
 
+    # --- Public cluster-A facade (#1830) ------------------------------- #
+    # Public wrappers around the private cluster-A dispatch helpers above
+    # so external callers (heartbeats, service_api, cockpit, checkpoints)
+    # can route session/runtime/event reads & writes through the backend-
+    # aware path without reaching into ``supervisor.store`` directly. In
+    # pg mode the legacy SQLite StateStore is invisible to readers of the
+    # unified pg session_runtime/messages tables — see #1830 for the
+    # divergence the indirection prevents.
+
+    def get_session_runtime(self, session_name: str):
+        """Public read for session_runtime rows (pg or sqlite backend)."""
+        return self._get_session_runtime(session_name)
+
+    def upsert_session_runtime(self, **kwargs) -> None:
+        """Public write for session_runtime rows (pg or sqlite backend)."""
+        self._upsert_session_runtime(**kwargs)
+
+    def recent_events(self, limit: int = 20):
+        """Public read for recent session events (pg or sqlite backend)."""
+        return self._recent_events(limit=limit)
+
+    def last_event_at(self, session_name: str, event_type: str):
+        """Public read for the latest event of (scope, subject)."""
+        return self._last_event_at(session_name, event_type)
+
     # --- Cluster D (leases) dispatch helpers -------------------------- #
     # Same pattern as the cluster-A helpers above: route through
     # ``pollypm.storage.pg_leases`` on the pg backend, stay on the
@@ -1921,6 +1946,9 @@ class Supervisor:
                 artifact=artifact,
                 snapshot_path=snapshot_path,
                 memory_backend_name=self.config.memory.backend,
+                # #1830: thread config so pg-mode session_runtime writes
+                # route through pg_sessions instead of legacy StateStore.
+                config=self.config,
             )
             # Proactive capacity rollover: if the account is near its limit
             # (≤ PROACTIVE_ROLLOVER_THRESHOLD_PCT remaining) and no hard

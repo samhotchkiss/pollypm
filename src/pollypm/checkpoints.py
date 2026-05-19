@@ -640,6 +640,7 @@ def record_checkpoint(
     artifact: CheckpointArtifact,
     snapshot_path: Path,
     memory_backend_name: str = "file",
+    config: PollyPMConfig | None = None,
 ) -> None:
     store.record_checkpoint(
         session_name=launch.session.name,
@@ -650,20 +651,40 @@ def record_checkpoint(
         snapshot_path=str(snapshot_path),
         summary_text=artifact.summary_text,
     )
-    # NB: cluster-A pg dispatch for the runtime read/write is NOT
-    # threaded here yet — ``record_checkpoint`` is invoked with a live
-    # ``store`` (StateStore today; tests rely on it). Callers that have
-    # already chosen the pg backend obtain that store through
-    # ``Supervisor.store`` which still proxies sqlite. The follow-up
-    # phase will rewire ``record_checkpoint`` to take a config / route
-    # through the pg facade; for now we keep parity with the legacy
-    # behaviour. See Slice K-state-port (#1737).
-    current = store.get_session_runtime(launch.session.name)
-    store.upsert_session_runtime(
-        session_name=launch.session.name,
-        status=current.status if current is not None else "healthy",
-        last_checkpoint_path=str(artifact.summary_path),
-    )
+    # #1830: route the session_runtime read/write through pg_sessions
+    # when running on the postgres backend. ``agent_profiles.defaults``
+    # already reads ``last_checkpoint_path`` from pg_sessions in pg
+    # mode (#1828); without this dispatch newly written checkpoints
+    # land on the legacy SQLite StateStore and are invisible to prompt/
+    # recovery readers. Fall back to ``store`` (StateStore) when no
+    # config is threaded or the sqlite backend is active.
+    use_pg = False
+    if config is not None:
+        try:
+            from pollypm.storage._backend_dispatch import is_pg_backend
+
+            use_pg = is_pg_backend(config)
+        except Exception:  # noqa: BLE001
+            use_pg = False
+    if use_pg:
+        from pollypm.storage.pg_sessions import (
+            get_session_runtime as _pg_get_runtime,
+            upsert_session_runtime as _pg_upsert_runtime,
+        )
+
+        current = _pg_get_runtime(launch.session.name)
+        _pg_upsert_runtime(
+            session_name=launch.session.name,
+            status=current.status if current is not None else "healthy",
+            last_checkpoint_path=str(artifact.summary_path),
+        )
+    else:
+        current = store.get_session_runtime(launch.session.name)
+        store.upsert_session_runtime(
+            session_name=launch.session.name,
+            status=current.status if current is not None else "healthy",
+            last_checkpoint_path=str(artifact.summary_path),
+        )
     try:
         memory_backend = get_memory_backend(launch.session.cwd, memory_backend_name)
         memory_backend.write_entry(

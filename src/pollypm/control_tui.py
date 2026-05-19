@@ -864,7 +864,8 @@ class PollyPMApp(App[None]):
                 ),
                 f"{event.created_at}:{event.session_name}:{event.event_type}",
             )
-            for event in supervisor.store.recent_events(limit=50)
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            for event in supervisor.recent_events(limit=50)
         ]
         self._replace_table_rows(self.events_table, rows)
 

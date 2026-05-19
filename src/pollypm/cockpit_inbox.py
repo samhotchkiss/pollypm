@@ -785,8 +785,9 @@ def _render_inbox_panel(config) -> str:
     each, and renders the combined view. Projects with no DB are silently
     skipped so a fresh install stays usable.
     """
+    from typing import Any
+
     from pollypm.work import create_work_service
-    from pollypm.work.sqlite_service import SQLiteWorkService
 
     # Aggregate inbox tasks across all tracked projects. Each project has its
     # own SQLite db; we open each, query, then close.
@@ -817,7 +818,7 @@ def _render_inbox_panel(config) -> str:
             raise KeyError(f"flow {name!r} not found")
 
     agg = _AggregateService()
-    opened: list[SQLiteWorkService] = []
+    opened: list[Any] = []
     seen_task_ids: set[str] = set()
     try:
         for project_key, db_path, project_path in _inbox_db_sources(config):

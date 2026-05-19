@@ -11,12 +11,15 @@ Contract:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
 from pollypm.work.models import WorkerSessionRecord
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+# ``service`` is typed ``Any`` here because these helpers reach into the
+# SQLite-specific ``service._conn`` attribute. The previous TYPE_CHECKING
+# import of ``SQLiteWorkService`` was an IDE hint only; dropping it
+# removes a direct ``sqlite_service`` import so the pg cutover can delete
+# that module (#1369, #1737).
 
 
 WORK_SESSIONS_DDL = """
@@ -75,12 +78,12 @@ def row_to_worker_session_record(row) -> WorkerSessionRecord:
     )
 
 
-def ensure_worker_session_schema(service: "SQLiteWorkService") -> None:
+def ensure_worker_session_schema(service: Any) -> None:
     service._conn.executescript(WORK_SESSIONS_DDL)
 
 
 def upsert_worker_session(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     task_project: str,
     task_number: int,
@@ -141,7 +144,7 @@ def upsert_worker_session(
 
 
 def mark_worker_session_ended(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     task_project: str,
     task_number: int,
@@ -172,7 +175,7 @@ def mark_worker_session_ended(
 
 
 def get_worker_session(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     task_project: str,
     task_number: int,
@@ -196,7 +199,7 @@ def get_worker_session(
 
 
 def list_worker_sessions(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     project: str | None = None,
     active_only: bool = True,
@@ -217,7 +220,7 @@ def list_worker_sessions(
 
 
 def end_worker_session(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     task_project: str,
     task_number: int,
@@ -243,7 +246,7 @@ def end_worker_session(
 
 
 def update_worker_session_tokens(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     task_project: str,
     task_number: int,

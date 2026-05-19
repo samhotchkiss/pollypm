@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import Any, Callable
 
 from pollypm.review_notify import notify_requires_review_hold
 from pollypm.task_review_summary import store_review_plain_summary
@@ -40,8 +40,12 @@ from pollypm.work.service_support import (
     _parse_task_id,
 )
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+# ``service`` is typed ``Any`` here because the manager calls into the
+# SQLite-specific service internals (``_conn``, ``_record_transition``,
+# ``_session_mgr``, etc.) that aren't part of the public ``WorkService``
+# Protocol. The previous TYPE_CHECKING import of ``SQLiteWorkService``
+# was an IDE hint only; dropping it removes a direct ``sqlite_service``
+# import so the pg cutover can delete that module (#1369, #1737).
 
 logger = logging.getLogger(__name__)
 
@@ -94,7 +98,7 @@ class _PMRepairCallSiteOutcome:
 class WorkTransitionManager:
     """Group the state-transition operations for ``SQLiteWorkService``."""
 
-    service: "SQLiteWorkService"
+    service: Any
 
     def _commit(self, mutate: Callable[[], None]) -> None:
         try:

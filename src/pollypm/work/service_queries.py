@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
 from pollypm.storage.sqlite_pragmas import readonly_uri
@@ -23,8 +23,14 @@ from pollypm.work.service_support import TaskNotFoundError, ValidationError, _no
 if TYPE_CHECKING:
     from pathlib import Path
 
-    from pollypm.work.sqlite_service import SQLiteWorkService
 
+# ``service`` is typed ``Any`` here because these helpers reach into the
+# SQLite-specific service internals (``_conn``, ``_row_to_task``,
+# ``_load_task_token_sums_bulk``, etc.) that aren't part of the public
+# ``WorkService`` Protocol. The previous TYPE_CHECKING import of
+# ``SQLiteWorkService`` was an IDE hint only; dropping it removes a
+# direct ``sqlite_service`` import so the pg cutover can delete that
+# module (#1369, #1737).
 
 logger = logging.getLogger(__name__)
 
@@ -217,7 +223,7 @@ def _enforce_product_state_gate(
 
 
 def create_task(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     title: str,
     description: str = "",
@@ -406,7 +412,7 @@ def create_task(
     return task
 
 
-def get_task(service: "SQLiteWorkService", task_id: str) -> Task:
+def get_task(service: Any, task_id: str) -> Task:
     project, task_number = _parse_task_id(task_id)
     row = service._conn.execute(
         "SELECT * FROM work_tasks WHERE project = ? AND task_number = ?",
@@ -418,7 +424,7 @@ def get_task(service: "SQLiteWorkService", task_id: str) -> Task:
 
 
 def list_tasks(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     work_status: str | None = None,
     owner: str | None = None,
@@ -462,7 +468,7 @@ def list_tasks(
 
 
 def list_nonterminal_tasks(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     project: str | None = None,
 ) -> list[Task]:
@@ -494,7 +500,7 @@ def list_nonterminal_tasks(
     return tasks
 
 
-def update_task(service: "SQLiteWorkService", task_id: str, **fields: object) -> Task:
+def update_task(service: Any, task_id: str, **fields: object) -> Task:
     if "work_status" in fields:
         raise ValidationError(
             "Cannot change work_status via update(). "
@@ -552,7 +558,7 @@ def update_task(service: "SQLiteWorkService", task_id: str, **fields: object) ->
 
 
 def _unresolved_blocked_task_keys(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     project: str | None = None,
 ) -> set[tuple[str, int]]:
@@ -581,7 +587,7 @@ def _unresolved_blocked_task_keys(
 
 
 def next_task(
-    service: "SQLiteWorkService",
+    service: Any,
     *,
     agent: str | None = None,
     project: str | None = None,
@@ -618,14 +624,14 @@ def next_task(
             # ``_safe_json_dict`` helper so the corrupt-payload defense
             # stays consistent with ``_row_to_task`` / ``_get_flow``
             # (cycles 107-113).
-            from pollypm.work.sqlite_service import _safe_json_dict
+            from pollypm.work._safe_json import _safe_json_dict
             if _safe_json_dict(row["roles"]).get("worker") != agent:
                 continue
         return service._row_to_task(row)
     return None
 
 
-def my_tasks(service: "SQLiteWorkService", agent: str) -> list[Task]:
+def my_tasks(service: Any, agent: str) -> list[Task]:
     rows = service._conn.execute(
         "SELECT * FROM work_tasks "
         "WHERE current_node_id IS NOT NULL AND assignee = ? "
@@ -635,7 +641,7 @@ def my_tasks(service: "SQLiteWorkService", agent: str) -> list[Task]:
     return [service._row_to_task(row) for row in rows]
 
 
-def state_counts(service: "SQLiteWorkService", project: str | None = None) -> dict[str, int]:
+def state_counts(service: Any, project: str | None = None) -> dict[str, int]:
     counts = {status.value: 0 for status in WorkStatus}
     clauses: list[str] = []
     params: list[object] = []
@@ -652,7 +658,7 @@ def state_counts(service: "SQLiteWorkService", project: str | None = None) -> di
     return counts
 
 
-def blocked_tasks(service: "SQLiteWorkService", project: str | None = None) -> list[Task]:
+def blocked_tasks(service: Any, project: str | None = None) -> list[Task]:
     clauses = ["work_status = ?"]
     params: list[object] = [WorkStatus.BLOCKED.value]
     if project is not None:

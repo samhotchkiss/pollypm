@@ -32,7 +32,6 @@ from pollypm.work.inbox_plan_reviews import (
     task_user_approval_is_approved,
 )
 from pollypm.work import create_work_service
-from pollypm.work.sqlite_service import SQLiteWorkService
 
 logger = logging.getLogger(__name__)
 
@@ -620,7 +619,7 @@ def _filter_approved_plan_reviews(
         approved_refs = approved_plan_review_refs(
             refs_by_db=refs_by_db,
             project_db_paths=project_db_paths,
-            service_factory=SQLiteWorkService,
+            service_factory=create_work_service,
         )
     kept: list[InboxEntry] = []
     dropped = 0

@@ -10,16 +10,20 @@ Contract:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Any
 
 from pollypm.work.models import LinkKind, Task, WorkStatus
 from pollypm.work.service_support import TaskNotFoundError, ValidationError, _now, _parse_task_id
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+# ``service`` is typed ``Any`` here because these helpers reach into
+# SQLite-specific internals (``service._conn``, ``service._record_transition``,
+# etc.) that aren't part of the public ``WorkService`` Protocol. The
+# previous TYPE_CHECKING import of ``SQLiteWorkService`` was a hint for
+# IDEs only; dropping it removes a direct ``sqlite_service`` import so
+# the pg cutover can delete that module (#1369, #1737).
 
 
-def link_tasks(service: "SQLiteWorkService", from_id: str, to_id: str, kind: str) -> None:
+def link_tasks(service: Any, from_id: str, to_id: str, kind: str) -> None:
     try:
         link_kind = LinkKind(kind)
     except ValueError as exc:
@@ -68,7 +72,7 @@ def link_tasks(service: "SQLiteWorkService", from_id: str, to_id: str, kind: str
         maybe_block(service, to_id)
 
 
-def unlink_tasks(service: "SQLiteWorkService", from_id: str, to_id: str, kind: str) -> None:
+def unlink_tasks(service: Any, from_id: str, to_id: str, kind: str) -> None:
     try:
         link_kind = LinkKind(kind)
     except ValueError as exc:
@@ -91,7 +95,7 @@ def unlink_tasks(service: "SQLiteWorkService", from_id: str, to_id: str, kind: s
         maybe_unblock(service, to_id)
 
 
-def dependent_tasks(service: "SQLiteWorkService", task_id: str) -> list[Task]:
+def dependent_tasks(service: Any, task_id: str) -> list[Task]:
     project, number = _parse_task_id(task_id)
     rows = service._conn.execute(
         """
@@ -130,7 +134,7 @@ def dependent_tasks(service: "SQLiteWorkService", task_id: str) -> list[Task]:
 
 
 def would_create_cycle(
-    service: "SQLiteWorkService",
+    service: Any,
     from_project: str,
     from_number: int,
     to_project: str,
@@ -158,7 +162,7 @@ def would_create_cycle(
     return False
 
 
-def has_unresolved_blockers(service: "SQLiteWorkService", task_id: str) -> bool:
+def has_unresolved_blockers(service: Any, task_id: str) -> bool:
     project, number = _parse_task_id(task_id)
     rows = service._conn.execute(
         "SELECT d.from_project, d.from_task_number "
@@ -180,7 +184,7 @@ def has_unresolved_blockers(service: "SQLiteWorkService", task_id: str) -> bool:
     return False
 
 
-def maybe_block(service: "SQLiteWorkService", task_id: str) -> None:
+def maybe_block(service: Any, task_id: str) -> None:
     task = service.get(task_id)
     if task.work_status not in (WorkStatus.QUEUED, WorkStatus.IN_PROGRESS):
         return
@@ -203,7 +207,7 @@ def maybe_block(service: "SQLiteWorkService", task_id: str) -> None:
     service._conn.commit()
 
 
-def maybe_unblock(service: "SQLiteWorkService", task_id: str) -> None:
+def maybe_unblock(service: Any, task_id: str) -> None:
     task = service.get(task_id)
     if task.work_status != WorkStatus.BLOCKED:
         return
@@ -226,7 +230,7 @@ def maybe_unblock(service: "SQLiteWorkService", task_id: str) -> None:
     service._conn.commit()
 
 
-def check_auto_unblock(service: "SQLiteWorkService", task_id: str) -> None:
+def check_auto_unblock(service: Any, task_id: str) -> None:
     task = service.get(task_id)
     rows = service._conn.execute(
         "SELECT to_project, to_task_number FROM work_task_dependencies "
@@ -267,7 +271,7 @@ def check_auto_unblock(service: "SQLiteWorkService", task_id: str) -> None:
         )
 
 
-def on_cancelled(service: "SQLiteWorkService", task_id: str) -> None:
+def on_cancelled(service: Any, task_id: str) -> None:
     task = service.get(task_id)
     rows = service._conn.execute(
         "SELECT to_project, to_task_number FROM work_task_dependencies "

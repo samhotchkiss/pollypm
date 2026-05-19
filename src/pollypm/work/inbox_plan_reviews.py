@@ -52,9 +52,9 @@ def approved_plan_review_refs(
 ) -> set[str]:
     """Return ``project/N`` refs whose plan-review task is already approved."""
     if service_factory is None:
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work.factory import create_work_service
 
-        service_factory = SQLiteWorkService
+        service_factory = create_work_service
     approved_refs: set[str] = set()
     for db_key, refs in refs_by_db.items():
         db_path, project_path = project_db_paths[db_key]

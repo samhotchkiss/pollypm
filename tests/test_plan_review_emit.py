@@ -79,7 +79,7 @@ class _FakeCreatedTask:
 
 
 class _FakeSvc:
-    """Minimal stand-in for :class:`SQLiteWorkService`.
+    """Minimal stand-in for :class:`PgWorkService`.
 
     Records ``svc.create`` calls so tests can assert on the inbox task
     that the emit path produces. ``_db_path`` is used by the emit

@@ -271,7 +271,7 @@ def test_protocol_mismatch_summary_is_human_readable() -> None:
 
 def test_work_service_protocol_real_implementations_conform() -> None:
     """Both built-in WorkService implementations
-    (SQLiteWorkService, MockWorkService) must conform to the
+    (PgWorkService, MockWorkService) must conform to the
     WorkService protocol on the methods the cockpit relies on.
 
     A failing test means the audit's #802 / #803 / #804 / #805
@@ -279,13 +279,13 @@ def test_work_service_protocol_real_implementations_conform() -> None:
     recurred."""
     try:
         from pollypm.work.service import WorkService
-        from pollypm.work.sqlite_service import SQLiteWorkService
+        from pollypm.work.pg_service import PgWorkService
         from pollypm.work.mock_service import MockWorkService
     except ImportError:
         pytest.skip("work-service modules not importable")
 
-    sqlite_mismatches = assert_implements_protocol(
-        protocol=WorkService, impl=SQLiteWorkService
+    pg_mismatches = assert_implements_protocol(
+        protocol=WorkService, impl=PgWorkService
     )
     mock_mismatches = assert_implements_protocol(
         protocol=WorkService, impl=MockWorkService
@@ -302,11 +302,11 @@ def test_work_service_protocol_real_implementations_conform() -> None:
     # Filter to *missing methods*; parameter checks are the deeper
     # test_work_service_protocol_conformance suite's job.
     missing_methods = [
-        m for m in sqlite_mismatches
+        m for m in pg_mismatches
         if m.method != "_unused" and "does not declare" in m.detail
     ]
     assert missing_methods == [], (
-        "SQLiteWorkService missing protocol methods: "
+        "PgWorkService missing protocol methods: "
         + ", ".join(m.method for m in missing_methods)
     )
     missing_methods_mock = [

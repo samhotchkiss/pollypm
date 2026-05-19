@@ -724,7 +724,9 @@ def load_inbox_entries(
                 except Exception:  # noqa: BLE001
                     pass
         try:
-            svc = create_work_service(db_path=db_path, project_path=project_path)
+            svc = create_work_service(
+                db_path=db_path, project_path=project_path, config=config,
+            )
         except Exception:  # noqa: BLE001
             logger.warning(
                 "load_inbox_entries: create_work_service(%s) failed; "

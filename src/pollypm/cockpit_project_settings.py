@@ -583,7 +583,9 @@ class PollyProjectSettingsApp(App[None]):
         if not db_path.exists():
             return "[dim]No project database yet.[/dim]"
         try:
-            with create_work_service(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(
+                db_path=db_path, project_path=project_path, config=config,
+            ) as svc:
                 tasks = svc.list_tasks(assignee=worker.name, limit=5)
         except Exception as exc:  # noqa: BLE001
             return f"[dim]Recent tasks unavailable: {exc}[/dim]"

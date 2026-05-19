@@ -234,7 +234,7 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
             return f"Project '{target}' not found."
         # Try the work service first, fall back to file-based backend
         try:
-            return _render_work_service_issues(project)
+            return _render_work_service_issues(project, config=config)
         except Exception:
             pass
         task_backend = get_task_backend(project.path)

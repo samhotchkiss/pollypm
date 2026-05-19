@@ -3485,7 +3485,9 @@ def _collect_recent_tasks_by_account(
         try:
             from pollypm.work import create_work_service
 
-            with create_work_service(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(
+                db_path=db_path, project_path=project_path, config=config,
+            ) as svc:
                 for status in account_statuses:
                     key = str(getattr(status, "key", ""))
                     if not key:
@@ -11446,7 +11448,7 @@ def _dashboard_done_plan_task(
             pass
         try:
             with create_work_service(
-                db_path=db_path, project_path=project_path,
+                db_path=db_path, project_path=project_path, config=config,
             ) as svc:
                 seen_ids: set[str] = set()
                 for alias in db_aliases:
@@ -11591,6 +11593,8 @@ def _dashboard_plan_staleness(
     plan_mtime: float | None,
     project_path: Path | None,
     project_key: str,
+    *,
+    config: object | None = None,
 ) -> str | None:
     """Return a human-readable stale reason, or ``None`` when fresh.
 
@@ -11641,7 +11645,7 @@ def _dashboard_plan_staleness(
     result: str | None = None
     try:
         with create_work_service(
-            db_path=db_path, project_path=project_path,
+            db_path=db_path, project_path=project_path, config=config,
         ) as svc:
             plan_task = _find_approved_plan_task(svc, project_key)
             if plan_task is None:
@@ -12599,7 +12603,9 @@ def _dashboard_gather_tasks(
                 db_aliases.append(discovered)
         tasks: list = []
         try:
-            with create_work_service(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(
+                db_path=db_path, project_path=project_path, config=config,
+            ) as svc:
                 seen_ids: set[str] = set()
                 for alias in db_aliases:
                     for found in svc.list_tasks(project=alias):
@@ -12727,6 +12733,8 @@ def _classify_worker_activity(
     project_aliases: set[str],
     project_path: Path | None,
     has_pane_permission_alert: bool,
+    *,
+    config: object | None = None,
 ) -> str:
     """Return ``"working" | "idle" | "awaiting_user"`` for a live session.
 
@@ -12781,7 +12789,9 @@ def _classify_worker_activity(
             db_path = project_path / ".pollypm" / "state.db"
             if db_path.exists():
                 with create_work_service(
-                    db_path=db_path, project_path=project_path,
+                    db_path=db_path,
+                    project_path=project_path,
+                    config=config,
                 ) as svc:
                     for alias in project_aliases:
                         try:
@@ -13022,6 +13032,7 @@ def _dashboard_active_worker(
                     _alias_set,
                     _project_path,
                     has_perm_alert,
+                    config=_config,
                 )
             except Exception:  # noqa: BLE001
                 activity = "idle"
@@ -13203,7 +13214,7 @@ def _dashboard_inbox(
     items: list[dict] = []
     try:
         with create_work_service(
-            db_path=db_path, project_path=project_path,
+            db_path=db_path, project_path=project_path, config=config,
         ) as svc:
             # #920 — query each project alias and dedupe so projects
             # whose config key (``foo_bar``) and work-DB project name
@@ -14102,7 +14113,7 @@ def _gather_project_dashboard_fast(
         plan_explainer = _dashboard_plan_explainer(project_path, project_key)
         plan_aux_files = _dashboard_plan_aux_files(project_path)
         plan_stale_reason = _dashboard_plan_staleness(
-            plan_path, plan_mtime, project_path, project_key,
+            plan_path, plan_mtime, project_path, project_key, config=config,
         )
         # #1518 — surface a done plan-shaped task to the Plan section
         # so projects whose plan completed via a non-plan_project flow
@@ -17329,6 +17340,14 @@ class PollyProjectDashboardApp(App[None]):
         except Exception as exc:  # noqa: BLE001
             self.notify(f"Could not load task service: {exc}", severity="error")
             return
+        # #1369 — load config so the factory dispatches to the configured
+        # storage backend (sqlite vs postgres). Without ``config=`` the
+        # factory silently defaults to sqlite and we'd write the decision
+        # to the wrong DB on a pg-backed install.
+        try:
+            cfg = load_config(self.config_path)
+        except Exception:  # noqa: BLE001
+            cfg = None
         db_path = data.project_path / ".pollypm" / "state.db"
         approved_task = None
         # Track the pre/post status so the toast can tell the user
@@ -17343,7 +17362,7 @@ class PollyProjectDashboardApp(App[None]):
         final_status = ""
         try:
             with create_work_service(
-                db_path=db_path, project_path=data.project_path,
+                db_path=db_path, project_path=data.project_path, config=cfg,
             ) as svc:
                 initial_status = svc.get(task_id).work_status.value
                 svc.add_reply(task_id, response, actor="user")

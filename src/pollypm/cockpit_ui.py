@@ -6587,6 +6587,17 @@ def _task_recent_timestamp(task) -> float | None:
 
 
 def _project_pm_persona(config: object, project_key: str, project: object) -> str | None:
+    # #1862 — the project's explicit ``persona_name`` wins over the
+    # architect-role default. SamBlog configures ``persona_name = "Sage"``
+    # but also registers an ``architect-samblog`` session; the previous
+    # ordering returned the architect's default ("Archie") before the
+    # project's own configuration was consulted, so PM Chat surfaced the
+    # wrong name. Resolve project config first, then fall back to the
+    # role default for projects that never picked a persona.
+    persona = getattr(project, "persona_name", None)
+    if isinstance(persona, str) and persona.strip():
+        return persona.strip()
+
     sessions = getattr(config, "sessions", {}) or {}
     session_role: object | None = None
     if isinstance(sessions, dict):
@@ -6612,8 +6623,7 @@ def _project_pm_persona(config: object, project_key: str, project: object) -> st
         except ValueError:
             pass
 
-    persona = getattr(project, "persona_name", None)
-    return persona.strip() if isinstance(persona, str) and persona.strip() else None
+    return None
 
 
 def _project_pm_label(config: object, project_key: str, project: object) -> str:

@@ -1971,6 +1971,76 @@ def test_project_pm_primer_matches_architect_session_persona() -> None:
     assert "Hey Bea" not in sent[0][1]
 
 
+class _PersonaProject:
+    def __init__(self, key: str, persona_name: str | None) -> None:
+        self.key = key
+        self.name = key
+        self.path = Path(f"/tmp/{key}")
+        self.persona_name = persona_name
+
+
+class _PersonaSession:
+    def __init__(self, project: str, role: str, enabled: bool = True) -> None:
+        self.project = project
+        self.role = role
+        self.enabled = enabled
+
+
+class _PersonaConfig:
+    def __init__(self, project_key: str, persona_name: str | None, sessions: dict) -> None:
+        self.projects = {project_key: _PersonaProject(project_key, persona_name)}
+        self.sessions = sessions
+
+
+def test_project_pm_persona_prefers_project_persona_over_architect_default() -> None:
+    """#1862 — the project's configured ``persona_name`` wins over the
+    architect-role default.
+
+    SamBlog set ``persona_name = "Sage"`` in its project config but also
+    runs an ``architect-samblog`` session. The old resolution order
+    matched the architect role first and surfaced "Archie" in the PM
+    Chat label, ignoring the project-level configuration. The label must
+    reflect the user's explicit choice.
+    """
+    from pollypm.cockpit_ui import _project_pm_label, _project_pm_persona
+
+    sessions = {"architect_samblog": _PersonaSession("samblog", "architect")}
+    config = _PersonaConfig("samblog", persona_name="Sage", sessions=sessions)
+    project = config.projects["samblog"]
+
+    assert _project_pm_persona(config, "samblog", project) == "Sage"
+    assert _project_pm_label(config, "samblog", project) == "PM: Sage"
+
+
+def test_project_pm_persona_falls_back_to_architect_default_when_unset() -> None:
+    """A project that never picked a ``persona_name`` should still get
+    the architect's default ("Archie") when an architect session is
+    registered — the fallback path keeps the #1321 primer/label working
+    for unconfigured projects.
+    """
+    from pollypm.cockpit_ui import _project_pm_persona
+
+    sessions = {"architect_demo": _PersonaSession("demo", "architect")}
+    config = _PersonaConfig("demo", persona_name=None, sessions=sessions)
+    project = config.projects["demo"]
+
+    assert _project_pm_persona(config, "demo", project) == "Archie"
+
+
+def test_project_pm_persona_returns_none_when_neither_configured() -> None:
+    """No project persona, no architect session → no PM label. Caller
+    suppresses the topbar PM meta entirely instead of rendering a
+    placeholder (#1542).
+    """
+    from pollypm.cockpit_ui import _project_pm_label, _project_pm_persona
+
+    config = _PersonaConfig("orphan", persona_name=None, sessions={})
+    project = config.projects["orphan"]
+
+    assert _project_pm_persona(config, "orphan", project) is None
+    assert _project_pm_label(config, "orphan", project) == ""
+
+
 def test_create_worker_and_route_targets_pm_chat_session_when_worker_exists() -> None:
     """#964 regression: after :meth:`create_worker_and_route` spawns
     the per-project worker (or finds a pre-existing one), it MUST route

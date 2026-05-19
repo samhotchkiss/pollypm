@@ -40,11 +40,13 @@ _GLOBAL_ROLE_ASSIGNMENT_KEYS = (
     "architect",
     "worker",
     "reviewer",
+    "advisor",
 )
 _PROJECT_ROLE_ASSIGNMENT_KEYS = (
     "architect",
     "worker",
     "reviewer",
+    "advisor",
 )
 
 _log = logging.getLogger(__name__)

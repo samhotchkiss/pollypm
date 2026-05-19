@@ -29,7 +29,11 @@ from pollypm.projects import ensure_session_lock
 from pollypm.providers import get_provider
 from pollypm.providers.args import sanitize_provider_args
 from pollypm.providers.base import LaunchCommand
-from pollypm.role_routing import resolved_provider_kind, resolve_role_assignment
+from pollypm.role_routing import (
+    rewrite_assignment_for_provider as _rewrite_assignment_for_provider,
+    resolved_provider_kind,
+    resolve_role_assignment,
+)
 from pollypm.runtime_env import codex_home_dir
 from pollypm.runtimes import get_runtime
 
@@ -37,7 +41,7 @@ if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
 from pollypm.models import CONTROL_ROLES as _CONTROL_ROLES
 
-_ROUTED_ROLES = frozenset({"operator-pm", "architect", "worker", "reviewer"})
+_ROUTED_ROLES = frozenset({"operator-pm", "architect", "worker", "reviewer", "advisor"})
 _ROUND_START_ENV_KEYS = (
     "ROUND_START_ISO_TS",
     "ROUND_START_ERRNO24",
@@ -422,7 +426,38 @@ class DefaultLaunchPlanner:
                     session.name,
                 )
             else:
-                if routed_assignment.source != "fallback":
+                provider_matches = effective.provider is routed_provider
+                # #1879 — when the routing source is ``fallback`` (no
+                # explicit project/global role assignment) and the
+                # resolver wants a different provider than the session's
+                # effective provider, don't fight the session config or
+                # runtime override. Rewrite the alias to the matching
+                # single-provider entry so launch argv still carries a
+                # sensible ``--model`` flag. Explicit role assignments
+                # (project/global source) still switch provider+account
+                # via the branch below so users can deliberately rehome
+                # a session via config.
+                if (
+                    not provider_matches
+                    and routed_assignment.source == "fallback"
+                ):
+                    rewritten = _rewrite_assignment_for_provider(
+                        session.role,
+                        effective.provider,
+                        ctx.config,
+                    )
+                    if rewritten is not None:
+                        routed_assignment = rewritten
+                        try:
+                            routed_provider = resolved_provider_kind(routed_assignment)
+                        except ValueError:
+                            routed_assignment = None
+                            provider_matches = False
+                        else:
+                            provider_matches = effective.provider is routed_provider
+                if routed_assignment is None:
+                    pass
+                elif routed_assignment.source != "fallback":
                     account_name = _first_account_for_provider(
                         ctx.config,
                         provider=routed_provider,
@@ -454,7 +489,7 @@ class DefaultLaunchPlanner:
                             routed_assignment.model,
                             routed_assignment.source,
                         )
-                elif effective.provider is routed_provider:
+                elif provider_matches:
                     _log.info(
                         "Role routing resolved %s session %s to %s/%s from %s.",
                         session.role,

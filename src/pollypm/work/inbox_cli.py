@@ -73,12 +73,15 @@ inbox_app = typer.Typer(
     help=help_with_examples(
         "Work assigned to the user.",
         [
-            ("pm inbox", "list open inbox items"),
             (
-                "pm inbox --awaits-user",
-                "filter to rows the rail badge counts (#1571)",
+                "pm inbox",
+                "list rows waiting on the user (curated default, #1806)",
             ),
-            ("pm inbox --json", "emit the merged inbox view as JSON"),
+            (
+                "pm inbox --drafts",
+                "also list Polly's scratch drafts + informational rows",
+            ),
+            ("pm inbox --all", "show every row (drafts + pure-FYI notifies)"),
         ],
     )
 )
@@ -156,6 +159,128 @@ def _message_has_channel_label(row: dict[str, Any], channel: str) -> bool:
     return actual == channel
 
 
+# #1805 — watchdog ``queue_without_motion`` findings escalate as one row
+# per scan tick. Without render-time dedup an idle project produces N
+# near-identical "Project X has Y queued task(s) but no claim / execution
+# / status-change activity ..." rows that drown out genuine user-action
+# items. Collapse them at render time keyed on (project, watchdog_rule)
+# so the operator sees one "still stalled" row per stalled project
+# rather than the full historical sequence.
+_WATCHDOG_QUEUE_WITHOUT_MOTION_RE = re.compile(
+    r"^Project\s+(?P<project>\S+)\s+has\s+\d+\s+queued\s+task\(s\)\s+"
+    r"but\s+no\s+claim\s*/\s*execution",
+    re.IGNORECASE,
+)
+
+
+def _watchdog_dedup_key(row: dict[str, Any]) -> tuple[str, str] | None:
+    """Return a ``(rule, project)`` key for repeat-watchdog rows.
+
+    ``None`` means the row is not a known repeat-watchdog shape and
+    should be kept verbatim. The current implementation collapses the
+    ``queue_without_motion`` finding (the loudest emitter today, per
+    issue #1805) — future emitters that suffer the same shape can grow
+    a sibling pattern here.
+    """
+    subject = str(row.get("title") or row.get("subject") or "").strip()
+    match = _WATCHDOG_QUEUE_WITHOUT_MOTION_RE.match(subject)
+    if match:
+        return ("queue_without_motion", match.group("project").lower())
+    return None
+
+
+def _dedupe_watchdog_repeats(
+    messages: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """Collapse repeat-watchdog rows in-place-order.
+
+    Returns ``(kept, collapsed_count)`` — the kept list preserves the
+    original input order with the **most recent** row per dedup key
+    surviving. ``collapsed_count`` is the number of rows hidden so the
+    CLI footer can announce them.
+
+    Messages without a dedup key pass through unchanged. The query
+    layer already returns rows newest-first (ORDER BY created_at DESC,
+    id DESC) so the first occurrence we see for a given key IS the
+    most recent; subsequent rows are older repeats and get dropped.
+    """
+    seen: set[tuple[str, str]] = set()
+    kept: list[dict[str, Any]] = []
+    collapsed = 0
+    for row in messages:
+        key = _watchdog_dedup_key(row)
+        if key is None:
+            kept.append(row)
+            continue
+        if key in seen:
+            collapsed += 1
+            continue
+        seen.add(key)
+        kept.append(row)
+    return kept, collapsed
+
+
+# #1806 — the "actionable" default lens. A row is actionable when it
+# is not (a) a pure-FYI completion announcement, (b) a Polly-authored
+# inbox/ scratch draft, or (c) a row whose ``kind`` is one of the
+# informational :class:`InboxItemKind` values (``COMPLETION_FYI``,
+# ``ACTIVITY_EVENT``, ``INFO``, ``SELF_BUG_REPORT``). Watchdog dispatches
+# and plan-review pendings stay visible. Mirrors the cockpit's default
+# lens (b88db3ea, #1573) so the CLI and TUI agree on "what's waiting".
+_INFORMATIONAL_KINDS: frozenset[str] = frozenset(
+    {
+        InboxItemKind.COMPLETION_FYI.value,
+        InboxItemKind.ACTIVITY_EVENT.value,
+        InboxItemKind.INFO.value,
+        InboxItemKind.SELF_BUG_REPORT.value,
+    }
+)
+
+
+def _message_is_inbox_namespace_draft(row: dict[str, Any]) -> bool:
+    """True for Polly-authored drafts that live under the ``inbox/`` scope.
+
+    The cockpit inbox writer scopes its scratch notes to the literal
+    ``inbox`` scope (no project prefix). Real user-action items always
+    carry a project scope. See issue #1806 root-cause-B.
+    """
+    scope = str(row.get("scope") or "").strip().lower()
+    return scope in {"", "inbox"}
+
+
+def _message_is_actionable_default(row: dict[str, Any]) -> bool:
+    """The default-view predicate for raw ``messages`` rows.
+
+    Distinct from :func:`pollypm.inbox.awaits_user` because the latter
+    fail-opens on ``LEGACY`` (so every untagged row counts as "awaits
+    user"), which made `pm inbox` collapse to "everything" before the
+    #1570 backfill ran in production. This predicate adds two
+    legacy-corpus-aware exclusions on top of ``awaits_user``:
+
+    1. Pure-FYI ``notify``-type rows whose ``kind`` is informational
+       (completion announcements, activity events, info, bug reports).
+    2. ``inbox/``-scope rows that are Polly's own scratch drafts.
+
+    Anything that ``awaits_user`` would already exclude (a properly
+    tagged informational kind) stays excluded. Anything ``awaits_user``
+    keeps (PLAN_REVIEW_PENDING, APPROVAL_REQUEST, WATCHDOG_OPERATOR_DISPATCH,
+    LEGACY, etc.) is kept unless the additional rules above catch it.
+    """
+    kind_value = str(row.get("kind") or "").lower()
+    if kind_value in _INFORMATIONAL_KINDS:
+        return False
+    # Polly's own inbox/ scratch drafts are informational by convention
+    # — the same rationale as the cockpit's default-lens filter.
+    if _message_is_inbox_namespace_draft(row):
+        # Keep alerts addressed to the operator even if scoped to
+        # ``inbox`` (those carry watchdog dispatch shape). The
+        # informational-drafts pattern is ``type=notify`` only.
+        msg_type = str(row.get("type") or "").lower()
+        if msg_type == "notify":
+            return False
+    return True
+
+
 @inbox_app.callback(invoke_without_command=True)
 def inbox_root(
     ctx: typer.Context,
@@ -168,7 +293,22 @@ def inbox_root(
             "Filter messages by delivery channel (#754). ``inbox`` "
             "(default) shows real user-facing notifications. Pass "
             "``dev`` to surface developer / test-harness traffic "
-            "that's normally hidden. Pass ``all`` to show every channel."
+            "that's normally hidden. Pass ``all`` to show every channel. "
+            "Note: most rows have no explicit ``channel:`` label and are "
+            "treated as ``inbox``-channel; on a corpus with no "
+            "``channel:dev``-tagged rows this filter is a no-op."
+        ),
+    ),
+    drafts: bool = typer.Option(
+        False,
+        "--drafts",
+        help=(
+            "Include Polly's scratch drafts under the ``inbox/`` scope and "
+            "informational rows (completion FYIs, activity events, "
+            "self-bug-reports, info) that the default curated lens hides. "
+            "(#1806.) Without this flag ``pm inbox`` only lists rows that "
+            "need a user decision — same predicate the cockpit inbox "
+            "default uses (b88db3ea, #1573)."
         ),
     ),
     include_inbox: bool = typer.Option(
@@ -183,35 +323,47 @@ def inbox_root(
             "user anything actionable to type. The cockpit inbox pane "
             "still surfaces them via its own structured action affordances. "
             "(#1013, mirrors the ``pm task list`` opt-in shipped in #1003.) "
-            "Prefer ``--awaits-user`` (#1571) when you actually want the "
-            "canonical 'what needs my attention' set — ``--include-inbox`` "
-            "is the wider chat-flow-row lens, not the curated one."
+            "Synonym for ``--drafts`` for the message-row split — included "
+            "for backwards compatibility."
         ),
     ),
     show_all: bool = typer.Option(
         False,
         "--all",
         help=(
-            "Show every inbox row including pure-FYI ``notify``-type "
-            "messages (completion announcements, heartbeat alerts, etc.) "
-            "that are hidden by default. The default listing surfaces "
-            "actionable rows only (reviews, alerts, inbox tasks); "
-            "everything else is collapsed behind a footer count so the "
-            "single thing that needs your attention doesn't get buried. "
-            "(#1027.)"
+            "Show every inbox row — equivalent to ``--drafts "
+            "--include-inbox --include-watchdog-repeats`` plus the "
+            "pure-FYI ``notify``-type messages (completion announcements, "
+            "heartbeat alerts, etc.) that are hidden by default. The "
+            "default listing surfaces actionable rows only (reviews, "
+            "alerts, inbox tasks); everything else is collapsed behind a "
+            "footer count so the single thing that needs your attention "
+            "doesn't get buried. (#1027, #1806.)"
         ),
     ),
     awaits_user_only: bool = typer.Option(
         False,
         "--awaits-user",
         help=(
-            "Filter the listing to rows where the canonical "
-            "``pollypm.inbox.awaits_user`` predicate (#1566) returns "
-            "True — the same predicate that drives the cockpit rail "
-            "badge (#1571) and the upcoming dashboard 'Waiting on you' "
-            "section. Use this to sanity-check the badge from the CLI: "
-            "the count printed by ``pm inbox --awaits-user`` matches "
-            "the rail badge on the same DB."
+            "Equivalent to the default lens (#1806). Filters to rows "
+            "where the canonical ``pollypm.inbox.awaits_user`` predicate "
+            "(#1566) returns True — the same predicate that drives the "
+            "cockpit rail badge (#1571) and the dashboard 'Waiting on "
+            "you' section. Kept for backwards compatibility and "
+            "explicit-intent automation; ``pm inbox`` already filters "
+            "this way."
+        ),
+    ),
+    include_watchdog_repeats: bool = typer.Option(
+        False,
+        "--include-watchdog-repeats",
+        help=(
+            "Disable render-time dedup of repeat watchdog "
+            "``queue_without_motion`` alerts (#1805). Without this flag "
+            "the inbox collapses N repeat 'Project X has Y queued task(s) "
+            "but no claim / execution / status-change activity ...' rows "
+            "into one per ``(project, rule)`` key, surviving row being "
+            "the most recent."
         ),
     ),
 ) -> None:
@@ -241,6 +393,15 @@ def inbox_root(
             err=True,
         )
         raise typer.Exit(code=1)
+
+    # #1806 — the default lens is the curated "awaits user" set.
+    # ``--drafts``, ``--include-inbox``, and ``--all`` are progressive
+    # opt-ins to the wider view; ``--awaits-user`` is explicit
+    # equivalent of the default (kept for backwards compatibility).
+    # ``show_all`` implies every wider-view flag so a single magic flag
+    # mirrors the legacy "show me everything" mental model.
+    show_drafts = drafts or include_inbox or show_all
+    dedupe_watchdog = not (include_watchdog_repeats or show_all)
 
     # --- Messages path (unified Store, #340 writers) -------------------
     db_path = _resolve_db_path(db, project=project)
@@ -286,21 +447,40 @@ def inbox_root(
     # plan_review handoff lands as one of them. The cockpit inbox pane
     # still surfaces them via its specialised actions; the CLI listing
     # has no equivalent affordance, so listing them just buries the
-    # genuinely actionable rows.
-    if not include_inbox:
+    # genuinely actionable rows. ``--drafts``/``--include-inbox``/``--all``
+    # opt back in.
+    if not show_drafts:
         from pollypm.notify_task import is_notify_inbox_task
         tasks = [task for task in tasks if not is_notify_inbox_task(task)]
 
-    # #1571 — narrow to the canonical "awaits user" set. The predicate
-    # reads ``item.kind`` (Task surfaces it as an attribute; for raw
-    # messages we coerce the stored value into a ``kind`` attribute on
-    # a tiny shim so the predicate stays the single source of truth).
-    if awaits_user_only:
+    # #1806 — default-lens curation. ``pm inbox`` (no flags) and
+    # ``pm inbox --awaits-user`` are equivalent: both run the curated
+    # actionable filter that mirrors the cockpit's default inbox lens.
+    # Drop the filter when ``--drafts`` / ``--include-inbox`` / ``--all``
+    # opts the user back into the wider view. ``--awaits-user`` is kept
+    # as an explicit equivalent to the default for scriptability.
+    apply_curated_filter = not show_drafts
+    if apply_curated_filter or awaits_user_only:
+        # Tasks pass through the canonical ``awaits_user`` predicate
+        # (which reads ``Task.kind``); messages pass through both the
+        # predicate AND the legacy-corpus-aware actionable filter so a
+        # pre-#1570-backfill DB doesn't degrade to "everything fails open".
         tasks = [task for task in tasks if awaits_user(task)]
         display_messages = [
             m for m in display_messages
             if awaits_user(SimpleNamespace(kind=m.get("kind")))
+            and _message_is_actionable_default(m)
         ]
+
+    # #1805 — collapse repeat watchdog ``queue_without_motion`` rows.
+    # The query layer returns rows newest-first, so the kept row per
+    # ``(rule, project)`` key is the most recent occurrence; older
+    # repeats are hidden and announced in the footer.
+    watchdog_collapsed = 0
+    if dedupe_watchdog:
+        display_messages, watchdog_collapsed = _dedupe_watchdog_repeats(
+            display_messages,
+        )
 
     # #1027 — default-hide pure ``notify``-type messages (completion
     # announcements, heartbeat alerts, "Done:" / "Repeated stale review
@@ -340,7 +520,16 @@ def inbox_root(
     item_word = "item" if total_visible == 1 else "items"
     typer.echo(f"Inbox: {total_visible} {item_word}")
     if total_all == 0:
-        typer.echo("No messages waiting for you.")
+        if apply_curated_filter and not awaits_user_only:
+            # #1806 — curated lens emptied the listing; tell the user
+            # how to widen it rather than the legacy "nothing here" line.
+            typer.echo(
+                "No messages waiting for you. "
+                "Pass --drafts to include scratch drafts / FYIs, or "
+                "--all to show every row."
+            )
+        else:
+            typer.echo("No messages waiting for you.")
         return
     if total_visible == 0:
         # Every row in scope is a hidden notification; announce the
@@ -378,6 +567,12 @@ def inbox_root(
         word = "notification" if hidden_n == 1 else "notifications"
         typer.echo(
             f"… {hidden_n} {word} hidden. Use --all to show."
+        )
+    if watchdog_collapsed:
+        word = "repeat" if watchdog_collapsed == 1 else "repeats"
+        typer.echo(
+            f"… {watchdog_collapsed} watchdog {word} collapsed. "
+            f"Use --include-watchdog-repeats to show."
         )
 
 

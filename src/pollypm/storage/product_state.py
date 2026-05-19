@@ -1,8 +1,11 @@
 """Product-state flag plumbing (#1546 heartbeat-cascade foundation).
 
 Contract:
-- Inputs: a :class:`pollypm.storage.state.StateStore` plus optional
-  metadata for set/clear operations.
+- Inputs: a :class:`pollypm.storage.state.StateStore` (or any object
+  exposing ``set_workspace_state`` / ``get_workspace_state`` /
+  ``clear_workspace_state``) plus optional metadata for set/clear
+  operations. ``store=None`` is accepted on every API and triggers
+  the pg-backend path via :mod:`pollypm.storage.pg_workspace_state`.
 - Outputs: structured ``ProductState`` records (or ``None`` when
   unset).
 - Side effects: writes one row to ``workspace_state`` keyed
@@ -18,6 +21,16 @@ dashboard takeover) live in follow-up issues. Today the only writers
 are explicit ``pm doctor`` / debug paths and tests; the read path is
 consulted by ``pollypm.work.service_queries.create_task`` to refuse
 new task queueing when the flag is set.
+
+Slice K-state-port phase 2 (#1737)
+----------------------------------
+
+The historical contract took a :class:`StateStore` instance. As part
+of the pg cutover the read/write path now dispatches to the new
+:mod:`pollypm.storage.pg_workspace_state` facade when the active
+backend is Postgres. Existing callers continue to pass a StateStore
+on the sqlite path; pg-only callers should pass ``store=None`` to
+short-circuit straight to the pg facade.
 """
 
 from __future__ import annotations
@@ -89,11 +102,23 @@ def set_product_state_broken(
         "forensics_path": forensics_path.strip(),
         "extra": dict(extra or {}),
     }
-    store.set_workspace_state(
-        PRODUCT_STATE_KEY,
-        payload,
-        actor=set_by or "system",
-    )
+    if store is None:
+        # pg cutover: callers that have shed their StateStore
+        # dependency pass ``store=None`` to route through the
+        # dedicated pg facade.
+        from pollypm.storage.pg_workspace_state import set_workspace_state
+
+        set_workspace_state(
+            PRODUCT_STATE_KEY,
+            payload,
+            actor=set_by or "system",
+        )
+    else:
+        store.set_workspace_state(
+            PRODUCT_STATE_KEY,
+            payload,
+            actor=set_by or "system",
+        )
     return ProductState(
         state=payload["state"],
         reason=payload["reason"],
@@ -113,11 +138,15 @@ def get_product_state(store: Any) -> ProductState | None:
     * Row exists but the payload doesn't carry a ``state`` field.
     """
     if store is None:
-        return None
-    getter = getattr(store, "get_workspace_state", None)
-    if not callable(getter):
-        return None
-    raw = getter(PRODUCT_STATE_KEY)
+        # pg cutover: read through the dedicated pg facade.
+        from pollypm.storage.pg_workspace_state import get_workspace_state
+
+        raw = get_workspace_state(PRODUCT_STATE_KEY)
+    else:
+        getter = getattr(store, "get_workspace_state", None)
+        if not callable(getter):
+            return None
+        raw = getter(PRODUCT_STATE_KEY)
     if not isinstance(raw, dict):
         return None
     state = raw.get("state")
@@ -136,7 +165,10 @@ def get_product_state(store: Any) -> ProductState | None:
 def clear_product_state(store: Any) -> bool:
     """Delete the product_state row. Returns True iff a row was deleted."""
     if store is None:
-        return False
+        # pg cutover: clear through the dedicated pg facade.
+        from pollypm.storage.pg_workspace_state import clear_workspace_state
+
+        return bool(clear_workspace_state(PRODUCT_STATE_KEY))
     clearer = getattr(store, "clear_workspace_state", None)
     if not callable(clearer):
         return False

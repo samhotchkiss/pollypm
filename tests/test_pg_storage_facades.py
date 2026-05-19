@@ -670,3 +670,202 @@ def test_pg_legacy_per_project_db_migration_skipped(pg_config):
 
     reports = migrate_legacy_per_project_dbs(config=pg_config)
     assert reports == []
+
+
+# --------------------------------------------------------------------- #
+# pg_workspace_state — workspace_state KV (Slice K-state-port phase 2)
+# --------------------------------------------------------------------- #
+
+
+def test_pg_workspace_state_set_get_clear_roundtrip(pg_schema_pool, pg_config):
+    """The pg facade must mirror StateStore's set / get / clear contract."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_workspace_state import (
+        clear_workspace_state,
+        get_workspace_state,
+        set_workspace_state,
+    )
+
+    assert get_workspace_state("missing", pool=pg_schema_pool) is None
+
+    set_workspace_state(
+        "product_state",
+        {"state": "broken", "reason": "test", "extra": {"k": 1}},
+        actor="unit-test",
+        pool=pg_schema_pool,
+    )
+    payload = get_workspace_state("product_state", pool=pg_schema_pool)
+    assert payload == {"state": "broken", "reason": "test", "extra": {"k": 1}}
+
+    # Idempotent re-set replaces the row.
+    set_workspace_state(
+        "product_state",
+        {"state": "broken", "reason": "updated"},
+        actor="unit-test-2",
+        pool=pg_schema_pool,
+    )
+    payload2 = get_workspace_state("product_state", pool=pg_schema_pool)
+    assert payload2 == {"state": "broken", "reason": "updated"}
+
+    # Clear returns True on hit, False on miss.
+    assert clear_workspace_state("product_state", pool=pg_schema_pool) is True
+    assert clear_workspace_state("product_state", pool=pg_schema_pool) is False
+    assert get_workspace_state("product_state", pool=pg_schema_pool) is None
+
+
+def test_pg_workspace_state_non_dict_payload_returns_none(pg_schema_pool, pg_config):
+    """A non-dict jsonb payload should read back as None (sqlite parity)."""
+    _apply_initial_migrations(pg_schema_pool)
+    # Write a list payload directly so the facade has to gracefully
+    # reject it on read. The StateStore equivalent returns None for any
+    # non-dict; the pg facade must do the same.
+    with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO workspace_state (key, value_json, set_at, set_by) "
+            "VALUES (%s, %s::jsonb, now(), 'test')",
+            ("weird", json.dumps(["not", "a", "dict"])),
+        )
+        conn.commit()
+
+    from pollypm.storage.pg_workspace_state import get_workspace_state
+
+    assert get_workspace_state("weird", pool=pg_schema_pool) is None
+
+
+# --------------------------------------------------------------------- #
+# pg_notifications — task-assignment dedupe (Slice K-state-port phase 2)
+# --------------------------------------------------------------------- #
+
+
+def test_pg_notifications_claim_then_dedupe(pg_schema_pool, pg_config):
+    """A second claim inside the window returns None (TOCTOU-safe dedupe)."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_notifications import claim_notification_slot
+
+    first = claim_notification_slot(
+        session_name="worker-alpha",
+        task_id="alpha:7",
+        window_seconds=1800,
+        execution_version=1,
+        project="alpha",
+        message="kickoff",
+        pool=pg_schema_pool,
+    )
+    assert isinstance(first, int) and first > 0
+
+    # Same session/task/version inside the window dedupes.
+    second = claim_notification_slot(
+        session_name="worker-alpha",
+        task_id="alpha:7",
+        window_seconds=1800,
+        execution_version=1,
+        project="alpha",
+        message="kickoff",
+        pool=pg_schema_pool,
+    )
+    assert second is None
+
+    # A bumped execution_version (e.g. reject-bounce) is a fresh ping.
+    third = claim_notification_slot(
+        session_name="worker-alpha",
+        task_id="alpha:7",
+        window_seconds=1800,
+        execution_version=2,
+        project="alpha",
+        message="kickoff-after-bounce",
+        pool=pg_schema_pool,
+    )
+    assert isinstance(third, int) and third > 0 and third != first
+
+
+def test_pg_notifications_update_status_and_was_notified(pg_schema_pool, pg_config):
+    """update_notification_status + was_notified_within must round-trip."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_notifications import (
+        claim_notification_slot,
+        update_notification_status,
+        was_notified_within,
+    )
+
+    claim_id = claim_notification_slot(
+        session_name="worker-beta",
+        task_id="beta:1",
+        window_seconds=1800,
+        execution_version=0,
+        project="beta",
+        message="kickoff",
+        pool=pg_schema_pool,
+    )
+    assert isinstance(claim_id, int)
+
+    update_notification_status(
+        claim_id,
+        delivery_status="sent",
+        message="canonical body",
+        pool=pg_schema_pool,
+    )
+
+    # The read-side probe should see the row inside the window.
+    assert (
+        was_notified_within(
+            "worker-beta", "beta:1", 1800, 0, pool=pg_schema_pool,
+        )
+        is True
+    )
+    # A different version doesn't match.
+    assert (
+        was_notified_within(
+            "worker-beta", "beta:1", 1800, 99, pool=pg_schema_pool,
+        )
+        is False
+    )
+
+
+def test_pg_notifications_recent_notifications_shape(pg_schema_pool, pg_config):
+    """recent_notifications returns the documented dict shape."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_notifications import (
+        record_notification,
+        recent_notifications,
+    )
+
+    record_notification(
+        session_name="worker-gamma",
+        task_id="gamma:5",
+        project="gamma",
+        message="kickoff",
+        delivery_status="sent",
+        execution_version=1,
+        pool=pg_schema_pool,
+    )
+    record_notification(
+        session_name="worker-delta",
+        task_id="delta:1",
+        project="delta",
+        message="kickoff",
+        delivery_status="failed: timeout",
+        execution_version=0,
+        pool=pg_schema_pool,
+    )
+
+    rows = recent_notifications(limit=10, pool=pg_schema_pool)
+    assert len(rows) == 2
+    keys = {
+        "session_name",
+        "task_id",
+        "project",
+        "notified_at",
+        "delivery_status",
+        "message",
+        "execution_version",
+    }
+    assert all(keys <= set(row.keys()) for row in rows)
+    by_task = {row["task_id"]: row for row in rows}
+    assert by_task["gamma:5"]["delivery_status"] == "sent"
+    assert by_task["delta:1"]["delivery_status"].startswith("failed")
+
+    # Filter by project.
+    only_gamma = recent_notifications(
+        project="gamma", limit=10, pool=pg_schema_pool,
+    )
+    assert [r["task_id"] for r in only_gamma] == ["gamma:5"]

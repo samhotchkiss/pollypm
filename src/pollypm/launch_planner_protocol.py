@@ -28,14 +28,13 @@ would defeat the seam.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from pollypm.models import AccountConfig, SessionConfig
 from pollypm.providers.base import LaunchCommand
 
 if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
-    from pollypm.storage.state import StateStore
 
 @dataclass(slots=True)
 class DefaultLaunchPlannerContext:
@@ -45,10 +44,19 @@ class DefaultLaunchPlannerContext:
     profile resolution — those live elsewhere (Supervisor today). The
     context threads the relevant callables through so the planner can
     call them without a hard Supervisor dependency.
+
+    ``store`` is typed as :class:`typing.Any` during the pg cutover
+    (#1737, Slice K-state-port). Historically this was a
+    sqlite-backed state-store instance; consumers are migrating to
+    per-table pg facades (e.g.
+    :mod:`pollypm.storage.pg_workspace_state`), and the handful of
+    remaining callers that still need the legacy state-store pass it
+    through transparently. Once all consumers are off the legacy
+    accessor the field is expected to be removed entirely.
     """
 
     config: "PollyPMConfig"
-    store: "StateStore"
+    store: Any
     readonly_state: bool
     effective_account: Callable[[SessionConfig, AccountConfig], AccountConfig]
     apply_role_launch_restrictions: Callable[[SessionConfig, LaunchCommand], LaunchCommand]

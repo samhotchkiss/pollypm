@@ -479,6 +479,89 @@ def test_recover_orphaned_claims_preserves_recovered_sibling_distinct_payload(
     assert live_row is not None and live_row.status is JobStatus.QUEUED
 
 
+def test_recover_orphaned_claims_preserves_queued_siblings_identical_payload(
+    pg_job_queue: JobQueue,
+) -> None:
+    """#1851 — pre-existing queued siblings with identical payload survive recovery.
+
+    Scenario:
+      1. Enqueue three no-dedupe jobs for the same handler with the
+         *same* payload — legitimate duplicate work the user enqueued
+         on purpose.
+      2. Claim one of them as a crashed worker.
+      3. Run ``recover_orphaned_claims``.
+
+    The recovered orphan rejoins the queue; the two queued siblings
+    that were never claimed must survive untouched. The pre-fix prune
+    scoped to ``handler_name + payload_json`` over *all* queued rows
+    (including untouched pre-existing siblings), so it kept only the
+    MAX(id) row and silently dropped two legitimate queued jobs.
+
+    The fix scopes the prune to the recovered-id set only: the prune
+    folds duplicates *within* the just-recovered rows but never
+    touches queued rows that were already there.
+    """
+    q = pg_job_queue
+    payload = {"unit": "shared"}
+    a = q.enqueue("user.handler", payload)
+    b = q.enqueue("user.handler", payload)
+    c = q.enqueue("user.handler", payload)
+    # Crashed worker claimed one of the three — say the first.
+    (claimed_job,) = q.claim("crashed-worker")
+    assert claimed_job.id == a
+
+    recovered, pruned = q.recover_orphaned_claims()
+    assert recovered == 1, "exactly one orphan should be requeued"
+    assert pruned == 0, (
+        "pre-existing queued siblings with identical payload are "
+        "legitimate user-enqueued work and must NOT be collapsed "
+        "during orphan recovery — the prune scope is the recovered "
+        "set only (#1851)."
+    )
+
+    for jid in (a, b, c):
+        row = q.get(jid)
+        assert row is not None, (
+            f"job {jid} disappeared — the orphan-recovery prune "
+            f"deleted a pre-existing queued sibling (#1851)."
+        )
+        assert row.status is JobStatus.QUEUED
+
+
+def test_recover_orphaned_claims_folds_recovered_set_identical_payload(
+    pg_job_queue: JobQueue,
+) -> None:
+    """#1851 corollary — duplicates *within* the recovered set still collapse.
+
+    The #1851 fix narrows the prune scope, but the original #1071
+    cadence-backlog collapse must still apply when *every* duplicate
+    is in the recovered set (a crashed daemon's accumulated
+    health_sweep ticks). Three claimed rows for the same handler +
+    payload + NULL dedupe_key, no pre-existing queued siblings:
+    recover requeues all three, prune folds them to one.
+    """
+    q = pg_job_queue
+    a = q.enqueue("session.health_sweep")
+    q.claim("crashed-1")
+    b = q.enqueue("session.health_sweep")
+    q.claim("crashed-1")
+    c = q.enqueue("session.health_sweep")
+    q.claim("crashed-1")
+
+    recovered, pruned = q.recover_orphaned_claims()
+    assert recovered == 3, "all three claimed rows must be requeued"
+    assert pruned == 2, (
+        "within the recovered set, identical (handler, payload, NULL "
+        "dedupe_key) rows fold to MAX(id) — the cadence-backlog "
+        "collapse from #1071 still applies."
+    )
+    # Newest survives, older two are dropped.
+    assert q.get(a) is None
+    assert q.get(b) is None
+    survivor = q.get(c)
+    assert survivor is not None and survivor.status is JobStatus.QUEUED
+
+
 def test_null_dedupe_key_does_not_deduplicate(pg_job_queue: JobQueue) -> None:
     q = pg_job_queue
     jid1 = q.enqueue("sweep", {"p": "a"})

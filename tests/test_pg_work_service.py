@@ -260,9 +260,14 @@ def test_list_nonterminal_excludes_done_and_cancelled(pg_service):
     assert [t.task_number for t in rows] == [c.task_number]
 
 
-def test_protocol_stubs_raise_not_implemented(pg_service):
-    """Slice A stubs must crash loud, not return None."""
-    with pytest.raises(NotImplementedError, match="Slice"):
-        pg_service.claim("demo/1", actor="u")
-    with pytest.raises(NotImplementedError, match="Slice"):
-        pg_service.approve("demo/1", actor="u")
+def test_slice_b_methods_are_implemented(pg_service):
+    """Slice B (#1737) ships claim / approve / etc. — no NotImplementedError."""
+    from pollypm.work.service_support import TaskNotFoundError
+
+    # Methods now reach the DB and surface domain errors instead of
+    # NotImplementedError. The missing-task lookup is the cheapest way
+    # to prove "code ran past the stub".
+    with pytest.raises(TaskNotFoundError):
+        pg_service.claim("demo/999", actor="u")
+    with pytest.raises(TaskNotFoundError):
+        pg_service.approve("demo/999", actor="u")

@@ -15,6 +15,7 @@ import json
 import logging
 import shutil
 import subprocess
+import tempfile
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -910,12 +911,12 @@ def backup_cmd(
         None,
         "--output",
         "-o",
-        help="Custom destination path for the snapshot. Default: ~/.pollypm/backups/state-db-<ts>.db.gz",
+        help="Custom destination path for the snapshot. Default: ~/.pollypm/backups/state-db-<ts>.db.gz (sqlite) or pg-<ts>.pgdump (postgres).",
     ),
     full: bool = typer.Option(
         False,
         "--full",
-        help="Bundle state.db + ~/.pollypm/ tree into a single .tar.gz. Not subject to retention.",
+        help="Bundle state.db + ~/.pollypm/ tree into a single .tar.gz. sqlite backend only; ignored on postgres.",
     ),
     keep: int = typer.Option(
         None,
@@ -924,7 +925,13 @@ def backup_cmd(
     ),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    """Snapshot ~/.pollypm/state.db using SQLite's online backup API."""
+    """Snapshot the configured state backend.
+
+    Dispatches on ``[storage] backend``: sqlite snapshots use SQLite's
+    online backup API; postgres snapshots shell out to ``pg_dump
+    --format=custom``. See ``pm storage backup`` for the explicit
+    storage-namespaced alias (#1737, Slice G).
+    """
     from pollypm import backup as backup_mod
 
     try:
@@ -936,14 +943,11 @@ def backup_cmd(
         )
         raise typer.Exit(code=1)
 
-    state_db = config.project.state_db
-    base_dir = config.project.base_dir
     keep_value = backup_mod.DEFAULT_KEEP if keep is None else keep
 
     try:
-        result = backup_mod.backup_state_db(
-            state_db,
-            base_dir=base_dir,
+        result = backup_mod.backup_via_config(
+            config,
             output=output,
             full=full,
             keep=keep_value,
@@ -951,16 +955,25 @@ def backup_cmd(
     except FileNotFoundError as exc:
         typer.echo(f"Backup failed: {exc}", err=True)
         raise typer.Exit(code=1)
+    except backup_mod.PgBackupError as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
     except Exception as exc:
         typer.echo(f"Backup failed: {exc}", err=True)
         raise typer.Exit(code=1)
 
-    before = backup_mod.humanize_bytes(result.db_size_before)
     after = backup_mod.humanize_bytes(result.archive_size)
-    typer.echo(
-        f"Backed up to {result.path}. DB size before: {before}. "
-        f"Archive size: {after}."
-    )
+    if isinstance(result, backup_mod.PgBackupResult):
+        typer.echo(
+            f"Backed up pg DSN {result.dsn!r} to {result.path}. "
+            f"Archive size: {after}."
+        )
+    else:
+        before = backup_mod.humanize_bytes(result.db_size_before)
+        typer.echo(
+            f"Backed up to {result.path}. DB size before: {before}. "
+            f"Archive size: {after}."
+        )
     if result.pruned:
         snap_word = "snapshot" if len(result.pruned) == 1 else "snapshots"
         typer.echo(
@@ -969,7 +982,7 @@ def backup_cmd(
         )
 
 def restore_cmd(
-    snapshot_path: Path = typer.Argument(..., help="Path to a .db.gz DB snapshot or --full .tar.gz archive."),
+    snapshot_path: Path = typer.Argument(..., help="Path to a .db.gz DB snapshot, --full .tar.gz archive, or pg-*.pgdump file."),
     confirm: bool = typer.Option(
         False,
         "--confirm",
@@ -982,7 +995,13 @@ def restore_cmd(
     ),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
-    """Restore state.db from a snapshot produced by ``pm backup``."""
+    """Restore the configured state backend from a snapshot.
+
+    Dispatches on ``[storage] backend``: sqlite restores swap state.db
+    after writing a ``.before-restore`` safety copy; postgres restores
+    shell out to ``pg_restore --clean --if-exists --no-owner`` after a
+    best-effort ``pg_dump`` safety snapshot.
+    """
     from pollypm import backup as backup_mod
     from pollypm.session_services import probe_session
 
@@ -995,10 +1014,8 @@ def restore_cmd(
         )
         raise typer.Exit(code=1)
 
-    live_db = config.project.state_db
-
     try:
-        plan = backup_mod.plan_restore(snapshot_path, live_db)
+        plan, backend = backup_mod.restore_via_config(config, snapshot_path)
     except FileNotFoundError as exc:
         typer.echo(f"Restore failed: {exc}", err=True)
         raise typer.Exit(code=1)
@@ -1008,17 +1025,26 @@ def restore_cmd(
 
     if dry_run:
         typer.echo("Dry run — no files will be touched.")
-        typer.echo(f"  snapshot:      {plan.snapshot_path}")
-        typer.echo(f"  live DB:       {plan.live_db_path}")
-        typer.echo(f"  safety copy:   {plan.safety_path}")
-        typer.echo(
-            f"  snapshot kind: {'full tar.gz' if plan.is_tar else 'db snapshot'}"
-        )
+        if isinstance(plan, backup_mod.PgRestorePlan):
+            typer.echo(f"  snapshot:      {plan.snapshot_path}")
+            typer.echo(f"  pg DSN:        {plan.dsn}")
+            typer.echo(f"  safety dump:   {plan.safety_path}")
+            typer.echo("  snapshot kind: pg_dump custom archive")
+        else:
+            typer.echo(f"  snapshot:      {plan.snapshot_path}")
+            typer.echo(f"  live DB:       {plan.live_db_path}")
+            typer.echo(f"  safety copy:   {plan.safety_path}")
+            typer.echo(
+                f"  snapshot kind: {'full tar.gz' if plan.is_tar else 'db snapshot'}"
+            )
         return
 
     if not confirm:
         session_name = config.project.tmux_session
-        typer.echo("Restore refused — this replaces the live state.db.")
+        if isinstance(plan, backup_mod.PgRestorePlan):
+            typer.echo("Restore refused — this replaces the live Postgres database.")
+        else:
+            typer.echo("Restore refused — this replaces the live state.db.")
         typer.echo("")
         typer.echo("Before you proceed:")
         typer.echo(
@@ -1028,10 +1054,17 @@ def restore_cmd(
         typer.echo("  2. Re-run with `--confirm`:")
         typer.echo(f"       pm restore {snapshot_path} --confirm")
         typer.echo("")
-        typer.echo(
-            "A safety copy of the live DB will be written to "
-            f"{plan.safety_path} before anything is replaced."
-        )
+        if isinstance(plan, backup_mod.PgRestorePlan):
+            typer.echo(
+                "A pg_dump safety snapshot of the live DB will be "
+                f"written to {plan.safety_path} before anything is "
+                "replaced."
+            )
+        else:
+            typer.echo(
+                "A safety copy of the live DB will be written to "
+                f"{plan.safety_path} before anything is replaced."
+            )
         raise typer.Exit(code=1)
 
     try:
@@ -1048,13 +1081,29 @@ def restore_cmd(
         )
 
     try:
-        result = backup_mod.execute_restore(plan)
+        if isinstance(plan, backup_mod.PgRestorePlan):
+            pg_result = backup_mod.execute_pg_restore(plan)
+            typer.echo(
+                f"Restored pg DSN {pg_result.dsn!r} from {pg_result.snapshot_path}."
+            )
+            if pg_result.safety_path is None:
+                typer.echo(
+                    "WARNING: pre-restore safety dump skipped (live pg "
+                    "was unreachable or empty)."
+                )
+            else:
+                typer.echo(
+                    f"Safety dump of the previous live DB: {pg_result.safety_path}"
+                )
+        else:
+            result = backup_mod.execute_restore(plan)
+            typer.echo(f"Restored {result.live_db_path} from {result.snapshot_path}.")
+            typer.echo(f"Safety copy of the previous live DB: {result.safety_path}")
     except Exception as exc:
         typer.echo(f"Restore failed mid-flight: {exc}", err=True)
         raise typer.Exit(code=1)
 
-    typer.echo(f"Restored {result.live_db_path} from {result.snapshot_path}.")
-    typer.echo(f"Safety copy of the previous live DB: {result.safety_path}")
+    _ = backend  # currently informational; reserved for richer next-step hints
     typer.echo("")
     typer.echo("Next steps:")
     typer.echo("  pm up                  # relaunch the cockpit")
@@ -1089,6 +1138,184 @@ def doctor_pg_connection(
     else:
         typer.echo(render_human(report))
     raise typer.Exit(code=0 if report.ok else 1)
+
+
+# --------------------------------------------------------------------- #
+# ``pm storage`` subcommands (issue #1737, Slice G)
+# --------------------------------------------------------------------- #
+
+
+storage_app = typer.Typer(
+    help=(
+        "Manage the configured state backend (sqlite or postgres). "
+        "Backup / restore dispatch on the storage backend setting in "
+        "pollypm.toml."
+    ),
+    no_args_is_help=True,
+)
+
+
+def storage_backup_cmd(
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Custom destination path for the snapshot.",
+    ),
+    keep: int = typer.Option(
+        None,
+        "--keep",
+        help="Keep N most recent snapshots; prune the rest.",
+    ),
+    verify: bool = typer.Option(
+        False,
+        "--verify",
+        help="After taking the snapshot, re-open it via pg_restore --list (postgres) or the SQLite header probe (sqlite) to confirm it's restorable. Slice J's cutover gates on this passing.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
+    ),
+) -> None:
+    """Snapshot the configured state backend.
+
+    Equivalent to ``pm backup`` but namespaced under ``pm storage``
+    for the post-cutover ergonomic where storage-management commands
+    live together. Both routes dispatch on ``[storage] backend``.
+    """
+    from pollypm import backup as backup_mod
+
+    try:
+        config = load_config(config_path)
+    except FileNotFoundError:
+        typer.echo(
+            f"Config not found at {config_path}. Run `pm` to onboard first.",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    keep_value = backup_mod.DEFAULT_KEEP if keep is None else keep
+
+    try:
+        result = backup_mod.backup_via_config(
+            config,
+            output=output,
+            full=False,
+            keep=keep_value,
+        )
+    except FileNotFoundError as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except backup_mod.PgBackupError as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+    except Exception as exc:
+        typer.echo(f"Backup failed: {exc}", err=True)
+        raise typer.Exit(code=1)
+
+    archive_size = backup_mod.humanize_bytes(result.archive_size)
+    if isinstance(result, backup_mod.PgBackupResult):
+        typer.echo(
+            f"Backed up pg DSN to {result.path}. Archive size: {archive_size}."
+        )
+    else:
+        before = backup_mod.humanize_bytes(result.db_size_before)
+        typer.echo(
+            f"Backed up to {result.path}. DB size before: {before}. "
+            f"Archive size: {archive_size}."
+        )
+    if result.pruned:
+        word = "snapshot" if len(result.pruned) == 1 else "snapshots"
+        typer.echo(
+            f"Pruned {len(result.pruned)} older {word} (keep={keep_value})."
+        )
+
+    if verify:
+        verify_ok = _verify_snapshot(result)
+        if not verify_ok:
+            typer.echo(
+                "Verification failed — the snapshot exists but could not "
+                "be re-opened. Investigate before relying on it.",
+                err=True,
+            )
+            raise typer.Exit(code=1)
+        typer.echo("Verified: snapshot re-opens cleanly.")
+
+
+def storage_restore_cmd(
+    snapshot_path: Path = typer.Argument(
+        ..., help="Path to a snapshot produced by `pm storage backup` (or legacy `pm backup`)."
+    ),
+    confirm: bool = typer.Option(
+        False,
+        "--confirm",
+        help="Required to actually overwrite the live DB. Without this flag, restore refuses.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Describe what would happen without touching any data.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."
+    ),
+) -> None:
+    """Restore the configured backend from ``snapshot_path``.
+
+    Dispatches on ``[storage] backend`` exactly like ``pm storage backup``.
+    """
+    # Delegate to the root-level ``pm restore`` implementation so the
+    # two surfaces stay in lockstep. ``pm storage restore`` is the
+    # storage-namespaced spelling promoted by the migration runbook.
+    restore_cmd(
+        snapshot_path=snapshot_path,
+        confirm=confirm,
+        dry_run=dry_run,
+        config_path=config_path,
+    )
+
+
+def _verify_snapshot(result: "object") -> bool:
+    """Re-open ``result`` to confirm it's restorable.
+
+    Returns True if verification passed, False on any failure. Stays
+    local to the storage CLI because the verification rules differ
+    between backends and the test suite drives it via the public
+    surface.
+    """
+    from pollypm import backup as backup_mod
+
+    if isinstance(result, backup_mod.PgBackupResult):
+        try:
+            binary = backup_mod._resolve_pg_binary("pg_restore")  # type: ignore[attr-defined]
+        except backup_mod.PgBackupError:
+            return False
+        try:
+            completed = subprocess.run(
+                [binary, "--list", str(result.path)],
+                check=False,
+                text=True,
+                capture_output=True,
+                timeout=60,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return completed.returncode == 0
+    if isinstance(result, backup_mod.BackupResult):
+        # sqlite gzipped DB — re-decompress and run the header probe.
+        if result.full:
+            return result.path.exists() and result.archive_size > 0
+        try:
+            with tempfile.TemporaryDirectory() as staging:
+                staged = Path(staging) / "probe.db"
+                backup_mod._gunzip_file(result.path, staged)  # type: ignore[attr-defined]
+                return backup_mod._is_valid_sqlite_file(staged)  # type: ignore[attr-defined]
+        except Exception:  # noqa: BLE001
+            return False
+    return False
+
+
+storage_app.command("backup")(storage_backup_cmd)
+storage_app.command("restore")(storage_restore_cmd)
 
 
 def register_maintenance_commands(app: typer.Typer) -> None:
@@ -1184,6 +1411,8 @@ def register_maintenance_commands(app: typer.Typer) -> None:
     app.command("backup")(backup_cmd)
 
     app.command("restore")(restore_cmd)
+
+    app.add_typer(storage_app, name="storage")
 
 
 

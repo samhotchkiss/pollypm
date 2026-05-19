@@ -576,6 +576,7 @@ check_config_file = _doctor_install_state.check_config_file
 check_provider_account_configured = _doctor_install_state.check_provider_account_configured
 check_storage_backend = _doctor_install_state.check_storage_backend
 check_pg_connection = _doctor_install_state.check_pg_connection
+check_pg_backup_freshness = _doctor_install_state.check_pg_backup_freshness
 check_registered_providers = _doctor_install_state.check_registered_providers
 
 check_builtin_plugin_manifests = _doctor_plugins.check_builtin_plugin_manifests
@@ -3809,6 +3810,15 @@ def _registered_checks() -> list[Check]:
         # #1737 — pg-connection probe. Skipped on sqlite installs so the
         # check never falsely fails for users who haven't opted in.
         Check("pg-connection", check_pg_connection, "install"),
+        # #1737 Slice G — pg backup freshness. Warning-only; skipped on
+        # sqlite. Surfaces "last backup is > N days old" as part of the
+        # cutover-safety pre-flight in the migration runbook.
+        Check(
+            "pg-backup-freshness",
+            check_pg_backup_freshness,
+            "install",
+            severity="warning",
+        ),
         Check("registered-providers", check_registered_providers, "install"),
         # Plugins
         Check("builtin-plugin-manifests", check_builtin_plugin_manifests, "plugins"),

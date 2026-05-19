@@ -26,10 +26,49 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
 
+from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
+if TYPE_CHECKING:
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------- #
+# Postgres branch (#1737, Slice C)
+# --------------------------------------------------------------------- #
+#
+# All probes here key off ``state.db`` in the sqlite world. The pg port
+# has a single shared schema (no per-project DB), so the doctor probes
+# become straight SELECTs against the RO pool.
+#
+# The ``schema_version`` / ``work_schema_version`` table doesn't exist
+# on the pg side — the pg migration applier uses ``schema_migrations``
+# (version 1 = ``0001_initial`` which contains the merged schema).
+# ``applied_schema_version_ro`` returns the max version from that table
+# instead so the doctor check can still answer "schema is current".
+
+
+def _pg_ro_conn(config: "PollyPMConfig | None" = None):
+    """Open a pool-borrowed RO connection or return ``None``.
+
+    Mirrors :func:`_connect_readonly`'s contract: every probe must
+    degrade silently when the backend is unreachable so a doctor run
+    never throws on a transient pool / network blip.
+    """
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("doctor_state_probes: pg_pool import failed: %s", exc)
+        return None
+    try:
+        return get_ro_pool(config).connection()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("doctor_state_probes: get_ro_pool failed: %s", exc)
+        return None
 
 
 def _connect_readonly(db_path: Path) -> sqlite3.Connection | None:
@@ -55,7 +94,12 @@ def _connect_readonly(db_path: Path) -> sqlite3.Connection | None:
     return conn
 
 
-def applied_schema_version_ro(db_path: Path, table: str) -> int | None:
+def applied_schema_version_ro(
+    db_path: Path,
+    table: str,
+    *,
+    config: "PollyPMConfig | None" = None,
+) -> int | None:
     """Return ``MAX(version)`` from a schema-version table, or ``None``.
 
     ``table`` is interpolated into the SQL string because the schema
@@ -67,7 +111,30 @@ def applied_schema_version_ro(db_path: Path, table: str) -> int | None:
     Returns ``None`` when the DB file is missing, the connect fails, or
     the table does not exist. Returns ``0`` when the table is present
     but empty (no migrations applied yet).
+
+    On the pg backend both ``schema_version`` and ``work_schema_version``
+    map to the unified ``schema_migrations`` table — the pg port collapses
+    the two-version split into a single forward-only migration list
+    (Slice A). Callers passing either table name get back the same
+    ``MAX(version)`` so existing doctor checks keep working.
     """
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return None
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT COALESCE(MAX(version), 0) FROM schema_migrations"
+                    )
+                    row = cur.fetchone()
+                except Exception:  # noqa: BLE001
+                    return None
+                return int(row[0]) if row and row[0] is not None else 0
+        except Exception:  # noqa: BLE001
+            return None
+
     conn = _connect_readonly(db_path)
     if conn is None:
         return None
@@ -83,7 +150,11 @@ def applied_schema_version_ro(db_path: Path, table: str) -> int | None:
         conn.close()
 
 
-def count_work_tasks_ro(db_path: Path) -> int | None:
+def count_work_tasks_ro(
+    db_path: Path,
+    *,
+    config: "PollyPMConfig | None" = None,
+) -> int | None:
     """Return ``COUNT(*) FROM work_tasks`` on ``db_path``, or ``None``.
 
     Returns ``None`` when the file is missing OR when the ``work_tasks``
@@ -91,6 +162,28 @@ def count_work_tasks_ro(db_path: Path) -> int | None:
     is empty. Used by the dual-DB drift probe to tell "no work tables
     on this file" apart from "tables present but empty".
     """
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return None
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'work_tasks'"
+                    )
+                    if cur.fetchone() is None:
+                        return None
+                    cur.execute("SELECT COUNT(*) FROM work_tasks")
+                    row = cur.fetchone()
+                except Exception:  # noqa: BLE001
+                    return None
+                return int(row[0]) if row and row[0] is not None else 0
+        except Exception:  # noqa: BLE001
+            return None
+
     conn = _connect_readonly(db_path)
     if conn is None:
         return None
@@ -113,13 +206,35 @@ def count_work_tasks_ro(db_path: Path) -> int | None:
         conn.close()
 
 
-def has_messages_table_ro(db_path: Path) -> bool:
+def has_messages_table_ro(
+    db_path: Path,
+    *,
+    config: "PollyPMConfig | None" = None,
+) -> bool:
     """Return ``True`` when ``db_path`` carries a ``messages`` table.
 
     Read-only probe used by the dual-DB drift check to decide whether a
     given state.db is the messages-side DB. Returns ``False`` on any
     open / read failure.
     """
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return False
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'messages'"
+                    )
+                    return cur.fetchone() is not None
+                except Exception:  # noqa: BLE001
+                    return False
+        except Exception:  # noqa: BLE001
+            return False
+
     conn = _connect_readonly(db_path)
     if conn is None:
         return False
@@ -136,7 +251,11 @@ def has_messages_table_ro(db_path: Path) -> bool:
         conn.close()
 
 
-def sessions_row_count_ro(db_path: Path) -> int | None:
+def sessions_row_count_ro(
+    db_path: Path,
+    *,
+    config: "PollyPMConfig | None" = None,
+) -> int | None:
     """Return ``COUNT(*) FROM sessions`` on ``db_path``, or ``None``.
 
     Returns ``None`` when the DB file cannot be opened or the
@@ -147,6 +266,28 @@ def sessions_row_count_ro(db_path: Path) -> int | None:
     distinct fail signal so the operator gets a clear "repair didn't
     run" hint instead of a silent skip.
     """
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return None
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'sessions'"
+                    )
+                    if cur.fetchone() is None:
+                        return None
+                    cur.execute("SELECT COUNT(*) FROM sessions")
+                    row = cur.fetchone()
+                except Exception:  # noqa: BLE001
+                    return None
+                return int(row[0]) if row and row[0] is not None else 0
+        except Exception:  # noqa: BLE001
+            return None
+
     conn = _connect_readonly(db_path)
     if conn is None:
         return None
@@ -160,7 +301,11 @@ def sessions_row_count_ro(db_path: Path) -> int | None:
         conn.close()
 
 
-def session_window_names_ro(db_path: Path) -> set[str] | None:
+def session_window_names_ro(
+    db_path: Path,
+    *,
+    config: "PollyPMConfig | None" = None,
+) -> set[str] | None:
     """Return the set of ``window_name`` values in ``sessions``, or ``None``.
 
     Returns ``None`` when the DB cannot be opened or the ``sessions``
@@ -168,11 +313,36 @@ def session_window_names_ro(db_path: Path) -> set[str] | None:
     no rows) so the session-drift doctor check can skip cleanly when
     the table itself has not been provisioned yet.
     """
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return None
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'sessions'"
+                    )
+                    if cur.fetchone() is None:
+                        return None
+                    cur.execute("SELECT window_name FROM sessions")
+                    windows: set[str] = set()
+                    for row in cur.fetchall():
+                        if row and row[0]:
+                            windows.add(str(row[0]))
+                    return windows
+                except Exception:  # noqa: BLE001
+                    return None
+        except Exception:  # noqa: BLE001
+            return None
+
     conn = _connect_readonly(db_path)
     if conn is None:
         return None
     try:
-        windows: set[str] = set()
+        windows = set()
         try:
             for row in conn.execute("SELECT window_name FROM sessions"):
                 if row and row[0]:

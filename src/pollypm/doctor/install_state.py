@@ -476,3 +476,74 @@ def check_pg_connection() -> doctor.CheckResult:
             "vector_installed": True,
         },
     )
+
+
+# Default freshness threshold for the pg backup probe (issue #1737,
+# Slice G). 7 days is a balance: short enough to surface an operator
+# who's stopped running ``pm storage backup``; long enough to avoid
+# nagging an operator who skipped one weekly run.
+PG_BACKUP_STALE_DAYS = 7
+
+
+def check_pg_backup_freshness() -> doctor.CheckResult:
+    """Warn when the most recent pg snapshot is older than N days.
+
+    Skipped on sqlite installs (the sqlite snapshot path has its own
+    retention semantics and this check would be noise). Returns a
+    warning, not a failure, so a stale backup doesn't gate the cockpit
+    from starting — the cutover flow in #1737 §9 surfaces the same
+    information through ``pm storage backup --verify`` instead.
+    """
+    from pollypm.backup import latest_pg_backup_age_seconds
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        return doctor._skip("pg-backup-freshness skipped (no config)")
+    try:
+        config = load_config(DEFAULT_CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001
+        return doctor._skip(f"pg-backup-freshness skipped (config parse: {exc})")
+
+    if config.storage.backend != "postgres":
+        return doctor._skip(
+            f"pg-backup-freshness skipped (backend={config.storage.backend!r})"
+        )
+
+    age = latest_pg_backup_age_seconds(config.project.base_dir)
+    if age is None:
+        return doctor._fail(
+            "no pg backups found",
+            why=(
+                "PollyPM is configured for postgres but no pg_dump "
+                "snapshot has been taken yet. The migration runbook "
+                "requires a verified backup before any cutover."
+            ),
+            fix=(
+                "Take a backup now —\n"
+                "  pm storage backup --verify\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data={"backup_dir": str(config.project.base_dir / "backups")},
+        )
+    days = age / 86400.0
+    if days > PG_BACKUP_STALE_DAYS:
+        return doctor._fail(
+            f"latest pg backup is {days:.1f} days old (> {PG_BACKUP_STALE_DAYS}d)",
+            why=(
+                "Operator backups are the rollback path for the pg "
+                "migration. A stale backup means a longer RPO than the "
+                "runbook promises."
+            ),
+            fix=(
+                "Refresh the snapshot —\n"
+                "  pm storage backup --verify\n"
+                "Recheck: pm doctor"
+            ),
+            severity="warning",
+            data={"age_days": round(days, 1), "threshold_days": PG_BACKUP_STALE_DAYS},
+        )
+    return doctor._ok(
+        f"latest pg backup is {days:.1f} days old",
+        data={"age_days": round(days, 1), "threshold_days": PG_BACKUP_STALE_DAYS},
+    )

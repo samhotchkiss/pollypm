@@ -20,6 +20,7 @@ from dataclasses import replace
 import logging
 import os
 from collections.abc import Mapping
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pollypm.launch_planner_protocol import DefaultLaunchPlannerContext
@@ -70,6 +71,48 @@ def _write_codex_agents_md_to_disk(account: AccountConfig, content: str) -> None
     target = codex_home_dir(account.home) / "AGENTS.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content.rstrip() + "\n", encoding="utf-8")
+
+
+def _write_claude_system_prompt_to_disk(
+    account: AccountConfig,
+    session: SessionConfig,
+    content: str,
+) -> "Path | None":
+    """Materialise the Claude profile prompt as a system-prompt file.
+
+    Sister of :func:`_write_codex_agents_md_to_disk` for the Claude
+    provider (refs #1854, #1867). The original Codex architect launch
+    relied on a tmux ``send-keys`` kickoff to deliver the role profile
+    to the pane after Claude/Codex finished bootstrapping. After #1854
+    moved several architect sessions from Codex to Claude (and Sam
+    manually edited his deployed toml), the kickoff started racing with
+    the audit watchdog's ``WATCHDOG ESCALATION`` first message — for
+    9-of-10 Claude architect sessions the ``.fresh`` marker was never
+    consumed by ``_send_initial_input_if_fresh``, so the agent never
+    received its persona prompt and answered "I'm Claude Code, the
+    official CLI…" when asked who it was.
+
+    The cleanest fix is to bake the prompt into the launch argv via
+    Claude's own ``--append-system-prompt-file`` flag rather than
+    relying on a post-stabilisation send-keys race. The argv carries
+    only the file path (small payload, well under tmux's
+    ``respawn-pane`` limit), and the agent sees its identity baked into
+    the system prompt from message one — regardless of whether the
+    watchdog (or any other tmux-driven sender) reaches the pane first.
+
+    Returns the on-disk path so callers can append
+    ``--append-system-prompt-file <path>`` to the launch argv. Returns
+    ``None`` when there is nothing to materialise (empty content, or
+    no account home — e.g. unit-test stubs that omit ``account.home``).
+    """
+    if not content or account.home is None:
+        return None
+    target = (
+        account.home / ".pollypm" / "system-prompts" / f"{session.name}.md"
+    )
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(content.rstrip() + "\n", encoding="utf-8")
+    return target
 
 
 def _carry_round_start_env(
@@ -232,6 +275,50 @@ class DefaultLaunchPlanner:
                 # the runtime launcher just exec codex.
                 _write_codex_agents_md_to_disk(account, launch.initial_input)
                 launch = replace(launch, initial_input=None)
+            if (
+                effective.provider is ProviderKind.CLAUDE
+                and launch.initial_input
+            ):
+                # #1854/#1867 — bake the role profile into Claude's
+                # system prompt via ``--append-system-prompt-file``
+                # rather than relying on the post-stabilisation
+                # ``send-keys`` kickoff in
+                # :meth:`Supervisor._send_initial_input_if_fresh`. The
+                # send-keys path is unreliable in practice: for 9-of-10
+                # Claude architect sessions migrated under #1854 the
+                # audit watchdog's ``WATCHDOG ESCALATION`` message
+                # reached the pane first, so the agent's first input
+                # was an unstuck-this-task ask — never the
+                # ``Hey — you're set up as architect`` primer. The
+                # ``.fresh`` marker stayed on disk and the agent
+                # introduced itself as "Claude Code, Anthropic's
+                # official CLI" because no persona ever loaded.
+                #
+                # The file path is small (well under tmux's
+                # ``respawn-pane`` limit) and survives ``--resume``
+                # because the same argv is constructed each launch.
+                # ``initial_input`` is preserved so the existing
+                # send-keys kickoff remains as a belt-and-suspenders
+                # signal that triggers the agent to greet the user;
+                # the kickoff text already asks Claude to read the
+                # same file, which is now idempotent (the system
+                # prompt already contains it). When the agent home is
+                # unavailable (e.g. unit-test stubs), the helper
+                # returns ``None`` and we fall through to the legacy
+                # send-keys behaviour.
+                prompt_path = _write_claude_system_prompt_to_disk(
+                    account, effective, launch.initial_input,
+                )
+                if prompt_path is not None:
+                    new_argv = list(launch.argv) + [
+                        "--append-system-prompt-file", str(prompt_path),
+                    ]
+                    launch = replace(launch, argv=new_argv)
+                    if launch.resume_argv is not None:
+                        new_resume_argv = list(launch.resume_argv) + [
+                            "--append-system-prompt-file", str(prompt_path),
+                        ]
+                        launch = replace(launch, resume_argv=new_resume_argv)
             runtime = get_runtime(account.runtime, root_dir=ctx.config.project.root_dir)
             window_name = effective.window_name or effective.name
             log_dir = ctx.config.project.logs_dir / effective.name

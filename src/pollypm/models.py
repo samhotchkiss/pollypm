@@ -252,6 +252,44 @@ class EventsRetentionSettings:
 
 
 @dataclass(slots=True)
+class PgStorageSettings:
+    """``[storage.pg]`` knobs — pool sizing + DSN override (issue #1737).
+
+    Slice A wires these as config-driven defaults; the
+    :mod:`pollypm.storage.pg_pool` module reads them when constructing
+    the process-wide pool. ``dsn`` is overridden by the
+    ``POLLYPM_PG_DSN`` env var (operator-level escape valve).
+
+    ``min_version`` is consulted by ``pm doctor pg-connection`` to
+    refuse to proceed against an older pg instance; pgvector's HNSW
+    behaviour is robust from pg 16 onward.
+    """
+
+    pool_min: int = 1
+    pool_max: int = 10
+    min_version: str = "16.0"
+    dsn: str = ""
+
+
+@dataclass(slots=True)
+class EmbeddingSettings:
+    """``[storage.embedding]`` knobs — embedding provider for pgvector.
+
+    Slice A only carries the dataclass shape; the writer lands in
+    Slice D. Knobs:
+
+    ``model`` — provider-namespaced model name (``openai:text-embedding-3-small``).
+    ``provider`` — short id used by the resolver (``openai``, ``ollama``, ...).
+    ``api_key_env`` — name of the env var that holds the provider's
+        API key. Defaults to ``OPENAI_API_KEY``.
+    """
+
+    model: str = "openai:text-embedding-3-small"
+    provider: str = "openai"
+    api_key_env: str = "OPENAI_API_KEY"
+
+
+@dataclass(slots=True)
 class StorageSettings:
     """Storage-backend selection from the ``[storage]`` TOML section.
 
@@ -266,10 +304,17 @@ class StorageSettings:
     ``url`` — SQLAlchemy URL passed to the backend constructor. Empty
     string means "derive from ``config.project.state_db``" —
     ``sqlite:///<resolved-state-db-path>``.
+
+    ``pg`` / ``embedding`` — sub-section knobs for the Postgres backend
+    (#1737, Slice A). Defaults are safe to read on a sqlite install —
+    they're only consulted when ``backend == "postgres"`` or the
+    embedding writer fires.
     """
 
     backend: str = "sqlite"
     url: str = ""
+    pg: PgStorageSettings = field(default_factory=PgStorageSettings)
+    embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)
 
 
 @dataclass(slots=True)

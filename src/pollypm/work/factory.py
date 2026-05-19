@@ -1,17 +1,25 @@
-"""Canonical factory for :class:`SQLiteWorkService`.
+"""Canonical factory for the active work-service backend.
 
 This module exists so callers outside ``pollypm.work.*`` do not have to
-know how the work-service DB path is resolved. Every direct
+know how the work-service DB is resolved. Every direct
 ``SQLiteWorkService(...)`` callsite that lives in presentation, plugin,
 or heartbeat code is suspect — see issue #1369. Migrating those callers
 through this factory means the resolver is the single point of truth
 for "where does work data live".
 
-The factory is intentionally tiny: it composes
-:func:`pollypm.work.db_resolver.resolve_work_db_path` with the
-``SQLiteWorkService`` constructor. The audit emit added in #1343 lives
-in the constructor itself, so every path through this factory still
-records ``work_db.opened``.
+Backend dispatch (#1737, Slice A)
+---------------------------------
+
+Reads ``config.storage.backend``:
+
+* ``"sqlite"`` (default) → :class:`pollypm.work.sqlite_service.SQLiteWorkService`,
+  resolved via :func:`pollypm.work.db_resolver.resolve_work_db_path`.
+* ``"postgres"`` → :class:`pollypm.work.pg_service.PgWorkService`, wired
+  against the lazy pool singleton in :mod:`pollypm.storage.pg_pool`.
+
+Any other value falls through to sqlite so a fat-fingered backend
+string doesn't brick the CLI; the doctor's ``storage-backend`` check
+surfaces the typo through its own error path.
 
 Escape valve
 ------------
@@ -19,18 +27,40 @@ A caller that genuinely needs a non-canonical path (legacy migration,
 explicit override, test fixture) may pass ``db_path=...`` directly.
 That keeps the callsite visibly different from the canonical pattern,
 which is the point: "this one is not using the resolver" should never
-be invisible.
+be invisible. ``db_path`` is sqlite-specific and is ignored on the pg
+backend.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
     from pollypm.work.service_dependencies import SyncManager
-    from pollypm.work.sqlite_service import SQLiteWorkService
+
+
+logger = logging.getLogger(__name__)
+
+
+def _resolve_backend(config: "PollyPMConfig | None") -> str:
+    """Return the configured backend string, defaulting to ``"sqlite"``.
+
+    Reads ``config.storage.backend`` defensively — a missing attribute
+    or non-string value falls back to sqlite. The doctor's
+    ``storage-backend`` check surfaces real typos.
+    """
+    if config is None:
+        return "sqlite"
+    storage = getattr(config, "storage", None)
+    if storage is None:
+        return "sqlite"
+    backend = getattr(storage, "backend", "sqlite")
+    if not isinstance(backend, str) or not backend.strip():
+        return "sqlite"
+    return backend.strip()
 
 
 def create_work_service(
@@ -41,37 +71,46 @@ def create_work_service(
     project_key: str | None = None,
     sync_manager: "SyncManager | None" = None,
     session_manager: object | None = None,
-) -> "SQLiteWorkService":
-    """Construct a :class:`SQLiteWorkService` for the canonical work DB.
+) -> Any:
+    """Construct the configured work-service backend.
 
     Parameters
     ----------
     db_path:
-        Explicit DB path override. When ``None`` (the canonical case),
+        Explicit DB path override for the sqlite backend. Ignored on
+        ``backend="postgres"``. When ``None`` (the canonical case),
         the path is resolved via
-        :func:`pollypm.work.db_resolver.resolve_work_db_path`. Pass a
-        value here only when you genuinely need a non-canonical path
-        (legacy migration, tests, explicit ``--db`` overrides).
+        :func:`pollypm.work.db_resolver.resolve_work_db_path`.
     project_path:
         Filesystem path of the project, when known. Forwarded to the
-        service constructor for project-aware operations (gates,
-        activity logs, audit metadata).
+        sqlite service constructor for project-aware operations (gates,
+        activity logs, audit metadata). Ignored on the pg backend until
+        Slice B re-introduces project_path-aware behaviour.
     config:
         Optional pre-loaded :class:`PollyPMConfig`. Forwarded to the
-        resolver to avoid a hidden ``load_config()`` call.
+        resolver / pool factory to avoid hidden ``load_config()`` calls.
     project_key:
         Optional project key. Forwarded to the resolver so it can warn
-        about stale per-project DB files (#1004).
+        about stale per-project DB files (#1004), and to the pg service
+        for the per-row ``project_key`` column.
     sync_manager / session_manager:
-        Forwarded to the constructor for callers that need to inject a
+        Forwarded to the sqlite constructor for callers that need a
         bespoke sync or session manager (the heartbeat does this).
+        Ignored on the pg backend until Slice B.
 
     Returns
     -------
-    SQLiteWorkService
-        The constructed service. Use as a context manager to ensure
-        the underlying connection is closed.
+    object
+        A :class:`pollypm.work.service.WorkService` Protocol-satisfying
+        instance. The concrete type depends on the configured backend.
     """
+    backend = _resolve_backend(config)
+    if backend == "postgres":
+        from pollypm.work.pg_service import PgWorkService
+
+        return PgWorkService(config=config, project_key=project_key)
+
+    # sqlite (the default, and the fallback for unknown backends).
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     resolved_path: Path

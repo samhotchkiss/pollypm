@@ -3673,6 +3673,19 @@ class CockpitRouter:
         across re-mounts so clicking PM Chat twice does not spam the agent.
         Failures are best-effort — the mount has already succeeded; a
         primer that does not land does not roll back attachment.
+
+        #1867 (and the persona-template follow-up that closes it):
+        in addition to the persisted ``pm_primed_sessions`` marker, this
+        also inspects the live pane for an established conversation
+        before sending. If the architect's pane already shows
+        substantive output (more than a fresh-launch banner), the primer
+        is suppressed and the session is marked as primed. This guards
+        against the "primer fires every ``c`` press" failure mode the
+        screenshot in #1867 captured: even when the persisted marker is
+        somehow cleared (a stray rewrite, a manual edit, a state-cache
+        race), the pane-content gate prevents the primer from being
+        injected on top of an active conversation and contradicting the
+        persona the user is mid-conversation with.
         """
         try:
             state = self._load_state()
@@ -3683,6 +3696,22 @@ class CockpitRouter:
                 primed = set()
             if session_name in primed:
                 return
+            right_pane_id = self._right_pane_id(window_target)
+            target = right_pane_id if right_pane_id else window_target
+            # First-attach gate (#1867): if the pane already carries an
+            # established conversation, do not inject a "Hey <persona>"
+            # primer on top of it. The primer was designed for the very
+            # first attach to a fresh session; firing it mid-conversation
+            # (after a state-cache reset, or any path that misses the
+            # persisted marker) parses as a system-authority reset to
+            # the agent and contradicts the persona it has been answering
+            # as. Mark the session primed so the regular early-return on
+            # the next attach is correct.
+            if self._pane_has_established_conversation(target):
+                primed.add(session_name)
+                state["pm_primed_sessions"] = sorted(primed)
+                self._write_state(state)
+                return
             primer = _build_project_pm_primer(
                 supervisor,
                 project_key,
@@ -3690,8 +3719,6 @@ class CockpitRouter:
             )
             if not primer:
                 return
-            right_pane_id = self._right_pane_id(window_target)
-            target = right_pane_id if right_pane_id else window_target
             try:
                 self.tmux.send_keys(target, primer, press_enter=True)
             except Exception:  # noqa: BLE001
@@ -3701,6 +3728,35 @@ class CockpitRouter:
             self._write_state(state)
         except Exception:  # noqa: BLE001
             return
+
+    def _pane_has_established_conversation(self, target: str | None) -> bool:
+        """Return ``True`` when ``target`` shows a substantive conversation.
+
+        Used by :meth:`_maybe_prime_project_pm_session` as a
+        belt-and-suspenders first-attach gate (#1867). A "fresh" Claude
+        pane shows only its welcome banner + a blank prompt box; an
+        established conversation has many lines of agent + user turns
+        scrolled into the pane. The check is intentionally conservative
+        — we look at a 200-line capture and count distinct non-empty
+        lines; any pane with significantly more content than a baseline
+        Claude/Codex banner is treated as "in a conversation, do not
+        re-prime". On capture failure we fall back to the historical
+        "send the primer" behaviour rather than silently skipping it.
+        """
+        if not target:
+            return False
+        try:
+            pane_text = self.tmux.capture_pane(target, lines=200)
+        except Exception:  # noqa: BLE001
+            return False
+        if not isinstance(pane_text, str) or not pane_text:
+            return False
+        non_empty = [line for line in pane_text.splitlines() if line.strip()]
+        # Baseline Claude/Codex banners are well under ~30 non-empty
+        # lines on first launch (including the box-drawing prompt). A
+        # real conversation grows the scrollback well past that
+        # threshold within a single exchange.
+        return len(non_empty) >= 40
 
     def _show_live_session(self, supervisor, session_name: str, window_target: str) -> None:
         # Mount-time identity check (replaces the legacy bare-string

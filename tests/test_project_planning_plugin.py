@@ -588,6 +588,139 @@ def test_architect_profile_points_at_research_stage() -> None:
     assert "research" in text.lower()
 
 
+def _make_architect_context(tmp_path: Path, *, persona_name: str | None):
+    """Build an ``AgentProfileContext`` keyed to the architect session.
+
+    Used by the persona-template tests below — they exercise
+    :class:`MarkdownPromptProfile`'s ``{persona_name}`` substitution
+    branch, which is keyed off the project's configured ``persona_name``
+    with a fallback to the architect-role default ("Archie").
+    """
+    from pollypm.agent_profiles.base import AgentProfileContext
+    from pollypm.models import (
+        AccountConfig,
+        KnownProject,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectKind,
+        ProjectSettings,
+        ProviderKind,
+        SessionConfig,
+    )
+
+    project_root = tmp_path / "repo"
+    project_root.mkdir(exist_ok=True)
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=tmp_path,
+            base_dir=tmp_path / ".pollypm",
+            logs_dir=tmp_path / ".pollypm/logs",
+            snapshots_dir=tmp_path / ".pollypm/snapshots",
+            state_db=tmp_path / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_primary"),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+                home=tmp_path / ".pollypm/homes/claude_primary",
+            )
+        },
+        sessions={
+            "architect": SessionConfig(
+                name="architect",
+                role="architect",
+                provider=ProviderKind.CLAUDE,
+                account="claude_primary",
+                cwd=project_root,
+                project="demo",
+                agent_profile="architect",
+            )
+        },
+        projects={
+            "demo": KnownProject(
+                key="demo",
+                path=project_root,
+                name="Demo",
+                kind=ProjectKind.GIT,
+                persona_name=persona_name,
+            )
+        },
+    )
+    return AgentProfileContext(
+        config=config,
+        session=config.sessions["architect"],
+        account=config.accounts["claude_primary"],
+    )
+
+
+def test_architect_profile_substitutes_project_persona_name(
+    tmp_path: Path,
+) -> None:
+    """``architect.md`` ships with a ``{persona_name}`` placeholder; when
+    a project configures ``persona_name`` (e.g. samblog → "Sage") the
+    rendered system prompt must greet the agent with that name, not the
+    architect-role default.
+
+    Regression for the self-contradicting-identity bug captured in the
+    #1867 follow-up: pre-fix the architect's system prompt said "You
+    are Archie" while the cockpit chat-open primer addressed the same
+    session as "Sage", leaving the agent visibly confused about its
+    own name. The substitution happens at prompt-build time so the
+    file written by ``_write_claude_system_prompt_to_disk`` carries
+    the correct persona before the launch argv references it.
+    """
+    from pollypm.plugin_host import ExtensionHost
+
+    host = ExtensionHost(tmp_path)
+    profile = host.get_agent_profile("architect")
+    context = _make_architect_context(tmp_path, persona_name="Sage")
+    prompt = profile.build_prompt(context)
+    assert prompt is not None
+    assert "You are Sage, the architect" in prompt
+    assert "{persona_name}" not in prompt
+    assert "You are Archie, the architect" not in prompt
+
+
+def test_architect_profile_falls_back_to_archie_without_persona(
+    tmp_path: Path,
+) -> None:
+    """Projects that never picked a ``persona_name`` keep the historical
+    architect default ("Archie") so the fallback path mirrors
+    ``role_contract.py``'s role-registry default. This is the same
+    precedence ``_resolve_project_chat_persona`` uses for the rail
+    label, keeping the two surfaces in lockstep.
+    """
+    from pollypm.plugin_host import ExtensionHost
+
+    host = ExtensionHost(tmp_path)
+    profile = host.get_agent_profile("architect")
+    context = _make_architect_context(tmp_path, persona_name=None)
+    prompt = profile.build_prompt(context)
+    assert prompt is not None
+    assert "You are Archie, the architect" in prompt
+    assert "{persona_name}" not in prompt
+
+
+def test_architect_profile_no_context_falls_back_to_archie(
+    tmp_path: Path,
+) -> None:
+    """Callers that pass ``context=None`` (existing
+    :func:`test_profile_prompt_is_substantive` parametrized case)
+    must still see the placeholder substituted — otherwise the
+    rendered file would contain a literal ``{persona_name}`` token
+    and the agent would read its own name as a template variable.
+    """
+    from pollypm.plugin_host import ExtensionHost
+
+    host = ExtensionHost(tmp_path)
+    profile = host.get_agent_profile("architect")
+    prompt = profile.build_prompt(context=None)
+    assert prompt is not None
+    assert "{persona_name}" not in prompt
+    assert "You are Archie, the architect" in prompt
+
+
 # ---------------------------------------------------------------------------
 # pp05 — tree-of-plans: 2-3 candidates, critics evaluate all, synthesis picks winner
 # ---------------------------------------------------------------------------

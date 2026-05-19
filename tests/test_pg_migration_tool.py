@@ -329,6 +329,166 @@ def test_parse_json_text_handles_text_and_objects():
 
 
 # --------------------------------------------------------------------- #
+# project_key stamping — unit tests around _convert_row (no pg required)
+# --------------------------------------------------------------------- #
+
+
+def _fake_row(mapping):
+    """sqlite3.Row stand-in: supports both ``row[col]`` and ``in`` checks
+    enough for _convert_row's needs."""
+    class _Row:
+        def __init__(self, data):
+            self._d = data
+
+        def __getitem__(self, key):
+            return self._d[key]
+
+    return _Row(mapping)
+
+
+def test_table_specs_flag_every_project_key_table():
+    """Every pg table with a project_key column must be flagged for
+    injection so an empty / missing source value is backfilled — fixes
+    the bug where workspace-DB migrations left project_key=''."""
+    from pollypm.storage.pg_migration_tool import TABLE_SPECS
+
+    expected = {
+        "work_tasks",
+        "messages",
+        "memory_entries",
+        "checkpoints",
+        "worktrees",
+        "token_samples",
+        "token_usage_hourly",
+        "architect_resume_tokens",
+    }
+    flagged = {
+        spec.pg_table for spec in TABLE_SPECS if spec.inject_project_key
+    }
+    assert expected.issubset(flagged), (
+        f"missing project_key injection on: {expected - flagged}"
+    )
+
+    # work_tasks must use its ``project`` column as the fallback so
+    # workspace-DB rows (where the descriptor's project_key is empty)
+    # still get a non-empty project_key.
+    work_spec = next(s for s in TABLE_SPECS if s.pg_table == "work_tasks")
+    assert work_spec.project_key_fallback_col == "project"
+
+
+def test_convert_row_work_tasks_stamps_project_key_from_project_col():
+    """work_tasks: source has ``project`` but no ``project_key`` column.
+    The migration must inject project_key = row.project so cockpit
+    queries that filter by project_key work after migration."""
+    from pollypm.storage.pg_migration_tool import TABLE_SPECS, _convert_row
+
+    spec = next(s for s in TABLE_SPECS if s.sqlite_table == "work_tasks")
+    source_columns = ["project", "task_number", "title"]
+    target_columns = {"project", "task_number", "title", "project_key"}
+    row = _fake_row({"project": "demo", "task_number": 1, "title": "T"})
+
+    cols, vals = _convert_row(
+        row,
+        source_columns=source_columns,
+        spec=spec,
+        project_key="",  # workspace-DB descriptor — empty on purpose.
+        target_columns=target_columns,
+    )
+    by_col = dict(zip(cols, vals))
+    assert by_col["project"] == "demo"
+    assert by_col["project_key"] == "demo"
+
+
+def test_convert_row_messages_stamps_from_source_descriptor():
+    """messages: source has no project_key column. When the descriptor
+    has one (per-project DB case) it must land on the row."""
+    from pollypm.storage.pg_migration_tool import TABLE_SPECS, _convert_row
+
+    spec = next(s for s in TABLE_SPECS if s.sqlite_table == "messages")
+    source_columns = ["scope", "type", "subject"]
+    target_columns = {"scope", "type", "subject", "project_key"}
+    row = _fake_row({"scope": "inbox", "type": "notify", "subject": "hi"})
+
+    cols, vals = _convert_row(
+        row,
+        source_columns=source_columns,
+        spec=spec,
+        project_key="myproject",
+        target_columns=target_columns,
+    )
+    by_col = dict(zip(cols, vals))
+    assert by_col["project_key"] == "myproject"
+
+
+def test_convert_row_prefers_non_empty_source_project_key():
+    """When the source row carries a non-empty project_key (e.g.
+    checkpoints) we keep it instead of overriding with the descriptor."""
+    from pollypm.storage.pg_migration_tool import TABLE_SPECS, _convert_row
+
+    spec = next(s for s in TABLE_SPECS if s.sqlite_table == "checkpoints")
+    source_columns = ["session_name", "project_key", "level"]
+    target_columns = {"session_name", "project_key", "level"}
+    row = _fake_row(
+        {"session_name": "s1", "project_key": "real-project", "level": "info"}
+    )
+
+    cols, vals = _convert_row(
+        row,
+        source_columns=source_columns,
+        spec=spec,
+        project_key="descriptor-project",
+        target_columns=target_columns,
+    )
+    by_col = dict(zip(cols, vals))
+    assert by_col["project_key"] == "real-project"
+
+
+def test_convert_row_overrides_empty_source_project_key():
+    """A source row with an empty project_key gets backfilled from the
+    descriptor — preserves column order so executemany's columns_for_insert
+    invariant holds across the batch."""
+    from pollypm.storage.pg_migration_tool import TABLE_SPECS, _convert_row
+
+    spec = next(s for s in TABLE_SPECS if s.sqlite_table == "worktrees")
+    source_columns = ["project_key", "lane_kind", "path"]
+    target_columns = {"project_key", "lane_kind", "path"}
+    row = _fake_row({"project_key": "", "lane_kind": "task", "path": "/x"})
+
+    cols, vals = _convert_row(
+        row,
+        source_columns=source_columns,
+        spec=spec,
+        project_key="from-descriptor",
+        target_columns=target_columns,
+    )
+    # Column order is exactly the source order; project_key was
+    # rewritten in place, not appended.
+    assert cols == ("project_key", "lane_kind", "path")
+    assert vals[0] == "from-descriptor"
+
+
+def test_convert_row_workspace_db_work_tasks_does_not_fallback_to_empty():
+    """Regression: workspace-DB migration (descriptor.project_key='')
+    must still produce a non-empty project_key for work_tasks via the
+    row's ``project`` column."""
+    from pollypm.storage.pg_migration_tool import TABLE_SPECS, _convert_row
+
+    spec = next(s for s in TABLE_SPECS if s.sqlite_table == "work_tasks")
+    source_columns = ["project", "task_number"]
+    target_columns = {"project", "task_number", "project_key"}
+    row = _fake_row({"project": "pollypm", "task_number": 7})
+
+    _, vals = _convert_row(
+        row,
+        source_columns=source_columns,
+        spec=spec,
+        project_key="",
+        target_columns=target_columns,
+    )
+    assert "pollypm" in vals
+
+
+# --------------------------------------------------------------------- #
 # Pg-backed tests
 # --------------------------------------------------------------------- #
 

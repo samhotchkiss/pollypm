@@ -109,8 +109,6 @@ RENAME_SUFFIX_PREFIX = ".pre-pg-"
 
 # Tables copied per source. Order matters for FK validity in pg:
 # parents (work_tasks, work_flow_templates) must land before children.
-# Each entry is ``(sqlite_table, pg_table, json_cols, ts_cols, bool_cols,
-# add_project_key_from_source: bool)``.
 #
 # ``json_cols`` — sqlite columns that store TEXT-encoded JSON; the
 # migrator parses and re-encodes to pg's jsonb adapter.
@@ -118,10 +116,17 @@ RENAME_SUFFIX_PREFIX = ".pre-pg-"
 # datetime for pg's timestamptz adapter.
 # ``bool_cols`` — sqlite columns that store 0/1 INTEGER; coerced to
 # Python bool for pg's boolean adapter.
-# ``inject_project_key`` — when True, the migrator adds a synthetic
-# ``project_key`` column to the inserted row using the source DB's
-# derived project key (per-project DB filename) when the source row
-# doesn't carry one.
+# ``inject_project_key`` — when True, the migrator ensures the
+# destination ``project_key`` column is populated, with this precedence:
+#   1. A non-empty value already on the source row.
+#   2. The per-table fallback (``project_key_fallback_col``), e.g.
+#      ``work_tasks.project`` carries the binding even though the source
+#      row has no native ``project_key`` column.
+#   3. The source DB's derived project key (per-project DB filename).
+# Tables whose source schema has a native ``project_key`` column
+# (checkpoints, worktrees, token_samples, token_usage_hourly,
+# architect_resume_tokens) still set this flag so an empty value gets
+# backfilled from the descriptor instead of landing as ``''``.
 @dataclass(frozen=True)
 class TableSpec:
     sqlite_table: str
@@ -130,6 +135,11 @@ class TableSpec:
     ts_cols: tuple[str, ...] = ()
     bool_cols: tuple[str, ...] = ()
     inject_project_key: bool = False
+    # Source column whose row value should be used as the project_key
+    # when the source row has no native (or only-empty) ``project_key``.
+    # Used by ``work_tasks`` where each row carries ``project`` even in
+    # the workspace-DB case.
+    project_key_fallback_col: str | None = None
 
 
 # Order: schema_version / FK-parents first, children after.
@@ -175,21 +185,25 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
         sqlite_table="checkpoints",
         pg_table="checkpoints",
         ts_cols=("created_at",),
+        inject_project_key=True,
     ),
     TableSpec(
         sqlite_table="worktrees",
         pg_table="worktrees",
         ts_cols=("created_at", "updated_at"),
+        inject_project_key=True,
     ),
     TableSpec(
         sqlite_table="token_samples",
         pg_table="token_samples",
         ts_cols=("observed_at",),
+        inject_project_key=True,
     ),
     TableSpec(
         sqlite_table="token_usage_hourly",
         pg_table="token_usage_hourly",
         ts_cols=("updated_at",),
+        inject_project_key=True,
     ),
     # Messages — the unified inbox surface.
     TableSpec(
@@ -213,6 +227,9 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
         json_cols=("gates",),
     ),
     # Work tasks — the FK parent for the rest of the work-* tables.
+    # The source ``project`` column carries the per-row project binding
+    # even in the workspace-DB case (where ``source.project_key`` is
+    # empty), so map it as the ``project_key`` fallback.
     TableSpec(
         sqlite_table="work_tasks",
         pg_table="work_tasks",
@@ -220,6 +237,7 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
         ts_cols=("created_at", "updated_at"),
         bool_cols=("requires_human_review",),
         inject_project_key=True,
+        project_key_fallback_col="project",
     ),
     TableSpec(
         sqlite_table="work_task_delete_audit_outbox",
@@ -279,6 +297,7 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
         sqlite_table="architect_resume_tokens",
         pg_table="architect_resume_tokens",
         ts_cols=("captured_at", "last_active_at"),
+        inject_project_key=True,
     ),
     TableSpec(
         sqlite_table="workspace_state",
@@ -761,8 +780,12 @@ def _convert_row(
       real jsonb.
     * timestamptz columns parse the ISO-8601 TEXT to a ``datetime``.
     * boolean columns coerce 0/1 to bool.
-    * ``project_key`` is appended (or substituted) when the spec
-      requires it and the source row doesn't already carry one.
+    * ``project_key`` is stamped with the first non-empty of: the
+      source row's ``project_key`` value, the per-table fallback column
+      (e.g. ``work_tasks.project``), or the source DB's derived project
+      key. This closes the gap where workspace-DB rows used to land
+      with ``project_key = ''`` and broke every cockpit query that
+      filters by project (#1737 follow-up).
     """
     from psycopg.types.json import Jsonb
 
@@ -772,6 +795,11 @@ def _convert_row(
 
     cols_out: list[str] = []
     vals_out: list[Any] = []
+
+    # Track whether we've emitted project_key already (and what value)
+    # so the post-loop injection step can decide whether to append or
+    # overwrite.
+    project_key_emitted_idx: int | None = None
 
     for col in source_columns:
         if col not in target_columns:
@@ -792,16 +820,38 @@ def _convert_row(
             cols_out.append(col)
             vals_out.append(_coerce_bool(raw))
             continue
+        if col == "project_key":
+            project_key_emitted_idx = len(cols_out)
         cols_out.append(col)
         vals_out.append(raw)
 
     if spec.inject_project_key and "project_key" in target_columns:
-        # Only inject when the source row didn't supply one. For
-        # workspace-DB tables that already carry project_key (e.g.
-        # checkpoints/worktrees) this branch is skipped.
-        if "project_key" not in source_columns:
-            cols_out.append("project_key")
-            vals_out.append(project_key)
+        # Resolve the project_key with the documented precedence:
+        # 1. Source row's non-empty value (if the column exists).
+        # 2. Per-table fallback column (e.g. work_tasks.project).
+        # 3. Source DB descriptor's project_key.
+        existing = (
+            vals_out[project_key_emitted_idx]
+            if project_key_emitted_idx is not None
+            else None
+        )
+        if existing is None or existing == "":
+            resolved: str = ""
+            fallback_col = spec.project_key_fallback_col
+            if fallback_col and fallback_col in source_columns:
+                fallback_val = row[fallback_col]
+                if fallback_val is not None and fallback_val != "":
+                    resolved = str(fallback_val)
+            if not resolved:
+                resolved = project_key or ""
+            if project_key_emitted_idx is not None:
+                # Overwrite the empty source value in place — keeps the
+                # column-order invariant the executemany batching relies
+                # on (columns_for_insert is derived from the first row).
+                vals_out[project_key_emitted_idx] = resolved
+            else:
+                cols_out.append("project_key")
+                vals_out.append(resolved)
 
     return tuple(cols_out), tuple(vals_out)
 

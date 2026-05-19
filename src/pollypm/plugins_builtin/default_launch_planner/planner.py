@@ -195,7 +195,16 @@ class DefaultLaunchPlanner:
             # place until the resumed architect produces output (the
             # heartbeat sweep clears it on first non-empty snapshot).
             if effective.role == "architect" and effective.project:
-                resume_token = ctx.store.get_architect_resume_token(effective.project)
+                # Use the pg facade directly rather than ``ctx.store`` —
+                # ``plan_launches_readonly`` (dashboard / Home view) builds
+                # a Supervisor shell with ``store=None`` and the planner
+                # must keep working for those read-only callers. The
+                # facade resolves its own pool, so we skip the legacy
+                # StateStore hop entirely (#1862; pg cutover #1737).
+                from pollypm.storage.pg_architect_resume import (
+                    get_architect_resume_token,
+                )
+                resume_token = get_architect_resume_token(effective.project)
                 if resume_token is not None and resume_token.provider == account.provider.value:
                     from pollypm.acct.registry import get_provider as _get_acct_provider
                     acct_adapter = _get_acct_provider(account.provider.value)

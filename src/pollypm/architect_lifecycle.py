@@ -188,8 +188,19 @@ def resolve_launch_argv(
     confirm and clear) or it explicitly fails. Leaving the token
     means a crash partway through resume doesn't lose the warm
     context — the next attempt picks up from the same UUID.
+
+    ``store`` may be ``None`` for read-only callers (e.g. the
+    dashboard's :func:`plan_launches_readonly` shell) — we route the
+    token lookup through the pg facade directly in that case so the
+    planner stays usable without a legacy StateStore (#1862; #1737).
     """
-    record = store.get_architect_resume_token(project_key)
+    if store is None:
+        from pollypm.storage.pg_architect_resume import (
+            get_architect_resume_token as _pg_get_token,
+        )
+        record = _pg_get_token(project_key)
+    else:
+        record = store.get_architect_resume_token(project_key)
     if record is None or record.provider != provider.name:
         # No token, or token belongs to a different provider (e.g.
         # account was switched). Always fall back to fresh launch.

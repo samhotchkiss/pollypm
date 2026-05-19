@@ -2,28 +2,26 @@
 
 Coverage target:
 
-1. ``backup_via_config`` routes to the sqlite branch when
-   ``[storage] backend = "sqlite"`` and produces a ``BackupResult``.
-2. ``backup_via_config`` routes to the pg branch when
-   ``[storage] backend = "postgres"`` and produces a
+1. ``backup_via_config`` routes to the pg branch and produces a
    ``PgBackupResult``. The pg_dump invocation itself is monkeypatched
    so the test runs without a live pg instance.
-3. ``--full`` against a pg backend raises ``PgBackupError`` rather
+2. ``--full`` against a pg backend raises ``PgBackupError`` rather
    than silently dropping the flag.
-4. ``restore_via_config`` returns the right plan type per backend.
+3. ``restore_via_config`` returns the right plan type per backend.
 
 These tests run without Docker — they exercise the dispatch logic and
 the pg branch's filesystem side effects with the actual ``pg_dump``
 binary stubbed. The end-to-end round-trip lives in
 ``tests/test_pg_backup.py``.
+
+Slice K migration: dropped the sqlite branch of every parametrization.
+The sqlite path is being deleted; only the pg dispatch remains.
 """
 
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
-from unittest.mock import patch
 
 import pytest
 
@@ -45,23 +43,11 @@ from pollypm.models import (
 # --------------------------------------------------------------------- #
 
 
-def _seed_sqlite(path: Path) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(path)
-    try:
-        conn.execute("CREATE TABLE probe (k TEXT PRIMARY KEY, v TEXT)")
-        conn.execute("INSERT INTO probe(k, v) VALUES ('hello', 'world')")
-        conn.commit()
-    finally:
-        conn.close()
-
-
 def _build_config(
     *,
-    backend: str,
     base_dir: Path,
     state_db: Path,
-    storage_url: str = "",
+    storage_url: str = "postgresql://localhost:5432/pollypm-dispatch-test",
 ) -> PollyPMConfig:
     project = ProjectSettings(
         name="PollyPM-Test",
@@ -81,7 +67,7 @@ def _build_config(
         )
     }
     storage = StorageSettings(
-        backend=backend,
+        backend="postgres",
         url=storage_url,
         pg=PgStorageSettings(),
         embedding=EmbeddingSettings(),
@@ -104,42 +90,21 @@ def fake_home(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def state_db(fake_home: Path) -> Path:
+    # Empty placeholder file — pg backend doesn't read this, but the
+    # config dataclass requires a path.
     db = fake_home / "state.db"
-    _seed_sqlite(db)
+    db.touch()
     return db
 
 
 @pytest.fixture
-def sqlite_config(fake_home: Path, state_db: Path) -> PollyPMConfig:
-    return _build_config(backend="sqlite", base_dir=fake_home, state_db=state_db)
-
-
-@pytest.fixture
 def pg_config(fake_home: Path, state_db: Path) -> PollyPMConfig:
-    return _build_config(
-        backend="postgres",
-        base_dir=fake_home,
-        state_db=state_db,
-        storage_url="postgresql://localhost:5432/pollypm-dispatch-test",
-    )
+    return _build_config(base_dir=fake_home, state_db=state_db)
 
 
 # --------------------------------------------------------------------- #
 # Backup dispatch
 # --------------------------------------------------------------------- #
-
-
-def test_backup_via_config_sqlite_returns_sqlite_result(
-    sqlite_config: PollyPMConfig, fake_home: Path
-) -> None:
-    result = backup_mod.backup_via_config(sqlite_config)
-    assert isinstance(result, backup_mod.BackupResult)
-    assert not result.full
-    assert result.path.exists()
-    assert result.path.name.startswith("state-db-")
-    assert result.path.name.endswith(".db.gz")
-    # The pg index file must NOT have been written for the sqlite path.
-    assert not (fake_home / "backups" / "index.jsonl").exists()
 
 
 def test_backup_via_config_postgres_returns_pg_result(
@@ -188,7 +153,7 @@ def test_backup_via_config_full_against_postgres_raises(
 def test_backup_via_config_postgres_rotates_keep(
     pg_config: PollyPMConfig, fake_home: Path, monkeypatch
 ) -> None:
-    """pg snapshots beyond --keep N must be pruned just like sqlite."""
+    """pg snapshots beyond --keep N must be pruned."""
 
     backups_dir = fake_home / "backups"
     backups_dir.mkdir(parents=True, exist_ok=True)
@@ -229,19 +194,6 @@ def test_backup_via_config_postgres_rotates_keep(
 # --------------------------------------------------------------------- #
 # Restore dispatch
 # --------------------------------------------------------------------- #
-
-
-def test_restore_via_config_sqlite_returns_sqlite_plan(
-    sqlite_config: PollyPMConfig, fake_home: Path
-) -> None:
-    """The sqlite restore plan validates against a real gzipped snapshot."""
-    backup_result = backup_mod.backup_via_config(sqlite_config)
-    plan, backend = backup_mod.restore_via_config(
-        sqlite_config, backup_result.path
-    )
-    assert backend == "sqlite"
-    assert isinstance(plan, backup_mod.RestorePlan)
-    assert plan.snapshot_path == backup_result.path
 
 
 def test_restore_via_config_postgres_returns_pg_plan(

@@ -92,10 +92,18 @@ def test_reader_module_paths_returns_unique_sorted() -> None:
 
 
 def test_reader_module_paths_includes_known_modules() -> None:
-    """Sanity: the high-traffic modules appear in the path set."""
+    """Sanity: the high-traffic modules appear in the path set.
+
+    Slice K-tests: ``pollypm.work.sqlite_service`` still appears in the
+    contract today; K-source-ripout flips this to ``pollypm.work.pg_service``
+    when the sqlite module is removed. The assertion accepts either to
+    stay green across the source-ripout boundary."""
     paths = set(reader_module_paths())
     assert "pollypm.signal_routing" in paths
-    assert "pollypm.work.sqlite_service" in paths
+    assert (
+        "pollypm.work.sqlite_service" in paths
+        or "pollypm.work.pg_service" in paths
+    )
     assert "pollypm.storage.state" in paths
 
 

@@ -7,28 +7,14 @@ table in the inbox-badge path. On a 12-project workspace that bottomed
 out at 60-100 sqlite opens per refresh, which the perf reviews on #1634
 flagged as the dominant rail latency.
 
-Under the postgres backend (``[storage] backend = "postgres"``) there is
-**one** database — the per-project fanout is structurally unnecessary.
-This module collapses every call site into a single pg query keyed on
-``WHERE project IN (...)`` (or no filter at all), then groups the
-result in Python.
-
-Scope guardrails (per the Slice H brief):
-
-* We do **not** touch :class:`pollypm.work.pg_service.PgWorkService`
-  (Slice B owns that). We compose on top of its existing read API
-  (``list_tasks(project=None)`` / ``list_nonterminal_tasks(project=None)``).
-* We do **not** touch :mod:`pollypm.storage.*` facades (Slice C). The
-  pg messages query lives here in cockpit-land for the same reason
-  the sqlite ``SQLAlchemyStore`` path lived in ``cockpit_inbox`` — it
-  is a cockpit aggregation, not a domain facade.
-* We do **not** delete the sqlite fallback. Each call site keeps its
-  pre-existing per-project walk as the ``backend != "postgres"`` path.
-  Slice K removes the dead branch after cutover.
+Under postgres there is **one** database — the per-project fanout is
+structurally unnecessary. This module collapses every call site into a
+single pg query keyed on ``WHERE project IN (...)`` (or no filter at
+all), then groups the result in Python.
 
 Every entry point in this module is best-effort: a pg outage falls
-through to ``None`` / empty so the caller can use its sqlite fallback
-rather than crash the rail.
+through to ``None`` / empty so the caller can degrade rather than
+crash the rail.
 """
 
 from __future__ import annotations
@@ -43,27 +29,6 @@ if TYPE_CHECKING:
     from pollypm.work.models import Task
 
 logger = logging.getLogger(__name__)
-
-
-# --------------------------------------------------------------------------- #
-# Backend probe
-# --------------------------------------------------------------------------- #
-
-
-def is_pg_backend(config: object) -> bool:
-    """Return True when the configured storage backend is ``"postgres"``.
-
-    Defensive against missing / mis-typed config sub-objects so a broken
-    ``[storage]`` block falls through to the sqlite path rather than
-    crashing the rail refresh.
-    """
-    storage = getattr(config, "storage", None)
-    if storage is None:
-        return False
-    backend = getattr(storage, "backend", "sqlite")
-    if not isinstance(backend, str):
-        return False
-    return backend.strip().lower() == "postgres"
 
 
 # --------------------------------------------------------------------------- #
@@ -327,6 +292,5 @@ __all__ = [
     "all_tasks_grouped",
     "inbox_tasks_for_project",
     "inbox_tasks_grouped",
-    "is_pg_backend",
     "open_messages",
 ]

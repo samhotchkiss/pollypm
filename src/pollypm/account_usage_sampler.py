@@ -24,28 +24,24 @@ from pollypm.providers import get_provider
 from pollypm.runtimes import get_runtime
 from pollypm.session_services import create_tmux_client
 from pollypm.storage.records import AccountUsageRecord
-from pollypm.storage.state import StateStore
 
 logger = logging.getLogger(__name__)
 
 
 def _read_cached_usage(config, account_name: str) -> AccountUsageRecord | None:
-    """Read cached usage row, routing through pg_accounts on the pg backend."""
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    """Read cached usage row via pg_accounts."""
+    del config  # pg backend reads through the pool directly
+    from pollypm.storage.pg_accounts import get_account_usage
 
-    if is_pg_backend(config):
-        from pollypm.storage.pg_accounts import get_account_usage
-
-        return get_account_usage(account_name)
-    with StateStore(config.project.state_db) as store:
-        return store.get_account_usage(account_name)
+    return get_account_usage(account_name)
 
 
 def _write_cached_usage(config, sample: "AccountUsageSample") -> None:
-    """Persist a usage sample, routing through pg_accounts on the pg backend."""
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    """Persist a usage sample via pg_accounts."""
+    del config  # pg backend writes through the pool directly
+    from pollypm.storage.pg_accounts import upsert_account_usage
 
-    kwargs = dict(
+    upsert_account_usage(
         account_name=sample.account_name,
         provider=sample.provider.value,
         plan=sample.plan,
@@ -57,13 +53,6 @@ def _write_cached_usage(config, sample: "AccountUsageSample") -> None:
         reset_at=sample.reset_at,
         period_label=sample.period_label,
     )
-    if is_pg_backend(config):
-        from pollypm.storage.pg_accounts import upsert_account_usage
-
-        upsert_account_usage(**kwargs)
-        return
-    with StateStore(config.project.state_db) as store:
-        store.upsert_account_usage(**kwargs)
 
 # Session-name prefix for the throwaway tmux sessions this module spawns.
 # Boot-time orphan sweeps and the per-probe cleanup both pivot on this

@@ -408,13 +408,6 @@ class TestSkipGates:
 
 
 class TestValidateAdvance:
-    @pytest.mark.xfail(
-        reason=(
-            "PgWorkService.validate_advance() returns empty list "
-            "instead of evaluating gates (#1774)"
-        ),
-        strict=False,
-    )
     def test_dry_run(self, svc):
         """Create and claim a task. validate_advance shows gate results."""
         task = _create_standard_task(svc)

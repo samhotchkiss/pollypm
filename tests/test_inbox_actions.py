@@ -19,18 +19,6 @@ from pollypm.work.service_support import (
 )
 
 
-# PgWorkService is missing the four inbox interaction methods
-# (add_reply/list_replies/mark_read/archive_task) — see #1776. Module-
-# level xfail; tests will xpass automatically once #1776 lands.
-pytestmark = pytest.mark.xfail(
-    reason=(
-        "PgWorkService inbox interaction methods "
-        "(add_reply/list_replies/mark_read/archive_task) not implemented (#1776)"
-    ),
-    strict=False,
-)
-
-
 @pytest.fixture
 def svc(pg_work_service):
     return pg_work_service

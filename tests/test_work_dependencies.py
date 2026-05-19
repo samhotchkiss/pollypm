@@ -14,19 +14,6 @@ from pollypm.work.service_support import (
 )
 
 
-# Most of this module exercises the dependency surface
-# (link/blocks/blocked_by/auto-unblock) that ``PgWorkService`` doesn't
-# implement yet (#1770). Mark the module-level xfail so the migration
-# lands without blocking on the production fix, per the K-tests rules.
-pytestmark = pytest.mark.xfail(
-    reason=(
-        "PgWorkService dependency surface (blocks/blocked/dependents) "
-        "is not yet implemented (#1770)"
-    ),
-    strict=False,
-)
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

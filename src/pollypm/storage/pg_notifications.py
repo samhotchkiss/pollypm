@@ -132,15 +132,25 @@ def _advisory_lock_keys(
     it); the safety property we need is that the *same* tuple always
     serialises.
 
-    Why the key omits ``dedupe_scope`` (#1841)
-    ------------------------------------------
-    The normal-scope predicate matches rows of *any* scope (so a
-    forced kickoff also throttles ordinary follow-up sweeps). If the
-    lock were keyed on scope, a concurrent ``normal`` + ``forced_kickoff``
-    pair for the same tuple would land on different advisory keys,
-    both pass their check-and-insert, and both insert. Keying the
-    lock on ``(session, task, version)`` alone forces every claim
-    against the same tuple to serialise, regardless of scope.
+    Why the key omits ``dedupe_scope`` (#1841 / #1852)
+    --------------------------------------------------
+    The advisory key is scope-agnostic so that two same-instant
+    callers against the same ``(session, task, version)`` tuple
+    serialise into a single check-and-insert window. After
+    serialisation, the dedupe *predicate* (NOT the lock) decides
+    whether the second caller's claim is suppressed — and that
+    predicate is scope-aware (see :func:`claim_notification_slot`):
+
+      * normal caller — matches any recent scope (so a successful
+        forced kickoff throttles follow-up normal sweeps);
+      * non-normal caller — matches only its own scope (so a stale
+        normal row does not suppress an explicit forced kickoff —
+        #1852).
+
+    Keying the lock on scope would let a concurrent normal+forced
+    pair land on different advisory keys, both pass their selects
+    against an empty table, and both insert — defeating the #1841
+    same-instant serialisation guarantee.
     """
     import hashlib
 
@@ -176,21 +186,29 @@ def claim_notification_slot(
     concurrent caller blocks until we commit instead of racing past
     the empty SELECT.
 
-    * Returns ``None`` when a row already exists for
-      ``(session, task, execution_version)`` inside the
+    * For a ``normal`` caller: returns ``None`` when ANY recent row
+      exists for ``(session, task, execution_version)`` inside the
       ``window_seconds`` window, regardless of the existing row's
-      ``dedupe_scope`` (#1841 — concurrent normal-vs-forced calls
-      must dedupe to a single ping).
+      ``dedupe_scope``. A successful forced kickoff therefore
+      throttles subsequent normal sweeps.
+    * For a non-normal caller (e.g. ``forced_kickoff``): returns
+      ``None`` only when a recent row exists with the *same*
+      ``dedupe_scope``. A stale normal row inside the window does NOT
+      suppress the forced kickoff — that's the explicit user-driven
+      bypass (#922/#952/#1852).
     * Otherwise inserts a placeholder row with
       ``delivery_status='pending'`` and returns its ``id``. The caller
       then attempts the send and stamps the resulting status via
       :func:`update_notification_status`.
 
     The "forced kickoff bypasses stale normal" semantic from #922/#952
-    is preserved by the *caller's* ``window_seconds``: forced-kickoff
-    callers pass a short ``RECENT_SWEEPER_PING_SECONDS`` window, so a
-    truly stale normal row (older than ~60s) is filtered by the
-    ``created_at`` cutoff and the forced kickoff still fires.
+    is preserved by the scope-aware predicate above. The collapse to a
+    scope-agnostic predicate in #1848 (intended to close the #1841
+    same-instant concurrent race) over-reached and silently dropped the
+    bypass — restored here (#1852). Same-instant concurrent claims
+    against the *same* ``(session, task, version)`` tuple still
+    serialise correctly because the advisory lock is scope-agnostic;
+    only the dedupe *predicate* differentiates scope.
 
     Why an advisory lock (#1821)
     ----------------------------
@@ -235,21 +253,24 @@ def claim_notification_slot(
         # with no existing row would both pass the SELECT and both
         # INSERT.
         cur.execute("SELECT pg_advisory_xact_lock(%s, %s)", (key_a, key_b))
-        # #1841: the predicate matches rows of any scope inside the
-        # ``window_seconds`` cutoff. Combined with the scope-agnostic
-        # advisory key above this serialises a concurrent
-        # ``normal`` + ``forced_kickoff`` race and the second caller
-        # sees the first's just-inserted row regardless of scope.
+        # #1852: scope-aware dedupe predicate restores the forced
+        # bypass that #1848's scope-agnostic collapse silently
+        # dropped. A ``normal`` caller matches recent rows of *any*
+        # scope (so a successful forced kickoff still throttles
+        # follow-up sweeps); a non-normal caller matches only rows of
+        # the SAME scope (so a stale ``normal`` row inside the window
+        # does NOT suppress an explicit forced kickoff — that's the
+        # whole point of forcing).
         #
-        # The "forced bypasses stale normal" semantic from #922/#952 is
-        # preserved by the *caller's* window: forced-kickoff callers
-        # pass ``window_seconds=RECENT_SWEEPER_PING_SECONDS`` (60s),
-        # while normal sweeps pass the much longer throttle window. A
-        # stale normal row outside the forced caller's 60s cutoff is
-        # filtered by ``created_at >= cutoff`` and the forced kickoff
-        # still fires. What this predicate change *does* fix is the
-        # narrow "same-instant concurrent claim" race that produces
-        # duplicate pings.
+        # Same-instant concurrent claims against the same
+        # ``(session, task, version)`` tuple still serialise correctly
+        # because the advisory key (above) is scope-agnostic: the
+        # second caller's transaction blocks behind the first's
+        # commit. After the lock is released, the second caller's
+        # SELECT sees the first's row — and decides whether to dedupe
+        # against it based on its OWN scope. Normal-after-forced
+        # dedupes (the throttle property); forced-after-normal goes
+        # through (the bypass property).
         cur.execute(
             """
             SELECT 1 FROM messages
@@ -257,6 +278,13 @@ def claim_notification_slot(
               AND scope = %s
               AND sender = %s
               AND COALESCE((payload_json->>'execution_version')::int, 0) = %s
+              AND (
+                %s = 'normal'
+                OR (
+                  %s <> 'normal'
+                  AND payload_json->>'dedupe_scope' = %s
+                )
+              )
               AND created_at >= %s
             LIMIT 1
             """,
@@ -264,6 +292,9 @@ def claim_notification_slot(
                 session_name,
                 task_id,
                 int(execution_version),
+                scope,
+                scope,
+                scope,
                 cutoff,
             ),
         )

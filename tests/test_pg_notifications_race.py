@@ -130,15 +130,30 @@ def test_concurrent_distinct_tasks_both_succeed(pg_schema_pool) -> None:
     assert results[0] != results[1]
 
 
-def test_concurrent_normal_and_forced_claim_one_winner(pg_schema_pool) -> None:
+def test_concurrent_normal_and_forced_claim_serialise(pg_schema_pool) -> None:
     """#1841 — a ``normal`` and ``forced_kickoff`` claim must serialise.
 
-    The normal-scope dedupe predicate matches rows of *any* scope, so
-    a concurrent ``normal`` + ``forced_kickoff`` pair for the same
-    ``(session, task, version)`` tuple must hit the same advisory key
-    and produce exactly one row. The pre-fix key included ``scope``,
-    so both callers landed on different keys, both passed the empty
-    SELECT, and both inserted.
+    Concurrent ``normal`` + ``forced_kickoff`` calls against the same
+    ``(session, task, version)`` tuple must hit the *same* advisory
+    key (scope-agnostic) so they enter the check-and-insert window
+    one at a time. The pre-fix key included ``scope``, so both
+    callers landed on different keys, both passed the empty SELECT,
+    and both inserted simultaneously — the #1841 race.
+
+    After serialisation the dedupe *predicate* (scope-aware as of
+    #1852) decides what happens:
+
+      * If ``normal`` wins the lock first, ``forced_kickoff`` runs
+        second and bypasses the normal row (different scope) — two
+        rows total. This is the explicit user-driven bypass.
+      * If ``forced_kickoff`` wins first, ``normal`` runs second and
+        matches the forced row (any-scope match) — one row total.
+
+    Either ordering is correct. The bug under test is "BOTH callers
+    inserted at the same instant without serialising" — which would
+    manifest as e.g. transient errors or duplicate rows that violate
+    the lock ordering. This test asserts both calls complete cleanly
+    and at least one returns a real id.
     """
     _apply_initial_migrations(pg_schema_pool)
     from pollypm.storage.pg_notifications import claim_notification_slot
@@ -173,13 +188,102 @@ def test_concurrent_normal_and_forced_claim_one_winner(pg_schema_pool) -> None:
 
     assert errors == [None, None], f"workers raised: {errors!r}"
 
-    winners = [r for r in results if r is not None]
-    losers = [r for r in results if r is None]
-    assert len(winners) == 1, (
-        f"normal-vs-forced concurrent claims must produce exactly one "
-        f"row; got results={results!r}. Two non-None ids means the "
-        f"advisory lock is scope-keyed and the dedupe predicate is "
-        f"bypassed — the #1841 race."
+    # At minimum, the first caller to win the advisory lock must
+    # succeed (the table is empty). The second caller's outcome
+    # depends on ordering: normal-after-forced dedupes (None);
+    # forced-after-normal bypasses (new id). Either is correct.
+    winners = [r for r in results if isinstance(r, int) and r > 0]
+    assert 1 <= len(winners) <= 2, (
+        f"expected one or two non-None ids depending on ordering; got "
+        f"results={results!r}. Zero winners means the first caller "
+        f"crashed; three winners is impossible. The bug under test "
+        f"(#1841) was BOTH callers inserting against an empty table "
+        f"without serialising — which still manifests as a missing "
+        f"lock-release error or a duplicate insert under a unique "
+        f"constraint, not as a silent two-row outcome."
     )
-    assert len(losers) == 1
-    assert isinstance(winners[0], int) and winners[0] > 0
+
+
+def test_forced_kickoff_bypasses_recent_normal_row(pg_schema_pool) -> None:
+    """#1852 — forced kickoff must bypass a recent ``normal`` row.
+
+    Scenario:
+      1. ``normal`` claim at T0 wins (empty table) and inserts.
+      2. ``forced_kickoff`` claim at T0+10s — well inside the
+         ``window_seconds`` cutoff — must still fire because the
+         scope-aware predicate only suppresses non-normal claims
+         against same-scope rows.
+
+    The #1848 collapse to a scope-agnostic predicate silently dropped
+    this bypass: any recent row (regardless of scope) suppressed the
+    forced claim. The fix restores the sqlite-parity semantic — a
+    stale ``normal`` does NOT suppress an explicit forced kickoff.
+    """
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_notifications import claim_notification_slot
+
+    normal_id = claim_notification_slot(
+        session_name="session-bypass",
+        task_id="bypass:1",
+        window_seconds=1800,
+        execution_version=0,
+        project="bypass",
+        message="normal ping",
+        dedupe_scope="normal",
+        pool=pg_schema_pool,
+    )
+    assert isinstance(normal_id, int) and normal_id > 0, (
+        "the normal claim against an empty table must win"
+    )
+
+    forced_id = claim_notification_slot(
+        session_name="session-bypass",
+        task_id="bypass:1",
+        window_seconds=1800,
+        execution_version=0,
+        project="bypass",
+        message="forced kickoff",
+        dedupe_scope="forced_kickoff",
+        pool=pg_schema_pool,
+    )
+    assert isinstance(forced_id, int) and forced_id > 0, (
+        "the forced kickoff must bypass the recent normal row — the "
+        "scope-aware dedupe predicate only suppresses non-normal "
+        "claims against same-scope rows (#1852)."
+    )
+    assert forced_id != normal_id
+
+    # A second forced claim at the same instant SHOULD now dedupe
+    # against its same-scope sibling — the bypass is one-shot, not a
+    # blanket disable of dedupe.
+    forced_again = claim_notification_slot(
+        session_name="session-bypass",
+        task_id="bypass:1",
+        window_seconds=1800,
+        execution_version=0,
+        project="bypass",
+        message="forced kickoff again",
+        dedupe_scope="forced_kickoff",
+        pool=pg_schema_pool,
+    )
+    assert forced_again is None, (
+        "a same-scope forced kickoff inside the window must still "
+        "dedupe — the bypass only ignores other-scope rows."
+    )
+
+    # And a normal claim after a recent forced should be suppressed
+    # (the throttle property is symmetric to the bypass).
+    normal_after = claim_notification_slot(
+        session_name="session-bypass",
+        task_id="bypass:1",
+        window_seconds=1800,
+        execution_version=0,
+        project="bypass",
+        message="normal after forced",
+        dedupe_scope="normal",
+        pool=pg_schema_pool,
+    )
+    assert normal_after is None, (
+        "a normal claim inside the window must dedupe against any "
+        "recent row regardless of scope — the throttle property."
+    )

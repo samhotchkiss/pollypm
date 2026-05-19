@@ -12,10 +12,6 @@ from pollypm.work.service_support import InvalidTransitionError
 runner = CliRunner()
 
 
-@pytest.mark.xfail(
-    reason="PgWorkService.queue() doesn't enforce requires_human_review gate yet (#1767)",
-    strict=False,
-)
 def test_requires_human_review_materializes_user_inbox_task(pg_work_service):
     svc = pg_work_service
     task = svc.create(
@@ -43,10 +39,6 @@ def test_requires_human_review_materializes_user_inbox_task(pg_work_service):
     assert [item.task_id for item in inbox_tasks(svc, project="demo")] == ["demo/2"]
 
 
-@pytest.mark.xfail(
-    reason="PgWorkService.queue() doesn't enforce requires_human_review gate yet (#1767)",
-    strict=False,
-)
 def test_human_review_approval_unlocks_queue_and_closes_request(pg_work_service):
     svc = pg_work_service
     task = svc.create(
@@ -72,10 +64,6 @@ def test_human_review_approval_unlocks_queue_and_closes_request(pg_work_service)
     assert context[-1].text == "looks safe"
 
 
-@pytest.mark.xfail(
-    reason="PgWorkService.queue() doesn't enforce requires_human_review gate yet (#1767)",
-    strict=False,
-)
 def test_operator_fast_track_requires_explicit_authorization(pg_work_service):
     svc = pg_work_service
     task = svc.create(

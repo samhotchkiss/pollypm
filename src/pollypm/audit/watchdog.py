@@ -2380,7 +2380,7 @@ def _detect_state_db_missing(
             project=project_key,
             subject=project_key,
             message=(
-                f"Workspace canonical state.db is missing"
+                "Workspace canonical state.db is missing"
                 + (f" at {canonical_db_path_str}" if canonical_db_path_str else "")
                 + (
                     " — only legacy archives remain (state.db.legacy-*)."
@@ -2390,10 +2390,10 @@ def _detect_state_db_missing(
                 )
             ),
             recommendation=(
-                f"Re-create the workspace state.db by opening it via "
-                f"``create_work_service`` (the schema replay rebuilds "
-                f"the tables); the heartbeat self-heal does this "
-                f"automatically."
+                "Re-create the workspace state.db by opening it via "
+                "``create_work_service`` (the schema replay rebuilds "
+                "the tables); the heartbeat self-heal does this "
+                "automatically."
             ),
             metadata={
                 "project_key": project_key,

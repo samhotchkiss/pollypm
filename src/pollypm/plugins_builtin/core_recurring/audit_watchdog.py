@@ -52,9 +52,6 @@ from pollypm.audit.watchdog import (
     RULE_TASK_PROGRESS_STALE,
     RULE_TASK_REVIEW_STALE,
     RULE_WORKER_SESSION_DEAD_LOOP,
-    TIER_1,
-    TIER_2,
-    TIER_3,
     WATCHDOG_ALERT_TYPE,
     WatchdogConfig,
     emit_escalation_dispatched,
@@ -1310,7 +1307,7 @@ def _self_heal_duplicate_advisor_tasks(
     )
     if not duplicate_ids:
         return counters
-    reason = f"duplicate advisor_review (auto-cleanup #1510)"
+    reason = "duplicate advisor_review (auto-cleanup #1510)"
     try:
         from pollypm.work import create_work_service
 

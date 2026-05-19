@@ -82,3 +82,10 @@ def _reset_store_cache_between_tests():
     yield
     if reset_store_cache is not None:
         reset_store_cache()
+
+
+# Pg-backed test fixtures (issue #1737, Slice A). Lives in a sibling
+# module so the heavy testcontainers / psycopg imports stay lazy
+# (``pytest_plugins`` is registered up-front but the fixtures within
+# only do their import work when actually invoked by a test).
+pytest_plugins = ["tests.conftest_pg"]

@@ -470,3 +470,89 @@ What an operator sees:
 - Repeated `worker.session_reaped` events for the same task can trip the
   watchdog's dead-loop rule and route an escalation to the project
   architect.
+
+## Setting up Postgres (issue #1737, Slice A foundation)
+
+PollyPM is migrating from per-project SQLite to a single Postgres
+instance with `pgvector` for semantic recall. Slice A ships the
+foundation — the pool, the schema, and the doctor probe — behind a
+feature flag. The sqlite backend remains the default until the cutover
+PR; the steps below are required only for operators opting into the
+new backend ahead of cutover, or for the test suite that exercises the
+`PgWorkService` skeleton.
+
+### Prerequisites
+
+- Postgres 16 or newer (`pgvector`'s HNSW indexes assume pg 16+).
+- The `vector` extension. Homebrew ships it as a separate formula.
+
+### macOS install
+
+```
+brew install postgresql@17 pgvector
+brew services start postgresql@17
+createdb pollypm
+psql pollypm -c "CREATE EXTENSION vector"
+```
+
+### Linux install (Debian / Ubuntu, pg 16 example)
+
+```
+sudo apt install postgresql-16 postgresql-16-pgvector
+sudo systemctl enable --now postgresql
+sudo -u postgres createdb pollypm
+sudo -u postgres psql pollypm -c "CREATE EXTENSION vector"
+```
+
+### Configure PollyPM to use Postgres
+
+Add to `~/.pollypm/pollypm.toml`:
+
+```toml
+[storage]
+backend = "postgres"
+# Optional — leaving this empty falls through to POLLYPM_PG_DSN, then
+# the default postgresql://localhost:5432/pollypm.
+url = "postgresql://localhost:5432/pollypm"
+
+[storage.pg]
+pool_min = 1
+pool_max = 10
+min_version = "16.0"
+
+[storage.embedding]
+model = "openai:text-embedding-3-small"
+provider = "openai"
+api_key_env = "OPENAI_API_KEY"
+```
+
+Override the DSN per-process with the env var:
+
+```
+export POLLYPM_PG_DSN="postgresql://user:pw@host:5432/pollypm"
+```
+
+`POLLYPM_PG_DSN` wins over `[storage] url`, mirroring `POLLYPM_HOME`.
+
+### Smoke test
+
+Run the pg-only doctor probe — fast feedback whether the cockpit will
+boot against the configured backend:
+
+```
+pm doctor-pg-connection
+```
+
+The check returns `ok` when pg is reachable, the server version is at
+least the configured `min_version`, and the `vector` extension is
+installed. Failures emit the standard three-question doctor message
+with an actionable fix command.
+
+### Flipping the backend back to sqlite
+
+Until the cutover PR lands, the safe rollback is to set `[storage]
+backend = "sqlite"` and restart. Slice A intentionally leaves the
+sqlite implementation in place — no data migration is required when
+the flag is flipped before any pg writes happen. After Slices B–H land
+and the cutover is complete the rollback path runs through the
+pre-cutover snapshot documented in the migration PR notes.

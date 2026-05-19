@@ -575,6 +575,7 @@ check_installed_version_matches_pyproject = _doctor_install_state.check_installe
 check_config_file = _doctor_install_state.check_config_file
 check_provider_account_configured = _doctor_install_state.check_provider_account_configured
 check_storage_backend = _doctor_install_state.check_storage_backend
+check_pg_connection = _doctor_install_state.check_pg_connection
 check_registered_providers = _doctor_install_state.check_registered_providers
 
 check_builtin_plugin_manifests = _doctor_plugins.check_builtin_plugin_manifests
@@ -3805,6 +3806,9 @@ def _registered_checks() -> list[Check]:
         Check("config-file", check_config_file, "install"),
         Check("provider-account", check_provider_account_configured, "install"),
         Check("storage-backend", check_storage_backend, "install"),
+        # #1737 — pg-connection probe. Skipped on sqlite installs so the
+        # check never falsely fails for users who haven't opted in.
+        Check("pg-connection", check_pg_connection, "install"),
         Check("registered-providers", check_registered_providers, "install"),
         # Plugins
         Check("builtin-plugin-manifests", check_builtin_plugin_manifests, "plugins"),

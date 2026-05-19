@@ -7,11 +7,13 @@ from pathlib import Path
 
 from pollypm.models import (
     AccountConfig,
+    EmbeddingSettings,
     EventsRetentionSettings,
     LoggingSettings,
     MemorySettings,
     ModelAssignment,
     KnownProject,
+    PgStorageSettings,
     PlannerSettings,
     PluginSettings,
     ProjectKind,
@@ -580,9 +582,62 @@ def _parse_storage_settings(
         # resolver downstream uses this URL verbatim, so emit an absolute
         # path that survives chdir.
         url_stripped = f"sqlite:///{project.state_db.resolve()}"
+
+    # ``[storage.pg]`` subsection (issue #1737, Slice A). Missing /
+    # malformed → dataclass defaults; fat-fingered types fall through
+    # individually so one bad knob doesn't void the whole block.
+    pg_defaults = PgStorageSettings()
+    pg_raw = storage_raw.get("pg", {})
+    if not isinstance(pg_raw, dict):
+        pg_raw = {}
+    pool_min_raw = pg_raw.get("pool_min", pg_defaults.pool_min)
+    pool_max_raw = pg_raw.get("pool_max", pg_defaults.pool_max)
+    try:
+        pool_min = max(1, int(pool_min_raw))
+    except (TypeError, ValueError):
+        pool_min = pg_defaults.pool_min
+    try:
+        pool_max = max(pool_min, int(pool_max_raw))
+    except (TypeError, ValueError):
+        pool_max = pg_defaults.pool_max
+    min_version_raw = pg_raw.get("min_version", pg_defaults.min_version)
+    if not isinstance(min_version_raw, str) or not min_version_raw.strip():
+        min_version_raw = pg_defaults.min_version
+    dsn_raw = pg_raw.get("dsn", "")
+    if not isinstance(dsn_raw, str):
+        dsn_raw = ""
+    pg_settings = PgStorageSettings(
+        pool_min=pool_min,
+        pool_max=pool_max,
+        min_version=min_version_raw.strip(),
+        dsn=dsn_raw.strip(),
+    )
+
+    # ``[storage.embedding]`` subsection (issue #1737, Slice A).
+    embed_defaults = EmbeddingSettings()
+    embed_raw = storage_raw.get("embedding", {})
+    if not isinstance(embed_raw, dict):
+        embed_raw = {}
+    model_raw = embed_raw.get("model", embed_defaults.model)
+    if not isinstance(model_raw, str) or not model_raw.strip():
+        model_raw = embed_defaults.model
+    provider_raw = embed_raw.get("provider", embed_defaults.provider)
+    if not isinstance(provider_raw, str) or not provider_raw.strip():
+        provider_raw = embed_defaults.provider
+    api_key_env_raw = embed_raw.get("api_key_env", embed_defaults.api_key_env)
+    if not isinstance(api_key_env_raw, str) or not api_key_env_raw.strip():
+        api_key_env_raw = embed_defaults.api_key_env
+    embedding_settings = EmbeddingSettings(
+        model=model_raw.strip(),
+        provider=provider_raw.strip(),
+        api_key_env=api_key_env_raw.strip(),
+    )
+
     return StorageSettings(
         backend=backend_raw.strip(),
         url=url_stripped,
+        pg=pg_settings,
+        embedding=embedding_settings,
     )
 
 

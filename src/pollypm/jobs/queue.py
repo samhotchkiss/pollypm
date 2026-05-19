@@ -1,49 +1,67 @@
-"""SQLite-backed durable job queue.
+"""Postgres-backed durable job queue (issue #1737, Slice K-jobs).
 
-Schema (see ``storage/state.py`` migration 6)::
+The queue lives in the ``work_jobs`` table installed by migration 0001
+in :mod:`pollypm.storage.pg_schema`::
 
     CREATE TABLE work_jobs (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      handler_name TEXT NOT NULL,
-      payload_json TEXT NOT NULL,
-      status TEXT NOT NULL DEFAULT 'queued',   -- queued|claimed|done|failed
-      attempt INTEGER NOT NULL DEFAULT 0,
-      max_attempts INTEGER NOT NULL DEFAULT 3,
-      dedupe_key TEXT,
-      enqueued_at TEXT NOT NULL,
-      run_after TEXT NOT NULL,
-      claimed_at TEXT,
-      claimed_by TEXT,
-      finished_at TEXT,
-      last_error TEXT
+        id            bigserial PRIMARY KEY,
+        handler_name  text NOT NULL,
+        payload_json  jsonb NOT NULL,
+        status        text NOT NULL DEFAULT 'queued',  -- queued|claimed|done|failed
+        attempt       int NOT NULL DEFAULT 0,
+        max_attempts  int NOT NULL DEFAULT 3,
+        dedupe_key    text,
+        enqueued_at   timestamptz NOT NULL,
+        run_after     timestamptz NOT NULL,
+        claimed_at    timestamptz,
+        claimed_by    text,
+        finished_at   timestamptz,
+        last_error    text
     );
 
-    -- Unique-when-pending dedupe: prevents pileup for dedupe_key + queued/claimed.
+    CREATE INDEX idx_work_jobs_claim
+        ON work_jobs(status, run_after, id);
     CREATE UNIQUE INDEX idx_work_jobs_dedupe_queued
-    ON work_jobs(dedupe_key)
-    WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'claimed');
+        ON work_jobs(dedupe_key)
+        WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'claimed');
 
-Claiming uses ``UPDATE ... RETURNING`` (SQLite >= 3.35) so the operation is
-atomic — two concurrent claim() calls cannot return the same row.
+Atomic claim
+------------
+Claim uses ``SELECT ... FOR UPDATE SKIP LOCKED`` so two workers never
+collide on the same row even under heavy contention — pg's row-level
+locks make the sqlite "two-step claim under a single writer" pattern
+unnecessary. SKIP LOCKED also removes the busy-wait window that
+plagued the sqlite queue under heartbeat + worker-pool load (#1018);
+contending workers immediately see the next free row instead of
+blocking on the locked one.
+
+API parity
+----------
+This module mirrors the public surface of the historical sqlite queue
+(``Job``, ``JobQueue``, ``JobStatus``, ``QueueStats``, ``RetryPolicy``,
+``exponential_backoff``) and every method signature. Callers (heartbeat
+boot, plugin handlers, the ``pm jobs`` CLI, tests) do not have to
+change. The constructor accepts the legacy ``db_path``/``connection``
+keyword arguments for back-compat — both are ignored at runtime; the
+queue always runs against the process-wide pg pool returned by
+:func:`pollypm.storage.pg_pool.get_rw_pool`.
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import random
-import sqlite3
 import threading
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
-from typing import Any, Callable, TypeVar
+from typing import TYPE_CHECKING, Any, Callable, TypeVar
 
-from pollypm.storage.sqlite_pragmas import (
-    apply_workspace_pragmas,
-    retry_on_database_locked,
-)
+if TYPE_CHECKING:
+    from psycopg_pool import ConnectionPool
+
+    from pollypm.models import PollyPMConfig
 
 
 logger = logging.getLogger(__name__)
@@ -139,151 +157,142 @@ def exponential_backoff(
 # ---------------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+def _now_utc() -> datetime:
+    return datetime.now(UTC)
 
 
-def _parse_ts(value: str | None) -> datetime | None:
-    if not value:
+def _ensure_utc(value: datetime | None) -> datetime | None:
+    """Coerce a returned timestamp to tz-aware UTC.
+
+    psycopg returns ``timestamptz`` rows as tz-aware datetimes already,
+    but tests that bypass the pool (e.g. seed direct rows) sometimes
+    drop the tz. This helper keeps the Job dataclass consistent with
+    the historical sqlite behaviour (always tz-aware UTC).
+    """
+    if value is None:
         return None
-    dt = datetime.fromisoformat(value)
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=UTC)
-    return dt
+    if value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value.astimezone(UTC)
 
 
-_CLOSED_DB_MARKER = "Cannot operate on a closed database"
+def _is_pool_closed_error(exc: BaseException) -> bool:
+    """True iff ``exc`` is psycopg-pool's "the pool is shut down" signal.
+
+    This is the pg analogue of the sqlite ``ProgrammingError: Cannot
+    operate on a closed database`` (#1006). When the process-wide
+    :class:`psycopg_pool.ConnectionPool` is closed under a live worker
+    (test teardown, ``pg_pool_shutdown()``, ``pm reset``) any
+    ``pool.connection()`` raises ``PoolClosed`` and we cannot recover.
+    The worker pool reads this predicate via the ``_is_closed_db_error``
+    shim in :mod:`pollypm.jobs.workers` and trips its stop event so
+    sibling workers exit cleanly instead of tight-looping a traceback.
+    """
+    cls_name = exc.__class__.__name__
+    if cls_name == "PoolClosed":
+        return True
+    # ``InterfaceError: connection is closed`` is what psycopg raises
+    # when a per-connection close races a queue operation. Treat it the
+    # same way — the pool will produce a fresh one on the next call,
+    # but the in-flight statement is dead.
+    try:
+        import psycopg
+
+        if isinstance(exc, psycopg.InterfaceError):
+            msg = str(exc).lower()
+            if "closed" in msg:
+                return True
+    except ImportError:  # pragma: no cover - psycopg is a hard runtime dep
+        pass
+    return False
 
 
-def _is_closed_db_error(exc: BaseException) -> bool:
-    return isinstance(exc, sqlite3.ProgrammingError) and _CLOSED_DB_MARKER in str(exc)
+def _is_unique_violation(exc: BaseException) -> bool:
+    """True iff ``exc`` is a pg unique-constraint violation.
+
+    The optimistic-locking pattern lives at two callsites:
+
+    * :meth:`JobQueue.enqueue` racing on the partial unique
+      ``idx_work_jobs_dedupe_queued`` — handled by re-reading the
+      winner.
+    * :meth:`JobQueue.fail` requeueing a failed-but-still-dedupe-keyed
+      row when a peer has already enqueued a replacement — handled by
+      marking the row terminal-failed (mirrors the sqlite behaviour
+      from #1052 / #1071).
+
+    Both surfaces translate the violation into an explicit recovery
+    path; the predicate here keeps the recognition logic in one place.
+    """
+    try:
+        from psycopg import errors as pg_errors
+
+        return isinstance(exc, pg_errors.UniqueViolation)
+    except ImportError:  # pragma: no cover - psycopg is a hard runtime dep
+        return False
 
 
 class JobQueue:
-    """Thread-safe SQLite-backed durable job queue.
+    """Postgres-backed durable job queue.
 
-    Construction options:
+    Construction
+    ------------
+    ``JobQueue()`` is the canonical form — the queue reads its
+    connection pool from :func:`pollypm.storage.pg_pool.get_rw_pool`.
+    The legacy keyword arguments ``db_path`` and ``connection`` are
+    accepted but ignored: every call goes through the pool regardless.
+    They remain in the signature so heartbeat / CLI / plugin callers
+    don't have to be touched as part of the pg cutover (#1737 Slice K).
 
-    * ``db_path`` — path to a standalone queue DB. A new connection is
-      opened with WAL + a 30s busy timeout.
-    * ``connection`` — pre-built ``sqlite3.Connection`` (used by tests and
-      when the queue shares the main state DB).
-
-    Exactly one of the two must be provided.
+    Tests that need a private schema namespace inject a per-test pool
+    via the ``pool=`` keyword (see ``tests/conftest_pg.py``'s
+    ``pg_schema_pool`` fixture).
     """
 
     def __init__(
         self,
         *,
-        db_path: Path | str | None = None,
-        connection: sqlite3.Connection | None = None,
+        db_path: Path | str | None = None,  # noqa: ARG002 — back-compat shim
+        connection: object | None = None,  # noqa: ARG002 — back-compat shim
+        pool: "ConnectionPool | None" = None,
+        config: "PollyPMConfig | None" = None,
         default_max_attempts: int = 3,
         retry_policy: RetryPolicy | None = None,
     ) -> None:
-        if (db_path is None) == (connection is None):
-            raise ValueError("JobQueue requires exactly one of db_path or connection")
+        if pool is None:
+            from pollypm.storage.pg_pool import get_rw_pool
+
+            pool = get_rw_pool(config)
+        self._pool = pool
+        # ``_lock`` is no longer load-bearing — psycopg + pg row-level
+        # locks serialise writers without an application lock — but
+        # the attribute is retained as an RLock so callers reaching into
+        # the queue's internal lock (legacy maintenance handlers) keep
+        # working until the K-deletion agent migrates them.
         self._lock = threading.RLock()
-        self._owns_connection = connection is None
-        self._db_path = Path(db_path) if db_path is not None else None
         self._closed = False
-        if connection is not None:
-            self._conn = connection
-        else:
-            self._conn = self._open_owned_connection()
-        self._ensure_schema()
         self.default_max_attempts = default_max_attempts
         self.retry_policy = retry_policy or exponential_backoff()
 
-    def _open_owned_connection(self) -> sqlite3.Connection:
-        if self._db_path is None:
-            raise RuntimeError("cannot open JobQueue connection without db_path")
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(
-            str(self._db_path), check_same_thread=False, isolation_level=None
-        )
-        # #1018: same WAL + busy_timeout treatment as the app state DB.
-        # JobQueue is one of the heaviest writers (claim+complete per job)
-        # so we keep the historical 30 s timeout instead of the 5 s
-        # workspace default.
-        apply_workspace_pragmas(conn, busy_timeout_ms=30000)
-        return conn
-
-    def _reopen_owned_connection(self, *, label: str) -> bool:
-        if not self._owns_connection or self._db_path is None or self._closed:
-            return False
-        with self._lock:
-            if self._closed:
-                return False
-            try:
-                self._conn.close()
-            except Exception:  # noqa: BLE001
-                pass
-            self._conn = self._open_owned_connection()
-            self._ensure_schema()
-        logger.warning("%s: reopened closed JobQueue SQLite connection", label)
-        return True
-
-    def _retry_reopening_closed_connection(
-        self,
-        fn: Callable[[], T],
-        *,
-        label: str,
-    ) -> T:
-        try:
-            return retry_on_database_locked(fn, label=label)
-        except BaseException as exc:  # noqa: BLE001
-            if not _is_closed_db_error(exc):
-                raise
-            if not self._reopen_owned_connection(label=label):
-                raise
-        return retry_on_database_locked(fn, label=label)
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
     def close(self) -> None:
-        if self._owns_connection:
-            with self._lock:
-                self._closed = True
-                try:
-                    self._conn.close()
-                except Exception:  # noqa: BLE001
-                    pass
+        """No-op — the pool's lifetime is owned by ``pg_pool``.
 
-    def __enter__(self):
+        The sqlite queue closed its private connection here; the pg
+        queue shares a process-wide pool, so explicit close from a
+        single consumer would tear down every other caller. Set the
+        ``_closed`` flag so context-manager teardown still observes the
+        same shape, but do not touch the pool itself.
+        """
+        self._closed = True
+
+    def __enter__(self) -> "JobQueue":
         return self
 
-    def __exit__(self, *args):
+    def __exit__(self, *args: object) -> None:
         self.close()
-
-    # ------------------------------------------------------------------
-    # Schema
-    # ------------------------------------------------------------------
-
-    def _ensure_schema(self) -> None:
-        """Create the table + indexes if missing — safe for standalone DBs."""
-        with self._lock:
-            self._conn.executescript(
-                """
-                CREATE TABLE IF NOT EXISTS work_jobs (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    handler_name TEXT NOT NULL,
-                    payload_json TEXT NOT NULL,
-                    status TEXT NOT NULL DEFAULT 'queued',
-                    attempt INTEGER NOT NULL DEFAULT 0,
-                    max_attempts INTEGER NOT NULL DEFAULT 3,
-                    dedupe_key TEXT,
-                    enqueued_at TEXT NOT NULL,
-                    run_after TEXT NOT NULL,
-                    claimed_at TEXT,
-                    claimed_by TEXT,
-                    finished_at TEXT,
-                    last_error TEXT
-                );
-                CREATE INDEX IF NOT EXISTS idx_work_jobs_claim
-                ON work_jobs(status, run_after, id);
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_work_jobs_dedupe_queued
-                ON work_jobs(dedupe_key)
-                WHERE dedupe_key IS NOT NULL AND status IN ('queued', 'claimed');
-                """
-            )
 
     # ------------------------------------------------------------------
     # Enqueue
@@ -300,68 +309,85 @@ class JobQueue:
     ) -> JobId:
         """Insert a job. Idempotent when ``dedupe_key`` is set.
 
-        If a queued-or-claimed job with the same ``dedupe_key`` already exists,
-        the existing job's id is returned and no new row is inserted.
+        If a queued-or-claimed job with the same ``dedupe_key`` already
+        exists, the existing job's id is returned and no new row is
+        inserted.
         """
         if not handler_name:
             raise ValueError("handler_name is required")
-        payload_json = json.dumps(payload or {}, sort_keys=True, default=str)
-        run_after_iso = (run_after or datetime.now(UTC)).astimezone(UTC).isoformat()
-        max_att = max_attempts if max_attempts is not None else self.default_max_attempts
-        now = _now_iso()
+        from psycopg.types.json import Json
 
-        # #1021 — retry-on-lock at the public surface. ``HeartbeatRail.tick``
-        # is the canonical caller and crashed the heartbeat ticker every
-        # time the dedupe SELECT or the INSERT raced past ``busy_timeout``.
-        # Wrapping the whole locked body keeps the dedupe + insert pair
-        # atomic across retries and lets callers (tick, plugin handlers)
-        # stay oblivious to transient WAL contention.
-        def _do_enqueue() -> JobId:
-            with self._lock:
+        payload_json = Json(payload or {})
+        run_after_ts = (run_after or _now_utc()).astimezone(UTC)
+        max_att = max_attempts if max_attempts is not None else self.default_max_attempts
+        now = _now_utc()
+
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
                 if dedupe_key is not None:
-                    existing = self._conn.execute(
+                    cur.execute(
                         """
                         SELECT id FROM work_jobs
-                        WHERE dedupe_key = ? AND status IN ('queued', 'claimed')
+                        WHERE dedupe_key = %s
+                          AND status IN ('queued', 'claimed')
                         LIMIT 1
                         """,
                         (dedupe_key,),
-                    ).fetchone()
+                    )
+                    existing = cur.fetchone()
                     if existing is not None:
+                        conn.rollback()
                         return int(existing[0])
 
                 try:
-                    cursor = self._conn.execute(
+                    cur.execute(
                         """
                         INSERT INTO work_jobs (
-                            handler_name, payload_json, status, attempt, max_attempts,
-                            dedupe_key, enqueued_at, run_after
-                        )
-                        VALUES (?, ?, 'queued', 0, ?, ?, ?, ?)
+                            handler_name, payload_json, status, attempt,
+                            max_attempts, dedupe_key, enqueued_at, run_after
+                        ) VALUES (%s, %s, 'queued', 0, %s, %s, %s, %s)
+                        RETURNING id
                         """,
-                        (handler_name, payload_json, max_att, dedupe_key, now, run_after_iso),
+                        (
+                            handler_name,
+                            payload_json,
+                            max_att,
+                            dedupe_key,
+                            now,
+                            run_after_ts,
+                        ),
                     )
-                except sqlite3.IntegrityError:
-                    # Raced with another enqueue on the same dedupe_key — look up.
-                    if dedupe_key is None:
+                except Exception as exc:  # noqa: BLE001
+                    # Raced with another enqueue on the same dedupe_key
+                    # — psycopg raises UniqueViolation. Roll back the
+                    # aborted transaction and look up the winner.
+                    if not _is_unique_violation(exc):
                         raise
-                    existing = self._conn.execute(
-                        """
-                        SELECT id FROM work_jobs
-                        WHERE dedupe_key = ? AND status IN ('queued', 'claimed')
-                        LIMIT 1
-                        """,
-                        (dedupe_key,),
-                    ).fetchone()
+                    conn.rollback()
+                    if dedupe_key is None:
+                        # Two anonymous (no-dedupe) jobs can't collide
+                        # on the partial unique index, so any unique
+                        # violation without a dedupe_key is unexpected.
+                        raise
+                    with conn.cursor() as look_cur:
+                        look_cur.execute(
+                            """
+                            SELECT id FROM work_jobs
+                            WHERE dedupe_key = %s
+                              AND status IN ('queued', 'claimed')
+                            LIMIT 1
+                            """,
+                            (dedupe_key,),
+                        )
+                        existing = look_cur.fetchone()
                     if existing is None:
                         raise
                     return int(existing[0])
-                return int(cursor.lastrowid)
-
-        return self._retry_reopening_closed_connection(
-            _do_enqueue,
-            label="JobQueue.enqueue",
-        )
+                else:
+                    row = cur.fetchone()
+                    conn.commit()
+                    return int(row[0])
 
     def has_recent_or_active_dedupe(
         self,
@@ -372,35 +398,28 @@ class JobQueue:
         """Return True if ``dedupe_key`` is active or already fired since ``since``.
 
         ``enqueue(dedupe_key=...)`` only dedupes queued/claimed rows. A
-        second HeartbeatRail can therefore enqueue the same cadence handler
-        seconds after the first one completes. Recurring ticks use this
-        read-side guard to coalesce same-window pulses across rails without
-        permanently reserving the dedupe key.
+        second HeartbeatRail can therefore enqueue the same cadence
+        handler seconds after the first one completes. Recurring ticks
+        use this read-side guard to coalesce same-window pulses across
+        rails without permanently reserving the dedupe key.
         """
         if not dedupe_key:
             return False
-        since_iso = since.astimezone(UTC).isoformat()
-
-        def _do_check() -> bool:
-            with self._lock:
-                row = self._conn.execute(
-                    """
-                    SELECT id FROM work_jobs
-                    WHERE dedupe_key = ?
-                      AND (
-                        status IN ('queued', 'claimed')
-                        OR enqueued_at > ?
-                      )
-                    LIMIT 1
-                    """,
-                    (dedupe_key, since_iso),
-                ).fetchone()
-                return row is not None
-
-        return self._retry_reopening_closed_connection(
-            _do_check,
-            label="JobQueue.has_recent_or_active_dedupe",
-        )
+        since_ts = since.astimezone(UTC)
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT id FROM work_jobs
+                WHERE dedupe_key = %s
+                  AND (
+                    status IN ('queued', 'claimed')
+                    OR enqueued_at > %s
+                  )
+                LIMIT 1
+                """,
+                (dedupe_key, since_ts),
+            )
+            return cur.fetchone() is not None
 
     # ------------------------------------------------------------------
     # Claim / complete / fail
@@ -409,60 +428,53 @@ class JobQueue:
     def claim(self, worker_id: str, *, limit: int = 1) -> list[Job]:
         """Atomically claim up to ``limit`` due jobs and return them.
 
-        Uses ``UPDATE ... RETURNING`` so concurrent workers cannot double-claim.
+        Uses ``SELECT ... FOR UPDATE SKIP LOCKED`` so concurrent workers
+        never see the same row. Rows currently locked by another claim
+        in flight are silently skipped; the claimer takes the next free
+        row in run_after / id order.
         """
         if limit <= 0:
             return []
-        now_dt = datetime.now(UTC)
-        now = now_dt.isoformat()
-        with self._lock:
-            # Two-step claim: pick candidate IDs under a transaction, then
-            # UPDATE ... RETURNING to lock them atomically. SQLite serializes
-            # writes so concurrent claims can't collide on the same row.
-            rows = self._conn.execute(
-                """
-                UPDATE work_jobs
-                SET status = 'claimed', claimed_at = ?, claimed_by = ?, attempt = attempt + 1
-                WHERE id IN (
-                    SELECT id FROM work_jobs
-                    WHERE status = 'queued' AND run_after <= ?
-                    ORDER BY run_after ASC, id ASC
-                    LIMIT ?
+        now = _now_utc()
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE work_jobs
+                    SET status = 'claimed',
+                        claimed_at = %s,
+                        claimed_by = %s,
+                        attempt = attempt + 1
+                    WHERE id IN (
+                        SELECT id FROM work_jobs
+                        WHERE status = 'queued' AND run_after <= %s
+                        ORDER BY run_after ASC, id ASC
+                        LIMIT %s
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING id, handler_name, payload_json, attempt,
+                              max_attempts, dedupe_key, enqueued_at,
+                              run_after, claimed_at, claimed_by
+                    """,
+                    (now, worker_id, now, limit),
                 )
-                RETURNING id, handler_name, payload_json, attempt, max_attempts,
-                          dedupe_key, enqueued_at, run_after, claimed_at, claimed_by
-                """,
-                (now, worker_id, now, limit),
-            ).fetchall()
+                rows = cur.fetchall()
+            conn.commit()
 
-        jobs: list[Job] = []
-        for row in rows:
-            jobs.append(
-                Job(
-                    id=int(row[0]),
-                    handler_name=row[1],
-                    payload=json.loads(row[2] or "{}"),
-                    attempt=int(row[3]),
-                    max_attempts=int(row[4]),
-                    dedupe_key=row[5],
-                    enqueued_at=_parse_ts(row[6]) or now_dt,
-                    run_after=_parse_ts(row[7]) or now_dt,
-                    claimed_at=_parse_ts(row[8]),
-                    claimed_by=row[9],
-                    status=JobStatus.CLAIMED,
-                )
-            )
-        return jobs
+        return [self._row_to_job(row, status=JobStatus.CLAIMED) for row in rows]
 
     def complete(self, job_id: JobId) -> None:
-        with self._lock:
-            self._conn.execute(
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE work_jobs
-                SET status = 'done', finished_at = ?, last_error = NULL
-                WHERE id = ?
+                SET status = 'done',
+                    finished_at = %s,
+                    last_error = NULL
+                WHERE id = %s
                 """,
-                (_now_iso(), int(job_id)),
+                (_now_utc(), int(job_id)),
             )
 
     def fail(
@@ -474,70 +486,90 @@ class JobQueue:
     ) -> None:
         """Mark a claimed job as failed. May retry with exponential backoff.
 
-        If ``retry=False`` or the job has exhausted its attempts, it moves to
-        the ``failed`` terminal state. Otherwise it returns to ``queued`` with
-        ``run_after`` bumped per the retry policy.
+        If ``retry=False`` or the job has exhausted its attempts, it
+        moves to the ``failed`` terminal state. Otherwise it returns to
+        ``queued`` with ``run_after`` bumped per the retry policy.
+
+        When a retry would re-acquire a ``dedupe_key`` that a peer has
+        already replaced (peer enqueued a new row after this one fell
+        out of ``claimed``), the partial unique index raises
+        ``UniqueViolation``. We translate that into a terminal-failed
+        state so the late-fail never resurrects a finished slot
+        (mirrors the sqlite #1052 behaviour).
         """
         error_text = (error or "")[:8192]
-        now_dt = datetime.now(UTC)
+        now_dt = _now_utc()
 
-        # #1021 — retry-on-lock so the failure-record write itself can
-        # ride out a transient WAL contention. Pre-fix, ``workers.py:336
-        # → queue.py:396 (UPDATE ... WHERE id = ?)`` propagated
-        # ``database is locked`` straight back into ``JobWorkerPool``,
-        # which logged the traceback and tripped a critical alert.
-        def _do_fail() -> None:
-            with self._lock:
-                row = self._conn.execute(
-                    "SELECT status, attempt, max_attempts FROM work_jobs WHERE id = ?",
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT status, attempt, max_attempts "
+                    "FROM work_jobs WHERE id = %s FOR UPDATE",
                     (int(job_id),),
-                ).fetchone()
+                )
+                row = cur.fetchone()
                 if row is None:
+                    conn.rollback()
                     return
-                status, attempt, max_attempts = str(row[0]), int(row[1]), int(row[2])
-                if status != JobStatus.CLAIMED.value:
+                status_raw, attempt, max_attempts = (
+                    str(row[0]), int(row[1]), int(row[2]),
+                )
+                if status_raw != JobStatus.CLAIMED.value:
+                    conn.rollback()
                     return
 
-                def _mark_terminal_failed() -> None:
-                    self._conn.execute(
+                def _mark_terminal_failed(cursor) -> None:
+                    cursor.execute(
                         """
                         UPDATE work_jobs
-                        SET status = 'failed', finished_at = ?, last_error = ?
-                        WHERE id = ?
+                        SET status = 'failed',
+                            finished_at = %s,
+                            last_error = %s
+                        WHERE id = %s
                         """,
-                        (now_dt.isoformat(), error_text, int(job_id)),
+                        (now_dt, error_text, int(job_id)),
                     )
 
                 if not retry or attempt >= max_attempts:
-                    _mark_terminal_failed()
+                    _mark_terminal_failed(cur)
+                    conn.commit()
                     return
 
                 delay = self.retry_policy(attempt)
-                next_run = (now_dt + delay).isoformat()
+                next_run = now_dt + delay
                 try:
-                    self._conn.execute(
+                    cur.execute(
                         """
                         UPDATE work_jobs
                         SET status = 'queued',
-                            run_after = ?,
-                            last_error = ?,
+                            run_after = %s,
+                            last_error = %s,
                             claimed_at = NULL,
                             claimed_by = NULL
-                        WHERE id = ?
+                        WHERE id = %s
                         """,
                         (next_run, error_text, int(job_id)),
                     )
-                except sqlite3.IntegrityError as exc:
-                    if "work_jobs.dedupe_key" not in str(exc):
+                except Exception as exc:  # noqa: BLE001
+                    if not _is_unique_violation(exc):
                         raise
+                    # Dedupe-key collision: a peer has already enqueued
+                    # a fresh replacement while this row was claimed.
+                    # Roll back the failed retry attempt and mark this
+                    # row terminal-failed instead so the late retry
+                    # never resurrects a finished slot.
+                    conn.rollback()
                     logger.warning(
                         "JobQueue.fail: retry for job %s hit a dedupe_key "
                         "collision; marking failed instead",
                         job_id,
                     )
-                    _mark_terminal_failed()
-
-        retry_on_database_locked(_do_fail, label="JobQueue.fail")
+                    with conn.cursor() as term_cur:
+                        _mark_terminal_failed(term_cur)
+                    conn.commit()
+                    return
+            conn.commit()
 
     def recover_orphaned_claims(self) -> tuple[int, int]:
         """Reset every ``claimed`` row back to ``queued`` (#1071).
@@ -550,59 +582,45 @@ class JobQueue:
         dedupe_key permanently reserved, and every subsequent
         ``enqueue(dedupe_key=...)`` short-circuits to the orphan's id —
         silently blocking the cadence handler from ever firing again.
-        ``stuck_claims.sweep`` is supposed to clean these up, but the
-        bootstrap problem is that ``stuck_claims.sweep`` itself uses a
-        ``dedupe_key``, so a single orphaned ``stuck_claims.sweep`` row
-        is enough to disable the recovery loop entirely.
 
         Two-step recovery:
           1. UPDATE every ``claimed`` row back to ``queued`` with
-             ``run_after = now()`` (don't replay the original schedule
-             — the orphan was already overdue) and rewind attempt by 1
-             since no handler body ever ran.
-          2. DELETE duplicate queued rows per dedupe_key, keeping only
-             the newest. Pre-#1052 rows had no dedupe_key so the
+             ``run_after = now()`` and rewind attempt by 1 since no
+             handler body ever ran.
+          2. DELETE duplicate queued rows per ``handler_name``, keeping
+             only the newest. Pre-#1052 rows had no dedupe_key so the
              previous daemon's cadence ticks accumulated thousands of
              identical session.health_sweep / task_assignment.sweep
              rows in ``claimed``; without this dedupe pass the worker
              pool would spend hours grinding through the legacy pile
-             before it could fire the freshly-scheduled handlers
-             (e.g. ``stuck_claims.sweep``, ``alerts.gc``) that prune
-             the rest.
+             before it could fire freshly-scheduled handlers.
 
         Returns ``(recovered, pruned)`` — the count of orphaned-claim
         rows we requeued, and the count of duplicate queued rows we
         dropped during the same boot pass.
         """
-        def _do_recover() -> tuple[int, int]:
-            now_iso = _now_iso()
-            with self._lock:
-                # 1. Recover claimed → queued, reset run_after to now so
-                # they enter the queue at current cadence priority
-                # rather than re-running the original (long-stale)
-                # schedule.
-                cursor = self._conn.execute(
+        now = _now_utc()
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
                     """
                     UPDATE work_jobs
                     SET status = 'queued',
                         claimed_at = NULL,
                         claimed_by = NULL,
-                        run_after = ?,
-                        attempt = CASE WHEN attempt > 0 THEN attempt - 1 ELSE 0 END
+                        run_after = %s,
+                        attempt = CASE
+                            WHEN attempt > 0 THEN attempt - 1
+                            ELSE 0
+                        END
                     WHERE status = 'claimed'
                     """,
-                    (now_iso,),
+                    (now,),
                 )
-                recovered = int(cursor.rowcount or 0)
+                recovered = int(cur.rowcount or 0)
 
-                # 2. Collapse the legacy pile: for any handler with
-                # multiple ``queued`` rows, keep only the newest id and
-                # drop the rest. Sub-second cadence handlers
-                # (session.health_sweep) accumulate the most. The
-                # cadence will re-enqueue a fresh row on the next tick,
-                # so dropping the duplicates costs nothing and frees
-                # the worker pool to drain the rest of the system.
-                cursor = self._conn.execute(
+                cur.execute(
                     """
                     DELETE FROM work_jobs
                     WHERE status = 'queued'
@@ -613,54 +631,51 @@ class JobQueue:
                       )
                     """,
                 )
-                pruned = int(cursor.rowcount or 0)
-                return recovered, pruned
-
-        return retry_on_database_locked(_do_recover, label="JobQueue.recover_orphaned_claims")
+                pruned = int(cur.rowcount or 0)
+            conn.commit()
+        return recovered, pruned
 
     # ------------------------------------------------------------------
     # Introspection
     # ------------------------------------------------------------------
 
     def get(self, job_id: JobId) -> Job | None:
-        with self._lock:
-            row = self._conn.execute(
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
                 """
                 SELECT id, handler_name, payload_json, attempt, max_attempts,
-                       dedupe_key, enqueued_at, run_after, claimed_at, claimed_by, status
-                FROM work_jobs WHERE id = ?
+                       dedupe_key, enqueued_at, run_after, claimed_at,
+                       claimed_by, status
+                FROM work_jobs WHERE id = %s
                 """,
                 (int(job_id),),
-            ).fetchone()
+            )
+            row = cur.fetchone()
         if row is None:
             return None
-        return Job(
-            id=int(row[0]),
-            handler_name=row[1],
-            payload=json.loads(row[2] or "{}"),
-            attempt=int(row[3]),
-            max_attempts=int(row[4]),
-            dedupe_key=row[5],
-            enqueued_at=_parse_ts(row[6]) or datetime.now(UTC),
-            run_after=_parse_ts(row[7]) or datetime.now(UTC),
-            claimed_at=_parse_ts(row[8]),
-            claimed_by=row[9],
-            status=JobStatus(row[10]),
-        )
+        return self._row_to_job(row, status=JobStatus(row[10]))
 
     def get_last_error(self, job_id: JobId) -> str | None:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT last_error FROM work_jobs WHERE id = ?", (int(job_id),)
-            ).fetchone()
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT last_error FROM work_jobs WHERE id = %s",
+                (int(job_id),),
+            )
+            row = cur.fetchone()
         return None if row is None else row[0]
 
     def stats(self) -> QueueStats:
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT status, COUNT(*) FROM work_jobs GROUP BY status"
-            ).fetchall()
-        counts = {JobStatus.QUEUED: 0, JobStatus.CLAIMED: 0, JobStatus.DONE: 0, JobStatus.FAILED: 0}
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT status, COUNT(*) FROM work_jobs GROUP BY status",
+            )
+            rows = cur.fetchall()
+        counts = {
+            JobStatus.QUEUED: 0,
+            JobStatus.CLAIMED: 0,
+            JobStatus.DONE: 0,
+            JobStatus.FAILED: 0,
+        }
         for status, count in rows:
             try:
                 counts[JobStatus(status)] = int(count)
@@ -680,9 +695,7 @@ class JobQueue:
         ``claimed_at``/``claimed_by``/``finished_at``/``last_error``.
         ``run_after`` is bumped to ``now`` so the job is eligible
         immediately. Raises ``LookupError`` if the job is missing and
-        ``ValueError`` if it isn't currently in the failed state — the
-        public surface keeps the CLI from poking ``_lock``/``_conn``
-        and centralises the invariant in one place (#803).
+        ``ValueError`` if it isn't currently in the failed state (#803).
         """
         job = self.get(job_id)
         if job is None:
@@ -691,8 +704,8 @@ class JobQueue:
             raise ValueError(
                 f"Job {job_id} is {job.status.value}, not failed — refusing to retry."
             )
-        with self._lock:
-            self._conn.execute(
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
                 """
                 UPDATE work_jobs
                 SET status = 'queued',
@@ -701,13 +714,13 @@ class JobQueue:
                     claimed_by = NULL,
                     finished_at = NULL,
                     last_error = NULL,
-                    run_after = ?
-                WHERE id = ?
+                    run_after = %s
+                WHERE id = %s
                 """,
-                (_now_iso(), int(job_id)),
+                (_now_utc(), int(job_id)),
             )
         refreshed = self.get(job_id)
-        if refreshed is None:  # pragma: no cover — UPDATE just succeeded
+        if refreshed is None:  # pragma: no cover - UPDATE just succeeded
             raise LookupError(f"Job {job_id} disappeared during retry")
         return refreshed
 
@@ -722,67 +735,53 @@ class JobQueue:
             raise ValueError(
                 f"purge only accepts DONE/FAILED, got {status.value}",
             )
-        with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM work_jobs WHERE status = ?", (status.value,),
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM work_jobs WHERE status = %s",
+                (status.value,),
             )
-            return int(cursor.rowcount or 0)
+            return int(cur.rowcount or 0)
 
     def handler_counts(self, *, limit: int = 10) -> list[tuple[str, int]]:
         """Top handlers by current row count, descending. (#803)"""
-        with self._lock:
-            rows = self._conn.execute(
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
                 """
                 SELECT handler_name, COUNT(*)
                 FROM work_jobs
                 GROUP BY handler_name
                 ORDER BY COUNT(*) DESC
-                LIMIT ?
+                LIMIT %s
                 """,
                 (int(limit),),
-            ).fetchall()
+            )
+            rows = cur.fetchall()
         return [(str(row[0]), int(row[1])) for row in rows]
 
     def find_stuck_claims(self, *, limit: int = 1000) -> list[Job]:
         """Return all claimed jobs with a non-null ``claimed_at`` (#1049).
 
-        The caller decides what "stuck" means by comparing ``claimed_at``
-        against a per-handler cutoff — the queue itself doesn't know
-        handler timeouts. Returned newest-claimed-first so a bounded
-        ``limit`` still surfaces the actively-blocking entries.
-
-        Used by the ``stuck_claims.sweep`` recurring handler to recover
-        jobs orphaned when the watchdog's ``queue.fail`` call exhausted
-        its retry budget under sustained WAL contention.
+        The caller decides what "stuck" means by comparing
+        ``claimed_at`` against a per-handler cutoff — the queue itself
+        doesn't know handler timeouts. Returned oldest-claimed-first so
+        a bounded ``limit`` still surfaces the actively-blocking
+        entries.
         """
-        with self._lock:
-            rows = self._conn.execute(
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
                 """
                 SELECT id, handler_name, payload_json, attempt, max_attempts,
-                       dedupe_key, enqueued_at, run_after, claimed_at, claimed_by, status
+                       dedupe_key, enqueued_at, run_after, claimed_at,
+                       claimed_by, status
                 FROM work_jobs
                 WHERE status = 'claimed' AND claimed_at IS NOT NULL
                 ORDER BY claimed_at ASC, id ASC
-                LIMIT ?
+                LIMIT %s
                 """,
                 (int(limit),),
-            ).fetchall()
-        return [
-            Job(
-                id=int(row[0]),
-                handler_name=row[1],
-                payload=json.loads(row[2] or "{}"),
-                attempt=int(row[3]),
-                max_attempts=int(row[4]),
-                dedupe_key=row[5],
-                enqueued_at=_parse_ts(row[6]) or datetime.now(UTC),
-                run_after=_parse_ts(row[7]) or datetime.now(UTC),
-                claimed_at=_parse_ts(row[8]),
-                claimed_by=row[9],
-                status=JobStatus(row[10]),
             )
-            for row in rows
-        ]
+            rows = cur.fetchall()
+        return [self._row_to_job(row, status=JobStatus(row[10])) for row in rows]
 
     def list_jobs(
         self,
@@ -793,34 +792,70 @@ class JobQueue:
         params: list[Any] = []
         where = ""
         if status is not None:
-            where = "WHERE status = ?"
+            where = "WHERE status = %s"
             params.append(status.value)
-        params.append(limit)
-        with self._lock:
-            rows = self._conn.execute(
-                f"""
-                SELECT id, handler_name, payload_json, attempt, max_attempts,
-                       dedupe_key, enqueued_at, run_after, claimed_at, claimed_by, status
-                FROM work_jobs
-                {where}
-                ORDER BY id DESC
-                LIMIT ?
-                """,
-                tuple(params),
-            ).fetchall()
-        return [
-            Job(
-                id=int(row[0]),
-                handler_name=row[1],
-                payload=json.loads(row[2] or "{}"),
-                attempt=int(row[3]),
-                max_attempts=int(row[4]),
-                dedupe_key=row[5],
-                enqueued_at=_parse_ts(row[6]) or datetime.now(UTC),
-                run_after=_parse_ts(row[7]) or datetime.now(UTC),
-                claimed_at=_parse_ts(row[8]),
-                claimed_by=row[9],
-                status=JobStatus(row[10]),
-            )
-            for row in rows
-        ]
+        params.append(int(limit))
+        sql = f"""
+            SELECT id, handler_name, payload_json, attempt, max_attempts,
+                   dedupe_key, enqueued_at, run_after, claimed_at,
+                   claimed_by, status
+            FROM work_jobs
+            {where}
+            ORDER BY id DESC
+            LIMIT %s
+        """
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+            rows = cur.fetchall()
+        return [self._row_to_job(row, status=JobStatus(row[10])) for row in rows]
+
+    # ------------------------------------------------------------------
+    # Row decoding
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _row_to_job(row: tuple, *, status: JobStatus) -> Job:
+        """Convert a SELECT-* row into a :class:`Job`.
+
+        Column order MUST match the SELECT lists in :meth:`get`,
+        :meth:`list_jobs`, :meth:`claim`, and :meth:`find_stuck_claims`.
+        """
+        payload_raw = row[2]
+        if payload_raw is None:
+            payload: dict[str, Any] = {}
+        elif isinstance(payload_raw, dict):
+            # psycopg returns jsonb columns already decoded.
+            payload = dict(payload_raw)
+        elif isinstance(payload_raw, (bytes, bytearray)):
+            import json as _json
+
+            try:
+                decoded = _json.loads(payload_raw.decode("utf-8"))
+            except (UnicodeDecodeError, ValueError):
+                decoded = {}
+            payload = decoded if isinstance(decoded, dict) else {}
+        elif isinstance(payload_raw, str):
+            import json as _json
+
+            try:
+                decoded = _json.loads(payload_raw)
+            except ValueError:
+                decoded = {}
+            payload = decoded if isinstance(decoded, dict) else {}
+        else:
+            payload = {}
+
+        now = _now_utc()
+        return Job(
+            id=int(row[0]),
+            handler_name=str(row[1]),
+            payload=payload,
+            attempt=int(row[3]),
+            max_attempts=int(row[4]),
+            dedupe_key=row[5],
+            enqueued_at=_ensure_utc(row[6]) or now,
+            run_after=_ensure_utc(row[7]) or now,
+            claimed_at=_ensure_utc(row[8]),
+            claimed_by=row[9],
+            status=status,
+        )

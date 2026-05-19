@@ -261,6 +261,34 @@ def pg_state_store(tmp_path: Path):
 
 
 @pytest.fixture()
+def pg_job_queue(pg_schema_pool):
+    """Pre-built :class:`JobQueue` against the per-test schema (#1737 Slice K-jobs).
+
+    Applies the schema migrations on first call so the ``work_jobs``
+    table is present, then constructs a queue bound to the per-test
+    pool. The retry policy is configured for near-zero delay so
+    failure / retry assertions don't pay the production backoff ladder.
+
+    Tests that want a custom retry policy build their own ``JobQueue``
+    against ``pg_schema_pool`` directly.
+    """
+    from pollypm.jobs import JobQueue, exponential_backoff
+    from pollypm.storage.pg_migrations import apply_migrations
+
+    apply_migrations(pg_schema_pool)
+    queue = JobQueue(
+        pool=pg_schema_pool,
+        retry_policy=exponential_backoff(
+            base_seconds=0.01, factor=1.0, max_seconds=0.01, jitter=0,
+        ),
+    )
+    try:
+        yield queue
+    finally:
+        queue.close()
+
+
+@pytest.fixture()
 def seeded_pg_workspace(pg_work_service):
     """A ``PgWorkService`` pre-seeded with one project + a few tasks.
 

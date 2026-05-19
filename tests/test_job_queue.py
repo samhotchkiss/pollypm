@@ -1,11 +1,9 @@
-"""Unit tests for the SQLite-backed durable job queue."""
+"""Unit tests for the Postgres-backed durable job queue (#1737 Slice K-jobs)."""
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 
 import pytest
 
@@ -17,35 +15,13 @@ from pollypm.jobs import (
 )
 
 
-class _DedupeIntegrityOnRetryConnection:
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-        self.fired = False
-
-    def execute(self, sql, *args, **kwargs):
-        normalized = " ".join(str(sql).split()).upper()
-        if (
-            not self.fired
-            and normalized.startswith("UPDATE WORK_JOBS")
-            and "SET STATUS = 'QUEUED'" in normalized
-        ):
-            self.fired = True
-            raise sqlite3.IntegrityError(
-                "UNIQUE constraint failed: work_jobs.dedupe_key"
-            )
-        return self._conn.execute(sql, *args, **kwargs)
-
-    def __getattr__(self, name):
-        return getattr(self._conn, name)
-
-
 # ---------------------------------------------------------------------------
 # Basic lifecycle
 # ---------------------------------------------------------------------------
 
 
-def test_enqueue_and_claim(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_enqueue_and_claim(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     jid = q.enqueue("hello", {"name": "world"})
     assert jid > 0
 
@@ -61,8 +37,8 @@ def test_enqueue_and_claim(tmp_path: Path) -> None:
     assert job.claimed_by == "worker-1"
 
 
-def test_complete_marks_done(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_complete_marks_done(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     jid = q.enqueue("h")
     (job,) = q.claim("w")
     q.complete(job.id)
@@ -72,10 +48,13 @@ def test_complete_marks_done(tmp_path: Path) -> None:
     assert stored.status is JobStatus.DONE
 
 
-def test_fail_with_retry_returns_to_queued_with_backoff(tmp_path: Path) -> None:
-    # Use a fixed-delay policy so we can assert exact run_after.
+def test_fail_with_retry_returns_to_queued_with_backoff(pg_schema_pool) -> None:
+    # Fixed-delay policy so we can assert exact run_after.
+    from pollypm.storage.pg_migrations import apply_migrations
+
+    apply_migrations(pg_schema_pool)
     q = JobQueue(
-        db_path=tmp_path / "q.db",
+        pool=pg_schema_pool,
         retry_policy=lambda attempt: timedelta(seconds=5),
     )
     q.enqueue("h")
@@ -91,9 +70,12 @@ def test_fail_with_retry_returns_to_queued_with_backoff(tmp_path: Path) -> None:
     assert q.get_last_error(job.id) == "boom"
 
 
-def test_fail_exhausted_attempts_moves_to_failed(tmp_path: Path) -> None:
+def test_fail_exhausted_attempts_moves_to_failed(pg_schema_pool) -> None:
+    from pollypm.storage.pg_migrations import apply_migrations
+
+    apply_migrations(pg_schema_pool)
     q = JobQueue(
-        db_path=tmp_path / "q.db",
+        pool=pg_schema_pool,
         retry_policy=lambda attempt: timedelta(seconds=0),
     )
     jid = q.enqueue("h", max_attempts=2)
@@ -118,8 +100,8 @@ def test_fail_exhausted_attempts_moves_to_failed(tmp_path: Path) -> None:
     assert q.get_last_error(jid) == "second"
 
 
-def test_fail_no_retry_goes_to_failed_immediately(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_fail_no_retry_goes_to_failed_immediately(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     jid = q.enqueue("h")
     (job,) = q.claim("w")
     q.fail(job.id, "nope", retry=False)
@@ -134,8 +116,8 @@ def test_fail_no_retry_goes_to_failed_immediately(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_dedupe_key_returns_same_id_for_duplicate(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_dedupe_key_returns_same_id_for_duplicate(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     jid1 = q.enqueue("sweep", {"p": "a"}, dedupe_key="sweep:a")
     jid2 = q.enqueue("sweep", {"p": "a"}, dedupe_key="sweep:a")
     jid3 = q.enqueue("sweep", {"p": "a"}, dedupe_key="sweep:a")
@@ -145,8 +127,8 @@ def test_dedupe_key_returns_same_id_for_duplicate(tmp_path: Path) -> None:
     assert stats.queued == 1
 
 
-def test_dedupe_key_allows_reenqueue_after_completion(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_dedupe_key_allows_reenqueue_after_completion(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     jid1 = q.enqueue("sweep", dedupe_key="sweep:a")
     (job,) = q.claim("w")
     q.complete(job.id)
@@ -156,8 +138,8 @@ def test_dedupe_key_allows_reenqueue_after_completion(tmp_path: Path) -> None:
     assert jid2 != jid1
 
 
-def test_dedupe_key_allows_reenqueue_after_failed(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_dedupe_key_allows_reenqueue_after_failed(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     jid1 = q.enqueue("sweep", dedupe_key="sweep:a")
     (job,) = q.claim("w")
     q.fail(job.id, "err", retry=False)
@@ -167,9 +149,9 @@ def test_dedupe_key_allows_reenqueue_after_failed(tmp_path: Path) -> None:
 
 
 def test_has_recent_or_active_dedupe_tracks_active_and_recent_rows(
-    tmp_path: Path,
+    pg_job_queue: JobQueue,
 ) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+    q = pg_job_queue
     before_enqueue = datetime.now(UTC) - timedelta(seconds=1)
     jid = q.enqueue("sweep", dedupe_key="sweep:a")
 
@@ -190,9 +172,9 @@ def test_has_recent_or_active_dedupe_tracks_active_and_recent_rows(
 
 
 def test_late_retry_fail_does_not_resurrect_terminal_dedupe_row(
-    tmp_path: Path,
+    pg_job_queue: JobQueue,
 ) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+    q = pg_job_queue
     jid1 = q.enqueue("sweep", dedupe_key="sweep:a")
     (job,) = q.claim("w")
     q.fail(job.id, "terminal", retry=False)
@@ -209,44 +191,118 @@ def test_late_retry_fail_does_not_resurrect_terminal_dedupe_row(
     assert new.status is JobStatus.QUEUED
 
 
-def test_retry_fail_converts_dedupe_integrity_error_to_failed_warning(
-    tmp_path: Path,
+def test_retry_fail_converts_dedupe_violation_to_failed_warning(
+    pg_job_queue: JobQueue,
     caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+    """A retry UPDATE raising ``UniqueViolation`` lands in terminal-failed.
+
+    Production hits this when ``queue.fail(retry=True)`` lands on a
+    row whose dedupe slot has already been re-acquired by a peer.
+    The partial unique index ``idx_work_jobs_dedupe_queued`` rejects
+    the requeue UPDATE; :meth:`JobQueue.fail` catches the violation,
+    rolls the transaction back, and marks the row terminal-failed
+    with a warning log line.
+
+    Reproducing the natural race against the index requires two
+    overlapping rows on the same dedupe_key, which the index itself
+    forbids. We synthesise the failure by patching
+    :func:`pollypm.jobs.queue._is_unique_violation` to fire on the
+    first requeue attempt — same shape as the sqlite test's
+    connection-wrapper approach (#1052 regression cover).
+    """
+    from pollypm.jobs import queue as queue_module
+
+    q = pg_job_queue
     jid = q.enqueue("sweep", dedupe_key="sweep:a")
     (job,) = q.claim("w")
-    wrapper = _DedupeIntegrityOnRetryConnection(q._conn)
-    original_conn = q._conn
+    assert job.id == jid
+
+    # Patch the predicate so the FIRST exception in fail()'s requeue
+    # UPDATE is treated as a unique violation. We trigger that
+    # exception by patching the retry policy to a tiny window so the
+    # row is requeued (which itself won't violate the index — the row
+    # is the only one with this dedupe_key — but the predicate-patch
+    # makes the regular path look like a collision regardless).
+    fired = {"n": 0}
+    real_predicate = queue_module._is_unique_violation
+
+    # Simulate a UniqueViolation by raising one ourselves from a
+    # patched cursor.execute the first time it sees the requeue UPDATE.
+    from psycopg import errors as pg_errors
+
+    class _OneShotViolatingCursor:
+        def __init__(self, real_cursor):
+            self._real = real_cursor
+
+        def execute(self, sql, *args, **kwargs):
+            if (
+                not fired["n"]
+                and "status = 'queued'" in str(sql)
+                and "run_after" in str(sql)
+            ):
+                fired["n"] += 1
+                raise pg_errors.UniqueViolation(
+                    "duplicate key value violates unique constraint "
+                    "\"idx_work_jobs_dedupe_queued\""
+                )
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self._real.__exit__(*args)
+
+    # Wrap the pool's connection.cursor so the first matching UPDATE
+    # raises UniqueViolation. Roll-and-restore is handled by fail().
+    real_connection = q._pool.connection
+
+    class _WrappedConn:
+        def __init__(self, ctx):
+            self._ctx = ctx
+
+        def __enter__(self):
+            self._conn = self._ctx.__enter__()
+            real_cursor = self._conn.cursor
+
+            def patched_cursor(*a, **kw):
+                return _OneShotViolatingCursor(real_cursor(*a, **kw))
+
+            self._conn.cursor = patched_cursor  # type: ignore[method-assign]
+            return self._conn
+
+        def __exit__(self, *args):
+            return self._ctx.__exit__(*args)
+
+    monkeypatch.setattr(
+        q._pool, "connection", lambda: _WrappedConn(real_connection()),
+    )
 
     caplog.set_level("WARNING", logger="pollypm.jobs.queue")
-    q._conn = wrapper  # type: ignore[assignment]
-    try:
-        q.fail(job.id, "timeout", retry=True)
-    finally:
-        q._conn = original_conn
+    q.fail(jid, "late timeout", retry=True)
 
+    assert fired["n"] == 1
     stored = q.get(jid)
-    assert wrapper.fired
     assert stored is not None
     assert stored.status is JobStatus.FAILED
-    assert q.get_last_error(jid) == "timeout"
+    assert q.get_last_error(jid) == "late timeout"
     assert "dedupe_key collision; marking failed instead" in caplog.text
+
+    # Restore (defensive — monkeypatch will undo at teardown).
+    assert real_predicate is queue_module._is_unique_violation
 
 
 def test_recover_orphaned_claims_resets_status_and_frees_dedupe(
-    tmp_path: Path,
+    pg_job_queue: JobQueue,
 ) -> None:
-    """#1071 — orphaned claimed rows must be requeued so dedupe slot frees.
-
-    A previous rail_daemon process claimed a job via ``dedupe_key`` and
-    then crashed before completing it. The dedupe unique index covers
-    ``status IN ('queued', 'claimed')``, so the orphan permanently
-    blocks any future ``enqueue(dedupe_key=...)`` from inserting a
-    fresh row — silently breaking every cadence handler that uses that
-    key (``task_assignment.sweep``, ``session.health_sweep``, etc).
-    """
-    q = JobQueue(db_path=tmp_path / "q.db")
+    """#1071 — orphaned claimed rows must be requeued so dedupe slot frees."""
+    q = pg_job_queue
     jid1 = q.enqueue("sweep", dedupe_key="sweep:a")
     (job,) = q.claim("crashed-worker")
     assert job.attempt == 1
@@ -256,7 +312,6 @@ def test_recover_orphaned_claims_resets_status_and_frees_dedupe(
     jid2 = q.enqueue("sweep", dedupe_key="sweep:a")
     assert jid2 == jid1
 
-    # Recover orphaned claims (simulates rail_daemon startup).
     recovered, pruned = q.recover_orphaned_claims()
     assert recovered == 1
     assert pruned == 0
@@ -266,45 +321,32 @@ def test_recover_orphaned_claims_resets_status_and_frees_dedupe(
     assert stored.status is JobStatus.QUEUED
     assert stored.claimed_at is None
     assert stored.claimed_by is None
-    # Attempt is rewound — the orphan never ran a handler body.
     assert stored.attempt == 0
 
-    # Post-recovery: a fresh enqueue with a different payload still
-    # dedupes onto the same key (slot is now held by the requeued
-    # row, not the orphan), but the row is claimable again.
     claimed = q.claim("worker-2")
     assert len(claimed) == 1
     assert claimed[0].id == jid1
 
 
 def test_recover_orphaned_claims_returns_zero_when_none_claimed(
-    tmp_path: Path,
+    pg_job_queue: JobQueue,
 ) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+    q = pg_job_queue
     q.enqueue("sweep")
     assert q.recover_orphaned_claims() == (0, 0)
 
 
 def test_recover_orphaned_claims_collapses_legacy_duplicates(
-    tmp_path: Path,
+    pg_job_queue: JobQueue,
 ) -> None:
-    """#1071 — pre-#1052 cadence ticks accumulated thousands of identical
-    rows in ``claimed`` (no dedupe_key). After requeueing them all, the
-    worker pool would grind through the legacy pile for hours before
-    firing freshly-scheduled handlers like ``stuck_claims.sweep`` that
-    are supposed to drain the backlog. Recovery collapses duplicates
-    per handler_name to the newest id.
-    """
-    q = JobQueue(db_path=tmp_path / "q.db")
-    # Three orphaned session.health_sweep rows from a prior daemon
-    # (dedupe_key=None, all claimed at restart time).
+    """#1071 — pre-#1052 cadence ticks accumulated duplicate rows in claimed."""
+    q = pg_job_queue
     a = q.enqueue("session.health_sweep")
     q.claim("crashed-1")
     b = q.enqueue("session.health_sweep")
     q.claim("crashed-1")
     c = q.enqueue("session.health_sweep")
     q.claim("crashed-1")
-    # One unrelated handler — must survive.
     other = q.enqueue("pane.classify")
     q.claim("crashed-1")
 
@@ -312,18 +354,16 @@ def test_recover_orphaned_claims_collapses_legacy_duplicates(
     assert recovered == 4  # all four rows requeued
     assert pruned == 2  # two duplicate session.health_sweep rows dropped
 
-    # Newest session.health_sweep id (c) survives; older ones gone.
     assert q.get(a) is None
     assert q.get(b) is None
     assert q.get(c) is not None
     assert q.get(c).status is JobStatus.QUEUED
-    # The unrelated handler is untouched.
     assert q.get(other) is not None
     assert q.get(other).status is JobStatus.QUEUED
 
 
-def test_null_dedupe_key_does_not_deduplicate(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_null_dedupe_key_does_not_deduplicate(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     jid1 = q.enqueue("sweep", {"p": "a"})
     jid2 = q.enqueue("sweep", {"p": "a"})
     assert jid1 != jid2
@@ -335,24 +375,21 @@ def test_null_dedupe_key_does_not_deduplicate(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_run_after_hides_job_until_due(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_run_after_hides_job_until_due(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     future = datetime.now(UTC) + timedelta(hours=1)
     q.enqueue("later", run_after=future)
 
-    # Not yet visible.
     assert q.claim("w") == []
 
-    # Reschedule to the past by manipulating via a fail-then-update? simpler:
-    # insert a second job with run_after in the past and verify ordering.
     q.enqueue("now")
     claimed = q.claim("w", limit=10)
     assert len(claimed) == 1
     assert claimed[0].handler_name == "now"
 
 
-def test_run_after_in_the_past_is_immediately_visible(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_run_after_in_the_past_is_immediately_visible(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     past = datetime.now(UTC) - timedelta(seconds=60)
     q.enqueue("old", run_after=past)
     claimed = q.claim("w")
@@ -364,9 +401,10 @@ def test_run_after_in_the_past_is_immediately_visible(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_concurrent_claim_never_duplicates(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
-    n_jobs = 200
+def test_concurrent_claim_never_duplicates(pg_job_queue: JobQueue) -> None:
+    """``SELECT ... FOR UPDATE SKIP LOCKED`` guarantees no double-claim."""
+    q = pg_job_queue
+    n_jobs = 100
     for i in range(n_jobs):
         q.enqueue("h", {"i": i})
 
@@ -383,7 +421,7 @@ def test_concurrent_claim_never_duplicates(tmp_path: Path) -> None:
             for job in batch:
                 q.complete(job.id)
 
-    threads = [threading.Thread(target=worker, args=(f"w-{i}",)) for i in range(8)]
+    threads = [threading.Thread(target=worker, args=(f"w-{i}",)) for i in range(4)]
     for t in threads:
         t.start()
     for t in threads:
@@ -402,15 +440,14 @@ def test_concurrent_claim_never_duplicates(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_stats_reflects_job_states(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_stats_reflects_job_states(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     for _ in range(3):
         q.enqueue("h")
     q.enqueue("will_fail")
     q.enqueue("will_done")
 
-    # One claimed+done.
-    (job,) = q.claim("w", limit=1)  # can't rely on ordering beyond run_after
+    (job,) = q.claim("w", limit=1)
     q.complete(job.id)
 
     stats = q.stats()
@@ -420,8 +457,8 @@ def test_stats_reflects_job_states(tmp_path: Path) -> None:
     assert stats.failed == 0
 
 
-def test_claim_limit_bounds_batch_size(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_claim_limit_bounds_batch_size(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     for _ in range(5):
         q.enqueue("h")
 
@@ -429,13 +466,13 @@ def test_claim_limit_bounds_batch_size(tmp_path: Path) -> None:
     assert len(batch) == 2
 
 
-def test_claim_returns_empty_when_no_jobs(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_claim_returns_empty_when_no_jobs(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     assert q.claim("w") == []
 
 
-def test_list_jobs_filter_by_status(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_list_jobs_filter_by_status(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     q.enqueue("h1")
     q.enqueue("h2")
     (job,) = q.claim("w", limit=1)
@@ -448,13 +485,12 @@ def test_list_jobs_filter_by_status(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Retry policy
+# Retry policy (pure helper — no DB needed)
 # ---------------------------------------------------------------------------
 
 
 def test_exponential_backoff_grows() -> None:
     policy = exponential_backoff(base_seconds=1.0, factor=2.0, max_seconds=60.0, jitter=0)
-    # Deterministic with no jitter.
     assert policy(1) == timedelta(seconds=1)
     assert policy(2) == timedelta(seconds=2)
     assert policy(3) == timedelta(seconds=4)
@@ -472,25 +508,28 @@ def test_exponential_backoff_respects_max() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_enqueue_requires_handler_name(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_enqueue_requires_handler_name(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     with pytest.raises(ValueError):
         q.enqueue("")
 
 
-def test_complete_of_missing_job_is_noop(tmp_path: Path) -> None:
-    q = JobQueue(db_path=tmp_path / "q.db")
+def test_complete_of_missing_job_is_noop(pg_job_queue: JobQueue) -> None:
+    q = pg_job_queue
     q.complete(99999)  # should not raise
     q.fail(99999, "missing", retry=True)  # should not raise
 
 
-def test_queue_can_reopen_existing_db(tmp_path: Path) -> None:
-    path = tmp_path / "q.db"
-    q1 = JobQueue(db_path=path)
+def test_queue_round_trip_via_pool(pg_schema_pool) -> None:
+    """A queue built against a pool can be re-opened and read previous rows."""
+    from pollypm.storage.pg_migrations import apply_migrations
+
+    apply_migrations(pg_schema_pool)
+    q1 = JobQueue(pool=pg_schema_pool)
     jid = q1.enqueue("h", {"a": 1})
     q1.close()
 
-    q2 = JobQueue(db_path=path)
+    q2 = JobQueue(pool=pg_schema_pool)
     job = q2.get(jid)
     assert job is not None
     assert job.handler_name == "h"

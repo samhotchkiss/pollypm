@@ -255,7 +255,7 @@ def _wait_until(predicate, *, timeout: float = 3.0, interval: float = 0.02) -> b
     return predicate()
 
 
-def test_registered_handler_runs_when_enqueued(tmp_path: Path) -> None:
+def test_registered_handler_runs_when_enqueued(pg_job_queue: JobQueue) -> None:
     registry = JobHandlerRegistry()
     seen: list[dict] = []
 
@@ -266,12 +266,7 @@ def test_registered_handler_runs_when_enqueued(tmp_path: Path) -> None:
         timeout_seconds=5.0,
     )
 
-    q = JobQueue(
-        db_path=tmp_path / "q.db",
-        retry_policy=exponential_backoff(
-            base_seconds=0.01, factor=1.0, max_seconds=0.01, jitter=0
-        ),
-    )
+    q = pg_job_queue
     pool = JobWorkerPool(q, registry=registry, poll_interval=0.01)
     pool.start(concurrency=1)
     try:
@@ -283,14 +278,9 @@ def test_registered_handler_runs_when_enqueued(tmp_path: Path) -> None:
     assert seen == [{"hi": "there"}]
 
 
-def test_unknown_handler_fails_with_clear_error(tmp_path: Path) -> None:
+def test_unknown_handler_fails_with_clear_error(pg_job_queue: JobQueue) -> None:
     registry = JobHandlerRegistry()  # empty
-    q = JobQueue(
-        db_path=tmp_path / "q.db",
-        retry_policy=exponential_backoff(
-            base_seconds=0.01, factor=1.0, max_seconds=0.01, jitter=0
-        ),
-    )
+    q = pg_job_queue
     pool = JobWorkerPool(q, registry=registry, poll_interval=0.01)
     pool.start(concurrency=1)
     try:

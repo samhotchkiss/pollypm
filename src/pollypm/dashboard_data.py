@@ -862,11 +862,23 @@ def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
 def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     """Gather all dashboard data."""
     from pollypm.service_api import plan_launches_readonly
+    from pollypm.storage._backend_dispatch import is_pg_backend
 
     now = datetime.now(UTC)
+    pg_active = is_pg_backend(config)
 
-    # Active sessions
-    all_runtimes = store.list_session_runtimes()
+    # Active sessions — Slice K-state-port phase 2c (#1737): on the pg
+    # path go straight through pg_sessions; sqlite path uses the legacy
+    # StateStore reader. Both branches yield the same SessionRuntimeRecord
+    # shape, so the runtime_map build is unchanged.
+    if pg_active:
+        from pollypm.storage.pg_sessions import (
+            list_session_runtimes as pg_list_session_runtimes,
+        )
+
+        all_runtimes = pg_list_session_runtimes()
+    else:
+        all_runtimes = store.list_session_runtimes()
     runtime_map = {rt.session_name: rt for rt in all_runtimes}
     launches = plan_launches_readonly(config, store)
 
@@ -895,8 +907,15 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
             status=status, description=desc, age_seconds=age,
         ))
 
-    # Events summary
-    recent = store.recent_events(limit=300)
+    # Events summary — Slice K-state-port phase 2c (#1737).
+    if pg_active:
+        from pollypm.storage.pg_sessions import (
+            recent_events as pg_recent_events,
+        )
+
+        recent = pg_recent_events(limit=300)
+    else:
+        recent = store.recent_events(limit=300)
     cutoff = (now - timedelta(hours=24)).isoformat()
     day_events = [e for e in recent if e.created_at >= cutoff]
 

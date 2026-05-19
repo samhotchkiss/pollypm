@@ -650,6 +650,14 @@ def record_checkpoint(
         snapshot_path=str(snapshot_path),
         summary_text=artifact.summary_text,
     )
+    # NB: cluster-A pg dispatch for the runtime read/write is NOT
+    # threaded here yet — ``record_checkpoint`` is invoked with a live
+    # ``store`` (StateStore today; tests rely on it). Callers that have
+    # already chosen the pg backend obtain that store through
+    # ``Supervisor.store`` which still proxies sqlite. The follow-up
+    # phase will rewire ``record_checkpoint`` to take a config / route
+    # through the pg facade; for now we keep parity with the legacy
+    # behaviour. See Slice K-state-port (#1737).
     current = store.get_session_runtime(launch.session.name)
     store.upsert_session_runtime(
         session_name=launch.session.name,

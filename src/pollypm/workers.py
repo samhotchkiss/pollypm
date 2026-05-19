@@ -23,11 +23,25 @@ _log = logging.getLogger(__name__)
 def _effective_control_accounts(config_path: Path) -> set[str]:
     config = load_config(config_path)
     accounts = {config.pollypm.controller_account}
-    with StateStore(config.project.state_db) as store:
+    # Slice K-state-port phase 2c (#1737): on the pg backend, skip the
+    # short-lived StateStore open and go straight through pg_sessions —
+    # the cluster-A facade owns session_runtime under postgres. The
+    # sqlite branch is unchanged for back-compat.
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if is_pg_backend(config):
+        from pollypm.storage.pg_sessions import get_session_runtime
+
         for session_name in ("heartbeat", "operator"):
-            runtime = store.get_session_runtime(session_name)
+            runtime = get_session_runtime(session_name)
             if runtime is not None and runtime.effective_account:
                 accounts.add(runtime.effective_account)
+    else:
+        with StateStore(config.project.state_db) as store:
+            for session_name in ("heartbeat", "operator"):
+                runtime = store.get_session_runtime(session_name)
+                if runtime is not None and runtime.effective_account:
+                    accounts.add(runtime.effective_account)
     return {name for name in accounts if name}
 
 

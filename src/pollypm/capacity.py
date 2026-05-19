@@ -317,10 +317,24 @@ def recovery_order(
     4. preempted - sessions that were preempted by failover
     5. new-work - sessions waiting for capacity
     """
+    # Slice K-state-port phase 2c (#1737): pg backend reads the cluster-A
+    # session_runtime row through the pg_sessions facade; sqlite path
+    # keeps the legacy StateStore reader.
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    pg_active = is_pg_backend(config)
+    if pg_active:
+        from pollypm.storage.pg_sessions import (
+            get_session_runtime as _get_session_runtime,
+        )
+    else:
+        def _get_session_runtime(name: str):
+            return store.get_session_runtime(name)
+
     sessions: list[tuple[str, str, int]] = []
 
     for session_name, session_config in config.sessions.items():
-        runtime = store.get_session_runtime(session_name)
+        runtime = _get_session_runtime(session_name)
 
         if session_config.role == "heartbeat-supervisor":
             category = "heartbeat"

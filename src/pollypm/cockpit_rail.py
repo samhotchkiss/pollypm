@@ -602,7 +602,9 @@ def _build_project_pm_primer(
             db_path = project.path / ".pollypm" / "state.db"
             if db_path.exists():
                 with create_work_service(
-                    db_path=db_path, project_path=project.path,
+                    db_path=db_path,
+                    project_path=project.path,
+                    config=supervisor.config,
                 ) as svc:
                     tasks = list(svc.list_tasks(project=project_key))
                     for task in tasks:
@@ -760,7 +762,9 @@ def _build_operator_primer(supervisor) -> str | None:
             continue
         try:
             with create_work_service(
-                db_path=db_path, project_path=project.path,
+                db_path=db_path,
+                project_path=project.path,
+                config=supervisor.config,
             ) as svc:
                 items = list(inbox_tasks(svc, project=project_key))
                 inbox_total += len(items)
@@ -2110,7 +2114,7 @@ class CockpitRouter:
         for db_path in candidate_db_paths:
             try:
                 work = create_work_service(
-                    db_path=db_path, project_path=project_path,
+                    db_path=db_path, project_path=project_path, config=config,
                 )
             except Exception:  # noqa: BLE001
                 continue

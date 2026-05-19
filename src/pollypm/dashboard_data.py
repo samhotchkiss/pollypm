@@ -590,7 +590,7 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
             continue
         try:
             with create_work_service(
-                db_path=db_path, project_path=project.path,
+                db_path=db_path, project_path=project.path, config=config,
             ) as svc:
                 total += len(inbox_tasks(svc, project=project_key))
         except Exception:  # noqa: BLE001
@@ -742,7 +742,9 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         if not db_path.exists():
             continue
         try:
-            with create_work_service(db_path=db_path, project_path=project_path) as svc:
+            with create_work_service(
+                db_path=db_path, project_path=project_path, config=config,
+            ) as svc:
                 for task in inbox_tasks(svc, project=project_key):
                     if task.task_id in seen_task_ids:
                         continue

@@ -1555,7 +1555,9 @@ class PollyTasksApp(App[None]):
             return None
         for db_path, project_path in candidates:
             try:
-                svc = create_work_service(db_path=db_path, project_path=project_path)
+                svc = create_work_service(
+                    db_path=db_path, project_path=project_path, config=config,
+                )
             except Exception:  # noqa: BLE001
                 continue
             try:
@@ -1577,7 +1579,9 @@ class PollyTasksApp(App[None]):
         first_db, first_project_path = candidates[0]
         try:
             return create_work_service(
-                db_path=first_db, project_path=first_project_path,
+                db_path=first_db,
+                project_path=first_project_path,
+                config=config,
             )
         except Exception:  # noqa: BLE001
             return None

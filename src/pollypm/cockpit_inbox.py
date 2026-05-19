@@ -65,7 +65,9 @@ def _timestamp_sort_value(value) -> float:
         return 0.0
 
 
-def _render_work_service_issues(project: object) -> str:
+def _render_work_service_issues(
+    project: object, *, config: object | None = None,
+) -> str:
     """Render tasks from the work service for a project."""
     from pollypm.work import create_work_service
 
@@ -73,7 +75,9 @@ def _render_work_service_issues(project: object) -> str:
     if not db_path.exists():
         raise FileNotFoundError(db_path)
 
-    with create_work_service(db_path=db_path, project_path=project.path) as svc:
+    with create_work_service(
+        db_path=db_path, project_path=project.path, config=config,
+    ) as svc:
         counts = svc.state_counts(project=getattr(project, "key", None))
         tasks = svc.list_tasks(project=getattr(project, "key", None))
 
@@ -222,7 +226,7 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
 
         try:
             with create_work_service(
-                db_path=db_path, project_path=project_path,
+                db_path=db_path, project_path=project_path, config=config,
             ) as svc:
                 for task in inbox_tasks(svc, project=project_key):
                     item = annotate_inbox_entry(
@@ -465,7 +469,7 @@ def pm_inbox_filtered_list(
 
         try:
             with create_work_service(
-                db_path=db_path, project_path=project_path,
+                db_path=db_path, project_path=project_path, config=config,
             ) as svc:
                 for task in inbox_tasks(svc, project=project_key):
                     item = annotate_inbox_entry(
@@ -821,7 +825,7 @@ def _render_inbox_panel(config) -> str:
                 continue
             try:
                 svc = create_work_service(
-                    db_path=db_path, project_path=project_path,
+                    db_path=db_path, project_path=project_path, config=config,
                 )
             except Exception:  # noqa: BLE001
                 continue
@@ -1442,7 +1446,9 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
         if not db_path.exists():
             continue
         try:
-            svc = create_work_service(db_path=db_path, project_path=project_path)
+            svc = create_work_service(
+                db_path=db_path, project_path=project_path, config=config,
+            )
         except Exception:  # noqa: BLE001
             continue
         try:

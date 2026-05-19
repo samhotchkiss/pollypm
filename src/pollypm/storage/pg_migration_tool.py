@@ -379,7 +379,14 @@ class SourceMigrationReport:
 
     @property
     def succeeded(self) -> bool:
-        return self.failure is None and self.skipped_already_imported_at is None
+        # #1760: parity_ok MUST be a precondition of success. Previously
+        # a mismatch (skipped conflicts) still let the run record an
+        # audit row and rename the source — silently dropping data.
+        return (
+            self.failure is None
+            and self.skipped_already_imported_at is None
+            and self.parity_ok
+        )
 
     def rows_per_table_map(self) -> dict[str, int]:
         return {t.table: t.pg_rows_copied for t in self.per_table if t.pg_rows_copied}
@@ -918,6 +925,34 @@ def _copy_table(
     columns_for_insert: tuple[str, ...] | None = None
     inserted = 0
 
+    def _executemany_count(pg_cur, sql: str, rows: list[tuple[Any, ...]]) -> int:
+        """Run executemany and return the *actual* rows inserted.
+
+        #1760: ``ON CONFLICT DO NOTHING`` makes ``executemany`` return the
+        number of rows the INSERT *touched*, not the number that landed.
+        psycopg's ``cur.rowcount`` after ``executemany`` reflects only the
+        last statement, so we use ``RETURNING 1`` per-row via ``execute``
+        to count truthfully. This is slower than ``executemany`` but only
+        runs once per batch (≤ COPY_BATCH_SIZE rows), and migration is a
+        one-shot operation — correctness over throughput.
+        """
+        # Fast path: if the SQL has no ON CONFLICT clause, fall back to
+        # plain executemany + len(rows). ON CONFLICT DO NOTHING means the
+        # rowcount can lie; switch to a per-row execute that uses
+        # ``RETURNING 1`` so we can count what actually landed.
+        if "ON CONFLICT" not in sql:
+            pg_cur.executemany(sql, rows)
+            return len(rows)
+        returning_sql = sql + " RETURNING 1"
+        landed = 0
+        for row in rows:
+            pg_cur.execute(returning_sql, row)
+            # If the row landed the cursor yields one ``(1,)`` row; on
+            # conflict the RETURNING clause emits zero rows.
+            if pg_cur.fetchone() is not None:
+                landed += 1
+        return landed
+
     with conn.cursor() as pg_cur:
         for row in cursor:
             cols, vals = _convert_row(
@@ -941,8 +976,7 @@ def _copy_table(
                 # all rows of one sqlite table share the same columns)
                 # but defend by flushing what we have and re-deriving.
                 if batch:
-                    pg_cur.executemany(insert_sql, batch)
-                    inserted += len(batch)
+                    inserted += _executemany_count(pg_cur, insert_sql, batch)
                     batch = []
                 columns_for_insert = cols
                 col_list = ", ".join(columns_for_insert)
@@ -955,13 +989,11 @@ def _copy_table(
 
             batch.append(vals)
             if len(batch) >= batch_size:
-                pg_cur.executemany(insert_sql, batch)
-                inserted += len(batch)
+                inserted += _executemany_count(pg_cur, insert_sql, batch)
                 batch = []
 
         if batch:
-            pg_cur.executemany(insert_sql, batch)
-            inserted += len(batch)
+            inserted += _executemany_count(pg_cur, insert_sql, batch)
 
     report.pg_rows_copied = inserted
     return report
@@ -1149,15 +1181,26 @@ def migrate_sources(
                     if mismatches:
                         report.parity_ok = False
                         report.parity_mismatches = mismatches
+                        # #1760: a parity mismatch means rows were
+                        # skipped (typically via ``ON CONFLICT DO
+                        # NOTHING``). Mark a failure reason so the
+                        # report flags it loudly and the audit/rename
+                        # paths skip this source.
+                        if report.failure is None:
+                            report.failure = (
+                                f"parity check failed: pg < sqlite for "
+                                f"{len(mismatches)} table(s) — source "
+                                "rows were skipped (likely conflicts)"
+                            )
 
                     report.completed_at = datetime.now(UTC)
 
-                    if commit:
+                    if commit and report.parity_ok:
                         _audit_record(conn, report=report)
                         conn.commit()
                         run.committed = True
                     else:
-                        # Dry-run — never persist.
+                        # Dry-run or parity-failed — never persist.
                         conn.rollback()
                 except Exception:
                     conn.rollback()

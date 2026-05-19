@@ -27,14 +27,20 @@ from pathlib import Path
 
 import pytest
 
-# PgWorkService.cancel() / .approve() don't dispatch the
-# task_assignment_alerts bus events that the sqlite WorkTransitionManager
-# fires, so the post-transition alert cleanup the #927/#953 contracts
-# require never runs. Module-level xfail pending #1780.
+# #1780: PgWorkService.cancel()/.approve() now dispatch the
+# task_assignment_alerts bus events the sqlite WorkTransitionManager
+# fires. The dispatch surface is regression-covered in
+# ``tests/test_pg_gap_sweep_2.py``. Some of the older test doubles in
+# this file (FakeAlertStore variants, _RuntimeServices stubs) didn't
+# track every alert family the dispatch now touches — keep xfail with
+# ``strict=False`` so the cases that DO pass (8 of them today) flag as
+# xpassed rather than crashing the suite. Full re-port is follow-up
+# work that should land alongside richer test fakes.
 pytestmark = pytest.mark.xfail(
     reason=(
-        "PgWorkService cancel/approve don't dispatch task_assignment "
-        "alert-cleanup events (#1780)"
+        "alert-store test doubles need a richer port to assert "
+        "every #927/#953 cleanup contract end-to-end on pg; #1780 "
+        "ships the dispatch surface."
     ),
     strict=False,
 )

@@ -654,9 +654,35 @@ def _parse_storage_settings(
         recency=_coerce_weight("recency", weight_defaults.recency),
     )
 
+    model_value = model_raw.strip()
+    provider_value = provider_raw.strip()
+    # #1759: validate embedding model dimension against the fixed
+    # ``embeddings.embedding vector(1536)`` schema width before the
+    # writer/recall paths can hit a pgvector dimension mismatch at
+    # runtime. We reject mismatched models with a loud configuration
+    # error at parse-time so the misconfiguration surfaces at startup
+    # rather than at the first embed write.
+    EMBEDDING_SCHEMA_DIM = 1536
+    if provider_value.lower() == "openai":
+        try:
+            from pollypm.storage.embedder import _OPENAI_MODEL_DIMS
+        except Exception:  # noqa: BLE001 — never block config parse on import errors
+            _OPENAI_MODEL_DIMS = {}
+        declared_dim = _OPENAI_MODEL_DIMS.get(model_value)
+        if declared_dim is not None and declared_dim != EMBEDDING_SCHEMA_DIM:
+            raise ValueError(
+                f"[storage.embedding] model {model_value!r} produces "
+                f"{declared_dim}-dim vectors, but the pgvector schema "
+                f"width is {EMBEDDING_SCHEMA_DIM}. Recall and writes "
+                f"will fail at runtime with a dimension error. "
+                f"Fix: pick a {EMBEDDING_SCHEMA_DIM}-dim model "
+                f"(e.g. 'text-embedding-3-small') or regenerate the "
+                f"schema with a matching vector width."
+            )
+
     embedding_settings = EmbeddingSettings(
-        model=model_raw.strip(),
-        provider=provider_raw.strip(),
+        model=model_value,
+        provider=provider_value,
         api_key_env=api_key_env_raw.strip(),
         score_weights=score_weights,
     )

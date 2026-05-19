@@ -252,6 +252,12 @@ class PgWorkService:
 
         self._pool = pool
         self._ro_pool = ro_pool
+        # #1825: store the constructor config so flow resolution honours
+        # the caller's config rather than reaching for ``load_config()``
+        # without a path. Multi-workspace / test-isolated callers depend
+        # on this so flow templates resolve from the project root the
+        # service was opened against.
+        self._config = config
         self._project_key = project_key or ""
         # Sync manager — optional collaborator that mirrors task lifecycle
         # events (create / update / transition) onto registered adapters
@@ -270,16 +276,51 @@ class PgWorkService:
         # the sqlite service has: open the service, schema is current.
         # Slice E adds an explicit ``pm storage migrate`` CLI; until
         # then the constructor is the only writer that runs DDL.
+        applied_versions: list[int] = []
         if apply_migrations:
             from pollypm.storage.pg_migrations import apply_migrations as run
 
-            run(self._pool)
+            summary = run(self._pool)
+            try:
+                applied_versions = [int(v) for v, _ in getattr(summary, "applied", [])]
+            except (TypeError, ValueError):  # pragma: no cover — defensive
+                applied_versions = []
 
         # Match the sqlite service's last-error breadcrumb (#243) so
         # cockpit code that reads this attribute via Protocol shape
         # doesn't crash on the pg backend.
         self.last_provision_error: str | None = None
         self.last_first_shipped_created: bool = False
+
+        # #1787: emit ``work_db.opened`` to mirror the sqlite service's
+        # audit trail. Without this, central tail watchers and ``pm
+        # doctor`` cannot tell when a pg-backed service was opened.
+        # Best-effort — audit failure must never block init.
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_WORK_DB_OPENED
+
+            _audit_emit(
+                event=EVENT_WORK_DB_OPENED,
+                project="_workspace",
+                subject="postgres",
+                actor="system",
+                metadata={
+                    "backend": "postgres",
+                    "tables_created": bool(applied_versions),
+                    "applied_migrations": applied_versions,
+                    "project_path": (
+                        str(self._project_path)
+                        if self._project_path is not None
+                        else None
+                    ),
+                },
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break init
+            logger.debug(
+                "pg work DB opened audit emit failed", exc_info=True
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -673,6 +714,23 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                # #1758: serialize per-project task-number allocation via
+                # an advisory lock keyed by ``project``. Without this,
+                # two concurrent ``create()`` calls for the same project
+                # can both read the same MAX(task_number) and race the
+                # ``(project, task_number)`` primary key.
+                #
+                # ``pg_advisory_xact_lock(bigint)`` releases automatically
+                # at commit/rollback — no manual unlock required, and the
+                # lock doesn't leak if the transaction crashes.
+                # ``hashtextextended`` maps the project string to a
+                # bigint key deterministically; the second arg is a salt
+                # we leave at 0.
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended(%s, 0))",
+                    (f"work_tasks.task_number:{project}",),
+                )
                 # Allocate the next task_number atomically per project.
                 cur.execute(
                     "SELECT COALESCE(MAX(task_number), 0) + 1 "
@@ -721,6 +779,45 @@ class PgWorkService:
                 )
             conn.commit()
         task = self.get(f"{project}/{task_number}")
+        # #1787: emit ``task.created`` audit to mirror sqlite's
+        # ``service_queries.create_task`` hook. Best-effort.
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_TASK_CREATED
+
+            _audit_emit(
+                event=EVENT_TASK_CREATED,
+                project=project,
+                subject=task.task_id,
+                actor=created_by or "system",
+                metadata={
+                    "title": title,
+                    "type": type,
+                    "flow_template": flow_template,
+                    "priority": priority,
+                    "requires_human_review": bool(requires_human_review),
+                },
+                project_path=self._project_path,
+            )
+            if predecessor_task_id is not None:
+                from pollypm.audit.log import EVENT_PLAN_SUCCESSOR_CREATED
+
+                _audit_emit(
+                    event=EVENT_PLAN_SUCCESSOR_CREATED,
+                    project=project,
+                    subject=task.task_id,
+                    actor=created_by or "system",
+                    metadata={
+                        "predecessor": predecessor_task_id,
+                    },
+                    project_path=self._project_path,
+                )
+        except Exception:  # noqa: BLE001 — audit must never break create
+            logger.debug(
+                "task.created audit emit failed for %s",
+                task.task_id,
+                exc_info=True,
+            )
         # Mirror :func:`service_queries.create_task`: invoke registered
         # sync adapters and persist any external refs they stamped onto
         # the task object so the github_issue ref (and similar) survives
@@ -993,6 +1090,20 @@ class PgWorkService:
             logger.debug(
                 "_on_cancelled cascade failed for %s", task_id, exc_info=True
             )
+        # #1780: dispatch the assignment-alert cleanup events the sqlite
+        # service's WorkTransitionManager raises so any
+        # ``no_session_for_assignment:<task_id>`` /
+        # ``worker-<project>/no_session`` alerts raised by the heartbeat
+        # sweep get cleared. Without this the task_assignment_notify
+        # plugin would leave those alerts open after the cancel.
+        try:
+            self._dispatch_cancel_assignment_alerts(task)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "assignment alert cleanup dispatch failed for %s",
+                task_id,
+                exc_info=True,
+            )
         return result
 
     def mark_done(self, task_id: str, actor: str) -> Task:
@@ -1070,9 +1181,58 @@ class PgWorkService:
                     ),
                 )
             conn.commit()
+        # #1787: audit emit after commit so a successful row in
+        # ``work_transitions`` always has a paired JSONL entry.
+        self._emit_status_changed_audit(
+            project=project,
+            task_number=task_number,
+            from_state=current.value,
+            to_state=to_state.value,
+            actor=actor,
+            reason=reason,
+        )
         task = self.get(task_id)
         self._sync_transition(task, current.value, to_state.value)
         return task
+
+    def _emit_status_changed_audit(
+        self,
+        *,
+        project: str,
+        task_number: int,
+        from_state: str,
+        to_state: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> None:
+        """Emit ``task.status_changed`` audit row (#1787).
+
+        Mirrors the sqlite ``_record_transition`` audit hook. Best-effort
+        — audit failures must never block a transition.
+        """
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_TASK_STATUS_CHANGED
+
+            _audit_emit(
+                event=EVENT_TASK_STATUS_CHANGED,
+                project=project,
+                subject=f"{project}/{task_number}",
+                actor=actor or "",
+                metadata={
+                    "from": from_state,
+                    "to": to_state,
+                    "reason": reason,
+                },
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break transitions
+            logger.debug(
+                "task status audit emit failed for %s/%s",
+                project,
+                task_number,
+                exc_info=True,
+            )
 
     def _sync_transition(
         self, task: Task, old_status: str, new_status: str
@@ -1745,6 +1905,7 @@ class PgWorkService:
         resume_merge: bool = False,  # noqa: ARG002 — git auto-merge is Slice C
     ) -> Task:
         """Approve a review node and advance the flow."""
+        self.last_first_shipped_created = False
         task = self.get(task_id)
         if task.work_status != WorkStatus.REVIEW:
             current = task.work_status.value
@@ -1836,6 +1997,39 @@ class PgWorkService:
                     task_id,
                     exc_info=True,
                 )
+            # #1782: record the first_shipped milestone the same way
+            # the sqlite service does. ``maybe_record_first_shipped``
+            # checks whether the task landed a commit artifact and, if
+            # so, writes the ``first_shipped_at`` state file + pinned
+            # activity event. Best-effort; failures are swallowed.
+            try:
+                from pollypm.work.sqlite_service import (
+                    maybe_record_first_shipped,
+                )
+
+                self.last_first_shipped_created = maybe_record_first_shipped(
+                    self,
+                    task_id,
+                    project_path=self._project_path,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "first_shipped record failed for %s",
+                    task_id,
+                    exc_info=True,
+                )
+        # #1780: clear the per-task no_session alert after approve.
+        # Mirrors the sqlite WorkTransitionManager._handle_approve_alert_cleanup
+        # hook so the alert raised by the heartbeat sweep doesn't sit in
+        # the alert store after the task is approved (#953).
+        try:
+            self._dispatch_clear_no_session_alert(task_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "no_session alert cleanup after approve failed for %s",
+                task_id,
+                exc_info=True,
+            )
         return result
 
     def reject(self, task_id: str, actor: str, reason: str) -> Task:
@@ -2158,6 +2352,226 @@ class PgWorkService:
         ]
 
     # ------------------------------------------------------------------
+    # Notification staging (#1827) — pg-native ports of the sqlite
+    # ``service_notifications`` helpers. The pg schema already has the
+    # ``notification_staging`` table; these methods read/write it
+    # directly. Messages-store digest staging is deferred (it lives in
+    # the SQLAlchemy store, which has no pg backend yet); the table-
+    # only path is enough for ``maintenance.notification_staging_prune``
+    # and the rollup-candidate query the flush job needs.
+    # ------------------------------------------------------------------
+
+    def stage_notification(
+        self,
+        *,
+        project: str,
+        subject: str,
+        body: str,
+        actor: str,
+        priority: str,
+        milestone_key: str | None,
+        payload: dict[str, object] | None = None,
+    ) -> int:
+        """Insert one digest/silent notification staging row."""
+        assert priority in {"digest", "silent"}, (
+            f"stage_notification called with non-stageable priority {priority!r}"
+        )
+        payload_dict = dict(payload or {})
+        payload_dict.setdefault("subject", subject)
+        payload_dict.setdefault("body", body)
+        payload_dict.setdefault("actor", actor)
+        payload_dict.setdefault("project", project)
+        now = _now_iso()
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO notification_staging "
+                "(project, subject, body, actor, priority, payload_json, "
+                "milestone_key, created_at) "
+                "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s) "
+                "RETURNING id",
+                (
+                    project,
+                    subject,
+                    body,
+                    actor,
+                    priority,
+                    json.dumps(payload_dict, separators=(",", ":"), default=str),
+                    milestone_key,
+                    now,
+                ),
+            )
+            row = cur.fetchone()
+            new_id = int(row[0]) if row else 0
+            conn.commit()
+        return new_id
+
+    def list_digest_rollup_candidates(
+        self,
+        *,
+        project: str,
+        milestone_key: str | None,
+    ):
+        """Return un-flushed digest rows for a project / milestone."""
+        from pollypm.work.models import DigestRollupCandidate
+
+        if milestone_key is None:
+            sql = (
+                "SELECT id, subject, body, actor, created_at, payload_json "
+                "FROM notification_staging "
+                "WHERE project = %s AND milestone_key IS NULL "
+                "AND flushed_at IS NULL AND priority = 'digest' "
+                "ORDER BY created_at, id"
+            )
+            params: tuple = (project,)
+        else:
+            sql = (
+                "SELECT id, subject, body, actor, created_at, payload_json "
+                "FROM notification_staging "
+                "WHERE project = %s AND milestone_key = %s "
+                "AND flushed_at IS NULL AND priority = 'digest' "
+                "ORDER BY created_at, id"
+            )
+            params = (project, milestone_key)
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        merged = []
+        for row in rows:
+            payload_raw = row[5]
+            if isinstance(payload_raw, dict):
+                payload = payload_raw
+            else:
+                try:
+                    parsed = json.loads(payload_raw) if payload_raw else {}
+                except (TypeError, ValueError):
+                    parsed = {}
+                payload = parsed if isinstance(parsed, dict) else {}
+            created_at_raw = row[4]
+            created_at = (
+                created_at_raw.isoformat()
+                if hasattr(created_at_raw, "isoformat")
+                else str(created_at_raw or "")
+            )
+            merged.append(
+                DigestRollupCandidate(
+                    source="legacy",
+                    row_id=int(row[0]),
+                    subject=str(row[1] or ""),
+                    body=str(row[2] or ""),
+                    actor=str(row[3] or "polly"),
+                    created_at=created_at,
+                    payload=payload,
+                )
+            )
+        return merged
+
+    def mark_rollup_candidates_flushed(
+        self,
+        candidates,
+        *,
+        rollup_task_id: str,
+        flushed_at: str,
+    ) -> None:
+        """Mark the given candidates as flushed under a rollup task."""
+        legacy_ids = [
+            row.row_id for row in candidates if row.source == "legacy"
+        ]
+        if not legacy_ids:
+            return
+        placeholders = ",".join("%s" for _ in legacy_ids)
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"UPDATE notification_staging "
+                f"SET flushed_at = %s, rollup_task_id = %s "
+                f"WHERE id IN ({placeholders})",
+                [flushed_at, rollup_task_id, *legacy_ids],
+            )
+            conn.commit()
+
+    def has_old_pending_digest_rows(
+        self,
+        *,
+        project: str,
+        milestone_key: str | None,
+        min_age_seconds: int,
+    ) -> bool:
+        """True when un-flushed digest rows older than ``min_age_seconds`` exist."""
+        from datetime import timedelta
+
+        cutoff = (datetime.now(UTC) - timedelta(seconds=min_age_seconds)).isoformat()
+        if milestone_key is None:
+            sql = (
+                "SELECT COUNT(*) FROM notification_staging "
+                "WHERE project = %s AND milestone_key IS NULL "
+                "AND flushed_at IS NULL AND priority = 'digest' "
+                "AND created_at <= %s"
+            )
+            params: tuple = (project, cutoff)
+        else:
+            sql = (
+                "SELECT COUNT(*) FROM notification_staging "
+                "WHERE project = %s AND milestone_key = %s "
+                "AND flushed_at IS NULL AND priority = 'digest' "
+                "AND created_at <= %s"
+            )
+            params = (project, milestone_key, cutoff)
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+        return bool(row and row[0])
+
+    def find_flushed_rollup_milestone(self, *, task_id: str) -> str | None:
+        """Return the milestone_key for a rollup-flushed staging row."""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT milestone_key, payload_json FROM notification_staging "
+                "WHERE flushed_at IS NOT NULL "
+                "ORDER BY flushed_at DESC LIMIT 500"
+            )
+            rows = cur.fetchall()
+        needle = f'"task_id": "{task_id}"'
+        needle_compact = f'"task_id":"{task_id}"'
+        for row in rows:
+            payload = row[1]
+            if isinstance(payload, dict):
+                payload_str = json.dumps(payload, default=str)
+            else:
+                payload_str = str(payload or "")
+            if (
+                needle in payload_str
+                or needle_compact in payload_str
+                or task_id in payload_str
+            ):
+                return row[0]
+        return None
+
+    def prune_staged_notifications(
+        self, *, retain_days: int = 30
+    ) -> dict[str, int]:
+        """Delete flushed/silent staging rows older than retain_days."""
+        from datetime import timedelta
+
+        cutoff = (datetime.now(UTC) - timedelta(days=retain_days)).isoformat()
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM notification_staging "
+                "WHERE flushed_at IS NOT NULL AND flushed_at <= %s",
+                (cutoff,),
+            )
+            flushed_deleted = cur.rowcount or 0
+            cur.execute(
+                "DELETE FROM notification_staging "
+                "WHERE priority = 'silent' AND created_at <= %s",
+                (cutoff,),
+            )
+            silent_deleted = cur.rowcount or 0
+            conn.commit()
+        return {
+            "flushed_pruned": int(flushed_deleted),
+            "silent_pruned": int(silent_deleted),
+        }
+
+    # ------------------------------------------------------------------
     # Inbox interaction methods — reply / archive / read-marker (#1776)
     #
     # These four wrap context-entry primitives with the idempotency +
@@ -2275,6 +2689,16 @@ class PgWorkService:
                     (WorkStatus.DONE.value, now, project, task_number),
                 )
             conn.commit()
+        # #1787: audit emit after commit so the JSONL trail tracks this
+        # transition the same way ``_simple_transition`` does.
+        self._emit_status_changed_audit(
+            project=project,
+            task_number=task_number,
+            from_state=from_status.value,
+            to_state=WorkStatus.DONE.value,
+            actor=actor,
+            reason="inbox.archive",
+        )
         result = self.get(task_id)
         self._sync_transition(result, from_status.value, WorkStatus.DONE.value)
         # Cascade: any dependents blocked on this task should unblock,
@@ -2523,6 +2947,96 @@ class PgWorkService:
                 actor="system",
                 reason=f"auto-unblocked, blocker {task.task_id} completed",
             )
+
+    # ------------------------------------------------------------------
+    # Assignment alert cleanup (#1780)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_alert_store() -> object | None:
+        """Best-effort resolve a Store handle for alert writes.
+
+        Mirrors :meth:`WorkTransitionManager._resolve_alert_store`. Returns
+        ``None`` when config / store cannot be loaded — the listener-side
+        helper then falls back to its own ``load_runtime_services`` path
+        so environments without a config still clear the per-task alert.
+        """
+        try:
+            from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+            from pollypm.store.registry import get_store
+
+            config = load_config(DEFAULT_CONFIG_PATH)
+            return get_store(config)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _dispatch_cancel_assignment_alerts(self, task: Task) -> None:
+        """Publish cleanup for assignment alerts on a just-cancelled task.
+
+        Mirrors :meth:`WorkTransitionManager._clear_assignment_alerts_after_cancel`.
+        The plugin handles the event when loaded; without that
+        subscriber this is a no-op.
+        """
+        from pollypm.work import task_assignment_alerts
+
+        try:
+            roles = tuple((task.roles or {}).keys()) or ("worker",)
+        except Exception:  # noqa: BLE001
+            roles = ("worker",)
+        # #941 same as sqlite path — only QUEUED / IN_PROGRESS / REVIEW
+        # / REWORK siblings are "active" for the project-level alert.
+        active_statuses = (
+            WorkStatus.QUEUED.value,
+            WorkStatus.IN_PROGRESS.value,
+            WorkStatus.REVIEW.value,
+            WorkStatus.REWORK.value,
+        )
+        active_map: dict[str, bool] = {}
+        for role in roles:
+            active_map[role] = False
+            for status in active_statuses:
+                try:
+                    siblings = self.list_tasks(
+                        project=task.project,
+                        work_status=status,
+                    )
+                except Exception:  # noqa: BLE001
+                    siblings = []
+                for sibling in siblings:
+                    if sibling.task_number == task.task_number:
+                        continue
+                    sibling_roles = getattr(sibling, "roles", {}) or {}
+                    if role in sibling_roles:
+                        active_map[role] = True
+                        break
+                if active_map[role]:
+                    break
+        task_assignment_alerts.dispatch(
+            task_assignment_alerts.CancelledTaskAssignmentAlertsEvent(
+                task_id=task.task_id,
+                project=task.project,
+                role_names=roles,
+                has_other_active_for_role=active_map,
+                store=self._resolve_alert_store(),
+            )
+        )
+
+    def _dispatch_clear_no_session_alert(self, task_id: str) -> None:
+        """Publish cleanup for a per-task no_session alert after approve.
+
+        Mirrors :meth:`WorkTransitionManager._clear_no_session_alert_after_approve`.
+        Narrower than the cancel cleanup: only the per-task alert is
+        cleared. The project-level alert stays open because other active
+        siblings may still need the role.
+        """
+        from pollypm.work import task_assignment_alerts
+
+        task_assignment_alerts.dispatch(
+            task_assignment_alerts.ClearNoSessionAlertForTaskEvent(
+                task_id=task_id,
+                store=self._resolve_alert_store(),
+            )
+        )
 
     def _on_cancelled(self, task_id: str) -> None:
         """After a cancellation, leave a context note on each dependent.
@@ -3114,26 +3628,60 @@ class PgWorkService:
         Returns ``None`` when no path is registered; the file-based
         flow resolver tolerates ``None`` and falls back to the bundled
         flow set.
+
+        #1825: prefer the constructor-supplied config over the operator's
+        default ``load_config()``. Multi-workspace / test-isolated
+        callers depend on this so custom flow templates resolve against
+        the right project root.
         """
         if project is None:
             return None
+
+        def _lookup(config) -> object | None:
+            try:
+                projects = getattr(config, "projects", None) or {}
+                normalized = project.replace("-", "_")
+                key = (
+                    project
+                    if project in projects
+                    else (normalized if normalized in projects else None)
+                )
+                if key is not None:
+                    return projects[key].path
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "project path config lookup failed for %s",
+                    project,
+                    exc_info=True,
+                )
+            return None
+
+        # Prefer the config the constructor was opened with.
+        if self._config is not None:
+            path = _lookup(self._config)
+            if path is not None:
+                return path
+
+        # Fall back to ``load_config()``. Logged so the fallback is
+        # visible when debugging unexpected flow-resolution behaviour.
         try:
             from pollypm.config import load_config
 
-            config = load_config()
-            normalized = project.replace("-", "_")
-            key = (
-                project
-                if project in config.projects
-                else (normalized if normalized in config.projects else None)
-            )
-            if key is not None:
-                return config.projects[key].path
+            fallback_config = load_config()
         except Exception:  # noqa: BLE001 — config lookup is best-effort
             logger.debug(
-                "project path config lookup failed for %s", project, exc_info=True
+                "project path config fallback load failed for %s",
+                project,
+                exc_info=True,
             )
-        return None
+            return None
+        if self._config is not None:
+            logger.debug(
+                "project path fallback to load_config() for %s "
+                "(constructor config missing project)",
+                project,
+            )
+        return _lookup(fallback_config)
 
     def _resolve_node_assignee(
         self, task: Task, node: FlowNode
@@ -3318,6 +3866,18 @@ class PgWorkService:
         actor: str,
         reason: str | None,
     ) -> None:
+        # #1787: emit ``task.status_changed`` audit in-transaction (same
+        # shape sqlite uses in ``_record_transition``). The audit module
+        # is best-effort and never raises, so a failed write only loses
+        # one event — never blocks the transition.
+        self._emit_status_changed_audit(
+            project=project,
+            task_number=task_number,
+            from_state=from_state,
+            to_state=to_state,
+            actor=actor,
+            reason=reason,
+        )
         cur.execute(
             "INSERT INTO work_transitions ("
             "task_project, task_number, from_state, to_state, "

@@ -609,21 +609,17 @@ def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 | HIGH_VOLUME_EVENT_SUBJECTS
             )
             try:
-                from sqlalchemy import and_ as _and
-                from sqlalchemy import delete as _delete
-
-                from pollypm.store.schema import messages as _messages
-
-                result = msg_store.execute(
-                    _delete(_messages).where(
-                        _and(
-                            _messages.c.type == "event",
-                            _messages.c.subject.notin_(tuple(known)),
-                            _messages.c.created_at < default_cutoff,
-                        )
+                # #1820 — typed prune_messages so pg and sqlite share
+                # one delete shape; the legacy execute(_delete(...))
+                # form raised on PgStore and was silently swallowed.
+                deleted_default = int(
+                    msg_store.prune_messages(
+                        type="event",
+                        subject_not_in=tuple(known),
+                        older_than=default_cutoff,
                     )
+                    or 0
                 )
-                deleted_default = int(getattr(result, "rowcount", 0) or 0)
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "events.retention_sweep: default-tier delete failed",
@@ -674,23 +670,20 @@ def events_retention_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _prune_event_subject(msg_store: Any, subject: str, cutoff: Any) -> int:
-    """Delete ``type='event'`` rows matching ``subject`` older than ``cutoff``."""
+    """Delete ``type='event'`` rows matching ``subject`` older than ``cutoff``.
+
+    #1820 — typed prune_messages so pg + sqlite share one shape; the
+    previous execute(_delete(...)) raised on PgStore and was swallowed.
+    """
     try:
-        from sqlalchemy import and_ as _and
-        from sqlalchemy import delete as _delete
-
-        from pollypm.store.schema import messages as _messages
-
-        result = msg_store.execute(
-            _delete(_messages).where(
-                _and(
-                    _messages.c.type == "event",
-                    _messages.c.subject == subject,
-                    _messages.c.created_at < cutoff,
-                )
+        return int(
+            msg_store.prune_messages(
+                type="event",
+                subject=subject,
+                older_than=cutoff,
             )
+            or 0
         )
-        return int(getattr(result, "rowcount", 0) or 0)
     except Exception:  # noqa: BLE001
         logger.debug(
             "events.retention_sweep: delete failed for subject=%s",

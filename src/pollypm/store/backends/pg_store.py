@@ -24,13 +24,17 @@ Design
   Executable surface does NOT travel cleanly across the dialect boundary
   for our schema (no ``RETURNING`` round-trip on sqlite, ``jsonb`` vs
   ``TEXT`` for payload columns, etc.).
-* **``execute()`` raises.** The legacy ``execute()`` escape hatch on
-  :class:`SQLAlchemyStore` accepts a SQLAlchemy ``Executable``. The pg
-  backend cannot honour that contract without bolting SQLAlchemy back
-  on, so it raises ``NotImplementedError`` with a three-question message.
-  No production caller hits ``execute()`` against pg in v1 — every
-  pg-backed writer goes through a typed method on this class or the
-  pg work-service.
+* **``execute()`` is wired through the pool (#1820).** The legacy
+  ``execute()`` escape hatch on :class:`SQLAlchemyStore` accepts a
+  SQLAlchemy ``Executable``. Five production call sites still select
+  ``execute()`` via ``hasattr(store, "execute")`` and broad ``except
+  Exception``, so a raising stub silently broke the cockpit
+  no-session metric and skipped event retention deletes on pg. The
+  pg implementation compiles the Executable to the postgresql
+  dialect and runs it on the rw pool, returning a small adapter
+  exposing ``rowcount`` / ``fetchall()``. New callers should prefer
+  the typed methods (:meth:`prune_messages`, :meth:`query_messages`,
+  ...) so the protocol stays portable.
 """
 
 from __future__ import annotations
@@ -66,6 +70,61 @@ _SUPPORTED_QUERY_FILTERS = frozenset(
 
 def _now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+class _ExecuteResult:
+    """Cursor-shaped adapter returned by :meth:`PgStore.execute`.
+
+    Mirrors the bits of SQLAlchemy's ``CursorResult`` that the existing
+    callers actually read: ``rowcount`` on writes and ``fetchall()`` on
+    reads. No fancier methods are added on purpose — if a caller wants
+    more, it should move to a typed method on :class:`PgStore`.
+    """
+
+    __slots__ = ("rowcount", "_rows")
+
+    def __init__(self, *, rowcount: int | None, rows: list[Any]) -> None:
+        self.rowcount = int(rowcount) if rowcount is not None else 0
+        self._rows = rows
+
+    def fetchall(self) -> list[Any]:
+        return list(self._rows)
+
+    def fetchone(self) -> Any:
+        return self._rows[0] if self._rows else None
+
+
+def _rewrite_qmark_to_percent_s(sql: str) -> str:
+    """Rewrite sqlite ``?`` placeholders to psycopg ``%s``.
+
+    Skips ``?`` inside single-quoted string literals so a SQL fragment
+    like ``WHERE label = 'a?b'`` isn't mangled. Doubled quotes (escaped
+    quotes inside strings) are handled by toggling the in-string state
+    only on un-escaped quotes.
+
+    This is deliberately a narrow rewrite — pg-native callers should
+    use ``%s`` directly. The rewrite is just a backstop for the legacy
+    ``DELETE FROM leases``-style call sites that pre-date the cutover.
+    """
+    out: list[str] = []
+    in_string = False
+    i = 0
+    while i < len(sql):
+        ch = sql[i]
+        if ch == "'":
+            # Doubled '' inside a string stays in-string.
+            if in_string and i + 1 < len(sql) and sql[i + 1] == "'":
+                out.append("''")
+                i += 2
+                continue
+            in_string = not in_string
+            out.append(ch)
+        elif ch == "?" and not in_string:
+            out.append("%s")
+        else:
+            out.append(ch)
+        i += 1
+    return "".join(out)
 
 
 class PgStore:
@@ -689,15 +748,32 @@ class PgStore:
         *,
         type: str | list[str] | tuple[str, ...] | set[str] | None = None,
         older_than: datetime | None = None,
+        subject: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        subject_not_in: list[str] | tuple[str, ...] | set[str] | None = None,
+        state: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude_pinned: bool = False,
     ) -> int:
-        """Delete messages matching ``type`` and older than ``older_than``."""
-        if type is None and older_than is None:
+        """Delete messages matching the given filters.
+
+        Extended in #1820 to mirror :meth:`SQLAlchemyStore.prune_messages`
+        — adds ``subject`` / ``subject_not_in`` / ``state`` filters so
+        the event-retention sweep and ``pm reset`` alert wipe can stay
+        on the typed protocol surface instead of falling through to
+        :meth:`execute` (which previously raised on the pg backend).
+        """
+        if (
+            type is None
+            and older_than is None
+            and subject is None
+            and subject_not_in is None
+            and state is None
+        ):
             raise ValueError(
                 "prune_messages requires at least one filter. "
                 "An unfiltered delete would truncate the ``messages`` table, "
                 "which is never the intent. "
-                "Fix: pass ``type=...`` (scalar or sequence) and/or "
-                "``older_than=<datetime>`` to scope the delete."
+                "Fix: pass one of ``type=``, ``older_than=``, "
+                "``subject=``, ``subject_not_in=``, or ``state=``."
             )
         self._ensure_schema()
         where: list[str] = []
@@ -716,6 +792,41 @@ class PgStore:
         if older_than is not None:
             where.append("created_at < %s")
             params.append(older_than)
+        if subject is not None:
+            if isinstance(subject, (list, tuple, set, frozenset)):
+                vals = list(subject)
+                if not vals:
+                    return 0
+                placeholders = ",".join(["%s"] * len(vals))
+                where.append(f"subject IN ({placeholders})")
+                params.extend(vals)
+            else:
+                where.append("subject = %s")
+                params.append(subject)
+        if subject_not_in is not None:
+            vals = list(subject_not_in)
+            if vals:
+                placeholders = ",".join(["%s"] * len(vals))
+                where.append(f"subject NOT IN ({placeholders})")
+                params.extend(vals)
+        if state is not None:
+            if isinstance(state, (list, tuple, set, frozenset)):
+                vals = list(state)
+                if not vals:
+                    return 0
+                placeholders = ",".join(["%s"] * len(vals))
+                where.append(f"state IN ({placeholders})")
+                params.extend(vals)
+            else:
+                where.append("state = %s")
+                params.append(state)
+        if exclude_pinned:
+            # ``payload_json`` is ``jsonb`` on pg. ``->>`` extracts the
+            # value as text; ``IS DISTINCT FROM`` makes NULL behave like
+            # "not pinned" (matches sqlite's coalesce(...,0) != 1).
+            where.append(
+                "(payload_json->>'pinned') IS DISTINCT FROM '1'"
+            )
         sql = f"DELETE FROM messages WHERE {' AND '.join(where)}"
         with self.transaction() as conn, conn.cursor() as cur:
             cur.execute(sql, tuple(params))
@@ -845,32 +956,94 @@ class PgStore:
             )
 
     # ------------------------------------------------------------------
-    # SQLAlchemy escape hatch — deliberately not supported on pg.
+    # SQLAlchemy / raw-SQL escape hatch
     # ------------------------------------------------------------------
 
-    def execute(self, stmt: Any) -> Any:
-        """Not supported on the pg backend.
+    def execute(self, stmt: Any, params: Any = None) -> Any:
+        """Execute a SQLAlchemy Executable or a raw SQL string on the pg pool.
 
-        :class:`SQLAlchemyStore` accepts a SQLAlchemy ``Executable`` here
-        as an escape hatch for callers writing to tables outside the
-        store's owned surface. Honouring that on pg would require
-        bolting SQLAlchemy back onto a psycopg-only stack, which defeats
-        the migration's reason for existing.
+        #1820 — historically this raised ``NotImplementedError`` on pg,
+        but five production callers select it via ``hasattr(store,
+        "execute")`` and broad ``except Exception``, so under
+        ``[storage] backend = "postgres"`` the cockpit no-session
+        metric reported zero and event retention silently skipped
+        pruning. Wiring this through to the pool restores parity with
+        :meth:`SQLAlchemyStore.execute` for the existing callers.
 
-        Every in-tree caller writes to pg via a typed method on this
-        class or through :class:`pollypm.work.pg_service.PgWorkService`.
-        If a new caller needs raw-SQL access, route it through the pg
-        pool directly via :func:`pollypm.storage.pg_pool.get_rw_pool`.
+        Two accepted call shapes:
+
+        * **SQLAlchemy Core ``Executable``** — compiled with the
+          ``postgresql`` dialect (no literal-binds) and executed through
+          a psycopg cursor. Returns a small adapter exposing
+          ``rowcount`` and ``fetchall()`` so existing callers that read
+          ``result.rowcount`` keep working.
+
+        * **Raw SQL string (+ optional params tuple)** — passed to
+          ``cur.execute()`` after a sqlite ``?`` → pg ``%s`` rewrite
+          so the few raw-SQL call sites that drifted in don't have to
+          branch on backend.
+
+        The implementation deliberately stays narrow: callers wanting
+        full SQLAlchemy ORM semantics should still use the typed methods
+        (:meth:`prune_messages`, :meth:`query_messages`, ...). This is
+        the escape hatch the Store protocol promises (#1820), not a
+        full SQLAlchemy execution surface.
         """
-        raise NotImplementedError(
-            "PgStore.execute is not supported. "
-            "The SQLAlchemy Executable escape hatch only exists on the "
-            "sqlite backend; routing arbitrary SQLAlchemy through psycopg "
-            "would require dragging SQLAlchemy onto the pg path. "
-            "Fix: call a typed method on PgStore, use PgWorkService, "
-            "or obtain a connection via pg_pool.get_rw_pool() and write "
-            "the psycopg statement directly."
-        )
+        self._ensure_schema()
+
+        # Branch 1: raw SQL string. Rewrite sqlite ``?`` placeholders
+        # to psycopg ``%s`` so the legacy ``DELETE FROM leases``-style
+        # call sites stay backend-agnostic. The rewrite is a literal
+        # substitution that skips ``?`` inside single-quoted strings.
+        if isinstance(stmt, str):
+            sql = _rewrite_qmark_to_percent_s(stmt)
+            args = tuple(params) if params else ()
+            with self.transaction() as conn, conn.cursor() as cur:
+                cur.execute(sql, args)
+                rowcount = cur.rowcount
+                rows: list[Any] = []
+                try:
+                    if cur.description is not None:
+                        rows = list(cur.fetchall())
+                except Exception:  # noqa: BLE001 — non-SELECTs have no rows
+                    rows = []
+            return _ExecuteResult(rowcount=rowcount, rows=rows)
+
+        # Branch 2: SQLAlchemy Executable. Compile to a pg dialect
+        # string + bind-parameter dict, then run through psycopg.
+        try:
+            from sqlalchemy.dialects import postgresql as _pg_dialect
+        except ImportError as exc:  # pragma: no cover — sqlalchemy is a hard dep
+            raise NotImplementedError(
+                "PgStore.execute received a SQLAlchemy Executable but "
+                "SQLAlchemy isn't importable in this environment."
+            ) from exc
+
+        try:
+            compiled = stmt.compile(
+                dialect=_pg_dialect.dialect(),
+                compile_kwargs={"render_postcompile": True},
+            )
+        except AttributeError as exc:
+            raise TypeError(
+                "PgStore.execute expects a SQLAlchemy Executable or a "
+                f"SQL string; got {type(stmt).__name__}."
+            ) from exc
+
+        sql_text = str(compiled)
+        bind_params = dict(getattr(compiled, "params", {}) or {})
+
+        with self.transaction() as conn, conn.cursor() as cur:
+            # psycopg accepts named placeholders via a dict mapping.
+            cur.execute(sql_text, bind_params)
+            rowcount = cur.rowcount
+            rows = []
+            try:
+                if cur.description is not None:
+                    rows = list(cur.fetchall())
+            except Exception:  # noqa: BLE001 — non-SELECTs have no rows
+                rows = []
+        return _ExecuteResult(rowcount=rowcount, rows=rows)
 
     # ------------------------------------------------------------------
     # Test-only conveniences — do NOT call from production paths.

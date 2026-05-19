@@ -37,6 +37,7 @@ wire into this module; the unit tests cover the primitive contract.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import os
 import threading
@@ -77,6 +78,27 @@ DEFAULT_POOL_MAX = 10
 _RW_POOL: "ConnectionPool | None" = None
 _RO_POOL: "ConnectionPool | None" = None
 _POOL_LOCK = threading.Lock()
+_ATEXIT_REGISTERED = False
+
+
+def _ensure_atexit_shutdown() -> None:
+    """Register a one-time interpreter-exit hook that closes both pools.
+
+    Without this, ``psycopg_pool``'s own ``__del__`` runs at finalisation
+    and blocks 5s per worker thread it fails to join — which on the
+    default ``min_size=1`` / ``max_size=10`` pool sizing turns into ~40s
+    of "stuck on exit" for every short-lived CLI invocation (e.g.
+    ``pm task list``; #1863). Calling :func:`pg_pool_shutdown` from an
+    atexit hook closes the pools cleanly before the threads turn into
+    daemon-thread join warnings.
+
+    Registration is idempotent — only the first pool open arms the hook.
+    """
+    global _ATEXIT_REGISTERED
+    if _ATEXIT_REGISTERED:
+        return
+    atexit.register(pg_pool_shutdown)
+    _ATEXIT_REGISTERED = True
 
 
 # --------------------------------------------------------------------- #
@@ -303,6 +325,7 @@ def get_rw_pool(config: "PollyPMConfig | None" = None) -> "ConnectionPool":
             read_only=False,
             application_name="pollypm/rw",
         )
+        _ensure_atexit_shutdown()
         return _RW_POOL
 
 
@@ -335,6 +358,7 @@ def get_ro_pool(config: "PollyPMConfig | None" = None) -> "ConnectionPool":
             read_only=True,
             application_name="pollypm/ro",
         )
+        _ensure_atexit_shutdown()
         return _RO_POOL
 
 

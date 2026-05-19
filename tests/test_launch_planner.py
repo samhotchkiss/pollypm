@@ -322,3 +322,59 @@ def test_launch_by_session_unknown_raises(tmp_path: Path) -> None:
         assert "nonexistent" in str(exc)
     else:
         raise AssertionError("Expected KeyError for unknown session")
+
+
+def test_planner_handles_none_store_for_architect_session(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """The planner must not crash when ``ctx.store`` is ``None`` (#1862).
+
+    The Home view dashboard builds a Supervisor shell via
+    :func:`pollypm.service_api.plan_launches_readonly` and passes
+    ``store=None`` through. Pre-fix, the architect-resume code path
+    called ``ctx.store.get_architect_resume_token(...)`` and raised
+    ``AttributeError: 'NoneType' object has no attribute
+    'get_architect_resume_token'``. The fix routes the lookup through
+    the pg facade directly, so a ``None`` store is a non-event for
+    architect sessions that have no warm token.
+    """
+    # Stub the pg facade so the test doesn't need a live Postgres.
+    from pollypm.storage import pg_architect_resume as _resume_mod
+
+    monkeypatch.setattr(
+        _resume_mod, "get_architect_resume_token", lambda key: None
+    )
+
+    config = _config(tmp_path)
+    config.projects["pollypm"].role_assignments["architect"] = ModelAssignment(
+        alias="sonnet-4.6"
+    )
+    config.sessions["architect"] = SessionConfig(
+        name="architect",
+        role="architect",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="architect-pollypm",
+    )
+    sup = Supervisor(config)
+    sup.ensure_layout()
+
+    ctx = _planner_ctx_from_supervisor(sup)
+    # Mimic the readonly shell that ``plan_launches_readonly`` builds —
+    # store is ``None`` because the dashboard read path bypassed it.
+    ctx = DefaultLaunchPlannerContext(
+        config=ctx.config,
+        store=None,
+        readonly_state=True,
+        effective_account=ctx.effective_account,
+        apply_role_launch_restrictions=ctx.apply_role_launch_restrictions,
+        resolve_profile_prompt=ctx.resolve_profile_prompt,
+        storage_closet_session_name=ctx.storage_closet_session_name,
+    )
+    planner = DefaultLaunchPlanner(ctx)
+    # Must not raise AttributeError.
+    plan = planner.plan_launches()
+    architect = next(item for item in plan if item.session.name == "architect")
+    assert architect.session.provider is ProviderKind.CLAUDE

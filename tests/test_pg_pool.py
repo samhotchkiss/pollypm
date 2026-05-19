@@ -235,6 +235,41 @@ def test_pg_pool_shutdown_is_idempotent(monkeypatch):
     mod.pg_pool_shutdown()  # second call must not raise
 
 
+def test_pool_creation_arms_atexit_shutdown(monkeypatch):
+    """Opening a pool must register the interpreter-exit shutdown hook (#1863).
+
+    Without this hook, ``psycopg_pool``'s finalisation waits 5 s per
+    worker thread it cannot stop — which on the default pool sizing
+    adds ~40 s of "stuck on exit" to every short-lived CLI invocation
+    (``pm task list``, etc.). The fix arms an :mod:`atexit` callback
+    on first pool open so the interpreter can shut down promptly.
+
+    We don't need a live pg here — we stub ``_build_pool`` and assert
+    the atexit registration flag flips.
+    """
+    monkeypatch.delenv("POLLYPM_PG_DSN", raising=False)
+    mod = _reload_pool_module()
+
+    registered: list[object] = []
+    monkeypatch.setattr(mod.atexit, "register", registered.append)
+
+    class _FakePool:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(mod, "_build_pool", lambda *a, **kw: _FakePool())
+
+    assert mod._ATEXIT_REGISTERED is False
+    mod.get_rw_pool(None)
+    assert mod._ATEXIT_REGISTERED is True
+    assert mod.pg_pool_shutdown in registered
+
+    # Opening the RO pool after must not register a second hook.
+    registered.clear()
+    mod.get_ro_pool(None)
+    assert registered == []
+
+
 def test_bad_dsn_raises_on_first_use(monkeypatch):
     """A DSN that points nowhere must fail loudly when used.
 

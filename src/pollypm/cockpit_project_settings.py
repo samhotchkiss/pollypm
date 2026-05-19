@@ -19,11 +19,22 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
-from textual.widgets import Button, DataTable, Input, RadioButton, RadioSet, Select, Static
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.widgets import (
+    Button,
+    DataTable,
+    Input,
+    RadioButton,
+    RadioSet,
+    Select,
+    Static,
+    TabbedContent,
+    TabPane,
+)
 
 from pollypm.account_usage_sampler import load_cached_account_usage
 from pollypm.config import load_config, write_config
+from pollypm.cockpit_project_advisor_log import render_advisor_log_lines
 from pollypm.cockpit_settings_confirm import _SettingsConfirmModal
 from pollypm.cockpit_settings_history import (
     UndoAction,
@@ -239,6 +250,22 @@ class PollyProjectSettingsApp(App[None]):
         height: auto;
         color: #c8d3dd;
     }
+    TabPane {
+        padding: 1 0 0 0;
+    }
+    #advisor-log-header {
+        height: 1;
+        color: #5b8aff;
+        text-style: bold;
+        padding-bottom: 1;
+    }
+    #advisor-log-body {
+        height: 1fr;
+        background: #111820;
+        border: round #253140;
+        padding: 1;
+        color: #c8d3dd;
+    }
     """
     BINDINGS = [
         Binding("u", "undo_recent_change", "Undo", show=False),
@@ -289,54 +316,61 @@ class PollyProjectSettingsApp(App[None]):
         yield self.title_bar
         yield self.message_bar
         yield self.preview_bar
-        with Vertical(classes="settings-section"):
-            yield Static("Worker Session", classes="section-label")
-            yield Static("", id="worker-info")
-        with Vertical(classes="settings-section"):
-            yield Static("Model & Account", classes="section-label")
-            yield Static("", id="model-info")
-        with Vertical(classes="settings-section"):
-            yield Static("Role Assignments", classes="section-label")
-            yield self.role_table
-            with Horizontal(id="project-role-editor"):
-                yield self.role_alias_select
-                yield self.role_provider_input
-                yield self.role_model_input
-                yield Button("Inherit Global", id="project-role-inherit")
-                yield Static(
-                    "Pick an alias or type both fields to save a custom override.",
-                    id="project-role-note",
-                )
-            yield Static("", id="project-role-detail", markup=True)
-        with Vertical(classes="settings-section"):
-            yield Static("Recent Tasks", classes="section-label")
-            yield Static("", id="task-info")
-        with Vertical(classes="settings-section"):
-            yield Static("Project Guides", classes="section-label")
-            yield Static("", id="guide-info")
-        with Vertical(classes="settings-section", id="release-channel-section"):
-            yield Static("Release channel", classes="section-label")
-            yield Static(
-                "Stable: Production builds. Recommended.\n"
-                "Beta: Pre-release builds. Faster features, occasional breakage.",
-                id="release-channel-explainer",
-            )
-            yield RadioSet(
-                RadioButton("Stable", id="release-channel-stable"),
-                RadioButton("Beta", id="release-channel-beta"),
-                id="release-channel-radio",
-            )
-        with Horizontal(id="actions"):
-            yield Button(Text("[R] Reset Session"), id="reset-session", variant="warning")
-            yield Button(Text("[C] Switch to Claude"), id="switch-claude", variant="primary")
-            yield Button(Text("[X] Switch to Codex"), id="switch-codex", variant="primary")
-            yield Button(Text("[U] Undo"), id="undo", variant="default")
+        with TabbedContent(initial="project-settings-tab", id="project-settings-tabs"):
+            with TabPane("Settings", id="project-settings-tab"):
+                with Vertical(classes="settings-section"):
+                    yield Static("Worker Session", classes="section-label")
+                    yield Static("", id="worker-info")
+                with Vertical(classes="settings-section"):
+                    yield Static("Model & Account", classes="section-label")
+                    yield Static("", id="model-info")
+                with Vertical(classes="settings-section"):
+                    yield Static("Role Assignments", classes="section-label")
+                    yield self.role_table
+                    with Horizontal(id="project-role-editor"):
+                        yield self.role_alias_select
+                        yield self.role_provider_input
+                        yield self.role_model_input
+                        yield Button("Inherit Global", id="project-role-inherit")
+                        yield Static(
+                            "Pick an alias or type both fields to save a custom override.",
+                            id="project-role-note",
+                        )
+                    yield Static("", id="project-role-detail", markup=True)
+                with Vertical(classes="settings-section"):
+                    yield Static("Recent Tasks", classes="section-label")
+                    yield Static("", id="task-info")
+                with Vertical(classes="settings-section"):
+                    yield Static("Project Guides", classes="section-label")
+                    yield Static("", id="guide-info")
+                with Vertical(classes="settings-section", id="release-channel-section"):
+                    yield Static("Release channel", classes="section-label")
+                    yield Static(
+                        "Stable: Production builds. Recommended.\n"
+                        "Beta: Pre-release builds. Faster features, occasional breakage.",
+                        id="release-channel-explainer",
+                    )
+                    yield RadioSet(
+                        RadioButton("Stable", id="release-channel-stable"),
+                        RadioButton("Beta", id="release-channel-beta"),
+                        id="release-channel-radio",
+                    )
+                with Horizontal(id="actions"):
+                    yield Button(Text("[R] Reset Session"), id="reset-session", variant="warning")
+                    yield Button(Text("[C] Switch to Claude"), id="switch-claude", variant="primary")
+                    yield Button(Text("[X] Switch to Codex"), id="switch-codex", variant="primary")
+                    yield Button(Text("[U] Undo"), id="undo", variant="default")
+            with TabPane("Advisor", id="project-settings-advisor-tab"):
+                yield Static("", id="advisor-log-header", markup=True)
+                with VerticalScroll(id="advisor-log-body"):
+                    yield Static("", id="advisor-log-content", markup=False)
 
     def on_mount(self) -> None:
         self.role_table.cursor_type = "row"
         self.role_table.zebra_stripes = True
         self.role_table.add_columns("Role", "Configured", "Resolved", "Source", "Warn")
         self._refresh()
+        self._refresh_advisor_log()
 
     def _refresh(self) -> None:
         config = load_config(self.config_path)
@@ -928,8 +962,56 @@ class PollyProjectSettingsApp(App[None]):
             return
         self._refresh()
 
+    def _refresh_advisor_log(self) -> None:
+        """Reload the per-project advisor log into the Advisor tab.
+
+        Reads the last 200 entries for ``self.project_key`` from the
+        advisor history log via the existing read facade and renders
+        them newest-first as ``HH:MM:SS  event_type  summary`` rows.
+        Failures (missing config, IO errors) fall back to a friendly
+        empty-state line so a broken advisor never blocks the rest of
+        the settings UI.
+        """
+        try:
+            header = self.query_one("#advisor-log-header", Static)
+            body = self.query_one("#advisor-log-content", Static)
+        except Exception:  # noqa: BLE001
+            return
+        header.update(f"[b]{self.project_key}[/b] [dim]advisor log[/dim]")
+        try:
+            config = load_config(self.config_path)
+            base_dir = Path(getattr(config.project, "base_dir", Path.home() / ".pollypm"))
+        except Exception as exc:  # noqa: BLE001
+            body.update(f"Advisor log unavailable: {exc}")
+            return
+        try:
+            text = render_advisor_log_lines(
+                base_dir=base_dir,
+                project_key=self.project_key,
+                limit=200,
+            )
+        except Exception as exc:  # noqa: BLE001
+            body.update(f"Advisor log read failed: {exc}")
+            return
+        body.update(text)
+
+    @on(TabbedContent.TabActivated, "#project-settings-tabs")
+    def on_settings_tab_activated(
+        self, event: TabbedContent.TabActivated
+    ) -> None:
+        # Refresh on focus only (no auto-poll) so the user sees fresh
+        # advisor events whenever they switch back to the tab without
+        # paying for a background timer.
+        try:
+            tab_id = event.tab.id or ""
+        except Exception:  # noqa: BLE001
+            return
+        if tab_id.endswith("project-settings-advisor-tab"):
+            self._refresh_advisor_log()
+
     def action_refresh(self) -> None:
         self._refresh()
+        self._refresh_advisor_log()
 
     def action_undo_recent_change(self) -> None:
         action = self._undo_action

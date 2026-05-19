@@ -70,7 +70,6 @@ def create_work_service(
     config: "PollyPMConfig | None" = None,
     project_key: str | None = None,
     sync_manager: "SyncManager | None" = None,
-    session_manager: object | None = None,
 ) -> Any:
     """Construct the configured work-service backend.
 
@@ -93,10 +92,10 @@ def create_work_service(
         Optional project key. Forwarded to the resolver so it can warn
         about stale per-project DB files (#1004), and to the pg service
         for the per-row ``project_key`` column.
-    sync_manager / session_manager:
+    sync_manager:
         Forwarded to the sqlite constructor for callers that need a
-        bespoke sync or session manager (the heartbeat does this).
-        Ignored on the pg backend until Slice B.
+        bespoke sync manager (the ``pm work`` CLI does this). Ignored
+        on the pg backend until Slice B.
 
     Returns
     -------
@@ -129,16 +128,14 @@ def create_work_service(
 
     # Forward only the args that callers explicitly opted into. The
     # underlying ``SQLiteWorkService.__init__`` accepts ``sync_manager``
-    # and ``session_manager`` as keyword args, but several test doubles
-    # in the tree implement a narrower constructor signature
-    # (``db_path``, ``project_path`` only). Passing ``None`` for the
-    # optional managers in the factory's default path would TypeError
-    # against those doubles, so we only forward when the caller asked.
-    extra: dict[str, object] = {}
-    if sync_manager is not None:
-        extra["sync_manager"] = sync_manager
-    if session_manager is not None:
-        extra["session_manager"] = session_manager
+    # as a keyword arg, but several test doubles in the tree implement
+    # a narrower constructor signature (``db_path``, ``project_path``
+    # only). Passing ``None`` for the optional manager in the factory's
+    # default path would TypeError against those doubles, so we only
+    # forward when the caller asked.
+    extra: dict[str, object] = (
+        {"sync_manager": sync_manager} if sync_manager is not None else {}
+    )
     return SQLiteWorkService(
         db_path=resolved_path,
         project_path=project_path_obj,

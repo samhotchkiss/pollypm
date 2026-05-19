@@ -153,43 +153,47 @@ def test_refresh_uses_thread_worker(monkeypatch, tmp_path: Path) -> None:
     _run(body())
 
 
-def test_parallel_scan_short_circuits_single_project(tmp_path: Path) -> None:
-    """One-project workspace doesn't pay the ThreadPool overhead."""
+def test_scan_to_row_handles_missing_service(tmp_path: Path) -> None:
+    """When no shared work-service is available the row falls back to the
+    inbox-only categorization (PAUSED / IDLE / WAITING) — #1634 collapsed
+    the per-project sqlite fanout into a single shared handle, and the
+    scan helper must still degrade gracefully when that handle is None.
+    """
+    from pollypm.dashboard.operator_view import _ProjectScan, _scan_to_row
+
+    scan = _ProjectScan(
+        project_key="solo",
+        project_path=tmp_path,
+        tracked=True,
+    )
+    row = _scan_to_row(scan, [], slice_svc=None)
+    assert row.project_key == "solo"
+    # Tracked + empty inbox → IDLE
+    assert row.state.value == "idle"
+
+
+def test_load_operator_view_preserves_per_project_results(tmp_path: Path) -> None:
+    """The single-handle sweep must produce one row per project — same
+    keys, no drops — even when the shared work-service is unavailable.
+    """
+    from types import SimpleNamespace
+
     from pollypm.dashboard.operator_view import (
-        _ProjectScan,
-        _parallel_scan_rows,
+        load_operator_view_from_config,
     )
 
-    scans = [
-        _ProjectScan(
-            project_key="solo",
-            project_path=tmp_path,
-            db_paths=(),
-            tracked=True,
-        ),
-    ]
-    rows = _parallel_scan_rows(scans, {})
-    assert len(rows) == 1
-    assert rows[0].project_key == "solo"
-
-
-def test_parallel_scan_preserves_per_project_results(tmp_path: Path) -> None:
-    """The parallel sweep must produce the same per-project rows as the
-    serial loop did — same project keys, same row count, no drops."""
-    from pollypm.dashboard.operator_view import (
-        _ProjectScan,
-        _parallel_scan_rows,
-    )
-
-    scans = [
-        _ProjectScan(
-            project_key=f"p{i}",
-            project_path=tmp_path,
-            db_paths=(),
-            tracked=(i % 2 == 0),
-        )
+    projects = {
+        f"p{i}": SimpleNamespace(path=tmp_path, tracked=(i % 2 == 0))
         for i in range(6)
-    ]
-    rows = _parallel_scan_rows(scans, {})
-    keys = sorted(row.project_key for row in rows)
+    }
+    config = SimpleNamespace(
+        projects=projects,
+        project=SimpleNamespace(workspace_root=str(tmp_path)),
+        storage=SimpleNamespace(backend="sqlite"),
+    )
+    view = load_operator_view_from_config(config)
+    keys = sorted(
+        row.project_key
+        for row in (*view.waiting, *view.working, *view.idle, *view.paused)
+    )
     assert keys == [f"p{i}" for i in range(6)]

@@ -82,14 +82,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-_NOT_IMPLEMENTED_SLICE_B = (
-    "PgWorkService method not implemented in Slice A. "
-    "The full work-service port lands in Slice B (#1737). "
-    "Fix: keep ``[storage] backend = 'sqlite'`` until Slice B merges, "
-    "or implement the method here if you are wiring Slice B."
-)
-
-
 def _parse_task_id(task_id: str) -> tuple[str, int]:
     """Split ``project/number`` into ``(project, int(number))``.
 

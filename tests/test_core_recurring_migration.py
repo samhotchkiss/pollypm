@@ -59,6 +59,8 @@ class TestCoreRecurringPlugin:
             # #savethenovel followup — audit-log watchdog (orphan
             # markers, stuck drafts, cancellation gaps).
             "audit.watchdog",
+            # #1815 — audit_watchdog liveness auto-heal probe.
+            "audit_watchdog.liveness_probe",
         }
         assert expected.issubset(set(registry.names()))
         # inbox.sweep was retired with the legacy inbox subsystem (iv04).
@@ -101,6 +103,10 @@ class TestCoreRecurringPlugin:
             "blocked_chain.sweep",
             # #savethenovel followup — audit-log watchdog, @every 5m.
             "audit.watchdog",
+            # #1592 — cockpit socket reap, @every 5m.
+            "cockpit_socket.reap",
+            # #1815 — audit_watchdog liveness auto-heal probe, @every 1m.
+            "audit_watchdog.liveness_probe",
         }
 
         # Cadences per issue #164 / #249.

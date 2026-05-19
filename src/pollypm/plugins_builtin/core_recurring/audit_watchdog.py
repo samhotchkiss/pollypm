@@ -3045,6 +3045,17 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
     Returns a dict with per-project + total counters for observability.
     """
+    # #1815 Bug A — liveness contract. The heartbeat tick MUST land in
+    # the central audit tail on every cadence fire so an operator (or
+    # ``audit_watchdog.liveness_probe``, below) can prove the
+    # scheduler is alive. Emit it BEFORE any pg / runtime-services
+    # call so that even if ``load_runtime_services`` hangs or the pg
+    # pool is wedged, the tick still lands. The prior call site
+    # (after ``load_runtime_services``) meant a load_runtime_services
+    # hang produced ZERO tick events anywhere on disk, defeating the
+    # whole liveness check.
+    emit_heartbeat_tick(metadata={"cadence": AUDIT_WATCHDOG_SCHEDULE})
+
     from pollypm.runtime_services import load_runtime_services
 
     config = _config_from_payload(payload or {})
@@ -3055,10 +3066,6 @@ def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
     services = load_runtime_services(config_path=config_path)
     now = datetime.now(UTC)
-
-    # Liveness ping — emitted before scanning so that even if
-    # scanning blows up the heartbeat-tick still lands in the log.
-    emit_heartbeat_tick(metadata={"cadence": AUDIT_WATCHDOG_SCHEDULE})
 
     totals: dict[str, int] = {
         "projects_scanned": 0,

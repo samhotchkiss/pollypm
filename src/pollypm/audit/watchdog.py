@@ -60,7 +60,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -109,6 +109,7 @@ __all__ = [
     "scan_events",
     "scan_project",
     "emit_heartbeat_tick",
+    "freshest_heartbeat_tick_ts",
     "emit_finding",
     "emit_escalation_dispatched",
     "emit_operator_dispatched",
@@ -2792,6 +2793,94 @@ def scan_project(
 # ---------------------------------------------------------------------------
 
 
+def freshest_heartbeat_tick_ts(
+    *,
+    actor: str | None = "audit_watchdog",
+    central_root: Path | None = None,
+) -> datetime | None:
+    """Return the freshest ``heartbeat.tick`` ts across the central audit tail.
+
+    Scans every ``<central_root>/*.jsonl`` file (default: the audit
+    tail under ``~/.pollypm/audit/``) and returns the maximum ``ts``
+    of any line whose ``event == "heartbeat.tick"`` and (optionally)
+    whose ``actor`` matches. Returns ``None`` when no matching event
+    exists anywhere on disk — that's the "watchdog has never emitted"
+    state that #1815 Bug A was designed to detect.
+
+    Why a filesystem scan instead of a pg query: the audit log is
+    JSONL by design (see ``pollypm.audit.__init__`` docstring — it
+    survives DB rebuilds and travels with the project directory). The
+    central tail is the canonical liveness surface, and it's tens of
+    MB at most, so reading line-by-line is cheap enough for a
+    once-a-minute probe.
+
+    The scan reads each file from the tail (last 64 KiB) so it stays
+    O(num_files) rather than O(total_bytes); a stale event at the
+    head of a 1.7 GB file would otherwise dominate the cost.
+    """
+    import json
+
+    from pollypm.audit.log import _central_root  # type: ignore[attr-defined]
+
+    root = central_root if central_root is not None else _central_root()
+    if not root.exists():
+        return None
+
+    freshest: datetime | None = None
+    tail_window = 65536  # 64 KiB — large enough to cover ~hundreds of recent lines.
+
+    for path in root.glob("*.jsonl"):
+        try:
+            file_size = path.stat().st_size
+        except OSError:
+            continue
+        if file_size == 0:
+            continue
+        try:
+            with open(path, "rb") as fh:
+                if file_size > tail_window:
+                    fh.seek(file_size - tail_window)
+                    # Discard the partial first line so JSON parsing
+                    # doesn't trip on a mid-record boundary.
+                    fh.readline()
+                tail = fh.read()
+        except OSError:
+            continue
+
+        try:
+            decoded = tail.decode("utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            continue
+
+        for line in decoded.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            if not isinstance(obj, dict):
+                continue
+            if obj.get("event") != EVENT_HEARTBEAT_TICK:
+                continue
+            if actor is not None and obj.get("actor") != actor:
+                continue
+            ts_raw = obj.get("ts")
+            if not isinstance(ts_raw, str) or not ts_raw:
+                continue
+            try:
+                parsed = datetime.fromisoformat(ts_raw)
+            except ValueError:
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            if freshest is None or parsed > freshest:
+                freshest = parsed
+
+    return freshest
+
+
 def emit_heartbeat_tick(
     *,
     project: str = "",
@@ -2817,7 +2906,17 @@ def emit_heartbeat_tick(
             project_path=project_path,
         )
     except Exception:  # noqa: BLE001 — never fail the cadence on audit hiccups
-        logger.debug("emit_heartbeat_tick failed", exc_info=True)
+        # #1815 Bug A — was DEBUG. A silent emit-failure here directly
+        # defeats the liveness contract this function documents (the
+        # central tail's ``heartbeat.tick`` is the canonical "the
+        # scheduler is alive" signal). Raise to WARNING so a
+        # systematic failure surfaces in errors.log instead of
+        # disappearing into a never-enabled DEBUG channel.
+        logger.warning(
+            "audit.watchdog: emit_heartbeat_tick failed — "
+            "liveness contract is broken",
+            exc_info=True,
+        )
 
 
 def emit_finding(finding: Finding) -> None:

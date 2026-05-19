@@ -30,6 +30,7 @@ from pollypm.plugins_builtin.core_recurring.maintenance import (
     OPERATIONAL_EVENT_SUBJECTS,
     account_usage_refresh_handler,
     agent_worktree_prune_handler,
+    audit_watchdog_liveness_probe_handler,
     capacity_probe_handler,
     cockpit_socket_reap_handler,
     db_vacuum_handler,
@@ -67,6 +68,13 @@ from pollypm.plugins_builtin.core_recurring.sweeps import (
 
 
 logger = logging.getLogger(__name__)
+
+
+# #1815 — auto-heal probe for the audit_watchdog scheduler. Runs every
+# minute; declared here so the handler-name string lives in exactly one
+# place across plugin.py + maintenance.py + tests.
+AUDIT_WATCHDOG_LIVENESS_PROBE_HANDLER_NAME = "audit_watchdog.liveness_probe"
+AUDIT_WATCHDOG_LIVENESS_PROBE_SCHEDULE = "@every 1m"
 
 
 # #1030 — cap concurrent ``session.health_sweep`` handler invocations.
@@ -491,6 +499,18 @@ def _register_handlers(api: JobHandlerAPI) -> None:
         AUDIT_WATCHDOG_HANDLER_NAME, audit_watchdog_handler,
         max_attempts=1, timeout_seconds=60.0,
     )
+    # #1815 — audit_watchdog self-heal probe. Runs every minute, scans
+    # the central audit tail for the freshest ``heartbeat.tick``, and
+    # force-re-enqueues the cadence job if the tick is older than
+    # 3× the audit_watchdog schedule. Cheap (filesystem tail scan +
+    # one indexed pg query); max_attempts=2 because if the probe
+    # itself wedges we want the next tick to retry rather than slot
+    # straight to terminal-failed.
+    api.register_handler(
+        AUDIT_WATCHDOG_LIVENESS_PROBE_HANDLER_NAME,
+        audit_watchdog_liveness_probe_handler,
+        max_attempts=2, timeout_seconds=30.0,
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:
@@ -577,6 +597,15 @@ def _register_roster(api: RosterAPI) -> None:
         AUDIT_WATCHDOG_SCHEDULE, AUDIT_WATCHDOG_HANDLER_NAME, {},
         dedupe_key=AUDIT_WATCHDOG_HANDLER_NAME,
     )
+    # #1815 — auto-heal probe for the watchdog itself. 1 min cadence so
+    # a wedge (last ``heartbeat.tick`` older than 3× the watchdog
+    # schedule) auto-heals within ~60 s of detection.
+    api.register_recurring(
+        AUDIT_WATCHDOG_LIVENESS_PROBE_SCHEDULE,
+        AUDIT_WATCHDOG_LIVENESS_PROBE_HANDLER_NAME,
+        {},
+        dedupe_key=AUDIT_WATCHDOG_LIVENESS_PROBE_HANDLER_NAME,
+    )
 
 
 def _initialize(api: PluginAPI) -> None:
@@ -631,6 +660,10 @@ plugin = PollyPMPlugin(
         Capability(kind="job_handler", name="stuck_claims.sweep"),
         Capability(kind="job_handler", name="blocked_chain.sweep"),
         Capability(kind="job_handler", name="audit.watchdog"),
+        Capability(
+            kind="job_handler",
+            name="audit_watchdog.liveness_probe",
+        ),
         Capability(kind="roster_entry", name="core_recurring"),
     ),
     register_handlers=_register_handlers,

@@ -236,9 +236,17 @@ def test_seed_demo_project_task_creates_a_visible_queue_item(tmp_path: Path) -> 
 
     task_id = seed_demo_project_task(project_path, project_key="demo_polly")
 
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    # Slice K (#1737): route through the factory so the assertion stays
+    # backend-neutral. ``seed_demo_project_task`` with ``config=None``
+    # still seeds the sqlite default for fresh onboarding (see the
+    # docstring on ``onboarding.seed_demo_project_task``); the factory
+    # opens whatever backend the env / config points at.
+    from pollypm.work import create_work_service
 
-    with SQLiteWorkService(db_path=project_path / ".pollypm" / "state.db", project_path=project_path) as svc:
+    with create_work_service(
+        db_path=project_path / ".pollypm" / "state.db",
+        project_path=project_path,
+    ) as svc:
         task = svc.get(task_id)
         assert task.project == "demo_polly"
         assert task.work_status.value == "queued"

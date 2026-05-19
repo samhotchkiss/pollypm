@@ -672,7 +672,7 @@ def test_collect_work_service_signals_skips_git_log_for_unregistered_worktree(tm
     claimed_worktree = tmp_path / ".pollypm" / "worktrees" / "pollypm-1"
     other_worktree = tmp_path / ".pollypm" / "worktrees" / "other"
 
-    class FakeSQLiteWorkService:
+    class FakeWorkService:
         def __init__(self, *_args, **kwargs) -> None:
             self.db_path = kwargs.get("db_path")
             self.project_path = kwargs.get("project_path")
@@ -705,13 +705,13 @@ def test_collect_work_service_signals_skips_git_log_for_unregistered_worktree(tm
         raise AssertionError(f"unexpected subprocess call: {args}")
 
     # Slice K (#1737): production uses ``create_work_service`` and
-    # dispatches to either SQLiteWorkService or PgWorkService by config.
+    # dispatches to the configured backend (sqlite or pg).
     # Patch the factory so the test stays backend-neutral. The fake
     # constructor must accept arbitrary kwargs because the factory
     # forwards more than the original sqlite signature.
     monkeypatch.setattr(
         "pollypm.work.create_work_service",
-        lambda *a, **kw: FakeSQLiteWorkService(**kw),
+        lambda *a, **kw: FakeWorkService(**kw),
     )
     monkeypatch.setattr("pollypm.heartbeats.local.subprocess.run", fake_run)
 
@@ -736,7 +736,7 @@ def test_collect_work_service_signals_reads_registered_worktree_commit_via_proje
     context = _context()
     claimed_worktree = tmp_path / ".pollypm" / "worktrees" / "pollypm-1"
 
-    class FakeSQLiteWorkService:
+    class FakeWorkService:
         def __init__(self, *_args, **kwargs) -> None:
             self.db_path = kwargs.get("db_path")
             self.project_path = kwargs.get("project_path")
@@ -777,13 +777,13 @@ def test_collect_work_service_signals_reads_registered_worktree_commit_via_proje
         raise AssertionError(f"unexpected subprocess call: {args}")
 
     # Slice K (#1737): production uses ``create_work_service`` and
-    # dispatches to either SQLiteWorkService or PgWorkService by config.
+    # dispatches to the configured backend (sqlite or pg).
     # Patch the factory so the test stays backend-neutral. The fake
     # constructor must accept arbitrary kwargs because the factory
     # forwards more than the original sqlite signature.
     monkeypatch.setattr(
         "pollypm.work.create_work_service",
-        lambda *a, **kw: FakeSQLiteWorkService(**kw),
+        lambda *a, **kw: FakeWorkService(**kw),
     )
     monkeypatch.setattr("pollypm.heartbeats.local.subprocess.run", fake_run)
 
@@ -821,7 +821,7 @@ def test_has_pending_work_skips_review_only_tasks(tmp_path: Path, monkeypatch) -
         def exists(self) -> bool:
             return False
 
-    class FakeSQLiteWorkService:
+    class FakeWorkService:
         def __init__(self, *_args, **kwargs) -> None:
             self.db_path = kwargs.get("db_path")
             self.project_path = kwargs.get("project_path")
@@ -846,7 +846,7 @@ def test_has_pending_work_skips_review_only_tasks(tmp_path: Path, monkeypatch) -
     )
     monkeypatch.setattr(
         "pollypm.work.create_work_service",
-        lambda *a, **kw: FakeSQLiteWorkService(**kw),
+        lambda *a, **kw: FakeWorkService(**kw),
     )
 
     assert backend._has_pending_work(api, context) is False
@@ -861,7 +861,7 @@ def test_has_pending_work_keeps_in_progress_tasks_actionable(tmp_path: Path, mon
         def exists(self) -> bool:
             return False
 
-    class FakeSQLiteWorkService:
+    class FakeWorkService:
         def __init__(self, *_args, **kwargs) -> None:
             self.db_path = kwargs.get("db_path")
             self.project_path = kwargs.get("project_path")
@@ -886,7 +886,7 @@ def test_has_pending_work_keeps_in_progress_tasks_actionable(tmp_path: Path, mon
     )
     monkeypatch.setattr(
         "pollypm.work.create_work_service",
-        lambda *a, **kw: FakeSQLiteWorkService(**kw),
+        lambda *a, **kw: FakeWorkService(**kw),
     )
 
     assert backend._has_pending_work(api, context) is True

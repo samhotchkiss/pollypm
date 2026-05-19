@@ -449,10 +449,19 @@ class EventProjector:
             if row["reason"]:
                 summary += f" ({row['reason']})"
             severity = "recommendation" if row["to_state"] in {"blocked", "cancelled"} else "routine"
+            # #1756: PG ``work_transition_queries`` yields ``datetime``
+            # objects (psycopg). Normalize to ISO-8601 strings so
+            # ``_timestamp_sort_key`` and downstream renderers see the
+            # same shape regardless of backend.
+            created_at_raw = row["created_at"]
+            if isinstance(created_at_raw, datetime):
+                created_at_value: str = created_at_raw.isoformat()
+            else:
+                created_at_value = str(created_at_raw) if created_at_raw is not None else ""
             entries.append(
                 FeedEntry(
                     id=f"wt:{row['task_project']}/{row['task_number']}:{row['id']}",
-                    timestamp=row["created_at"],
+                    timestamp=created_at_value,
                     project=row["task_project"] or project_key,
                     kind="task_transition",
                     actor=row["actor"] or "worker",
@@ -583,10 +592,23 @@ def _timestamp_sort_key(entry: FeedEntry) -> str:
     ``T`` separator so it sorts adjacent to ``isoformat()`` strings
     written by other sources. Handles missing/malformed timestamps by
     returning the empty string (which sorts to the end under ``DESC``).
+
+    PG path (#1756): ``work_transition_queries._pg_activity_feed_transition_rows``
+    yields ``datetime`` objects rather than strings (psycopg returns
+    ``timestamptz`` as a Python ``datetime``). Coerce to ISO-8601 before
+    the string-replace so the projector's cross-source sort doesn't
+    crash on the pg backend.
     """
     raw = getattr(entry, "timestamp", "") or ""
     if not raw:
         return ""
+    if isinstance(raw, datetime):
+        raw = raw.isoformat()
+    elif not isinstance(raw, str):
+        try:
+            raw = str(raw)
+        except Exception:  # noqa: BLE001
+            return ""
     # `2026-04-26 14:30:00` → `2026-04-26T14:30:00`. Only replace the
     # first space — the time component never contains one.
     return raw.replace(" ", "T", 1)

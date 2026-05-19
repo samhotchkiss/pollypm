@@ -548,6 +548,22 @@ class WorkTransitionManager:
             if claim_node.type == NodeType.REVIEW
             else WorkStatus.IN_PROGRESS
         )
+        # #1737 — enforce the per-project parallel-worker cap BEFORE the
+        # DB transition so a cap-exceeded claim surfaces a clean error
+        # instead of leaving the task ``in_progress`` with no worker.
+        # Review claims and skip_gates bypass the cap (review windows
+        # have their own naming + lifecycle; skip_gates is the operator
+        # escape hatch).
+        if (
+            target_status is WorkStatus.IN_PROGRESS
+            and not skip_gates
+            and self.service._session_mgr is not None
+        ):
+            check_cap = getattr(
+                self.service._session_mgr, "check_parallel_cap", None,
+            )
+            if callable(check_cap):
+                check_cap(task.project, task_id)
         latest_execution = self._latest_node_execution(task, node_id)
         resume_blocked_execution = (
             task.current_node_id is not None

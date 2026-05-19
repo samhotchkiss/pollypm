@@ -739,6 +739,7 @@ def _parse_known_projects(raw: dict[str, object], *, base: Path) -> dict[str, Kn
             continue
         auto_claim_raw = item_raw.get("auto_claim")
         max_concurrent_raw = item_raw.get("max_concurrent_workers")
+        max_parallel_raw = item_raw.get("max_parallel_workers")
         projects[project_key] = KnownProject(
             key=project_key,
             path=_resolve_path(base, item_raw["path"]),
@@ -755,6 +756,11 @@ def _parse_known_projects(raw: dict[str, object], *, base: Path) -> dict[str, Kn
             max_concurrent_workers=(
                 int(max_concurrent_raw)
                 if isinstance(max_concurrent_raw, int) and max_concurrent_raw > 0
+                else None
+            ),
+            max_parallel_workers=(
+                int(max_parallel_raw)
+                if isinstance(max_parallel_raw, int) and max_parallel_raw > 0
                 else None
             ),
         )

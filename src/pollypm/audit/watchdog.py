@@ -62,7 +62,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 from pollypm.audit.log import (
     EVENT_MARKER_CREATED,
@@ -1374,6 +1374,7 @@ def _detect_role_session_missing(
     open_tasks: Sequence[Any] | None = None,
     storage_window_names: Sequence[str] | None = None,
     project: str = "",
+    worker_cap_back_pressure: Mapping[str, bool] | None = None,
 ) -> list[Finding]:
     """Rule 6: in-flight task whose assigned role has no tmux session.
 
@@ -1384,11 +1385,19 @@ def _detect_role_session_missing(
 
     The window-name list is passed in (not queried here) so the pure
     detector can be unit-tested without spinning up tmux.
+
+    #1737 — ``worker_cap_back_pressure`` maps ``project_key -> bool``;
+    when True, queued worker-role tasks for that project are treated
+    as normal back-pressure (the project is already at
+    ``max_parallel_workers``) and no finding is emitted. The cadence
+    handler computes the flag from live worker-session counts +
+    project cap before invoking ``scan_events``.
     """
     findings: list[Finding] = []
     if not open_tasks or storage_window_names is None:
         return findings
     window_set = {str(name).strip() for name in storage_window_names if name}
+    back_pressure = worker_cap_back_pressure or {}
 
     for task in open_tasks:
         status = getattr(task, "work_status", None)
@@ -1441,6 +1450,19 @@ def _detect_role_session_missing(
                 # so this is the right default when no roles are set.
                 role_used = "worker"
         if role_used is None:
+            continue
+        # #1737 — queued worker-role tasks for a project at the
+        # ``max_parallel_workers`` ceiling are not a missing-session
+        # condition; they are normal back-pressure. The auto-claim
+        # sweep + per-task spawn-on-claim already gate fresh workers
+        # against the cap, so suppress the tier-1 finding here to
+        # avoid a noisy false-positive loop. ``in_progress`` workers
+        # already have a session, so no special-case needed there.
+        if (
+            role_used == "worker"
+            and status_value == "queued"
+            and back_pressure.get(task_project)
+        ):
             continue
         expected_window = f"{role_used}-{task_project}"
         if expected_window in window_set:
@@ -2576,6 +2598,7 @@ def scan_events(
     plan_missing_clears: Sequence[Any] | None = None,
     state_db_probes: Sequence[Any] | None = None,
     run_safety_net_probes: bool = True,
+    worker_cap_back_pressure: Mapping[str, bool] | None = None,
 ) -> list[Finding]:
     """Run every detection rule against ``events`` and return findings.
 
@@ -2650,6 +2673,7 @@ def scan_events(
         open_tasks=open_tasks,
         storage_window_names=storage_window_names,
         project=project,
+        worker_cap_back_pressure=worker_cap_back_pressure,
     ))
     findings.extend(_detect_worker_session_dead_loop(
         materialised, now=now, config=config,
@@ -2737,6 +2761,7 @@ def scan_project(
     plan_missing_clears: Sequence[Any] | None = None,
     state_db_probes: Sequence[Any] | None = None,
     run_safety_net_probes: bool = True,
+    worker_cap_back_pressure: Mapping[str, bool] | None = None,
 ) -> list[Finding]:
     """Read audit events for ``project`` and scan them.
 
@@ -2785,6 +2810,7 @@ def scan_project(
         plan_missing_clears=plan_missing_clears,
         state_db_probes=state_db_probes,
         run_safety_net_probes=run_safety_net_probes,
+        worker_cap_back_pressure=worker_cap_back_pressure,
     )
 
 

@@ -946,6 +946,70 @@ def _gather_storage_windows(storage_closet_name: str | None) -> list[str]:
         return []
 
 
+def _gather_worker_cap_back_pressure(
+    project_key: str,
+    project_path: Path | None,
+    config_path: Path | None,
+) -> dict[str, bool]:
+    """Compute the cap-back-pressure flag for ``project_key`` (#1737).
+
+    Returns ``{project_key: True}`` when the project's currently-active
+    per-task worker session count is at or above
+    ``max_parallel_workers``; an empty dict otherwise. Best effort: any
+    error returns an empty dict so a transient store failure doesn't
+    suppress legitimate ``role_session_missing`` findings.
+
+    The detector consumes this to suppress queued-worker
+    ``role_session_missing`` findings when the project is at cap —
+    those queued tasks are normal back-pressure, not a missing-session
+    fault.
+    """
+    if not project_key or project_path is None:
+        return {}
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+        from pollypm.work import create_work_service
+        from pollypm.work.session_manager import (
+            DEFAULT_MAX_PARALLEL_WORKERS,
+        )
+
+        cfg_path = config_path
+        if cfg_path is None and DEFAULT_CONFIG_PATH.exists():
+            cfg_path = DEFAULT_CONFIG_PATH
+        cfg = load_config(cfg_path) if cfg_path else None
+        cap = DEFAULT_MAX_PARALLEL_WORKERS
+        if cfg is not None:
+            proj = (getattr(cfg, "projects", {}) or {}).get(project_key)
+            if proj is not None:
+                override = getattr(proj, "max_parallel_workers", None)
+                if isinstance(override, int) and override > 0:
+                    cap = override
+                else:
+                    legacy = getattr(proj, "max_concurrent_workers", None)
+                    if isinstance(legacy, int) and legacy > 0:
+                        cap = legacy
+        svc = create_work_service(project_path=project_path)
+        try:
+            records = svc.list_worker_sessions(
+                project=project_key, active_only=True,
+            )
+            active = len(list(records))
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+        if active >= cap:
+            return {project_key: True}
+        return {}
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: worker_cap_back_pressure probe failed for %s",
+            project_key, exc_info=True,
+        )
+        return {}
+
+
 def _architect_window_target(
     storage_closet_name: str | None, project_key: str,
 ) -> str | None:
@@ -2849,6 +2913,12 @@ def _scan_one_project(
         p for p in (state_db_probes or [])
         if p.project_key == project_key
     ]
+    # #1737 — compute per-project worker-cap back-pressure so the
+    # ``role_session_missing`` detector can suppress queued-worker
+    # findings when the project is already at ``max_parallel_workers``.
+    worker_cap_back_pressure = _gather_worker_cap_back_pressure(
+        project_key, project_path, config_path,
+    )
     try:
         findings = scan_project(
             project_key,
@@ -2863,6 +2933,7 @@ def _scan_one_project(
             legacy_db_shadows=project_shadows or None,
             plan_missing_clears=project_clears or None,
             state_db_probes=project_state_probes or None,
+            worker_cap_back_pressure=worker_cap_back_pressure or None,
         )
     except Exception:  # noqa: BLE001
         logger.debug(

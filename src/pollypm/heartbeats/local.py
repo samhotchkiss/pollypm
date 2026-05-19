@@ -1408,7 +1408,47 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
         The send is routed through the same rate-limit path used for
         ordinary nudges so we don't spam a worker that's slow to pick up.
+
+        #1737 — per-task worker sessions (window name
+        ``task-<project>-<N>``) are spawned for one specific task and
+        torn down on accept/cancel; they should not be polling the
+        queue for new work. When the silent_worker rule fires on a
+        per-task session it means the task lost its claim without the
+        worker tearing down — escalate instead of pushing ``pm task
+        next`` (which would steal another task into a dying window).
         """
+        session_name = context.session_name or ""
+        if session_name.startswith("task-"):
+            try:
+                from pollypm.events.summaries import activity_summary
+
+                api.supervisor.msg_store.append_event(
+                    scope=session_name,
+                    sender=session_name,
+                    subject="silent_worker_per_task_skipped",
+                    payload={
+                        "message": activity_summary(
+                            summary=(
+                                "Per-task worker is silent without an "
+                                "active claim; skipping `pm task next` "
+                                "(per-task workers should not poll the "
+                                "queue). The auto-claim recovery sweep "
+                                "will release the stale claim and a "
+                                "fresh `pm task claim` will spawn a new "
+                                "worker."
+                            ),
+                            severity="recommendation",
+                            verb="skipped",
+                            subject=session_name,
+                        ),
+                    },
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "silent_worker per-task skip event failed for %s",
+                    session_name, exc_info=True,
+                )
+            return
         try:
             self._send_worker_message(
                 api,

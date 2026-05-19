@@ -78,6 +78,15 @@ class KnownProject:
     # #768 auto-claim overrides. ``None`` means "defer to planner defaults".
     auto_claim: bool | None = None
     max_concurrent_workers: int | None = None
+    # #1737 per-task parallel worker cap. When set, ``provision_worker``
+    # refuses to spawn a new per-task worker once the project already has
+    # this many active worker sessions. ``None`` defers to the default
+    # (``DEFAULT_MAX_PARALLEL_WORKERS``, currently 5). This is distinct
+    # from ``max_concurrent_workers`` (which the auto-claim sweep uses to
+    # rate-limit DB-level claims): the cap here is the hard ceiling on
+    # concurrently-spawned worker tmux windows per project, regardless of
+    # how the claim was initiated.
+    max_parallel_workers: int | None = None
     # Per-project override of ``[planner].enforce_plan``. ``None`` defers
     # to the global setting; ``False`` bypasses the plan-presence gate
     # for this project (single-task / cleanup / one-off work that doesn't

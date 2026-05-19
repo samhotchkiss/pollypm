@@ -12,7 +12,6 @@ from pollypm.providers.claude.usage_parse import parse_claude_usage_text
 from pollypm.providers.codex.usage_parse import parse_codex_status_text
 from pollypm.storage.state import StateStore
 
-
 def test_parse_claude_usage_text() -> None:
     health, summary = parse_claude_usage_text(
         """

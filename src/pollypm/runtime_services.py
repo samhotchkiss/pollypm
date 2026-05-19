@@ -70,7 +70,6 @@ def load_runtime_services(
     config = load_config(resolved_path)
 
     from pollypm.storage.state import StateStore
-
     store = StateStore(config.project.state_db)
 
     msg_store: Any | None

@@ -13,7 +13,6 @@ from enum import StrEnum
 
 from pollypm.models import PollyPMConfig, ProviderKind
 from pollypm.storage.state import StateStore
-
 logger = logging.getLogger(__name__)
 
 

@@ -88,7 +88,8 @@ from pollypm.store.registry import get_store
 from pollypm.transcript_ledger import sync_token_ledger_for_config
 from pollypm import supervisor_alerts as _supervisor_alerts
 from pollypm.supervision import ControllerProbeService, ControlHomeManager, ProbeRunner
-from pollypm.storage.state import AlertRecord, LeaseRecord, StateStore
+from pollypm.storage.records import AlertRecord, LeaseRecord
+from pollypm.storage.state import StateStore
 from pollypm.tmux.client import TmuxWindow
 from typing import TYPE_CHECKING
 

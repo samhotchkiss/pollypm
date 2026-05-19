@@ -26,10 +26,7 @@ from unittest.mock import patch
 
 import pytest
 
-from pollypm.storage.state import StateStore
-
-
-# ---------------------------------------------------------------------------
+from pollypm.storage.state import StateStore  # ---------------------------------------------------------------------------
 # 1. ``prune_old_data`` directly — accepts ``None`` for event_days
 # ---------------------------------------------------------------------------
 

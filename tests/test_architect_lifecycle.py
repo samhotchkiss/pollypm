@@ -29,7 +29,6 @@ from pollypm.providers.claude import ClaudeProvider
 from pollypm.providers.codex import CodexProvider
 from pollypm.storage.state import StateStore
 
-
 @pytest.fixture
 def store(tmp_path: Path) -> StateStore:
     return StateStore(tmp_path / "state.db")

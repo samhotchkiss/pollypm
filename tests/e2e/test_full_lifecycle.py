@@ -36,7 +36,6 @@ from pollypm.recovery.base import (
 from pollypm.recovery.default import DefaultRecoveryPolicy
 from pollypm.recovery_prompt import build_recovery_prompt
 from pollypm.storage.state import StateStore
-
 from tests.fixtures import (
     sample_config,
     sample_launch,

@@ -304,7 +304,6 @@ def downtime_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
     store = None
     try:
         from pollypm.storage.state import StateStore
-
         state_db = getattr(config.project, "state_db", None)
         if state_db is not None:
             store = StateStore(Path(state_db))

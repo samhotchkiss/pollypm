@@ -36,7 +36,6 @@ def get_memory_backend(project_path: Path, backend_name: str = "file") -> Memory
         from pollypm.plugin_host import extension_host_for_root
         from pollypm.projects import ensure_project_scaffold, project_artifacts_dir, project_dossier_dir
         from pollypm.storage.state import StateStore
-
         resolved = project_path.expanduser().resolve()
         # Scaffold the project up-front so the backend can assume memory
         # roots exist (it used to call ensure_project_scaffold itself).

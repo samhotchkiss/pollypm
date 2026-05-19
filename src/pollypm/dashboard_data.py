@@ -11,7 +11,6 @@ from pathlib import Path
 
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.storage.state import StateStore
-
 logger = logging.getLogger(__name__)
 
 

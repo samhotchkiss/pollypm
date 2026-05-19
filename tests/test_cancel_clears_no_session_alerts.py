@@ -657,7 +657,6 @@ class TestStaleAlertGuardIntact:
         behind the #1524 banner flash.
         """
         from pollypm.storage.state import StateStore
-
         store = StateStore(tmp_path / "prune.db")
         store.upsert_alert(
             "plan_gate-coffeeboardnm",

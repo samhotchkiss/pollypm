@@ -1175,7 +1175,6 @@ def test_product_state_set_get_clear_roundtrip(tmp_path: Path) -> None:
         set_product_state_broken,
     )
     from pollypm.storage.state import StateStore
-
     db = tmp_path / "state.db"
     store = StateStore(db)
     try:
@@ -1225,7 +1224,6 @@ def test_workspace_state_migration_idempotent_on_old_db(tmp_path: Path) -> None:
     import sqlite3
 
     from pollypm.storage.state import StateStore
-
     db = tmp_path / "old.db"
     # Simulate pre-#1546 DB shape: every other table from SCHEMA except
     # workspace_state. We create a stripped DB by hand and then open it
@@ -1275,7 +1273,6 @@ def test_get_workspace_state_tolerates_missing_table(tmp_path: Path) -> None:
     import sqlite3
 
     from pollypm.storage.state import StateStore
-
     db = tmp_path / "no_table.db"
     store = StateStore(db)
     try:
@@ -1291,7 +1288,6 @@ def test_get_workspace_state_tolerates_missing_table(tmp_path: Path) -> None:
 def test_product_state_refuses_empty_reason(tmp_path: Path) -> None:
     from pollypm.storage.product_state import set_product_state_broken
     from pollypm.storage.state import StateStore
-
     store = StateStore(tmp_path / "state.db")
     try:
         with pytest.raises(ValueError):

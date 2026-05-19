@@ -20,7 +20,6 @@ from pollypm.memory_backends import (
 )
 from pollypm.storage.state import StateStore
 
-
 def test_file_memory_backend_writes_reads_and_compacts(tmp_path: Path) -> None:
     backend = FileMemoryBackend(tmp_path)
 

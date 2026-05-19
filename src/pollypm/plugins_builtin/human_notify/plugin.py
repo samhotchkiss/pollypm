@@ -140,7 +140,6 @@ def _resolve_store(api: PluginAPI) -> Any | None:
         )
     try:
         from pollypm.storage.state import StateStore
-
         config = getattr(api, "config", None)
         if config is None:
             return None

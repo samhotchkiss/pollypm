@@ -14,7 +14,7 @@ from pollypm.dashboard_data import (
     InboxPreview,
     load_dashboard,
 )
-from pollypm.storage.state import AccountUsageRecord
+from pollypm.storage.records import AccountUsageRecord
 
 
 def _run(coro) -> None:

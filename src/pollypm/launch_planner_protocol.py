@@ -37,7 +37,6 @@ if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
     from pollypm.storage.state import StateStore
 
-
 @dataclass(slots=True)
 class DefaultLaunchPlannerContext:
     """Callables the default planner needs from its host.

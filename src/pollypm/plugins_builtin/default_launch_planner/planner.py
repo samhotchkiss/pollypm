@@ -35,8 +35,6 @@ from pollypm.runtimes import get_runtime
 if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
     from pollypm.storage.state import StateStore
-
-
 from pollypm.models import CONTROL_ROLES as _CONTROL_ROLES
 
 _ROUTED_ROLES = frozenset({"operator-pm", "architect", "worker", "reviewer"})

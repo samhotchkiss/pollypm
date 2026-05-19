@@ -60,7 +60,8 @@ from pollypm.projects import (
 )
 from pollypm.role_routing import RoleRoutingFacade
 from pollypm.schedulers.base import ScheduledJob
-from pollypm.storage.state import AlertRecord, StateStore
+from pollypm.storage.records import AlertRecord
+from pollypm.storage.state import StateStore
 from pollypm.supervisor import Supervisor
 from pollypm.task_backends import FileTaskBackend, get_task_backend
 from pollypm.task_backends.base import TaskRecord

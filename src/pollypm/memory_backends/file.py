@@ -28,7 +28,6 @@ from pollypm.memory_backends.base import (
 if TYPE_CHECKING:
     from pollypm.storage.state import StateStore
 
-
 class _PluginHook(Protocol):
     """Narrow subset of ExtensionHost the file backend consumes.
 
@@ -102,7 +101,6 @@ class FileMemoryBackend(MemoryBackend):
         # but new code is expected to inject via get_memory_backend().
         if state_store is None:
             from pollypm.storage.state import StateStore
-
             self._state_db = state_db or (self._project_path / ".pollypm" / "state.db")
             self._state_store = StateStore(self._state_db)
         else:

@@ -34,7 +34,6 @@ def _load_config(payload: dict[str, Any]):
 def _load_config_and_store(payload: dict[str, Any]):
     """Yield ``(config, store)`` and close the store deterministically."""
     from pollypm.storage.state import StateStore
-
     config = _load_config(payload)
     store = StateStore(config.project.state_db)
     try:

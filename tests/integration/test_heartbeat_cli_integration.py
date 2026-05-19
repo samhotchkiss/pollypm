@@ -6,7 +6,6 @@ from typer.testing import CliRunner
 import pollypm.cli as cli
 from pollypm.storage.state import StateStore
 
-
 def _write_cli_config(tmp_path: Path) -> Path:
     workspace_root = tmp_path / "workspace"
     workspace_root.mkdir()

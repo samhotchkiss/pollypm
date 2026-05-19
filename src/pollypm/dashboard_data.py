@@ -1,6 +1,7 @@
 """Gather dashboard data from git, issues, snapshots, and state."""
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -10,6 +11,8 @@ from pathlib import Path
 from pollypm.config import load_config
 from pollypm.config import PollyPMConfig
 from pollypm.storage.state import StateStore
+
+logger = logging.getLogger(__name__)
 
 
 # ANSI CSI/OSC escapes plus C0 control chars that can survive in a
@@ -546,6 +549,10 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
         from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "_count_inbox_tasks: failed to import work service helpers",
+            exc_info=True,
+        )
         return 0
     total = 0
     for project_key, project in getattr(config, "projects", {}).items():
@@ -567,6 +574,10 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
             ) as svc:
                 total += len(inbox_tasks(svc, project=project_key))
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_count_inbox_tasks: project=%s db=%s inbox lookup failed",
+                project_key, db_path, exc_info=True,
+            )
             continue
     return total
 
@@ -583,6 +594,11 @@ def _count_dashboard_inbox_items(config: PollyPMConfig) -> int:
         from pollypm.cockpit_inbox import _count_inbox_tasks_for_label
         return int(_count_inbox_tasks_for_label(config) or 0)
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "_count_dashboard_inbox_items: registered-project count failed; "
+            "falling back to tracked-only _count_inbox_tasks",
+            exc_info=True,
+        )
         return _count_inbox_tasks(config)
 
 
@@ -630,6 +646,10 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
     except Exception:  # noqa: BLE001
+        logger.warning(
+            "_recent_inbox_messages: failed to import work service helpers",
+            exc_info=True,
+        )
         return []
 
     now = datetime.now(UTC)
@@ -678,6 +698,10 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
                         )
                     )
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "_recent_inbox_messages: project=%s db=%s scan failed",
+                project_key, db_path, exc_info=True,
+            )
             continue
 
     previews.sort(key=lambda item: item.age_seconds)

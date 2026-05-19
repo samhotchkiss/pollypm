@@ -9,7 +9,7 @@ transitions) the post-#1067 daemon still grew the user-scope
 
 Root cause: ``task_assignment_notify.resolver.load_runtime_services``
 opens a fresh ``StateStore`` on every call and a fresh
-``SQLiteWorkService``. The cadence handlers
+``PgWorkService``. The cadence handlers
 (``task_assignment.sweep`` @every 30s, ``task_assignment.notify``
 on every state transition incl. rework/notify_rejection,
 ``pane.classify`` @every 30s) used to close only the work service

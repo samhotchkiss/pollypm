@@ -1,7 +1,7 @@
 """Per-endpoint integration tests for Phase 1 read endpoints.
 
 Each test exercises the FastAPI app against a real
-:class:`SQLiteWorkService` + tmp config. The work-service is opened
+:class:`PgWorkService` + tmp config. The work-service is opened
 through the canonical :func:`pollypm.work.factory.create_work_service`
 so the test path matches what the cockpit uses.
 """
@@ -154,7 +154,7 @@ def test_get_task_detail_passes_through_production_entry_types(
     with create_work_service(db_path=db_path, project_path=project_root) as svc:
         task = make_task(svc, project="myproj", title="Review me")
         # ``human_review_approved`` is a real production entry_type
-        # written by SQLiteWorkService.transition() on approve.
+        # written by PgWorkService.transition() on approve.
         svc.add_context(
             task.task_id,
             actor="pm",

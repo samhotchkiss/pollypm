@@ -28,6 +28,51 @@ from pollypm.session_services import create_tmux_client
 from pollypm.storage.state import StateStore
 
 
+class _AccountReader:
+    """Context-manager wrapper that reads account_usage/account_runtime via the active backend.
+
+    On the pg backend this is a thin wrapper around :mod:`pollypm.storage.pg_accounts`
+    that exposes the same ``get_account_usage`` / ``get_account_runtime`` methods
+    as :class:`pollypm.storage.state.StateStore`. On the sqlite backend it opens
+    a short-lived StateStore. Used by the cached + live status helpers below
+    so they can iterate over ``config.accounts`` without growing per-call
+    backend probes.
+    """
+
+    def __init__(self, config) -> None:
+        self._config = config
+        self._sqlite_store: "StateStore | None" = None
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        self._is_pg = is_pg_backend(config)
+
+    def __enter__(self) -> "_AccountReader":
+        if not self._is_pg:
+            self._sqlite_store = StateStore(self._config.project.state_db)
+        return self
+
+    def __exit__(self, *exc) -> None:
+        if self._sqlite_store is not None:
+            self._sqlite_store.close()
+            self._sqlite_store = None
+
+    def get_account_usage(self, account_name: str):
+        if self._is_pg:
+            from pollypm.storage.pg_accounts import get_account_usage
+
+            return get_account_usage(account_name)
+        assert self._sqlite_store is not None
+        return self._sqlite_store.get_account_usage(account_name)
+
+    def get_account_runtime(self, account_name: str):
+        if self._is_pg:
+            from pollypm.storage.pg_accounts import get_account_runtime
+
+            return get_account_runtime(account_name)
+        assert self._sqlite_store is not None
+        return self._sqlite_store.get_account_runtime(account_name)
+
+
 @dataclass(slots=True)
 class AccountStatus:
     key: str
@@ -331,7 +376,7 @@ def probe_account_usage(config_path: Path, identifier: str) -> AccountStatus:
         raise typer.BadParameter(f"Account {account_name} does not have an isolated home configured.")
 
     refresh_account_usage(config_path, account_name)
-    with StateStore(config.project.state_db) as store:
+    with _AccountReader(config) as store:
         cached = store.get_account_usage(account_name)
         runtime = store.get_account_runtime(account_name)
     default_plan = cached.plan if cached is not None else "unknown"
@@ -374,7 +419,7 @@ def probe_account_usage(config_path: Path, identifier: str) -> AccountStatus:
 def list_account_statuses(config_path: Path) -> list[AccountStatus]:
     config = load_config(config_path)
     items: list[AccountStatus] = []
-    with StateStore(config.project.state_db) as store:
+    with _AccountReader(config) as store:
         for key, account in config.accounts.items():
             plan, health, usage_summary = _account_usage_summary(account)
             cached = store.get_account_usage(key)
@@ -426,7 +471,7 @@ def list_cached_account_statuses(config_path: Path) -> list[AccountStatus]:
     """
     config = load_config(config_path)
     items: list[AccountStatus] = []
-    with StateStore(config.project.state_db) as store:
+    with _AccountReader(config) as store:
         for key, account in config.accounts.items():
             plan, default_health, default_summary = _cached_account_usage_summary(
                 account

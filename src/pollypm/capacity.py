@@ -93,13 +93,17 @@ class FailoverDecision:
 
 def probe_capacity(
     config: PollyPMConfig,
-    store: StateStore,
+    store: "StateStore | None",
     account_name: str,
 ) -> CapacityProbeResult:
     """Probe the capacity state for a single account from stored data.
 
-    This reads from the SQLite registry (populated by the usage probe
-    in accounts.py) rather than making live API calls.
+    Reads from the per-backend account_usage / account_runtime tables
+    (populated by the usage probe in accounts.py). When ``store`` is a
+    legacy :class:`StateStore` we use it directly; when ``store`` is
+    ``None`` and the active backend is postgres, we read through
+    :mod:`pollypm.storage.pg_accounts` so callers can drop the
+    StateStore handle entirely.
     """
     account = config.accounts.get(account_name)
     if account is None:
@@ -110,9 +114,7 @@ def probe_capacity(
             reason="Account not found in config",
         )
 
-    # Read cached capacity from SQLite
-    usage = store.get_account_usage(account_name)
-    runtime = store.get_account_runtime(account_name)
+    usage, runtime = _read_account_state(config, store, account_name)
 
     # Runtime status takes precedence (captures live failures)
     if runtime and runtime.status in FAILOVER_TRIGGERS:
@@ -150,13 +152,41 @@ def probe_capacity(
 
 def probe_all_accounts(
     config: PollyPMConfig,
-    store: StateStore,
+    store: "StateStore | None",
 ) -> list[CapacityProbeResult]:
-    """Probe capacity for all configured accounts."""
+    """Probe capacity for all configured accounts.
+
+    ``store`` may be ``None`` on the pg backend — the per-account
+    helpers dispatch to :mod:`pollypm.storage.pg_accounts` in that case.
+    """
     return [
         probe_capacity(config, store, name)
         for name in config.accounts
     ]
+
+
+def _read_account_state(
+    config: PollyPMConfig,
+    store: "StateStore | None",
+    account_name: str,
+):
+    """Return (usage, runtime) rows for ``account_name`` via the active backend.
+
+    Lets ``probe_capacity`` callers pass either a legacy
+    :class:`StateStore` handle or ``None`` (when pg is active).
+    """
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if store is not None:
+        return store.get_account_usage(account_name), store.get_account_runtime(account_name)
+    if is_pg_backend(config):
+        from pollypm.storage.pg_accounts import get_account_runtime, get_account_usage
+
+        return get_account_usage(account_name), get_account_runtime(account_name)
+    # No store + sqlite backend — open a short-lived one. Rare path:
+    # callers with sqlite typically already own a StateStore handle.
+    with StateStore(config.project.state_db) as fallback:
+        return fallback.get_account_usage(account_name), fallback.get_account_runtime(account_name)
 
 
 def account_needs_proactive_rollover(

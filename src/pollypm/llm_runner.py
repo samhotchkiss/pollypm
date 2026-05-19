@@ -21,13 +21,26 @@ from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import ProviderKind
 from pollypm.runtime_env import claude_config_dir
 from pollypm.storage.state import StateStore
+
 logger = logging.getLogger(__name__)
+
+
+def _account_store(config: PollyPMConfig) -> "StateStore | None":
+    """Return a StateStore handle on sqlite; ``None`` on pg (pg_accounts is module-level)."""
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if is_pg_backend(config):
+        return None
+    return StateStore(config.project.state_db)
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
 DEFAULT_CONFIG_PATH = Path.home() / ".pollypm" / "pollypm.toml"
 
 
-def select_background_account(config: PollyPMConfig, store: StateStore) -> str | None:
+def select_background_account(
+    config: PollyPMConfig,
+    store: "StateStore | None",
+) -> str | None:
     """Pick the Claude account with the most remaining capacity.
 
     Prefers non-controller accounts to avoid starving interactive sessions.
@@ -88,7 +101,7 @@ def run_haiku(
 
     try:
         config = load_config(config_path)
-        store = StateStore(config.project.state_db)
+        store = _account_store(config)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Unable to initialize Haiku runner from %s: %s", config_path, exc)
         return None
@@ -190,7 +203,7 @@ def run_opus(
 
     try:
         config = load_config(config_path)
-        store = StateStore(config.project.state_db)
+        store = _account_store(config)
     except Exception as exc:  # noqa: BLE001
         logger.warning("Unable to initialize Opus runner from %s: %s", config_path, exc)
         return None

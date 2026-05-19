@@ -1233,12 +1233,30 @@ def _default_spawn_fn() -> Callable[[Path], None]:
 
 
 def query_last_heartbeat_iso(state_db_path: Path) -> str | None:
-    """Open the StateStore read-only and return ``last_heartbeat_at()``.
+    """Return ``last_heartbeat_at()`` from the active storage backend.
 
     Returns ``None`` when the DB doesn't exist (fresh install) or any
     error occurs — callers must treat ``None`` as "no tick history",
-    not "tick stale".
+    not "tick stale". On the pg backend the ``state_db_path`` argument
+    is unused; we read through :mod:`pollypm.storage.pg_heartbeats`.
     """
+    # Try pg first when the active config selects it. We can't rely on
+    # the state_db_path existing — pg installs may leave it absent.
+    try:
+        from pollypm.config import load_config
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        config = load_config()
+        if is_pg_backend(config):
+            try:
+                from pollypm.storage.pg_heartbeats import last_heartbeat_at
+
+                return last_heartbeat_at()
+            except Exception:  # noqa: BLE001
+                return None
+    except Exception:  # noqa: BLE001
+        pass
+
     if not state_db_path.exists():
         return None
     try:

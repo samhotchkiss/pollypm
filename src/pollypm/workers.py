@@ -50,8 +50,15 @@ def _account_is_available(config_path: Path, account_name: str) -> bool:
     account = config.accounts[account_name]
     if not detect_logged_in(account):
         return False
-    with StateStore(config.project.state_db) as store:
-        runtime = store.get_account_runtime(account_name)
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if is_pg_backend(config):
+        from pollypm.storage.pg_accounts import get_account_runtime
+
+        runtime = get_account_runtime(account_name)
+    else:
+        with StateStore(config.project.state_db) as store:
+            runtime = store.get_account_runtime(account_name)
     # Accept both ``auth_broken`` (canonical, written by heartbeats/api.py
     # and supervisor.py) and the legacy hyphenated ``auth-broken`` form
     # so a runtime row written by either side correctly excludes the

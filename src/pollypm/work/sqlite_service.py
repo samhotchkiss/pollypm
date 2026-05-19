@@ -33,11 +33,56 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 _DISABLE_WORK_DB_OPENED_AUDIT_ENV = "POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT"
+_ENABLE_WORK_DB_OPENED_AUDIT_ENV = "POLLYPM_ENABLE_WORK_DB_OPENED_AUDIT"
+
+# Per-process dedup: which (subject) db paths have already emitted a
+# ``work_db.opened`` row in this interpreter. The audit row exists to
+# stamp "first-time open of this DB in this process" — a doctor /
+# heartbeat diagnostic, not a per-call event. Re-opens of the same
+# path within the same process are noise and were producing 99.8% of
+# the bytes in ``~/.pollypm/audit/_workspace.jsonl`` (#1808).
+_emitted_work_db_opened_subjects: set[str] = set()
 
 
 def _work_db_opened_audit_disabled() -> bool:
-    value = os.environ.get(_DISABLE_WORK_DB_OPENED_AUDIT_ENV, "")
-    return value.strip().lower() not in {"", "0", "false", "no", "off"}
+    """Return ``True`` when the ``work_db.opened`` emit should be skipped.
+
+    Default policy (v1 RC, #1808): SUPPRESSED. The event was emitting
+    at ~15 events/min sustained because every cockpit panel render
+    reopened the sqlite work service; 99.8% of ``_workspace.jsonl``
+    was ``work_db.opened`` churn (1.87 GB file). Operators who still
+    want the event can opt in via ``POLLYPM_ENABLE_WORK_DB_OPENED_AUDIT=1``.
+
+    The legacy ``POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT`` env is honored
+    for forward-compat but is now a no-op default — kept so existing
+    shell rc files / config snippets don't break.
+    """
+    # Active backend short-circuit: if we're running pg-mode then the
+    # sqlite work service is a legacy/migration path; any DB it opens
+    # is by definition not the runtime store. Suppress unconditionally.
+    try:
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        if is_pg_backend():
+            return True
+    except Exception:  # noqa: BLE001 — never break init on a config probe
+        pass
+
+    enable_value = os.environ.get(_ENABLE_WORK_DB_OPENED_AUDIT_ENV, "")
+    if enable_value.strip().lower() in {"1", "true", "yes", "on"}:
+        # Explicit opt-in; honor the legacy disable flag if also set.
+        disable_value = os.environ.get(_DISABLE_WORK_DB_OPENED_AUDIT_ENV, "")
+        return disable_value.strip().lower() in {"1", "true", "yes", "on"}
+    # Default: suppressed.
+    return True
+
+
+def _should_emit_work_db_opened(subject: str) -> bool:
+    """Per-process dedup gate. ``True`` only on first call for ``subject``."""
+    if subject in _emitted_work_db_opened_subjects:
+        return False
+    _emitted_work_db_opened_subjects.add(subject)
+    return True
 
 
 # #894 — register the work_service module as an emitter that routes
@@ -623,7 +668,9 @@ class SQLiteWorkService:
         # broad try/except so audit infra failure cannot block work-
         # service init — matches the pattern used at the other audit
         # callsites in this module.
-        if not _work_db_opened_audit_disabled():
+        if not _work_db_opened_audit_disabled() and _should_emit_work_db_opened(
+            str(db_path)
+        ):
             try:
                 from pollypm.audit import emit as _audit_emit
                 from pollypm.audit.log import EVENT_WORK_DB_OPENED

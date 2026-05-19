@@ -81,6 +81,14 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Per-process dedup for the ``work_db.opened`` audit row (#1808). The
+# event is a doctor / heartbeat diagnostic stamped at first open of a
+# given (subject, project_path) pair — subsequent opens within the
+# same interpreter are noise. The sqlite service applies the same
+# pattern; keep them symmetric so a future audit-volume regression is
+# easier to spot.
+_emitted_pg_work_db_opened: set[tuple[str, str | None]] = set()
+
 
 def _parse_task_id(task_id: str) -> tuple[str, int]:
     """Split ``project/number`` into ``(project, int(number))``.
@@ -296,31 +304,41 @@ class PgWorkService:
         # audit trail. Without this, central tail watchers and ``pm
         # doctor`` cannot tell when a pg-backed service was opened.
         # Best-effort — audit failure must never block init.
-        try:
-            from pollypm.audit import emit as _audit_emit
-            from pollypm.audit.log import EVENT_WORK_DB_OPENED
+        #
+        # #1808: dedup per (subject, project_path) per process. Cockpit
+        # panels reopen the service multiple times per second; the
+        # event is a startup stamp, not a per-call signal.
+        _dedup_key = (
+            "postgres",
+            str(self._project_path) if self._project_path is not None else None,
+        )
+        if _dedup_key not in _emitted_pg_work_db_opened:
+            _emitted_pg_work_db_opened.add(_dedup_key)
+            try:
+                from pollypm.audit import emit as _audit_emit
+                from pollypm.audit.log import EVENT_WORK_DB_OPENED
 
-            _audit_emit(
-                event=EVENT_WORK_DB_OPENED,
-                project="_workspace",
-                subject="postgres",
-                actor="system",
-                metadata={
-                    "backend": "postgres",
-                    "tables_created": bool(applied_versions),
-                    "applied_migrations": applied_versions,
-                    "project_path": (
-                        str(self._project_path)
-                        if self._project_path is not None
-                        else None
-                    ),
-                },
-                project_path=self._project_path,
-            )
-        except Exception:  # noqa: BLE001 — audit must never break init
-            logger.debug(
-                "pg work DB opened audit emit failed", exc_info=True
-            )
+                _audit_emit(
+                    event=EVENT_WORK_DB_OPENED,
+                    project="_workspace",
+                    subject="postgres",
+                    actor="system",
+                    metadata={
+                        "backend": "postgres",
+                        "tables_created": bool(applied_versions),
+                        "applied_migrations": applied_versions,
+                        "project_path": (
+                            str(self._project_path)
+                            if self._project_path is not None
+                            else None
+                        ),
+                    },
+                    project_path=self._project_path,
+                )
+            except Exception:  # noqa: BLE001 — audit must never break init
+                logger.debug(
+                    "pg work DB opened audit emit failed", exc_info=True
+                )
 
     # ------------------------------------------------------------------
     # Lifecycle

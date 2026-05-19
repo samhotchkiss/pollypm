@@ -321,14 +321,14 @@ def check_pg_connection() -> doctor.CheckResult:
         return doctor._fail(
             "pg pool module unavailable",
             why=(
-                "The Postgres backend is selected but the pollypm pg "
-                "pool module failed to import — psycopg/psycopg_pool "
-                "are likely missing."
+                "The pollypm pg pool module failed to import — "
+                "psycopg/psycopg_pool are missing from this install. "
+                "They are required base dependencies (#1813); something "
+                "stripped them out of the environment."
             ),
             fix=(
-                "Install the runtime extras —\n"
-                "  uv pip install 'pollypm[postgres]'\n"
-                "Or switch `[storage] backend` back to `sqlite`.\n"
+                "Reinstall pollypm so the pg base deps are restored —\n"
+                "  uv tool install --reinstall --force pollypm\n"
                 "Recheck: pm doctor"
             ),
             data={"error": str(exc)},

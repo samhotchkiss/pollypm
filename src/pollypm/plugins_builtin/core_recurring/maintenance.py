@@ -64,8 +64,15 @@ def transcript_ingest_handler(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def db_vacuum_handler(payload: dict[str, Any]) -> dict[str, Any]:
-    """Run an incremental vacuum against StateStore to reclaim freelist pages."""
+    """Run an incremental vacuum against StateStore to reclaim freelist pages.
+
+    No-op on the pg backend — autovacuum and the pg autovacuum daemon
+    handle page reclamation, and StateStore.incremental_vacuum is a
+    sqlite-only PRAGMA.
+    """
     with _load_config_and_store(payload) as (_config, store):
+        if store is None:
+            return {"bytes_reclaimed": 0, "mb_reclaimed": 0.0, "skipped": "pg backend"}
         bytes_reclaimed = store.incremental_vacuum()
         mb_reclaimed = bytes_reclaimed / (1024 * 1024)
         msg_store = _open_msg_store(_config)
@@ -683,7 +690,12 @@ def _prune_event_subject(msg_store: Any, subject: str, cutoff: Any) -> int:
 def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Drop expired memory_entries (TTL in the past)."""
     with _load_config_and_store(payload) as (_config, store):
-        deleted = store.sweep_expired_memory_entries()
+        if store is not None:
+            deleted = store.sweep_expired_memory_entries()
+        else:
+            from pollypm.storage.pg_memory import sweep_expired_memory_entries
+
+            deleted = sweep_expired_memory_entries()
         msg_store = _open_msg_store(_config)
         try:
             if msg_store is not None:

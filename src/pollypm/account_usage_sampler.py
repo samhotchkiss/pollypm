@@ -25,7 +25,45 @@ from pollypm.runtimes import get_runtime
 from pollypm.session_services import create_tmux_client
 from pollypm.storage.records import AccountUsageRecord
 from pollypm.storage.state import StateStore
+
 logger = logging.getLogger(__name__)
+
+
+def _read_cached_usage(config, account_name: str) -> AccountUsageRecord | None:
+    """Read cached usage row, routing through pg_accounts on the pg backend."""
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if is_pg_backend(config):
+        from pollypm.storage.pg_accounts import get_account_usage
+
+        return get_account_usage(account_name)
+    with StateStore(config.project.state_db) as store:
+        return store.get_account_usage(account_name)
+
+
+def _write_cached_usage(config, sample: "AccountUsageSample") -> None:
+    """Persist a usage sample, routing through pg_accounts on the pg backend."""
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    kwargs = dict(
+        account_name=sample.account_name,
+        provider=sample.provider.value,
+        plan=sample.plan,
+        health=sample.health,
+        usage_summary=sample.usage_summary,
+        raw_text=sample.raw_text,
+        used_pct=sample.used_pct,
+        remaining_pct=sample.remaining_pct,
+        reset_at=sample.reset_at,
+        period_label=sample.period_label,
+    )
+    if is_pg_backend(config):
+        from pollypm.storage.pg_accounts import upsert_account_usage
+
+        upsert_account_usage(**kwargs)
+        return
+    with StateStore(config.project.state_db) as store:
+        store.upsert_account_usage(**kwargs)
 
 # Session-name prefix for the throwaway tmux sessions this module spawns.
 # Boot-time orphan sweeps and the per-probe cleanup both pivot on this
@@ -64,8 +102,7 @@ def refresh_account_usage(
             f"Account {account_name!r} does not have an isolated home configured."
         )
 
-    with StateStore(config.project.state_db) as store:
-        cached = store.get_account_usage(account_name)
+    cached = _read_cached_usage(config, account_name)
 
     try:
         sample = collect_account_usage_sample(
@@ -254,19 +291,7 @@ def sweep_orphan_usage_sessions() -> int:
 def persist_account_usage_sample(config_path: Path, sample: AccountUsageSample) -> None:
     """Persist one usage sample into ``account_usage``."""
     config = load_config(config_path)
-    with StateStore(config.project.state_db) as store:
-        store.upsert_account_usage(
-            account_name=sample.account_name,
-            provider=sample.provider.value,
-            plan=sample.plan,
-            health=sample.health,
-            usage_summary=sample.usage_summary,
-            raw_text=sample.raw_text,
-            used_pct=sample.used_pct,
-            remaining_pct=sample.remaining_pct,
-            reset_at=sample.reset_at,
-            period_label=sample.period_label,
-        )
+    _write_cached_usage(config, sample)
 
 
 def load_cached_account_usage(config_path: Path) -> dict[str, AccountUsageRecord]:
@@ -275,13 +300,12 @@ def load_cached_account_usage(config_path: Path) -> dict[str, AccountUsageRecord
     account_names = list(getattr(config, "accounts", {}) or {})
     if not account_names:
         return {}
-    with StateStore(config.project.state_db) as store:
-        cached: dict[str, AccountUsageRecord] = {}
-        for account_name in account_names:
-            usage = store.get_account_usage(account_name)
-            if usage is not None:
-                cached[account_name] = usage
-        return cached
+    cached: dict[str, AccountUsageRecord] = {}
+    for account_name in account_names:
+        usage = _read_cached_usage(config, account_name)
+        if usage is not None:
+            cached[account_name] = usage
+    return cached
 
 
 def _probe_session_spec(root_dir: Path, account_name: str, provider: ProviderKind) -> SessionConfig:

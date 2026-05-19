@@ -92,9 +92,10 @@ The work service exposes its operations through the Layer 3 Service API, meaning
 ### Process Boundary
 
 V1 ships the work service as an in-process library. The `pm` CLI and other
-local callers obtain a `SQLiteWorkService` against the shared `state.db`
-through the `pollypm.work.create_work_service` factory; there is no
-separate daemon or Unix socket in the current build.
+local callers obtain a `PgWorkService` against the workspace Postgres
+database (DSN from `[storage] url` in `pollypm.toml`) through the
+`pollypm.work.create_work_service` factory; there is no separate daemon
+or Unix socket in the current build.
 
 ```python
 from pollypm.work import create_work_service
@@ -103,13 +104,13 @@ with create_work_service(project_path=project.path) as svc:
     ...
 ```
 
-Direct construction of `SQLiteWorkService` from outside the `pollypm.work`
-package is discouraged: it forces every callsite to know the on-disk
-layout (workspace vs. per-project paths, dual-DB confusion, etc.) and
-bypasses future resolver enhancements (env overrides, fallbacks,
-telemetry). The factory resolves the canonical DB path via
-`pollypm.work.db_resolver.resolve_work_db_path` and yields a
-context-managed service so the SQLite handle closes deterministically.
+Direct construction of `PgWorkService` from outside the `pollypm.work`
+package is discouraged: it forces every callsite to know the DSN
+resolution rules (env override, `[storage] url`, default) and bypasses
+future resolver enhancements (telemetry, pool tuning). The factory
+resolves the canonical DSN via `pollypm.work.db_resolver` and yields a
+context-managed service so the Postgres connection returns to the pool
+deterministically.
 
 Callers that genuinely need a non-canonical path (legacy migration,
 tests, explicit `--db` overrides) may pass `db_path=...` explicitly so the
@@ -118,10 +119,10 @@ deviation is visible at the callsite.
 ### Audit Hooks
 
 The current work-service implementation emits audit-log events for task
-creation, status transitions, task deletion/pruning, and every SQLite work DB
-open. The `work_db.opened` event is the forensic breadcrumb for the workspace
-vs. messages-side DB confusion: its metadata records whether the opened file
-already had a `messages` table and whether work tables had to be created.
+creation, status transitions, task deletion/pruning, and every work-DB
+open. The `work_db.opened` event is the forensic breadcrumb for schema
+state: its metadata records whether the opened DB already had a
+`messages` table and whether work tables had to be created.
 
 See [Audit Log](audit-log.md) for the JSONL schema, on-disk paths, watchdog
 rules that consume these events, and the contributor contract for adding new
@@ -135,8 +136,8 @@ event types.
   so a Unix-socket daemon can still be introduced later without redesigning
   flows, gates, or storage.
 
-SQLite WAL mode handles concurrent reads while writes stay serialized through
-the work-service boundary.
+Postgres handles concurrent reads through its MVCC model while writes
+stay serialized through the work-service boundary.
 
 ## 4. Task Schema
 
@@ -302,11 +303,11 @@ A `Transition`:
 ## 5. API Surface
 
 The work service exposes these operations. In the current build, all mutations
-are intended to flow through the in-process `SQLiteWorkService` boundary. All
+are intended to flow through the in-process `PgWorkService` boundary. All
 operations return structured results (not raw file contents).
 
-**Current implementation note (2026-04-26):** `WorkService`,
-`SQLiteWorkService`, and `MockWorkService` all expose the shared parameters
+**Current implementation note:** `WorkService`,
+`PgWorkService`, and `MockWorkService` all expose the shared parameters
 callers rely on, including `created_by`, `skip_gates`, and `entry_type`.
 
 ### Task Lifecycle
@@ -742,7 +743,7 @@ session.
 | Work status state machine | Eight states (`draft` through `cancelled`) derived from OtterCamp v2. `work_status` is a projection of flow node state, not an independent controller. |
 | File-first philosophy | The file sync adapter maintains `issues/` as a human-inspectable projection. `ls issues/01-ready/` still works. |
 | Override chain | Built-in < user-global < project-local. Same precedence model as rules, magic, and agent profiles. |
-| Heartbeat supervision | Still monitors agent health. Work-state mutations remain safe because the service is in-process and SQLite-backed. |
+| Heartbeat supervision | Still monitors agent health. Work-state mutations remain safe because the service is in-process and Postgres-backed. |
 
 ## 12. Open Questions
 
@@ -760,13 +761,13 @@ Future work tracker: see GitHub issue #141.
 
 Not a v1 concern. Tasks should be well-scoped enough that context logs stay manageable. If a task is accumulating a massive context log, it's too big and should be split. For v1, `get_context` with `limit` and `since` parameters is sufficient. Revisit if real-world usage reveals a problem.
 
-### ~~OQ-3: Storage Backend for v1~~ — RESOLVED
+### ~~OQ-3: Storage Backend for v1~~ — RESOLVED (revised post-#1737)
 
-SQLite, using the existing PollyPM state database (`state.db`). Work service tables use a `work_` prefix (`work_tasks`, `work_flow_templates`, `work_node_executions`, etc.) so they coexist cleanly with existing tables (`sessions`, `heartbeats`, `alerts`, etc.). This lets work service tables reference existing tables via foreign keys (e.g., project references) without cross-database joins or sync. Plugins follow the same pattern — prefixed tables in the shared database.
+Postgres, using the workspace database (DSN from `[storage] url`). Work service tables use a `work_` prefix (`work_tasks`, `work_flow_templates`, `work_node_executions`, etc.) so they coexist cleanly with existing tables (`sessions`, `heartbeats`, `alerts`, etc.). This lets work service tables reference existing tables via foreign keys (e.g., project references) without cross-database joins or sync. Plugins follow the same pattern — prefixed tables in the shared database. (The original v1 RFC picked SQLite; #1737 moved everything to Postgres + pgvector so semantic recall and cross-project reads stop fanning out across per-project DBs.)
 
 ### ~~OQ-4: Daemon vs. In-Process Service~~ — RESOLVED
 
-In-process for v1. The `pm` CLI calls the work service library directly. SQLite WAL mode handles concurrent reads. Graduate to a Unix socket daemon in Phase 3 once the API surface is stable. The API boundary is designed to be transport-agnostic, so the upgrade is a wiring change, not a redesign.
+In-process for v1. The `pm` CLI calls the work service library directly. The Postgres pool handles concurrent reads. Graduate to a Unix socket daemon in Phase 3 once the API surface is stable. The API boundary is designed to be transport-agnostic, so the upgrade is a wiring change, not a redesign.
 
 ### ~~OQ-5: Two-Way GitHub Sync Conflict Policy~~ — DEFERRED
 
@@ -796,7 +797,7 @@ Yes, cross-project dependencies are allowed. A task in project A can be blocked 
 Because v1 is in-process, callers could be tempted to reach around the service
 and mutate tables directly. That would bypass flows, gates, sync hooks, and
 transition logging. Mitigations:
-- Keep CLI and supervisor mutations routed through `SQLiteWorkService`
+- Keep CLI and supervisor mutations routed through `PgWorkService`
 - Maintain import-boundary tests around service helpers and storage access
 - Reserve a future transport boundary for the point where stronger process
   isolation is actually needed
@@ -1225,7 +1226,7 @@ test_migrate_idempotent
 
 ```
 test_e2e_worker_claims_and_completes
-  Build a real SQLiteWorkService against a temp DB
+  Build a real PgWorkService against a temp database / schema
   Polly calls: create → queue
   Worker calls: next → claim → add_context → node_done with work output
   Polly calls: approve
@@ -1242,13 +1243,13 @@ test_e2e_gate_blocks_advance
   Verify advance is rejected with gate failure message
 
 test_e2e_supervisor_assigns_work
-  Build a real SQLiteWorkService
+  Build a real PgWorkService
   Polly creates and assigns a task
   Verify the task shows up in my_tasks for the assigned worker
 
 test_e2e_service_reopen_recovery
-  Build a SQLiteWorkService, create some tasks, then drop it
-  Re-open a fresh SQLiteWorkService against the same DB
+  Build a PgWorkService, create some tasks, then drop it
+  Re-open a fresh PgWorkService against the same DB
   Verify all state is preserved and operations resume
 ```
 
@@ -1378,7 +1379,7 @@ Build the work service as an in-process library. This gets the API surface, flow
 
 Deliverables:
 - `WorkService` protocol definition
-- Default implementation with SQLite backend
+- Default implementation with Postgres backend (`PgWorkService`)
 - Flow engine with YAML loading and override resolution
 - Built-in gates
 - Full unit and integration test suite

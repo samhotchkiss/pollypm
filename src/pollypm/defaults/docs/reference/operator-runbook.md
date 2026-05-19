@@ -148,8 +148,8 @@ what will be deleted before you commit:
 
 - `sessions to purge:` — `[sessions.*]` blocks tied to this project,
   with a `(live)` or `(stale)` marker per tmux session.
-- `state.db rows to purge:` — per-table counts in the workspace
-  `state.db` (work_tasks, messages, worktrees, audit history, …).
+- `rows to purge:` — per-table counts in the workspace Postgres
+  database (work_tasks, messages, worktrees, audit history, …).
 - `worktree directories to purge:` — `<project>/.pollypm/worktrees/`
   subdirs, with a `[dirty]` marker on any worktree with uncommitted
   changes.
@@ -167,9 +167,9 @@ pm project remove russell --yes \
 
 | Flag | Effect |
 |------|--------|
-| (no flags) | Only removes the `[projects.<key>]` config entry. Refuses while `[sessions.*]` blocks reference the project. State.db rows, audit history, and worktree dirs are left in place. |
+| (no flags) | Only removes the `[projects.<key>]` config entry. Refuses while `[sessions.*]` blocks reference the project. Workspace-DB rows, audit history, and worktree dirs are left in place. |
 | `--purge-sessions` | Kills every tmux session tied to the project and drops the matching `[sessions.*]` entries. Required when sessions reference the project — otherwise `remove_project` refuses. |
-| `--purge-state` | Deletes every state.db row tied to the project (work_tasks, messages, audit_outbox, notification_staging, worktrees, architect_resume_tokens, token_usage, …) and removes the central audit-tail JSONL at `~/.pollypm/audit/<key>.jsonl`. |
+| `--purge-state` | Deletes every workspace-DB row tied to the project (work_tasks, messages, audit_outbox, notification_staging, worktrees, architect_resume_tokens, token_usage, …) and removes the central audit-tail JSONL at `~/.pollypm/audit/<key>.jsonl`. |
 | `--purge-worktrees` | Removes every git worktree under `<project>/.pollypm/worktrees/`. Uses `git worktree remove` for registered worktrees, `shutil.rmtree` for stale dirs. Refuses dirty worktrees unless `--force-discard-worktree-changes` is also set. |
 | `--force-discard-worktree-changes` | Pairs with `--purge-worktrees`. Runs `git worktree remove --force` so dirty worktrees are removed and the local branch ref is dropped. |
 | `--force` | Skips the active-task confirmation prompt (queued or in-flight work-service tasks). Does NOT auto-accept the `--purge-state` or `--purge-worktrees` destructive prompts — use `--yes` for those. |
@@ -184,9 +184,9 @@ The cascade always runs in this order, with each step gating the next:
 2. **Sessions.** With `--purge-sessions`, tmux sessions are killed first
    so workers don't keep writing to a project that's about to disappear.
    `[sessions.*]` entries drop next.
-3. **State.db rows.** With `--purge-state`, the SQLite sweep runs BEFORE
-   the TOML edit. A failure here aborts without touching the config so
-   the rows-vs-config asymmetry can only point one way (issue #1673).
+3. **Workspace-DB rows.** With `--purge-state`, the Postgres sweep runs
+   BEFORE the TOML edit. A failure here aborts without touching the config
+   so the rows-vs-config asymmetry can only point one way (issue #1673).
 4. **Worktree directories.** With `--purge-worktrees`, dirs under
    `.pollypm/worktrees/` are removed. Dirty worktrees are skipped unless
    `--force-discard-worktree-changes` is set.
@@ -228,7 +228,7 @@ pm project new <path-from-the-removed-entry> \
     --slug russell --skip-planner
 ```
 
-The full cascade — sessions, state.db rows, worktrees, config entry —
+The full cascade — sessions, workspace-DB rows, worktrees, config entry —
 runs in the same order documented in **Destructive-action ordering**
 above. Step 5 (re-register) re-runs `ensure_project_scaffold` on the
 path so the standard `.pollypm/` directory layout reappears.
@@ -471,15 +471,11 @@ What an operator sees:
   watchdog's dead-loop rule and route an escalation to the project
   architect.
 
-## Setting up Postgres (issue #1737, Slice A foundation)
+## Setting up Postgres (issue #1737)
 
-PollyPM is migrating from per-project SQLite to a single Postgres
-instance with `pgvector` for semantic recall. Slice A ships the
-foundation — the pool, the schema, and the doctor probe — behind a
-feature flag. The sqlite backend remains the default until the cutover
-PR; the steps below are required only for operators opting into the
-new backend ahead of cutover, or for the test suite that exercises the
-`PgWorkService` skeleton.
+PollyPM uses a single Postgres instance with `pgvector` for semantic
+recall as its only storage backend. The steps below are required on
+every host before `pm` will start.
 
 ### Prerequisites
 
@@ -510,7 +506,6 @@ Add to `~/.pollypm/pollypm.toml`:
 
 ```toml
 [storage]
-backend = "postgres"
 # Optional — leaving this empty falls through to POLLYPM_PG_DSN, then
 # the default postgresql://localhost:5432/pollypm.
 url = "postgresql://localhost:5432/pollypm"
@@ -536,8 +531,8 @@ export POLLYPM_PG_DSN="postgresql://user:pw@host:5432/pollypm"
 
 ### Smoke test
 
-Run the pg-only doctor probe — fast feedback whether the cockpit will
-boot against the configured backend:
+Run the pg doctor probe — fast feedback whether the cockpit will boot
+against the configured DSN:
 
 ```
 pm doctor-pg-connection
@@ -547,12 +542,3 @@ The check returns `ok` when pg is reachable, the server version is at
 least the configured `min_version`, and the `vector` extension is
 installed. Failures emit the standard three-question doctor message
 with an actionable fix command.
-
-### Flipping the backend back to sqlite
-
-Until the cutover PR lands, the safe rollback is to set `[storage]
-backend = "sqlite"` and restart. Slice A intentionally leaves the
-sqlite implementation in place — no data migration is required when
-the flag is flipped before any pg writes happen. After Slices B–H land
-and the cutover is complete the rollback path runs through the
-pre-cutover snapshot documented in the migration PR notes.

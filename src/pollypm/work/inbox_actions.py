@@ -10,23 +10,39 @@ logger = logging.getLogger(__name__)
 
 
 def open_work_service_for_task(config: Any, task_id: str) -> Any | None:
-    """Open the work service for the registered project owning ``task_id``."""
+    """Open the work service for the registered project owning ``task_id``.
+
+    Backend-aware (#1812). On the sqlite backend we still gate on the
+    per-project ``.pollypm/state.db`` existing on disk — that's the file
+    the service will read. On the pg backend there is no per-project
+    file; the only gate is "the task's project key is registered" so
+    :func:`create_work_service` is asked for a service against the
+    workspace-wide pg store with ``project_key`` set. The previous
+    blanket ``db_path.exists()`` short-circuit silently disabled the
+    primary resolver path under pg.
+    """
     project_key = task_id.split("/", 1)[0]
     project = getattr(config, "projects", {}).get(project_key)
     if project is None:
         return None
     db_path = project.path / ".pollypm" / "state.db"
-    if not db_path.exists():
+    try:
+        from pollypm.work.factory import _resolve_backend, create_work_service
+    except Exception:  # noqa: BLE001
+        return None
+
+    backend = _resolve_backend(config)
+    if backend != "postgres" and not db_path.exists():
+        # sqlite-only gate kept: there is literally no DB file to open.
+        # On pg the file is irrelevant so we skip this check.
         return None
     try:
-        from pollypm.work.factory import create_work_service
-
         # Forward ``config`` so ``[storage] backend`` is honoured (#1369,
         # #1737). ``db_path`` is ignored on the pg backend per the factory
         # docstring; on sqlite the per-project file is used as before.
         return create_work_service(
             config=config,
-            db_path=db_path,
+            db_path=db_path if backend != "postgres" else None,
             project_path=project.path,
             project_key=project_key,
         )
@@ -38,25 +54,20 @@ def resolve_inbox_work_service(config: Any, item: Any, task_id: str) -> Any | No
     """Resolve a work service for a cockpit inbox row.
 
     The task-id project key is tried first. If that does not map to a
-    registered project DB, or if that DB exists but does not contain the
-    task that produced the inbox row, the inbox entry's source
+    registered project, or if the registered service does not contain
+    the task that produced the inbox row, the inbox entry's source
     ``db_path`` is used as a best-effort fallback.
+
+    Backend-agnostic (#1812). Previously this helper used a sqlite-only
+    ``svc._db_path`` getattr to short-circuit the ``svc.get(task_id)``
+    probe; under pg that attribute is missing, so ``same_db`` was always
+    ``False`` and the probe always ran (which is the safer default
+    anyway). Now we always probe — the cost is one extra select per
+    inbox row and the resolver behaves identically across backends.
     """
     db_path = getattr(item, "db_path", None) if item is not None else None
     svc = open_work_service_for_task(config, task_id)
     if svc is not None:
-        item_db_path = Path(db_path) if db_path is not None else None
-        svc_db_path = getattr(svc, "_db_path", None)
-        try:
-            same_db = (
-                item_db_path is not None
-                and svc_db_path is not None
-                and item_db_path.resolve() == Path(svc_db_path).resolve()
-            )
-        except Exception:  # noqa: BLE001
-            same_db = False
-        if item_db_path is None or same_db:
-            return svc
         try:
             svc.get(task_id)
             return svc
@@ -66,7 +77,7 @@ def resolve_inbox_work_service(config: Any, item: Any, task_id: str) -> Any | No
             except Exception:  # noqa: BLE001
                 pass
             logger.debug(
-                "cockpit inbox: registered project db did not contain %s; "
+                "cockpit inbox: registered project svc did not contain %s; "
                 "falling back to source db_path=%r",
                 task_id,
                 db_path,

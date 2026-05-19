@@ -259,6 +259,27 @@ class WorkService(Protocol):
         """
         ...
 
+    def list_replies(self, task_id: str) -> list[ContextEntry]:
+        """Return reply entries for ``task_id`` oldest-first (#1812).
+
+        Thin wrapper around :meth:`get_context` with
+        ``entry_type='reply'`` plus a reversal so the inbox detail pane
+        renders the thread in natural reading order. Pinned on the
+        protocol so cockpit code never has to ``hasattr`` past a
+        backend that forgot to implement it.
+        """
+        ...
+
+    def bulk_list_replies(self, *, project: str) -> dict[int, list[ContextEntry]]:
+        """Return ``task_number -> [reply entries (oldest first)]`` (#1812).
+
+        One project-wide query, bucketed in Python. Replaces a per-task
+        :meth:`list_replies` loop on the inbox loader hot path. Pinned
+        on the protocol so the bulk path is part of the WorkService
+        contract rather than a backend-specific optimisation.
+        """
+        ...
+
     # ------------------------------------------------------------------
     # Relationships
     # ------------------------------------------------------------------

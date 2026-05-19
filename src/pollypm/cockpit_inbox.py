@@ -1650,7 +1650,7 @@ def _render_worker_roster_panel(config_path: Path) -> str:
     lines = ["Workers", ""]
     dot_for = {
         "working": "\u25cf", "idle": "\u25cb",
-        "stuck": "\u25b2", "offline": "\u25cf",
+        "stuck": "\u25b2", "offline": "\u25cb",
     }
     for row in rows:
         dot = dot_for.get(row.status, "\u25cb")

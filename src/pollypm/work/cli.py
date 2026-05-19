@@ -49,7 +49,7 @@ _TASK_APP_HELP = help_with_examples(
 )
 
 if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from pollypm.work.service import WorkService
 
 task_app = typer.Typer(help=_TASK_APP_HELP)
 flow_app = typer.Typer(
@@ -194,12 +194,36 @@ def _project_from_task_id(task_id: str) -> str | None:
     return None
 
 
-def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
+def _svc(db: str, project: str | None = None) -> "WorkService":
     import atexit
 
+    from pollypm.work.db_resolver import WORKSPACE_DEFAULT_DB_PATH
+    from pollypm.work.factory import create_work_service
     from pollypm.work.sync import SyncManager
     from pollypm.work.sync_file import FileSyncAdapter
-    from pollypm.work.sqlite_service import SQLiteWorkService
+
+    # Load config once per invocation so backend dispatch (#1737) sees
+    # the operator's ``[storage] backend = "postgres"`` setting. Hidden
+    # ``load_config()`` calls in callsites that omitted ``config=`` were
+    # the root cause of #1369 — the factory silently defaults to sqlite
+    # whenever ``config`` is None.
+    config_obj: object | None = None
+    try:
+        from pollypm.config import load_config
+
+        config_obj = load_config()
+    except Exception:  # noqa: BLE001
+        config_obj = None
+
+    # ``--db`` is the explicit test / CI escape hatch — a non-default
+    # value means the caller is pinning a specific sqlite file. The
+    # factory normally ignores ``db_path`` on the pg backend, so honour
+    # the override by routing through sqlite dispatch even when config
+    # selects postgres. ``config_obj`` is kept around for the
+    # SessionManager wiring below.
+    backend_config: object | None = config_obj
+    if db != WORKSPACE_DEFAULT_DB_PATH:
+        backend_config = None
 
     db_path = _resolve_db_path(db, project=project)
     db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -217,13 +241,10 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
     # form (``blackjack_trainer``) while task IDs use the project's
     # display slug (``blackjack-trainer``); look up via both.
     project_root = db_derived_root
-    config_obj: object | None = None
-    if project:
+    if project and config_obj is not None:
         try:
-            from pollypm.config import load_config
             from pollypm.projects import slugify_project_key
 
-            config_obj = load_config()
             known = getattr(config_obj, "projects", {}) or {}
             project_cfg = known.get(project)
             if project_cfg is None:
@@ -242,13 +263,23 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
                 if cfg_path is not None:
                     project_root = Path(cfg_path)
         except Exception:  # noqa: BLE001
-            config_obj = None
+            pass
 
     sync = SyncManager()
     sync.register(FileSyncAdapter(issues_root=project_root / "issues"))
 
-    svc = SQLiteWorkService(
-        db_path=db_path, sync_manager=sync, project_path=project_root,
+    # Route through the factory so ``[storage] backend`` is honoured
+    # (#1369, #1737). ``db_path`` / ``project_path`` / ``sync_manager``
+    # are sqlite-only; the pg backend ignores them per the factory
+    # docstring. An explicit ``--db`` override forces sqlite dispatch
+    # (see ``backend_config`` above) so the test / CI escape hatch
+    # keeps working on machines whose ``pollypm.toml`` selects postgres.
+    svc = create_work_service(
+        config=backend_config,
+        db_path=db_path,
+        project_path=project_root,
+        project_key=project,
+        sync_manager=sync,
     )
 
     # Wire up the session manager for per-task worker lifecycle
@@ -293,7 +324,7 @@ def _svc(db: str, project: str | None = None) -> SQLiteWorkService:
 
 
 def _resolve_actor_for_task(
-    svc: SQLiteWorkService,
+    svc: "WorkService",
     task_id: str,
     actor: str | None,
 ) -> str:

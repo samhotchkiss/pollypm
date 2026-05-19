@@ -120,6 +120,10 @@ from pollypm.cockpit_rail_listview import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_rail_item import (  # noqa: F401  (re-exported)
     RailItem,
 )
+from pollypm.cockpit_route_controls import (  # noqa: F401  (re-exported)
+    _CockpitRouteContentResolver,
+    _CockpitRouteWindowApplier,
+)
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
     clear_live_chat_network_dead_notice,
@@ -215,25 +219,6 @@ _PLAN_REVIEW_UNAVAILABLE_HINT_RE = _re.compile(
     _re.IGNORECASE,
 )
 _PLAN_REVIEW_DISCUSSION_ENTRY_TYPE = "plan_review_discussed"
-
-
-class _CockpitRouteContentResolver:
-    """Navigation resolver for the root cockpit rail.
-
-    The router still owns full content resolution during this integration
-    step; the navigation controller owns acknowledgement/cancellation state.
-    """
-
-    def resolve(self, request: NavigationCommand) -> NavigationContent:
-        return NavigationContent(request.key)
-
-
-class _CockpitRouteWindowApplier:
-    def __init__(self, app: "PollyCockpitApp") -> None:
-        self._app = app
-
-    def apply(self, request: NavigationCommand, _content: object) -> str:
-        return self._app._route_selected_with_deadline(request.key)
 
 
 def _md_to_rich(text: str) -> str:

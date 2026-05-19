@@ -1633,18 +1633,49 @@ class CockpitRouter:
         return registry
 
     def _project_session_map(self, launches) -> dict[str, str]:
+        """Resolve ``project_key -> session_name`` for project PM Chat routing.
+
+        Per Sam's clarification (project PM == project architect):
+        ``architect_<project>`` is the canonical per-project PM persona.
+        It already runs as a long-lived session primed with the project
+        persona; "Chat PM" should attach to that conversation rather
+        than a sibling worker / advisor / generic operator.
+
+        Selection rules (priority order, control roles skipped):
+          1. ``architect`` — the canonical project PM persona.
+          2. ``worker``    — per-task worker (PM persona only when no
+             architect exists for the project).
+          3. Anything else (``advisor``, custom roles) — last-resort
+             fallback so projects that ship without an architect still
+             have a routable PM target.
+
+        Within a priority tier the first launch wins (deterministic on
+        ``plan_launches`` ordering). Control roles (operator-pm,
+        reviewer, etc.) remain excluded — they are routed through the
+        workspace-level rail keys, never as a project's PM.
+        """
         from pollypm.models import CONTROL_ROLES
 
-        project_session_map: dict[str, str] = {}
-        for launch in launches:
-            role = getattr(launch.session, "role", "")
+        _ROLE_PRIORITY = {"architect": 0, "worker": 1}
+        _DEFAULT_PRIORITY = 2
+
+        ranked: dict[str, tuple[int, int, str]] = {}
+        for index, launch in enumerate(launches):
+            role = getattr(launch.session, "role", "") or ""
             if role in CONTROL_ROLES:
                 continue
             project = getattr(launch.session, "project", None)
             name = getattr(launch.session, "name", None)
-            if project and name:
-                project_session_map.setdefault(project, name)
-        return project_session_map
+            if not project or not name:
+                continue
+            priority = _ROLE_PRIORITY.get(role, _DEFAULT_PRIORITY)
+            existing = ranked.get(project)
+            # Strictly lower priority wins; on ties keep the earlier launch
+            # so behavior stays deterministic and matches the prior
+            # first-wins semantics inside a priority tier.
+            if existing is None or priority < existing[0]:
+                ranked[project] = (priority, index, name)
+        return {project: entry[2] for project, entry in ranked.items()}
 
     def _decorate_project_items(
         self,

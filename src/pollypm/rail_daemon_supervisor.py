@@ -1233,51 +1233,20 @@ def _default_spawn_fn() -> Callable[[Path], None]:
 
 
 def query_last_heartbeat_iso(state_db_path: Path) -> str | None:
-    """Return ``last_heartbeat_at()`` from the active storage backend.
+    """Return ``last_heartbeat_at()`` from the pg heartbeats facade.
 
-    Returns ``None`` when the DB doesn't exist (fresh install) or any
-    error occurs — callers must treat ``None`` as "no tick history",
-    not "tick stale". On the pg backend the ``state_db_path`` argument
-    is unused; we read through :mod:`pollypm.storage.pg_heartbeats`.
+    Returns ``None`` when no tick history is available or any error
+    occurs — callers must treat ``None`` as "no tick history", not
+    "tick stale". The ``state_db_path`` argument is unused under pg
+    (kept for caller compatibility).
     """
-    # Try pg first when the active config selects it. We can't rely on
-    # the state_db_path existing — pg installs may leave it absent.
+    del state_db_path  # unused on pg backend
     try:
-        from pollypm.config import load_config
-        from pollypm.storage._backend_dispatch import is_pg_backend
+        from pollypm.storage.pg_heartbeats import last_heartbeat_at
 
-        config = load_config()
-        if is_pg_backend(config):
-            try:
-                from pollypm.storage.pg_heartbeats import last_heartbeat_at
-
-                return last_heartbeat_at()
-            except Exception:  # noqa: BLE001
-                return None
-    except Exception:  # noqa: BLE001
-        pass
-
-    if not state_db_path.exists():
-        return None
-    try:
-        from pollypm.storage.state import StateStore
+        return last_heartbeat_at()
     except Exception:  # noqa: BLE001
         return None
-    try:
-        store = StateStore(state_db_path, readonly=True)
-    except Exception:  # noqa: BLE001
-        return None
-    try:
-        return store.last_heartbeat_at()
-    except Exception:  # noqa: BLE001
-        return None
-    finally:
-        try:
-            close = getattr(store, "close", None)
-            if callable(close):
-                close()
-        except Exception:  # noqa: BLE001
-            pass
 
 
 def revive_if_needed(

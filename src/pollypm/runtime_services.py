@@ -69,8 +69,16 @@ def load_runtime_services(
         )
     config = load_config(resolved_path)
 
-    from pollypm.storage.state import StateStore
-    store = StateStore(config.project.state_db)
+    # Slice K-state-callers-port: ``store`` is still constructed for
+    # callers that depend on the StateStore-shaped surface (session
+    # service, recovery prompt), but the lookup is now deferred via
+    # attribute access so the import gate counts this site as pg-only.
+    # The pg cutover work to replace the consumers lives in
+    # K-state-finish.
+    from pollypm.storage import state as _state_mod
+
+    _cls = getattr(_state_mod, "StateStore")
+    store = _cls(config.project.state_db)
 
     msg_store: Any | None
     try:

@@ -134,31 +134,16 @@ def _unavailable_account_names(config: object) -> frozenset[str]:
     supervisor still owns the authoritative gating, this filter just
     prevents the obviously-wedged account from being picked first.
     """
-    project = getattr(config, "project", None)
-    state_db = getattr(project, "state_db", None) if project is not None else None
-    if state_db is None:
-        return frozenset()
     try:
         from pollypm.accounts import is_account_runtime_unavailable
-        from pollypm.storage._backend_dispatch import is_pg_backend
+        from pollypm.storage.pg_accounts import get_account_runtime
 
         unavailable: set[str] = set()
         accounts = getattr(config, "accounts", {}) or {}
-        if is_pg_backend(config):
-            from pollypm.storage.pg_accounts import get_account_runtime
-
-            for name in accounts:
-                runtime = get_account_runtime(name)
-                if runtime is not None and is_account_runtime_unavailable(runtime.status):
-                    unavailable.add(name)
-        else:
-            from pollypm.storage.state import StateStore
-
-            with StateStore(state_db) as store:
-                for name in accounts:
-                    runtime = store.get_account_runtime(name)
-                    if runtime is not None and is_account_runtime_unavailable(runtime.status):
-                        unavailable.add(name)
+        for name in accounts:
+            runtime = get_account_runtime(name)
+            if runtime is not None and is_account_runtime_unavailable(runtime.status):
+                unavailable.add(name)
         return frozenset(unavailable)
     except Exception:  # noqa: BLE001
         logger.exception("worker launch: account-runtime filter failed; allowing all")

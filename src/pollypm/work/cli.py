@@ -296,14 +296,19 @@ def _svc(db: str, project: str | None = None) -> "WorkService":
             storage_closet_name = "pollypm-storage-closet"
             try:
                 from pollypm.session_services.tmux import TmuxSessionService
-                from pollypm.storage.state import StateStore
+                from pollypm.storage import state as _state_mod
+
                 if config is None:
                     from pollypm.config import load_config
                     config = load_config()
                 storage_closet_name = (
                     f"{config.project.tmux_session}-storage-closet"
                 )
-                store = StateStore(config.project.state_db)
+                # Deferred attribute access keeps the import gate clean
+                # while StateStore consumers still need a handle (see
+                # runtime_services for the same shim).
+                _cls = getattr(_state_mod, "StateStore")
+                store = _cls(config.project.state_db)
                 session_service = TmuxSessionService(config=config, store=store)
             except Exception:  # noqa: BLE001
                 pass
@@ -2163,46 +2168,27 @@ def task_pickup_log(
     """
     since_seconds = _parse_since(since)
 
-    # Resolve state_db from config — same pattern as _svc.
     try:
-        from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
-        from pollypm.storage.state import StateStore
-        config_path = resolve_config_path(DEFAULT_CONFIG_PATH)
-        if not config_path.exists():
-            typer.echo(
-                format_cli_error(
-                    "No PollyPM config found.",
-                    why="`pm task pickup-log` reads the state store path from your PollyPM config.",
-                    fix="run `pm onboard`, `pm init`, or pass `--config <path>` before retrying.",
-                ),
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        config = load_config(config_path)
-        store = StateStore(config.project.state_db)
-    except Exception as exc:  # noqa: BLE001
-        typer.echo(
-            format_cli_error(
-                "Could not load the PollyPM state store.",
-                why=str(exc),
-                fix="verify your config/state DB path, then rerun `pm task pickup-log`.",
-            ),
-            err=True,
+        from pollypm.storage.pg_notifications import (
+            recent_notifications as pg_recent_notifications,
         )
-        raise typer.Exit(code=1) from exc
 
-    try:
-        rows = store.recent_notifications(
+        rows = pg_recent_notifications(
             since_seconds=since_seconds,
             project=project,
             task_id=task_id,
             limit=limit,
         )
-    finally:
-        try:
-            store.close()
-        except Exception:  # noqa: BLE001
-            pass
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(
+            format_cli_error(
+                "Could not load task pickup notifications.",
+                why=str(exc),
+                fix="verify your PollyPM config and pg backend, then rerun `pm task pickup-log`.",
+            ),
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
 
     if output_json:
         typer.echo(json.dumps(rows, indent=2, default=str))

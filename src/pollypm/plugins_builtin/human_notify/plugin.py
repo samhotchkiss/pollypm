@@ -121,11 +121,7 @@ def _read_webhook_from_toml(config: Any) -> dict:
 
 
 def _resolve_store(api: PluginAPI) -> Any | None:
-    """Get a ``StateStore``-like handle for the cockpit fallback.
-
-    Tries the unified Store first (per #349), falls back to the
-    legacy ``StateStore`` on the config's state_db path.
-    """
+    """Return the unified Store handle for the cockpit fallback (#349)."""
     try:
         from pollypm.store.registry import get_store
 
@@ -134,22 +130,10 @@ def _resolve_store(api: PluginAPI) -> Any | None:
             return get_store(config)
     except Exception:  # noqa: BLE001
         logger.warning(
-            "human_notify: unified Store lookup failed; falling back to "
-            "legacy StateStore",
+            "human_notify: unified Store lookup failed",
             exc_info=True,
         )
-    try:
-        from pollypm.storage.state import StateStore
-        config = getattr(api, "config", None)
-        if config is None:
-            return None
-        return StateStore(config.project.state_db)
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "human_notify: legacy StateStore fallback failed",
-            exc_info=True,
-        )
-        return None
+    return None
 
 
 def _load_entrypoint_adapters() -> list[Any]:

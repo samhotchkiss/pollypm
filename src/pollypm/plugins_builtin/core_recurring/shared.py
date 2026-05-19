@@ -32,26 +32,12 @@ def _load_config(payload: dict[str, Any]):
 
 @contextmanager
 def _load_config_and_store(payload: dict[str, Any]):
-    """Yield ``(config, store)`` and close the store deterministically.
-
-    On the pg backend ``store`` is ``None`` — recurring handlers that
-    write alerts already route through the unified :class:`Store` via
-    :func:`_open_msg_store`, which is backend-aware. This helper just
-    needs to expose the config for those code paths.
+    """Yield ``(config, None)``: recurring handlers route through
+    :func:`_open_msg_store` (unified ``Store``) and the pg facades.
+    ``store`` is retained in the tuple for caller compatibility.
     """
     config = _load_config(payload)
-    from pollypm.storage._backend_dispatch import is_pg_backend
-
-    if is_pg_backend(config):
-        yield config, None
-        return
-    from pollypm.storage.state import StateStore
-
-    store = StateStore(config.project.state_db)
-    try:
-        yield config, store
-    finally:
-        store.close()
+    yield config, None
 
 
 def _open_msg_store(config: Any) -> Any:

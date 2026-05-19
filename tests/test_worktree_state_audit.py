@@ -283,8 +283,8 @@ class _FakeStore:
 
 
 class _FakeWork:
-    """Minimal SQLiteWorkService stand-in — only the two methods the
-    handler uses (``list_worker_sessions`` + ``create`` + ``list_tasks``)."""
+    """Minimal work-service stand-in — only the methods the handler
+    uses (``list_worker_sessions`` + ``create`` + ``list_tasks``)."""
 
     def __init__(self, sessions: list[_FakeSession]) -> None:
         self._sessions = list(sessions)
@@ -311,7 +311,7 @@ def _invoke_handler_with_fakes(
     sessions: list[_FakeSession],
     project_root: Path,
 ) -> tuple[dict[str, Any], _FakeStore, _FakeWork]:
-    """Run the handler with the SQLiteWorkService + _load_config_and_store
+    """Run the handler with the work-service factory + ``_load_config_and_store``
     swapped for fakes. Returns (result, store, work) so assertions can
     inspect side effects."""
     from pollypm.plugins_builtin.core_recurring import plugin as plugin_module
@@ -343,11 +343,16 @@ def _invoke_handler_with_fakes(
     monkeypatch.setattr(
         sweeps_module, "_close_msg_store", lambda _store: None,
     )
-    # Patch SQLiteWorkService to return our fake regardless of args.
-    import pollypm.work.sqlite_service as sqlite_service_mod
+    # Patch the work-service factory to return our fake, regardless of
+    # the active backend. Slice K (#1737) flipped the production path
+    # from a direct ``SQLiteWorkService(...)`` construction to
+    # ``create_work_service(...)`` (which dispatches to ``PgWorkService``
+    # on the pg backend), so patching the sqlite class is a no-op under
+    # pg — patch the factory instead.
+    import pollypm.work as work_mod
 
     monkeypatch.setattr(
-        sqlite_service_mod, "SQLiteWorkService",
+        work_mod, "create_work_service",
         lambda *a, **kw: fake_work,
     )
 
@@ -511,10 +516,10 @@ class TestHandler:
         monkeypatch.setattr(
             sweeps_module, "_close_msg_store", lambda _store: None,
         )
-        import pollypm.work.sqlite_service as sqlite_service_mod
+        import pollypm.work as work_mod
 
         monkeypatch.setattr(
-            sqlite_service_mod, "SQLiteWorkService",
+            work_mod, "create_work_service",
             lambda *a, **kw: fake_work,
         )
 

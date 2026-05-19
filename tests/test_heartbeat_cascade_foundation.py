@@ -836,6 +836,48 @@ def test_tier1_healer_role_session_missing_skips_worker_role() -> None:
     assert counters["worker_lane_failed"] == 0
 
 
+def test_tier1_healer_role_session_missing_reviewer_role_routes_per_task(
+    tmp_path: Path,
+) -> None:
+    """#1737 — when the finding role is ``reviewer``, the healer routes
+    through :meth:`SessionManager.provision_reviewer` (task-scoped)
+    rather than the legacy per-project worker-session create path.
+
+    Without a real config_path on disk the helper short-circuits with
+    ``worker_lane_failed`` — we assert that path so we know the
+    reviewer branch is taken (not silently falling through to the
+    legacy create_worker_session call which would spawn the retired
+    per-project lane).
+    """
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _self_heal_role_session_missing,
+    )
+
+    finding = Finding(
+        rule=RULE_ROLE_SESSION_MISSING,
+        tier=TIER_1,
+        project="samblog",
+        subject="samblog/26",
+        metadata={
+            "role": "reviewer",
+            "expected_window": "reviewer-samblog-26",
+            "task_id": "samblog/26",
+            "status": "review",
+        },
+    )
+    counters = _self_heal_role_session_missing(
+        finding,
+        project_key="samblog",
+        project_path=None,
+        config_path=tmp_path / "does-not-exist.toml",
+    )
+    # No real config to load -> reviewer branch increments failed
+    # (not spawned). Critically: it does NOT raise, and it does NOT
+    # call the legacy worker-session create path.
+    assert counters["worker_lane_spawned"] == 0
+    assert counters["worker_lane_failed"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Tier-3 operator dispatch — throttle, audit emit, no-op for ineligible rules
 # ---------------------------------------------------------------------------

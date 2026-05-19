@@ -694,6 +694,10 @@ class WorkTransitionManager:
                         task_id,
                         exc,
                     )
+            # #1737 — kill any per-task reviewer window on cancel.
+            # Idempotent: no-op if the window does not exist (e.g. the
+            # task was cancelled before reaching review).
+            self._teardown_per_task_reviewer(task_id)
             # #927: clear the no_session_for_assignment alerts the
             # heartbeat sweep raised while this task was active. The
             # per-task alert is unambiguous (alert key is the task id);
@@ -1139,15 +1143,28 @@ class WorkTransitionManager:
                             task_id,
                             exc,
                         )
+                # #1737 — kill the per-task reviewer window on terminal
+                # done. Safe to call whether or not the task ever
+                # visited a review node (idempotent: no-op if the
+                # window does not exist).
+                self._teardown_per_task_reviewer(task_id)
                 self.service._on_task_done(task_id, actor)
             elif result.work_status == WorkStatus.REVIEW:
-                # #1413 — when a worker finishes a node and the task
-                # advances to a review node, make sure the project has
-                # a reviewer session ready to consume the queue. The
-                # bootstrap sweep handles fresh-boot tracked projects;
-                # this hook catches projects registered AFTER bootstrap
-                # (or whose reviewer session was manually torn down)
-                # without waiting for the heartbeat's 60s threshold.
+                # #1737 — spawn the per-task reviewer window so a
+                # dedicated Russell session reviews THIS task (and
+                # remembers what it flagged across reject -> rework
+                # -> resubmit cycles). Idempotent: if the window
+                # already exists we re-use it. Replaces the older
+                # per-project reviewer-lane bootstrap (#1413) which
+                # spawned a single ``reviewer-<project>`` window that
+                # tried to multiplex every task.
+                self._provision_per_task_reviewer(result)
+                # #1413 — keep the per-project bootstrap call as a
+                # belt-and-suspenders hook for installs that still
+                # have ``reviewer_<project>`` entries in their toml
+                # (Sam's deployed config is migrating session-by-
+                # session). The function is idempotent: when no
+                # static reviewer session is configured it no-ops.
                 self._ensure_reviewer_for_review_handoff(result)
 
         return self._finish(
@@ -1155,6 +1172,63 @@ class WorkTransitionManager:
             task.work_status.value,
             after_reload=_before_sync,
         )
+
+    def _provision_per_task_reviewer(self, task: Task) -> None:
+        """Spawn the per-task reviewer window on a review handoff.
+
+        Architectural alignment per #1737: reviewers move from
+        per-project persistent (``reviewer-<project>``) to per-task
+        ephemeral (``reviewer-<project>-<task_number>``). Each task in
+        review gets its own dedicated Russell window that persists
+        across reject -> rework -> resubmit cycles for that task and is
+        torn down on accept or terminal cancel.
+
+        Best-effort: any failure logs and swallows so the transition
+        completes. The watchdog's ``role_session_missing`` detector
+        will retry within ~5 minutes if the spawn failed.
+        """
+        if self.service._session_mgr is None:
+            return
+        provision_fn = getattr(
+            self.service._session_mgr, "provision_reviewer", None,
+        )
+        if not callable(provision_fn):
+            return
+        try:
+            window_name = provision_fn(task.task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "provision_per_task_reviewer failed for %s: %s",
+                task.task_id, exc,
+            )
+            return
+        if window_name:
+            logger.info(
+                "provisioned per-task reviewer %s for %s",
+                window_name, task.task_id,
+            )
+
+    def _teardown_per_task_reviewer(self, task_id: str) -> None:
+        """Kill the per-task reviewer window on terminal done / cancel.
+
+        Best-effort: any error logs and swallows so the transition
+        completes. Idempotent — safe to call whether or not the task
+        ever visited a review node (#1737 architectural alignment).
+        """
+        if self.service._session_mgr is None:
+            return
+        teardown_fn = getattr(
+            self.service._session_mgr, "teardown_reviewer", None,
+        )
+        if not callable(teardown_fn):
+            return
+        try:
+            teardown_fn(task_id)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "teardown_per_task_reviewer failed for %s: %s",
+                task_id, exc,
+            )
 
     def _ensure_reviewer_for_review_handoff(self, task: Task) -> None:
         """Fire-and-forget provision of a reviewer session for ``task.project``.
@@ -1345,6 +1419,12 @@ class WorkTransitionManager:
                             task_id,
                             exc,
                         )
+                # #1737 — per-task reviewer windows are torn down on
+                # accept (the reviewer's job for this task is complete).
+                # The same window is preserved across reject -> rework
+                # -> resubmit cycles (the reviewer remembers what it
+                # flagged); only the terminal-done transition kills it.
+                self._teardown_per_task_reviewer(task_id)
                 self.service._on_task_done(task_id, actor)
             # #953: clear the per-task no_session_for_assignment alert
             # the heartbeat sweep raised while the task was sitting in

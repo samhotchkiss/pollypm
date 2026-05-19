@@ -1464,7 +1464,13 @@ def _detect_role_session_missing(
             and back_pressure.get(task_project)
         ):
             continue
-        expected_window = f"{role_used}-{task_project}"
+        # #1737 — reviewers are per-task ephemeral
+        # (``reviewer-<project>-<N>``) so the watchdog must check the
+        # task-scoped window, not the legacy per-project lane.
+        if role_used == "reviewer" and status_value == "review":
+            expected_window = f"reviewer-{task_project}-{int(task_number)}"
+        else:
+            expected_window = f"{role_used}-{task_project}"
         if expected_window in window_set:
             continue
         findings.append(Finding(
@@ -1487,6 +1493,7 @@ def _detect_role_session_missing(
                 "expected_window": expected_window,
                 "role": role_used,
                 "status": status_value,
+                "task_id": f"{task_project}/{int(task_number)}",
             },
         ))
     return findings

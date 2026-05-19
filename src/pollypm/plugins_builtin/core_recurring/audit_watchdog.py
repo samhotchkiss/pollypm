@@ -1459,7 +1459,8 @@ def _self_heal_role_session_missing(
     about how many lanes were actually created.
     """
     counters = {"worker_lane_spawned": 0, "worker_lane_failed": 0}
-    role = (finding.metadata or {}).get("role") or ""
+    meta = finding.metadata or {}
+    role = meta.get("role") or ""
     if not role:
         counters["worker_lane_failed"] += 1
         return counters
@@ -1469,6 +1470,66 @@ def _self_heal_role_session_missing(
         # leak memory (see ``pm worker-start --role worker`` for the
         # rationale). Treat as a no-op so the cadence handler isn't
         # blamed for a lane it can't structurally repair.
+        return counters
+    if role == "reviewer":
+        # #1737 — reviewers are per-task ephemeral. Re-use the
+        # ``SessionManager.provision_reviewer`` path the transition
+        # manager hits on review-handoff so the spawn semantics
+        # (idempotency, persona injection, account routing) stay
+        # consistent.
+        task_id = meta.get("task_id") or ""
+        if not task_id:
+            # Reconstruct from the finding subject (``<project>/<N>``).
+            task_id = finding.subject or ""
+        if not task_id or "/" not in task_id:
+            counters["worker_lane_failed"] += 1
+            return counters
+        try:
+            from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+            from pollypm.work import create_work_service
+            from pollypm.work.session_manager import SessionManager
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "audit.watchdog: reviewer per-task spawn imports failed "
+                "for %s", task_id, exc_info=True,
+            )
+            counters["worker_lane_failed"] += 1
+            return counters
+        cfg_path = config_path
+        if cfg_path is None and DEFAULT_CONFIG_PATH.exists():
+            cfg_path = DEFAULT_CONFIG_PATH
+        if cfg_path is None:
+            counters["worker_lane_failed"] += 1
+            return counters
+        try:
+            cfg = load_config(cfg_path)
+        except Exception:  # noqa: BLE001
+            counters["worker_lane_failed"] += 1
+            return counters
+        try:
+            with create_work_service(
+                project_path=project_path,
+                project_key=project_key,
+            ) as svc:
+                from pollypm.tmux.client import TmuxClient
+
+                tmux = TmuxClient()
+                mgr = SessionManager(
+                    tmux, svc, project_path or cfg.project.root_dir,
+                    config=cfg,
+                )
+                window = mgr.provision_reviewer(task_id)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "audit.watchdog: reviewer per-task spawn failed for %s",
+                task_id, exc_info=True,
+            )
+            counters["worker_lane_failed"] += 1
+            return counters
+        if window is None:
+            counters["worker_lane_failed"] += 1
+        else:
+            counters["worker_lane_spawned"] += 1
         return counters
     try:
         from pollypm import cli as cli_mod

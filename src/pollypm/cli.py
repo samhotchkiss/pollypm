@@ -200,6 +200,9 @@ from pollypm.plugins_builtin.project_planning.cli import project_app
 app.add_typer(project_app, name="project")
 
 from pollypm.memory_cli import memory_app
+# Imported for the @memory_app.command side effect — registers
+# ``pm memory pg-recall`` and ``pm memory backfill-embeddings`` (#1737 Slice D).
+from pollypm import memory_recall_cli as _memory_recall_cli  # noqa: F401
 app.add_typer(memory_app, name="memory")
 
 from pollypm.plugins_builtin.advisor.cli.advisor_cli import advisor_app

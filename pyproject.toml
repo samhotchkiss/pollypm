@@ -25,14 +25,17 @@ dev = [
   # dev installs always pull both so `pytest tests/test_pg_*` runs.
   "psycopg[binary]>=3.2.0",
   "psycopg-pool>=3.2.0",
+  "pgvector>=0.3.0",
   "testcontainers[postgres]>=4.8.0",
 ]
 # Runtime extra for the postgres backend. Operators flipping
 # ``[storage] backend = "postgres"`` in pollypm.toml must
-# ``uv pip install 'pollypm[postgres]'`` (#1737).
+# ``uv pip install 'pollypm[postgres]'`` (#1737). pgvector ships
+# the psycopg type adapter for the recall path (Slice D).
 postgres = [
   "psycopg[binary]>=3.2.0",
   "psycopg-pool>=3.2.0",
+  "pgvector>=0.3.0",
 ]
 
 [project.scripts]

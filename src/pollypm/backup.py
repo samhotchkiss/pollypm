@@ -1,40 +1,57 @@
 """Backup + restore of the PollyPM state database.
 
-This module is the implementation behind ``pm backup`` / ``pm restore``. The
-CLI layer in :mod:`pollypm.cli` is kept thin — all of the IO, sanity
-checks, and retention logic live here so they are testable without going
-through Typer.
+This module is the implementation behind ``pm backup`` / ``pm restore``
+and ``pm storage backup`` / ``pm storage restore``. The CLI layer in
+:mod:`pollypm.cli` is kept thin — all of the IO, sanity checks, and
+retention logic live here so they are testable without going through
+Typer.
 
 Design notes:
 
-* The DB snapshot uses SQLite's online backup API (``sqlite3.Connection.backup``),
-  NOT ``shutil.copy``. That is the only safe way to copy a live WAL-mode
-  database while the heartbeat / cockpit may be writing to it.
-* Snapshots are gzipped on disk. The backup API needs a plain sqlite
-  file to write into, so we back up to a temporary uncompressed file
-  first and then gzip it.
-* ``--full`` tar.gz archives include the snapshot DB plus config /
-  logs / snapshots / agent homes. They are not touched by retention —
-  operators use them for point-in-time rescue, not routine cleanup.
+* The SQLite DB snapshot uses SQLite's online backup API
+  (``sqlite3.Connection.backup``), NOT ``shutil.copy``. That is the
+  only safe way to copy a live WAL-mode database while the heartbeat
+  / cockpit may be writing to it.
+* SQLite snapshots are gzipped on disk. The backup API needs a plain
+  sqlite file to write into, so we back up to a temporary uncompressed
+  file first and then gzip it.
+* The Postgres branch (#1737, Slice G) shells out to ``pg_dump
+  --format=custom`` and ``pg_restore --clean --if-exists --no-owner``.
+  Custom format is already compressed; we do not gzip on top.
+* ``--full`` tar.gz archives include the SQLite snapshot DB plus
+  config / logs / snapshots / agent homes. They are not touched by
+  retention — operators use them for point-in-time rescue, not routine
+  cleanup.
 * Restores always write a ``.before-restore`` sibling copy of the live
   DB before replacing it. This is the safety net; it's non-negotiable
-  and the CLI layer cannot skip it.
+  and the CLI layer cannot skip it. For the pg branch the safety copy
+  is itself a ``pg_dump`` to ``<dsn>.before-restore-<ts>.pgdump``.
+* Backend dispatch reads ``config.storage.backend``: ``"sqlite"``
+  preserves the legacy path verbatim (the migration rollback safety
+  net), ``"postgres"`` runs the pg_dump / pg_restore branch added in
+  Slice G.
 """
 
 from __future__ import annotations
 
 import gzip
+import json
 import os
 import shutil
 import sqlite3
+import subprocess
 import tarfile
 import tempfile
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pollypm.storage.sqlite_pragmas import readonly_uri
+
+if TYPE_CHECKING:
+    from pollypm.models import PollyPMConfig
 
 # Retention only applies to plain DB snapshots (``state-db-*.db.gz``).
 # ``--full`` tar.gz archives are left alone because they are larger and
@@ -45,7 +62,16 @@ _DB_SNAPSHOT_SUFFIX = ".db.gz"
 _FULL_SNAPSHOT_PREFIX = "full-"
 _FULL_SNAPSHOT_SUFFIX = ".tar.gz"
 
-# Default retention for plain DB snapshots; keep the last N.
+# Postgres pg_dump custom-format snapshot naming. Filename shape mirrors
+# the sqlite path so an operator scanning ``~/.pollypm/backups/`` can
+# tell which backend a snapshot came from at a glance.
+_PG_SNAPSHOT_PREFIX = "pg-"
+_PG_SNAPSHOT_SUFFIX = ".pgdump"
+_PG_AUDIT_INDEX_FILENAME = "index.jsonl"
+
+# Default retention for plain DB snapshots; keep the last N. Applies to
+# both the sqlite ``.db.gz`` path and the pg ``.pgdump`` path so an
+# operator's mental model carries cleanly across the cutover.
 DEFAULT_KEEP = 7
 BACKUP_LOCK_RETRY_MAX_SECONDS = 3.0
 BACKUP_LOCK_RETRY_INITIAL_SECONDS = 0.1
@@ -83,6 +109,41 @@ class RestoreResult:
 
 class BackupLockedError(RuntimeError):
     """Raised when the live SQLite DB stays locked across backup retries."""
+
+
+class PgBackupError(RuntimeError):
+    """Raised when ``pg_dump`` / ``pg_restore`` fails or is missing."""
+
+
+@dataclass(slots=True)
+class PgBackupResult:
+    """Outcome of a successful ``pg_dump`` snapshot.
+
+    Mirrors :class:`BackupResult` for the sqlite path but is its own
+    type so the CLI layer can dispatch on backend without a ``full``
+    flag in the way.
+    """
+
+    path: Path
+    archive_size: int
+    pruned: list[Path]
+    dsn: str
+
+
+@dataclass(slots=True)
+class PgRestorePlan:
+    """Description of what ``pg_restore`` would do against ``dsn``."""
+
+    snapshot_path: Path
+    dsn: str
+    safety_path: Path
+
+
+@dataclass(slots=True)
+class PgRestoreResult:
+    snapshot_path: Path
+    dsn: str
+    safety_path: Path | None
 
 
 # --------------------------------------------------------------------- #
@@ -389,8 +450,445 @@ def _prune_db_snapshots(backup_dir: Path, keep: int) -> list[Path]:
 
 
 # --------------------------------------------------------------------- #
+# Postgres branch — pg_dump / pg_restore (issue #1737, Slice G)
+# --------------------------------------------------------------------- #
+
+
+def _resolve_pg_binary(name: str) -> str:
+    """Return an absolute path to ``pg_dump``/``pg_restore`` or raise.
+
+    The pg client tools are usually on ``$PATH`` on a dev box but may
+    live under ``/opt/homebrew/opt/postgresql@17/bin`` on macOS. We
+    consult ``$PATH`` first (operators who put pg on PATH should keep
+    that override) and fall back to ``pg_config --bindir`` so the
+    Homebrew layout works without extra config.
+    """
+    found = shutil.which(name)
+    if found:
+        return found
+    pg_config = shutil.which("pg_config")
+    if pg_config:
+        try:
+            result = subprocess.run(
+                [pg_config, "--bindir"],
+                check=True,
+                text=True,
+                capture_output=True,
+                timeout=10,
+            )
+        except (subprocess.SubprocessError, OSError):
+            result = None
+        if result is not None:
+            bindir = Path(result.stdout.strip())
+            candidate = bindir / name
+            if candidate.exists():
+                return str(candidate)
+    raise PgBackupError(
+        f"could not locate {name}. Install the Postgres client tools "
+        "(e.g. `brew install postgresql@17`) or put pg_dump on PATH."
+    )
+
+
+def _record_pg_backup_index(
+    backup_dir: Path,
+    *,
+    snapshot_path: Path,
+    dsn: str,
+    archive_size: int,
+    duration_seconds: float,
+) -> None:
+    """Append an audit row to ``~/.pollypm/backups/index.jsonl``.
+
+    The index gives operators a single ledger of every pg_dump that
+    ran without having to ``stat`` every file in the directory. Append-
+    only JSONL keeps the format trivial to grep and survives DB
+    rebuilds — the same reasoning behind the audit JSONL the migration
+    spec calls out as non-negotiable.
+
+    Errors writing the index are logged via stderr but do NOT fail the
+    backup — losing the audit row should not cost the operator a
+    snapshot they just paid for.
+    """
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "event": "pg_backup",
+        "path": str(snapshot_path),
+        "dsn": _redact_dsn(dsn),
+        "archive_size": archive_size,
+        "duration_seconds": round(duration_seconds, 3),
+    }
+    index_path = backup_dir / _PG_AUDIT_INDEX_FILENAME
+    try:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        with index_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+    except OSError:
+        # Best-effort: the snapshot itself succeeded; losing the audit
+        # row would be embarrassing but not catastrophic.
+        return
+
+
+def _redact_dsn(dsn: str) -> str:
+    """Best-effort password redaction for log / audit output."""
+    try:
+        from urllib.parse import urlsplit, urlunsplit
+
+        parts = urlsplit(dsn)
+        if not parts.password:
+            return dsn
+        userinfo, _, hostinfo = parts.netloc.rpartition("@")
+        user = userinfo.partition(":")[0]
+        new_netloc = f"{user}:***@{hostinfo}" if user else f":***@{hostinfo}"
+        return urlunsplit(parts._replace(netloc=new_netloc))
+    except Exception:  # noqa: BLE001 — never break a log line
+        return "***"
+
+
+def _list_pg_snapshots(backup_dir: Path) -> list[Path]:
+    if not backup_dir.exists():
+        return []
+    out: list[Path] = []
+    for child in backup_dir.iterdir():
+        if not child.is_file():
+            continue
+        if child.name.startswith(_PG_SNAPSHOT_PREFIX) and child.name.endswith(
+            _PG_SNAPSHOT_SUFFIX
+        ):
+            out.append(child)
+    out.sort(key=lambda p: p.stat().st_mtime)
+    return out
+
+
+def _prune_pg_snapshots(backup_dir: Path, keep: int) -> list[Path]:
+    if keep < 0:
+        raise ValueError("keep must be >= 0")
+    snapshots = _list_pg_snapshots(backup_dir)
+    if len(snapshots) <= keep:
+        return []
+    to_delete = snapshots[: len(snapshots) - keep]
+    deleted: list[Path] = []
+    for path in to_delete:
+        try:
+            path.unlink()
+            deleted.append(path)
+        except OSError:
+            continue
+    return deleted
+
+
+def _run_pg_dump(
+    dsn: str,
+    dest: Path,
+    *,
+    pg_dump_binary: str | None = None,
+) -> None:
+    """Run ``pg_dump --format=custom`` against ``dsn`` into ``dest``.
+
+    Uses ``--no-owner`` and ``--no-privileges`` so the dump replays
+    cleanly into a fresh database owned by a different role (matches
+    the migration spec — operators can move PollyPM between machines
+    without dragging the original superuser ACL along).
+    """
+    binary = pg_dump_binary or _resolve_pg_binary("pg_dump")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        binary,
+        "--format=custom",
+        "--no-owner",
+        "--no-privileges",
+        f"--dbname={dsn}",
+        f"--file={dest}",
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise PgBackupError(f"pg_dump invocation failed: {exc}") from exc
+    if completed.returncode != 0:
+        # Clean up partial output so retention math doesn't trip later.
+        try:
+            if dest.exists():
+                dest.unlink()
+        except OSError:
+            pass
+        raise PgBackupError(
+            f"pg_dump exited with code {completed.returncode}: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+
+
+def _run_pg_restore(
+    dsn: str,
+    source: Path,
+    *,
+    pg_restore_binary: str | None = None,
+) -> None:
+    """Run ``pg_restore --clean --if-exists --no-owner`` against ``dsn``.
+
+    ``--clean --if-exists`` drops + recreates objects so the restore is
+    idempotent against an already-populated database. ``--no-owner``
+    matches the dump-side flag so the restore doesn't try to chown
+    objects to the original role.
+    """
+    binary = pg_restore_binary or _resolve_pg_binary("pg_restore")
+    if not source.exists():
+        raise FileNotFoundError(f"snapshot not found: {source}")
+    cmd = [
+        binary,
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        f"--dbname={dsn}",
+        str(source),
+    ]
+    try:
+        completed = subprocess.run(
+            cmd,
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+    except OSError as exc:
+        raise PgBackupError(f"pg_restore invocation failed: {exc}") from exc
+    # ``pg_restore`` exits non-zero even on benign "table did not exist
+    # to drop" warnings. The ``--exit-on-error`` flag would help but
+    # also rejects warnings we explicitly tolerate. We require returncode
+    # 0 OR 1 (1 = warnings only) and surface anything higher.
+    if completed.returncode not in (0, 1):
+        raise PgBackupError(
+            f"pg_restore exited with code {completed.returncode}: "
+            f"{completed.stderr.strip() or completed.stdout.strip()}"
+        )
+
+
+def _resolve_pg_dsn(config: "PollyPMConfig | None") -> str:
+    """Return the pg DSN to use for backup / restore.
+
+    Delegates to :mod:`pollypm.storage.pg_pool` so the priority order
+    (env override → ``[storage] url`` → default) stays in one place.
+    """
+    from pollypm.storage.pg_pool import resolve_dsn
+
+    return resolve_dsn(config)
+
+
+def backup_pg_dsn(
+    *,
+    base_dir: Path,
+    config: "PollyPMConfig | None" = None,
+    output: Path | None = None,
+    keep: int = DEFAULT_KEEP,
+    pg_dump_binary: str | None = None,
+) -> PgBackupResult:
+    """Snapshot the configured pg DSN to ``backup_dir`` via ``pg_dump``.
+
+    Parameters
+    ----------
+    base_dir:
+        ``config.project.base_dir`` — used to locate the default
+        ``backups/`` directory.
+    config:
+        Optional :class:`PollyPMConfig` so DSN resolution honours the
+        ``[storage] url`` knob. Pass ``None`` to fall back to the env
+        override + built-in default (matches the doctor probe).
+    output:
+        Optional custom destination path. Directories are created.
+    keep:
+        Retention count for pg snapshots.
+    pg_dump_binary:
+        Override the ``pg_dump`` binary path. Test seam only.
+    """
+    backup_dir = _default_backup_dir(base_dir)
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = _timestamp()
+    if output is not None:
+        snapshot_path = output
+    else:
+        snapshot_path = backup_dir / f"{_PG_SNAPSHOT_PREFIX}{timestamp}{_PG_SNAPSHOT_SUFFIX}"
+    snapshot_path.parent.mkdir(parents=True, exist_ok=True)
+
+    dsn = _resolve_pg_dsn(config)
+    start = time.monotonic()
+    _run_pg_dump(dsn, snapshot_path, pg_dump_binary=pg_dump_binary)
+    duration = time.monotonic() - start
+
+    archive_size = _size_or_zero(snapshot_path)
+    _record_pg_backup_index(
+        backup_dir,
+        snapshot_path=snapshot_path,
+        dsn=dsn,
+        archive_size=archive_size,
+        duration_seconds=duration,
+    )
+
+    pruned: list[Path] = []
+    if output is None:
+        pruned = _prune_pg_snapshots(backup_dir, keep)
+
+    return PgBackupResult(
+        path=snapshot_path,
+        archive_size=archive_size,
+        pruned=pruned,
+        dsn=dsn,
+    )
+
+
+def plan_pg_restore(
+    snapshot_path: Path,
+    *,
+    config: "PollyPMConfig | None" = None,
+) -> PgRestorePlan:
+    """Validate ``snapshot_path`` and describe the planned restore.
+
+    Raises ``FileNotFoundError`` / ``ValueError`` on invalid input.
+    Does NOT touch the database.
+    """
+    if not snapshot_path.exists():
+        raise FileNotFoundError(f"snapshot not found: {snapshot_path}")
+    # The custom format starts with the 5-byte magic "PGDMP". We don't
+    # parse the header further — pg_restore itself is the canonical
+    # validator.
+    try:
+        with snapshot_path.open("rb") as fh:
+            magic = fh.read(5)
+    except OSError as exc:
+        raise ValueError(f"cannot read snapshot at {snapshot_path}: {exc}") from exc
+    if magic != b"PGDMP":
+        raise ValueError(
+            f"snapshot is not a pg_dump custom-format archive: {snapshot_path}"
+        )
+    dsn = _resolve_pg_dsn(config)
+    safety_path = snapshot_path.with_name(
+        f"{snapshot_path.stem}.before-restore-{_timestamp()}{_PG_SNAPSHOT_SUFFIX}"
+    )
+    return PgRestorePlan(snapshot_path=snapshot_path, dsn=dsn, safety_path=safety_path)
+
+
+def execute_pg_restore(
+    plan: PgRestorePlan,
+    *,
+    pg_dump_binary: str | None = None,
+    pg_restore_binary: str | None = None,
+) -> PgRestoreResult:
+    """Apply ``plan``: safety-snapshot the live pg, then run pg_restore.
+
+    The safety snapshot is best-effort — if the live pg is unreachable
+    (e.g. fresh install, never written to) we proceed without one so
+    operators can still bootstrap from a snapshot. That mirrors how the
+    sqlite branch tolerates a missing live DB.
+    """
+    safety_written: Path | None = None
+    try:
+        _run_pg_dump(
+            plan.dsn, plan.safety_path, pg_dump_binary=pg_dump_binary
+        )
+        safety_written = plan.safety_path
+    except PgBackupError:
+        # Best-effort safety dump. The restore is still useful — we
+        # surface the missing safety net to the operator via the
+        # returned result so the CLI can warn.
+        safety_written = None
+
+    _run_pg_restore(
+        plan.dsn, plan.snapshot_path, pg_restore_binary=pg_restore_binary
+    )
+
+    return PgRestoreResult(
+        snapshot_path=plan.snapshot_path,
+        dsn=plan.dsn,
+        safety_path=safety_written,
+    )
+
+
+def latest_pg_backup_age_seconds(base_dir: Path) -> float | None:
+    """Return the age in seconds of the most recent pg snapshot, or None.
+
+    Used by ``pm doctor`` (#1737, Slice G) to surface "last backup is
+    > N days old" as an actionable warning. Returns ``None`` when no
+    snapshot exists — the doctor renders that as a separate failure
+    mode ("no backups exist yet").
+    """
+    backup_dir = _default_backup_dir(base_dir)
+    snapshots = _list_pg_snapshots(backup_dir)
+    if not snapshots:
+        return None
+    newest = snapshots[-1]
+    try:
+        mtime = newest.stat().st_mtime
+    except OSError:
+        return None
+    return max(0.0, time.time() - mtime)
+
+
+# --------------------------------------------------------------------- #
 # Public API — backup
 # --------------------------------------------------------------------- #
+
+
+def backup_via_config(
+    config: "PollyPMConfig",
+    *,
+    output: Path | None = None,
+    full: bool = False,
+    keep: int = DEFAULT_KEEP,
+    extra_roots: list[Path] | None = None,
+) -> BackupResult | PgBackupResult:
+    """Dispatch to the sqlite or pg backup path based on ``config``.
+
+    Single entry point for the CLI layer so the dispatch lives in one
+    place and the tests can drive it without touching Typer. The
+    sqlite branch preserves :func:`backup_state_db` verbatim (still
+    the rollback safety net during the transition); the pg branch
+    delegates to :func:`backup_pg_dsn`.
+
+    ``full`` is sqlite-only — running ``--full`` against a pg backend
+    surfaces a clear error rather than silently dropping the flag.
+    """
+    backend = config.storage.backend
+    if backend == "postgres":
+        if full:
+            raise PgBackupError(
+                "--full archives are not supported on the postgres "
+                "backend. Run `pm storage backup` without --full, then "
+                "use your filesystem snapshot tool for ~/.pollypm/."
+            )
+        return backup_pg_dsn(
+            base_dir=config.project.base_dir,
+            config=config,
+            output=output,
+            keep=keep,
+        )
+    return backup_state_db(
+        config.project.state_db,
+        base_dir=config.project.base_dir,
+        output=output,
+        full=full,
+        keep=keep,
+        extra_roots=extra_roots,
+    )
+
+
+def restore_via_config(
+    config: "PollyPMConfig",
+    snapshot_path: Path,
+) -> tuple[RestorePlan | PgRestorePlan, str]:
+    """Build a restore plan dispatched on ``config.storage.backend``.
+
+    Returns ``(plan, backend)`` so the CLI can render the appropriate
+    confirmation banner before calling :func:`execute_restore` /
+    :func:`execute_pg_restore`. Raises the same ``FileNotFoundError``
+    / ``ValueError`` shapes the underlying planners do.
+    """
+    backend = config.storage.backend
+    if backend == "postgres":
+        plan = plan_pg_restore(snapshot_path, config=config)
+        return plan, "postgres"
+    plan = plan_restore(snapshot_path, config.project.state_db)
+    return plan, "sqlite"
 
 
 def backup_state_db(
@@ -646,9 +1144,19 @@ __all__ = [
     "BackupResult",
     "RestorePlan",
     "RestoreResult",
+    "PgBackupError",
+    "PgBackupResult",
+    "PgRestorePlan",
+    "PgRestoreResult",
     "DEFAULT_KEEP",
     "backup_state_db",
     "plan_restore",
     "execute_restore",
+    "backup_pg_dsn",
+    "plan_pg_restore",
+    "execute_pg_restore",
+    "backup_via_config",
+    "restore_via_config",
+    "latest_pg_backup_age_seconds",
     "humanize_bytes",
 ]

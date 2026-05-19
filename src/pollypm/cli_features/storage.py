@@ -1,10 +1,19 @@
-"""``pm storage`` CLI — Postgres migration tooling (issue #1737, Slice E).
+"""``pm storage`` CLI — Postgres migration + bootstrap tooling.
 
-Slice E ships the operator-facing ``pm storage migrate-to-pg`` command
-that moves data from the existing sqlite workspace into the pg schema
-installed by Slice A. The implementation lives in
-:mod:`pollypm.storage.pg_migration_tool`; this module is the typer-level
-glue: flag parsing, confirmation prompt, structured failure messages.
+Two operator-facing entry points live here:
+
+* ``pm storage migrate-to-pg`` (issue #1737, Slice E) — copies an
+  existing sqlite workspace into the pg schema. The implementation
+  lives in :mod:`pollypm.storage.pg_migration_tool`.
+* ``pm bootstrap-pg`` (issue #1747) — guided one-shot install for
+  first-run operators on macOS Homebrew. Detects the platform, runs
+  ``brew install postgresql@17 pgvector``, starts the service,
+  ``createdb pollypm``, ``CREATE EXTENSION vector``, applies the
+  schema, and writes a ``[storage]`` block to ``~/.pollypm/pollypm.toml``.
+  Every destructive step is gated behind ``--yes`` (default is dry-run).
+
+Both commands share the typer-level glue: flag parsing, confirmation
+prompts, structured failure messages.
 
 Contract
 --------
@@ -27,6 +36,10 @@ Contract
 
 from __future__ import annotations
 
+import platform
+import shutil
+import subprocess
+from dataclasses import dataclass
 from pathlib import Path
 
 import typer
@@ -35,7 +48,447 @@ from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 
 
-__all__ = ["storage_app", "register_storage_commands"]
+__all__ = [
+    "bootstrap_pg",
+    "register_storage_commands",
+    "storage_app",
+]
+
+
+# --------------------------------------------------------------------- #
+# ``pm bootstrap-pg`` — guided one-shot Postgres install (#1747).
+# --------------------------------------------------------------------- #
+#
+# Design notes
+# ------------
+#
+# The command is a thin orchestrator over `brew`, `createdb`, `psql`,
+# and our own `apply_migrations` / config writer. It is **never silent
+# about mutation**: --dry-run is the default; the destructive path
+# requires --yes (and we still print every command before running it).
+#
+# Step list (each step is idempotent on its own and skip-when-satisfied):
+#
+#   1. Detect platform (macOS Homebrew is the only fully-supported
+#      target for now; Linux falls back to a copy-paste hint).
+#   2. `brew install postgresql@17 pgvector` (skip per-package if
+#      already installed).
+#   3. `brew services start postgresql@17` (skip if already running).
+#   4. `createdb pollypm` (skip if the db already exists).
+#   5. `CREATE EXTENSION IF NOT EXISTS vector` via psql — this also
+#      catches the pgvector-missing case before apply_migrations does.
+#   6. `apply_migrations` against the new pg, surfacing the friendly
+#      pgvector error from #1750 if the extension is somehow still
+#      not visible.
+#   7. Write a `[storage]` block to `~/.pollypm/pollypm.toml` so the
+#      runtime picks up the new DSN on next launch.
+
+
+_DEFAULT_PG_VERSION = "postgresql@17"
+_DEFAULT_DB_NAME = "pollypm"
+_DEFAULT_DSN = f"postgresql://localhost:5432/{_DEFAULT_DB_NAME}"
+
+
+@dataclass(slots=True)
+class _Step:
+    """One step of the bootstrap pipeline.
+
+    Each step records the human label, the command to run (``None`` =
+    pure-Python step), and whether it's a no-op on this system.
+    """
+
+    label: str
+    cmd: list[str] | None
+    skip_reason: str = ""
+
+    @property
+    def skipped(self) -> bool:
+        return bool(self.skip_reason)
+
+
+def _which(binary: str) -> str | None:
+    """Resolve ``binary`` on PATH; return None if not found."""
+    return shutil.which(binary)
+
+
+def _brew_pkg_installed(pkg: str) -> bool:
+    """Return True if ``brew list <pkg>`` succeeds (best-effort)."""
+    brew = _which("brew")
+    if brew is None:
+        return False
+    try:
+        result = subprocess.run(  # noqa: S603 — explicit args, no shell
+            [brew, "list", "--versions", pkg],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
+
+
+def _brew_service_running(svc: str) -> bool:
+    """Return True if ``brew services list`` reports ``svc`` running."""
+    brew = _which("brew")
+    if brew is None:
+        return False
+    try:
+        result = subprocess.run(  # noqa: S603
+            [brew, "services", "list"],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if result.returncode != 0:
+        return False
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] == svc and parts[1].lower() == "started":
+            return True
+    return False
+
+
+def _pg_db_exists(db_name: str) -> bool:
+    """Return True if ``psql`` reports ``db_name`` already created."""
+    psql = _which("psql")
+    if psql is None:
+        return False
+    try:
+        result = subprocess.run(  # noqa: S603
+            [
+                psql,
+                "-tAc",
+                f"SELECT 1 FROM pg_database WHERE datname='{db_name}'",
+                "postgres",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0 and result.stdout.strip() == "1"
+
+
+def _plan_steps(
+    *,
+    pg_version: str,
+    db_name: str,
+) -> list[_Step]:
+    """Compute the per-platform bootstrap plan, marking skipped steps.
+
+    macOS / Homebrew is the only fully-orchestrated target. On every
+    other platform we still print the plan, but every brew step is
+    marked skipped with a hint pointing at the platform docs.
+    """
+    is_mac = platform.system() == "Darwin"
+    brew_available = _which("brew") is not None
+
+    steps: list[_Step] = []
+
+    if not (is_mac and brew_available):
+        # Non-Homebrew systems get a single informational step that
+        # tells the operator exactly which manual install to run. We
+        # still try the createdb + extension + migrations + config
+        # write steps below — those work against any reachable pg.
+        steps.append(
+            _Step(
+                label=f"Install {pg_version} and pgvector",
+                cmd=None,
+                skip_reason=(
+                    "Non-Homebrew platform — install Postgres 16+ and "
+                    "pgvector via your system package manager, then "
+                    "re-run `pm bootstrap-pg` (subsequent steps will "
+                    "be picked up). See https://github.com/pgvector/"
+                    "pgvector#installation-notes."
+                ),
+            )
+        )
+    else:
+        pg_installed = _brew_pkg_installed(pg_version)
+        steps.append(
+            _Step(
+                label=f"brew install {pg_version}",
+                cmd=["brew", "install", pg_version],
+                skip_reason=(
+                    f"{pg_version} already installed (brew list)"
+                    if pg_installed
+                    else ""
+                ),
+            )
+        )
+        pgvector_installed = _brew_pkg_installed("pgvector")
+        steps.append(
+            _Step(
+                label="brew install pgvector",
+                cmd=["brew", "install", "pgvector"],
+                skip_reason=(
+                    "pgvector already installed (brew list)"
+                    if pgvector_installed
+                    else ""
+                ),
+            )
+        )
+        svc_running = _brew_service_running(pg_version)
+        steps.append(
+            _Step(
+                label=f"brew services start {pg_version}",
+                cmd=["brew", "services", "start", pg_version],
+                skip_reason=(
+                    f"{pg_version} service already running"
+                    if svc_running
+                    else ""
+                ),
+            )
+        )
+
+    db_exists = _pg_db_exists(db_name)
+    steps.append(
+        _Step(
+            label=f"createdb {db_name}",
+            cmd=["createdb", db_name],
+            skip_reason=(
+                f"database {db_name!r} already exists" if db_exists else ""
+            ),
+        )
+    )
+    steps.append(
+        _Step(
+            label="CREATE EXTENSION IF NOT EXISTS vector",
+            cmd=[
+                "psql",
+                db_name,
+                "-c",
+                "CREATE EXTENSION IF NOT EXISTS vector",
+            ],
+        )
+    )
+    steps.append(
+        _Step(
+            label="apply_migrations (pollypm schema)",
+            cmd=None,  # pure-Python — handled inline below
+        )
+    )
+    steps.append(
+        _Step(
+            label="Write [storage] block to ~/.pollypm/pollypm.toml",
+            cmd=None,
+        )
+    )
+    return steps
+
+
+def _print_plan(steps: list[_Step], *, dry_run: bool) -> None:
+    """Render the per-step plan with skip markers and command preview."""
+    typer.echo("")
+    typer.echo("Bootstrap plan:")
+    for idx, step in enumerate(steps, start=1):
+        if step.skipped:
+            typer.echo(f"  {idx}. [skip] {step.label} — {step.skip_reason}")
+            continue
+        if step.cmd is None:
+            typer.echo(f"  {idx}. {step.label}")
+        else:
+            typer.echo(f"  {idx}. {step.label}")
+            typer.echo(f"       $ {' '.join(step.cmd)}")
+    typer.echo("")
+    if dry_run:
+        typer.echo(
+            "Dry-run mode (default). Re-run with --yes to execute the "
+            "non-skip steps above."
+        )
+
+
+def _run_cmd(cmd: list[str]) -> None:
+    """Run ``cmd``, streaming stdout/stderr, raising on non-zero exit."""
+    typer.echo(f"  $ {' '.join(cmd)}")
+    try:
+        subprocess.run(cmd, check=True)  # noqa: S603 — explicit args
+    except FileNotFoundError as exc:
+        raise typer.Exit(code=2) from exc
+    except subprocess.CalledProcessError as exc:
+        raise typer.Exit(code=exc.returncode) from exc
+
+
+def _write_storage_block(config_path: Path, dsn: str) -> bool:
+    """Append a ``[storage]`` block to ``config_path`` if absent.
+
+    Returns True if the block was written, False if it was already
+    there. Idempotent: a second run is a no-op.
+    """
+    if not config_path.exists():
+        typer.echo(
+            f"  config {config_path} does not exist; create it with "
+            "`pm example-config` first.",
+            err=True,
+        )
+        return False
+    current = config_path.read_text(encoding="utf-8")
+    if "\n[storage]\n" in current or current.startswith("[storage]\n"):
+        return False
+    snippet = (
+        "\n[storage]\n"
+        f'url = "{dsn}"\n'
+        '# Postgres is the required backend (sqlite was removed in '
+        "the #1737 cutover).\n"
+    )
+    config_path.write_text(current.rstrip() + "\n" + snippet, encoding="utf-8")
+    return True
+
+
+_BOOTSTRAP_HELP = help_with_examples(
+    (
+        "Guided one-shot Postgres install for first-run operators.\n\n"
+        "DEFAULT IS DRY-RUN. Re-run with --yes to actually mutate "
+        "your system (brew install, services start, createdb, "
+        "CREATE EXTENSION, schema apply, config write). Every "
+        "destructive step is printed before it runs."
+    ),
+    [
+        ("pm bootstrap-pg", "preview the plan (dry-run, no system changes)"),
+        (
+            "pm bootstrap-pg --yes",
+            "execute the plan (brew + pgvector + createdb + schema + config)",
+        ),
+        (
+            "pm bootstrap-pg --db pollypm-dev --yes",
+            "bootstrap with a custom db name",
+        ),
+    ],
+    trailing=(
+        "macOS Homebrew is the fully-orchestrated path. On Linux / "
+        "other platforms the brew steps are skipped with a hint; "
+        "the database / extension / schema / config steps still run."
+    ),
+)
+
+
+def bootstrap_pg(
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help=(
+            "Confirm the destructive steps. Without --yes the command "
+            "runs in dry-run mode and prints the plan only."
+        ),
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help=(
+            "Force dry-run mode even when --yes is set. Dry-run is the "
+            "default; this flag is kept for clarity in scripts."
+        ),
+    ),
+    pg_version: str = typer.Option(
+        _DEFAULT_PG_VERSION,
+        "--pg-version",
+        help=(
+            "Homebrew formula for Postgres. Default: postgresql@17 "
+            "(the only version PollyPM is tested against)."
+        ),
+    ),
+    db_name: str = typer.Option(
+        _DEFAULT_DB_NAME,
+        "--db",
+        help="Database name to create. Default: pollypm.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH,
+        "--config",
+        help="PollyPM config path to receive the [storage] block.",
+    ),
+) -> None:
+    """``pm bootstrap-pg`` entry point (issue #1747)."""
+    do_apply = yes and not dry_run
+
+    typer.echo(f"PollyPM bootstrap-pg ({'apply' if do_apply else 'dry-run'})")
+    typer.echo(f"  platform: {platform.system()} {platform.release()}")
+    typer.echo(f"  pg formula: {pg_version}")
+    typer.echo(f"  db name: {db_name}")
+    typer.echo(f"  config: {config_path}")
+
+    steps = _plan_steps(pg_version=pg_version, db_name=db_name)
+    _print_plan(steps, dry_run=not do_apply)
+
+    if not do_apply:
+        # Dry-run exits cleanly so scripts can chain `pm bootstrap-pg
+        # && pm bootstrap-pg --yes` for a preview-then-commit pattern.
+        raise typer.Exit(code=0)
+
+    # Confirmation gate. We already require --yes, but echo a final
+    # warning so operators who alias `pm bootstrap-pg -y` still see it.
+    typer.echo(
+        "Executing plan. Each non-skip step prints its command before "
+        "it runs; ctrl-c aborts cleanly between steps."
+    )
+    typer.echo("")
+
+    for idx, step in enumerate(steps, start=1):
+        typer.echo(f"[{idx}/{len(steps)}] {step.label}")
+        if step.skipped:
+            typer.echo(f"  skip — {step.skip_reason}")
+            continue
+
+        if step.cmd is not None:
+            _run_cmd(step.cmd)
+            continue
+
+        # Pure-Python steps. Labels are stable keys for now.
+        if step.label.startswith("apply_migrations"):
+            from pollypm.storage import pg_migrations, pg_pool
+
+            # The bootstrap command does not load a config (it's a
+            # first-run tool that may run before pollypm.toml exists),
+            # so we point the pool at the freshly-created localhost db
+            # via POLLYPM_PG_DSN — pg_pool.resolve_dsn() picks the env
+            # var ahead of any config / default.
+            import os
+
+            os.environ["POLLYPM_PG_DSN"] = (
+                f"postgresql://localhost:5432/{db_name}"
+            )
+            pool = pg_pool.get_rw_pool(None)
+            try:
+                result = pg_migrations.apply_migrations(pool)
+            except pg_migrations.PgVectorExtensionMissing as exc:
+                typer.echo(str(exc), err=True)
+                raise typer.Exit(code=3) from exc
+            if result.applied:
+                applied = ", ".join(
+                    f"{v}:{label}" for v, label in result.applied
+                )
+                typer.echo(f"  applied: {applied}")
+            else:
+                typer.echo("  schema already up to date")
+            continue
+
+        if step.label.startswith("Write [storage]"):
+            wrote = _write_storage_block(
+                config_path,
+                dsn=f"postgresql://localhost:5432/{db_name}",
+            )
+            if wrote:
+                typer.echo(f"  wrote [storage] block to {config_path}")
+            else:
+                typer.echo(
+                    f"  [storage] block already present in {config_path}; "
+                    "no edit"
+                )
+            continue
+
+    typer.echo("")
+    typer.echo("Bootstrap complete. Next steps:")
+    typer.echo("  pm doctor-pg-connection   # confirm pg + pgvector are healthy")
+    typer.echo("  pm up                     # relaunch the cockpit")
+    raise typer.Exit(code=0)
 
 
 storage_app = typer.Typer(
@@ -85,8 +538,13 @@ _MIGRATE_HELP = help_with_examples(
 
 
 def register_storage_commands(app: typer.Typer) -> None:
-    """Attach the ``storage`` sub-app to the root CLI."""
+    """Attach the ``storage`` sub-app + ``bootstrap-pg`` to the root CLI."""
     app.add_typer(storage_app, name="storage")
+    # ``pm bootstrap-pg`` is a top-level command (not nested under
+    # ``pm storage``) because it's the first command a brand-new user
+    # runs — surfacing it at the root keeps the install path short
+    # (issue #1747).
+    app.command("bootstrap-pg", help=_BOOTSTRAP_HELP)(bootstrap_pg)
 
 
 @storage_app.command("migrate-to-pg", help=_MIGRATE_HELP)

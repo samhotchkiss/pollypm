@@ -50,6 +50,21 @@ class MigrationResult:
         return bool(self.applied)
 
 
+class PgVectorExtensionMissing(RuntimeError):
+    """Raised when ``CREATE EXTENSION vector`` fails on a fresh pg.
+
+    The pgvector contrib module ships separately from Postgres itself,
+    so a brand-new server (Homebrew ``postgresql@17``, ``apt install
+    postgresql``, etc.) will not have the ``vector`` type registered
+    until the operator installs the extension package and the schema
+    migration runs ``CREATE EXTENSION vector``. When the ``CREATE
+    EXTENSION`` itself fails (because the .so/.control files aren't
+    on disk) we raise this with a copy-paste install hint instead of
+    leaking psycopg's bare ``feature_not_supported`` error — the bare
+    error is what #1750 calls out as the install-time footgun.
+    """
+
+
 def _ensure_bookkeeping(conn) -> None:
     """Create the ``schema_migrations`` table + extensions if missing.
 
@@ -59,9 +74,31 @@ def _ensure_bookkeeping(conn) -> None:
     per-version DDL) because pg parses each multi-statement DDL pack
     as a unit, and would refuse to parse ``vector(1536)`` if the type
     weren't already registered at session scope.
+
+    The ``CREATE EXTENSION vector`` call is wrapped in a friendly
+    error (#1750): pgvector is a separate contrib package, and a
+    fresh Postgres install will fail this DDL with a low-signal
+    psycopg error. We catch that and re-raise with the install hint
+    so first-run operators don't have to decode a server-side message.
     """
     with conn.cursor() as cur:
-        cur.execute(EXTENSIONS)
+        try:
+            cur.execute(EXTENSIONS)
+        except Exception as exc:  # noqa: BLE001 — re-raise as friendly
+            conn.rollback()
+            raise PgVectorExtensionMissing(
+                "Could not install the `vector` extension on this Postgres "
+                "instance. PollyPM requires pgvector for semantic recall "
+                "and embeddings (see issue #1737).\n\n"
+                "Fix (macOS/Homebrew):\n"
+                "  brew install pgvector\n"
+                "  brew services restart postgresql@17\n"
+                "  # then re-run `pm storage migrate-to-pg` "
+                "(or `pm bootstrap-pg`)\n\n"
+                "Other platforms: https://github.com/pgvector/pgvector "
+                "#installation-notes\n\n"
+                f"Underlying error: {exc}"
+            ) from exc
         cur.execute(SCHEMA_MIGRATIONS_TABLE)
     conn.commit()
 
@@ -166,5 +203,6 @@ def apply_migrations(pool: "ConnectionPool") -> MigrationResult:
 
 __all__ = [
     "MigrationResult",
+    "PgVectorExtensionMissing",
     "apply_migrations",
 ]

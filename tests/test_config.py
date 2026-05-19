@@ -63,6 +63,29 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert "[projects." not in config_path.read_text()
 
 
+def test_example_config_documents_storage_block(tmp_path: Path) -> None:
+    """``pm example-config`` carries a commented ``[storage]`` block (#1751).
+
+    The sqlite backend was removed in the #1737 cutover, so first-run
+    operators need a visible hint that pg is required + the
+    ``pm bootstrap-pg`` lead-in. Keeping the block commented out
+    preserves round-trip parse (the parser still defaults the URL).
+    """
+    rendered = render_example_config()
+    # The hint header must call out that pg is required.
+    assert "[storage]" in rendered
+    assert "Postgres" in rendered
+    assert "pm bootstrap-pg" in rendered
+    # The example DSN line is commented out so the parser falls
+    # through to the documented default.
+    assert '# url = "postgresql://localhost:5432/pollypm"' in rendered
+    # And the rendered config still parses cleanly end-to-end.
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(rendered)
+    config = load_config(config_path)
+    assert config.storage.backend == "sqlite"  # default until uncommented
+
+
 def test_write_example_config_uses_fresh_install_session_name(tmp_path: Path) -> None:
     config_path = tmp_path / ".pollypm" / "pollypm.toml"
 

@@ -991,6 +991,28 @@ def _render_global_config(config: PollyPMConfig) -> str:
         ]
     )
 
+    # #1751: emit a commented [storage] block so new-user-install
+    # configs document that PollyPM is Postgres-only (the sqlite
+    # backend was removed in the #1737 cutover). The block is fully
+    # commented out so the parser still falls through to the runtime
+    # defaults — uncomment the `url` line and adjust to point at a
+    # different host/port/db. The companion command is
+    # `pm bootstrap-pg`, which installs pg + pgvector and writes a
+    # ready-to-use [storage] block for you.
+    lines.extend(
+        [
+            "# [storage] — Postgres is the required backend (sqlite "
+            "was removed in the #1737 cutover).",
+            "# Uncomment to override the default DSN "
+            "(postgresql://localhost:5432/pollypm).",
+            "# Run `pm bootstrap-pg` for a guided one-shot install on "
+            "macOS (brew + pgvector + createdb + extension + this block).",
+            '# [storage]',
+            '# url = "postgresql://localhost:5432/pollypm"',
+            "",
+        ]
+    )
+
     if config.plugins.disabled:
         items = ", ".join(f'"{_toml_str(name)}"' for name in config.plugins.disabled)
         lines.extend(

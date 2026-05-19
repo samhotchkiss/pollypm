@@ -51,7 +51,7 @@ class _FakeCard:
 
 
 class _FakeSvc:
-    """Minimal stand-in for SQLiteWorkService that records create() calls."""
+    """Minimal stand-in for PgWorkService that records create() calls."""
 
     def __init__(
         self,

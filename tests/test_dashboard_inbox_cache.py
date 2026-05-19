@@ -1,7 +1,7 @@
 """Cycle 138 — perf: content-addressed cache on _dashboard_inbox.
 
 The per-project dashboard refresh tick (every 10s) used to call
-``_dashboard_inbox`` which opens SQLAlchemyStore + SQLiteWorkService
+``_dashboard_inbox`` which opens SQLAlchemyStore + PgWorkService
 and runs queries against both. On 9 projects = 18 DB opens per tick
 even when no inbox change has landed.
 

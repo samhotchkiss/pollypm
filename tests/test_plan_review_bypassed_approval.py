@@ -271,7 +271,7 @@ class _FakeCreatedTask:
 
 
 class _FakeSvc:
-    """Minimal stand-in for SQLiteWorkService used by emit_plan_review_for_task."""
+    """Minimal stand-in for PgWorkService used by emit_plan_review_for_task."""
 
     def __init__(self, *, db_path: Path, task: _FakeTask) -> None:
         self._db_path = db_path

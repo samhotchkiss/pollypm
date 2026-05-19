@@ -128,3 +128,58 @@ def test_concurrent_distinct_tasks_both_succeed(pg_schema_pool) -> None:
         f"both distinct-task claims must succeed; got {results!r}"
     )
     assert results[0] != results[1]
+
+
+def test_concurrent_normal_and_forced_claim_one_winner(pg_schema_pool) -> None:
+    """#1841 — a ``normal`` and ``forced_kickoff`` claim must serialise.
+
+    The normal-scope dedupe predicate matches rows of *any* scope, so
+    a concurrent ``normal`` + ``forced_kickoff`` pair for the same
+    ``(session, task, version)`` tuple must hit the same advisory key
+    and produce exactly one row. The pre-fix key included ``scope``,
+    so both callers landed on different keys, both passed the empty
+    SELECT, and both inserted.
+    """
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_notifications import claim_notification_slot
+
+    barrier = threading.Barrier(2)
+    results: list[object] = [None, None]
+    errors: list[BaseException | None] = [None, None]
+    scopes = ("normal", "forced_kickoff")
+
+    def _worker(slot: int) -> None:
+        try:
+            barrier.wait(timeout=10)
+            results[slot] = claim_notification_slot(
+                session_name="session-mixed",
+                task_id="mixed:1",
+                window_seconds=1800,
+                execution_version=0,
+                project="mixed",
+                message="kickoff",
+                dedupe_scope=scopes[slot],
+                pool=pg_schema_pool,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors[slot] = exc
+
+    t1 = threading.Thread(target=_worker, args=(0,))
+    t2 = threading.Thread(target=_worker, args=(1,))
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+
+    assert errors == [None, None], f"workers raised: {errors!r}"
+
+    winners = [r for r in results if r is not None]
+    losers = [r for r in results if r is None]
+    assert len(winners) == 1, (
+        f"normal-vs-forced concurrent claims must produce exactly one "
+        f"row; got results={results!r}. Two non-None ids means the "
+        f"advisory lock is scope-keyed and the dedupe predicate is "
+        f"bypassed — the #1841 race."
+    )
+    assert len(losers) == 1
+    assert isinstance(winners[0], int) and winners[0] > 0

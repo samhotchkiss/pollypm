@@ -116,7 +116,12 @@ CREATE TABLE IF NOT EXISTS account_usage (
     raw_text      text NOT NULL,
     used_pct      int,
     remaining_pct int,
-    reset_at      timestamptz,
+    -- #1842 — reset_at carries provider display strings ("Monday 1am",
+    -- "10:09 on 5 May", "Apr 10 at 1am"), not parseable timestamps. It
+    -- must be ``text`` to match the sqlite StateStore contract and to
+    -- avoid Postgres rejecting/silently corrupting normal provider
+    -- output. See tests/test_provider_sdk.py + the pg_accounts facade.
+    reset_at      text,
     period_label  text,
     updated_at    timestamptz NOT NULL
 );
@@ -126,8 +131,11 @@ CREATE TABLE IF NOT EXISTS account_runtime (
     provider            text NOT NULL,
     status              text NOT NULL,
     reason              text NOT NULL,
-    available_at        timestamptz,
-    access_expires_at   timestamptz,
+    -- #1842 — available_at / access_expires_at are display strings
+    -- from the account-runtime sampler, not parseable timestamps.
+    -- Stored as ``text`` to round-trip the sqlite StateStore contract.
+    available_at        text,
+    access_expires_at   text,
     refresh_available   boolean NOT NULL DEFAULT false,
     updated_at          timestamptz NOT NULL
 );

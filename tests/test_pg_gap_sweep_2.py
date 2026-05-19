@@ -25,7 +25,6 @@ suites and the focused tests at the bottom of this file.
 from __future__ import annotations
 
 import json
-import os
 import threading
 from pathlib import Path
 
@@ -400,6 +399,74 @@ def test_embedding_config_accepts_matching_model(tmp_path):
     project = ProjectSettings(state_db=tmp_path / "state.db")
     settings = _parse_storage_settings(raw, project=project)
     assert settings.embedding.model == "text-embedding-3-small"
+
+
+def test_embedding_config_rejects_provider_prefixed_3072_dim_model(
+    tmp_path, monkeypatch
+):
+    """#1844 — provider-prefixed 3072-dim model must also be rejected.
+
+    The dim table is keyed on bare model ids, but ``model`` accepts
+    either ``text-embedding-3-large`` or ``openai:text-embedding-3-large``
+    (the documented provider-namespaced form). The pre-#1844 guard
+    only looked up the raw ``model_value``, so the provider-prefixed
+    form slipped past and the operator still hit the runtime
+    pgvector dimension failure.
+    """
+    from pollypm.config import _parse_storage_settings
+    from pollypm.models import ProjectSettings
+
+    raw = {
+        "storage": {
+            "embedding": {
+                "model": "openai:text-embedding-3-large",
+                "provider": "openai",
+            }
+        }
+    }
+    project = ProjectSettings(state_db=tmp_path / "state.db")
+    with pytest.raises(ValueError, match="vectors, but the pgvector schema"):
+        _parse_storage_settings(raw, project=project)
+
+
+def test_embedding_config_accepts_provider_prefixed_matching_model(tmp_path):
+    """#1844 — ``openai:text-embedding-3-small`` (1536-dim) must parse."""
+    from pollypm.config import _parse_storage_settings
+    from pollypm.models import ProjectSettings
+
+    raw = {
+        "storage": {
+            "embedding": {
+                "model": "openai:text-embedding-3-small",
+                "provider": "openai",
+            }
+        }
+    }
+    project = ProjectSettings(state_db=tmp_path / "state.db")
+    settings = _parse_storage_settings(raw, project=project)
+    assert settings.embedding.model == "openai:text-embedding-3-small"
+
+
+def test_embedding_config_provider_prefix_without_explicit_provider(tmp_path):
+    """#1844 — ``provider`` may be implied by the model prefix.
+
+    Operators sometimes set only ``model = "openai:..."`` and omit
+    ``provider`` (the embedder resolves it from the prefix). The dim
+    guard must still fire in that case.
+    """
+    from pollypm.config import _parse_storage_settings
+    from pollypm.models import ProjectSettings
+
+    raw = {
+        "storage": {
+            "embedding": {
+                "model": "openai:text-embedding-3-large",
+            }
+        }
+    }
+    project = ProjectSettings(state_db=tmp_path / "state.db")
+    with pytest.raises(ValueError, match="vectors, but the pgvector schema"):
+        _parse_storage_settings(raw, project=project)
 
 
 # ---------------------------------------------------------------------------

@@ -437,6 +437,48 @@ def test_recover_orphaned_claims_preserves_distinct_payloads_same_handler(
     assert q.get(b) is not None and q.get(b).status is JobStatus.QUEUED
 
 
+def test_recover_orphaned_claims_preserves_recovered_sibling_distinct_payload(
+    pg_job_queue: JobQueue,
+) -> None:
+    """#1843 — recovered claim must survive when a sibling queued row has a different payload.
+
+    Scenario:
+      1. Enqueue ``user.handler`` with ``{"p": "orphan"}`` and claim
+         it as a crashed worker (dedupe_key=None).
+      2. Enqueue another ``user.handler`` with ``{"p": "live"}``
+         (also dedupe_key=None).
+      3. Run ``recover_orphaned_claims``.
+
+    The recovered orphan must survive the prune because its payload
+    differs from the live row. The pre-fix prune grouped by
+    ``handler_name`` alone, so it kept ``MAX(id)`` (the live row) and
+    deleted the recovered orphan — silently dropping durable work.
+    """
+    q = pg_job_queue
+    orphan = q.enqueue("user.handler", {"p": "orphan"})
+    (claimed_job,) = q.claim("crashed-worker")
+    assert claimed_job.id == orphan
+
+    live = q.enqueue("user.handler", {"p": "live"})
+
+    recovered, pruned = q.recover_orphaned_claims()
+    assert recovered == 1, "the orphan must be requeued"
+    assert pruned == 0, (
+        "distinct-payload rows must NOT be collapsed — the prune step "
+        "is for the legacy cadence backlog where every row has an "
+        "identical (typically empty) payload"
+    )
+
+    orphan_row = q.get(orphan)
+    live_row = q.get(live)
+    assert orphan_row is not None, (
+        "the recovered orphan disappeared — the prune step deleted "
+        "durable work it had just requeued (#1843)."
+    )
+    assert orphan_row.status is JobStatus.QUEUED
+    assert live_row is not None and live_row.status is JobStatus.QUEUED
+
+
 def test_null_dedupe_key_does_not_deduplicate(pg_job_queue: JobQueue) -> None:
     q = pg_job_queue
     jid1 = q.enqueue("sweep", {"p": "a"})

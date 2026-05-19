@@ -105,11 +105,12 @@ class _FakeSvc:
 
 @pytest.fixture
 def db_path(tmp_path: Path) -> Path:
-    """Bare workspace state.db that ``SQLAlchemyStore`` can open.
+    """Bare workspace state.db path that the configured Store backend
+    can open.
 
     The emit path writes through ``store.enqueue_message`` and
     re-opens to ``store.update_message``; both succeed against an
-    auto-migrating empty DB.
+    auto-migrating empty DB on either sqlite or pg.
     """
     pollypm_dir = tmp_path / ".pollypm"
     pollypm_dir.mkdir(parents=True, exist_ok=True)

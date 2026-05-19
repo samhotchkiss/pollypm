@@ -344,11 +344,9 @@ def _invoke_handler_with_fakes(
         sweeps_module, "_close_msg_store", lambda _store: None,
     )
     # Patch the work-service factory to return our fake, regardless of
-    # the active backend. Slice K (#1737) flipped the production path
-    # from a direct ``SQLiteWorkService(...)`` construction to
-    # ``create_work_service(...)`` (which dispatches to ``PgWorkService``
-    # on the pg backend), so patching the sqlite class is a no-op under
-    # pg — patch the factory instead.
+    # the active backend. Production goes through ``create_work_service``
+    # which dispatches to the configured backend, so patching the
+    # backend class directly is a no-op when the wrong one is active.
     import pollypm.work as work_mod
 
     monkeypatch.setattr(

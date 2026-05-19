@@ -420,6 +420,70 @@ class Supervisor:
         if not readonly_state:
             self._core_rail.register_subsystem(self)
 
+    # --- Cluster A pg dispatch helpers (Slice K-state-port #1737) --- #
+    # The ``self.store.*`` session/runtime/event calls are dual-pathed: pg
+    # backend routes through ``pollypm.storage.pg_sessions`` (process-wide
+    # pool), sqlite backend stays on the legacy StateStore reader. The
+    # helpers below absorb the backend probe so the dozen-plus call sites
+    # in this file don't each grow an ``if is_pg_backend(...)`` branch.
+
+    def _cluster_a_pg_active(self) -> bool:
+        """Return True when cluster-A reads/writes should go through pg_sessions."""
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        return is_pg_backend(self.config)
+
+    def _upsert_session(
+        self,
+        *,
+        name: str,
+        role: str,
+        project: str,
+        provider: str,
+        account: str,
+        cwd: str,
+        window_name: str,
+    ) -> None:
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_sessions import upsert_session as pg_upsert
+
+            pg_upsert(
+                name=name, role=role, project=project, provider=provider,
+                account=account, cwd=cwd, window_name=window_name,
+            )
+            return
+        self.store.upsert_session(
+            name=name, role=role, project=project, provider=provider,
+            account=account, cwd=cwd, window_name=window_name,
+        )
+
+    def _prune_sessions(self, valid_session_names: set[str]) -> None:
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_sessions import prune_sessions as pg_prune
+
+            pg_prune(valid_session_names)
+            return
+        self.store.prune_sessions(valid_session_names)
+
+    def _get_session_runtime(self, session_name: str):
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_sessions import (
+                get_session_runtime as pg_get_runtime,
+            )
+
+            return pg_get_runtime(session_name)
+        return self.store.get_session_runtime(session_name)
+
+    def _upsert_session_runtime(self, **kwargs) -> None:
+        if self._cluster_a_pg_active():
+            from pollypm.storage.pg_sessions import (
+                upsert_session_runtime as pg_upsert_runtime,
+            )
+
+            pg_upsert_runtime(**kwargs)
+            return
+        self.store.upsert_session_runtime(**kwargs)
+
     def _build_launch_planner(self):
         """Resolve the launch planner via the plugin host.
 
@@ -998,7 +1062,7 @@ class Supervisor:
             if launch.window_name not in live_windows:
                 continue
             try:
-                self.store.upsert_session(
+                self._upsert_session(
                     name=launch.session.name,
                     role=launch.session.role,
                     project=launch.session.project,
@@ -1257,7 +1321,7 @@ class Supervisor:
         return None
 
     def _record_launch(self, launch: SessionLaunchSpec) -> None:
-        self.store.upsert_session(
+        self._upsert_session(
             name=launch.session.name,
             role=launch.session.role,
             project=launch.session.project,
@@ -1445,7 +1509,7 @@ class Supervisor:
             if base_account is None or base_account.home is None:
                 continue
             self._sync_control_home(base_account, session.name)
-        self.store.prune_sessions(
+        self._prune_sessions(
             {session.name for session in self.config.sessions.values() if session.enabled}
         )
         return project.base_dir
@@ -2399,7 +2463,7 @@ class Supervisor:
             return
         # Skip if we already rolled this session for low capacity in the
         # current recovery window — avoids oscillating between accounts.
-        runtime = self.store.get_session_runtime(launch.session.name)
+        runtime = self._get_session_runtime(launch.session.name)
         if runtime and runtime.last_failure_type == "capacity_low" and runtime.status == "recovering":
             return
         pct = probe.remaining_pct if probe.remaining_pct is not None else -1
@@ -2473,7 +2537,7 @@ class Supervisor:
 
     def _record_recovery_attempt(self, session_name: str, *, status: str, failure_type: str, failure_message: str) -> tuple[bool, int]:
         now = datetime.now(UTC)
-        runtime = self.store.get_session_runtime(session_name)
+        runtime = self._get_session_runtime(session_name)
         attempts = 1
         started_at = now.isoformat()
         if runtime is not None and runtime.recovery_window_started_at:
@@ -2484,7 +2548,7 @@ class Supervisor:
             if now - previous_start <= self._RECOVERY_WINDOW:
                 attempts = runtime.recovery_attempts + 1
                 started_at = runtime.recovery_window_started_at
-        self.store.upsert_session_runtime(
+        self._upsert_session_runtime(
             session_name=session_name,
             status=status,
             effective_account=runtime.effective_account if runtime else None,
@@ -2539,7 +2603,7 @@ class Supervisor:
                 signal_kwargs["capacity_state"] = CapacityState.EXHAUSTED
             signals = SessionSignals(**signal_kwargs)  # type: ignore[arg-type]
 
-            runtime = self.store.get_session_runtime(launch.session.name)
+            runtime = self._get_session_runtime(launch.session.name)
             previous = runtime.recovery_attempts if runtime else 0
             history = [
                 InterventionHistoryEntry(action="") for _ in range(previous)
@@ -3108,7 +3172,7 @@ class Supervisor:
                         who_cleared=f"auto:supervisor-recovery:{alert_type}",
                     )
                     if alert_type == "recovery_limit":
-                        self.store.upsert_session_runtime(
+                        self._upsert_session_runtime(
                             session_name=session_name,
                             status="idle",
                             recovery_attempts=0,
@@ -3391,7 +3455,7 @@ class Supervisor:
                 )
                 return
         if failure_type == "provider_outage":
-            self.store.upsert_session_runtime(
+            self._upsert_session_runtime(
                 session_name=launch.session.name,
                 status="blocked",
                 effective_account=launch.account.name,
@@ -3421,7 +3485,7 @@ class Supervisor:
                 "error",
                 msg,
             )
-            self.store.upsert_session_runtime(
+            self._upsert_session_runtime(
                 session_name=launch.session.name,
                 status="degraded",
                 last_failure_type=failure_type,
@@ -3443,7 +3507,7 @@ class Supervisor:
                 "error",
                 f"No viable account is currently available to recover {launch.window_name}",
             )
-            self.store.upsert_session_runtime(
+            self._upsert_session_runtime(
                 session_name=launch.session.name,
                 status="blocked",
                 last_failure_type=failure_type,
@@ -3488,7 +3552,7 @@ class Supervisor:
             "error",
             f"Recovery failed for all viable accounts: {last_error or 'no candidate succeeded'}",
         )
-        self.store.upsert_session_runtime(
+        self._upsert_session_runtime(
             session_name=launch.session.name,
             status="blocked",
             last_failure_type=failure_type,
@@ -3514,7 +3578,7 @@ class Supervisor:
             action="restart",
         )
         tmux_session = self._tmux_session_for_launch(launch)
-        previous_runtime = self.store.get_session_runtime(session_name)
+        previous_runtime = self._get_session_runtime(session_name)
         if self.session_service.tmux.has_session(tmux_session):
             window_map = self._window_map()
             # #1096 — key includes the tmux_session so we don't mistake
@@ -3522,7 +3586,7 @@ class Supervisor:
             if (tmux_session, launch.window_name) in window_map:
                 self.session_service.tmux.kill_window(f"{tmux_session}:{launch.window_name}")
         account = self.config.accounts[account_name]
-        self.store.upsert_session_runtime(
+        self._upsert_session_runtime(
             session_name=session_name,
             status="recovering",
             effective_account=account_name,
@@ -3549,7 +3613,7 @@ class Supervisor:
                         exc_info=True,
                     )
         except Exception:
-            self.store.upsert_session_runtime(
+            self._upsert_session_runtime(
                 session_name=session_name,
                 status=previous_runtime.status if previous_runtime else "degraded",
                 effective_account=previous_runtime.effective_account if previous_runtime else None,
@@ -3653,7 +3717,7 @@ class Supervisor:
         else:
             eff_account = account_name
             eff_provider = account.provider.value
-        self.store.upsert_session_runtime(
+        self._upsert_session_runtime(
             session_name=session_name,
             status="healthy",
             effective_account=eff_account,
@@ -3812,7 +3876,7 @@ class Supervisor:
         account = self.config.accounts.get(account_name)
         if account is None:
             raise KeyError(f"Unknown account: {account_name}")
-        self.store.upsert_session_runtime(
+        self._upsert_session_runtime(
             session_name=session_name,
             status="recovering",
             effective_account=account_name,

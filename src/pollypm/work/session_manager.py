@@ -107,6 +107,19 @@ def task_window_name(project: str, task_number: int) -> str:
     return f"task-{project}-{int(task_number)}"
 
 
+def reviewer_window_name(project: str, task_number: int) -> str:
+    """Return the canonical tmux window name for a per-task reviewer.
+
+    Per the architectural alignment locked in #1737, reviewers are
+    spawned per task (one window per task in review, persists across
+    approve/reject cycles for that task, killed on accept or terminal
+    cancel). The window-name convention is ``reviewer-<project>-<N>``
+    so the watchdog's ``role_session_missing`` detector and the
+    transition manager's spawn/teardown hooks all agree.
+    """
+    return f"reviewer-{project}-{int(task_number)}"
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -1149,6 +1162,333 @@ class SessionManager:
         )
 
     # ------------------------------------------------------------------
+    # Per-task reviewer lifecycle (#1737 architectural alignment)
+    # ------------------------------------------------------------------
+
+    def provision_reviewer(self, task_id: str) -> str | None:
+        """Spawn a per-task reviewer tmux window. Idempotent.
+
+        Window name: ``reviewer-<project>-<N>`` — one per task in review,
+        persists across reject -> rework -> re-submit cycles for the
+        same task so the reviewer remembers what it previously flagged.
+        Torn down on ``approve`` (terminal done) or ``cancel``.
+
+        Mirrors the worker-provision path (``_worker_launch_bundle`` +
+        ``_launch_worker_window``) but does NOT create a per-task
+        worktree: reviewers read the worker's worktree (or the project
+        root for review nodes whose work_status entered ``review``
+        without a per-task worktree). The reviewer launches with the
+        Russell persona prompt baked into the system prompt via the
+        Claude ``--append-system-prompt-file`` convention (mirrors the
+        architect persona-injection landed under #1870/#1873).
+
+        Best-effort: any failure logs and swallows so the transition
+        completes — the heartbeat watchdog (``role_session_missing``)
+        catches stragglers within ~5 minutes.
+
+        Returns the window name on success (newly spawned or already
+        alive), or ``None`` when provisioning failed.
+        """
+        try:
+            project, task_number = _parse_task_id(task_id)
+        except ValueError:
+            logger.warning("provision_reviewer: bad task_id %r", task_id)
+            return None
+
+        window_name = reviewer_window_name(project, task_number)
+        session_name = self._storage_closet_name
+
+        # Idempotency: if the window already exists in the storage
+        # closet, the reviewer is still live for this task (the
+        # reject -> rework -> resubmit cycle MUST hit the same window
+        # so the reviewer keeps its prior context).
+        try:
+            if self._tmux.has_session(session_name):
+                windows = self._tmux.list_windows(session_name)
+                for w in windows:
+                    if getattr(w, "name", None) == window_name:
+                        logger.debug(
+                            "provision_reviewer: window %s already alive "
+                            "for %s (re-using across review cycle)",
+                            window_name, task_id,
+                        )
+                        return window_name
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "provision_reviewer: pre-check has_session/list_windows "
+                "failed for %s: %s (will attempt spawn anyway)",
+                task_id, exc,
+            )
+
+        if self._config is None:
+            # Test harnesses without a config can't route through the
+            # provider/runtime adapters. Spawn a no-op shell window so
+            # the watchdog stops firing and tests can assert the
+            # window-creation path was reached.
+            try:
+                self._tmux.create_window(
+                    session_name, window_name, ":", detached=True,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "provision_reviewer: stub create_window failed for "
+                    "%s: %s", task_id, exc,
+                )
+                return None
+            return window_name
+
+        try:
+            reviewer_cmd, _provider, _account = self._reviewer_launch_bundle(
+                window_name=window_name,
+                project=project,
+                task_number=task_number,
+            )
+        except ProvisionError as exc:
+            logger.warning(
+                "provision_reviewer: launch-bundle failed for %s: %s",
+                task_id, exc,
+            )
+            return None
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "provision_reviewer: unexpected launch-bundle error for "
+                "%s: %s", task_id, exc, exc_info=True,
+            )
+            return None
+
+        try:
+            if not self._tmux.has_session(session_name):
+                self._tmux.create_session(
+                    session_name, window_name, reviewer_cmd,
+                )
+            else:
+                self._tmux.create_window(
+                    session_name, window_name, reviewer_cmd, detached=True,
+                )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "provision_reviewer: tmux spawn failed for %s: %s",
+                task_id, exc,
+            )
+            return None
+
+        # Best-effort forensic event so operators can grep the audit
+        # log for spawn cadence. Mirrors the worker provision audit
+        # surface but uses the existing session.provisioned event so
+        # the watchdog quantifier (#1414) keeps working unchanged.
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_SESSION_PROVISIONED
+
+            _audit_emit(
+                event=EVENT_SESSION_PROVISIONED,
+                project=project,
+                subject=window_name,
+                actor="system",
+                status="ok",
+                metadata={
+                    "role": "reviewer",
+                    "project": project,
+                    "task_number": task_number,
+                    "task_id": task_id,
+                    "reason": "per_task_review_handoff",
+                },
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "provision_reviewer: audit emit failed for %s",
+                task_id, exc_info=True,
+            )
+
+        return window_name
+
+    def teardown_reviewer(self, task_id: str) -> bool:
+        """Kill the per-task reviewer window. Idempotent.
+
+        Called from the approve (terminal-done) and cancel transition
+        paths. Best-effort: a kill failure is logged and swallowed so
+        the transition completes — a stale reviewer window is a
+        cosmetic nuisance, not a correctness violation.
+
+        Returns True when the kill succeeded (or there was nothing to
+        kill), False on tmux error.
+        """
+        try:
+            project, task_number = _parse_task_id(task_id)
+        except ValueError:
+            logger.warning("teardown_reviewer: bad task_id %r", task_id)
+            return False
+
+        window_name = reviewer_window_name(project, task_number)
+        target = f"{self._storage_closet_name}:{window_name}"
+        try:
+            self._tmux.kill_window(target)
+            return True
+        except _CalledProcessError:
+            # "no such window" is the normal idempotent path.
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "teardown_reviewer: kill_window failed for %s: %s",
+                target, exc,
+            )
+            return False
+
+    def _reviewer_launch_bundle(
+        self,
+        *,
+        window_name: str,
+        project: str,
+        task_number: int,
+    ) -> tuple[str, str, str]:
+        """Build the launch command for a per-task reviewer window.
+
+        Returns ``(command, provider_name, account_name)``. Routes
+        through the configured provider/runtime adapter pair so the
+        reviewer obeys the same account, runtime, and permissions
+        policy as the worker. Materialises the reviewer persona prompt
+        to disk and appends ``--append-system-prompt-file`` for Claude
+        launches (mirrors #1870/#1873 architect persona injection).
+        """
+        from pollypm.models import ProviderKind, SessionConfig
+        from pollypm.onboarding import default_session_args
+        from pollypm.providers import get_provider
+        from pollypm.role_routing import (
+            resolved_provider_kind,
+            resolve_role_assignment,
+        )
+        from pollypm.runtimes import get_runtime
+
+        config = self._config
+        accounts = getattr(config, "accounts", {}) or {}
+        routed_assignment = resolve_role_assignment(
+            "reviewer", project, config=config,
+        )
+        try:
+            routed_provider = resolved_provider_kind(routed_assignment)
+        except ValueError as exc:
+            raise ProvisionError(
+                f"Reviewer routing for project {project} resolved an "
+                f"unknown provider {routed_assignment.provider!r}: {exc}"
+            ) from exc
+
+        unavailable_accounts = _unavailable_account_names(config)
+        pollypm_settings = getattr(config, "pollypm", None)
+        failover_accounts: list[str] = list(
+            getattr(pollypm_settings, "failover_accounts", []) or []
+        )
+        preferred_names = [
+            getattr(pollypm_settings, "controller_account", ""),
+            *failover_accounts,
+        ]
+        account_name, account = _first_matching_account(
+            accounts,
+            provider=routed_provider,
+            preferred_names=preferred_names,
+            excluded_names=unavailable_accounts,
+        )
+        if account is None and accounts:
+            # Final fallback: ignore the unavailable filter so we still
+            # produce a launch bundle. The supervisor's recovery ladder
+            # will observe and resolve the failure.
+            account_name, account = _first_matching_account(
+                accounts,
+                provider=routed_provider,
+                preferred_names=preferred_names,
+            )
+        if account is None:
+            raise ProvisionError(
+                "Could not provision a reviewer because no configured "
+                f"account is available for routed provider "
+                f"{routed_provider.value}. Add at least one matching "
+                "account to PollyPM config, then retry."
+            )
+
+        session_provider = account.provider
+        session_model: str | None = None
+        if account.provider is routed_provider:
+            session_model = routed_assignment.model
+
+        session_args = default_session_args(
+            session_provider,
+            open_permissions=config.pollypm.open_permissions_by_default,
+            role="reviewer",
+            model=session_model,
+        )
+        session_cwd = self._project_path
+
+        session = SessionConfig(
+            name=window_name,
+            role="reviewer",
+            provider=session_provider,
+            account=account_name,
+            cwd=session_cwd,
+            project=project,
+            window_name=window_name,
+            args=session_args,
+        )
+        provider = get_provider(
+            session_provider, root_dir=config.project.root_dir,
+        )
+        runtime = get_runtime(
+            account.runtime, root_dir=config.project.root_dir,
+        )
+
+        # Resolve the reviewer persona prompt with project.persona_name
+        # override (matches the architect persona resolution in
+        # #1870/#1873 — project's persona_name wins over the role
+        # default).
+        persona_prompt = _resolve_reviewer_persona_prompt(config, project)
+
+        launch = provider.build_launch_command(session, account)
+        # For Claude, bake the persona prompt into the system prompt
+        # via the on-disk file convention used by the architect.
+        # For other providers (Codex), fall through and rely on
+        # send-keys / AGENTS.md materialisation handled at supervisor
+        # send-input time — out of scope for this hook.
+        if (
+            session_provider is ProviderKind.CLAUDE
+            and persona_prompt
+            and account.home is not None
+        ):
+            target = (
+                account.home
+                / ".pollypm"
+                / "system-prompts"
+                / f"reviewer_{project}_{int(task_number)}.md"
+            )
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(
+                    persona_prompt.rstrip() + "\n", encoding="utf-8",
+                )
+                from dataclasses import replace as _replace
+
+                launch = _replace(
+                    launch,
+                    argv=list(launch.argv) + [
+                        "--append-system-prompt-file", str(target),
+                    ],
+                )
+                if launch.resume_argv is not None:
+                    launch = _replace(
+                        launch,
+                        resume_argv=list(launch.resume_argv) + [
+                            "--append-system-prompt-file", str(target),
+                        ],
+                    )
+            except OSError as exc:
+                logger.warning(
+                    "provision_reviewer: failed to materialise persona "
+                    "prompt at %s: %s (launching without persona)",
+                    target, exc,
+                )
+
+        command = runtime.wrap_command(launch, account, config.project)
+        return command, account.provider.value, account_name
+
+    # ------------------------------------------------------------------
     # Rejection
     # ------------------------------------------------------------------
 
@@ -1499,6 +1839,84 @@ def _parse_task_id(task_id: str) -> tuple[str, int]:
     if len(parts) != 2:
         raise ValueError(f"Invalid task_id: {task_id}")
     return parts[0], int(parts[1])
+
+
+def _resolve_reviewer_persona_prompt(
+    config: object, project_key: str,
+) -> str | None:
+    """Resolve the reviewer persona prompt for ``project_key``.
+
+    Mirrors the architect persona resolution landed under #1870/#1873:
+
+    * Base prompt: ``reviewer_prompt()`` from
+      :mod:`pollypm.agent_profiles.defaults` (the Russell persona body).
+    * Project-local fork override: when
+      ``<project>/.pollypm/project-guides/reviewer.md`` exists, that
+      forked body replaces the base.
+    * Persona substitution: ``project.persona_name`` (when set) wins
+      over the role default ``"Russell"``. Both the
+      ``{persona_name}`` placeholder and the legacy literal
+      ``"You are Russell, the code reviewer"`` kickoff identity are
+      substituted so legacy forked guides stay correct without a
+      manual reset.
+
+    Returns ``None`` when the base prompt could not be loaded (the
+    caller will fall back to a launch without ``--append-system-prompt-file``).
+    """
+    try:
+        from pollypm.agent_profiles.defaults import reviewer_prompt
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "_resolve_reviewer_persona_prompt: import failed",
+            exc_info=True,
+        )
+        return None
+
+    try:
+        base = reviewer_prompt()
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "_resolve_reviewer_persona_prompt: reviewer_prompt() raised",
+            exc_info=True,
+        )
+        return None
+
+    prompt = base
+    project = None
+    projects = getattr(config, "projects", {}) or {}
+    project = projects.get(project_key) if hasattr(projects, "get") else None
+
+    if project is not None:
+        try:
+            from pollypm.project_guides import resolve_project_guide_text
+
+            prompt = resolve_project_guide_text(
+                project.path,
+                "reviewer",
+                fallback_text=prompt,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "_resolve_reviewer_persona_prompt: project-guide read "
+                "failed for %s", project_key, exc_info=True,
+            )
+
+    persona = "Russell"
+    if project is not None:
+        persona_raw = getattr(project, "persona_name", None)
+        if isinstance(persona_raw, str) and persona_raw.strip():
+            persona = persona_raw.strip()
+
+    if "{persona_name}" in prompt:
+        prompt = prompt.replace("{persona_name}", persona)
+    if persona != "Russell":
+        # Legacy forked guides have ``You are Russell, the code reviewer``
+        # baked in literally — rescue them so persona stays in sync.
+        prompt = prompt.replace(
+            "You are Russell, the code reviewer",
+            f"You are {persona}, the code reviewer",
+        )
+    return prompt or None
 
 
 def _shell_quote(s: str) -> str:

@@ -615,7 +615,13 @@ class _FakeTask:
 
 
 def test_role_session_missing_fires_when_window_absent(now: datetime) -> None:
-    """A review-state task with no reviewer-<project> window fires."""
+    """A review-state task with no reviewer-<project>-<N> window fires.
+
+    #1737 — reviewers moved from per-project (``reviewer-<project>``) to
+    per-task ephemeral (``reviewer-<project>-<N>``). The detector now
+    checks the task-scoped window so legacy per-project windows that
+    were retired no longer mask a missing per-task reviewer.
+    """
     from pollypm.audit.watchdog import RULE_ROLE_SESSION_MISSING
 
     task = _FakeTask(
@@ -628,15 +634,46 @@ def test_role_session_missing_fires_when_window_absent(now: datetime) -> None:
         [],
         now=now,
         open_tasks=[task],
-        storage_window_names=["worker-savethenovel", "architect-savethenovel"],
+        # Even the legacy per-project ``reviewer-savethenovel`` is now
+        # treated as a stranger window — the detector demands the
+        # task-scoped form.
+        storage_window_names=[
+            "worker-savethenovel",
+            "architect-savethenovel",
+            "reviewer-savethenovel",
+        ],
         project="savethenovel",
     )
     matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
     assert len(matched) == 1
     f = matched[0]
     assert f.subject == "savethenovel/10"
-    assert f.metadata["expected_window"] == "reviewer-savethenovel"
+    assert f.metadata["expected_window"] == "reviewer-savethenovel-10"
     assert f.metadata["role"] == "reviewer"
+    assert f.metadata["task_id"] == "savethenovel/10"
+
+
+def test_role_session_missing_silent_when_per_task_reviewer_present(
+    now: datetime,
+) -> None:
+    """A review-state task whose per-task reviewer window IS in the
+    storage closet must NOT fire ``role_session_missing`` (#1737)."""
+    from pollypm.audit.watchdog import RULE_ROLE_SESSION_MISSING
+
+    task = _FakeTask(
+        project="samblog",
+        task_number=26,
+        work_status="review",
+        roles={"reviewer": "claude:reviewer"},
+    )
+    findings = scan_events(
+        [],
+        now=now,
+        open_tasks=[task],
+        storage_window_names=["reviewer-samblog-26"],
+        project="samblog",
+    )
+    assert not any(f.rule == RULE_ROLE_SESSION_MISSING for f in findings)
 
 
 def test_role_session_missing_silent_when_window_present(now: datetime) -> None:

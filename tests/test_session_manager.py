@@ -1895,3 +1895,130 @@ class TestRoleSessionMissingCapAware:
         matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
         assert len(matched) == 1
         assert matched[0].subject == "samblog/4"
+
+
+# ---------------------------------------------------------------------------
+# Per-task reviewer lifecycle (#1737)
+# ---------------------------------------------------------------------------
+
+
+class TestPerTaskReviewerLifecycle:
+    """Reviewer spawn/teardown/idempotency under the new per-task model.
+
+    Architectural alignment per #1737: reviewer windows are
+    ``reviewer-<project>-<N>`` (one per task), persist across reject ->
+    rework -> resubmit cycles, and are torn down on terminal done or
+    cancel. The pre-#1737 ``reviewer-<project>`` per-project lane was
+    retired (its toml entries are removed in a follow-up doc step).
+    """
+
+    def test_reviewer_window_name_shape(self):
+        from pollypm.work.session_manager import reviewer_window_name
+
+        assert reviewer_window_name("samblog", 26) == "reviewer-samblog-26"
+
+    def test_provision_reviewer_creates_window_when_absent(
+        self, manager, mock_tmux, tmp_project,
+    ):
+        """No existing window -> spawn the per-task reviewer."""
+        mock_tmux.has_session.return_value = False
+        result = manager.provision_reviewer("proj/1")
+        assert result == "reviewer-proj-1"
+        # With config=None (test harness path), the stub create_window
+        # is invoked with a ``:`` no-op shell command.
+        assert mock_tmux.create_window.called
+
+    def test_provision_reviewer_is_idempotent_across_reject_cycles(
+        self, manager, mock_tmux, tmp_project,
+    ):
+        """The same task being re-submitted MUST hit the same reviewer
+        window — that's how Russell keeps context about what he
+        flagged on the prior cycle. The second provision call must
+        not spawn a duplicate window."""
+        mock_tmux.has_session.return_value = True
+        # First call sees an empty storage closet; spawns.
+        mock_tmux.list_windows.return_value = []
+        first = manager.provision_reviewer("proj/1")
+        assert first == "reviewer-proj-1"
+        spawn_calls = mock_tmux.create_window.call_count
+
+        # Subsequent call sees the already-spawned window — must no-op.
+        existing_window = MagicMock()
+        existing_window.name = "reviewer-proj-1"
+        existing_window.pane_id = "%99"
+        mock_tmux.list_windows.return_value = [existing_window]
+        second = manager.provision_reviewer("proj/1")
+        assert second == "reviewer-proj-1"
+        assert mock_tmux.create_window.call_count == spawn_calls
+
+    def test_teardown_reviewer_kills_window(
+        self, manager, mock_tmux,
+    ):
+        ok = manager.teardown_reviewer("proj/1")
+        assert ok is True
+        mock_tmux.kill_window.assert_called_once_with(
+            "pollypm-storage-closet:reviewer-proj-1"
+        )
+
+    def test_teardown_reviewer_idempotent_when_window_gone(
+        self, manager, mock_tmux,
+    ):
+        """A kill_window CalledProcessError ('no such window') must be
+        treated as success — the window is already gone."""
+        mock_tmux.kill_window.side_effect = subprocess.CalledProcessError(
+            1, "tmux kill-window",
+        )
+        ok = manager.teardown_reviewer("proj/1")
+        assert ok is True
+
+    def test_provision_reviewer_uses_persona_name_when_set(self, tmp_path):
+        """When ``project.persona_name`` is set (e.g. samblog -> "Sage"),
+        the materialised persona prompt substitutes the role default
+        "Russell" for the project's persona. Mirrors the architect
+        persona-name resolution under #1870/#1873."""
+        from pollypm.work.session_manager import (
+            _resolve_reviewer_persona_prompt,
+        )
+        from pollypm.models import KnownProject, ProjectKind
+
+        class _Cfg:
+            projects = {
+                "samblog": KnownProject(
+                    key="samblog",
+                    path=tmp_path / "samblog",
+                    name="samblog",
+                    persona_name="Sage",
+                    kind=ProjectKind.FOLDER,
+                    tracked=True,
+                ),
+            }
+
+        prompt = _resolve_reviewer_persona_prompt(_Cfg(), "samblog")
+        assert prompt is not None
+        assert "You are Sage, the code reviewer" in prompt
+        assert "You are Russell, the code reviewer" not in prompt
+
+    def test_provision_reviewer_falls_back_to_russell_without_override(
+        self, tmp_path,
+    ):
+        """No project.persona_name -> "Russell" stays as the persona."""
+        from pollypm.work.session_manager import (
+            _resolve_reviewer_persona_prompt,
+        )
+        from pollypm.models import KnownProject, ProjectKind
+
+        class _Cfg:
+            projects = {
+                "demo": KnownProject(
+                    key="demo",
+                    path=tmp_path / "demo",
+                    name="demo",
+                    persona_name="",
+                    kind=ProjectKind.FOLDER,
+                    tracked=True,
+                ),
+            }
+
+        prompt = _resolve_reviewer_persona_prompt(_Cfg(), "demo")
+        assert prompt is not None
+        assert "You are Russell, the code reviewer" in prompt

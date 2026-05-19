@@ -60,6 +60,7 @@ from pollypm.work.models import (
     Task,
     TaskType,
     TERMINAL_STATUSES,
+    Transition,
     WorkOutput,
     WorkStatus,
     WorkerSessionRecord,
@@ -71,9 +72,12 @@ from pollypm.work.service_support import (
 )
 
 if TYPE_CHECKING:
+    from pathlib import Path
+
     from psycopg_pool import ConnectionPool
 
     from pollypm.models import PollyPMConfig
+    from pollypm.work.sync import SyncManager
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +138,63 @@ def _coerce_type(raw: str) -> TaskType:
         return TaskType.TASK
 
 
+def _empty_rels() -> dict:
+    """Return an empty relationships dict with stable shape."""
+    return {
+        "blocks": [],
+        "blocked_by": [],
+        "relates_to": [],
+        "children": [],
+        "superseded_by_project": None,
+        "superseded_by_task_number": None,
+    }
+
+
+def _aggregate_relationship_rows(rows: list) -> dict:
+    """Aggregate raw dependency edges into the per-task relationships dict.
+
+    Row shape: ``(from_project, from_task_number, to_project,
+    to_task_number, kind, is_outgoing, is_incoming)``. Mirrors the
+    aggregation in :meth:`SQLiteWorkService._load_relationships` so the
+    pg and sqlite paths produce identical Task hydration shapes.
+    """
+    rels = _empty_rels()
+    for row in rows:
+        from_p = str(row[0])
+        from_n = int(row[1])
+        to_p = str(row[2])
+        to_n = int(row[3])
+        kind = row[4]
+        is_outgoing = bool(row[5])
+        is_incoming = bool(row[6])
+        if is_outgoing:
+            target = (to_p, to_n)
+            if kind == LinkKind.BLOCKS.value:
+                rels["blocks"].append(target)
+            elif kind == LinkKind.RELATES_TO.value:
+                rels["relates_to"].append(target)
+            elif kind == LinkKind.PARENT.value:
+                rels["children"].append(target)
+            elif kind == LinkKind.SUPERSEDES.value:
+                # outgoing supersedes is stored on the supersedes_* columns
+                pass
+        if is_incoming:
+            source = (from_p, from_n)
+            if kind == LinkKind.BLOCKS.value:
+                rels["blocked_by"].append(source)
+            elif kind == LinkKind.RELATES_TO.value:
+                if source not in rels["relates_to"]:
+                    rels["relates_to"].append(source)
+            elif kind == LinkKind.PARENT.value:
+                # incoming parent edge — the parent_* columns already
+                # carry this on the task row, so no extra bookkeeping.
+                pass
+            elif kind == LinkKind.SUPERSEDES.value:
+                rels["superseded_by_project"] = from_p
+                rels["superseded_by_task_number"] = from_n
+    return rels
+
+
 def _json_loads(raw: Any, default: Any) -> Any:
     """Decode a JSON column tolerantly.
 
@@ -181,6 +242,9 @@ class PgWorkService:
         config: "PollyPMConfig | None" = None,
         project_key: str | None = None,
         apply_migrations: bool = True,
+        sync_manager: "SyncManager | None" = None,
+        session_manager: object | None = None,
+        project_path: "Path | None" = None,
     ) -> None:
         if pool is None:
             from pollypm.storage.pg_pool import get_rw_pool
@@ -197,6 +261,19 @@ class PgWorkService:
         self._pool = pool
         self._ro_pool = ro_pool
         self._project_key = project_key or ""
+        # Sync manager — optional collaborator that mirrors task lifecycle
+        # events (create / update / transition) onto registered adapters
+        # (file, github, etc.). The cockpit / CLI wires this from
+        # ``pollypm.work.factory``; tests pass a hand-built one. Same
+        # shape as ``SQLiteWorkService._sync`` so the structural helpers
+        # in :mod:`pollypm.work.service_sync` can address either backend.
+        self._sync = sync_manager
+        self._session_mgr = session_manager
+        # ``project_path`` is the on-disk root for filesystem-aware gates
+        # (receipt lookup, audit log per-project paths). The sqlite path
+        # carries this attribute too; pg-only callers can leave it
+        # ``None`` and the file-aware gates degrade to project-less mode.
+        self._project_path = project_path
         # Slice A keeps the same single-process schema-on-open contract
         # the sqlite service has: open the service, schema is current.
         # Slice E adds an explicit ``pm storage migrate`` CLI; until
@@ -229,9 +306,14 @@ class PgWorkService:
         """No-op — pool lifetime is owned by ``pg_pool``."""
         return None
 
-    def set_session_manager(self, session_manager: object) -> None:  # noqa: ARG002
-        """Slice A: session manager wiring lands in Slice B."""
-        return None
+    def set_session_manager(self, session_manager: object) -> None:
+        """Wire up the session manager after construction.
+
+        Two-phase init: the service is created first, then the session
+        manager (which needs a reference to the service) is created and
+        registered back. Mirrors :meth:`SQLiteWorkService.set_session_manager`.
+        """
+        self._session_mgr = session_manager
 
     # ------------------------------------------------------------------
     # Read path
@@ -258,7 +340,11 @@ class PgWorkService:
             row = cur.fetchone()
         if row is None:
             raise TaskNotFoundError(f"Task '{task_id}' not found.")
-        return self._row_to_task(row)
+        rels = self._load_relationships(project, task_number)
+        task = self._row_to_task(row, relationships=rels)
+        task.transitions = self._load_transitions(project, task_number)
+        task.context = self._load_context_entries(project, task_number)
+        return task
 
     def list_tasks(
         self,
@@ -316,9 +402,32 @@ class PgWorkService:
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-        return [self._row_to_task(row) for row in rows]
+        # Bulk-load relationships keyed by (project, task_number) to
+        # avoid the N+1 hit on big result sets.
+        keys = [(str(r[0]), int(r[1])) for r in rows]
+        rels_by_key = self._load_relationships_bulk(keys)
+        tasks = [
+            self._row_to_task(
+                row,
+                relationships=rels_by_key.get(
+                    (str(row[0]), int(row[1])), None
+                ),
+            )
+            for row in rows
+        ]
+        # ``blocked`` post-filter mirrors the sqlite behaviour: the column
+        # is derived from ``work_status``, so callers passing
+        # ``blocked=True/False`` get the same surface either backend.
+        if blocked is not None:
+            tasks = [task for task in tasks if task.blocked == blocked]
+        return tasks
 
-    def _row_to_task(self, row: tuple) -> Task:
+    def _row_to_task(
+        self,
+        row: tuple,
+        *,
+        relationships: dict | None = None,
+    ) -> Task:
         """Convert a SELECT-* row tuple into a :class:`Task` dataclass.
 
         Column order MUST match the SELECT list in :meth:`get` and
@@ -358,6 +467,7 @@ class PgWorkService:
             created_by,
             updated_at,
         ) = row
+        rels: dict = relationships or {}
         return Task(
             project=str(project),
             task_number=int(task_number),
@@ -379,12 +489,18 @@ class PgWorkService:
             parent_task_number=(
                 int(parent_task_number) if parent_task_number is not None else None
             ),
+            blocks=list(rels.get("blocks", [])),
+            blocked_by=list(rels.get("blocked_by", [])),
+            relates_to=list(rels.get("relates_to", [])),
+            children=list(rels.get("children", [])),
             supersedes_project=supersedes_project,
             supersedes_task_number=(
                 int(supersedes_task_number)
                 if supersedes_task_number is not None
                 else None
             ),
+            superseded_by_project=rels.get("superseded_by_project"),
+            superseded_by_task_number=rels.get("superseded_by_task_number"),
             plan_version=int(plan_version or 1),
             predecessor_task_id=predecessor_task_id,
             kind=_coerce_inbox_kind(kind_raw),
@@ -394,6 +510,140 @@ class PgWorkService:
             created_by=str(created_by or ""),
             updated_at=updated_at,
         )
+
+    def _load_transitions(
+        self, project: str, task_number: int
+    ) -> list[Transition]:
+        """Load transition history for a task, oldest-first."""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT from_state, to_state, actor, reason, created_at "
+                "FROM work_transitions "
+                "WHERE task_project = %s AND task_number = %s "
+                "ORDER BY id ASC",
+                (project, task_number),
+            )
+            rows = cur.fetchall()
+        return [
+            Transition(
+                from_state=str(r[0]),
+                to_state=str(r[1]),
+                actor=str(r[2]),
+                timestamp=r[4],
+                reason=r[3],
+            )
+            for r in rows
+        ]
+
+    def _load_context_entries(
+        self, project: str, task_number: int
+    ) -> list[ContextEntry]:
+        """Load context entries for a task, oldest-first."""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT actor, created_at, text, entry_type "
+                "FROM work_context_entries "
+                "WHERE task_project = %s AND task_number = %s "
+                "ORDER BY id ASC",
+                (project, task_number),
+            )
+            rows = cur.fetchall()
+        return [
+            ContextEntry(
+                actor=str(r[0]),
+                timestamp=r[1],
+                text=str(r[2]),
+                entry_type=str(r[3] or "note"),
+            )
+            for r in rows
+        ]
+
+    def _load_relationships(
+        self, project: str, task_number: int
+    ) -> dict:
+        """Load dependency relationships for a single task.
+
+        Mirrors :meth:`SQLiteWorkService._load_relationships`. Returns a
+        dict keyed by relationship kind plus the optional
+        ``superseded_by_*`` pair.
+        """
+        sql = """
+            SELECT from_project, from_task_number,
+                   to_project, to_task_number, kind,
+                   1 AS is_outgoing, 0 AS is_incoming
+              FROM work_task_dependencies
+             WHERE from_project = %s AND from_task_number = %s
+            UNION ALL
+            SELECT from_project, from_task_number,
+                   to_project, to_task_number, kind,
+                   0 AS is_outgoing, 1 AS is_incoming
+              FROM work_task_dependencies
+             WHERE to_project = %s AND to_task_number = %s
+        """
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (project, task_number, project, task_number),
+            )
+            rows = cur.fetchall()
+        return _aggregate_relationship_rows(rows)
+
+    def _load_relationships_bulk(
+        self, keys: list[tuple[str, int]]
+    ) -> dict[tuple[str, int], dict]:
+        """Bulk relationship hydration keyed by ``(project, task_number)``.
+
+        Returns ``{}``  for unrelated tasks (caller defaults). One query
+        regardless of result-set size — avoids the N+1 the sqlite path
+        was rewritten to escape (#1770).
+        """
+        if not keys:
+            return {}
+        out: dict[tuple[str, int], dict] = {key: _empty_rels() for key in keys}
+        # We don't have a single VALUES clause that scales to thousands
+        # of rows ergonomically, so issue one query that pulls every
+        # row touching ANY of the keys, then bucket in Python.
+        where_clauses: list[str] = []
+        params: list[object] = []
+        for project, number in keys:
+            where_clauses.append(
+                "(from_project = %s AND from_task_number = %s) "
+                "OR (to_project = %s AND to_task_number = %s)"
+            )
+            params.extend([project, number, project, number])
+        clause = " OR ".join(where_clauses)
+        sql = (
+            "SELECT from_project, from_task_number, "
+            "to_project, to_task_number, kind "
+            f"FROM work_task_dependencies WHERE {clause}"
+        )
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            all_rows = cur.fetchall()
+        # Bucket by both endpoints (outgoing and incoming relative to
+        # each key) and re-use the same aggregator the per-task path
+        # uses, so the wire shape is identical.
+        key_set = set(keys)
+        bucket: dict[tuple[str, int], list[tuple]] = {k: [] for k in keys}
+        for row in all_rows:
+            from_p, from_n, to_p, to_n, kind = (
+                str(row[0]),
+                int(row[1]),
+                str(row[2]),
+                int(row[3]),
+                row[4],
+            )
+            if (from_p, from_n) in key_set:
+                bucket[(from_p, from_n)].append(
+                    (from_p, from_n, to_p, to_n, kind, 1, 0)
+                )
+            if (to_p, to_n) in key_set:
+                bucket[(to_p, to_n)].append(
+                    (from_p, from_n, to_p, to_n, kind, 0, 1)
+                )
+        for key, rows in bucket.items():
+            out[key] = _aggregate_relationship_rows(rows)
+        return out
 
     # ------------------------------------------------------------------
     # Write path — minimal CRUD trio.
@@ -478,7 +728,60 @@ class PgWorkService:
                     ),
                 )
             conn.commit()
-        return self.get(f"{project}/{task_number}")
+        task = self.get(f"{project}/{task_number}")
+        # Mirror :func:`service_queries.create_task`: invoke registered
+        # sync adapters and persist any external refs they stamped onto
+        # the task object so the github_issue ref (and similar) survives
+        # the create transaction round-trip (#1775).
+        if self._sync is not None:
+            external_refs_before_sync = dict(task.external_refs)
+            try:
+                self._sync.on_create(task)
+            except Exception:  # noqa: BLE001 — sync failure must not break create
+                logger.warning(
+                    "sync.on_create failed for %s",
+                    task.task_id,
+                    exc_info=True,
+                )
+            changed_refs = {
+                key: value
+                for key, value in task.external_refs.items()
+                if external_refs_before_sync.get(key) != value
+            }
+            for key, value in changed_refs.items():
+                self.set_external_ref(task.task_id, key, value)
+            if changed_refs:
+                task = self.get(task.task_id)
+        return task
+
+    def set_external_ref(self, task_id: str, key: str, value: str) -> None:
+        """Persist one external reference on a task.
+
+        Mirrors :meth:`SQLiteWorkService.set_external_ref`. Used by the
+        sync hooks to record adapter-stamped identifiers (e.g.
+        ``github_issue``) without going through ``update()``.
+        """
+        if not key.strip():
+            raise ValidationError(
+                "Cannot persist an external ref with an empty key. "
+                "The work service would have no stable name for the external "
+                "system identifier, so later sync hooks could not retrieve it. "
+                "Fix: pass a non-empty key such as 'github_issue'."
+            )
+        task = self.get(task_id)
+        refs = dict(task.external_refs)
+        refs[str(key)] = str(value)
+        project, task_number = _parse_task_id(task_id)
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_tasks SET external_refs = %s::jsonb, "
+                    "updated_at = %s "
+                    "WHERE project = %s AND task_number = %s",
+                    (json.dumps(refs), _now_iso(), project, task_number),
+                )
+            conn.commit()
 
     def queue(
         self,
@@ -498,6 +801,16 @@ class PgWorkService:
         place to land the approval/reject decision.
         """
         task = self.get(task_id)
+        # Idempotent: re-queueing an already-queued task is a no-op so
+        # ``pm task queue`` is safe to retry. Other non-draft states are
+        # still rejected with three-question guidance.
+        if task.work_status == WorkStatus.QUEUED:
+            return task
+        if task.work_status != WorkStatus.DRAFT:
+            raise InvalidTransitionError(
+                f"Cannot queue task in '{task.work_status.value}' state. "
+                f"Task must be in 'draft' state."
+            )
         if (
             task.requires_human_review
             and not skip_gates
@@ -664,37 +977,58 @@ class PgWorkService:
         return self.get(task_id)
 
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:
-        """Move any non-terminal task to ``cancelled``."""
+        """Move any non-terminal task to ``cancelled``.
+
+        Mirrors :meth:`SQLiteWorkService.cancel` — after the transition
+        we cascade :meth:`_on_cancelled` so dependents get the breadcrumb
+        the PM uses to decide unblock-vs-cancel.
+        """
         task = self.get(task_id)
         if task.work_status in (WorkStatus.DONE, WorkStatus.CANCELLED):
             raise InvalidTransitionError(
                 f"Cannot cancel task in terminal state {task.work_status.value!r}."
             )
-        return self._simple_transition(
+        result = self._simple_transition(
             task_id,
             from_state=task.work_status,
             to_state=WorkStatus.CANCELLED,
             actor=actor,
             reason=reason,
         )
+        try:
+            self._on_cancelled(task_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "_on_cancelled cascade failed for %s", task_id, exc_info=True
+            )
+        return result
 
     def mark_done(self, task_id: str, actor: str) -> Task:
         """Force a task to ``done`` without running the flow.
 
-        Mirrors the sqlite ``mark_done`` escape valve used by admin /
-        recovery paths. Slice A intentionally leaves the full
-        ``node_done`` pipeline (flow advancement, work output coercion,
-        gate replay) to Slice B.
+        Mirrors :meth:`SQLiteWorkService.mark_done`: writes the transition
+        + audit row, then cascades :meth:`_check_auto_unblock` so any
+        dependents this task was blocking get a chance to drop back to
+        QUEUED.
         """
         task = self.get(task_id)
         if task.work_status == WorkStatus.DONE:
             return task
-        return self._simple_transition(
+        result = self._simple_transition(
             task_id,
             from_state=task.work_status,
             to_state=WorkStatus.DONE,
             actor=actor,
         )
+        try:
+            self._check_auto_unblock(task_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "auto_unblock after mark_done failed for %s",
+                task_id,
+                exc_info=True,
+            )
+        return result
 
     def _simple_transition(
         self,
@@ -744,7 +1078,29 @@ class PgWorkService:
                     ),
                 )
             conn.commit()
-        return self.get(task_id)
+        task = self.get(task_id)
+        self._sync_transition(task, current.value, to_state.value)
+        return task
+
+    def _sync_transition(
+        self, task: Task, old_status: str, new_status: str
+    ) -> None:
+        """Fire registered sync adapters on a state transition.
+
+        Mirrors :meth:`SQLiteWorkService._sync_transition`. Best-effort:
+        adapter failures are logged and swallowed so a broken sync
+        side-channel never blocks the primary transition.
+        """
+        if self._sync is None:
+            return
+        try:
+            self._sync.on_transition(task, old_status, new_status)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "sync.on_transition failed for %s",
+                task.task_id,
+                exc_info=True,
+            )
 
     # ------------------------------------------------------------------
     # Protocol stubs — Slice B fills these in.
@@ -777,7 +1133,17 @@ class PgWorkService:
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-        return [self._row_to_task(row) for row in rows]
+        keys = [(str(r[0]), int(r[1])) for r in rows]
+        rels_by_key = self._load_relationships_bulk(keys)
+        return [
+            self._row_to_task(
+                row,
+                relationships=rels_by_key.get(
+                    (str(row[0]), int(row[1])), None
+                ),
+            )
+            for row in rows
+        ]
 
     # ------------------------------------------------------------------
     # Mutable field updates
@@ -845,21 +1211,31 @@ class PgWorkService:
                     params,
                 )
             conn.commit()
-        return self.get(task_id)
+        task = self.get(task_id)
+        if self._sync is not None:
+            try:
+                self._sync.on_update(task, list(fields.keys()))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "sync.on_update failed for %s",
+                    task.task_id,
+                    exc_info=True,
+                )
+        return task
 
     def increment_plan_version(
         self,
         task_id: str,
         *,
-        actor: str = "system",  # noqa: ARG002 — audit emission is Slice C
-        reason: str | None = None,  # noqa: ARG002 — audit emission is Slice C
+        actor: str = "system",
+        reason: str | None = None,
     ) -> Task:
-        """Bump ``plan_version`` on a plan task (#1398).
+        """Bump ``plan_version`` on a plan task and emit an audit event (#1398).
 
-        Slice B keeps the version bump itself; the audit emission
-        (``plan.version_incremented``) lands when Slice C ports the
-        audit log adapter. Behavior is otherwise 1:1 with the sqlite
-        path.
+        Mirrors :meth:`SQLiteWorkService.increment_plan_version`: writes
+        ``plan_version + 1`` then emits ``plan.version_incremented`` via
+        :func:`pollypm.audit.emit` (#1773). Audit emission is best-effort
+        — a failed audit write never blocks the version bump.
         """
         project, task_number = _parse_task_id(task_id)
         with self._pool.connection() as conn:
@@ -882,6 +1258,33 @@ class PgWorkService:
                     (new_version, _now_iso(), project, task_number),
                 )
             conn.commit()
+
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_PLAN_VERSION_INCREMENTED
+
+            metadata: dict[str, object] = {
+                "task_id": task_id,
+                "old_version": old_version,
+                "new_version": new_version,
+            }
+            if reason:
+                metadata["reason"] = reason
+            _audit_emit(
+                event=EVENT_PLAN_VERSION_INCREMENTED,
+                project=project,
+                subject=task_id,
+                actor=actor or "system",
+                metadata=metadata,
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break the bump
+            logger.debug(
+                "plan version audit emit failed for %s",
+                task_id,
+                exc_info=True,
+            )
+
         return self.get(task_id)
 
     def list_successors(self, predecessor_task_id: str) -> list[Task]:
@@ -901,7 +1304,17 @@ class PgWorkService:
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(sql, (predecessor_task_id,))
             rows = cur.fetchall()
-        return [self._row_to_task(row) for row in rows]
+        keys = [(str(r[0]), int(r[1])) for r in rows]
+        rels_by_key = self._load_relationships_bulk(keys)
+        return [
+            self._row_to_task(
+                row,
+                relationships=rels_by_key.get(
+                    (str(row[0]), int(row[1])), None
+                ),
+            )
+            for row in rows
+        ]
 
     # ------------------------------------------------------------------
     # State transitions (Slice B port of the transition manager)
@@ -922,13 +1335,42 @@ class PgWorkService:
         """
         task = self.get(task_id)
         if task.work_status != WorkStatus.QUEUED:
+            if task.work_status == WorkStatus.IN_PROGRESS:
+                claimant = task.assignee or "another actor"
+                raise InvalidTransitionError(
+                    f"Task {task_id} is already claimed by '{claimant}'.\n"
+                    f"\n"
+                    f"Why: the task is in 'in_progress' and assigned. A "
+                    f"second claim would orphan the first worker's "
+                    f"session.\n"
+                    f"\n"
+                    f"Fix: use `pm task get {task_id}` to see the current "
+                    f"state. If the existing claim is stale (worker "
+                    f"session dead), hold and resume:\n"
+                    f"    pm task hold {task_id} --reason 'stale claim'\n"
+                    f"    pm task resume {task_id}\n"
+                    f"Otherwise, find an unclaimed task with `pm task next`."
+                )
             raise InvalidTransitionError(
-                f"Cannot claim task in '{task.work_status.value}' state. "
-                f"Task must be in 'queued' state."
+                f"Cannot claim task in '{task.work_status.value}' state.\n"
+                f"\n"
+                f"Why: only tasks in 'queued' state can be claimed.\n"
+                f"\n"
+                f"Fix: if the task is 'draft', run "
+                f"`pm task queue {task_id}` first. If it's 'done' or "
+                f"'cancelled', find another task with `pm task next`."
             )
         if task.blocked:
             raise InvalidTransitionError(
-                f"Cannot claim task {task_id}: it is blocked by another task."
+                f"Cannot claim task {task_id}: it is blocked by another "
+                f"task.\n"
+                f"\n"
+                f"Why: blocking tasks must reach a terminal state before "
+                f"dependents can start.\n"
+                f"\n"
+                f"Fix: run `pm task get {task_id}` to see the blockers, "
+                f"then work on those first (or unblock with "
+                f"`pm task unlink`)."
             )
 
         flow = self._load_flow(task)
@@ -1022,7 +1464,26 @@ class PgWorkService:
                     None,
                 )
             conn.commit()
-        return self.get(task_id)
+        result = self.get(task_id)
+        self._sync_transition(
+            result, WorkStatus.QUEUED.value, target_status.value
+        )
+        # Provision a worker session if a session manager is wired. Best
+        # effort — failures land in ``last_provision_error`` for the CLI
+        # to render rather than bubbling up. Mirrors the sqlite path.
+        self.last_provision_error = None
+        if self._session_mgr is not None:
+            try:
+                self._session_mgr.provision_worker(task_id, assignee)
+            except Exception as exc:  # noqa: BLE001
+                self.last_provision_error = str(exc)
+                logger.warning(
+                    "provision_worker failed for %s (actor=%s): %s",
+                    task_id,
+                    actor,
+                    exc,
+                )
+        return result
 
     def next(  # noqa: A003
         self,
@@ -1064,7 +1525,8 @@ class PgWorkService:
             task_key = (str(row[0]), int(row[1]))
             if task_key in blocked_keys:
                 continue
-            task = self._row_to_task(row)
+            rels = self._load_relationships(task_key[0], task_key[1])
+            task = self._row_to_task(row, relationships=rels)
             if agent is not None and task.roles.get("worker") != agent:
                 continue
             return task
@@ -1164,11 +1626,28 @@ class PgWorkService:
                 f"(type: {node.type.value})."
             )
 
+        # Actor-vs-role validation — sqlite's node_done runs this before
+        # the work-output coercion so a stranger trying to ``done`` a
+        # task they don't own gets the actor-role error, not a missing
+        # --output error. Mirror that here (#1771).
+        self._validate_actor_role(task, node, actor)
+
         coerced = self._coerce_work_output(work_output)
         if coerced is None:
             raise ValidationError(
                 "pm task done requires a --output payload describing "
-                "what you built."
+                "what you built.\n"
+                "\n"
+                "Why: the reviewer cannot evaluate the handoff without "
+                "a summary and at least one artifact.\n"
+                "\n"
+                "Fix: pass --output with a JSON object, e.g.:\n"
+                "    pm task done <id> --output '{\n"
+                '      "type": "code_change",\n'
+                '      "summary": "<what you built>",\n'
+                '      "artifacts": [{"kind": "commit", "description": '
+                '"impl", "ref": "HEAD"}]\n'
+                "    }'"
             )
         self._validate_work_output(coerced)
 
@@ -1198,6 +1677,9 @@ class PgWorkService:
                 )
             conn.commit()
         result = self.get(task_id)
+        self._sync_transition(
+            result, from_status.value, result.work_status.value
+        )
         self._write_review_summary_after_transition(result)
         return result
 
@@ -1273,9 +1755,41 @@ class PgWorkService:
         """Approve a review node and advance the flow."""
         task = self.get(task_id)
         if task.work_status != WorkStatus.REVIEW:
+            current = task.work_status.value
+            if current == "draft":
+                hint = (
+                    f"Fix: drafts move through the queue, not straight "
+                    f"to review. Run `pm task queue {task_id}` to queue "
+                    f"it, then have a worker claim + build it."
+                )
+            elif current == "in_progress":
+                hint = (
+                    f"Fix: the worker hasn't handed this off yet. Wait "
+                    f"for `pm task done {task_id}` to run (which moves "
+                    f"the task to 'review'), or check in with the "
+                    f"claimant '{task.assignee or 'unknown'}'."
+                )
+            elif current == "queued":
+                hint = (
+                    "Fix: this task is waiting for a worker. Approval "
+                    "comes after a worker marks it done. Claim + build "
+                    "first, or wait for a worker to pick it up."
+                )
+            else:
+                hint = (
+                    f"Fix: only tasks in 'review' can be approved. Run "
+                    f"`pm task get {task_id}` to inspect the current "
+                    f"state, or find a reviewable task with "
+                    f"`pm task list --status review`."
+                )
             raise InvalidTransitionError(
-                f"Cannot approve task in '{task.work_status.value}' state. "
-                f"Only tasks in 'review' can be approved."
+                f"Cannot approve task in '{current}' state.\n"
+                f"\n"
+                f"Why: only tasks whose current node is a review node "
+                f"(work_status = 'review') can be approved. Approving a "
+                f"non-review task would bypass the worker-build step.\n"
+                f"\n"
+                f"{hint}"
             )
         flow = self._load_flow(task)
         if task.current_node_id is None:
@@ -1285,6 +1799,11 @@ class PgWorkService:
             raise InvalidTransitionError(
                 f"Current node '{task.current_node_id}' is not a review node."
             )
+
+        # Enforce actor-vs-role authorization — same shape sqlite uses
+        # so the three-question guidance text drives reviewer errors
+        # (#1771).
+        self._validate_actor_role(task, node, actor)
 
         now = _now_iso()
         with self._pool.connection() as conn:
@@ -1310,7 +1829,22 @@ class PgWorkService:
                     cur, task, flow, node.next_node_id, actor, WorkStatus.REVIEW
                 )
             conn.commit()
-        return self.get(task_id)
+        result = self.get(task_id)
+        self._sync_transition(
+            result, WorkStatus.REVIEW.value, result.work_status.value
+        )
+        # Cascade: any dependents blocked on this task should unblock
+        # when approve drives us to DONE. Mirrors sqlite path.
+        if result.work_status == WorkStatus.DONE:
+            try:
+                self._check_auto_unblock(task_id)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "auto_unblock after approve failed for %s",
+                    task_id,
+                    exc_info=True,
+                )
+        return result
 
     def reject(self, task_id: str, actor: str, reason: str) -> Task:
         """Reject a review node and bounce the task to ``rework``."""
@@ -1400,7 +1934,11 @@ class PgWorkService:
                     reason,
                 )
             conn.commit()
-        return self.get(task_id)
+        result = self.get(task_id)
+        self._sync_transition(
+            result, WorkStatus.REVIEW.value, WorkStatus.REWORK.value
+        )
+        return result
 
     def block(self, task_id: str, actor: str, blocker_task_id: str) -> Task:
         """Mark a task blocked by ``blocker_task_id``."""
@@ -1474,7 +2012,11 @@ class PgWorkService:
                     f"Blocked by {blocker_task_id}",
                 )
             conn.commit()
-        return self.get(task_id)
+        result = self.get(task_id)
+        self._sync_transition(
+            result, old_status.value, WorkStatus.BLOCKED.value
+        )
+        return result
 
     # ------------------------------------------------------------------
     # Execution query
@@ -1624,6 +2166,183 @@ class PgWorkService:
         ]
 
     # ------------------------------------------------------------------
+    # Inbox interaction methods — reply / archive / read-marker (#1776)
+    #
+    # These four wrap context-entry primitives with the idempotency +
+    # event-emission shape the cockpit's Textual inbox screen relies
+    # on. Mirror the sqlite path so cockpit code stays backend-agnostic.
+    # ------------------------------------------------------------------
+
+    def add_reply(
+        self, task_id: str, body: str, actor: str = "user",
+    ) -> ContextEntry:
+        """Record a user reply on an inbox task.
+
+        Stored as a ``work_context_entries`` row with
+        ``entry_type='reply'`` so :meth:`list_replies` and the inbox
+        thread view can render chat turns without collision with
+        system/notes context. Raises :class:`ValidationError` when
+        ``body`` is empty after strip.
+        """
+        if not body or not body.strip():
+            raise ValidationError("Reply body must not be empty.")
+        return self.add_context(
+            task_id, actor, body.strip(), entry_type="reply",
+        )
+
+    def list_replies(self, task_id: str) -> list[ContextEntry]:
+        """Return reply entries for a task in chronological order.
+
+        Thin wrapper over :meth:`get_context` — :meth:`get_context`
+        returns newest-first; the inbox view wants oldest-first for the
+        natural reading order, so we reverse here.
+        """
+        entries = self.get_context(task_id, entry_type="reply")
+        entries.reverse()
+        return entries
+
+    def mark_read(self, task_id: str, actor: str = "user") -> bool:
+        """Record a read-marker on an inbox task if one isn't already present.
+
+        Returns ``True`` when a new marker row was written, ``False``
+        when a ``read`` row already existed (idempotent repeat-open).
+        Callers use the return value to gate event emission so the
+        activity feed only sees the *first* open.
+        """
+        project, task_number = _parse_task_id(task_id)
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT 1 FROM work_tasks "
+                    "WHERE project = %s AND task_number = %s",
+                    (project, task_number),
+                )
+                if cur.fetchone() is None:
+                    raise TaskNotFoundError(f"Task '{task_id}' not found.")
+                cur.execute(
+                    "SELECT 1 FROM work_context_entries "
+                    "WHERE task_project = %s AND task_number = %s "
+                    "AND entry_type = 'read' LIMIT 1",
+                    (project, task_number),
+                )
+                if cur.fetchone() is not None:
+                    return False
+                cur.execute(
+                    "INSERT INTO work_context_entries "
+                    "(task_project, task_number, actor, text, created_at, "
+                    "entry_type) "
+                    "VALUES (%s, %s, %s, %s, %s, 'read')",
+                    (
+                        project,
+                        task_number,
+                        actor,
+                        "opened in cockpit inbox",
+                        _now_iso(),
+                    ),
+                )
+            conn.commit()
+        return True
+
+    def archive_task(self, task_id: str, actor: str = "user") -> Task:
+        """Flip an inbox task to the chat-flow terminal state.
+
+        Idempotent: archiving an already-terminal task is a no-op and
+        returns the current record unchanged. Uses the same underlying
+        transition shape as :meth:`mark_done` (audit row + auto-unblock
+        cascade) so dashboard counts and dependency unblocking stay
+        consistent.
+        """
+        task = self.get(task_id)
+        if task.work_status in TERMINAL_STATUSES:
+            return task
+        project, task_number = task.project, task.task_number
+        now = _now_iso()
+        from_status = task.work_status
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO work_transitions ("
+                    "task_project, task_number, from_state, to_state, "
+                    "actor, reason, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        project,
+                        task_number,
+                        from_status.value,
+                        WorkStatus.DONE.value,
+                        actor,
+                        "inbox.archive",
+                        now,
+                    ),
+                )
+                cur.execute(
+                    "UPDATE work_tasks SET work_status = %s, updated_at = %s "
+                    "WHERE project = %s AND task_number = %s",
+                    (WorkStatus.DONE.value, now, project, task_number),
+                )
+            conn.commit()
+        result = self.get(task_id)
+        self._sync_transition(result, from_status.value, WorkStatus.DONE.value)
+        # Cascade: any dependents blocked on this task should unblock,
+        # same as mark_done. archive_task is effectively 'done' for the
+        # chat-flow, so we respect the same contract.
+        try:
+            self._check_auto_unblock(task_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "auto_unblock after archive failed for %s",
+                task_id,
+                exc_info=True,
+            )
+        return result
+
+    def task_numbers_with_context_entry(
+        self, *, project: str, entry_type: str,
+    ) -> set[int]:
+        """Return task numbers that have at least one entry of ``entry_type``.
+
+        Used by the inbox loader's read-marker check — collapses a
+        per-task ``get_context(..., entry_type='read', limit=1)`` loop
+        into one project-wide query.
+        """
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT DISTINCT task_number FROM work_context_entries "
+                "WHERE task_project = %s AND entry_type = %s",
+                (project, entry_type),
+            )
+            rows = cur.fetchall()
+        return {int(r[0]) for r in rows}
+
+    def bulk_list_replies(self, *, project: str) -> dict[int, list[ContextEntry]]:
+        """Return ``task_number -> [reply entries (oldest first)]``.
+
+        One query, bucketed in Python. Replaces a per-task
+        :meth:`list_replies` loop on the inbox loader hot path.
+        """
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT task_number, actor, created_at, text, entry_type "
+                "FROM work_context_entries "
+                "WHERE task_project = %s AND entry_type = 'reply' "
+                "ORDER BY id ASC",
+                (project,),
+            )
+            rows = cur.fetchall()
+        out: dict[int, list[ContextEntry]] = {}
+        for r in rows:
+            entry = ContextEntry(
+                actor=str(r[1]),
+                timestamp=r[2],
+                text=str(r[3]),
+                entry_type=str(r[4] or "reply"),
+            )
+            out.setdefault(int(r[0]), []).append(entry)
+        return out
+
+    # ------------------------------------------------------------------
     # Dependencies
     # ------------------------------------------------------------------
 
@@ -1709,7 +2428,11 @@ class PgWorkService:
             self._maybe_unblock(to_id)
 
     def dependents(self, task_id: str) -> list[Task]:
-        """All tasks blocked by this task, transitively."""
+        """All tasks blocked by this task, transitively.
+
+        Bulk-loads in a single SELECT to avoid the per-node ``get()``
+        round-trip the slice-A implementation issued (#1770).
+        """
         project, number = _parse_task_id(task_id)
         sql = """
             WITH RECURSIVE deps(project, task_number) AS (
@@ -1734,8 +2457,112 @@ class PgWorkService:
                 sql,
                 (project, number, LinkKind.BLOCKS.value, LinkKind.BLOCKS.value),
             )
-            task_keys = [(row[0], int(row[1])) for row in cur.fetchall()]
-        return [self.get(f"{p}/{n}") for p, n in task_keys]
+            task_keys = [(str(row[0]), int(row[1])) for row in cur.fetchall()]
+        if not task_keys:
+            return []
+        # Bulk-fetch every dependent in one query, then hydrate
+        # relationships in one more query — never per-row ``get()``.
+        where_clauses = " OR ".join(
+            "(project = %s AND task_number = %s)" for _ in task_keys
+        )
+        params: list[object] = []
+        for p, n in task_keys:
+            params.extend([p, n])
+        bulk_sql = (
+            "SELECT project, task_number, project_key, title, type, labels, "
+            "work_status, flow_template_id, flow_template_version, "
+            "current_node_id, assignee, priority, requires_human_review, "
+            "description, acceptance_criteria, constraints, relevant_files, "
+            "parent_project, parent_task_number, "
+            "supersedes_project, supersedes_task_number, "
+            "plan_version, predecessor_task_id, kind, roles, external_refs, "
+            "created_at, created_by, updated_at "
+            f"FROM work_tasks WHERE {where_clauses} "
+            "ORDER BY project, task_number"
+        )
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(bulk_sql, params)
+            rows = cur.fetchall()
+        rels_by_key = self._load_relationships_bulk(task_keys)
+        return [
+            self._row_to_task(
+                row,
+                relationships=rels_by_key.get(
+                    (str(row[0]), int(row[1])), None
+                ),
+            )
+            for row in rows
+        ]
+
+    def _check_auto_unblock(self, task_id: str) -> None:
+        """After a task hits a terminal state, unblock its dependents.
+
+        Mirrors :meth:`SQLiteWorkService._check_auto_unblock` /
+        :func:`service_dependencies.check_auto_unblock`. Walks the
+        outgoing ``blocks`` edges and, for each target that's still
+        BLOCKED and now has no unresolved blockers, transitions it
+        back to QUEUED with a system audit row.
+        """
+        task = self.get(task_id)
+        project, task_number = task.project, task.task_number
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT to_project, to_task_number "
+                "FROM work_task_dependencies "
+                "WHERE from_project = %s AND from_task_number = %s "
+                "AND kind = %s",
+                (project, task_number, LinkKind.BLOCKS.value),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            blocked_id = f"{row[0]}/{row[1]}"
+            try:
+                blocked_task = self.get(blocked_id)
+            except TaskNotFoundError:
+                continue
+            if blocked_task.work_status != WorkStatus.BLOCKED:
+                continue
+            if self._has_unresolved_blockers(blocked_id):
+                continue
+            self._simple_transition(
+                blocked_id,
+                from_state=WorkStatus.BLOCKED,
+                to_state=WorkStatus.QUEUED,
+                actor="system",
+                reason=f"auto-unblocked, blocker {task.task_id} completed",
+            )
+
+    def _on_cancelled(self, task_id: str) -> None:
+        """After a cancellation, leave a context note on each dependent.
+
+        Mirrors :func:`service_dependencies.on_cancelled`. The PM still
+        decides whether to unblock or cancel each dependent — we just
+        record the breadcrumb so the operator notices.
+        """
+        try:
+            task = self.get(task_id)
+        except TaskNotFoundError:
+            return
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT to_project, to_task_number "
+                "FROM work_task_dependencies "
+                "WHERE from_project = %s AND from_task_number = %s "
+                "AND kind = %s",
+                (task.project, task.task_number, LinkKind.BLOCKS.value),
+            )
+            rows = cur.fetchall()
+        for row in rows:
+            blocked_id = f"{row[0]}/{row[1]}"
+            try:
+                self.add_context(
+                    blocked_id,
+                    "system",
+                    f"blocker {task.task_id} was cancelled "
+                    "— PM must decide whether to unblock or cancel this task.",
+                )
+            except TaskNotFoundError:
+                continue
 
     # ------------------------------------------------------------------
     # Flow templates
@@ -1777,8 +2604,10 @@ class PgWorkService:
     ) -> list[GateResult]:
         """Dry-run preflight: would advancing the current node succeed?
 
-        Slice B ships the actor-role check. Full gate evaluation lands
-        in Slice C alongside the gate registry / kwargs port.
+        Mirrors :meth:`SQLiteWorkService.validate_advance` — evaluates
+        the declared gates on the current flow node plus an
+        actor-vs-role synthetic gate so permission preflight is
+        accurate (#1774).
         """
         task = self.get(task_id)
         if task.current_node_id is None:
@@ -1802,6 +2631,16 @@ class PgWorkService:
                     gate_type="hard",
                 )
             )
+        if node.gates:
+            from pollypm.work.gates import GateRegistry, evaluate_gates
+
+            registry = GateRegistry(project_path=self._project_path)
+            kwargs: dict[str, object] = {"get_task": self.get}
+            if self._project_path is not None:
+                kwargs["project_root"] = self._project_path
+            results.extend(
+                evaluate_gates(task, node.gates, registry, **kwargs)
+            )
         return results
 
     # ------------------------------------------------------------------
@@ -1811,10 +2650,10 @@ class PgWorkService:
     def sync_status(self, task_id: str) -> dict[str, object]:
         """Current sync state per adapter for a task.
 
-        Slice B reads ``work_sync_state`` and returns the per-adapter
-        map. The actual adapter list (and force-sync) lands when Slice
-        C wires the sync manager. Without an adapter manager every task
-        returns an empty dict.
+        Reads ``work_sync_state`` and merges in any registered adapters
+        that have never run (so the cockpit shows ``attempts=0`` instead
+        of hiding the adapter row). Mirrors
+        :meth:`SQLiteWorkService.sync_status`.
         """
         project, task_number = _parse_task_id(task_id)
         with self._pool.connection() as conn, conn.cursor() as cur:
@@ -1832,7 +2671,7 @@ class PgWorkService:
                 (project, task_number),
             )
             rows = cur.fetchall()
-        return {
+        result: dict[str, object] = {
             str(r[0]): {
                 "last_synced_at": r[1],
                 "last_error": r[2],
@@ -1840,20 +2679,62 @@ class PgWorkService:
             }
             for r in rows
         }
+        if self._sync is not None:
+            for adapter in self._sync.adapters:
+                name = getattr(adapter, "name", None)
+                if name and name not in result:
+                    result[name] = {
+                        "last_synced_at": None,
+                        "last_error": None,
+                        "attempts": 0,
+                    }
+        return result
+
+    def _record_sync_state(
+        self,
+        project: str,
+        task_number: int,
+        adapter_name: str,
+        *,
+        success: bool,
+        error: str | None,
+    ) -> None:
+        """Upsert a ``work_sync_state`` row after a sync attempt."""
+        now = _now_iso() if success else None
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO work_sync_state "
+                    "(task_project, task_number, adapter_name, "
+                    "last_synced_at, last_error, attempts) "
+                    "VALUES (%s, %s, %s, %s, %s, 1) "
+                    "ON CONFLICT (task_project, task_number, adapter_name) "
+                    "DO UPDATE SET "
+                    "last_synced_at = COALESCE(EXCLUDED.last_synced_at, "
+                    "work_sync_state.last_synced_at), "
+                    "last_error = EXCLUDED.last_error, "
+                    "attempts = work_sync_state.attempts + 1",
+                    (project, task_number, adapter_name, now, error),
+                )
+            conn.commit()
 
     def trigger_sync(
         self,
         task_id: str | None = None,
-        adapter: str | None = None,  # noqa: ARG002 — adapter wiring is Slice C
+        adapter: str | None = None,
     ) -> dict[str, object]:
         """Force a sync cycle.
 
-        Slice B returns ``{synced: 0, errors: {}}`` because the pg
-        service has no sync adapter manager yet — Slice C ports
-        ``service_sync.SyncManager`` to the pg pool. Callers can already
-        invoke this method; the sqlite path still goes through its own
-        adapters when they're registered there.
+        Mirrors :meth:`SQLiteWorkService.trigger_sync`: iterates every
+        task (or just ``task_id``), invokes ``on_create`` on each
+        registered adapter, and records per-adapter outcomes in
+        ``work_sync_state``. Returns
+        ``{"synced": int, "errors": {adapter_name: [task_id, ...]}}``.
+        Without a sync manager attached, returns the empty summary.
         """
+        summary: dict[str, object] = {"synced": 0, "errors": {}}
+
         if task_id is not None:
             project, task_number = _parse_task_id(task_id)
             with self._pool.connection() as conn, conn.cursor() as cur:
@@ -1864,7 +2745,55 @@ class PgWorkService:
                 )
                 if cur.fetchone() is None:
                     raise TaskNotFoundError(f"Task '{task_id}' not found.")
-        return {"synced": 0, "errors": {}}
+            task_ids = [task_id]
+        else:
+            with self._pool.connection() as conn, conn.cursor() as cur:
+                cur.execute(
+                    "SELECT project, task_number FROM work_tasks "
+                    "ORDER BY project, task_number"
+                )
+                task_ids = [f"{r[0]}/{r[1]}" for r in cur.fetchall()]
+
+        if self._sync is None:
+            return summary
+
+        adapters = [
+            item
+            for item in self._sync.adapters
+            if adapter is None or getattr(item, "name", None) == adapter
+        ]
+        if not adapters:
+            return summary
+
+        errors: dict[str, list[str]] = {}
+        synced = 0
+        for tid in task_ids:
+            try:
+                task = self.get(tid)
+            except TaskNotFoundError:
+                continue
+            project, task_number = _parse_task_id(tid)
+            for current in adapters:
+                name = getattr(current, "name", "unknown")
+                err: str | None = None
+                try:
+                    current.on_create(task)
+                except Exception as exc:  # noqa: BLE001
+                    err = str(exc)
+                    errors.setdefault(name, []).append(tid)
+                self._record_sync_state(
+                    project,
+                    task_number,
+                    name,
+                    success=(err is None),
+                    error=err,
+                )
+                if err is None:
+                    synced += 1
+
+        summary["synced"] = synced
+        summary["errors"] = errors
+        return summary
 
     # ------------------------------------------------------------------
     # Aggregate queries
@@ -1905,7 +2834,17 @@ class PgWorkService:
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(sql, (agent,))
             rows = cur.fetchall()
-        return [self._row_to_task(row) for row in rows]
+        keys = [(str(r[0]), int(r[1])) for r in rows]
+        rels_by_key = self._load_relationships_bulk(keys)
+        return [
+            self._row_to_task(
+                row,
+                relationships=rels_by_key.get(
+                    (str(row[0]), int(row[1])), None
+                ),
+            )
+            for row in rows
+        ]
 
     def blocked_tasks(self, project: str | None = None) -> list[Task]:
         """All tasks with ``work_status == blocked``."""
@@ -1929,7 +2868,17 @@ class PgWorkService:
         with self._pool.connection() as conn, conn.cursor() as cur:
             cur.execute(sql, params)
             rows = cur.fetchall()
-        return [self._row_to_task(row) for row in rows]
+        keys = [(str(r[0]), int(r[1])) for r in rows]
+        rels_by_key = self._load_relationships_bulk(keys)
+        return [
+            self._row_to_task(
+                row,
+                relationships=rels_by_key.get(
+                    (str(row[0]), int(row[1])), None
+                ),
+            )
+            for row in rows
+        ]
 
     # ------------------------------------------------------------------
     # Worker sessions
@@ -2212,38 +3161,68 @@ class PgWorkService:
     def _validate_actor_role(
         self, task: Task, node: FlowNode, actor: str
     ) -> None:
+        """Validate that ``actor`` is authorized for ``node``.
+
+        Mirrors :meth:`SQLiteWorkService._validate_actor_role`: emits the
+        three-question guidance text (#240) so workers / reviewers can
+        copy-paste the rerun command from the error itself.
+        """
         if node.actor_type == ActorType.HUMAN:
             reviewer = None
             if node.actor_role:
                 reviewer = task.roles.get(node.actor_role)
-            allowed = []
-            seen = set()
+            allowed: list[str] = []
+            seen: set[str] = set()
             for name in (reviewer, *sorted(self._HUMAN_ACTOR_NAMES)):
                 if name and name not in seen:
                     allowed.append(name)
                     seen.add(name)
             if actor not in allowed:
+                schema = "actor_type='human'"
+                if node.actor_role:
+                    schema += f", actor_role='{node.actor_role}'"
+                    if reviewer:
+                        schema += (
+                            f", task.roles['{node.actor_role}']='{reviewer}'"
+                        )
                 raise ValidationError(
-                    f"Node '{node.name}' requires human review. "
-                    f"Actor '{actor}' is not authorized."
+                    f"Node '{node.name}' requires human review ({schema}). "
+                    f"Actor '{actor}' is not authorized. "
+                    f"Accepted actors: {', '.join(repr(name) for name in allowed)}. "
+                    f"Fix: rerun this action with --actor {allowed[0]}."
                 )
         elif node.actor_type == ActorType.ROLE and node.actor_role:
-            expected = task.roles.get(node.actor_role)
-            if expected and actor != expected:
+            expected_actor = task.roles.get(node.actor_role)
+            if expected_actor and actor != expected_actor:
                 if actor != node.actor_role:
                     raise ValidationError(
                         f"Actor '{actor}' does not match role "
-                        f"'{node.actor_role}' (expected '{expected}')."
+                        f"'{node.actor_role}' (expected '{expected_actor}'). "
+                        f"Node '{node.name}' uses actor_type='role', "
+                        f"actor_role='{node.actor_role}', "
+                        f"task.roles['{node.actor_role}']='{expected_actor}'. "
+                        f"Accepted actors: '{expected_actor}' or literal role "
+                        f"name '{node.actor_role}'. "
+                        f"Fix: rerun this action with --actor {expected_actor}."
                     )
-            elif expected is None and actor != node.actor_role:
+            elif expected_actor is None and actor != node.actor_role:
                 raise ValidationError(
-                    f"Actor '{actor}' does not match role '{node.actor_role}'."
+                    f"Actor '{actor}' does not match role '{node.actor_role}'. "
+                    f"Node '{node.name}' uses actor_type='role', "
+                    f"actor_role='{node.actor_role}', but this task has no "
+                    f"binding in task.roles['{node.actor_role}']. "
+                    f"Accepted actor: '{node.actor_role}'. "
+                    f"Fix: rerun this action with --actor {node.actor_role}, "
+                    f"or update the role binding."
                 )
         elif node.actor_type == ActorType.AGENT and node.agent_name:
             if actor != node.agent_name:
                 raise ValidationError(
                     f"Node '{node.name}' is pinned to agent "
-                    f"'{node.agent_name}'. Actor '{actor}' is not authorized."
+                    f"'{node.agent_name}' (actor_type='agent', "
+                    f"agent_name='{node.agent_name}'). Actor '{actor}' is not "
+                    f"authorized. Fix: rerun this action with --actor "
+                    f"{node.agent_name}."
                 )
 
     def _advance_to_node_locked(
@@ -2473,6 +3452,12 @@ class PgWorkService:
 
     @staticmethod
     def _validate_work_output(output: WorkOutput) -> None:
+        """Validate a WorkOutput has required fields and at least one artifact.
+
+        Mirrors :meth:`SQLiteWorkService._validate_work_output` — emits the
+        three-question guidance text (#240 / #1771) so workers can
+        copy-paste the corrected --output JSON from the error.
+        """
         if not isinstance(output.type, OutputType):
             try:
                 OutputType(output.type)
@@ -2481,19 +3466,64 @@ class PgWorkService:
                     f"Invalid output type '{output.type}'."
                 )
         if not output.summary or not output.summary.strip():
-            raise ValidationError("Work output has an empty summary.")
+            raise ValidationError(
+                "Work output has an empty summary.\n"
+                "\n"
+                "Why: the reviewer needs a one-paragraph explanation of "
+                "what you built.\n"
+                "\n"
+                "Fix: include a non-empty \"summary\" in your --output "
+                "JSON, for example:\n"
+                "    pm task done <id> --output '{\n"
+                "      \"type\": \"code_change\",\n"
+                "      \"summary\": \"Implemented X; all tests green.\",\n"
+                "      \"artifacts\": [{\"kind\": \"commit\", \"description\": "
+                "\"impl\", \"ref\": \"HEAD\"}]\n"
+                "    }'"
+            )
         if not output.artifacts:
             raise ValidationError(
-                "Work output must have at least one artifact."
+                "Work output must have at least one artifact.\n"
+                "\n"
+                "Why: the reviewer needs concrete evidence of what you "
+                "built — a commit SHA, a changed file, or a recorded "
+                "action — before a task can advance to review.\n"
+                "\n"
+                "Fix: include an \"artifacts\" array in your --output "
+                "JSON. Common shapes:\n"
+                "    commit:      {\"kind\": \"commit\", \"description\": "
+                "\"impl\", \"ref\": \"HEAD\"}\n"
+                "    file change: {\"kind\": \"file_change\", \"description\": "
+                "\"docs\", \"path\": \"README.md\"}\n"
+                "    note:        {\"kind\": \"note\", \"description\": "
+                "\"investigated X; no code change needed\"}\n"
+                "\n"
+                "Full example:\n"
+                "    pm task done <id> --output '{\n"
+                "      \"type\": \"code_change\",\n"
+                "      \"summary\": \"...\",\n"
+                "      \"artifacts\": [{\"kind\": \"commit\", \"description\": "
+                "\"impl\", \"ref\": \"HEAD\"}]\n"
+                "    }'"
             )
-        for art in output.artifacts:
+        for i, art in enumerate(output.artifacts):
             if not isinstance(art.kind, ArtifactKind):
                 try:
                     ArtifactKind(art.kind)
                 except (ValueError, KeyError):
                     raise ValidationError(
-                        f"Invalid artifact kind '{art.kind}'."
+                        f"Artifact {i}: invalid kind '{art.kind}'. "
+                        f"Expected one of: commit, file_change, action, note. "
+                        f"Fix: change \"kind\" in your --output JSON to one "
+                        f"of the four supported values."
                     )
+            if not (art.description or art.ref or art.path):
+                raise ValidationError(
+                    f"Artifact {i}: must have at least one of "
+                    f"description, ref, or path. "
+                    f"Fix: add a \"description\" field, or a \"ref\" (SHA) "
+                    f"for commits, or a \"path\" for file changes."
+                )
 
     @staticmethod
     def _coerce_work_output(

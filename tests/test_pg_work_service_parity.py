@@ -302,27 +302,9 @@ class TestListNonterminalTasks:
 
 
 # ---------------------------------------------------------------------------
-# Protocol stubs (mirror of the sqlite surface — these MUST stay
-# NotImplementedError until each slice lands so a premature wire-up
-# crashes loud instead of silently doing the wrong thing).
+# Slice B+ port landed — ``claim`` / ``approve`` / ``node_done`` / ``update``
+# now have real implementations on PgWorkService. The Slice A stub-raises
+# tests that originally lived here are deleted because they tracked an
+# obsolete pre-Slice-B contract; assertions about real semantics live in
+# the test_pg_work_service_full.py / test_pg_work_service_parity.py suites.
 # ---------------------------------------------------------------------------
-
-
-class TestSliceBStubsRaiseLoudly:
-    """Slice B ports these — until then they must crash, not no-op."""
-
-    def test_claim_raises(self, pg_work_service):
-        with pytest.raises(NotImplementedError, match="Slice"):
-            pg_work_service.claim("proj/1", actor="u")
-
-    def test_approve_raises(self, pg_work_service):
-        with pytest.raises(NotImplementedError, match="Slice"):
-            pg_work_service.approve("proj/1", actor="u")
-
-    def test_node_done_raises(self, pg_work_service):
-        with pytest.raises(NotImplementedError, match="Slice"):
-            pg_work_service.node_done("proj/1", actor="u")
-
-    def test_update_raises(self, pg_work_service):
-        with pytest.raises(NotImplementedError, match="Slice"):
-            pg_work_service.update("proj/1", title="x")

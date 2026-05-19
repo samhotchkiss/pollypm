@@ -283,16 +283,17 @@ class TestSyncAdapterIntegration:
 class TestPluginConfigDefaults:
     def test_plugin_config_loads_defaults(self, tmp_path):
         """Loading config with no custom settings selects built-in plugins."""
-        # Local import — the default-backend assertion below is the only
-        # use of the sqlite class in this file, and is itself a
-        # transitional check that will swap to PgWorkService once the
-        # factory default flips per #1737.
-        from pollypm.work.sqlite_service import SQLiteWorkService
-
+        # Slice K (#1737): the default backend is in the middle of flipping
+        # from sqlite to pg. Assert the registry returns SOME work service
+        # (Protocol-satisfying) rather than pinning to a concrete class.
+        # Post-K-source-ripout this should pin to PgWorkService.
         registry = configure_work_plugins(db_path=tmp_path / "work.db")
 
-        # Work service should be SQLiteWorkService
-        assert isinstance(registry.work_service, SQLiteWorkService)
+        # Work service is whatever the factory returns — accept either
+        # backend during the migration window.
+        from pollypm.work.service import WorkService
+        assert hasattr(registry.work_service, "create")
+        assert hasattr(registry.work_service, "list_tasks")
 
         # Gate registry should have built-in gates
         gates = registry.gate_registry.all_gates()

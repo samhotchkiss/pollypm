@@ -358,7 +358,7 @@ class TestGateRegistry:
 
 
 # ---------------------------------------------------------------------------
-# Integration with SQLiteWorkService
+# Integration with the work service (pg)
 # ---------------------------------------------------------------------------
 
 

@@ -297,22 +297,69 @@ class EventProjector:
         for entry in entries: ...
     """
 
-    __slots__ = ("_state_db", "_work_dbs")
+    __slots__ = ("_state_db", "_work_dbs", "_config")
 
     def __init__(
         self,
         state_db_path: Path,
         work_db_paths: Iterable[tuple[str, Path]] = (),
+        *,
+        config: Any | None = None,
     ) -> None:
         self._state_db = Path(state_db_path)
         # list of (project_key, work_db_path) for per-project work stores.
         self._work_dbs: list[tuple[str, Path]] = [
             (key, Path(path)) for key, path in work_db_paths
         ]
+        # #1816: when ``config`` is provided and ``[storage] backend ==
+        # "postgres"`` we route state-store reads through the pg-backed
+        # Store instead of the sqlite file. Without the config the
+        # projector keeps its legacy sqlite-only behaviour so existing
+        # callers (mostly tests) don't have to thread a config in.
+        self._config = config
 
     # ------------------------------------------------------------------
     # Per-source projectors.
     # ------------------------------------------------------------------
+
+    def _open_state_store(self):
+        """Return a :class:`Store` for the state DB, or ``None``.
+
+        #1816: when the active backend is pg, route through
+        :func:`get_store` so the projector reads ``messages`` rows from
+        pg instead of the (stale) sqlite file. Falls back to the legacy
+        ``sqlite:///<state_db>`` path when no config is in scope or the
+        backend is sqlite.
+        """
+        try:
+            from pollypm.store.registry import get_store, get_store_by_url
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "activity_feed: failed to import store registry",
+                exc_info=True,
+            )
+            return None
+
+        if self._config is not None:
+            try:
+                from pollypm.storage._backend_dispatch import is_pg_backend
+            except Exception:  # noqa: BLE001
+                is_pg_backend = lambda _config=None: False  # type: ignore[assignment]
+            try:
+                if is_pg_backend(self._config):
+                    return get_store(self._config)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "activity_feed: get_store(pg) failed; falling back to sqlite",
+                )
+
+        if not self._state_db.exists():
+            return None
+        try:
+            return get_store_by_url(f"sqlite:///{self._state_db}")
+        except Exception:  # noqa: BLE001
+            logger.exception("activity_feed: failed to open Store")
+            return None
 
     def _project_from_state_store(
         self,
@@ -329,24 +376,15 @@ class EventProjector:
         'notify', 'alert')`` and reshape each row into a
         :class:`FeedEntry`.
         """
-        if not self._state_db.exists():
+        store = self._open_state_store()
+        if store is None:
             return []
 
-        try:
-            from pollypm.store.registry import get_store_by_url
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "activity_feed: failed to import store registry",
-                exc_info=True,
-            )
-            return []
-
-        try:
-            store = get_store_by_url(f"sqlite:///{self._state_db}")
-        except Exception:  # noqa: BLE001
-            logger.exception("activity_feed: failed to open Store")
-            return []
-
+        # ``get_store`` / ``get_store_by_url`` return a process-wide
+        # cached singleton — closing it would tear down the shared engine
+        # for every other caller in the process. The projector borrows
+        # the singleton and lets the registry's shutdown hook own the
+        # close() call.
         try:
             filters: dict[str, Any] = {
                 "type": ["event", "notify", "alert"],
@@ -364,11 +402,9 @@ class EventProjector:
                     "activity_feed: query_messages failed"
                 )
                 rows = []
-        finally:
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001
-                pass
+        except Exception:  # noqa: BLE001
+            logger.exception("activity_feed: query_messages outer failure")
+            rows = []
 
         entries: list[FeedEntry] = []
         for row in rows:

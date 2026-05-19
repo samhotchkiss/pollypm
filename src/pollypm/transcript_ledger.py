@@ -377,10 +377,17 @@ def token_usage_costs(
     from pollypm.storage.pg_pool import get_ro_pool
 
     pool = get_ro_pool()
+    # #1857: ``cache_read_tokens`` is not in the pg ``token_usage_hourly``
+    # schema (and pg_token_usage doesn't track it on the write side).
+    # Dropping the SUM here so the query stops crashing the cost view
+    # under pg; the report renders ``cache_read_tokens=0`` until the
+    # column is added on both sides.
+    # TODO(#1857): when pg_token_usage starts tracking cache reads, add
+    # a ``cache_read_tokens bigint`` column via a forward migration and
+    # restore ``SUM(cache_read_tokens)`` here.
     sql = (
         "SELECT LOWER(project_key) AS project_key, "
         "       SUM(tokens_used) AS total, "
-        "       SUM(cache_read_tokens) AS cache_total, "
         "       COUNT(DISTINCT substr(hour_bucket, 1, 10)) AS days_active "
         "FROM token_usage_hourly "
         "WHERE hour_bucket >= (NOW() - (%s || ' days')::interval)::text "
@@ -403,8 +410,8 @@ def token_usage_costs(
             TokenCostSummary(
                 project_key=project_key,
                 tokens_used=int(row[1]),
-                cache_read_tokens=int(row[2] or 0),
-                days_active=int(row[3]),
+                cache_read_tokens=0,
+                days_active=int(row[2]),
             )
         )
     return out

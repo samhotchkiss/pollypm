@@ -46,7 +46,14 @@ def build_projector(config: Any) -> EventProjector | None:
     state_db = getattr(getattr(config, "project", None), "state_db", None)
     if state_db is None:
         return None
-    return EventProjector(state_db, _collect_work_db_paths(config))
+    # #1816: thread the config through so the projector can detect a
+    # pg backend and route state-store reads to the pg-backed Store
+    # instead of the (possibly stale) sqlite file at ``state_db``.
+    return EventProjector(
+        state_db,
+        _collect_work_db_paths(config),
+        config=config,
+    )
 
 
 __all__ = ["build_projector"]

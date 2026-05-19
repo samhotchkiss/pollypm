@@ -573,14 +573,30 @@ def _remove_demo_repo_files(target: Path, relative_names: set[str]) -> None:
             path.unlink()
 
 
-def seed_demo_project_task(project_path: Path, *, project_key: str) -> str:
-    """Seed one small PollyPM task into the demo project's work DB."""
+def seed_demo_project_task(
+    project_path: Path,
+    *,
+    project_key: str,
+    config: PollyPMConfig | None = None,
+) -> str:
+    """Seed one small PollyPM task into the demo project's work DB.
+
+    Slice J-C (#1369, #1737): ``config`` is forwarded to the factory so
+    backend dispatch sees ``[storage] backend``. ``config=None`` keeps
+    the historical sqlite-into-``<project>/.pollypm/state.db`` path —
+    onboarding runs before the operator's config is finalised, and the
+    test contract asserts against that exact sqlite file. Callers that
+    have a config in scope should pass it through; for the pg backend
+    the seed routes to the pool instead.
+    """
     from pollypm.projects import ensure_project_scaffold
     from pollypm.work import create_work_service
 
     ensure_project_scaffold(project_path)
     db_path = project_path / ".pollypm" / "state.db"
-    with create_work_service(db_path=db_path, project_path=project_path) as svc:
+    with create_work_service(
+        db_path=db_path, project_path=project_path, config=config,
+    ) as svc:
         existing = svc.list_tasks(project=project_key)
         for task in existing:
             if task.title == DEMO_PROJECT_TASK_TITLE:

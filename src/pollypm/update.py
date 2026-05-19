@@ -204,13 +204,17 @@ def count_in_progress_tasks() -> int:
     which is the worse failure mode.
     """
     try:
-        from pollypm.config import DEFAULT_CONFIG_PATH
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
         from pollypm.work import create_work_service
         from pollypm.work.db_resolver import resolve_work_db_path
     except Exception:  # noqa: BLE001
         return 0
     try:
-        db_path = resolve_work_db_path()
+        config = load_config()
+    except Exception:  # noqa: BLE001
+        config = None
+    try:
+        db_path = resolve_work_db_path(config=config)
     except Exception:  # noqa: BLE001
         return 0
     if not db_path.exists():
@@ -226,7 +230,7 @@ def count_in_progress_tasks() -> int:
     # CLI today, but the leaky pattern would bite any future caller
     # that loops. Mirrors the close-on-exit pattern from #1069 / #1381.
     try:
-        with create_work_service(db_path=db_path) as svc:
+        with create_work_service(db_path=db_path, config=config) as svc:
             tasks = svc.list_tasks(work_status="in_progress")
     except Exception:  # noqa: BLE001
         return 0

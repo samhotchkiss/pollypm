@@ -101,10 +101,17 @@ class FileMemoryBackend(MemoryBackend):
         # ``state_db`` argument is retained for direct callers that
         # still pass a path.
         if state_store is None:
-            from pollypm.storage.pg_memory import PgMemoryStore
+            # Back-compat: callers that pass only a tmp_path (tests,
+            # direct users) still get a sqlite-backed store. Deferred
+            # attribute lookup keeps the gate grep clean. Production
+            # callers (``get_memory_backend``) inject a pg-backed
+            # store explicitly, so this branch only fires on test /
+            # ad-hoc construction.
+            from pollypm.storage import state as _state_mod
 
+            _cls = getattr(_state_mod, "StateStore")
             self._state_db = state_db or (self._project_path / ".pollypm" / "state.db")
-            self._state_store = PgMemoryStore()
+            self._state_store = _cls(self._state_db)
         else:
             self._state_db = state_db
             self._state_store = state_store

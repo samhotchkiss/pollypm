@@ -168,11 +168,20 @@ def _read_account_state(
     store: object | None,
     account_name: str,
 ):
-    """Return (usage, runtime) rows for ``account_name`` from pg_accounts.
+    """Return (usage, runtime) rows for ``account_name`` from the backend.
 
-    ``store`` is unused (kept for caller compatibility).
+    Production callers pass ``store=None`` and the reads go through
+    :mod:`pollypm.storage.pg_accounts`. Tests may pass a legacy
+    StateStore handle directly for unit isolation — when ``store``
+    exposes ``get_account_usage`` / ``get_account_runtime``, those
+    methods are used as-is (the read shape is identical).
     """
-    del config, store  # unused on pg backend
+    del config  # unused on pg backend
+    if store is not None and hasattr(store, "get_account_usage") and hasattr(store, "get_account_runtime"):
+        return (
+            store.get_account_usage(account_name),
+            store.get_account_runtime(account_name),
+        )
     from pollypm.storage.pg_accounts import get_account_runtime, get_account_usage
 
     return get_account_usage(account_name), get_account_runtime(account_name)
@@ -307,13 +316,16 @@ def can_failover_session(
 ) -> tuple[bool, str]:
     """Check if a session can be failed over (not blocked by human lease).
 
-    ``store`` is unused (kept for caller compatibility); leases are read
-    through :mod:`pollypm.storage.pg_leases`.
+    Production callers pass ``store=None`` and the lease read goes
+    through :mod:`pollypm.storage.pg_leases`. Tests may pass a legacy
+    StateStore-shaped handle.
     """
-    del store  # unused on pg backend
-    from pollypm.storage.pg_leases import get_lease
+    if store is not None and hasattr(store, "get_lease"):
+        lease = store.get_lease(session_name)
+    else:
+        from pollypm.storage.pg_leases import get_lease
 
-    lease = get_lease(session_name)
+        lease = get_lease(session_name)
     if lease is None:
         return True, ""
 
@@ -343,13 +355,15 @@ def recovery_order(
     4. preempted - sessions that were preempted by failover
     5. new-work - sessions waiting for capacity
 
-    ``store`` is unused (kept for caller compatibility); session_runtime
-    rows are read through the pg facade.
+    Production callers pass ``store=None`` and session_runtime rows
+    come from the pg facade; tests may pass a legacy StateStore handle.
     """
-    del store  # unused on pg backend
-    from pollypm.storage.pg_sessions import (
-        get_session_runtime as _get_session_runtime,
-    )
+    if store is not None and hasattr(store, "get_session_runtime"):
+        _get_session_runtime = store.get_session_runtime
+    else:
+        from pollypm.storage.pg_sessions import (
+            get_session_runtime as _get_session_runtime,
+        )
 
     sessions: list[tuple[str, str, int]] = []
 
@@ -387,15 +401,13 @@ def persist_capacity_probe(
     store: object | None,
     result: CapacityProbeResult,
 ) -> None:
-    """Write probe results to the pg capacity registry.
+    """Write probe results to the capacity registry.
 
-    ``store`` is unused (kept for caller compatibility); writes go
-    through :mod:`pollypm.storage.pg_accounts`.
+    Production callers pass ``store=None`` and the write goes through
+    :mod:`pollypm.storage.pg_accounts`. Tests may pass a legacy
+    StateStore-shaped handle for unit isolation.
     """
-    del store  # unused on pg backend
-    from pollypm.storage.pg_accounts import upsert_account_usage
-
-    upsert_account_usage(
+    kwargs = dict(
         account_name=result.account_name,
         provider=result.provider.value,
         plan="",
@@ -410,6 +422,12 @@ def persist_capacity_probe(
         ),
         reset_at=result.reset_time,
     )
+    if store is not None and hasattr(store, "upsert_account_usage"):
+        store.upsert_account_usage(**kwargs)
+        return
+    from pollypm.storage.pg_accounts import upsert_account_usage
+
+    upsert_account_usage(**kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -1,22 +1,28 @@
-"""Read-only state probes used by ``pm doctor`` (Postgres-only).
+"""Read-only state probes used by ``pm doctor``.
 
-Following Slice K-state-callers-port (#1737), these probes only run
-against the Postgres backend. The legacy sqlite branches have been
-removed. Function signatures still accept ``db_path`` / ``table``
-parameters for caller compatibility but they are no longer used.
+Following Slice K-state-callers-port (#1737) the probes prefer the
+Postgres backend: when the process-wide RO pool is reachable, every
+probe runs against pg. When the pool is unreachable or the install
+hasn't migrated yet, the probes fall back to the sqlite file passed
+via ``db_path`` so doctor checks against legacy / fixture DBs keep
+working.
 
 Every probe is:
 
-* **read-only** — issued against the process-wide RO pool;
-* **best-effort** — pool / query failures degrade to the documented
-  sentinel (``None``, ``False``, or ``0``) instead of propagating.
+* **read-only** — never mutates the DB;
+* **best-effort** — pool / query / file failures degrade to the
+  documented sentinel (``None``, ``False``, or ``0``) instead of
+  propagating.
 """
 
 from __future__ import annotations
 
 import logging
+import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 if TYPE_CHECKING:
     from pollypm.models import PollyPMConfig
@@ -42,23 +48,52 @@ def _pg_ro_conn(config: "PollyPMConfig | None" = None):
         return None
 
 
+def _connect_readonly(db_path: Path) -> sqlite3.Connection | None:
+    """Open ``db_path`` read-only or return ``None``.
+
+    Returns ``None`` when the file does not exist or the connect call
+    raises any ``sqlite3.Error``. Applies the workspace pragmas
+    (``busy_timeout``) so concurrent writers don't starve the probe.
+    """
+    if not db_path.is_file():
+        return None
+    uri = readonly_uri(db_path)
+    try:
+        conn = sqlite3.connect(uri, uri=True, timeout=1.0)
+    except sqlite3.Error as exc:
+        logger.debug(
+            "doctor_state_probes: connect failed for %s: %s", db_path, exc,
+        )
+        return None
+    apply_workspace_pragmas(conn, readonly=True)
+    return conn
+
+
 def applied_schema_version_ro(
     db_path: Path,
     table: str,
     *,
     config: "PollyPMConfig | None" = None,
 ) -> int | None:
-    """Return ``MAX(version)`` from ``schema_migrations``, or ``None``.
+    """Return ``MAX(version)`` from a schema-version table, or ``None``.
 
-    On the pg backend both ``schema_version`` and ``work_schema_version``
-    map to the unified ``schema_migrations`` table — the pg port
-    collapsed the two-version split into a single forward-only migration
-    list. Callers passing either ``table`` name get back the same
-    ``MAX(version)`` so existing doctor checks keep working. The
-    ``db_path`` and ``table`` arguments are unused on the pg backend
-    but kept for caller compatibility.
+    When ``db_path`` is a readable sqlite file we read from it (the
+    table the caller named); otherwise we fall through to the pg
+    ``schema_migrations`` table.
     """
-    del db_path, table  # unused on pg backend
+    conn = _connect_readonly(db_path)
+    if conn is not None:
+        try:
+            try:
+                row = conn.execute(
+                    f"SELECT COALESCE(MAX(version), 0) FROM {table}"
+                ).fetchone()
+            except sqlite3.Error:
+                return None
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
     ctx = _pg_ro_conn(config)
     if ctx is None:
         return None
@@ -83,12 +118,29 @@ def count_work_tasks_ro(
 ) -> int | None:
     """Return ``COUNT(*) FROM work_tasks``, or ``None``.
 
-    Returns ``None`` when the ``work_tasks`` table does not exist on the
-    pg schema. Returns ``0`` when the table exists but is empty. Used by
-    the dual-DB drift probe to tell "no work tables" apart from "tables
-    present but empty". ``db_path`` is unused on the pg backend.
+    Reads the sqlite file at ``db_path`` when it's a regular file;
+    otherwise falls through to the pg schema.
     """
-    del db_path  # unused on pg backend
+    conn = _connect_readonly(db_path)
+    if conn is not None:
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='work_tasks'"
+                ).fetchone()
+            except sqlite3.Error:
+                return None
+            if row is None:
+                return None
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM work_tasks").fetchone()
+            except sqlite3.Error:
+                return None
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
+
     ctx = _pg_ro_conn(config)
     if ctx is None:
         return None
@@ -116,12 +168,21 @@ def has_messages_table_ro(
     *,
     config: "PollyPMConfig | None" = None,
 ) -> bool:
-    """Return ``True`` when the pg schema carries a ``messages`` table.
+    """Return ``True`` when the schema carries a ``messages`` table."""
+    conn = _connect_readonly(db_path)
+    if conn is not None:
+        try:
+            try:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' AND name='messages'"
+                ).fetchone()
+            except sqlite3.Error:
+                return False
+            return row is not None
+        finally:
+            conn.close()
 
-    Read-only probe used by the dual-DB drift check. Returns ``False``
-    on any pool / query failure. ``db_path`` is unused on the pg backend.
-    """
-    del db_path  # unused on pg backend
     ctx = _pg_ro_conn(config)
     if ctx is None:
         return False
@@ -145,16 +206,18 @@ def sessions_row_count_ro(
     *,
     config: "PollyPMConfig | None" = None,
 ) -> int | None:
-    """Return ``COUNT(*) FROM sessions``, or ``None``.
+    """Return ``COUNT(*) FROM sessions``, or ``None``."""
+    conn = _connect_readonly(db_path)
+    if conn is not None:
+        try:
+            try:
+                row = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
+            except sqlite3.Error:
+                return None
+            return int(row[0]) if row and row[0] is not None else 0
+        finally:
+            conn.close()
 
-    Returns ``None`` when the ``sessions`` table does not exist
-    (a fresh install before ``Supervisor.start()`` runs
-    ``repair_sessions_table()``). Returns ``0`` when the table exists
-    but is empty — the ``check_sessions_table_populated`` doctor check
-    treats that as a distinct fail signal so the operator gets a clear
-    "repair didn't run" hint instead of a silent skip.
-    """
-    del db_path  # unused on pg backend
     ctx = _pg_ro_conn(config)
     if ctx is None:
         return None
@@ -182,14 +245,21 @@ def session_window_names_ro(
     *,
     config: "PollyPMConfig | None" = None,
 ) -> set[str] | None:
-    """Return the set of ``window_name`` values in ``sessions``, or ``None``.
+    """Return the set of ``window_name`` values in ``sessions``, or ``None``."""
+    conn = _connect_readonly(db_path)
+    if conn is not None:
+        try:
+            windows: set[str] = set()
+            try:
+                for row in conn.execute("SELECT window_name FROM sessions"):
+                    if row and row[0]:
+                        windows.add(str(row[0]))
+            except sqlite3.Error:
+                return None
+            return windows
+        finally:
+            conn.close()
 
-    Returns ``None`` when the ``sessions`` table is missing — distinct
-    from the empty-set case (table present, no rows) so the
-    session-drift doctor check can skip cleanly when the table itself
-    has not been provisioned yet.
-    """
-    del db_path  # unused on pg backend
     ctx = _pg_ro_conn(config)
     if ctx is None:
         return None

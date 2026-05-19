@@ -1916,6 +1916,44 @@ def _maybe_dispatch_to_operator(
     return "dispatched"
 
 
+def _is_pg_backend(config: Any | None) -> bool:
+    """Return ``True`` when the active storage backend is Postgres.
+
+    Mirrors :func:`pollypm.plugins_builtin.advisor.handlers.detect_changes._is_pg_backend`
+    — inlined here so the watchdog stays decoupled from the advisor.
+    Defaults to sqlite when the config can't be read.
+    """
+    if config is None:
+        return False
+    storage = getattr(config, "storage", None)
+    if storage is None:
+        return False
+    backend = getattr(storage, "backend", "sqlite")
+    if not isinstance(backend, str):
+        return False
+    return backend.strip().lower() == "postgres"
+
+
+def _resolve_notify_config(config_path: Path | None) -> Any | None:
+    """Load the active config, honouring ``--config`` when supplied.
+
+    Returns ``None`` only if ``load_config`` itself raises — callers
+    fall back to legacy behaviour in that case. Threading the config
+    object through ``get_store`` is what lets the dedup-and-emit path
+    honour ``[storage].backend = "postgres"`` (#1898 family) so the
+    watchdog stops re-enqueueing duplicates against a stale per-project
+    sqlite shadow.
+    """
+    try:
+        from pollypm.config import load_config
+
+        if config_path is not None:
+            return load_config(config_path)
+        return load_config()
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _create_operator_inbox_task(
     *,
     project_key: str,
@@ -1928,10 +1966,22 @@ def _create_operator_inbox_task(
     """Materialise the operator inbox task. Returns ``task_id`` on success.
 
     Mirrors the relevant slice of :func:`pollypm.cli_features.session_runtime.notify`
-    (the immediate-priority branch) — opens the workspace SQLAlchemy
-    store, enqueues a notify message with the dedup_key, then creates
-    the work-service task with ``roles.operator='user'`` and the
-    ``notify`` label. Any failure raises and the caller logs it.
+    (the immediate-priority branch) — opens the configured-backend Store,
+    enqueues a notify message with the dedup_key, then creates the
+    work-service task with ``roles.operator='user'`` and the ``notify``
+    label. Any failure raises and the caller logs it.
+
+    Backend routing (PG-cutover straggler fix): pre-fix this hard-coded
+    ``SQLAlchemyStore(sqlite:///<state.db>)`` for both the dedup lookup
+    and the enqueue. On a ``[storage].backend = "postgres"`` install
+    that meant ``find_open_dedup_message`` read the stale per-project
+    sqlite shadow (always empty) and the watchdog enqueued a fresh
+    notify row every 5-minute tick — the projector then mirrored each
+    one into the pg ``messages`` table, stacking 30+ duplicate rows in
+    the cockpit awaits-user inbox. Routing through
+    :func:`pollypm.store.get_store` makes the dedup query land on the
+    same backend the projector writes to, so the second tick collapses
+    onto the first via ``bump_dedup_message``.
 
     ``config_path`` (#1546 fix) — threads the active cadence config so
     alternate-config heartbeat runs route the inbox task to the right
@@ -1945,24 +1995,47 @@ def _create_operator_inbox_task(
         find_open_dedup_message,
         initial_dedup_payload,
     )
-    from pollypm.store import SQLAlchemyStore
+    from pollypm.store import get_store
     from pollypm.work import create_work_service
-    from pollypm.work.db_resolver import resolve_work_db_path
 
-    resolved_config: Any | None = None
-    if config_path is not None:
-        try:
-            from pollypm.config import load_config
+    resolved_config = _resolve_notify_config(config_path)
 
-            resolved_config = load_config(config_path)
-        except Exception:  # noqa: BLE001
-            resolved_config = None
-    db_path = resolve_work_db_path(
-        ".pollypm/state.db",
-        project=project_key,
-        config=resolved_config,
-    )
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    # The work-service factory routes by ``config.storage.backend``;
+    # ``db_path`` is sqlite-only and ignored on pg. Resolve it only
+    # when we're going to need it so we don't trip the resolver on a
+    # postgres-migrated install with no per-project sqlite file.
+    db_path: Path | None = None
+    if not _is_pg_backend(resolved_config):
+        from pollypm.work.db_resolver import resolve_work_db_path
+
+        db_path = resolve_work_db_path(
+            ".pollypm/state.db",
+            project=project_key,
+            config=resolved_config,
+        )
+
+    # ``get_store`` returns a process-wide singleton — do NOT call
+    # ``.close()`` on it. The registry tears it down on shutdown.
+    store = get_store(resolved_config) if resolved_config is not None else None
+    if store is None:
+        # Fallback for the unlikely case ``load_config`` raised. Keeps
+        # the legacy sqlite path so a config-error doesn't drop the
+        # dispatch entirely.
+        from pollypm.store import SQLAlchemyStore
+
+        if db_path is None:
+            from pollypm.work.db_resolver import resolve_work_db_path
+
+            db_path = resolve_work_db_path(
+                ".pollypm/state.db",
+                project=project_key,
+                config=None,
+            )
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        _store_owned = True
+    else:
+        _store_owned = False
+
     payload = {
         "actor": "audit_watchdog",
         "project": project_key,
@@ -2001,46 +2074,49 @@ def _create_operator_inbox_task(
                 state="closed",
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
-    finally:
-        store.close()
 
-    svc = create_work_service(
-        db_path=db_path,
-        project_path=db_path.parent.parent,
-    )
-    try:
-        task_labels = [
-            "notify",
-            "watchdog",
-            f"notify_message:{message_id}",
-        ]
-        task = svc.create(
-            title=subject,
-            description=body,
-            type="task",
-            project=project_key,
-            flow_template="chat",
-            roles={
-                "requester": "user",
-                "operator": "user",
-            },
-            priority="high",
-            created_by="audit_watchdog",
-            labels=task_labels,
-            kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
-        )
-        inbox_task_id = task.task_id
-        store2 = SQLAlchemyStore(f"sqlite:///{db_path}")
+        # ``create_work_service`` honours ``config.storage.backend`` on
+        # its own: on pg it ignores ``db_path``; on sqlite it uses the
+        # resolved path. Pass both so either branch lands correctly.
+        svc_kwargs: dict[str, Any] = {"config": resolved_config}
+        if db_path is not None:
+            svc_kwargs["db_path"] = db_path
+            svc_kwargs["project_path"] = db_path.parent.parent
+        svc = create_work_service(**svc_kwargs)
         try:
-            store2.update_message(
+            task_labels = [
+                "notify",
+                "watchdog",
+                f"notify_message:{message_id}",
+            ]
+            task = svc.create(
+                title=subject,
+                description=body,
+                type="task",
+                project=project_key,
+                flow_template="chat",
+                roles={
+                    "requester": "user",
+                    "operator": "user",
+                },
+                priority="high",
+                created_by="audit_watchdog",
+                labels=task_labels,
+                kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
+            )
+            inbox_task_id = task.task_id
+            # Reuse the same configured-backend store for the task_id
+            # back-fill so both writes land on the same backend.
+            store.update_message(
                 message_id,
                 payload={**payload, "task_id": inbox_task_id},
             )
+            return inbox_task_id
         finally:
-            store2.close()
-        return inbox_task_id
+            svc.close()
     finally:
-        svc.close()
+        if _store_owned:
+            store.close()
 
 
 # ---------------------------------------------------------------------------
@@ -2117,6 +2193,7 @@ def _create_operator_tier4_inbox_task(
     subject: str,
     body: str,
     dedup_key: str,
+    config_path: Path | None = None,
 ) -> str | None:
     """Materialise the tier-4 operator inbox task.
 
@@ -2125,18 +2202,44 @@ def _create_operator_tier4_inbox_task(
     inbox query can distinguish them. Reuses the same enqueue + create
     plumbing so the inbox surface stays unified — only the prompt + the
     label set differ.
+
+    Backend routing (PG-cutover straggler fix): same change as
+    :func:`_create_operator_inbox_task` — the dedup lookup must hit
+    whichever backend ``[storage].backend`` resolves to, otherwise the
+    tier-4 inbox row gets re-enqueued on every tick against a stale
+    sqlite shadow.
     """
     from pollypm.inbox_dedup import (
         bump_dedup_message,
         find_open_dedup_message,
         initial_dedup_payload,
     )
-    from pollypm.store import SQLAlchemyStore
+    from pollypm.store import get_store
     from pollypm.work import create_work_service
-    from pollypm.work.cli import _resolve_db_path
 
-    db_path = _resolve_db_path(".pollypm/state.db", project=project_key)
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    resolved_config = _resolve_notify_config(config_path)
+
+    db_path: Path | None = None
+    if not _is_pg_backend(resolved_config):
+        from pollypm.work.cli import _resolve_db_path
+
+        db_path = _resolve_db_path(".pollypm/state.db", project=project_key)
+
+    store = get_store(resolved_config) if resolved_config is not None else None
+    if store is None:
+        from pollypm.store import SQLAlchemyStore
+
+        if db_path is None:
+            from pollypm.work.cli import _resolve_db_path
+
+            db_path = _resolve_db_path(
+                ".pollypm/state.db", project=project_key,
+            )
+        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        _store_owned = True
+    else:
+        _store_owned = False
+
     payload = {
         "actor": "audit_watchdog",
         "project": project_key,
@@ -2176,47 +2279,45 @@ def _create_operator_tier4_inbox_task(
                 state="closed",
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
-    finally:
-        store.close()
 
-    svc = create_work_service(
-        db_path=db_path,
-        project_path=db_path.parent.parent,
-    )
-    try:
-        task_labels = [
-            "notify",
-            "watchdog",
-            "tier4",
-            f"notify_message:{message_id}",
-        ]
-        task = svc.create(
-            title=subject,
-            description=body,
-            type="task",
-            project=project_key,
-            flow_template="chat",
-            roles={
-                "requester": "user",
-                "operator": "user",
-            },
-            priority="high",
-            created_by="audit_watchdog",
-            labels=task_labels,
-            kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
-        )
-        inbox_task_id = task.task_id
-        store2 = SQLAlchemyStore(f"sqlite:///{db_path}")
+        svc_kwargs: dict[str, Any] = {"config": resolved_config}
+        if db_path is not None:
+            svc_kwargs["db_path"] = db_path
+            svc_kwargs["project_path"] = db_path.parent.parent
+        svc = create_work_service(**svc_kwargs)
         try:
-            store2.update_message(
+            task_labels = [
+                "notify",
+                "watchdog",
+                "tier4",
+                f"notify_message:{message_id}",
+            ]
+            task = svc.create(
+                title=subject,
+                description=body,
+                type="task",
+                project=project_key,
+                flow_template="chat",
+                roles={
+                    "requester": "user",
+                    "operator": "user",
+                },
+                priority="high",
+                created_by="audit_watchdog",
+                labels=task_labels,
+                kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
+            )
+            inbox_task_id = task.task_id
+            store.update_message(
                 message_id,
                 payload={**payload, "task_id": inbox_task_id},
             )
+            return inbox_task_id
         finally:
-            store2.close()
-        return inbox_task_id
+            svc.close()
     finally:
-        svc.close()
+        if _store_owned:
+            store.close()
 
 
 def _build_tier4_body(

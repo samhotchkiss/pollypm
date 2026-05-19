@@ -71,13 +71,81 @@ def test_global_assignment_used_when_project_has_no_override(tmp_path: Path) -> 
 
 
 def test_fallback_assignment_used_when_no_configured_assignment(tmp_path: Path) -> None:
+    # #1737 — claude-only configs fall back to Opus across the board
+    # (no Codex account means we can't route worker/architect to Codex).
     config = _config(tmp_path)
 
     resolved = resolve_role_assignment("reviewer", "demo", config=config)
 
-    assert resolved.alias == "sonnet-4.6"
+    assert resolved.alias == "opus-4.7"
     assert resolved.provider == "claude"
     assert resolved.source == "fallback"
+
+
+def test_dual_provider_fallback_table(tmp_path: Path) -> None:
+    # #1737 — with both Claude and Codex accounts configured but NO
+    # explicit role_assignments, each role falls back to the
+    # dual-provider default table:
+    #   operator_pm / reviewer  -> Opus (Claude)
+    #   worker / architect       -> Codex
+    #   advisor                  -> Codex
+    config = _config(tmp_path)
+    config.accounts["codex_main"] = AccountConfig(
+        name="codex_main",
+        provider=ProviderKind.CODEX,
+        home=tmp_path / ".pollypm" / "homes" / "codex_main",
+    )
+
+    expectations = {
+        "operator_pm": ("opus-4.7", "claude"),
+        "reviewer": ("opus-4.7", "claude"),
+        "worker": ("codex-gpt-5.4", "codex"),
+        "architect": ("codex-gpt-5.4", "codex"),
+        "advisor": ("codex-gpt-5.4", "codex"),
+    }
+    for role, (alias, provider) in expectations.items():
+        # operator_pm is global-only — pass project_key=None
+        project = None if role == "operator_pm" else "demo"
+        resolved = resolve_role_assignment(role, project, config=config)
+        assert resolved.alias == alias, f"role {role}: expected {alias}, got {resolved.alias}"
+        assert resolved.provider == provider, f"role {role}: expected {provider}, got {resolved.provider}"
+        assert resolved.source == "fallback"
+
+
+def test_codex_only_fallback_routes_all_roles_to_codex(tmp_path: Path) -> None:
+    # #1737 — single-provider (Codex only) fallback: every role
+    # collapses to the strongest Codex alias because there's no
+    # Claude account to route Opus-favoring roles to.
+    config = _config(tmp_path)
+    # Replace claude account with codex-only configuration.
+    config.accounts.clear()
+    config.accounts["codex_main"] = AccountConfig(
+        name="codex_main",
+        provider=ProviderKind.CODEX,
+        home=tmp_path / ".pollypm" / "homes" / "codex_main",
+    )
+
+    for role in ("operator_pm", "architect", "worker", "reviewer", "advisor"):
+        project = None if role == "operator_pm" else "demo"
+        resolved = resolve_role_assignment(role, project, config=config)
+        assert resolved.provider == "codex"
+        assert resolved.alias == "codex-gpt-5.4"
+        assert resolved.source == "fallback"
+
+
+def test_claude_only_fallback_routes_all_roles_to_claude(tmp_path: Path) -> None:
+    # #1737 — single-provider (Claude only) fallback: every role
+    # routes to Opus.
+    config = _config(tmp_path)
+    # Default _config already has only a single claude account; no
+    # additional setup needed.
+
+    for role in ("operator_pm", "architect", "worker", "reviewer", "advisor"):
+        project = None if role == "operator_pm" else "demo"
+        resolved = resolve_role_assignment(role, project, config=config)
+        assert resolved.provider == "claude"
+        assert resolved.alias == "opus-4.7"
+        assert resolved.source == "fallback"
 
 
 def test_unknown_alias_falls_through_to_next_precedence_level(

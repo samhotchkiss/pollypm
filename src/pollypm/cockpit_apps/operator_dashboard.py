@@ -420,9 +420,7 @@ def _format_section(rows, *, empty: str) -> str:
         glyph_markup = f"[{color}]{glyph}[/{color}]" if color else glyph
         project = _escape(row.project_key)
         detail = _escape(row.detail)
-        if row.state is ProjectState.IDLE:
-            lines.append(f"{glyph_markup} [dim]{project}[/dim]  [dim]{detail}[/dim]")
-        elif row.state is ProjectState.PAUSED:
+        if row.state in (ProjectState.IDLE, ProjectState.PAUSED):
             lines.append(f"{glyph_markup} [dim]{project}[/dim]  [dim]{detail}[/dim]")
         else:
             lines.append(f"{glyph_markup} [b]{project}[/b]  {detail}")
@@ -434,8 +432,6 @@ def _color_for_state(state: ProjectState) -> str:
         return "#d29922"
     if state is ProjectState.WORKING:
         return "#3fb950"
-    if state is ProjectState.IDLE:
-        return "#484f58"
-    if state is ProjectState.PAUSED:
+    if state in (ProjectState.IDLE, ProjectState.PAUSED):
         return "#484f58"
     return ""

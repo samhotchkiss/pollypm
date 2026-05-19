@@ -11,11 +11,39 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Iterable
+from typing import TYPE_CHECKING, Iterable
 
+from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
+if TYPE_CHECKING:
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------- #
+# Postgres branch (#1737, Slice C)
+# --------------------------------------------------------------------- #
+#
+# Sqlite probes walk a list of candidate per-project DB paths. Postgres
+# has one shared DB so the candidate list collapses to a single pool
+# borrow. The probes preserve the same return shape — callers above
+# storage stay unchanged.
+
+
+def _pg_ro_conn(config: "PollyPMConfig | None" = None):
+    """Borrow an RO connection from the pool or return ``None``."""
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("work_task_state: pg_pool import failed: %s", exc)
+        return None
+    try:
+        return get_ro_pool(config).connection()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("work_task_state: get_ro_pool failed: %s", exc)
+        return None
 
 
 def _candidate_paths(
@@ -58,6 +86,7 @@ def task_status_probe(
     task_number: int,
     project_path: Path,
     workspace_root: Path | None = None,
+    config: "PollyPMConfig | None" = None,
 ) -> tuple[bool, str | None]:
     """Return ``(found_any_db, status)`` for a task lookup.
 
@@ -65,6 +94,28 @@ def task_status_probe(
     Transient SQLite errors are treated as misses for that DB so callers
     can keep their existing best-effort behavior.
     """
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return False, None
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT work_status FROM work_tasks "
+                        "WHERE project = %s AND task_number = %s",
+                        (project_key, int(task_number)),
+                    )
+                    row = cur.fetchone()
+                except Exception:  # noqa: BLE001
+                    return True, None
+                if row is None:
+                    return True, None
+                status = row[0]
+                return True, status if isinstance(status, str) else None
+        except Exception:  # noqa: BLE001
+            return False, None
+
     found_any_db = False
     for db_path in _candidate_paths(project_path, workspace_root=workspace_root):
         try:
@@ -100,11 +151,40 @@ def task_numbers_with_statuses(
     project_path: Path,
     statuses: Iterable[str],
     workspace_root: Path | None = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[int]:
     """Return sorted task numbers whose ``work_status`` is in ``statuses``."""
     status_values = tuple(str(status) for status in statuses)
     if not status_values:
         return []
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return []
+        placeholders_pg = ", ".join("%s" for _ in status_values)
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT task_number FROM work_tasks "
+                        "WHERE project = %s "
+                        f"AND work_status IN ({placeholders_pg}) "
+                        "ORDER BY task_number ASC",
+                        (project_key, *status_values),
+                    )
+                    rows = cur.fetchall()
+                except Exception:  # noqa: BLE001
+                    return []
+        except Exception:  # noqa: BLE001
+            return []
+        out: list[int] = []
+        for row in rows:
+            try:
+                out.append(int(row[0]))
+            except (TypeError, ValueError):
+                continue
+        return out
+
     placeholders = ", ".join("?" for _ in status_values)
     for db_path in _candidate_paths(project_path, workspace_root=workspace_root):
         conn = _connect_readonly(db_path)
@@ -141,6 +221,7 @@ def project_task_total_fast(
     project_key: str,
     connect_timeout: float = 0.05,
     busy_timeout_ms: int = 50,
+    config: "PollyPMConfig | None" = None,
 ) -> int | None:
     """Return the work-task count for ``project_key`` quickly.
 
@@ -148,7 +229,35 @@ def project_task_total_fast(
     DB is locked/busy and the caller should surface a ``busy`` indicator
     rather than wait. Any other SQLite error is treated as ``0`` to
     preserve the previous best-effort UI behavior.
+
+    Postgres branch (#1737, Slice C): the pg pool has its own
+    busy-handling semantics, so we just run the COUNT and return 0 on
+    failure. The "busy" sentinel (``None``) only fires when the pool
+    isn't reachable at all.
     """
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return None
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM work_tasks WHERE project = %s",
+                        (project_key,),
+                    )
+                    row = cur.fetchone()
+                except Exception:  # noqa: BLE001
+                    return 0
+                if row is None:
+                    return 0
+                try:
+                    return int(row[0] or 0)
+                except (TypeError, ValueError):
+                    return 0
+        except Exception:  # noqa: BLE001
+            return 0
+
     try:
         if not db_path.exists():
             return 0
@@ -200,8 +309,36 @@ def has_work_task_rows(
     db_path: Path,
     *,
     project_key: str | None = None,
+    config: "PollyPMConfig | None" = None,
 ) -> bool:
     """Return whether ``work_tasks`` has rows, optionally scoped by project."""
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return False
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT 1 FROM information_schema.tables "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = 'work_tasks'"
+                    )
+                    if cur.fetchone() is None:
+                        return False
+                    if project_key:
+                        cur.execute(
+                            "SELECT 1 FROM work_tasks WHERE project = %s LIMIT 1",
+                            (project_key,),
+                        )
+                    else:
+                        cur.execute("SELECT 1 FROM work_tasks LIMIT 1")
+                    return cur.fetchone() is not None
+                except Exception:  # noqa: BLE001
+                    return False
+        except Exception:  # noqa: BLE001
+            return False
+
     conn = _connect_readonly(db_path)
     if conn is None:
         return False
@@ -233,8 +370,40 @@ def project_activity_probe(
     project_path: Path,
     cutoff_iso: str,
     workspace_root: Path | None = None,
+    config: "PollyPMConfig | None" = None,
 ) -> tuple[bool, bool]:
     """Return ``(is_active, has_working_task)`` from work-task rows."""
+    if is_pg_backend(config):
+        ctx = _pg_ro_conn(config)
+        if ctx is None:
+            return False, False
+        try:
+            with ctx as conn, conn.cursor() as cur:
+                try:
+                    cur.execute(
+                        "SELECT "
+                        "  SUM(CASE WHEN work_status = 'in_progress' "
+                        "           THEN 1 ELSE 0 END) AS working_count, "
+                        "  MAX(updated_at::text) AS max_updated "
+                        "FROM work_tasks WHERE project = %s",
+                        (project_key,),
+                    )
+                    row = cur.fetchone()
+                except Exception:  # noqa: BLE001
+                    return False, False
+                if row is None:
+                    return False, False
+                working_count = int(row[0] or 0)
+                max_updated = str(row[1] or "")
+                has_working_task = working_count > 0
+                is_active = bool(
+                    has_working_task
+                    or (max_updated and max_updated >= cutoff_iso)
+                )
+                return is_active, has_working_task
+        except Exception:  # noqa: BLE001
+            return False, False
+
     for db_path in _candidate_paths(project_path, workspace_root=workspace_root):
         conn = _connect_readonly(db_path)
         if conn is None:

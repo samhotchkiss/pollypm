@@ -11,9 +11,13 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
+
+if TYPE_CHECKING:
+    from pollypm.models import PollyPMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +31,18 @@ _ADVISOR_TRANSITION_SQL = (
     "LEFT JOIN work_tasks w "
     "  ON w.project = t.task_project AND w.task_number = t.task_number "
     "WHERE t.task_project = ? AND t.created_at >= ? "
+    "ORDER BY t.created_at ASC"
+)
+
+_ADVISOR_TRANSITION_PG_SQL = (
+    "SELECT t.task_project AS project, t.task_number AS task_number, "
+    "       COALESCE(w.title, '') AS title, "
+    "       t.from_state AS from_state, t.to_state AS to_state, "
+    "       t.actor AS actor, t.created_at AS created_at "
+    "FROM work_transitions t "
+    "LEFT JOIN work_tasks w "
+    "  ON w.project = t.task_project AND w.task_number = t.task_number "
+    "WHERE t.task_project = %s AND t.created_at::text >= %s "
     "ORDER BY t.created_at ASC"
 )
 
@@ -64,8 +80,14 @@ def advisor_transition_rows(
     *,
     project_key: str,
     since_iso: str,
+    config: "PollyPMConfig | None" = None,
 ) -> list[dict[str, Any]]:
     """Return transition rows for advisor change detection."""
+    if is_pg_backend(config):
+        return _pg_advisor_transition_rows(
+            project_key=project_key, since_iso=since_iso, config=config,
+        )
+
     conn = _open_readonly(db_path)
     if conn is None:
         return []
@@ -92,8 +114,14 @@ def activity_feed_transition_rows(
     *,
     since_ts: str | None,
     limit: int,
+    config: "PollyPMConfig | None" = None,
 ) -> list[dict[str, Any]]:
     """Return recent work-transition rows for activity-feed projection."""
+    if is_pg_backend(config):
+        return _pg_activity_feed_transition_rows(
+            since_ts=since_ts, limit=limit, config=config,
+        )
+
     conn = _open_readonly(db_path)
     if conn is None:
         return []
@@ -127,6 +155,84 @@ def activity_feed_transition_rows(
     finally:
         conn.close()
     return [_row_dict(row) for row in rows]
+
+
+def _pg_advisor_transition_rows(
+    *,
+    project_key: str,
+    since_iso: str,
+    config: "PollyPMConfig | None",
+) -> list[dict[str, Any]]:
+    """Postgres branch for :func:`advisor_transition_rows`.
+
+    Same column shape as the sqlite query. The pg ``created_at`` is a
+    ``timestamptz``; psycopg returns it as a ``datetime`` — callers that
+    compared the value as a string still work because the advisor wraps
+    every read in its own ``str(..)`` coerce. The dict keys land in the
+    same lower-case form as the sqlite Row factory.
+    """
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("work_transition_queries: pg_pool import failed: %s", exc)
+        return []
+    try:
+        pool = get_ro_pool(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("work_transition_queries: get_ro_pool failed: %s", exc)
+        return []
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(_ADVISOR_TRANSITION_PG_SQL, (project_key, since_iso))
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "work_transition_queries: pg advisor query failed for %s: %s",
+            project_key, exc,
+        )
+        return []
+    return [dict(zip(cols, row, strict=False)) for row in rows]
+
+
+def _pg_activity_feed_transition_rows(
+    *,
+    since_ts: str | None,
+    limit: int,
+    config: "PollyPMConfig | None",
+) -> list[dict[str, Any]]:
+    """Postgres branch for :func:`activity_feed_transition_rows`."""
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("work_transition_queries: pg_pool import failed: %s", exc)
+        return []
+    try:
+        pool = get_ro_pool(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("work_transition_queries: get_ro_pool failed: %s", exc)
+        return []
+    params: list[Any] = []
+    where = ""
+    if since_ts is not None:
+        where = "WHERE created_at::text >= %s"
+        params.append(since_ts)
+    sql = (
+        "SELECT id, task_project, task_number, from_state, to_state, "
+        f"actor, reason, created_at FROM work_transitions {where} "
+        "ORDER BY id DESC LIMIT %s"
+    )
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, (*params, int(limit)))
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "work_transition_queries: pg activity-feed query failed: %s", exc,
+        )
+        return []
+    return [dict(zip(cols, row, strict=False)) for row in rows]
 
 
 __all__ = [

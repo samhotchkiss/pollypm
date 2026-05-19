@@ -19,11 +19,14 @@ in without core taking a hard dependency on the optional plugin tree.
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from pollypm.work.models import Task
+
+logger = logging.getLogger(__name__)
 
 
 NotifyCallback = Callable[..., None]
@@ -83,6 +86,14 @@ def _resolve_default_os_adapter() -> OsApprovalNotifier | None:
     try:
         return factory()
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A broken factory disables OS banners
+        # for every approval — log so the plugin owner can spot the
+        # regression without grepping for missing toasts.
+        logger.warning(
+            "approval_notifications: default OS adapter factory raised; "
+            "OS banners disabled for this approval",
+            exc_info=True,
+        )
         return None
 
 
@@ -124,6 +135,15 @@ def notify_task_approved(
     try:
         available = adapter.is_available()
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. Treat adapter probe failures as
+        # unavailable but log — a flaky is_available masks every
+        # subsequent banner without trace.
+        logger.warning(
+            "approval_notifications: OS adapter is_available() raised for %s; "
+            "treating as unavailable",
+            getattr(adapter, "__class__", type(adapter)).__name__,
+            exc_info=True,
+        )
         available = False
     if available:
         adapter.notify(

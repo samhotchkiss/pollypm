@@ -258,7 +258,14 @@ class DefaultLaunchPlanner:
                         account, resume_token.session_id, extra_args,
                     )
                     launch = replace(launch, argv=new_argv)
-            if effective.provider is ProviderKind.CODEX and effective.role in _CONTROL_ROLES and launch.initial_input:
+            if (
+                effective.provider is ProviderKind.CODEX
+                and launch.initial_input
+                and (
+                    effective.role in _CONTROL_ROLES
+                    or effective.role == "advisor"
+                )
+            ):
                 # #1011 — pre-write ``AGENTS.md`` directly into the
                 # account's codex_home instead of stuffing the prompt
                 # into ``PM_CODEX_HOME_AGENTS_MD`` for the runtime
@@ -273,6 +280,15 @@ class DefaultLaunchPlanner:
                 # spawn-attempt history. Writing the file from the
                 # planner side keeps the launch payload small and lets
                 # the runtime launcher just exec codex.
+                #
+                # #1809 — advisor is included so the advisor profile
+                # lands in ``codex_home/AGENTS.md`` before launch. The
+                # advisor role is project-scoped (not in _CONTROL_ROLES)
+                # but its 30-minute cadence means a missed first-prompt
+                # delivery wedges the role for the whole half-hour
+                # window; we cannot rely on the send-keys kickoff race.
+                # The advisor profile is read-mostly and small enough
+                # that overwriting AGENTS.md per-launch is cheap.
                 _write_codex_agents_md_to_disk(account, launch.initial_input)
                 launch = replace(launch, initial_input=None)
             if (

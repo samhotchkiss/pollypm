@@ -334,6 +334,60 @@ def test_planner_skips_claude_system_prompt_file_when_initial_input_empty(
         assert not prompt_file.exists()
 
 
+def test_planner_writes_codex_agents_md_for_advisor(tmp_path: Path) -> None:
+    """#1809 — Codex advisor launches materialise the advisor profile as
+    ``AGENTS.md`` in the account's codex_home, mirroring the
+    control-role behaviour. Pre-fix advisor sessions on Codex booted
+    into the generic ``> Run /review on my current changes…`` placeholder
+    because no AGENTS.md was written (the gate only included
+    ``_CONTROL_ROLES``) AND the post-stabilisation send-keys kickoff
+    never fired (advisor was missing from ``_INITIAL_INPUT_ROLES`` too).
+    """
+    config = _config(tmp_path)
+    config.accounts["codex_backup"] = AccountConfig(
+        name="codex_backup",
+        provider=ProviderKind.CODEX,
+        email="codex@example.com",
+        home=tmp_path / ".pollypm/homes/codex_backup",
+    )
+    config.sessions["advisor_pollypm"] = SessionConfig(
+        name="advisor_pollypm",
+        role="advisor",
+        provider=ProviderKind.CODEX,
+        account="codex_backup",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="advisor-pollypm",
+    )
+    sup = Supervisor(config)
+    sup.ensure_layout()
+
+    launch = next(
+        item for item in sup.plan_launches()
+        if item.session.name == "advisor_pollypm"
+    )
+
+    # The Codex AGENTS.md write path consumes ``initial_input`` and
+    # nulls it on the launch spec so the runtime launcher just execs
+    # codex. Confirm the file landed in the account's codex_home with
+    # the advisor profile in it.
+    from pollypm.runtime_env import codex_home_dir
+
+    account_home = config.accounts["codex_backup"].home
+    agents_md = codex_home_dir(account_home) / "AGENTS.md"
+    assert agents_md.exists(), f"expected AGENTS.md at {agents_md}"
+    body = agents_md.read_text(encoding="utf-8")
+    # Stable marker — the advisor profile carries a recognisable header
+    # block. Compare a substring rather than the full body so the test
+    # survives routine copy edits.
+    assert (
+        "advisor" in body.lower()
+    ), f"AGENTS.md did not contain the advisor profile body:\n{body[:500]}"
+    # ``initial_input`` is nulled because the prompt is now baked into
+    # the runtime via AGENTS.md, not delivered via send-keys.
+    assert launch.initial_input is None
+
+
 def test_planner_routes_operator_to_codex_when_compatible_account_exists(tmp_path: Path) -> None:
     config = _config(tmp_path)
     config.pollypm.role_assignments["operator_pm"] = ModelAssignment(

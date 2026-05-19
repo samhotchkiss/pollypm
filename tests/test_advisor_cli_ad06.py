@@ -410,6 +410,91 @@ class TestStatus:
 
 
 # ---------------------------------------------------------------------------
+# Cadence audit emission — #1809
+# ---------------------------------------------------------------------------
+
+
+class TestTickAuditEmission:
+    """#1809 — the half-hourly tick is silent in the audit log.
+
+    Pre-fix, the only way to tell whether ``advisor.tick`` was firing
+    was to grep for ``Advisor review for <project>`` rows in the work
+    table. If ``_should_review`` skipped every project, the tick left
+    no breadcrumb at all. These tests pin the contract: every tick
+    invocation emits one ``advisor.tick.fired`` (or ``.skipped``) row
+    to the workspace audit log so an operator can reconstruct cadence
+    from grep.
+    """
+
+    def test_tick_emits_fired_audit_event_on_success(
+        self, env, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        emitted: list[dict] = []
+
+        def fake_emit(**kwargs):
+            emitted.append(kwargs)
+
+        monkeypatch.setattr("pollypm.audit.emit", fake_emit)
+        monkeypatch.setattr(tick_module, "detect_changes", lambda *a, **kw: False)
+
+        result = advisor_tick_handler({"config_path": str(env["config_path"])})
+        assert result["fired"] is True
+
+        # Exactly one fired event with the workspace-scoped project key.
+        fired = [e for e in emitted if e.get("event") == "advisor.tick.fired"]
+        assert len(fired) == 1, emitted
+        event = fired[0]
+        assert event["project"] == "_workspace"
+        assert event["actor"] == "advisor.tick"
+        assert event["status"] == "ok"
+        # Metadata carries the operator's "did this cycle do anything?"
+        # question — a list of tracked projects + an enqueued count.
+        meta = event["metadata"]
+        assert meta["tracked"] == ["proj"]
+        assert meta["enqueued"] == []
+        # ``skipped_reasons`` rolls per-project reasons into a counter so
+        # the grep target shows "no-changes: 1" rather than swallowing
+        # the diagnostic.
+        assert isinstance(meta["skipped_reasons"], dict)
+        assert meta["skipped_reasons"].get("no-changes") == 1
+
+    def test_tick_emits_skipped_audit_event_when_plugin_disabled(
+        self, env, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        env["config_path"].write_text("[advisor]\nenabled = false\n")
+        emitted: list[dict] = []
+
+        def fake_emit(**kwargs):
+            emitted.append(kwargs)
+
+        monkeypatch.setattr("pollypm.audit.emit", fake_emit)
+
+        result = advisor_tick_handler({"config_path": str(env["config_path"])})
+        assert result["fired"] is False
+        assert result["reason"] == "plugin-disabled"
+        # One skipped event lands with the disabled reason.
+        skipped = [e for e in emitted if e.get("event") == "advisor.tick.skipped"]
+        assert len(skipped) == 1, emitted
+        assert skipped[0]["metadata"]["reason"] == "plugin-disabled"
+
+    def test_tick_audit_emit_failure_does_not_block_cadence(
+        self, env, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Audit-emit failure must NEVER block the tick — losing
+        forensics is strictly better than losing cadence."""
+
+        def boom(**kwargs):
+            raise RuntimeError("audit dir wedged")
+
+        monkeypatch.setattr("pollypm.audit.emit", boom)
+        monkeypatch.setattr(tick_module, "detect_changes", lambda *a, **kw: False)
+
+        # Must not raise.
+        result = advisor_tick_handler({"config_path": str(env["config_path"])})
+        assert result["fired"] is True
+
+
+# ---------------------------------------------------------------------------
 # [advisor] config — parse + load.
 # ---------------------------------------------------------------------------
 

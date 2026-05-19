@@ -339,7 +339,14 @@ class Supervisor:
     # supervisor" tripped Claude's prompt-injection defense (the agent
     # refused the bootstrap as an injection attempt — see #1005, #1007).
     # Direction 2 from #1007: stop trying to bootstrap the pane at all.
-    _INITIAL_INPUT_ROLES = (_CONTROL_ROLES | {"worker", "architect"}) - {
+    # #1809 — ``advisor`` is included so its profile prompt is delivered
+    # on launch via the post-stabilisation send-keys kickoff. Without
+    # this entry the advisor pane booted into the Codex placeholder
+    # because no AGENTS.md was materialised (the planner only writes
+    # ``AGENTS.md`` for ``_CONTROL_ROLES``) AND no kickoff fired (this
+    # set previously excluded ``advisor``). Both delivery paths were
+    # off, so 9-of-9 advisor windows sat idle.
+    _INITIAL_INPUT_ROLES = (_CONTROL_ROLES | {"worker", "architect", "advisor"}) - {
         "heartbeat-supervisor",
     }
     #: Name of the PollyPM console/cockpit window inside a tmux session.
@@ -808,6 +815,14 @@ class Supervisor:
             return "russell"
         if session.role == "architect":
             return "architect"
+        # #1809 — advisor sessions were missing from this mapping, so the
+        # planner's ``_resolve_profile_prompt`` returned None and the
+        # advisor profile was never delivered to the Codex pane. The
+        # session booted into a generic Codex placeholder ("> Run /review
+        # on my current changes…") because no AGENTS.md was materialised
+        # and no kickoff fired.
+        if session.role == "advisor":
+            return "advisor"
         return None
 
     def _resolve_profile_prompt(self, session: SessionConfig, account: AccountConfig) -> str | None:
@@ -3861,6 +3876,22 @@ class Supervisor:
             window_target = f"{tmux_session}:0"
             self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")
         else:
+            # #1809 — duplicate-spawn race guard. The in-memory
+            # ``window_map`` snapshot above can go stale before we
+            # reach ``create_window`` if a parallel caller (e.g. the
+            # audit watchdog's role-lane spawn vs. an interactive
+            # ``pm chat`` press) wins the race and creates the
+            # canonical window in between. Re-call ``_window_map`` so
+            # this thread sees the freshest state through the same
+            # owned-sessions filter the snapshot used (avoids
+            # collisions with the host operator's personal tmux
+            # windows). Without this check, both racers passed the
+            # snapshot gate and both called ``create_window`` —
+            # producing the two ``advisor-media`` windows in #1809's
+            # reproduction.
+            fresh_window_map = self._window_map()
+            if (tmux_session, launch.window_name) in fresh_window_map:
+                return launch, None
             new_pane_id = self.session_service.tmux.create_window(tmux_session, launch.window_name, launch.command, detached=True)
             window_target = f"{tmux_session}:{launch.window_name}"
             self.session_service.tmux.set_window_option(window_target, "allow-passthrough", "on")

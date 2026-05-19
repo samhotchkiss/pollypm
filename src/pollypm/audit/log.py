@@ -215,6 +215,17 @@ EVENT_COCKPIT_PARK_SKIPPED_EXISTING = "cockpit.park_skipped_existing"
 # the audit log instead of re-running the heuristic.
 EVENT_INBOX_KIND_BACKFILLED = "inbox.kind_backfilled"
 
+# #1809 — advisor cadence forensics. ``advisor.tick`` was previously
+# silent in the audit log even when it ran: no operator could tell
+# from grep whether the cadence handler was firing, skipping
+# projects, or never invoked at all. ``advisor.tick.fired`` is
+# emitted once per tick to the workspace audit log with the tracked
+# projects + per-project outcomes in metadata so an operator can
+# trail-grep ``~/.pollypm/audit/_workspace.jsonl`` for cadence
+# evidence.
+EVENT_ADVISOR_TICK_FIRED = "advisor.tick.fired"
+EVENT_ADVISOR_TICK_SKIPPED = "advisor.tick.skipped"
+
 
 @dataclass(slots=True, frozen=True)
 class AuditEvent:

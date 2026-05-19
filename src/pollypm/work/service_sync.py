@@ -1,26 +1,51 @@
 """Sync-state helpers for the SQLite work service.
 
 Contract:
-- Inputs: a ``SQLiteWorkService``, task ids, and sync adapter names.
+- Inputs: a work-service collaborator (see :class:`_WorkService` below)
+  plus task ids and sync adapter names.
 - Outputs: persisted sync-attempt state and force-sync summaries.
 - Side effects: writes ``work_sync_state`` rows and invokes registered
   sync adapters.
 - Invariants: sync bookkeeping stays owned by the work service instead
   of leaking into callers.
+
+The helpers in this module are parameterised over a structural
+:class:`typing.Protocol` rather than the concrete
+``pollypm.work.sqlite_service.SQLiteWorkService`` class. This breaks
+the import cycle flagged in #1367 (the service top-imports this module,
+so a reverse type-annotation import — even guarded with
+``TYPE_CHECKING`` — registers as a cycle in the AST boundary scan).
+``SQLiteWorkService`` satisfies :class:`_WorkService` structurally; no
+runtime registration or subclass change is required.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+import sqlite3
+from typing import Protocol
 
+from pollypm.work.models import Task
 from pollypm.work.service_support import TaskNotFoundError, _now, _parse_task_id
+from pollypm.work.sync import SyncManager
 
-if TYPE_CHECKING:
-    from pollypm.work.sqlite_service import SQLiteWorkService
+
+class _WorkService(Protocol):
+    """Structural view of the SQLite work service used by sync helpers.
+
+    Captures the exact slice these helpers reach into so the
+    ``service_sync <-> sqlite_service`` cycle can be broken without
+    pulling the full concrete class into this module's type graph
+    (#1367 wedge).
+    """
+
+    _conn: sqlite3.Connection
+    _sync: SyncManager | None
+
+    def get(self, task_id: str) -> Task: ...
 
 
 def record_sync_state(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     project: str,
     task_number: int,
     adapter_name: str,
@@ -48,7 +73,7 @@ def record_sync_state(
 
 
 def sync_status(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     task_id: str,
 ) -> dict[str, object]:
     project, task_number = _parse_task_id(task_id)
@@ -88,7 +113,7 @@ def sync_status(
 
 
 def trigger_sync(
-    service: "SQLiteWorkService",
+    service: _WorkService,
     *,
     task_id: str | None = None,
     adapter: str | None = None,

@@ -29,6 +29,8 @@ from pollypm.storage.records import ArchitectResumeRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -63,6 +65,7 @@ def upsert_architect_resume_token(
     session_id: str,
     last_active_at: str,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Insert-or-replace the resume token row for ``project_key``.
 
@@ -73,7 +76,7 @@ def upsert_architect_resume_token(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     captured_at = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -95,12 +98,13 @@ def get_architect_resume_token(
     project_key: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> ArchitectResumeRecord | None:
     """Return the resume token for ``project_key``, or ``None``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -125,12 +129,13 @@ def clear_architect_resume_token(
     project_key: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Delete the resume token row for ``project_key`` (no-op if missing)."""
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM architect_resume_tokens WHERE project_key = %s",
@@ -141,12 +146,13 @@ def clear_architect_resume_token(
 def list_architect_resume_tokens(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[ArchitectResumeRecord]:
     """Return every stored resume token (unordered)."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

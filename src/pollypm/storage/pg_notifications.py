@@ -57,6 +57,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,6 +76,7 @@ def record_notification(
     delivery_status: str = "sent",
     execution_version: int = 0,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Record a task-assignment ping sent to ``session_name``.
 
@@ -86,7 +89,7 @@ def record_notification(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     payload = json.dumps(
         {
             "project": project,
@@ -177,6 +180,7 @@ def claim_notification_slot(
     message: str = "",
     dedupe_scope: str = "normal",
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> int | None:
     """Atomically claim a dedupe slot for a ``(session, task, version)`` ping.
 
@@ -226,7 +230,7 @@ def claim_notification_slot(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     scope = (dedupe_scope or "normal").strip() or "normal"
     now = _now()
     cutoff = now - timedelta(seconds=window_seconds)
@@ -331,6 +335,7 @@ def update_notification_status(
     delivery_status: str,
     message: str | None = None,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Update the delivery status / body of a previously-claimed slot.
 
@@ -343,7 +348,7 @@ def update_notification_status(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now()
     with pool.connection() as conn, conn.cursor() as cur:
         if message is None:
@@ -384,6 +389,7 @@ def was_notified_within(
     execution_version: int = 0,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> bool:
     """Return ``True`` if ``(session, task, version)`` was pinged inside the window.
 
@@ -397,7 +403,7 @@ def was_notified_within(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     cutoff = _now() - timedelta(seconds=window_seconds)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -427,6 +433,7 @@ def recent_notifications(
     task_id: str | None = None,
     limit: int = 500,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[dict[str, Any]]:
     """Return a reverse-chronological slice of pickup notifications.
 
@@ -435,7 +442,7 @@ def recent_notifications(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     clauses: list[str] = []
     params: list[Any] = []
     if since_seconds is not None:

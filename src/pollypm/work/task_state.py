@@ -45,6 +45,7 @@ def active_task_numbers(project: Any, *, config: Any = None) -> list[int]:
         project_path=Path(project_path),
         statuses=ACTIVE_TASK_STATUSES,
         workspace_root=_workspace_root(config),
+        config=config,
     )
 
 
@@ -62,6 +63,7 @@ def user_waiting_task_ids(config: Any) -> frozenset[str]:
             project_path=Path(project_path),
             statuses=USER_WAITING_STATUSES,
             workspace_root=None,
+            config=config,
         )
         out.update(f"{project_key}/{number}" for number in numbers)
     return frozenset(out)
@@ -71,15 +73,17 @@ def has_work_tasks_in_db(
     db_path: Path,
     *,
     project_key: str | None = None,
+    config: Any = None,
 ) -> bool:
     """Return whether a work DB has task rows without exposing SQLite to callers."""
-    return has_work_task_rows(Path(db_path), project_key=project_key)
+    return has_work_task_rows(Path(db_path), project_key=project_key, config=config)
 
 
 def project_task_total_fast_count(
     db_path: Path,
     *,
     project_key: str,
+    config: Any = None,
 ) -> int | None:
     """Return a project's work-task count quickly, or ``None`` if the DB is busy.
 
@@ -87,7 +91,9 @@ def project_task_total_fast_count(
     blocking the UI mount on a locked DB; ``None`` lets callers surface
     a ``busy`` label instead of waiting on the writer.
     """
-    return project_task_total_fast(Path(db_path), project_key=project_key)
+    return project_task_total_fast(
+        Path(db_path), project_key=project_key, config=config,
+    )
 
 
 def project_activity(
@@ -106,6 +112,7 @@ def project_activity(
         project_path=Path(project_path),
         cutoff_iso=cutoff_iso,
         workspace_root=_workspace_root(config),
+        config=config,
     )
 
 
@@ -142,6 +149,7 @@ def task_window_terminal_or_missing(config: Any, name: str) -> bool:
         task_number=task_number,
         project_path=Path(project_path),
         workspace_root=_workspace_root(config),
+        config=config,
     )
     if status is None:
         return True

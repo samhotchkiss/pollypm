@@ -41,6 +41,8 @@ from pollypm.storage.records import AlertRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -129,6 +131,7 @@ def upsert_alert(
     message: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Insert-or-update an open alert keyed on ``(scope=session_name, sender=alert_type)``.
 
@@ -141,7 +144,7 @@ def upsert_alert(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     subject = f"[Alert] {message}"
     with pool.connection() as conn, conn.cursor() as cur:
@@ -244,6 +247,7 @@ def clear_alert(
     alert_type: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Close every open alert whose ``(scope, sender)`` matches.
 
@@ -253,7 +257,7 @@ def clear_alert(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -272,12 +276,13 @@ def clear_alert(
 def open_alerts(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[AlertRecord]:
     """Return every open alert, newest ``updated_at`` first."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -295,6 +300,7 @@ def get_alert(
     alert_id: int,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> AlertRecord | None:
     """Return a single alert row by id, or ``None`` if absent.
 
@@ -304,7 +310,7 @@ def get_alert(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -324,6 +330,7 @@ def clear_alert_by_id(
     alert_id: int,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> AlertRecord | None:
     """Close one specific alert row by id.
 
@@ -338,7 +345,7 @@ def clear_alert_by_id(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -355,6 +362,7 @@ def clear_alert_by_id(
 def deduplicate_alerts(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> int:
     """Drop duplicate open alerts, keeping the most recently updated row.
 
@@ -367,7 +375,7 @@ def deduplicate_alerts(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

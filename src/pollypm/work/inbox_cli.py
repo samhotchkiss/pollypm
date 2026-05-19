@@ -1250,13 +1250,31 @@ def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
 
 
 _BACKFILL_HINT = (
-    "Re-run with --commit to apply; unmatched rows stay legacy and "
-    "remain visible to the awaits_user predicate."
+    "Re-run with --commit to apply; unmatched rows stay legacy."
 )
 
 
+def _resolve_backfill_store() -> Any:
+    """Return the configured-backend ``Store`` for backfill reads/writes.
+
+    Routes through :func:`pollypm.store.get_store` so the helper honours
+    ``[storage].backend`` (sqlite vs postgres) rather than hard-coding a
+    sqlite URL. On postgres, the returned :class:`PgStore` shares the
+    process-wide RW pool — the caller must NOT ``close()`` the singleton
+    (see :func:`pollypm.store.registry.get_store` docstring).
+
+    Issue #1811: the pre-cutover path constructed ``SQLAlchemyStore(
+    sqlite:///...)`` directly, which silently read the empty sqlite shadow
+    when the active backend was postgres and reported "0 legacy rows" while
+    live pg traffic went un-reclassified.
+    """
+    from pollypm.config import load_config
+    from pollypm.store import get_store
+
+    return get_store(load_config())
+
+
 def _legacy_message_rows(
-    db_path: str,
     *,
     project: str | None,
 ) -> list[dict[str, Any]]:
@@ -1270,23 +1288,18 @@ def _legacy_message_rows(
     ``query_messages`` does not accept ``kind`` as a server-side filter,
     so we trim in Python after the call. The volume is bounded (low
     hundreds for the original 2026-05-17 sample); a wider filter would
-    require widening :meth:`SQLAlchemyStore.query_messages` and is out
-    of scope for the one-shot migration helper.
+    require widening the Store protocol and is out of scope for the
+    one-shot migration helper.
     """
-    from pollypm.store import SQLAlchemyStore
-
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
-    try:
-        filters: dict[str, Any] = dict(
-            recipient="user",
-            state="open",
-            type=["notify", "inbox_task", "alert"],
-        )
-        if project:
-            filters["scope"] = project
-        rows = store.query_messages(**filters)
-    finally:
-        store.close()
+    store = _resolve_backfill_store()
+    filters: dict[str, Any] = dict(
+        recipient="user",
+        state="open",
+        type=["notify", "inbox_task", "alert"],
+    )
+    if project:
+        filters["scope"] = project
+    rows = store.query_messages(**filters)
 
     legacy_rows: list[dict[str, Any]] = []
     for row in rows:
@@ -1315,19 +1328,19 @@ def _title_preview(title: str, limit: int = 60) -> str:
 
 
 def _apply_kind_update(
-    db_path: str,
     *,
     msg_id: int,
     new_kind: InboxItemKind,
 ) -> None:
-    """Persist a single ``messages.kind`` reclassification."""
-    from pollypm.store import SQLAlchemyStore
+    """Persist a single ``messages.kind`` reclassification.
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
-    try:
-        store.update_message(msg_id, kind=new_kind.value)
-    finally:
-        store.close()
+    Routes through :func:`_resolve_backfill_store` so the write hits
+    whichever backend ``[storage].backend`` resolves to. The singleton
+    Store is NOT closed here — that's the registry's responsibility on
+    process shutdown.
+    """
+    store = _resolve_backfill_store()
+    store.update_message(msg_id, kind=new_kind.value)
 
 
 def _emit_backfill_audit(
@@ -1365,7 +1378,6 @@ def _emit_backfill_audit(
 
 
 def _legacy_task_rows(
-    db_path: str,
     *,
     project: str | None,
 ) -> list[Any]:
@@ -1377,15 +1389,17 @@ def _legacy_task_rows(
     intentionally included: the user's 2026-05-17 dashboard surfaced
     cancelled ``audit_watchdog`` rows, and the awaits-user predicate
     treats ``legacy`` as visible regardless of work_status.
+
+    Routes through :func:`pollypm.work.create_work_service` with the
+    loaded config so the factory's backend dispatch picks the active
+    ``[storage].backend`` (#1811). Passing ``db_path`` here would force
+    the sqlite branch and read the empty pre-cutover shadow.
     """
+    from pollypm.config import load_config
     from pollypm.work import create_work_service
 
-    from pathlib import Path
-
-    svc = create_work_service(
-        db_path=db_path,
-        project_path=Path(db_path).parent.parent,
-    )
+    config = load_config()
+    svc = create_work_service(config=config, project_key=project)
     try:
         tasks = svc.list_tasks(project=project)
     finally:
@@ -1406,20 +1420,22 @@ def _task_classification(task: Any) -> Classification | None:
 
 
 def _apply_task_kind_update(
-    db_path: str,
     *,
     task_id: str,
     new_kind: InboxItemKind,
+    project: str | None,
 ) -> None:
-    """Persist a single ``work_tasks.kind`` reclassification."""
+    """Persist a single ``work_tasks.kind`` reclassification.
+
+    Routes through :func:`pollypm.work.create_work_service` with the
+    loaded config so backend dispatch matches the read path in
+    :func:`_legacy_task_rows` (#1811).
+    """
+    from pollypm.config import load_config
     from pollypm.work import create_work_service
 
-    from pathlib import Path
-
-    svc = create_work_service(
-        db_path=db_path,
-        project_path=Path(db_path).parent.parent,
-    )
+    config = load_config()
+    svc = create_work_service(config=config, project_key=project)
     try:
         svc.backfill_kind(task_id, new_kind=new_kind.value)
     finally:
@@ -1478,10 +1494,15 @@ def backfill_kinds(
     # Default = dry-run. --commit is the explicit opt-in to mutation.
     effective_commit = bool(commit)
 
-    db_path = _resolve_db_path(db, project=project)
+    # ``--db`` is accepted but no longer used directly — the configured
+    # backend (sqlite vs postgres) is resolved via ``load_config()`` so
+    # the helper reads the same DB ``pm inbox`` reads. See #1811: the
+    # pre-cutover path hard-coded a sqlite URL and silently missed
+    # everything during the pg cutover.
+    del db
 
     try:
-        message_rows = _legacy_message_rows(db_path, project=project)
+        message_rows = _legacy_message_rows(project=project)
     except Exception as exc:  # noqa: BLE001
         typer.echo(
             f"Error: failed to read legacy inbox rows ({exc}).",
@@ -1490,7 +1511,7 @@ def backfill_kinds(
         raise typer.Exit(code=1) from exc
 
     try:
-        task_rows = _legacy_task_rows(db_path, project=project)
+        task_rows = _legacy_task_rows(project=project)
     except Exception as exc:  # noqa: BLE001
         typer.echo(
             f"Error: failed to read legacy work_task rows ({exc}).",
@@ -1548,7 +1569,7 @@ def backfill_kinds(
                 continue
             try:
                 _apply_kind_update(
-                    db_path, msg_id=msg_id, new_kind=classification.kind,
+                    msg_id=msg_id, new_kind=classification.kind,
                 )
             except Exception as exc:  # noqa: BLE001
                 msg_failures.append((msg_id, str(exc)))
@@ -1596,9 +1617,9 @@ def backfill_kinds(
                 continue
             try:
                 _apply_task_kind_update(
-                    db_path,
                     task_id=task_id,
                     new_kind=classification.kind,
+                    project=project,
                 )
             except Exception as exc:  # noqa: BLE001
                 task_failures.append((task_id, str(exc)))

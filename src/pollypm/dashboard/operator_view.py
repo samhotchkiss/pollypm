@@ -1,20 +1,24 @@
 """Operator dashboard data loader (#1572).
 
 Bridges the leaf categorization module to the workspace's project
-config + per-project work-service DBs. Keeps the I/O side-effects
+config + the canonical work-service. Keeps the I/O side-effects
 out of :mod:`pollypm.dashboard.categorization` so the categorizer
 stays trivially unit-testable against a mock work service.
 
-The loader mirrors :func:`pollypm.cockpit_inbox.pm_inbox_awaits_user_list`'s
-DB-discovery shape: one work-service handle per (project, db_path)
-tuple, opened with the canonical workspace DB and the legacy
-per-project DB so paused-with-work projects still surface.
+Post-#1634 perf fix: open ONE work-service handle keyed on the
+workspace config (which resolves to the canonical workspace DB on
+sqlite and the pg pool on postgres) and prefetch every project's
+tasks + active worker sessions in two bulk queries before categorizing.
+The historic per-project fanout opened a fresh sqlite handle per
+project even on a postgres backend (``_open_work_service`` did not
+forward ``config`` to the factory, so the resolver fell back to
+``"sqlite"``) and queried stale ``state.db`` files on every dashboard
+mount — 12 projects × ~5–350ms sqlite opens dominated the cold path.
 """
 
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -30,31 +34,26 @@ from pollypm.dashboard.categorization import (
     why_waiting,
 )
 
-# #1630 — cap concurrent per-project sqlite opens. Each project costs
-# one sqlite ``open`` plus a small number of read queries; 12 projects
-# was measured at ~12s serial on the operator dashboard. A modest pool
-# (capped to avoid swamping the FS / GIL when the worker count >>
-# project count) brings the sweep close to single-project latency.
-_MAX_PARALLEL_PROJECT_SCANS = 8
-
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
 class _ProjectScan:
-    """Resolved scan target — project key + a list of DB paths to try."""
+    """Resolved scan target — project key + tracked flag.
+
+    Pre-#1634 this also carried per-project ``db_paths`` for the
+    sqlite fanout; post-fix the loader opens ONE shared work-service
+    via the factory's config-resolved path, so the per-project DB
+    list is no longer needed.
+    """
 
     project_key: str
     project_path: Path
-    db_paths: tuple[Path, ...]
     tracked: bool
 
 
 def _collect_project_scans(config) -> list[_ProjectScan]:  # noqa: ANN001
-    """Resolve (project_key, project_path, db_paths, tracked) tuples."""
-    project_settings = getattr(config, "project", None)
-    workspace_root = getattr(project_settings, "workspace_root", None)
-
+    """Resolve (project_key, project_path, tracked) tuples for every project."""
     scans: list[_ProjectScan] = []
     seen_projects: set[str] = set()
     projects = getattr(config, "projects", {}) or {}
@@ -63,30 +62,10 @@ def _collect_project_scans(config) -> list[_ProjectScan]:  # noqa: ANN001
             continue
         seen_projects.add(project_key)
         project_path = Path(getattr(project, "path", "."))
-        db_candidates: list[Path] = []
-
-        def _add(p: object) -> None:
-            try:
-                candidate = Path(p)
-            except TypeError:
-                return
-            if candidate in db_candidates:
-                return
-            try:
-                if candidate.exists():
-                    db_candidates.append(candidate)
-            except OSError:
-                return
-
-        if workspace_root is not None:
-            _add(Path(workspace_root) / ".pollypm" / "state.db")
-        _add(project_path / ".pollypm" / "state.db")
-
         scans.append(
             _ProjectScan(
                 project_key=str(project_key),
                 project_path=project_path,
-                db_paths=tuple(db_candidates),
                 tracked=bool(getattr(project, "tracked", False)),
             )
         )
@@ -120,61 +99,37 @@ def _waiting_items_by_project(config) -> dict[str, list]:  # noqa: ANN001
     return grouped
 
 
-def _open_work_service(scan: _ProjectScan):  # noqa: ANN202
-    """Open the first work-service handle that has rows for ``scan``.
+def _open_shared_work_service(config):  # noqa: ANN001, ANN202
+    """Open one work-service handle keyed on ``config``.
 
-    Mirrors ``cockpit_rail._project_tasks_for_rollup``'s canonical →
-    legacy walk: try each candidate DB in order, prefer the first one
-    that returns at least one task row for the project key, fall
-    through to the next candidate when the current DB is empty. This
-    keeps the dashboard and the rail in sync on which DB a project's
-    state lives in — without it, a canonical workspace DB that simply
-    opens (but has no rows for the project) would silently shadow the
-    legacy per-project DB where the real work lives.
+    The factory routes to the configured backend (pg pool on
+    ``storage.backend = "postgres"``, the canonical workspace
+    ``state.db`` on sqlite). Returns ``None`` on import / open
+    failure so the caller can degrade rather than crash the
+    dashboard.
 
-    Returns the handle the caller should close.
+    #1634 — replaces ``_open_work_service`` which opened a fresh
+    sqlite handle per project (the historic dual-DB fallback walk)
+    even on a pg backend, since the legacy callsite never forwarded
+    ``config`` to the factory.
     """
-    from pollypm.work import create_work_service
-
-    fallback = None
-    for db_path in scan.db_paths:
-        try:
-            svc = create_work_service(
-                db_path=db_path, project_path=scan.project_path,
-            )
-        except Exception:  # noqa: BLE001
-            # #1355: previously silent. A failed open here silently skips
-            # this DB candidate — log so a bad workspace/legacy path is
-            # debuggable instead of "the project just disappears".
-            logger.warning(
-                "operator_view: create_work_service failed for %s (project=%s)",
-                db_path,
-                scan.project_key,
-                exc_info=True,
-            )
-            continue
-        try:
-            tasks = svc.list_tasks(project=scan.project_key)
-        except Exception:  # noqa: BLE001
-            # #1355: previously silent. An empty task list here drops us
-            # to fallback selection; log so a broken list_tasks doesn't
-            # masquerade as "no work in this DB".
-            logger.warning(
-                "operator_view: list_tasks failed for project=%s db=%s",
-                scan.project_key,
-                db_path,
-                exc_info=True,
-            )
-            tasks = []
-        if tasks:
-            if fallback is not None and fallback is not svc:
-                _safe_close(fallback)
-            return svc
-        if fallback is None:
-            fallback = svc
-        else:
-            _safe_close(svc)
-    return fallback
+    try:
+        from pollypm.work import create_work_service
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "operator_view: create_work_service import failed",
+            exc_info=True,
+        )
+        return None
+    try:
+        return create_work_service(config=config)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "operator_view: create_work_service(config=...) failed; "
+            "dashboard will degrade to inbox-only categorization",
+            exc_info=True,
+        )
+        return None
 
 
 def _safe_close(svc) -> None:  # noqa: ANN001
@@ -184,6 +139,142 @@ def _safe_close(svc) -> None:  # noqa: ANN001
             close()
         except Exception:  # noqa: BLE001
             pass
+
+
+def _prefetch_project_state(config, svc) -> tuple[  # noqa: ANN001
+    "dict[str, list]", "dict[str, list]"
+]:
+    """Return ``(tasks_by_alias, workers_by_alias)`` in two bulk queries.
+
+    Single ``list_tasks(project=None)`` + ``list_worker_sessions(project=None,
+    active_only=True)`` against the shared work-service, grouped in
+    Python by the project alias each row carries. The categorizer then
+    reads its per-project slice from these dicts via
+    :func:`pollypm.work.project_aliases.project_storage_aliases` —
+    replacing N ``list_tasks(project=<key>)`` calls and N
+    ``list_worker_sessions(project=<key>)`` calls with two queries.
+    """
+    tasks_by_alias: dict[str, list] = {}
+    workers_by_alias: dict[str, list] = {}
+    if svc is None:
+        return tasks_by_alias, workers_by_alias
+    try:
+        all_tasks = svc.list_tasks()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "operator_view: bulk list_tasks failed; categorization "
+            "degrades to inbox-only",
+            exc_info=True,
+        )
+        all_tasks = []
+    for task in all_tasks or []:
+        key = str(getattr(task, "project", "") or "")
+        if not key:
+            continue
+        tasks_by_alias.setdefault(key, []).append(task)
+    try:
+        all_workers = svc.list_worker_sessions(active_only=True)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "operator_view: bulk list_worker_sessions failed; "
+            "live-worker WORKING signal will degrade",
+            exc_info=True,
+        )
+        all_workers = []
+    for session in all_workers or []:
+        key = str(getattr(session, "task_project", "") or "")
+        if not key:
+            continue
+        workers_by_alias.setdefault(key, []).append(session)
+    return tasks_by_alias, workers_by_alias
+
+
+def _aliases_for(config, project_key: str) -> list[str]:  # noqa: ANN001
+    """Resolve every storage alias for ``project_key`` (defensive)."""
+    try:
+        from pollypm.work.project_aliases import project_storage_aliases
+
+        return project_storage_aliases(config, project_key)
+    except Exception:  # noqa: BLE001
+        return [project_key]
+
+
+class _ProjectSliceService:
+    """Read-only adapter exposing one project's pre-fetched rows.
+
+    Implements the :class:`_WorkServiceLike` Protocol the categorizer
+    consumes (``list_tasks`` / ``list_worker_sessions`` / ``get``)
+    without touching the underlying DB. The shared svc has already
+    paid the round-trip; this adapter just hands the categorizer the
+    per-project slice keyed on every known alias for the project.
+    """
+
+    __slots__ = ("_project_key", "_aliases", "_tasks", "_workers", "_svc")
+
+    def __init__(
+        self,
+        project_key: str,
+        aliases: list[str],
+        tasks_by_alias: dict[str, list],
+        workers_by_alias: dict[str, list],
+        shared_svc,
+    ) -> None:
+        self._project_key = project_key
+        self._aliases = aliases
+        self._tasks = tasks_by_alias
+        self._workers = workers_by_alias
+        self._svc = shared_svc
+
+    def list_tasks(
+        self, *, project: str | None = None, **_kwargs: object,
+    ) -> list:
+        out: list = []
+        seen: set[str] = set()
+        # ``project=None`` returns everything we have for this slice;
+        # the categorizer always passes the project key explicitly,
+        # so this branch is just a defensive default.
+        target_aliases = (
+            self._aliases if project is None else [project, *self._aliases]
+        )
+        for alias in target_aliases:
+            for task in self._tasks.get(alias, []):
+                tid = getattr(task, "task_id", None)
+                if tid and tid in seen:
+                    continue
+                if tid:
+                    seen.add(tid)
+                out.append(task)
+        return out
+
+    def list_worker_sessions(
+        self, *, project: str | None = None, active_only: bool = True,
+    ) -> list:
+        del project  # adapter is already project-scoped
+        del active_only  # prefetch already filters to active_only=True
+        out: list = []
+        seen: set[tuple[str, object]] = set()
+        for alias in self._aliases:
+            for session in self._workers.get(alias, []):
+                key = (alias, getattr(session, "task_number", None))
+                if key in seen:
+                    continue
+                seen.add(key)
+                out.append(session)
+        return out
+
+    def get(self, task_id: str):  # noqa: ANN201
+        # Categorizer's ``what_working`` reaches for a task title via
+        # ``svc.get`` after picking a worker; route the single-row
+        # fetch through the shared svc so we don't have to prefetch
+        # every task body. Falls back to a scan over the prefetched
+        # slice when no shared svc is available.
+        if self._svc is not None and hasattr(self._svc, "get"):
+            return self._svc.get(task_id)
+        for alias in self._aliases:
+            for task in self._tasks.get(alias, []):
+                if getattr(task, "task_id", "") == task_id:
+                    return task
+        raise KeyError(task_id)
 
 
 def load_operator_view(config_path: Path) -> OperatorDashboardView:
@@ -202,88 +293,53 @@ def load_operator_view(config_path: Path) -> OperatorDashboardView:
 
 
 def _scan_to_row(
-    scan: _ProjectScan, items: list,
+    scan: _ProjectScan,
+    items: list,
+    *,
+    slice_svc: "_ProjectSliceService | None",
 ) -> OperatorDashboardRow:
-    """Per-project worker: open the DB, categorize, return the row.
+    """Categorize one project using a pre-fetched slice adapter.
 
-    Extracted from ``load_operator_view_from_config`` so it can run on
-    a worker thread without sharing mutable state with peer scans —
-    each call opens its own work-service handle and closes it before
-    returning. This keeps the parallel sweep correctness-equivalent to
-    the original serial loop (#1630).
+    Pre-#1634 every call opened its own sqlite handle; now the per-
+    project slice is supplied by the caller (one shared work-service
+    feeds every scan) so the categorizer pays only Python work.
     """
-    svc = _open_work_service(scan)
-    try:
-        if svc is None:
-            state = (
-                ProjectState.WAITING if items
-                else (ProjectState.PAUSED if not scan.tracked else ProjectState.IDLE)
-            )
-            detail = (
-                why_waiting(items) if state is ProjectState.WAITING
-                else ("Paused" if state is ProjectState.PAUSED else "Quiet")
-            )
-            return OperatorDashboardRow(
-                project_key=scan.project_key,
-                state=state,
-                glyph=glyph_for_project_state(state),
-                detail=detail,
-            )
-        state = categorize_project(
-            scan.project_key,
-            work_service=svc,
-            inbox_items=items,
-            tracked=scan.tracked,
+    if slice_svc is None:
+        state = (
+            ProjectState.WAITING if items
+            else (ProjectState.PAUSED if not scan.tracked else ProjectState.IDLE)
         )
-        glyph = glyph_for_project_state(state)
-        if state is ProjectState.WAITING:
-            detail = why_waiting(items)
-        elif state is ProjectState.WORKING:
-            detail = what_working(scan.project_key, work_service=svc)
-        elif state is ProjectState.PAUSED:
-            detail = "Paused"
-        else:
-            detail = "Quiet"
+        detail = (
+            why_waiting(items) if state is ProjectState.WAITING
+            else ("Paused" if state is ProjectState.PAUSED else "Quiet")
+        )
         return OperatorDashboardRow(
             project_key=scan.project_key,
             state=state,
-            glyph=glyph,
+            glyph=glyph_for_project_state(state),
             detail=detail,
         )
-    finally:
-        if svc is not None:
-            _safe_close(svc)
-
-
-def _parallel_scan_rows(
-    scans: list[_ProjectScan],
-    waiting_by_project: dict[str, list],
-) -> list[OperatorDashboardRow]:
-    """Run ``_scan_to_row`` over ``scans`` with a small thread pool.
-
-    Falls through to a serial loop when there's only one scan — the
-    pool overhead isn't worth it. Bounded at
-    :data:`_MAX_PARALLEL_PROJECT_SCANS` so a 50-project workspace
-    doesn't open 50 sqlite handles at once.
-    """
-    if len(scans) <= 1:
-        return [
-            _scan_to_row(scan, waiting_by_project.get(scan.project_key, []))
-            for scan in scans
-        ]
-    max_workers = min(_MAX_PARALLEL_PROJECT_SCANS, len(scans))
-    with ThreadPoolExecutor(
-        max_workers=max_workers,
-        thread_name_prefix="operator-scan",
-    ) as pool:
-        return list(
-            pool.map(
-                lambda scan: _scan_to_row(
-                    scan, waiting_by_project.get(scan.project_key, []),
-                ),
-                scans,
-            )
-        )
+    state = categorize_project(
+        scan.project_key,
+        work_service=slice_svc,
+        inbox_items=items,
+        tracked=scan.tracked,
+    )
+    glyph = glyph_for_project_state(state)
+    if state is ProjectState.WAITING:
+        detail = why_waiting(items)
+    elif state is ProjectState.WORKING:
+        detail = what_working(scan.project_key, work_service=slice_svc)
+    elif state is ProjectState.PAUSED:
+        detail = "Paused"
+    else:
+        detail = "Quiet"
+    return OperatorDashboardRow(
+        project_key=scan.project_key,
+        state=state,
+        glyph=glyph,
+        detail=detail,
+    )
 
 
 def load_operator_view_from_config(config) -> OperatorDashboardView:  # noqa: ANN001
@@ -291,15 +347,50 @@ def load_operator_view_from_config(config) -> OperatorDashboardView:  # noqa: AN
 
     Useful for tests + callers that have a config in hand and want to
     avoid re-parsing the TOML.
+
+    Post-#1634 data path:
+
+    1. Open one shared work-service via the config-resolved factory.
+       On pg this is the pool singleton; on sqlite it's the canonical
+       workspace ``state.db``. No per-project handles.
+    2. Prefetch every task + active worker session in two bulk
+       queries, grouped by project alias.
+    3. Per-project: gather the inbox slice (already a single pg
+       query inside ``_waiting_items_by_project``) and categorize
+       against an adapter view of the prefetched dicts. Serial loop —
+       no DB I/O remains in the per-project step, so parallel threads
+       buy nothing.
     """
     scans = _collect_project_scans(config)
     waiting_by_project = _waiting_items_by_project(config)
 
-    # #1630 — per-project sqlite opens run in parallel. Each scan is
-    # independent (its own DB handle, its own categorize), so the only
-    # contention is the GIL during pure-Python work; sqlite I/O
-    # releases the GIL and is the dominant cost.
-    rows = _parallel_scan_rows(scans, waiting_by_project)
+    shared_svc = _open_shared_work_service(config)
+    try:
+        tasks_by_alias, workers_by_alias = _prefetch_project_state(
+            config, shared_svc,
+        )
+        rows: list[OperatorDashboardRow] = []
+        for scan in scans:
+            if shared_svc is None:
+                slice_svc = None
+            else:
+                slice_svc = _ProjectSliceService(
+                    project_key=scan.project_key,
+                    aliases=_aliases_for(config, scan.project_key),
+                    tasks_by_alias=tasks_by_alias,
+                    workers_by_alias=workers_by_alias,
+                    shared_svc=shared_svc,
+                )
+            rows.append(
+                _scan_to_row(
+                    scan,
+                    waiting_by_project.get(scan.project_key, []),
+                    slice_svc=slice_svc,
+                )
+            )
+    finally:
+        if shared_svc is not None:
+            _safe_close(shared_svc)
 
     waiting: list[OperatorDashboardRow] = []
     working: list[OperatorDashboardRow] = []
@@ -328,32 +419,29 @@ def load_operator_view_from_config(config) -> OperatorDashboardView:  # noqa: AN
 
 
 def _scan_to_state(
-    scan: _ProjectScan, items: list,
+    scan: _ProjectScan,
+    items: list,
+    *,
+    slice_svc: "_ProjectSliceService | None",
 ) -> tuple[str, ProjectState]:
-    """Per-project worker for :func:`project_state_map_from_config`.
+    """Return ``(project_key, ProjectState)`` for one scan.
 
-    Mirrors :func:`_scan_to_row` but returns only the classification —
-    callers that just want the state map (e.g. the rail's glyph
-    selector) shouldn't pay for ``what_working`` / ``why_waiting``
-    string assembly that the dashboard view consumes.
+    Mirrors :func:`_scan_to_row` but skips ``what_working`` /
+    ``why_waiting`` — the rail just needs the category for its glyph
+    table. Reads from the pre-fetched slice adapter, no DB I/O.
     """
-    svc = _open_work_service(scan)
-    try:
-        if svc is None:
-            if items:
-                return scan.project_key, ProjectState.WAITING
-            if not scan.tracked:
-                return scan.project_key, ProjectState.PAUSED
-            return scan.project_key, ProjectState.IDLE
-        return scan.project_key, categorize_project(
-            scan.project_key,
-            work_service=svc,
-            inbox_items=items,
-            tracked=scan.tracked,
-        )
-    finally:
-        if svc is not None:
-            _safe_close(svc)
+    if slice_svc is None:
+        if items:
+            return scan.project_key, ProjectState.WAITING
+        if not scan.tracked:
+            return scan.project_key, ProjectState.PAUSED
+        return scan.project_key, ProjectState.IDLE
+    return scan.project_key, categorize_project(
+        scan.project_key,
+        work_service=slice_svc,
+        inbox_items=items,
+        tracked=scan.tracked,
+    )
 
 
 def project_state_map_from_config(config) -> dict[str, ProjectState]:  # noqa: ANN001
@@ -365,39 +453,45 @@ def project_state_map_from_config(config) -> dict[str, ProjectState]:  # noqa: A
     a project whose DB can't be opened falls through to a tracked /
     paused IDLE classification rather than raising.
 
-    #1642 — Per-project sqlite opens run in parallel via the same
-    bounded pool the dashboard loader uses. The rail invokes this
-    inside its ``rail_refresh`` worker and the prior serial loop was
-    the dominant cost on multi-project workspaces; mirroring
-    :func:`load_operator_view_from_config`'s parallel sweep keeps the
-    rail-refresh path within a single project's DB-open latency
-    regardless of project count. The router additionally TTL-caches
-    the result so navigation bursts collapse into one sweep.
+    #1634 — opens ONE shared work-service and prefetches every
+    project's tasks + active worker sessions in two bulk queries
+    before classifying. Replaces the parallel per-project sqlite
+    fanout that ran one ``state.db`` open per project per refresh
+    (~5–350ms each on a 9MB workspace DB, dominating the dashboard
+    mount path even though the system is on postgres).
     """
     scans = _collect_project_scans(config)
     waiting_by_project = _waiting_items_by_project(config)
     if not scans:
         return {}
-    if len(scans) <= 1:
-        pairs = [
-            _scan_to_state(scan, waiting_by_project.get(scan.project_key, []))
-            for scan in scans
-        ]
-    else:
-        max_workers = min(_MAX_PARALLEL_PROJECT_SCANS, len(scans))
-        with ThreadPoolExecutor(
-            max_workers=max_workers,
-            thread_name_prefix="operator-state",
-        ) as pool:
-            pairs = list(
-                pool.map(
-                    lambda scan: _scan_to_state(
-                        scan, waiting_by_project.get(scan.project_key, []),
-                    ),
-                    scans,
+    shared_svc = _open_shared_work_service(config)
+    try:
+        tasks_by_alias, workers_by_alias = _prefetch_project_state(
+            config, shared_svc,
+        )
+        pairs: list[tuple[str, ProjectState]] = []
+        for scan in scans:
+            if shared_svc is None:
+                slice_svc = None
+            else:
+                slice_svc = _ProjectSliceService(
+                    project_key=scan.project_key,
+                    aliases=_aliases_for(config, scan.project_key),
+                    tasks_by_alias=tasks_by_alias,
+                    workers_by_alias=workers_by_alias,
+                    shared_svc=shared_svc,
+                )
+            pairs.append(
+                _scan_to_state(
+                    scan,
+                    waiting_by_project.get(scan.project_key, []),
+                    slice_svc=slice_svc,
                 )
             )
-    return {key: state for key, state in pairs}
+        return {key: state for key, state in pairs}
+    finally:
+        if shared_svc is not None:
+            _safe_close(shared_svc)
 
 
 def view_as_ascii(view: OperatorDashboardView) -> str:

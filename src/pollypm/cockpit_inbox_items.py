@@ -540,6 +540,7 @@ def _filter_approved_plan_reviews(
     items: list[InboxEntry],
     *,
     project_db_paths: dict[str, tuple[Path, Path]],
+    config: object | None = None,
 ) -> list[InboxEntry]:
     """Drop ``plan_review`` rows whose user_approval is already APPROVED.
 
@@ -620,6 +621,7 @@ def _filter_approved_plan_reviews(
             refs_by_db=refs_by_db,
             project_db_paths=project_db_paths,
             service_factory=create_work_service,
+            config=config,
         )
     kept: list[InboxEntry] = []
     dropped = 0
@@ -808,7 +810,7 @@ def load_inbox_entries(
     items = _dedupe_replayed_plan_reviews(items)
     items = _dedupe_message_vs_task_plan_reviews(items)
     items = _filter_approved_plan_reviews(
-        items, project_db_paths=project_db_paths,
+        items, project_db_paths=project_db_paths, config=config,
     )
     return items, unread, replies_by_task
 

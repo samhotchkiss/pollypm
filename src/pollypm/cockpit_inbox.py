@@ -244,7 +244,9 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     if collected and project_db_paths:
         return list(
             _filter_approved_plan_reviews(
-                collected, project_db_paths=project_db_paths,
+                collected,
+                project_db_paths=project_db_paths,
+                config=config,
             )
         )
     return collected
@@ -387,7 +389,9 @@ def pm_inbox_filtered_list(
     if collected and project_db_paths:
         return list(
             _filter_approved_plan_reviews(
-                collected, project_db_paths=project_db_paths,
+                collected,
+                project_db_paths=project_db_paths,
+                config=config,
             )
         )
     return collected

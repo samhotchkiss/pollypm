@@ -49,35 +49,74 @@ def approved_plan_review_refs(
     refs_by_db: dict[str, set[tuple[str, int]]],
     project_db_paths: dict[str, tuple[Path, Path]],
     service_factory: ServiceFactory | None = None,
+    config: object | None = None,
 ) -> set[str]:
-    """Return ``project/N`` refs whose plan-review task is already approved."""
+    """Return ``project/N`` refs whose plan-review task is already approved.
+
+    ``config`` is forwarded to the factory so the resolver routes to
+    the configured backend; without it the factory fell back to sqlite
+    even on a pg workspace, opening a stale ``state.db`` per project
+    refs ref-set (#1634).
+    """
     if service_factory is None:
         from pollypm.work.factory import create_work_service
 
         service_factory = create_work_service
     approved_refs: set[str] = set()
-    for db_key, refs in refs_by_db.items():
-        db_path, project_path = project_db_paths[db_key]
+    # On the pg backend every db_key resolves to the same pool, so
+    # one shared svc handles every ref-set. On sqlite each db_key
+    # still maps to its own canonical workspace ``state.db`` (which
+    # the factory resolves identically per call), so the shared
+    # handle is also correct there.
+    shared_svc = None
+    if config is not None:
         try:
-            svc = service_factory(db_path=db_path, project_path=project_path)
+            shared_svc = service_factory(config=config)
         except Exception:  # noqa: BLE001
             logger.debug(
-                "inbox: open svc failed for db %s during plan-review check",
-                db_key,
+                "inbox: shared svc open failed; falling back to per-db opens",
                 exc_info=True,
             )
-            continue
+            shared_svc = None
+    for db_key, refs in refs_by_db.items():
+        if shared_svc is not None:
+            svc = shared_svc
+            opened_local = False
+        else:
+            db_path, project_path = project_db_paths[db_key]
+            try:
+                svc = service_factory(
+                    db_path=db_path,
+                    project_path=project_path,
+                    config=config,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "inbox: open svc failed for db %s during plan-review check",
+                    db_key,
+                    exc_info=True,
+                )
+                continue
+            opened_local = True
         try:
             for project, number in refs:
                 if is_plan_task_approved(svc, project, number):
                     approved_refs.add(f"{project}/{number}")
         finally:
-            close = getattr(svc, "close", None)
-            if callable(close):
-                try:
-                    close()
-                except Exception:  # noqa: BLE001
-                    pass
+            if opened_local:
+                close = getattr(svc, "close", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception:  # noqa: BLE001
+                        pass
+    if shared_svc is not None:
+        close = getattr(shared_svc, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001
+                pass
     return approved_refs
 
 

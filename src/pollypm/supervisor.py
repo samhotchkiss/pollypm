@@ -2208,7 +2208,6 @@ class Supervisor:
         self.session_service.tmux.send_keys(target, prefixed, press_enter=press_enter)
         # Codex CLI buffers input and requires a second Enter to submit.
         if press_enter and launch.session.provider is ProviderKind.CODEX:
-            import time
             time.sleep(0.3)
             self.session_service.tmux.send_keys(target, "", press_enter=True)
         # Verify the message left the input bar.
@@ -2235,8 +2234,6 @@ class Supervisor:
         Captures the last few lines of the pane. If the text still appears
         on the final line (the input prompt), press Enter again.
         """
-        import time
-
         # Use a prefix of the message for matching (input may be truncated)
         check_text = text[:60].strip()
         if not check_text:
@@ -3537,8 +3534,7 @@ class Supervisor:
         except RuntimeError as exc:
             # Retry once if window name collision
             if "already exists" in str(exc).lower() or "duplicate" in str(exc).lower():
-                import time as _time
-                _time.sleep(0.5)
+                time.sleep(0.5)
                 try:
                     self.launch_session(session_name)
                 except Exception:

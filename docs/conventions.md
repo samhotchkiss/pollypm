@@ -62,9 +62,9 @@ guardrails left by the Supervisor decomposition (#179, #182, #186, #187):
 2. **No ``supervisor._<anything>`` reach-through.** Every private helper
    that had callers was promoted to public during the decomposition; if
    you need one that isn't public, promote it first.
-3. **No direct SQL on ``StateStore._conn`` / ``SQLiteWorkService._conn``.**
-   Use the typed accessor methods the store exposes. The connection's
-   lifecycle is owned by one module only.
+3. **No direct SQL on ``StateStore._conn`` / the work service's pool.**
+   Use the typed accessor methods the store and ``WorkService`` expose.
+   The connection / pool lifecycle is owned by one module only.
 
 If you hit one of these failures and the violation is genuinely
 unavoidable (usually: a core-decomposition step that's still mid-flight),

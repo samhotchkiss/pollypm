@@ -676,34 +676,41 @@ class SQLAlchemyStore:
         *,
         type: str | list[str] | tuple[str, ...] | set[str] | None = None,
         older_than: datetime | None = None,
+        subject: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        subject_not_in: list[str] | tuple[str, ...] | set[str] | None = None,
+        state: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude_pinned: bool = False,
     ) -> int:
-        """Delete messages matching ``type`` and older than ``older_than``.
+        """Delete messages matching the given filters.
 
         Replaces the legacy tiered ``events`` retention sweep (folded in
         from :mod:`pollypm.storage.events_retention` when #342 retired
-        the legacy tables). Callers pass a ``type`` filter (scalar or
-        sequence) and a ``created_at`` cutoff; every matching row is
-        deleted inside the single-connection writer pool, so the call
-        serializes cleanly with inserts from
-        :meth:`append_event` / :meth:`enqueue_message`.
+        the legacy tables). Also serves as the typed entry point for
+        ``pm reset``'s alert wipe (#1820) so callers don't reach into
+        SQLAlchemy ``delete()`` through :meth:`execute`.
 
-        Returns the number of rows deleted. ``0`` is a valid (and common)
-        result — silent no-op when nothing is old enough.
+        At least one filter is required. Returns the number of rows
+        deleted. ``0`` is a valid (and common) result.
 
         Raises
         ------
         ValueError
-            If neither ``type`` nor ``older_than`` is supplied. We refuse
-            to delete the whole table accidentally; pass one of the two
-            filters (or both) to make the intent explicit.
+            If no filter is supplied. We refuse to delete the whole
+            table accidentally; pass at least one filter.
         """
-        if type is None and older_than is None:
+        if (
+            type is None
+            and older_than is None
+            and subject is None
+            and subject_not_in is None
+            and state is None
+        ):
             raise ValueError(
                 "prune_messages requires at least one filter. "
                 "An unfiltered delete would truncate the ``messages`` "
                 "table, which is never the intent. "
-                "Fix: pass ``type=...`` (scalar or sequence) and/or "
-                "``older_than=<datetime>`` to scope the delete."
+                "Fix: pass one of ``type=``, ``older_than=``, "
+                "``subject=``, ``subject_not_in=``, or ``state=``."
             )
         conditions = []
         if type is not None:
@@ -713,6 +720,30 @@ class SQLAlchemyStore:
                 conditions.append(messages.c.type == type)
         if older_than is not None:
             conditions.append(messages.c.created_at < older_than)
+        if subject is not None:
+            if isinstance(subject, (list, tuple, set, frozenset)):
+                conditions.append(messages.c.subject.in_(list(subject)))
+            else:
+                conditions.append(messages.c.subject == subject)
+        if subject_not_in is not None:
+            vals = list(subject_not_in)
+            if vals:
+                conditions.append(messages.c.subject.notin_(vals))
+        if state is not None:
+            if isinstance(state, (list, tuple, set, frozenset)):
+                conditions.append(messages.c.state.in_(list(state)))
+            else:
+                conditions.append(messages.c.state == state)
+        if exclude_pinned:
+            from sqlalchemy import func as _func
+
+            conditions.append(
+                _func.coalesce(
+                    _func.json_extract(messages.c.payload_json, "$.pinned"),
+                    0,
+                )
+                != 1
+            )
         stmt = delete(messages).where(and_(*conditions))
         with self.transaction() as conn:
             result = conn.execute(stmt)

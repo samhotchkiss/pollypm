@@ -106,11 +106,31 @@ class Store(Protocol):
         *,
         type: str | list[str] | tuple[str, ...] | set[str] | None = None,
         older_than: Any = None,
+        subject: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        subject_not_in: list[str] | tuple[str, ...] | set[str] | None = None,
+        state: str | list[str] | tuple[str, ...] | set[str] | None = None,
+        exclude_pinned: bool = False,
     ) -> int:
-        """Delete messages matching ``type`` and older than ``older_than``.
+        """Delete messages matching the given filters.
 
         At least one filter is required — an unbounded delete would
         truncate the table. Returns the number of rows removed.
+
+        Filters:
+
+        * ``type`` — scalar or sequence; passed through to ``type = ?`` /
+          ``type IN (...)``.
+        * ``older_than`` — ``created_at < <datetime>``.
+        * ``subject`` — scalar or sequence; ``subject = ?`` / ``IN (...)``.
+        * ``subject_not_in`` — ``subject NOT IN (...)``; used by the
+          retention sweep's default-tier (delete events whose subject
+          isn't on any known tier list).
+        * ``state`` — scalar or sequence; ``state = ?`` / ``IN (...)``.
+          Used by ``pm reset`` to clear open alerts.
+        * ``exclude_pinned`` — when ``True``, rows whose
+          ``payload_json`` carries ``"pinned": 1`` (or truthy) are
+          retained. Implementations use ``json_extract`` (sqlite) or
+          ``payload_json->>'pinned'`` (pg).
         """
         ...
 

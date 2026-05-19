@@ -64,6 +64,21 @@ from pollypm.storage.doctor_state_probes import (
 __path__ = [str(Path(__file__).resolve().with_name("doctor"))]
 
 
+def _pg_mode_active() -> bool:
+    """Return True when the resolved storage backend is Postgres.
+
+    Cheap probe used to short-circuit sqlite-flavored checks during
+    the pg cutover (#1810). Failure to resolve the backend returns
+    ``False`` — the legacy sqlite path stays the default.
+    """
+    try:
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        return is_pg_backend()
+    except Exception:  # noqa: BLE001 — defensive
+        return False
+
+
 # --------------------------------------------------------------------- #
 # Result model
 # --------------------------------------------------------------------- #
@@ -631,6 +646,91 @@ def _latest_work_migration_version() -> int | None:
         return None
 
 
+def _latest_pg_migration_version() -> int | None:
+    """Highest declared pg migration version, or ``None`` if unavailable."""
+    try:
+        from pollypm.storage.pg_schema import MIGRATIONS as _PG_MIGRATIONS
+
+        if not _PG_MIGRATIONS:
+            return None
+        return max(v for v, _, _ in _PG_MIGRATIONS)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _applied_pg_schema_version() -> int | None:
+    """``MAX(version)`` from pg's ``schema_migrations`` table, or ``None``."""
+    try:
+        from pollypm.storage.doctor_state_probes import applied_schema_version_ro
+    except Exception:  # noqa: BLE001
+        return None
+    config = _doctor_config_or_none()
+    if config is None:
+        return None
+    # The pg branch ignores ``db_path``; pass a dummy path so the
+    # routing helper picks the pg conn regardless of file existence.
+    return applied_schema_version_ro(Path("/dev/null"), "schema_migrations", config=config)
+
+
+def _pg_state_migrations_probe() -> CheckResult:
+    """pg-mode counterpart to :func:`check_state_migrations`."""
+    latest = _latest_pg_migration_version()
+    if latest is None:
+        return _skip("state migration check skipped (pg migrations list empty)")
+    applied = _applied_pg_schema_version()
+    if applied is None:
+        return _skip(
+            "state migration check skipped (pg schema_migrations unreadable)"
+        )
+    if applied < latest:
+        return _fail(
+            f"pg schema_migrations @v{applied}, latest v{latest}",
+            why=(
+                "Pg schema is behind head. Subsystems that expect tables / "
+                "columns from later migrations will error at runtime."
+            ),
+            fix=(
+                "Apply outstanding pg migrations —\n"
+                "  pm up   # runs apply_migrations on cockpit boot\n"
+                "Or directly:\n"
+                "  python -c 'from pollypm.storage.pg_pool import get_rw_pool; "
+                "from pollypm.storage.pg_migrations import apply_migrations; "
+                "apply_migrations(get_rw_pool())'\n"
+                "Recheck: pm doctor"
+            ),
+            data={"latest": latest, "applied": applied},
+        )
+    return _ok(
+        f"pg schema_migrations on v{latest}",
+        data={"latest": latest, "applied": applied},
+    )
+
+
+def _pg_work_migrations_probe() -> CheckResult:
+    """In pg-mode the work schema is folded into ``schema_migrations``.
+
+    Returns OK when the pg schema is at-head; a separate ``work``
+    migration table doesn't exist on the pg backend (#1737).
+    """
+    latest = _latest_pg_migration_version()
+    if latest is None:
+        return _skip("work migration check skipped (pg migrations list empty)")
+    applied = _applied_pg_schema_version()
+    if applied is None:
+        return _skip(
+            "work migration check skipped (pg schema_migrations unreadable)"
+        )
+    if applied < latest:
+        return _skip(
+            f"work migration check folded into pg schema_migrations "
+            f"(@v{applied}/{latest}); see state-migrations probe"
+        )
+    return _ok(
+        f"work schema folded into pg schema_migrations @v{latest}",
+        data={"latest": latest, "applied": applied},
+    )
+
+
 def _doctor_config_or_none() -> "PollyPMConfig | None":
     """Best-effort loader for the operator config inside doctor checks.
 
@@ -824,6 +924,13 @@ def check_product_state() -> CheckResult:
 
 
 def check_state_migrations() -> CheckResult:
+    # #1810 — in pg-mode, the sqlite state migrations table is no longer
+    # the source of truth. Probe the live pg ``schema_migrations`` via
+    # the storage facade instead of walking stale sqlite files. A
+    # successful pg probe with the matching latest version returns OK;
+    # anything else falls back to a benign skip with operator guidance.
+    if _pg_mode_active():
+        return _pg_state_migrations_probe()
     latest = _latest_state_migration_version()
     if latest is None:
         return _skip("state migration check skipped (no migrations defined)")
@@ -862,6 +969,11 @@ def check_state_migrations() -> CheckResult:
 
 
 def check_work_migrations() -> CheckResult:
+    # #1810 — in pg-mode the work-schema lives in pg, not in the
+    # legacy ``work_schema_version`` sqlite table. Skip the sqlite walk
+    # and route to the pg probe.
+    if _pg_mode_active():
+        return _pg_work_migrations_probe()
     latest = _latest_work_migration_version()
     if latest is None:
         return _skip("work migration check skipped (no migrations defined)")
@@ -1040,7 +1152,15 @@ def check_db_layout_canonical() -> CheckResult:
 
     Any leftover legacy state directory is noise from a pre-#339 install.
     Nothing reads it; we just flag it so the user can remove it.
+
+    #1810 — skipped in pg-mode: the sqlite "two state.db files" layout
+    is the wrong abstraction once the cutover lands.
     """
+    if _pg_mode_active():
+        return _skip(
+            "db-layout-canonical skipped (pg-mode: sqlite state.db is a "
+            "legacy artifact)"
+        )
     from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 
     user_db = Path.home() / ".pollypm" / "state.db"
@@ -1207,6 +1327,9 @@ def _read_recent_work_db_opened_events(
 def check_dual_db_work_tasks_drift() -> CheckResult:
     """Detect work-tables stamped on the messages-side DB (savethenovel class).
 
+    #1810 — in pg-mode there's only one DB (the pg cluster); the
+    sqlite "dual DB" concept doesn't apply, so the probe short-circuits.
+
     PollyPM keeps two state DBs that look similar but serve different
     purposes:
 
@@ -1242,6 +1365,10 @@ def check_dual_db_work_tasks_drift() -> CheckResult:
     readers go through ``resolve_work_db_path``, so the canonical
     workspace DB is still authoritative for the live system.
     """
+    if _pg_mode_active():
+        return _skip(
+            "dual-db drift check skipped (pg-mode: single store)"
+        )
     _path, config = _safe_load_config()
     if config is None:
         return _skip("dual-db check skipped (no config)")
@@ -1508,10 +1635,17 @@ def check_doubled_pollypm_path() -> CheckResult:
     if not doubled.exists():
         return _ok("no doubled ~/.pollypm/.pollypm/ path", data=data)
 
-    # Walk the tree once, summing sizes and tracking newest mtime.
+    # #1810 — bound the rglob scan. The artifact has been observed at
+    # 281K files / 1.8 GB in the wild; the original unbounded walk
+    # took >60s and dominated ``pm doctor`` runtime. We only need to
+    # know "large + newest-mtime"; a 10K-file cap captures both with
+    # bounded latency. A ``capped`` data field tells the operator the
+    # number is a lower bound.
+    _SCAN_CAP = 10_000
     total_bytes = 0
     file_count = 0
     newest_mtime = 0.0
+    capped = False
     try:
         for entry in doubled.rglob("*"):
             try:
@@ -1521,6 +1655,9 @@ def check_doubled_pollypm_path() -> CheckResult:
                     file_count += 1
                     if stat.st_mtime > newest_mtime:
                         newest_mtime = stat.st_mtime
+                    if file_count >= _SCAN_CAP:
+                        capped = True
+                        break
             except OSError:
                 continue
     except OSError as exc:
@@ -1546,6 +1683,7 @@ def check_doubled_pollypm_path() -> CheckResult:
             "size_bytes": total_bytes,
             "file_count": file_count,
             "newest_mtime": newest_mtime,
+            "capped": capped,
         }
     )
 
@@ -1572,10 +1710,11 @@ def check_doubled_pollypm_path() -> CheckResult:
     age_days = age_seconds / 86400.0
     size_kib = total_bytes / 1024.0
     word = "file" if file_count == 1 else "files"
+    plus = "+" if capped else ""
     return _fail(
         (
-            f"~/.pollypm/.pollypm/ holds {file_count} {word} "
-            f"({size_kib:.1f} KiB, newest {age_days:.1f}d old)"
+            f"~/.pollypm/.pollypm/ holds {file_count}{plus} {word} "
+            f"({size_kib:.1f} KiB{plus}, newest {age_days:.1f}d old)"
         ),
         why=(
             "config.py:_resolve_path documents this artifact: an older "
@@ -2719,7 +2858,16 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
     per-project DB still survives (we treat both as a successful probe
     so the cockpit's pattern A — try per-project, fall back to
     workspace — keeps passing during the deprecation window).
+
+    #1810 — in pg-mode the per-project sqlite walk is meaningless;
+    the sweeper reads work_tasks from the pg pool, partitioned by the
+    ``project`` column.
     """
+    if _pg_mode_active():
+        return _skip(
+            "task-assignment sweeper check skipped (pg-mode: work_tasks "
+            "is a single pg table partitioned by project)"
+        )
     _path, config = _safe_load_config()
     if config is None:
         return _skip("task-assignment sweeper check skipped (no config)")
@@ -3192,6 +3340,15 @@ _SESSION_RSS_WARN_BYTES = 1024 * 1024 * 1024
 
 def check_state_db_size() -> CheckResult:
     """Warn at 500 MB, error at 2 GB. Recommends ``pm doctor --fix``."""
+    if _pg_mode_active():
+        # #1810 — the legacy sqlite ``state.db`` is irrelevant in
+        # pg-mode (pg has no analogue of incremental_vacuum on a per-
+        # file basis). Skip the file-stat probe so the post-cutover
+        # 4 GB sqlite artifact stops reading as an active ERROR.
+        return _skip(
+            "state.db size check skipped (pg-mode active; sqlite state.db "
+            "is a legacy artifact and can be removed once cutover is final)"
+        )
     candidates = _state_db_candidates()
     if not candidates:
         return _skip("state.db size check skipped (no tracked DBs)")

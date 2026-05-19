@@ -666,8 +666,24 @@ def _failure_section(day_events: list, store=None) -> MetricsSection:
     if store is not None:
         try:
             from datetime import UTC, datetime, timedelta
-            cutoff = (datetime.now(UTC) - timedelta(hours=24)).isoformat()
-            if hasattr(store, "execute"):
+            cutoff_dt = datetime.now(UTC) - timedelta(hours=24)
+            # #1820 — prefer the typed ``query_messages`` path on both
+            # backends. The legacy ``hasattr(store, "execute")`` branch
+            # selected PgStore.execute (which used to raise), so the
+            # ``no_session`` count read as a permanent zero on pg. The
+            # typed path post-filters in Python — the sender prefix is
+            # narrow enough that the row count stays small.
+            if hasattr(store, "query_messages"):
+                rows_24h = store.query_messages(
+                    type=["alert"],
+                    since=cutoff_dt,
+                )
+                no_session = sum(
+                    1 for row in rows_24h
+                    if "no_session" in str(row.get("sender") or "")
+                )
+            elif hasattr(store, "execute"):
+                cutoff = cutoff_dt.isoformat()
                 rows = store.execute(
                     """
                     SELECT sender FROM messages
@@ -678,15 +694,6 @@ def _failure_section(day_events: list, store=None) -> MetricsSection:
                     (cutoff,),
                 ).fetchall()
                 no_session = len(rows)
-            elif hasattr(store, "query_messages"):
-                rows_24h = store.query_messages(
-                    type=["alert"],
-                    since=datetime.fromisoformat(cutoff),
-                )
-                no_session = sum(
-                    1 for row in rows_24h
-                    if "no_session" in str(row.get("sender") or "")
-                )
         except Exception:  # noqa: BLE001
             no_session = 0
 

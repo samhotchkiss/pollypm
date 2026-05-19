@@ -335,18 +335,31 @@ def reset(
     cockpit_state = supervisor.config.project.base_dir / "cockpit_state.json"
     cockpit_state.unlink(missing_ok=True)
     try:
-        from sqlalchemy import delete
-
-        from pollypm.store.schema import messages
-
+        # ``supervisor.store`` is the StateStore (sqlite-only — it owns
+        # the ``leases`` / ``session_runtime`` tables that don't have
+        # a pg equivalent yet, tracked separately). ``msg_store`` may
+        # be either SQLAlchemyStore or PgStore; route the alert wipe
+        # through the typed ``prune_messages`` (#1820) so we don't
+        # depend on the SQLAlchemy ``execute`` escape hatch.
         supervisor.store.execute("DELETE FROM leases")
         supervisor.store.execute("DELETE FROM session_runtime")
-        supervisor.msg_store.execute(
-            delete(messages).where(
-                messages.c.type == "alert",
-                messages.c.state == "open",
+        try:
+            supervisor.msg_store.prune_messages(type="alert", state="open")
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "Failed to prune open alerts via typed path; "
+                "falling back to SQLAlchemy execute()",
+                exc_info=True,
             )
-        )
+            from sqlalchemy import delete
+            from pollypm.store.schema import messages
+
+            supervisor.msg_store.execute(
+                delete(messages).where(
+                    messages.c.type == "alert",
+                    messages.c.state == "open",
+                )
+            )
         supervisor.store.commit()
     except Exception:  # noqa: BLE001
         logger.warning(

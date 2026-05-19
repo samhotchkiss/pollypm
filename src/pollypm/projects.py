@@ -96,12 +96,38 @@ def detect_project_kind(path: Path) -> ProjectKind:
     return ProjectKind.GIT if (normalized / ".git").exists() else ProjectKind.FOLDER
 
 
+def _resolve_pollypm_root(project_path: Path) -> Path:
+    """Return the canonical ``.pollypm`` root for ``project_path``.
+
+    Normal case: ``<project>/.pollypm``.
+
+    Doubled-path guard (#1810): when the caller passed the global
+    config dir itself (``~/.pollypm``) we'd otherwise produce
+    ``~/.pollypm/.pollypm`` and the entire scaffold (transcripts,
+    artifacts/checkpoints, dossier, ...) writes into that doubled
+    tree. Production builds this up to ~280K files / 1.8 GB. Detect
+    the case and return the global dir verbatim so all the helpers
+    that chain through ``project_instruction_dir`` (artifacts,
+    transcripts, worktrees, ...) stop emitting into the doubled path.
+    """
+    from pollypm.config import GLOBAL_CONFIG_DIR
+
+    normalized = normalize_project_path(project_path)
+    try:
+        global_dir = GLOBAL_CONFIG_DIR.expanduser().resolve()
+    except Exception:  # noqa: BLE001 — defensive; never break pathing
+        global_dir = GLOBAL_CONFIG_DIR
+    if normalized == global_dir:
+        return normalized
+    return normalized / ".pollypm"
+
+
 def project_pollypm_dir(project_path: Path) -> Path:
-    return normalize_project_path(project_path) / ".pollypm"
+    return _resolve_pollypm_root(project_path)
 
 
 def project_instruction_dir(project_path: Path) -> Path:
-    return normalize_project_path(project_path) / ".pollypm"
+    return _resolve_pollypm_root(project_path)
 
 
 def project_instruction_file(project_path: Path) -> Path:

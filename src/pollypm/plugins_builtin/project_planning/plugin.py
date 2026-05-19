@@ -79,25 +79,45 @@ class MarkdownPromptProfile:
                     "architect",
                     fallback_text=prompt,
                 )
-        # Substitute the ``{persona_name}`` placeholder so the architect's
-        # baked-in identity matches the project's configured persona.
-        # Pre-fix the profile was a static "You are Archie, the architect"
-        # — when the project's chat-open primer greeted the agent as
-        # "Sage" (samblog's configured persona_name), the agent's system
-        # prompt and the user-facing greeting contradicted each other.
-        # The fallback keeps the historical role default ("Archie") for
-        # projects that never picked a persona, mirroring the precedence
-        # used by ``_resolve_project_chat_persona`` for the rail label
-        # and the per-project primer (#1866 follow-up).
+        # Resolve the architect persona from the project config, then
+        # substitute it into the prompt body. This is the precedence used
+        # by ``_resolve_project_chat_persona`` for the rail label and the
+        # per-project primer (#1866 follow-up): the project's explicit
+        # ``persona_name`` wins; everything else falls back to the
+        # historical role default "Archie".
+        #
+        # We handle two cases so the materialised system prompt always
+        # matches the project's configured persona:
+        #
+        # 1. The built-in profile / freshly-forked guides use the explicit
+        #    ``{persona_name}`` placeholder (#1872). Substitute it.
+        # 2. Legacy project-local forks (``<project>/.pollypm/project-guides
+        #    /architect.md``) were forked BEFORE #1872 and have "Archie"
+        #    baked in literally — no placeholder. ``resolve_project_guide_text``
+        #    returns that forked body, so step 1 finds nothing to replace
+        #    and the agent's system prompt contradicts the chat-open primer
+        #    ("Hi Sage" vs. "You are Archie"). Detected on Sam's live
+        #    samblog config where ``persona_name = "Sage"`` but the
+        #    materialised system prompt still read "You are Archie, the
+        #    architect" (follow-up to #1872). To rescue legacy forks, also
+        #    replace the literal kickoff identity ``"You are Archie, the
+        #    architect"`` when a non-default persona is configured. The
+        #    string is precise enough to avoid collateral damage in other
+        #    text that happens to mention "Archie".
+        persona = "Archie"
+        if context is not None:
+            project = context.config.projects.get(context.session.project)
+            if project is not None:
+                persona_raw = getattr(project, "persona_name", None)
+                if isinstance(persona_raw, str) and persona_raw.strip():
+                    persona = persona_raw.strip()
         if "{persona_name}" in prompt:
-            persona = "Archie"
-            if context is not None:
-                project = context.config.projects.get(context.session.project)
-                if project is not None:
-                    persona_raw = getattr(project, "persona_name", None)
-                    if isinstance(persona_raw, str) and persona_raw.strip():
-                        persona = persona_raw.strip()
             prompt = prompt.replace("{persona_name}", persona)
+        if persona != "Archie":
+            prompt = prompt.replace(
+                "You are Archie, the architect",
+                f"You are {persona}, the architect",
+            )
         return prompt or None
 
 

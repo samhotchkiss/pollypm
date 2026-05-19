@@ -721,6 +721,43 @@ def test_architect_profile_no_context_falls_back_to_archie(
     assert "You are Archie, the architect" in prompt
 
 
+def test_architect_profile_rescues_legacy_forked_project_guide(
+    tmp_path: Path,
+) -> None:
+    """Regression: legacy project-local forks of ``architect.md`` were
+    forked BEFORE #1872 added the ``{persona_name}`` placeholder, so the
+    forked body has ``"You are Archie, the architect"`` baked in
+    literally. ``MarkdownPromptProfile.build_prompt`` reads the forked
+    file via ``resolve_project_guide_text`` and the original #1872 logic
+    found no ``{persona_name}`` token to substitute — the materialised
+    system prompt contradicted the cockpit chat-open primer ("Hi Sage"
+    vs. "You are Archie") on Sam's live samblog config.
+    The fix also substitutes the legacy literal kickoff identity when a
+    non-default persona is configured, so forked guides stay correct
+    without the user re-running ``pm project guide reset``.
+    """
+    from pollypm.plugin_host import ExtensionHost
+
+    host = ExtensionHost(tmp_path)
+    profile = host.get_agent_profile("architect")
+    context = _make_architect_context(tmp_path, persona_name="Sage")
+    # Fork a legacy-style project guide (no ``{persona_name}`` placeholder).
+    project_path = context.config.projects["demo"].path
+    guides_dir = project_path / ".pollypm" / "project-guides"
+    guides_dir.mkdir(parents=True, exist_ok=True)
+    legacy_body = (
+        "<identity>\nYou are the PollyPM Architect.\n</identity>\n\n"
+        "<kickoff>\nYou are Archie, the architect. On session start:\n"
+        "Do the architect things.\n</kickoff>\n"
+    )
+    (guides_dir / "architect.md").write_text(legacy_body, encoding="utf-8")
+
+    prompt = profile.build_prompt(context)
+    assert prompt is not None
+    assert "You are Sage, the architect" in prompt
+    assert "You are Archie, the architect" not in prompt
+
+
 # ---------------------------------------------------------------------------
 # pp05 — tree-of-plans: 2-3 candidates, critics evaluate all, synthesis picks winner
 # ---------------------------------------------------------------------------

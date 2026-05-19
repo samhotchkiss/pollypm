@@ -1910,9 +1910,21 @@ def test_cockpit_router_primes_per_project_pm_session_distinctly() -> None:
     assert len(sent) == 2  # unchanged
 
 
-def test_project_pm_primer_matches_architect_session_persona() -> None:
-    """An architect-backed PM Chat should greet Archie, not the project's
-    worker persona (#1321).
+def test_project_pm_primer_greets_project_persona_over_architect_default() -> None:
+    """Follow-up to #1866: when the project explicitly configures a
+    ``persona_name`` it must win over the architect-role default in the
+    primer too, mirroring the rail "PM Chat (…)" label.
+
+    Pre-#1866 the rail label and primer both deferred to the architect
+    default ("Archie") whenever an architect-role session existed for
+    the project, which let "Archie" shadow projects that had picked
+    their own PM name (e.g. samblog → "Sage"). The primer greeting is
+    the most visible regression — Sam saw "Hey Archie" injected into
+    the PM session for samblog despite the project config saying
+    "Sage". The fix here is the same precedence used by the rail label:
+    project ``persona_name`` first, architect-role default only as a
+    fallback. (Originally regression-tested for #1321; the assertion
+    has been inverted now that the precedence is correct.)
     """
     sent: list[tuple[str, str]] = []
     primed_state: dict[str, object] = {}
@@ -1964,6 +1976,70 @@ def test_project_pm_primer_matches_architect_session_persona() -> None:
         supervisor,
         "pollypm:PollyPM",
         ProjectRoute(project_key="bikepath", sub_view="session"),
+    )
+
+    assert len(sent) == 1
+    assert "Hey Bea" in sent[0][1]
+    assert "Hey Archie" not in sent[0][1]
+
+
+def test_project_pm_primer_falls_back_to_architect_default_when_persona_unset() -> None:
+    """A project without an explicit ``persona_name`` still gets the
+    architect-role default ("Archie") in the primer when an architect
+    session backs the PM Chat. The follow-up to #1866 only changes
+    *precedence* — projects that relied on the role-default greeting
+    must not regress.
+    """
+    sent: list[tuple[str, str]] = []
+    primed_state: dict[str, object] = {}
+
+    class _FakeTmux:
+        def send_keys(self, target, text, press_enter=True):  # noqa: ARG002
+            sent.append((target, text))
+
+    class _Project:
+        key = "booktalk"
+        name = "booktalk"
+        path = Path("/tmp/booktalk-no-db")
+        persona_name = None
+
+    class _FakeConfig:
+        projects = {"booktalk": _Project()}
+
+    class _FakeSupervisor:
+        config = _FakeConfig()
+
+        def plan_launches(self):
+            class _Sess:
+                name = "architect_booktalk"
+                role = "architect"
+                project = "booktalk"
+
+            class _L:
+                session = _Sess()
+
+            return [_L()]
+
+    router = CockpitRouter.__new__(CockpitRouter)
+    router.config_path = Path("/tmp/pollypm.toml")
+    router.tmux = _FakeTmux()
+    router._right_pane_id = lambda window_target: "%right"  # type: ignore[assignment]
+    router._load_state = lambda: dict(primed_state)  # type: ignore[assignment]
+
+    def _write(data):
+        primed_state.clear()
+        primed_state.update(data)
+
+    router._write_state = _write  # type: ignore[assignment]
+    router._session_available_for_mount = lambda *a, **k: True  # type: ignore[assignment]
+    router._show_live_session = lambda *a, **k: None  # type: ignore[assignment]
+
+    supervisor = _FakeSupervisor()
+
+    router._route_project_selection(
+        supervisor,
+        "pollypm:PollyPM",
+        ProjectRoute(project_key="booktalk", sub_view="session"),
     )
 
     assert len(sent) == 1

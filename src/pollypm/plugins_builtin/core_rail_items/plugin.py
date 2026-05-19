@@ -357,21 +357,16 @@ def _selected_key(ctx: RailContext) -> str:
 
 
 def _project_chat_persona(project: Any, session_role: Any) -> str:
-    if isinstance(session_role, str) and session_role.strip():
-        try:
-            from pollypm.role_contract import canonical_role, persona_for
+    # Follow-up to #1866: the project's explicit ``persona_name`` wins
+    # over the architect-role default ("Archie"). samblog set
+    # ``persona_name = "Sage"`` and also has an architect session — the
+    # old ordering returned "Archie" before consulting project config,
+    # so the rail rendered ``PM Chat (Archie)``. Delegate to the
+    # shared resolver so the rail label and the PM primer agree.
+    from pollypm.cockpit_rail import _resolve_project_chat_persona
 
-            if canonical_role(session_role) == "architect":
-                return persona_for("architect")
-        except ValueError:
-            pass
-
-    persona_raw = getattr(project, "persona_name", None)
-    return (
-        persona_raw.strip()
-        if isinstance(persona_raw, str) and persona_raw.strip()
-        else "Project PM"
-    )
+    persona = _resolve_project_chat_persona(project, session_role)
+    return persona if persona else "Project PM"
 
 
 def _project_rows(ctx: RailContext) -> list[RailRow]:

@@ -480,6 +480,28 @@ def _project_pm_persona_for_role(session_role: object) -> str | None:
     return None
 
 
+def _resolve_project_chat_persona(
+    project: object, session_role: object,
+) -> str | None:
+    """Return the persona that should label/greet a project's PM Chat.
+
+    Follow-up to #1866: the project's explicit ``persona_name`` always
+    wins over the architect-role default ("Archie"). When the project
+    has no configured persona we fall back to the architect-role default
+    so projects that never picked a persona keep the historical label.
+
+    Shared by the rail "PM Chat (…)" label
+    (:mod:`pollypm.plugins_builtin.core_rail_items.plugin`) and the
+    per-project PM primer (:func:`_build_project_pm_primer`) so the
+    glyph in the rail and the greeting injected into the PM session
+    never disagree.
+    """
+    persona_raw = getattr(project, "persona_name", None)
+    if isinstance(persona_raw, str) and persona_raw.strip():
+        return persona_raw.strip()
+    return _project_pm_persona_for_role(session_role)
+
+
 def _session_role_for_name(supervisor, session_name: str | None) -> object | None:
     if not session_name:
         return None
@@ -519,16 +541,16 @@ def _build_project_pm_primer(
     project = supervisor.config.projects.get(project_key)
     if project is None:
         return None
-    persona = _project_pm_persona_for_role(
+    # Follow-up to #1866: the project's ``persona_name`` wins over the
+    # architect-role default. The previous ordering let the architect
+    # default ("Archie") shadow projects that explicitly configured a
+    # PM name (e.g. samblog → "Sage"), so the primer greeted the wrong
+    # persona on attach. Shared helper keeps the rail label + primer
+    # in lockstep.
+    persona = _resolve_project_chat_persona(
+        project,
         _session_role_for_name(supervisor, session_name),
     )
-    if persona is None:
-        persona_raw = getattr(project, "persona_name", None)
-        persona = (
-            persona_raw.strip()
-            if isinstance(persona_raw, str) and persona_raw.strip()
-            else None
-        )
     project_name = project.name or project_key
     project_path = str(project.path)
 

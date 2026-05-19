@@ -41,7 +41,7 @@ import shutil
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 from pollypm.storage.sqlite_pragmas import readonly_uri
 

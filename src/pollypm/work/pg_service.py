@@ -1478,7 +1478,7 @@ class PgWorkService:
     # Slice C alongside the audit / sync adapter ports.
     # ------------------------------------------------------------------
 
-    def claim(self, task_id: str, actor: str, skip_gates: bool = False) -> Task:  # noqa: ARG002
+    def claim(self, task_id: str, actor: str, skip_gates: bool = False) -> Task:
         """Atomically claim a queued task.
 
         Loads the flow template, resolves the start (or current) node,
@@ -1547,6 +1547,20 @@ class PgWorkService:
             if node.type == NodeType.REVIEW
             else WorkStatus.IN_PROGRESS
         )
+        # #1737 — pre-claim cap check. Mirrors the sqlite transition
+        # manager so a Postgres-backed workspace also refuses cap-exceeded
+        # claims cleanly instead of leaving the task ``in_progress`` with
+        # no worker. See ``SessionManager.check_parallel_cap``.
+        if (
+            target_status is WorkStatus.IN_PROGRESS
+            and not skip_gates
+            and self._session_mgr is not None
+        ):
+            check_cap = getattr(
+                self._session_mgr, "check_parallel_cap", None,
+            )
+            if callable(check_cap):
+                check_cap(task.project, task_id)
         now = _now_iso()
         with self._pool.connection() as conn:
             conn.autocommit = False

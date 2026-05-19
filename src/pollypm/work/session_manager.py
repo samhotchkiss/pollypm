@@ -48,6 +48,25 @@ class ProvisionError(RuntimeError):
     """
 
 
+class WorkerCapExceededError(ProvisionError):
+    """Raised when a project already has ``max_parallel_workers`` active.
+
+    #1737 — distinct from generic ``ProvisionError`` so callers (and the
+    audit watchdog) can recognise normal back-pressure vs. a genuine
+    provisioning failure. The auto-claim sweep already rate-limits via
+    ``max_concurrent_workers``; this cap is the hard ceiling on per-task
+    worker tmux windows regardless of who initiated the claim.
+    """
+
+
+# Default per-project cap on concurrent per-task worker sessions.
+# #1737 architectural alignment: per Sam's flow-chart, the per-task
+# parallel model replaces the per-project sequential worker. 5 is the
+# product default; users can opt-in to a different value via
+# ``[projects.<key>].max_parallel_workers`` in pollypm.toml.
+DEFAULT_MAX_PARALLEL_WORKERS = 5
+
+
 # ---------------------------------------------------------------------------
 # Data models
 # ---------------------------------------------------------------------------
@@ -225,6 +244,14 @@ class SessionManager:
         if existing is not None:
             self._reap_dead_existing_session(task_id, existing)
 
+        # #1737 — enforce the per-project parallel-worker cap before any
+        # filesystem or tmux mutation. Counting at this point (after the
+        # idempotent existing-session short-circuit above) means a
+        # re-claim of an already-active task does not consume a cap slot
+        # but a fresh task does. Raised as ``WorkerCapExceededError`` so
+        # the audit watchdog can recognise normal back-pressure.
+        self._enforce_parallel_cap(project, task_id)
+
         # Derive slug from task_id for branch/path naming
         task_slug = f"{project}-{task_number}"
         branch_name = f"task/{task_slug}"
@@ -264,6 +291,10 @@ class SessionManager:
             if existing is not None:
                 self._reap_dead_existing_session(task_id, existing)
 
+            # #1737 — re-check the cap under the lock so two racing
+            # claims can't both squeeze past a single open slot.
+            self._enforce_parallel_cap(project, task_id)
+
             worker_session = self._provision_locked(
                 task_id=task_id,
                 agent_name=agent_name,
@@ -282,6 +313,97 @@ class SessionManager:
                         "provision_worker[%s]: failed to release session lock: %s",
                         task_id, exc,
                     )
+
+    # ------------------------------------------------------------------
+    # Per-project parallel cap (#1737)
+    # ------------------------------------------------------------------
+
+    def _resolve_parallel_cap(self, project: str) -> int:
+        """Return the per-task worker cap for ``project``.
+
+        Precedence: per-project ``max_parallel_workers`` →
+        ``max_concurrent_workers`` (legacy field, kept for back-compat with
+        operators who already set it) → :data:`DEFAULT_MAX_PARALLEL_WORKERS`.
+        A non-positive override is ignored so a typo can't silently disable
+        worker spawning (use ``auto_claim=false`` to gate claims at the
+        sweep level).
+        """
+        config = self._config
+        if config is None:
+            return DEFAULT_MAX_PARALLEL_WORKERS
+        projects = getattr(config, "projects", {}) or {}
+        proj = projects.get(project)
+        if proj is None:
+            return DEFAULT_MAX_PARALLEL_WORKERS
+        override = getattr(proj, "max_parallel_workers", None)
+        if isinstance(override, int) and override > 0:
+            return override
+        legacy = getattr(proj, "max_concurrent_workers", None)
+        if isinstance(legacy, int) and legacy > 0:
+            return legacy
+        return DEFAULT_MAX_PARALLEL_WORKERS
+
+    def _count_active_workers(self, project: str) -> int:
+        """Return the number of currently active worker sessions for a project.
+
+        Counts ``work_sessions`` rows with ``ended_at IS NULL``. The
+        teardown path stamps ``ended_at`` on accept / cancel so this
+        count tracks live per-task tmux windows in steady state. Best
+        effort: a DB error returns 0 so a transient failure doesn't
+        spuriously raise the cap and lock out new claims.
+        """
+        try:
+            records = self._svc.list_worker_sessions(
+                project=project, active_only=True,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "provision_worker[%s]: active-worker count failed: %s; "
+                "treating as zero",
+                project, exc,
+            )
+            return 0
+        return len(list(records))
+
+    def _enforce_parallel_cap(self, project: str, task_id: str) -> None:
+        """Raise ``WorkerCapExceededError`` when the project is at cap.
+
+        See :class:`WorkerCapExceededError` for the contract. The caller
+        is expected to have already short-circuited on an existing-alive
+        session for ``task_id`` so a re-claim of an active task doesn't
+        consume a cap slot.
+        """
+        # If this task already has an active session, a fresh claim is a
+        # no-op (handled upstream) — don't let it tip the cap detector.
+        try:
+            existing = self.session_for_task(task_id)
+        except Exception:  # noqa: BLE001
+            existing = None
+        if existing is not None and self._existing_session_is_alive(existing):
+            return
+        cap = self._resolve_parallel_cap(project)
+        active = self._count_active_workers(project)
+        if active < cap:
+            return
+        raise WorkerCapExceededError(
+            f"Cannot spawn worker for {task_id}: project {project!r} "
+            f"already has {active} active worker sessions (cap={cap}). "
+            "Why it matters: per-task workers run in parallel up to a "
+            "per-project ceiling so a queue burst doesn't burn every "
+            "provider session at once. "
+            "Fix: wait for one of the running workers to finish, or "
+            "raise the cap by setting "
+            f"`max_parallel_workers = <N>` under `[projects.{project}]` "
+            "in pollypm.toml."
+        )
+
+    # Public alias — pre-claim callers (transition managers) check the
+    # cap *before* the DB transition so a cap-exceeded claim is refused
+    # cleanly. Provisioning re-checks under the per-task lock to close
+    # the race window between two concurrent claims.
+    def check_parallel_cap(self, project: str, task_id: str) -> None:
+        """Public entry point for the pre-claim cap probe (#1737)."""
+        self._enforce_parallel_cap(project, task_id)
 
     # ------------------------------------------------------------------
     # Existing-session liveness (#1012)

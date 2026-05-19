@@ -1599,3 +1599,299 @@ class TestClaudeCwdEncoding:
 
         encoded = _encode_claude_cwd(Path("/Users/sam/dev/foo/.pollypm/worktrees/foo-1"))
         assert encoded == "-Users-sam-dev-foo--pollypm-worktrees-foo-1"
+
+
+# ---------------------------------------------------------------------------
+# Per-project parallel worker cap (#1737)
+# ---------------------------------------------------------------------------
+
+
+class _StubProject:
+    """Minimal project stand-in for cap-resolution tests."""
+
+    def __init__(
+        self,
+        *,
+        max_parallel_workers: int | None = None,
+        max_concurrent_workers: int | None = None,
+    ) -> None:
+        self.max_parallel_workers = max_parallel_workers
+        self.max_concurrent_workers = max_concurrent_workers
+
+
+class _StubConfig:
+    """Minimal config stand-in with a ``projects`` mapping."""
+
+    def __init__(self, projects: dict[str, object] | None = None) -> None:
+        self.projects = projects or {}
+
+
+def _seed_active_workers(svc: _StubWorkService, project: str, count: int) -> None:
+    """Insert ``count`` active worker_session rows for ``project``."""
+    for i in range(count):
+        # Insert a task row to satisfy the FK.
+        svc._conn.execute(
+            "INSERT OR IGNORE INTO work_tasks (project, task_number) "
+            "VALUES (?, ?)",
+            (project, 100 + i),
+        )
+        svc._conn.execute(
+            "INSERT INTO work_sessions "
+            "(task_project, task_number, agent_name, pane_id, "
+            "worktree_path, branch_name, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                project, 100 + i, "worker",
+                f"%seed{i}",
+                f"/tmp/{project}-{100 + i}",
+                f"task/{project}-{100 + i}",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+    svc._conn.commit()
+
+
+class TestParallelWorkerCap:
+    """#1737 — per-project parallel worker cap enforcement."""
+
+    def test_default_cap_is_five_when_no_config(self, manager) -> None:
+        from pollypm.work.session_manager import DEFAULT_MAX_PARALLEL_WORKERS
+
+        assert DEFAULT_MAX_PARALLEL_WORKERS == 5
+        assert manager._resolve_parallel_cap("proj") == 5
+
+    def test_resolve_cap_prefers_max_parallel_workers(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        config = _StubConfig(
+            projects={"proj": _StubProject(max_parallel_workers=3)},
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        assert mgr._resolve_parallel_cap("proj") == 3
+
+    def test_resolve_cap_falls_back_to_max_concurrent_workers(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        config = _StubConfig(
+            projects={"proj": _StubProject(max_concurrent_workers=2)},
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        assert mgr._resolve_parallel_cap("proj") == 2
+
+    def test_resolve_cap_uses_default_when_overrides_invalid(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        # Non-positive override is ignored — never silently disable spawn.
+        config = _StubConfig(
+            projects={
+                "proj": _StubProject(
+                    max_parallel_workers=0,
+                    max_concurrent_workers=-1,
+                ),
+            },
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        assert mgr._resolve_parallel_cap("proj") == 5
+
+    def test_check_parallel_cap_passes_under_cap(self, manager) -> None:
+        _seed_active_workers(manager._svc, "proj", 2)
+        # Default cap is 5; 2 active < 5 → no raise.
+        manager.check_parallel_cap("proj", "proj/200")
+
+    def test_check_parallel_cap_raises_at_cap(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        from pollypm.work.session_manager import WorkerCapExceededError
+
+        config = _StubConfig(
+            projects={"proj": _StubProject(max_parallel_workers=5)},
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        _seed_active_workers(mock_svc, "proj", 5)
+        with pytest.raises(WorkerCapExceededError) as exc_info:
+            mgr.check_parallel_cap("proj", "proj/999")
+        msg = str(exc_info.value)
+        assert "max_parallel_workers" in msg
+        assert "proj" in msg
+        assert "cap=5" in msg
+
+    def test_check_parallel_cap_isolates_projects(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        # 5 active workers on ``other`` must NOT block ``proj``.
+        config = _StubConfig(
+            projects={
+                "proj": _StubProject(max_parallel_workers=5),
+                "other": _StubProject(max_parallel_workers=5),
+            },
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        _seed_active_workers(mock_svc, "other", 5)
+        # No raise for proj.
+        mgr.check_parallel_cap("proj", "proj/1")
+
+    def test_check_parallel_cap_ignores_active_session_for_same_task(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        """Re-claim of an already-active task must not consume a cap slot.
+
+        Otherwise a transient cap-aware re-provision would refuse to
+        honour the idempotent return of an existing live session.
+        """
+        # Cap=1, project already has the same task active.
+        config = _StubConfig(
+            projects={"proj": _StubProject(max_parallel_workers=1)},
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        mock_svc._conn.execute(
+            "INSERT OR IGNORE INTO work_tasks (project, task_number) "
+            "VALUES (?, ?)",
+            ("proj", 7),
+        )
+        mock_svc._conn.execute(
+            "INSERT INTO work_sessions "
+            "(task_project, task_number, agent_name, pane_id, "
+            "worktree_path, branch_name, started_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "proj", 7, "worker", "%alive",
+                "/tmp/proj-7", "task/proj-7",
+                "2026-01-01T00:00:00+00:00",
+            ),
+        )
+        mock_svc._conn.commit()
+        # The pane is "alive" per the mock_tmux fixture (is_pane_alive
+        # returns True), so the re-claim short-circuits to the existing
+        # session and the cap check does NOT raise.
+        mgr.check_parallel_cap("proj", "proj/7")
+
+    def test_provision_worker_raises_when_at_cap(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        from pollypm.work.session_manager import WorkerCapExceededError
+
+        config = _StubConfig(
+            projects={"proj": _StubProject(max_parallel_workers=2)},
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        _seed_active_workers(mock_svc, "proj", 2)
+        # Insert the target task row so a partial-success path wouldn't
+        # blow up on FK before the cap check.
+        mock_svc._conn.execute(
+            "INSERT OR IGNORE INTO work_tasks (project, task_number) "
+            "VALUES (?, ?)",
+            ("proj", 42),
+        )
+        mock_svc._conn.commit()
+        with pytest.raises(WorkerCapExceededError):
+            mgr.provision_worker("proj/42", "worker")
+
+
+# ---------------------------------------------------------------------------
+# Per-task silent_worker skip (#1737)
+# ---------------------------------------------------------------------------
+
+
+class TestRoleSessionMissingCapAware:
+    """#1737 — cap-back-pressure suppresses queued worker_role findings."""
+
+    def test_queued_worker_at_cap_emits_no_finding(self) -> None:
+        from pollypm.audit.watchdog import (
+            RULE_ROLE_SESSION_MISSING,
+            scan_events,
+        )
+
+        class _T:
+            def __init__(self, project, n, status, roles):
+                self.project = project
+                self.task_number = n
+                self.work_status = status
+                self.roles = roles
+                self.assignee = None
+
+        # 3 queued worker-role tasks; project is at cap; storage closet
+        # has no per-project worker window — pre-#1737 this would emit
+        # 3 findings. With back-pressure flag set, zero.
+        tasks = [
+            _T("samblog", n, "queued", {"worker": "worker"})
+            for n in (6, 7, 8)
+        ]
+        findings = scan_events(
+            [],
+            now=datetime(2026, 5, 19, tzinfo=timezone.utc),
+            open_tasks=tasks,
+            storage_window_names=["architect-samblog"],
+            project="samblog",
+            worker_cap_back_pressure={"samblog": True},
+        )
+        assert not any(f.rule == RULE_ROLE_SESSION_MISSING for f in findings)
+
+    def test_queued_worker_not_at_cap_still_fires(self) -> None:
+        from pollypm.audit.watchdog import (
+            RULE_ROLE_SESSION_MISSING,
+            scan_events,
+        )
+
+        class _T:
+            def __init__(self, project, n, status, roles):
+                self.project = project
+                self.task_number = n
+                self.work_status = status
+                self.roles = roles
+                self.assignee = None
+
+        # Same shape but back_pressure False → legacy detector behaviour.
+        tasks = [_T("samblog", 9, "queued", {"worker": "worker"})]
+        findings = scan_events(
+            [],
+            now=datetime(2026, 5, 19, tzinfo=timezone.utc),
+            open_tasks=tasks,
+            storage_window_names=["architect-samblog"],
+            project="samblog",
+            worker_cap_back_pressure={"samblog": False},
+        )
+        matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
+        assert len(matched) == 1
+
+    def test_in_progress_worker_finding_unaffected_by_back_pressure(self) -> None:
+        """Back-pressure only suppresses queued; in_progress still fires
+        because an active claim with no window is a real fault."""
+        from pollypm.audit.watchdog import (
+            RULE_ROLE_SESSION_MISSING,
+            scan_events,
+        )
+
+        class _T:
+            def __init__(self, project, n, status, roles):
+                self.project = project
+                self.task_number = n
+                self.work_status = status
+                self.roles = roles
+                self.assignee = None
+
+        tasks = [_T("samblog", 4, "in_progress", {"worker": "worker"})]
+        findings = scan_events(
+            [],
+            now=datetime(2026, 5, 19, tzinfo=timezone.utc),
+            open_tasks=tasks,
+            storage_window_names=["architect-samblog"],
+            project="samblog",
+            worker_cap_back_pressure={"samblog": True},
+        )
+        matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
+        assert len(matched) == 1
+        assert matched[0].subject == "samblog/4"

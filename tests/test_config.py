@@ -403,6 +403,48 @@ path = "wire"
     assert config.sessions["worker_wire"].cwd == project_root
 
 
+def test_load_config_reads_project_max_parallel_workers(tmp_path: Path) -> None:
+    """#1737 — ``max_parallel_workers`` lands on KnownProject."""
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.samblog]
+path = "samblog"
+max_parallel_workers = 3
+"""
+    )
+    (tmp_path / "samblog").mkdir()
+
+    config = load_config(config_path)
+
+    assert config.projects["samblog"].max_parallel_workers == 3
+    # Legacy field unaffected when only the new field is set.
+    assert config.projects["samblog"].max_concurrent_workers is None
+
+
 def test_load_config_reads_project_local_planner_enforce_plan(tmp_path: Path) -> None:
     """Per-project ``[planner].enforce_plan`` lands on KnownProject."""
     project_root = tmp_path / "wire"

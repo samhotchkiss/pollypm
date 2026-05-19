@@ -25,8 +25,10 @@ Four categories, priority-ordered:
 The module is a leaf in the import graph: it depends only on the
 canonical inbox predicate, the ``InboxItemKind`` enum, and the
 structural shape of the work service. No cockpit, no Supervisor, no
-sqlite3. That keeps it importable from every surface (rail, dashboard
-app, CLI, tests).
+direct database driver (sqlite3 or psycopg) — the work service is
+consumed structurally via :class:`_WorkServiceLike` so either backend
+satisfies the contract. That keeps it importable from every surface
+(rail, dashboard app, CLI, tests).
 """
 
 from __future__ import annotations
@@ -106,7 +108,7 @@ class _WorkerSession(Protocol):
 class _WorkServiceLike(Protocol):
     """The narrow slice of ``WorkService`` the categorizer needs.
 
-    Both :class:`pollypm.work.sqlite_service.SQLiteWorkService` and
+    Both :class:`pollypm.work.pg_service.PgWorkService` and
     :class:`pollypm.work.mock_service.MockWorkService` satisfy this
     shape, so tests can pass either implementation. Method signatures
     mirror the public protocol — adding methods here would tighten the

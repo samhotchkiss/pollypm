@@ -1060,6 +1060,37 @@ def restore_cmd(
     typer.echo("  pm up                  # relaunch the cockpit")
     typer.echo("  pm doctor              # verify the restored state")
 
+def doctor_pg_connection(
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit machine-readable JSON instead of the human result.",
+    ),
+) -> None:
+    """Probe the Postgres backend in isolation (issue #1737).
+
+    Equivalent to running only the ``pg-connection`` doctor check.
+    Useful during the migration runbook ("did pg come up?") and as a
+    smoke test after flipping ``[storage] backend = "postgres"``.
+    Exits 0 on pass, 1 on fail. Skipped on sqlite installs exits 0
+    with an informational status line.
+    """
+    from pollypm.doctor import (
+        Check,
+        check_pg_connection,
+        render_human,
+        render_json,
+        run_checks,
+    )
+
+    report = run_checks([Check("pg-connection", check_pg_connection, "install")])
+    if json_output:
+        typer.echo(render_json(report))
+    else:
+        typer.echo(render_human(report))
+    raise typer.Exit(code=0 if report.ok else 1)
+
+
 def register_maintenance_commands(app: typer.Typer) -> None:
     app.command(
         help=help_with_examples(
@@ -1071,6 +1102,15 @@ def register_maintenance_commands(app: typer.Typer) -> None:
             ],
         )
     )(doctor)
+
+    app.command(
+        "doctor-pg-connection",
+        help=(
+            "Probe just the Postgres backend (pg reachable, version "
+            ">= configured min, vector extension present). Skipped "
+            "when [storage] backend is sqlite."
+        ),
+    )(doctor_pg_connection)
 
     app.command(
         help=(

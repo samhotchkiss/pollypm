@@ -270,3 +270,209 @@ def check_registered_providers() -> doctor.CheckResult:
         f"registered-providers: {', '.join(names)}",
         data={"providers": names},
     )
+
+
+def _parse_pg_server_version(raw: object) -> tuple[int, int] | None:
+    """Parse pg's numeric ``server_version_num`` to ``(major, minor)``.
+
+    Postgres 10+ encodes the version as ``MMMMmm`` (160012 → 16.12).
+    Returns ``None`` for any non-int value so the caller can fail
+    through to the "couldn't read version" branch without raising.
+    """
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return (n // 10000, n % 10000)
+
+
+def check_pg_connection() -> doctor.CheckResult:
+    """Probe the configured Postgres backend (issue #1737, Slice A).
+
+    Runs:
+
+    1. ``SELECT 1`` via the read-only pool (catches "pg not reachable").
+    2. ``SHOW server_version_num`` (verifies pg ≥ configured minimum).
+    3. ``SELECT 1 FROM pg_extension WHERE extname='vector'`` (verifies
+       pgvector is installed — required for embeddings + recall).
+
+    Skipped benignly when ``[storage] backend != "postgres"`` so a
+    sqlite-backed install isn't pestered. Failures emit the standard
+    three-question doctor message with an actionable fix command.
+    """
+    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+    if not DEFAULT_CONFIG_PATH.exists():
+        return doctor._skip("pg-connection skipped (no config)")
+    try:
+        config = load_config(DEFAULT_CONFIG_PATH)
+    except Exception as exc:  # noqa: BLE001
+        return doctor._skip(f"pg-connection skipped (config parse: {exc})")
+
+    backend = config.storage.backend
+    if backend != "postgres":
+        return doctor._skip(
+            f"pg-connection skipped (backend={backend!r})"
+        )
+
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool, resolve_dsn
+    except Exception as exc:  # noqa: BLE001
+        return doctor._fail(
+            "pg pool module unavailable",
+            why=(
+                "The Postgres backend is selected but the pollypm pg "
+                "pool module failed to import — psycopg/psycopg_pool "
+                "are likely missing."
+            ),
+            fix=(
+                "Install the runtime extras —\n"
+                "  uv pip install 'pollypm[postgres]'\n"
+                "Or switch `[storage] backend` back to `sqlite`.\n"
+                "Recheck: pm doctor"
+            ),
+            data={"error": str(exc)},
+        )
+
+    dsn = resolve_dsn(config)
+
+    try:
+        pool = get_ro_pool(config)
+    except Exception as exc:  # noqa: BLE001
+        return doctor._fail(
+            f"pg not reachable at {dsn}",
+            why=(
+                "PollyPM could not open a read-only connection to "
+                "Postgres. The cockpit refuses to start while the "
+                "configured backend is unreachable."
+            ),
+            fix=(
+                "Verify pg is running and the DSN is correct —\n"
+                "  brew services start postgresql@17\n"
+                "  pg_isready\n"
+                f"  psql '{dsn}' -c 'SELECT 1'\n"
+                "Override the DSN with POLLYPM_PG_DSN if needed.\n"
+                "Recheck: pm doctor"
+            ),
+            data={"dsn": dsn, "error": str(exc)},
+        )
+
+    server_version: tuple[int, int] | None = None
+    vector_installed = False
+    select_ok = False
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1")
+            row = cur.fetchone()
+            select_ok = bool(row and int(row[0]) == 1)
+            cur.execute("SHOW server_version_num")
+            row = cur.fetchone()
+            server_version = _parse_pg_server_version(row[0]) if row else None
+            cur.execute(
+                "SELECT 1 FROM pg_extension WHERE extname = 'vector'"
+            )
+            vector_installed = cur.fetchone() is not None
+    except Exception as exc:  # noqa: BLE001
+        return doctor._fail(
+            f"pg probe failed at {dsn}",
+            why=(
+                "Acquired a connection but the SELECT 1 probe raised. "
+                "The pg instance is reachable but not usable for "
+                "PollyPM — most likely an auth, schema, or role issue."
+            ),
+            fix=(
+                f"Investigate with psql '{dsn}'.\n"
+                "Recheck: pm doctor"
+            ),
+            data={"dsn": dsn, "error": str(exc)},
+        )
+
+    if not select_ok:
+        return doctor._fail(
+            f"pg probe returned unexpected payload at {dsn}",
+            why="SELECT 1 returned something other than 1.",
+            fix=(
+                f"Investigate with psql '{dsn}'.\n"
+                "Recheck: pm doctor"
+            ),
+            data={"dsn": dsn},
+        )
+
+    # Parse the configured minimum version (default "16.0"). Tolerant
+    # of "16", "16.0", "16.2.3"; falls back to (16, 0) on a malformed
+    # string so a typo can't trivially pass the gate.
+    min_version_raw = config.storage.pg.min_version or "16.0"
+    parts = [p for p in min_version_raw.split(".") if p.isdigit()]
+    if parts:
+        min_major = int(parts[0])
+        min_minor = int(parts[1]) if len(parts) > 1 else 0
+    else:
+        min_major, min_minor = 16, 0
+    min_version = (min_major, min_minor)
+
+    if server_version is None:
+        return doctor._fail(
+            f"pg version unreadable at {dsn}",
+            why=(
+                "The SHOW server_version_num probe returned a value "
+                "that didn't parse as an integer."
+            ),
+            fix=(
+                f"Investigate with psql '{dsn}'.\n"
+                "Recheck: pm doctor"
+            ),
+            data={"dsn": dsn},
+        )
+
+    if server_version < min_version:
+        version_str = f"{server_version[0]}.{server_version[1]}"
+        min_str = f"{min_version[0]}.{min_version[1]}"
+        return doctor._fail(
+            f"pg version {version_str} < required {min_str}",
+            why=(
+                "PollyPM requires pg "
+                f"{min_str}+ for pgvector HNSW indexes and the "
+                "generated-column tsvector path. Older pg instances "
+                "will silently degrade or fail at migration time."
+            ),
+            fix=(
+                "Upgrade pg —\n"
+                "  brew install postgresql@17\n"
+                "  brew services start postgresql@17\n"
+                "  createdb pollypm\n"
+                "Recheck: pm doctor"
+            ),
+            data={
+                "dsn": dsn,
+                "server_version": version_str,
+                "min_version": min_str,
+            },
+        )
+
+    if not vector_installed:
+        return doctor._fail(
+            f"vector extension missing at {dsn}",
+            why=(
+                "The pgvector extension is required for the "
+                "embeddings table + recall path. Without it the schema "
+                "migrations will fail and pgvector-backed memory "
+                "recall is unavailable."
+            ),
+            fix=(
+                "Install the extension —\n"
+                "  brew install pgvector  # or apt install postgresql-NN-pgvector\n"
+                f'  psql "{dsn}" -c "CREATE EXTENSION vector"\n'
+                "Recheck: pm doctor"
+            ),
+            data={"dsn": dsn},
+        )
+
+    version_str = f"{server_version[0]}.{server_version[1]}"
+    return doctor._ok(
+        f"pg {version_str} reachable at {dsn} (vector extension installed)",
+        data={
+            "dsn": dsn,
+            "server_version": version_str,
+            "vector_installed": True,
+        },
+    )

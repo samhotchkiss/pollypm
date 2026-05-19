@@ -20,6 +20,19 @@ dev = [
   "openapi-spec-validator>=0.7.0",
   "pytest>=8.4.0",
   "ruff>=0.15.12",
+  # Postgres + pgvector migration tests (#1737, Slice A). The pg
+  # driver itself is a runtime extra so sqlite installs stay slim;
+  # dev installs always pull both so `pytest tests/test_pg_*` runs.
+  "psycopg[binary]>=3.2.0",
+  "psycopg-pool>=3.2.0",
+  "testcontainers[postgres]>=4.8.0",
+]
+# Runtime extra for the postgres backend. Operators flipping
+# ``[storage] backend = "postgres"`` in pollypm.toml must
+# ``uv pip install 'pollypm[postgres]'`` (#1737).
+postgres = [
+  "psycopg[binary]>=3.2.0",
+  "psycopg-pool>=3.2.0",
 ]
 
 [project.scripts]

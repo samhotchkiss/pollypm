@@ -663,12 +663,24 @@ def _parse_storage_settings(
     # error at parse-time so the misconfiguration surfaces at startup
     # rather than at the first embed write.
     EMBEDDING_SCHEMA_DIM = 1536
-    if provider_value.lower() == "openai":
+    # #1844: ``model`` may be either a bare model id
+    # (``text-embedding-3-large``) or the documented provider-namespaced
+    # form (``openai:text-embedding-3-large``). The dim table is keyed
+    # on bare model ids — without this normalisation a provider-
+    # prefixed 3072-dim model slips past the guard. The provider key
+    # comes from either the explicit ``provider`` field or the prefix.
+    if ":" in model_value:
+        prefix, _, bare_model = model_value.partition(":")
+        effective_provider = (provider_value or prefix).strip()
+    else:
+        bare_model = model_value
+        effective_provider = provider_value
+    if effective_provider.lower() == "openai":
         try:
             from pollypm.storage.embedder import _OPENAI_MODEL_DIMS
         except Exception:  # noqa: BLE001 — never block config parse on import errors
             _OPENAI_MODEL_DIMS = {}
-        declared_dim = _OPENAI_MODEL_DIMS.get(model_value)
+        declared_dim = _OPENAI_MODEL_DIMS.get(bare_model)
         if declared_dim is not None and declared_dim != EMBEDDING_SCHEMA_DIM:
             raise ValueError(
                 f"[storage.embedding] model {model_value!r} produces "

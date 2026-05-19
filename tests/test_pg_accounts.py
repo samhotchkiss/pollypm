@@ -146,3 +146,70 @@ def test_pg_account_runtime_list(pg_schema_pool):
 
     rows = list_account_runtimes(pool=pg_schema_pool)
     assert [r.account_name for r in rows] == ["alpha", "beta"]
+
+
+# ---------------------------------------------------------------------------
+# #1842 — provider display strings must round-trip through pg_accounts
+# ---------------------------------------------------------------------------
+
+
+def test_pg_account_usage_reset_at_display_string_roundtrip(pg_schema_pool):
+    """#1842 — provider ``reset_at`` strings round-trip without corruption.
+
+    The account usage sampler emits human-readable display strings
+    such as ``"Monday 1am"``, ``"10:09 on 5 May"``, ``"Apr 10 at 1am"``
+    (see ``tests/test_provider_sdk.py`` + the sampler). The pg
+    schema's pre-#1842 ``timestamptz`` either rejected these with
+    ``InvalidDatetimeFormat`` or silently coerced them to nonsense
+    timestamps. After the schema flip to ``text`` they round-trip
+    exactly.
+    """
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_accounts import (
+        get_account_usage,
+        upsert_account_usage,
+    )
+
+    for display in ("Monday 1am", "10:09 on 5 May", "Apr 10 at 1am"):
+        upsert_account_usage(
+            account_name="primary",
+            provider="claude-cli",
+            plan="max",
+            health="ok",
+            usage_summary="42%",
+            raw_text="raw",
+            reset_at=display,
+            period_label="weekly",
+            pool=pg_schema_pool,
+        )
+        row = get_account_usage("primary", pool=pg_schema_pool)
+        assert row is not None
+        assert row.reset_at == display, (
+            f"reset_at must round-trip the provider display string; "
+            f"got {row.reset_at!r}, wrote {display!r}"
+        )
+
+
+def test_pg_account_runtime_available_at_display_string_roundtrip(pg_schema_pool):
+    """#1842 — ``available_at`` / ``access_expires_at`` round-trip as text."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_accounts import (
+        get_account_runtime,
+        upsert_account_runtime,
+    )
+
+    upsert_account_runtime(
+        account_name="primary",
+        provider="claude-cli",
+        status="rate_limited",
+        reason="quota",
+        available_at="Monday 1am",
+        access_expires_at="Apr 10 at 1am",
+        refresh_available=True,
+        pool=pg_schema_pool,
+    )
+
+    row = get_account_runtime("primary", pool=pg_schema_pool)
+    assert row is not None
+    assert row.available_at == "Monday 1am"
+    assert row.access_expires_at == "Apr 10 at 1am"

@@ -163,12 +163,18 @@ TABLE_SPECS: tuple[TableSpec, ...] = (
     TableSpec(
         sqlite_table="account_usage",
         pg_table="account_usage",
-        ts_cols=("reset_at", "updated_at"),
+        # #1842 — ``reset_at`` is a provider display string, not an
+        # ISO timestamp, so it stays as ``text`` in pg and must NOT be
+        # coerced through ``_parse_iso_timestamp`` (which silently
+        # drops values like "Monday 1am").
+        ts_cols=("updated_at",),
     ),
     TableSpec(
         sqlite_table="account_runtime",
         pg_table="account_runtime",
-        ts_cols=("available_at", "access_expires_at", "updated_at"),
+        # #1842 — ``available_at`` and ``access_expires_at`` are
+        # display strings, see ``account_usage.reset_at`` above.
+        ts_cols=("updated_at",),
         bool_cols=("refresh_available",),
     ),
     TableSpec(

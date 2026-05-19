@@ -649,11 +649,21 @@ class JobQueue:
                 if recovered_handlers:
                     # Step 2 — collapse the legacy NULL-dedupe-key
                     # backlog for the handlers we just recovered. We
-                    # keep the newest row per handler (so the cadence
-                    # can still fire) and drop the older duplicates.
-                    # Distinct dedupe_keyed rows are filtered out by
-                    # the ``dedupe_key IS NULL`` clause, so payload-
-                    # differentiated work survives untouched.
+                    # keep the newest row per (handler, payload) pair
+                    # and drop the older duplicates. Two refinements:
+                    #
+                    # * Distinct dedupe_keyed rows are filtered out by
+                    #   the ``dedupe_key IS NULL`` clause, so payload-
+                    #   differentiated work *with* a dedupe key
+                    #   survives untouched (#1822).
+                    # * Grouping by ``payload_json`` as well as handler
+                    #   means arbitrary user/plugin jobs that happen
+                    #   to share a handler with the legacy cadence
+                    #   backlog — but carry distinct payloads — are
+                    #   never collapsed. Only true duplicates (same
+                    #   handler, same payload, no dedupe key) get
+                    #   pruned, matching the original cadence-backlog
+                    #   shape this step is for (#1843).
                     cur.execute(
                         """
                         DELETE FROM work_jobs
@@ -665,7 +675,7 @@ class JobQueue:
                             WHERE status = 'queued'
                               AND dedupe_key IS NULL
                               AND handler_name = ANY(%s)
-                            GROUP BY handler_name
+                            GROUP BY handler_name, payload_json
                           )
                         """,
                         (recovered_handlers, recovered_handlers),

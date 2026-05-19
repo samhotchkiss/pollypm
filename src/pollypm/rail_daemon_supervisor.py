@@ -845,6 +845,97 @@ def _wait_for_child_pid(
         sleep_fn(poll_interval)
 
 
+def _short_circuit_for_diagnosis(
+    decision: RevivalDecision,
+    *,
+    cron: bool,
+) -> RevivalResult | None:
+    """Return a no-op :class:`RevivalResult` when no spawn should happen.
+
+    Two pure-logic short circuits sit at the top of
+    :func:`check_and_revive_rail_daemon`:
+
+    * **Healthy / throttled** — ``decision.needs_revival`` is ``False`` and
+      we want to record the inspection without acting.
+    * **Cron + ``missing_pid``** — the cron caller MUST NOT spawn when
+      only the PID file is missing, because the cockpit may be hosting
+      the rail in-process and a fresh headless daemon would race it.
+
+    Returning ``None`` means the caller should proceed with the lock /
+    spawn sequence. Logging is intentionally a side effect of *this*
+    helper so the caller's branch-free body stays linear — the same
+    debug lines were emitted inline before.
+    """
+    if not decision.needs_revival:
+        # No-op for healthy / throttled daemons. We still log at debug
+        # so a flood of "alive" decisions is auditable when needed.
+        logger.debug(
+            "rail_daemon_supervisor: %s — %s", decision.state, decision.reason,
+        )
+        return RevivalResult(
+            decision=decision,
+            revived=False,
+            spawn_error=None,
+            killed_pid=None,
+            kill_signal=None,
+        )
+
+    if cron and decision.state == "missing_pid":
+        # Cron-path guard: a missing PID file from cron MAY mean the
+        # cockpit is hosting the rail in-process (no headless daemon
+        # ever existed). Spawning a daemon now would race the cockpit's
+        # in-thread ticker. Cron only acts on dead_process /
+        # stuck_no_tick — those imply a daemon was recorded and lost,
+        # which doesn't happen in cockpit-hosted mode (it never writes
+        # a PID file).
+        logger.debug(
+            "rail_daemon_supervisor: cron skipping missing_pid revival "
+            "(cockpit may be hosting rail in-process)",
+        )
+        return RevivalResult(
+            decision=decision,
+            revived=False,
+            spawn_error=None,
+            killed_pid=None,
+            kill_signal=None,
+        )
+
+    return None
+
+
+def _classify_kill_outcome(
+    kill_signal: str | None,
+) -> tuple[bool, str | None]:
+    """Translate a ``_terminate_with_grace`` return into (killed?, abort_label).
+
+    Pure mapping from the signal-label vocabulary to the supervisor's
+    two state slots:
+
+    * ``("SIGTERM", "SIGKILL", "already_gone")`` → ``(True, None)`` — the
+      stuck process is gone (we either signaled it or it had already
+      exited); proceed to the unlink + spawn step.
+    * ``("denied", "identity_mismatch")`` → ``(False, "signal_denied"
+      | "identity_mismatch")`` — refuse to proceed. The caller writes
+      the abort label into ``RevivalResult.spawn_error`` and emits an
+      audit row.
+    * Anything else (``None``, ``"none"``) → ``(False, None)`` — no
+      action was taken (e.g. PID was 0); the caller continues without
+      claiming a kill.
+
+    Factoring this out keeps the post-kill branching out of
+    :func:`check_and_revive_rail_daemon` and lets the table of labels
+    live in one place — adding a new outcome doesn't require touching
+    the spawn sequence's control flow.
+    """
+    if kill_signal in ("SIGTERM", "SIGKILL", "already_gone"):
+        return (True, None)
+    if kill_signal == "denied":
+        return (False, "signal_denied")
+    if kill_signal == "identity_mismatch":
+        return (False, "identity_mismatch")
+    return (False, None)
+
+
 def check_and_revive_rail_daemon(
     *,
     config_path: Path,
@@ -927,38 +1018,9 @@ def check_and_revive_rail_daemon(
         config_path=config_path,
     )
 
-    if not decision.needs_revival:
-        # No-op for healthy / throttled daemons. We still log at debug
-        # so a flood of "alive" decisions is auditable when needed.
-        logger.debug(
-            "rail_daemon_supervisor: %s — %s", decision.state, decision.reason,
-        )
-        return RevivalResult(
-            decision=decision,
-            revived=False,
-            spawn_error=None,
-            killed_pid=None,
-            kill_signal=None,
-        )
-
-    # Cron-path guard: a missing PID file from cron MAY mean the cockpit
-    # is hosting the rail in-process (no headless daemon ever existed).
-    # Spawning a daemon now would race the cockpit's in-thread ticker.
-    # Cron only acts on dead_process / stuck_no_tick — those imply a
-    # daemon was recorded and lost, which doesn't happen in
-    # cockpit-hosted mode (it never writes a PID file).
-    if cron and decision.state == "missing_pid":
-        logger.debug(
-            "rail_daemon_supervisor: cron skipping missing_pid revival "
-            "(cockpit may be hosting rail in-process)",
-        )
-        return RevivalResult(
-            decision=decision,
-            revived=False,
-            spawn_error=None,
-            killed_pid=None,
-            kill_signal=None,
-        )
+    short_circuit = _short_circuit_for_diagnosis(decision, cron=cron)
+    if short_circuit is not None:
+        return short_circuit
 
     logger.warning(
         "rail_daemon_supervisor: reviving heartbeat — %s", decision.reason,
@@ -1032,24 +1094,21 @@ def check_and_revive_rail_daemon(
             kill_signal = _terminate_with_grace(
                 diagnosed_pid, sleep_fn=sleep_fn, config_path=config_path,
             )
-            if kill_signal in ("SIGTERM", "SIGKILL", "already_gone"):
+            killed, abort_label = _classify_kill_outcome(kill_signal)
+            if killed:
                 killed_pid = diagnosed_pid
-            elif kill_signal in ("denied", "identity_mismatch"):
+            elif abort_label is not None:
                 # Couldn't (or refused to) kill it — bail without
                 # spawning so we don't end up with two daemons or
                 # corrupt an unrelated user process.
-                err_label = (
-                    "signal_denied" if kill_signal == "denied"
-                    else "identity_mismatch"
-                )
                 logger.warning(
                     "rail_daemon_supervisor: skipping respawn for pid=%d "
-                    "(%s)", diagnosed_pid, err_label,
+                    "(%s)", diagnosed_pid, abort_label,
                 )
                 result = RevivalResult(
                     decision=recheck,
                     revived=False,
-                    spawn_error=err_label,
+                    spawn_error=abort_label,
                     killed_pid=None,
                     kill_signal=kill_signal,
                 )
@@ -1057,7 +1116,7 @@ def check_and_revive_rail_daemon(
                     _emit_revival_audit(
                         decision=recheck,
                         revived=False,
-                        spawn_error=err_label,
+                        spawn_error=abort_label,
                         killed_pid=None,
                         kill_signal=kill_signal,
                     )

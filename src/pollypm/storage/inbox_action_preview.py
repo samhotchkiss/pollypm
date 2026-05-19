@@ -15,9 +15,13 @@ from pathlib import Path
 import re
 import sqlite3
 import tomllib
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.sqlite_pragmas import readonly_uri
+
+if TYPE_CHECKING:
+    from pollypm.models import PollyPMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +104,7 @@ def load_fast_inbox_action_preview(
     *,
     project: str | None = None,
     limit: int = 12,
+    config: "PollyPMConfig | None" = None,
 ) -> tuple[list[FastInboxPreviewEntry], set[str], int] | None:
     """Return Store-backed action rows without importing the full inbox stack.
 
@@ -120,11 +125,39 @@ def load_fast_inbox_action_preview(
             exc_info=True,
         )
         return None
+
+    if is_pg_backend(config):
+        # Postgres branch: one unified ``messages`` table — collapse the
+        # per-state.db scan into a single query against the shared pool.
+        projects_raw = raw.get("projects")
+        projects = projects_raw if isinstance(projects_raw, dict) else {}
+        known_projects = {str(key) for key in projects}
+        rows_per_source = max(preview_limit * 4, 48)
+        pg_rows = _pg_query_message_rows(limit=rows_per_source, config=config)
+        items: list[FastInboxPreviewEntry] = []
+        for row in pg_rows:
+            item = _row_to_entry(
+                row,
+                source_key=WORKSPACE_DB_KEY,
+                known_projects=known_projects,
+            )
+            if item is None:
+                continue
+            if project and item.project != project:
+                continue
+            items.append(item)
+        if not items:
+            return None
+        items = _dedupe_replayed_plan_reviews(items)
+        items.sort(key=_entry_sort_value, reverse=True)
+        preview = items[:preview_limit]
+        return preview, {item.task_id for item in preview}, len(items)
+
     sources, known_projects = _message_sources(raw, config_path=config_path)
     if not sources:
         return None
 
-    items: list[FastInboxPreviewEntry] = []
+    items = []
     rows_per_source = max(preview_limit * 4, 48)
     for source_key, db_path in sources:
         if not db_path.exists():
@@ -148,6 +181,53 @@ def load_fast_inbox_action_preview(
     items.sort(key=_entry_sort_value, reverse=True)
     preview = items[:preview_limit]
     return preview, {item.task_id for item in preview}, len(items)
+
+
+def _pg_query_message_rows(
+    *,
+    limit: int,
+    config: "PollyPMConfig | None",
+) -> list[dict[str, object]]:
+    """Postgres branch for :func:`_query_message_rows`.
+
+    Returns one row per qualifying ``messages`` row; the dict shape
+    matches the sqlite branch (same column names) so ``_row_to_entry``
+    is backend-agnostic.
+    """
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("inbox_action_preview: pg_pool import failed: %s", exc)
+        return []
+    try:
+        pool = get_ro_pool(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("inbox_action_preview: get_ro_pool failed: %s", exc)
+        return []
+    sql = (
+        "SELECT id, scope, type, tier, recipient, sender, state, parent_id, "
+        "       subject, body, payload_json, labels, "
+        "       created_at, updated_at, closed_at "
+        "FROM messages "
+        "WHERE recipient = %s AND state = %s "
+        "  AND type IN (%s, %s, %s) "
+        "ORDER BY created_at DESC, id DESC "
+        "LIMIT %s"
+    )
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                sql,
+                ("user", "open", "notify", "inbox_task", "alert", int(limit)),
+            )
+            cols = [d[0] for d in cur.description] if cur.description else []
+            rows = cur.fetchall()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "inbox_action_preview: pg query failed: %s", exc, exc_info=True,
+        )
+        return []
+    return [dict(zip(cols, row, strict=False)) for row in rows]
 
 
 def _message_sources(

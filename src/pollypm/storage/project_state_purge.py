@@ -23,6 +23,12 @@ from __future__ import annotations
 import logging
 import sqlite3
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+from pollypm.storage._backend_dispatch import is_pg_backend
+
+if TYPE_CHECKING:
+    from pollypm.models import PollyPMConfig
 
 logger = logging.getLogger(__name__)
 
@@ -83,6 +89,8 @@ def _params_for(project_key: str, kind: str) -> tuple[str, ...]:
 def count_project_state_rows(
     db_path: Path | None,
     project_key: str,
+    *,
+    config: "PollyPMConfig | None" = None,
 ) -> dict[str, int]:
     """Return per-table row counts for ``project_key`` in ``db_path``.
 
@@ -93,6 +101,9 @@ def count_project_state_rows(
     onto the result.
     """
     counts: dict[str, int] = {table: 0 for table, _w, _p in _STATE_PURGE_TABLES}
+
+    if is_pg_backend(config):
+        return _pg_count_project_state_rows(project_key, counts, config=config)
 
     if db_path is None or not db_path.exists():
         return counts
@@ -136,6 +147,7 @@ def purge_project_state_rows(
     project_key: str,
     *,
     dry_run: bool = False,
+    config: "PollyPMConfig | None" = None,
 ) -> dict[str, int]:
     """Delete every project-scoped row from ``db_path``.
 
@@ -165,9 +177,12 @@ def purge_project_state_rows(
     silences the side-channels and matches the operator's mental
     model ("tear it all down, fast").
     """
-    counts = count_project_state_rows(db_path, project_key)
+    counts = count_project_state_rows(db_path, project_key, config=config)
     if dry_run:
         return counts
+
+    if is_pg_backend(config):
+        return _pg_purge_project_state_rows(project_key, counts, config=config)
 
     if db_path is None or not db_path.exists():
         return counts
@@ -214,6 +229,121 @@ def purge_project_state_rows(
     finally:
         conn.close()
 
+    return counts
+
+
+def _pg_count_project_state_rows(
+    project_key: str,
+    counts: dict[str, int],
+    *,
+    config: "PollyPMConfig | None",
+) -> dict[str, int]:
+    """Postgres branch for :func:`count_project_state_rows`.
+
+    Runs each per-table COUNT through the RO pool. Best-effort per
+    table: a missing table (slate-clean pg DB before migrations) yields
+    zero so the caller's summary stays accurate.
+    """
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("project_state_purge: pg_pool import failed: %s", exc)
+        return counts
+    try:
+        pool = get_ro_pool(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("project_state_purge: get_ro_pool failed: %s", exc)
+        return counts
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            for table, where, ptype in _STATE_PURGE_TABLES:
+                params = _params_for(project_key, ptype)
+                # ``?`` placeholders in the sqlite WHERE clause have to
+                # become ``%s`` for psycopg. Replace each ``?`` one at a
+                # time so the count of placeholders stays right for both
+                # the ``single`` and ``pair`` shapes.
+                where_pg = where.replace("?", "%s")
+                try:
+                    cur.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE {where_pg}",
+                        params,
+                    )
+                    row = cur.fetchone()
+                    counts[table] = int(row[0]) if row else 0
+                except Exception:  # noqa: BLE001
+                    # Rollback the per-statement error so the next loop
+                    # iteration's execute succeeds; psycopg aborts the
+                    # whole transaction on any error otherwise.
+                    try:
+                        conn.rollback()
+                    except Exception:  # noqa: BLE001
+                        pass
+                    counts[table] = 0
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("project_state_purge: pg count failed: %s", exc)
+    return counts
+
+
+def _pg_purge_project_state_rows(
+    project_key: str,
+    counts: dict[str, int],
+    *,
+    config: "PollyPMConfig | None",
+) -> dict[str, int]:
+    """Postgres branch for :func:`purge_project_state_rows`.
+
+    Wraps every per-table DELETE in a single transaction against the
+    RW pool. Matches the sqlite shape: any pg-level error rolls back
+    and raises :class:`ProjectStatePurgeError` so the caller can abort
+    before mutating ``pollypm.toml``.
+    """
+    try:
+        from pollypm.storage.pg_pool import get_rw_pool
+    except Exception as exc:  # noqa: BLE001
+        raise ProjectStatePurgeError(
+            f"pg_pool import failed during purge of '{project_key}': {exc}"
+        ) from exc
+    try:
+        pool = get_rw_pool(config)
+    except Exception as exc:  # noqa: BLE001
+        raise ProjectStatePurgeError(
+            f"could not open pg pool during purge of '{project_key}': {exc}"
+        ) from exc
+    try:
+        with pool.connection() as conn:
+            conn.autocommit = False
+            try:
+                with conn.cursor() as cur:
+                    for table, where, ptype in _STATE_PURGE_TABLES:
+                        params = _params_for(project_key, ptype)
+                        where_pg = where.replace("?", "%s")
+                        try:
+                            cur.execute(
+                                f"DELETE FROM {table} WHERE {where_pg}",
+                                params,
+                            )
+                            counts[table] = int(cur.rowcount or 0)
+                        except Exception:  # noqa: BLE001
+                            # Missing-table case in pg aborts the
+                            # transaction; surface so the caller sees a
+                            # consistent partial-rollback signal rather
+                            # than a silent skip.
+                            raise
+                conn.commit()
+            except Exception as exc:  # noqa: BLE001
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass
+                raise ProjectStatePurgeError(
+                    f"pg state purge failed for '{project_key}': {exc}"
+                ) from exc
+    except ProjectStatePurgeError:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise ProjectStatePurgeError(
+            f"pg state purge failed for '{project_key}': {exc}"
+        ) from exc
     return counts
 
 

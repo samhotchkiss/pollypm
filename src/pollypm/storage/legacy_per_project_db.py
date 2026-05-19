@@ -43,6 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.sqlite_pragmas import readonly_uri
 
 if TYPE_CHECKING:
@@ -334,6 +335,14 @@ def migrate_legacy_per_project_dbs(
         except Exception as exc:  # noqa: BLE001
             logger.warning("legacy_per_project_db: load_config failed: %s", exc)
             return []
+
+    # #1737, Slice C: on the postgres backend there are no per-project
+    # state.db files — the unified ``messages`` + ``work_*`` tables live
+    # in the shared pg DB. Skip the migration entirely so an install with
+    # ``backend = "postgres"`` never tries to open sqlite shards that
+    # don't exist.
+    if is_pg_backend(config):
+        return []
 
     workspace_root_raw = getattr(config.project, "workspace_root", None)
     if workspace_root_raw is None:

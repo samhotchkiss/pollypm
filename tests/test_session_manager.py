@@ -1800,6 +1800,149 @@ class TestParallelWorkerCap:
         with pytest.raises(WorkerCapExceededError):
             mgr.provision_worker("proj/42", "worker")
 
+    def test_reserve_worker_cap_slot_atomic_called_by_provision_locked(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        """#1883 — ``_reserve_cap_slot_atomic`` routes through the work service.
+
+        Pre-fix the cap check and the worker session row insert ran
+        in separate transactions on separate connections. Two
+        concurrent claims for *different* tasks on the same project
+        could both pass the count and both insert — silently
+        exceeding ``max_parallel_workers``. The fix delegates the
+        check-and-reserve to the work service, which performs both
+        inside one transaction under a project-scoped advisory lock
+        (pg) or ``BEGIN IMMEDIATE`` (sqlite).
+        """
+        config = _StubConfig(
+            projects={"proj": _StubProject(max_parallel_workers=5)},
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        calls: list[dict[str, object]] = []
+
+        def _fake_reserve(**kwargs):
+            calls.append(kwargs)
+            return True
+
+        mock_svc.reserve_worker_cap_slot = _fake_reserve
+
+        # Exercise the atomic-reserve entry point directly so the
+        # test doesn't have to thread role-routing config through the
+        # full provision pipeline.
+        mgr._reserve_cap_slot_atomic("proj", 31, "worker")
+
+        assert len(calls) == 1
+        kw = calls[0]
+        assert kw["task_project"] == "proj"
+        assert kw["task_number"] == 31
+        assert kw["agent_name"] == "worker"
+        assert kw["cap"] == 5
+
+    def test_reserve_worker_cap_slot_returns_false_raises(
+        self, mock_tmux, mock_svc, tmp_project,
+    ) -> None:
+        """#1883 — reserve returning ``False`` raises ``WorkerCapExceeded``.
+
+        The atomic reserve is the load-bearing back-pressure signal;
+        a ``False`` return means a concurrent claim won the race so
+        the caller must surface the cap-exceeded error rather than
+        silently proceeding to create a worktree.
+        """
+        from pollypm.work.session_manager import WorkerCapExceededError
+
+        config = _StubConfig(
+            projects={"proj": _StubProject(max_parallel_workers=3)},
+        )
+        mgr = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+        mock_svc.reserve_worker_cap_slot = lambda **kw: False
+
+        with pytest.raises(WorkerCapExceededError):
+            mgr._reserve_cap_slot_atomic("proj", 17, "worker")
+
+    def test_sqlite_reserve_worker_cap_slot_atomic_behavior(
+        self, tmp_path,
+    ) -> None:
+        """#1883 — the SQLiteWorkService reserve is atomic.
+
+        Verifies the work-service-level contract: ``reserve_worker_cap_slot``
+        on the SQLite backend serialises check + insert under a
+        ``BEGIN IMMEDIATE`` transaction so the placeholder row is
+        visible to subsequent ``list_worker_sessions`` calls.
+        """
+        from pollypm.work.sqlite_service import SQLiteWorkService
+
+        db_path = tmp_path / "work.db"
+        svc = SQLiteWorkService(db_path=db_path)
+        svc.ensure_worker_session_schema()
+        # Satisfy the work_sessions FK to work_tasks. The reserve
+        # method writes into work_sessions which references
+        # ``work_tasks(project, task_number)`` — and ``work_tasks``
+        # has NOT NULL columns for title/type/flow/created_at/etc.
+        now = "2026-05-19T00:00:00+00:00"
+        for n in (1, 2, 3):
+            svc._conn.execute(
+                "INSERT OR IGNORE INTO work_tasks "
+                "(project, task_number, title, type, flow_template_id, "
+                " created_at, created_by, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                ("proj", n, f"task {n}", "feat", "simple",
+                 now, "system", now),
+            )
+        svc._conn.commit()
+
+        # No active rows; cap = 2 -> reserve succeeds, placeholder
+        # row is now visible to the count.
+        ok = svc.reserve_worker_cap_slot(
+            task_project="proj",
+            task_number=1,
+            agent_name="worker",
+            started_at="2026-05-19T00:00:00+00:00",
+            cap=2,
+        )
+        assert ok is True
+        active = svc.list_worker_sessions(
+            project="proj", active_only=True,
+        )
+        assert len(active) == 1, active
+
+        # Second reserve for a different task — still under cap.
+        ok2 = svc.reserve_worker_cap_slot(
+            task_project="proj",
+            task_number=2,
+            agent_name="worker",
+            started_at="2026-05-19T00:00:00+00:00",
+            cap=2,
+        )
+        assert ok2 is True
+
+        # Third reserve at cap -> rejected without inserting a row.
+        ok3 = svc.reserve_worker_cap_slot(
+            task_project="proj",
+            task_number=3,
+            agent_name="worker",
+            started_at="2026-05-19T00:00:00+00:00",
+            cap=2,
+        )
+        assert ok3 is False
+        active = svc.list_worker_sessions(
+            project="proj", active_only=True,
+        )
+        assert len(active) == 2, active
+
+        # Re-claim for an already-reserved task is idempotent.
+        ok4 = svc.reserve_worker_cap_slot(
+            task_project="proj",
+            task_number=1,
+            agent_name="worker",
+            started_at="2026-05-19T00:00:00+00:00",
+            cap=2,
+        )
+        assert ok4 is True
+
 
 # ---------------------------------------------------------------------------
 # Per-task silent_worker skip (#1737)
@@ -2022,3 +2165,122 @@ class TestPerTaskReviewerLifecycle:
         prompt = _resolve_reviewer_persona_prompt(_Cfg(), "demo")
         assert prompt is not None
         assert "You are Russell, the code reviewer" in prompt
+
+    def test_reviewer_cwd_is_worker_worktree_when_present(
+        self, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        """#1886 — the reviewer launches in the worker's task worktree.
+
+        Pre-fix the reviewer's ``SessionConfig.cwd`` was the project
+        root, so the per-task reviewer window opened idle on whatever
+        ``main`` happened to be and never saw the worker's
+        in-progress changes. The fix selects the worker's worktree at
+        ``<project>/.pollypm/worktrees/<project>-<N>`` when it exists.
+        """
+        from pollypm.models import (
+            AccountConfig, KnownProject, ProjectKind, ProviderKind,
+        )
+
+        # Pre-create the worker's worktree directory the reviewer
+        # should now point at.
+        task_slug = "proj-7"
+        worker_worktree = (
+            tmp_project / ".pollypm" / "worktrees" / task_slug
+        )
+        worker_worktree.mkdir(parents=True, exist_ok=True)
+
+        config = _worker_launch_config(
+            tmp_project,
+            account_name="claude_main",
+            provider=ProviderKind.CLAUDE,
+            home=tmp_path / "claude-home",
+        )
+        # Register the project so role routing resolves.
+        config.projects["proj"] = KnownProject(
+            key="proj",
+            path=tmp_project,
+            name="proj",
+            persona_name="",
+            kind=ProjectKind.FOLDER,
+            tracked=True,
+        )
+
+        manager = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+
+        # Capture the SessionConfig the launch bundle hands to the
+        # provider/runtime adapters — that's where ``cwd`` lives.
+        captured = {}
+
+        from pollypm.models import SessionConfig as _SC
+        orig_init = _SC.__init__
+
+        def _capture_init(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            captured.setdefault("cwd", self.cwd)
+            captured.setdefault("role", self.role)
+
+        with patch.object(_SC, "__init__", _capture_init):
+            try:
+                manager._reviewer_launch_bundle(
+                    window_name="reviewer-proj-7",
+                    project="proj",
+                    task_number=7,
+                )
+            except Exception:
+                # Provider/runtime adapters may fail to find a binary
+                # in the test sandbox — that's fine, the SessionConfig
+                # construction we want to assert on already happened.
+                pass
+
+        assert captured.get("role") == "reviewer"
+        assert captured.get("cwd") == worker_worktree
+
+    def test_reviewer_cwd_falls_back_to_project_root_without_worktree(
+        self, mock_tmux, mock_svc, tmp_project, tmp_path,
+    ):
+        """#1886 — when no worker worktree exists, fall back to the project
+        root (the legacy review-from-main path for review-only tasks)."""
+        from pollypm.models import (
+            KnownProject, ProjectKind, ProviderKind, SessionConfig as _SC,
+        )
+
+        config = _worker_launch_config(
+            tmp_project,
+            account_name="claude_main",
+            provider=ProviderKind.CLAUDE,
+            home=tmp_path / "claude-home",
+        )
+        config.projects["proj"] = KnownProject(
+            key="proj",
+            path=tmp_project,
+            name="proj",
+            persona_name="",
+            kind=ProjectKind.FOLDER,
+            tracked=True,
+        )
+
+        manager = SessionManager(
+            mock_tmux, mock_svc, tmp_project, config=config,
+        )
+
+        captured = {}
+        orig_init = _SC.__init__
+
+        def _capture_init(self, *args, **kwargs):
+            orig_init(self, *args, **kwargs)
+            captured.setdefault("cwd", self.cwd)
+
+        with patch.object(_SC, "__init__", _capture_init):
+            try:
+                manager._reviewer_launch_bundle(
+                    window_name="reviewer-proj-9",
+                    project="proj",
+                    task_number=9,
+                )
+            except Exception:
+                pass
+
+        # No worktree on disk -> falls back to project root.
+        assert captured.get("cwd") == tmp_project

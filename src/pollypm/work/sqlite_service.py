@@ -3988,6 +3988,77 @@ class SQLiteWorkService:
             provider_home=provider_home,
         )
 
+    def reserve_worker_cap_slot(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        agent_name: str,
+        started_at: str,
+        cap: int,
+    ) -> bool:
+        """Atomically reserve a per-project worker-cap slot (#1883).
+
+        SQLite uses ``BEGIN IMMEDIATE`` so the count + insert run under
+        the database-wide write lock. The pg backend (production) uses
+        ``pg_advisory_xact_lock`` keyed on the project — the two
+        implementations satisfy the same atomic-check-and-reserve
+        contract via their respective concurrency primitives.
+
+        Idempotent for the same ``(task_project, task_number)``: an
+        active row short-circuits to ``True``.
+        """
+        conn = self._conn
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+        except Exception:  # noqa: BLE001 — fall through to a best-effort plain check
+            conn.execute("BEGIN")
+        try:
+            cur = conn.execute(
+                "SELECT ended_at FROM work_sessions "
+                "WHERE task_project = ? AND task_number = ?",
+                (task_project, task_number),
+            )
+            existing = cur.fetchone()
+            if existing is not None and existing[0] is None:
+                conn.commit()
+                return True
+            cur = conn.execute(
+                "SELECT COUNT(*) FROM work_sessions "
+                "WHERE task_project = ? AND ended_at IS NULL",
+                (task_project,),
+            )
+            active = int(cur.fetchone()[0])
+            if active >= int(cap):
+                conn.rollback()
+                return False
+            # Reserve the slot with a placeholder. Subsequent COUNT
+            # calls from other concurrent claims see it immediately.
+            conn.execute(
+                "INSERT OR REPLACE INTO work_sessions ("
+                "task_project, task_number, agent_name, pane_id, "
+                "worktree_path, branch_name, started_at, ended_at, "
+                "archive_path"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                (
+                    task_project,
+                    task_number,
+                    agent_name,
+                    "",
+                    "",
+                    "",
+                    started_at,
+                ),
+            )
+            conn.commit()
+            return True
+        except Exception:
+            try:
+                conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            raise
+
     def get_worker_session(
         self,
         *,

@@ -372,6 +372,44 @@ class WorkService(Protocol):
         """
         ...
 
+    def reserve_worker_cap_slot(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        agent_name: str,
+        started_at: str,
+        cap: int,
+    ) -> bool:
+        """Atomically reserve a per-project worker cap slot (#1883).
+
+        Performs the cap check (active-row count vs ``cap``) AND the
+        placeholder row insert in a single transaction, gated by a
+        project-scoped advisory lock so two concurrent claims for
+        different ``task_number``\\s on the same project serialise on
+        the count.
+
+        Returns ``True`` when a slot was reserved (a placeholder row
+        with ``pane_id=""`` is now visible to subsequent counts).
+        Returns ``False`` when the project is already at cap — the
+        caller (typically ``SessionManager.provision_worker``) raises
+        :class:`pollypm.work.session_manager.WorkerCapExceededError`.
+
+        Idempotent for the same ``(task_project, task_number)``: a
+        re-claim against an already-active row returns ``True`` without
+        consuming an additional slot — the caller's existing-session
+        short-circuit handles this case upstream, but the work-service
+        contract is explicit so a test harness racing two calls can't
+        accidentally double-count.
+
+        The placeholder row is upgraded to the real binding by the
+        subsequent :meth:`upsert_worker_session` call once tmux /
+        worktree provisioning succeeds. On provisioning failure the
+        caller should call :meth:`mark_worker_session_ended` so the
+        slot is freed for the next claim.
+        """
+        ...
+
     def get_worker_session(
         self,
         *,

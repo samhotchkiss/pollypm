@@ -40,6 +40,8 @@ from pollypm.storage.records import AccountRuntimeRecord, AccountUsageRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -80,6 +82,7 @@ def upsert_account_usage(
     reset_at: str | None = None,
     period_label: str | None = None,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Insert-or-update an ``account_usage`` row.
 
@@ -89,7 +92,7 @@ def upsert_account_usage(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -131,12 +134,13 @@ def get_account_usage(
     account_name: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> AccountUsageRecord | None:
     """Return the ``account_usage`` row for ``account_name`` or ``None``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -168,12 +172,13 @@ def get_account_usage(
 def list_account_usage(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[AccountUsageRecord]:
     """Return every ``account_usage`` row, sorted by ``account_name``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -217,6 +222,7 @@ def upsert_account_runtime(
     access_expires_at: str | None = None,
     refresh_available: bool = False,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Insert-or-update an ``account_runtime`` row.
 
@@ -226,7 +232,7 @@ def upsert_account_runtime(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -262,12 +268,13 @@ def get_account_runtime(
     account_name: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> AccountRuntimeRecord | None:
     """Return the ``account_runtime`` row for ``account_name`` or ``None``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -296,12 +303,13 @@ def get_account_runtime(
 def list_account_runtimes(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[AccountRuntimeRecord]:
     """Return every ``account_runtime`` row, sorted by ``account_name``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

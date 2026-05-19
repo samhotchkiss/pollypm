@@ -57,6 +57,8 @@ from pollypm.storage.records import MemoryEntryRecord, MemorySummaryRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -155,6 +157,7 @@ def record_memory_entry(
     ttl_at: str | None = None,
     scope_tier: str = "project",
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> MemoryEntryRecord:
     """Append a memory entry and return the populated record.
 
@@ -165,7 +168,7 @@ def record_memory_entry(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     tags_json = json.dumps([str(tag) for tag in tags], ensure_ascii=True)
     with pool.connection() as conn, conn.cursor() as cur:
@@ -222,12 +225,13 @@ def get_memory_entry(
     entry_id: int,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> MemoryEntryRecord | None:
     """Return a single memory entry by id, or ``None`` if absent."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -252,6 +256,7 @@ def list_memory_entries(
     scope_tier: str | None = None,
     limit: int = 50,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[MemoryEntryRecord]:
     """List memory entries with optional filters, newest first.
 
@@ -276,7 +281,7 @@ def list_memory_entries(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"""
@@ -297,12 +302,13 @@ def delete_memory_entry(
     entry_id: int,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> bool:
     """Hard-delete a memory entry by id. Returns True when a row was removed."""
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM memory_entries WHERE id = %s",
@@ -321,6 +327,7 @@ def update_memory_entry(
     superseded_by: int | None = None,
     clear_superseded: bool = False,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> bool:
     """Patch a subset of fields on a memory row. Returns True on change.
 
@@ -357,7 +364,7 @@ def update_memory_entry(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             f"UPDATE memory_entries SET {', '.join(sets)} WHERE id = %s",
@@ -379,6 +386,7 @@ def recall_memory_entries(
     tier_scope_pairs: list[tuple[str, str]] | None = None,
     include_superseded: bool = False,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[tuple[MemoryEntryRecord, float | None]]:
     """Keyword-only recall against ``memory_entries.title_body_tsv``.
 
@@ -433,7 +441,7 @@ def recall_memory_entries(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
 
     where = " AND ".join(clauses)
     if query_text:
@@ -487,6 +495,7 @@ def purge_session_scope(
     session_id: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> int:
     """Delete every session-tier memory entry with ``scope = session_id``.
 
@@ -496,7 +505,7 @@ def purge_session_scope(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM memory_entries WHERE scope_tier = 'session' AND scope = %s",
@@ -511,6 +520,7 @@ def expire_task_scope(
     terminal_at: str | None = None,
     ttl_days: int = 30,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> int:
     """Stamp a 30-day TTL on task-tier entries with ``scope = task_id``.
 
@@ -528,7 +538,7 @@ def expire_task_scope(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -545,6 +555,7 @@ def expire_task_scope(
 def sweep_expired_memory_entries(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> int:
     """Drop ``memory_entries`` whose ``ttl_at`` has elapsed.
 
@@ -554,7 +565,7 @@ def sweep_expired_memory_entries(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM memory_entries WHERE ttl_at IS NOT NULL AND ttl_at < now()"
@@ -574,12 +585,13 @@ def record_memory_summary(
     summary_path: str,
     entry_count: int,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> MemorySummaryRecord:
     """Append a memory_summary row and return the populated record."""
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -606,12 +618,13 @@ def latest_memory_summary(
     scope: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> MemorySummaryRecord | None:
     """Return the most-recently inserted summary for ``scope`` or ``None``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

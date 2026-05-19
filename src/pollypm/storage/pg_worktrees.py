@@ -30,6 +30,8 @@ from pollypm.storage.records import WorktreeRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,6 +70,7 @@ def upsert_worktree(
     branch: str,
     status: str,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Insert-or-update the worktree row for ``(project, lane, status)``.
 
@@ -80,7 +83,7 @@ def upsert_worktree(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -137,6 +140,7 @@ def update_worktree_status(
     status: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Promote the ``active`` row for ``(project, lane)`` to ``status``.
 
@@ -147,7 +151,7 @@ def update_worktree_status(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -167,6 +171,7 @@ def list_worktrees(
     project_key: str | None = None,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[WorktreeRecord]:
     """Return every worktree row, ordered most-recently-updated first.
 
@@ -176,7 +181,7 @@ def list_worktrees(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         if project_key is None:
             cur.execute(

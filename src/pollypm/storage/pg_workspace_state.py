@@ -36,6 +36,8 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -55,6 +57,7 @@ def set_workspace_state(
     *,
     actor: str = "system",
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Upsert one ``workspace_state`` row.
 
@@ -79,7 +82,7 @@ def set_workspace_state(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     payload = json.dumps(value)
     set_at = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
@@ -100,6 +103,7 @@ def get_workspace_state(
     key: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> dict[str, Any] | None:
     """Return the JSON payload stored under ``key``, or ``None``.
 
@@ -119,7 +123,7 @@ def get_workspace_state(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     try:
         with pool.connection() as conn, conn.cursor() as cur:
             cur.execute(
@@ -151,6 +155,7 @@ def clear_workspace_state(
     key: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> bool:
     """Delete the row at ``key``; return ``True`` iff a row was removed.
 
@@ -168,7 +173,7 @@ def clear_workspace_state(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "DELETE FROM workspace_state WHERE key = %s",

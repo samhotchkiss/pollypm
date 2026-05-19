@@ -28,6 +28,8 @@ from pollypm.storage.records import CheckpointRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -65,6 +67,7 @@ def record_checkpoint(
     snapshot_path: str,
     summary_text: str,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Append a checkpoint row.
 
@@ -76,7 +79,7 @@ def record_checkpoint(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     created_at = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -103,12 +106,13 @@ def latest_checkpoint(
     session_name: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> CheckpointRecord | None:
     """Return the most recently inserted checkpoint for ``session_name``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

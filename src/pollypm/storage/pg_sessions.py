@@ -64,6 +64,8 @@ from pollypm.storage.records import EventRecord, SessionRecord, SessionRuntimeRe
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -120,6 +122,7 @@ def upsert_session(
     cwd: str,
     window_name: str,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Insert-or-update a session row.
 
@@ -129,7 +132,7 @@ def upsert_session(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -150,12 +153,13 @@ def upsert_session(
 def list_sessions(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[SessionRecord]:
     """Return every row in the ``sessions`` table as a SessionRecord."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT name, role, project, provider, account, cwd, window_name FROM sessions"
@@ -179,6 +183,7 @@ def prune_sessions(
     valid_session_names: set[str],
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Delete sessions / leases / session-tier memory not in ``valid_session_names``.
 
@@ -200,7 +205,7 @@ def prune_sessions(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         if valid_session_names:
@@ -259,12 +264,13 @@ def get_session_window(
     session_name: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> str | None:
     """Return the tmux window_name for ``session_name``, or None if missing."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT window_name FROM sessions WHERE name = %s",
@@ -287,6 +293,7 @@ def record_event(
     message: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Append an event row into ``messages`` with type='event'.
 
@@ -298,7 +305,7 @@ def record_event(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     payload = json.dumps(
         {
@@ -334,12 +341,13 @@ def last_event_at(
     event_type: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> str | None:
     """Return the ISO timestamp of the most recent matching event, or None."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             "SELECT created_at FROM messages "
@@ -357,6 +365,7 @@ def recent_events(
     limit: int = 20,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[EventRecord]:
     """Return the ``limit`` most recent event rows.
 
@@ -368,7 +377,7 @@ def recent_events(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -421,6 +430,7 @@ def upsert_session_runtime(
     retry_at: str | None | object = _UNSET,
     last_recovered_at: str | None | object = _UNSET,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Insert-or-update a row in ``session_runtime``.
 
@@ -439,7 +449,7 @@ def upsert_session_runtime(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -513,12 +523,13 @@ def get_session_runtime(
     session_name: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> SessionRuntimeRecord | None:
     """Return the runtime row for ``session_name``, or None if absent."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -553,12 +564,13 @@ def get_session_runtime(
 def list_session_runtimes(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[SessionRuntimeRecord]:
     """Return every row in the ``session_runtime`` table."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

@@ -31,6 +31,8 @@ from pollypm.storage.records import TokenSampleRecord, TokenUsageHourlyRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -70,12 +72,13 @@ def get_token_sample(
     session_name: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> TokenSampleRecord | None:
     """Return the latest cumulative-token sample for ``session_name``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -110,6 +113,7 @@ def record_token_sample(
     cumulative_tokens: int,
     observed_at: str | None = None,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> int:
     """Observe a cumulative-token reading and roll forward the hourly bucket.
 
@@ -132,7 +136,7 @@ def record_token_sample(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = observed_at or _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -216,6 +220,7 @@ def upsert_token_sample(
     cumulative_tokens: int,
     observed_at: str,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Raw upsert of a cumulative-token sample (no delta tracking).
 
@@ -227,7 +232,7 @@ def upsert_token_sample(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -260,6 +265,7 @@ def replace_token_usage_hourly(
     *,
     account_names: list[str] | None = None,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Atomically delete-and-reinsert the hourly aggregate.
 
@@ -272,7 +278,7 @@ def replace_token_usage_hourly(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         if account_names:
             cur.execute(
@@ -305,6 +311,7 @@ def recent_token_usage(
     limit: int = 24,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[TokenUsageHourlyRecord]:
     """Return the most recent hourly aggregate rows (newest hour first).
 
@@ -315,7 +322,7 @@ def recent_token_usage(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -346,6 +353,7 @@ def daily_token_usage(
     days: int = 30,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[tuple[str, int]]:
     """Return the last ``days`` days as ``(YYYY-MM-DD, total_tokens)`` pairs.
 
@@ -356,7 +364,7 @@ def daily_token_usage(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

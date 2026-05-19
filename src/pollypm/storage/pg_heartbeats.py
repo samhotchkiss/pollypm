@@ -33,6 +33,8 @@ from pollypm.storage.records import HeartbeatRecord
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
 
+    from pollypm.models import PollyPMConfig
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,6 +61,7 @@ def record_heartbeat(
     snapshot_path: str,
     snapshot_hash: str,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> None:
     """Append a heartbeat row.
 
@@ -70,7 +73,7 @@ def record_heartbeat(
     if pool is None:
         from pollypm.storage.pg_pool import get_rw_pool
 
-        pool = get_rw_pool()
+        pool = get_rw_pool(config)
     now = _now_iso()
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
@@ -99,12 +102,13 @@ def latest_heartbeat(
     session_name: str,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> HeartbeatRecord | None:
     """Return the most-recent heartbeat row for ``session_name``, or ``None``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -128,12 +132,13 @@ def recent_heartbeats(
     limit: int = 3,
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> list[HeartbeatRecord]:
     """Return up to ``limit`` most-recent heartbeats for ``session_name``."""
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -153,6 +158,7 @@ def recent_heartbeats(
 def last_heartbeat_at(
     *,
     pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
 ) -> str | None:
     """Return the ISO timestamp of the most-recent heartbeat sweep event.
 
@@ -163,7 +169,7 @@ def last_heartbeat_at(
     if pool is None:
         from pollypm.storage.pg_pool import get_ro_pool
 
-        pool = get_ro_pool()
+        pool = get_ro_pool(config)
     with pool.connection() as conn, conn.cursor() as cur:
         cur.execute(
             """

@@ -119,7 +119,7 @@ Per-session tmux pane logs capture everything an agent session outputs.
 
 ### Event Log
 
-All operational events are recorded in the SQLite state store.
+All operational events are recorded in the Postgres state store.
 
 Event types:
 
@@ -158,7 +158,7 @@ Structured recovery data created at meaningful boundaries (doc 12):
 
 - Machine-readable JSON files in `<project>/.pollypm/artifacts/checkpoints/`
 - Human-readable markdown summaries for Level 1 and Level 2 checkpoints
-- Indexed in the SQLite checkpoints table
+- Indexed in the `checkpoints` table
 
 ### TUI Dashboard
 
@@ -218,7 +218,7 @@ Every alert record contains:
 
 ### Alert Durability
 
-Alerts are durable. They are stored in the SQLite state store, not just displayed in the TUI.
+Alerts are durable. They are stored in the Postgres state store, not just displayed in the TUI.
 
 - Alerts persist across TUI restarts
 - Unresolved alerts are displayed immediately when the TUI starts
@@ -348,7 +348,7 @@ Mitigation:
 | Log Type | Default Retention | Configurable |
 |----------|------------------|--------------|
 | Pane logs | Indefinite | Yes |
-| Event log (SQLite) | Indefinite | Yes |
+| Event log (Postgres) | Indefinite | Yes |
 | Heartbeat snapshots | 24 hours | Yes |
 | Level 0 checkpoints | 24 hours | Yes |
 | Level 1+ checkpoints | Indefinite | Yes |
@@ -375,7 +375,7 @@ This pattern — strong defaults that are fully replaceable — applies througho
 
 2. **Account homes are the isolation boundary.** Setting `HOME` per-session is the primary isolation mechanism. It is simple, works with all provider CLIs, and leverages each provider's existing config/auth conventions. Container-level isolation is a future enhancement, not a requirement.
 
-3. **Alerts are durable, not ephemeral.** Alerts are stored in SQLite and persist across TUI restarts. This ensures no alert is lost due to a TUI crash or operator absence. Alert history is queryable and available to automated systems.
+3. **Alerts are durable, not ephemeral.** Alerts are stored in Postgres and persist across TUI restarts. This ensures no alert is lost due to a TUI crash or operator absence. Alert history is queryable and available to automated systems.
 
 4. **Token tracking via JSONL, not API polling.** Token usage is extracted from provider transcript files after the fact, not by intercepting or polling provider APIs. This is non-intrusive, works offline, and does not require provider API access beyond what the CLI already has.
 

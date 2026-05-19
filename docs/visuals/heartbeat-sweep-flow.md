@@ -21,7 +21,7 @@ flowchart TD
     H -->|"error message / auth fail"| K["BLOCKED"]
     H -->|"task complete signal"| L["DONE"]
 
-    I --> M["Record heartbeat +<br/>level0 checkpoint<br/>in SQLite"]
+    I --> M["Record heartbeat +<br/>level0 checkpoint<br/>in Postgres"]
     J --> M
     K --> M
     L --> M

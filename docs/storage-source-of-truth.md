@@ -39,8 +39,8 @@ entry at import time.
 | `INBOX_ITEM`        | `pollypm.signal_routing:shared_inbox_count`              |
 | `ACTIVITY_EVENT`    | `pollypm.store.sqlalchemy_store:SQLAlchemyStore.query_messages` |
 | `ALERT`             | `pollypm.signal_routing:shared_alert_count`              |
-| `TASK`              | `pollypm.work.sqlite_service:SQLiteWorkService.list_tasks` |
-| `EXECUTION`         | `pollypm.work.sqlite_service:SQLiteWorkService.get_execution` |
+| `TASK`              | `pollypm.work.pg_service:PgWorkService.list_tasks` |
+| `EXECUTION`         | `pollypm.work.pg_service:PgWorkService.get_execution` |
 | `TRANSCRIPT`        | `pollypm.transcript_ingest:TranscriptIngestor`           |
 | `TOKEN_USAGE`       | `pollypm.storage.state:StateStore.get_token_sample`      |
 | `PROVIDER_ACCOUNT`  | `pollypm.config:load_config` (`.accounts`)               |
@@ -87,9 +87,9 @@ Currently active:
 Currently isolated (audit-passing):
 
 * **per-task workspace DB writes** — shadows `TASK`. Already
-  routed through `SQLiteWorkService` with the resolved per-
-  project DB path. Workspace-root writes are reserved for
-  messages-only concerns.
+  routed through `PgWorkService` against the single workspace
+  Postgres database. Per-project tables are namespaced by
+  `project_key` rather than separate DBs.
 
 ## Adding a new concept
 

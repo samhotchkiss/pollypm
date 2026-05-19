@@ -21,7 +21,7 @@ graph TB
     end
 
     subgraph data["Shared State"]
-        DB[("SQLite state.db<br/>16,569 heartbeats<br/>16,528 checkpoints<br/>13,063 events")]
+        DB[("Postgres workspace DB<br/>heartbeats<br/>checkpoints<br/>events")]
         Issues["File-based Issues<br/>23 issues / 6 states"]
         Jobs["jobs.json<br/>Scheduler config"]
     end

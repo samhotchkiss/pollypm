@@ -1,3 +1,9 @@
+> ⚠️ **Archived.** This document predates the Postgres cutover (#1737)
+> and references SQLite / per-project `state.db` / dual-backend mode that no
+> longer exist. Kept for historical context only; consult
+> `docs/architecture.md` and `src/pollypm/defaults/docs/reference/operator-runbook.md`
+> for the current storage model.
+
 # Work Service Integration Test Plan
 
 **Goal**: Validate the work service end-to-end as a real user would experience it. The user ONLY interacts through conversation with PollyPM agents via tmux. The user never runs CLI commands directly — that's the agents' job. CLI commands may be used by the tester ONLY for troubleshooting when a bug is detected, and the bug must then be fixed.

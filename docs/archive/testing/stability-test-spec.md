@@ -1,3 +1,9 @@
+> ⚠️ **Archived.** This document predates the Postgres cutover (#1737)
+> and references SQLite / per-project `state.db` / dual-backend mode that no
+> longer exist. Kept for historical context only; consult
+> `docs/architecture.md` and `src/pollypm/defaults/docs/reference/operator-runbook.md`
+> for the current storage model.
+
 # Stability Test Spec — Pre-Demo Fix
 
 Sam presents to investors tomorrow. Everything must work: cockpit, sessions,

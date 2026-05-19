@@ -7,7 +7,7 @@
 - This document stays deliberately short; raw extracted knowledge lives under `.pollypm/knowledge/`, and deeper references live in the docs listed below.
 
 ## What PollyPM Is
-PollyPM manages real terminal-native coding sessions. It launches operator and worker sessions in `tmux`, tracks them through a shared SQLite-backed state layer, and gives the operator a CLI and Textual cockpit for visibility, approval, and intervention.
+PollyPM manages real terminal-native coding sessions. It launches operator and worker sessions in `tmux`, tracks them through a shared Postgres-backed state layer, and gives the operator a CLI and Textual cockpit for visibility, approval, and intervention.
 
 The project is optimized for replaceability inside one local system:
 

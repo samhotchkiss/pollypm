@@ -1,3 +1,9 @@
+> ⚠️ **Archived.** This document predates the Postgres cutover (#1737)
+> and references SQLite / per-project `state.db` / dual-backend mode that no
+> longer exist. Kept for historical context only; consult
+> `docs/architecture.md` and `src/pollypm/defaults/docs/reference/operator-runbook.md`
+> for the current storage model.
+
 # PollyPM System State — April 11, 2026
 
 ## What PollyPM Is

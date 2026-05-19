@@ -8,7 +8,7 @@ The current memory system (`src/pollypm/memory_backends/`, ~300 LOC across `base
 
 - **Protocol:** `MemoryBackend` with `write_entry`, `list_entries`, `read_entry`, `summarize`, `compact`.
 - **Entry shape:** `MemoryEntry(entry_id, scope, kind, title, body, tags, source, file_path, summary_path, created_at, updated_at)`.
-- **Storage:** files at `.pollypm/memory/<scope>/<timestamp>-<slug>.md` + SQLite index (`record_memory_entry` in `storage/state.py`).
+- **Storage:** files at `.pollypm/memory/<scope>/<timestamp>-<slug>.md` + Postgres index (`record_memory_entry` in `storage/state.py`).
 - **Writers:** `knowledge_extract.py` (post-session knowledge deltas), `checkpoints.py` (session checkpoint summaries).
 - **Readers:** Almost nothing reads it back. `summarize` exists; no agent automatically pulls memory into its context at session start.
 
@@ -134,7 +134,7 @@ When a new memory contradicts an existing one, the writer flags it. The old memo
 ### 3.9 Plugin surface
 
 `MemoryBackend` stays a plugin kind. Existing `FileMemoryBackend` evolves. Future backends:
-- `SQLiteMemoryBackend` — one-file store, no separate markdown (simpler for some users).
+- `PgMemoryBackend` — DB-only store, no separate markdown (simpler for some users).
 - `VectorMemoryBackend` — v1.1, uses a vector store for semantic retrieval.
 
 Write paths go through an `observer` chain so plugins can intercept (e.g. a "team sync" plugin mirrors memories to a shared store).
@@ -160,7 +160,7 @@ Write paths go through an `observer` chain so plugins can intercept (e.g. a "tea
 
 **Phase 4 — Semantic retrieval (v1.2+)**
 
-- **#M09** Vector-embedding support — new `VectorMemoryBackend` plugin using a lightweight local store (e.g., chromadb or sqlite-vec).
+- **#M09** Vector-embedding support — already covered by the `pgvector`-backed `PgEmbeddingMemoryBackend` (Slice D of #1737).
 - **#M10** Cross-project memory for operator — user-tier memories surface across all projects the operator works in.
 
 ## 5. What this buys us

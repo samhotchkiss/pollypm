@@ -223,13 +223,13 @@ In multi-session scenarios, checkpoint paths are scoped per-session via the `<se
 
 ### State Store Integration
 
-Checkpoint metadata is also recorded in the SQLite state store's `checkpoints` table. This enables:
+Checkpoint metadata is also recorded in the Postgres state store's `checkpoints` table. This enables:
 
 - Fast lookup of the canonical checkpoint for any session
 - Querying checkpoint history without scanning the filesystem
 - Cross-session checkpoint queries (e.g., "what is the latest checkpoint for each session in project X")
 
-The JSON files on disk are the source of truth. The SQLite records are an index.
+The JSON files on disk are the source of truth. The Postgres records are an index.
 
 
 ## Recovery Flow

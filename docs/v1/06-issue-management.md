@@ -145,7 +145,7 @@ Users can write their own issue management plugins by implementing this interfac
 - Linear issue tracker integration
 - Jira adapter
 - Notion database backend
-- Plain SQLite tracker
+- Plain DB-backed tracker
 - Trello board adapter
 
 The plugin system handles discovery and registration — the issue management interface handles the contract.

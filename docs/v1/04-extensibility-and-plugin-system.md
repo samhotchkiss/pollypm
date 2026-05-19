@@ -28,7 +28,7 @@ The core is the runtime/API substrate. It owns all durable domain behavior and r
 - **Transcript and pane access**: ingestion, normalization, and access to pane output and transcript archives
 - **LLM account/session plumbing**: auth, credentials, session routing, provider connections
 - **Scheduling/cron trigger**: recurring, delayed, and one-shot orchestration jobs
-- **Durable state store**: SQLite-backed event log, heartbeats, launches, alerts, checkpoints
+- **Durable state store**: Postgres-backed event log, heartbeats, launches, alerts, checkpoints
 - **Stable internal API**: defined surface that plugins call — plugins never reach into core internals
 - **Projects**: declarations, bindings, directory mappings
 - **Sessions**: lifecycle state machine, role assignment, provider binding
@@ -230,7 +230,7 @@ Memory scopes:
 - **Session**: scoped to a single agent session
 - **Inbox thread**: scoped to a single conversation thread
 
-Default backend: local file + SQLite. Possible alternates: vector store, Postgres, remote hosted service.
+Default backend: local file + Postgres (with `pgvector` for embeddings). Possible alternates: remote hosted Postgres, external vector store.
 
 ### Task
 

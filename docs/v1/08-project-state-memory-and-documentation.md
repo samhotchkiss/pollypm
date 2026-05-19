@@ -172,10 +172,10 @@ The memory system exposes a standardized interface (from doc 04) that any storag
 
 ### Default Backend
 
-The default memory backend is a file + SQLite hybrid:
+The default memory backend is a file + Postgres hybrid:
 
 - **File storage** for `docs/` documents and large text content
-- **SQLite** for indexed metadata, scope tracking, timestamps, and queries
+- **Postgres** for indexed metadata, scope tracking, timestamps, and queries (with `pgvector` for embeddings)
 - This requires no external services and works immediately on any system
 
 ### Future Backends

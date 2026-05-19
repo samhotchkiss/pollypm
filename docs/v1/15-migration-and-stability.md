@@ -18,7 +18,7 @@ PollyPM's current functionality is the baseline. Any change that causes a regres
 This means:
 
 - Existing `pollypm.toml` configurations must continue to work after updates
-- Existing SQLite state stores must continue to be readable after schema changes
+- Existing Postgres state databases must continue to be readable after schema changes
 - Existing CLI commands must retain their current behavior (new flags and commands are fine; changing existing ones requires a deprecation cycle)
 - Existing plugins must continue to load and function after core changes
 - Existing tmux session structures must be compatible with updated PollyPM versions
@@ -57,7 +57,7 @@ Core changes are reserved for:
 
 Every change to shared state (database, config, file formats) must be forward-compatible:
 
-- New columns in SQLite tables must have defaults
+- New columns in Postgres tables must have defaults
 - New tables are fine — they do not affect existing queries
 - Existing columns are never dropped or renamed without a migration
 - New config keys must have defaults that preserve existing behavior
@@ -147,7 +147,7 @@ Plugins are the primary mechanism for adding capabilities without modifying core
 |------------|-----------|
 | Session lifecycle management | Fundamental orchestration — all plugins depend on it |
 | Tmux layer | Shared infrastructure — not provider-specific |
-| State store (SQLite) | Shared data layer — plugins read/write through defined APIs |
+| State store (Postgres) | Shared data layer — plugins read/write through defined APIs |
 | Config loading | Must work before plugins are loaded |
 | Plugin loader itself | Bootstrap dependency — cannot be a plugin |
 | CLI and TUI framework | Shared UI infrastructure |
@@ -166,7 +166,7 @@ Plugins depend on core interfaces. Those interfaces have a stability guarantee:
 
 ## State Store Migration
 
-The SQLite state store evolves as features are added. Migrations keep existing data accessible while enabling new functionality.
+The Postgres state store evolves as features are added. Migrations keep existing data accessible while enabling new functionality.
 
 ### Schema Versioning
 
@@ -215,7 +215,7 @@ Each migration script contains:
 
 On startup:
 
-1. Open the SQLite database
+1. Open the Postgres state database
 2. Read the current schema version from `schema_version`
 3. Find all migration scripts with version numbers higher than current
 4. Apply each migration in order, within a transaction
@@ -233,7 +233,7 @@ On startup:
 | Drop column | No | Breaks existing queries. Use deprecation. |
 | Rename column | No | Breaks existing queries. Add new column, migrate data, deprecate old. |
 | Drop table | No | Breaks existing queries. Only after all references are removed. |
-| Change column type | No | SQLite is flexible here but it can break application assumptions. |
+| Change column type | No | Even when Postgres permits the cast, it can break application assumptions. |
 
 ### Backup Before Migration
 

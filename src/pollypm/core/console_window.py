@@ -160,8 +160,21 @@ class ConsoleWindowManager:
             )
             storage_session = self._storage_closet_session_name()
             if launch is not None and tmux.has_session(storage_session):
+                # #1631 follow-up — idempotent park.  If the storage
+                # closet already holds a live window with this name,
+                # ``safe_break_pane_to_storage`` skips the break-pane
+                # (killing our surviving pane instead) so the next
+                # mount can't pick the wrong duplicate.
                 try:
-                    tmux.break_pane(pane.pane_id, storage_session, launch.window_name)
+                    from pollypm.cockpit_storage_park import (
+                        safe_break_pane_to_storage,
+                    )
+                    safe_break_pane_to_storage(
+                        tmux,
+                        source_pane_id=pane.pane_id,
+                        storage_session=storage_session,
+                        window_name=launch.window_name,
+                    )
                 except Exception:  # noqa: BLE001
                     pass
 

@@ -626,6 +626,65 @@ def test_park_live_to_storage_breaks_right_and_replaces_static_content() -> None
     assert storage_windows[0].pane_id == right_id
 
 
+def test_park_live_to_storage_skips_when_live_duplicate_exists() -> None:
+    """#1631 follow-up — ``park_live_to_storage`` must NOT silently
+    add a second window when storage already holds a live one of the
+    same name.
+
+    Sam's 2026-05-19 wipe: ``architect-samblog`` was duplicated at
+    indices 22 and 42 in the closet, and a click away from PM Chat
+    would have grown that to three before the fix.  The manager now
+    routes through :func:`safe_break_pane_to_storage`, which refuses
+    the break-pane when a live duplicate exists.
+
+    Regression contract:
+      * Storage closet ends up with exactly one ``architect-samblog``
+        window (the pre-existing live one, untouched).
+      * ``break_pane`` is never called.
+      * The result still ``ok`` — the manager treats this as a
+        successful park because the persistent home already exists.
+      * Mount state is cleared so the next mount can re-attach via
+        the rail selector.
+    """
+    tmux = FakeTmux()
+    # Pre-existing live conversation in the closet.
+    tmux.add_window(
+        "pollypm-storage-closet",
+        "architect-samblog",
+        [("claude", 0)],
+    )
+    cockpit = tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("claude", 100)])
+    right_id = cockpit.panes[1].pane_id
+    manager = _manager(tmux)
+
+    result = manager.park_live_to_storage(
+        CockpitWindowState(
+            right_pane_id=right_id,
+            mounted_session="architect_samblog",
+            mounted_window_name="architect-samblog",
+        ),
+        park=ParkPaneSpec(
+            storage_session="pollypm-storage-closet",
+            window_name="architect-samblog",
+            mounted_session="architect_samblog",
+        ),
+    )
+
+    assert result.ok
+    storage_windows = tmux.list_windows("pollypm-storage-closet")
+    same_name = [w for w in storage_windows if w.name == "architect-samblog"]
+    assert len(same_name) == 1, (
+        "park_live_to_storage must not duplicate architect-samblog — "
+        "that's the #1631 conversation-wipe surface"
+    )
+    # No break-pane to storage was emitted.
+    assert not any(
+        call[0] == "break_pane" for call in tmux.calls
+    ), "break-pane must be skipped when a live duplicate already exists"
+    assert "park_skipped_live_duplicate:pollypm-storage-closet:architect-samblog" in result.actions
+    assert result.state.mounted_session is None
+
+
 def test_focus_right_selects_content_pane_and_shows_hint() -> None:
     tmux = FakeTmux()
     cockpit = tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("pm", 100)])

@@ -43,7 +43,7 @@ from pollypm.recovery.pane_patterns import (
     rule_by_name,
 )
 from pollypm.storage.state import StateStore
-from pollypm.work.sqlite_service import SQLiteWorkService
+from pollypm.work.pg_service import PgWorkService
 
 
 # ---------------------------------------------------------------------------
@@ -440,7 +440,7 @@ class TestPaneClassifyHandler:
     """Handler raises + clears + emits inbox tasks correctly."""
 
     def test_handler_raises_alert_for_matched_rule(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, pg_work_service,
     ) -> None:
         store = StateStore(tmp_path / "state.db")
         svc = FakeSessionService(
@@ -462,7 +462,7 @@ class TestPaneClassifyHandler:
         assert svc.sent == []
 
     def test_alert_clears_when_text_no_longer_matches(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, pg_work_service,
     ) -> None:
         store = StateStore(tmp_path / "state.db")
         svc = FakeSessionService(
@@ -484,10 +484,10 @@ class TestPaneClassifyHandler:
         assert svc.sent == []
 
     def test_user_visible_rule_emits_inbox_task(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, pg_work_service,
     ) -> None:
         store = StateStore(tmp_path / "state.db")
-        work = SQLiteWorkService(db_path=tmp_path / "work.db")
+        work = pg_work_service
         svc = FakeSessionService(
             handles=[FakeHandle("worker-demo")],
             captures={"worker-demo": CONTEXT_FULL_POSITIVE},
@@ -508,10 +508,10 @@ class TestPaneClassifyHandler:
         assert svc.sent == []
 
     def test_non_user_visible_rule_does_not_emit_inbox(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, pg_work_service,
     ) -> None:
         store = StateStore(tmp_path / "state.db")
-        work = SQLiteWorkService(db_path=tmp_path / "work.db")
+        work = pg_work_service
         svc = FakeSessionService(
             handles=[FakeHandle("worker-demo")],
             captures={"worker-demo": STUCK_ON_ERROR_POSITIVE},
@@ -525,7 +525,7 @@ class TestPaneClassifyHandler:
         assert svc.sent == []
 
     def test_handler_skips_when_session_service_missing(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, pg_work_service,
     ) -> None:
         # Resolver returns None services — handler short-circuits.
         def _fake_loader(*, config_path=None):
@@ -544,10 +544,10 @@ class TestPaneClassifyHandler:
         assert result == {"outcome": "skipped", "reason": "services_unavailable"}
 
     def test_no_match_yields_no_alerts_no_inbox(
-        self, tmp_path, monkeypatch,
+        self, tmp_path, monkeypatch, pg_work_service,
     ) -> None:
         store = StateStore(tmp_path / "state.db")
-        work = SQLiteWorkService(db_path=tmp_path / "work.db")
+        work = pg_work_service
         svc = FakeSessionService(
             handles=[FakeHandle("worker-clean")],
             captures={"worker-clean": "Working normally. All good."},

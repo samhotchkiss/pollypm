@@ -670,3 +670,63 @@ def test_pg_legacy_per_project_db_migration_skipped(pg_config):
 
     reports = migrate_legacy_per_project_dbs(config=pg_config)
     assert reports == []
+
+
+# --------------------------------------------------------------------- #
+# pg_workspace_state — workspace_state KV (Slice K-state-port phase 2)
+# --------------------------------------------------------------------- #
+
+
+def test_pg_workspace_state_set_get_clear_roundtrip(pg_schema_pool, pg_config):
+    """The pg facade must mirror StateStore's set / get / clear contract."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_workspace_state import (
+        clear_workspace_state,
+        get_workspace_state,
+        set_workspace_state,
+    )
+
+    assert get_workspace_state("missing", pool=pg_schema_pool) is None
+
+    set_workspace_state(
+        "product_state",
+        {"state": "broken", "reason": "test", "extra": {"k": 1}},
+        actor="unit-test",
+        pool=pg_schema_pool,
+    )
+    payload = get_workspace_state("product_state", pool=pg_schema_pool)
+    assert payload == {"state": "broken", "reason": "test", "extra": {"k": 1}}
+
+    # Idempotent re-set replaces the row.
+    set_workspace_state(
+        "product_state",
+        {"state": "broken", "reason": "updated"},
+        actor="unit-test-2",
+        pool=pg_schema_pool,
+    )
+    payload2 = get_workspace_state("product_state", pool=pg_schema_pool)
+    assert payload2 == {"state": "broken", "reason": "updated"}
+
+    # Clear returns True on hit, False on miss.
+    assert clear_workspace_state("product_state", pool=pg_schema_pool) is True
+    assert clear_workspace_state("product_state", pool=pg_schema_pool) is False
+    assert get_workspace_state("product_state", pool=pg_schema_pool) is None
+
+
+def test_pg_workspace_state_non_dict_payload_returns_none(pg_schema_pool, pg_config):
+    """A non-dict jsonb payload should read back as None (sqlite parity)."""
+    _apply_initial_migrations(pg_schema_pool)
+    # Write a list payload directly so the facade has to gracefully
+    # reject it on read. The StateStore equivalent returns None for any
+    # non-dict; the pg facade must do the same.
+    with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO workspace_state (key, value_json, set_at, set_by) "
+            "VALUES (%s, %s::jsonb, now(), 'test')",
+            ("weird", json.dumps(["not", "a", "dict"])),
+        )
+        conn.commit()
+
+    from pollypm.storage.pg_workspace_state import get_workspace_state
+
+    assert get_workspace_state("weird", pool=pg_schema_pool) is None

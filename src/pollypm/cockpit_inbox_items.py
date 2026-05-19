@@ -659,7 +659,27 @@ def load_inbox_entries(
     *,
     session_read_ids: set[str] | None = None,
 ) -> tuple[list[InboxEntry], set[str], dict[str, list]]:
-    """Load Store-backed messages and task-backed inbox items together."""
+    """Load Store-backed messages and task-backed inbox items together.
+
+    Backend-aware (#1817). On the configured ``[storage] backend``:
+
+    * ``postgres`` — collapse the per-project fanout into a small fixed
+      number of pg queries: one bulk ``messages`` read via
+      :func:`pollypm.cockpit_pg_aggregates.open_messages`, one bulk
+      ``inbox_tasks`` via
+      :func:`pollypm.cockpit_pg_aggregates.inbox_tasks_grouped`, and
+      one read-marker + one bulk-replies query against a single shared
+      :class:`PgWorkService` handle. Previously this function walked
+      every tracked project's ``state.db`` and opened a fresh
+      ``SQLAlchemyStore`` per project; on a pg workspace that surfaced
+      stale sqlite data AND emitted ``work_db.opened`` ~15×/min into
+      ``_workspace.jsonl``.
+    * ``sqlite`` — keep the per-project ``state.db`` walk; on sqlite
+      each project owns its own file so the fanout is the only correct
+      shape.
+    """
+    from pollypm.work.factory import _resolve_backend
+
     session_read_ids = session_read_ids or set()
     items: list[InboxEntry] = []
     unread: set[str] = set()
@@ -673,140 +693,294 @@ def load_inbox_entries(
     # the filter can fall back to it when a referenced project has no
     # per-project state.db (#1103 follow-up).
     project_db_paths: dict[str, tuple[Path, Path]] = {}
-    for project_key, db_path, project_path in _inbox_db_sources(config):
-        if not db_path.exists():
-            continue
-        source_key = project_key or _WORKSPACE_DB_KEY
-        if project_key:
-            project_db_paths[project_key] = (db_path, project_path)
-        else:
-            project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
+    backend = _resolve_backend(config)
+
+    if backend == "postgres":
+        # ------------------------------------------------------------------ #
+        # pg path: one shared svc + bulk aggregates. No per-project sqlite
+        # opens, no SQLAlchemyStore opens, no ``work_db.opened`` flood.
+        # ------------------------------------------------------------------ #
+        from pollypm.cockpit_pg_aggregates import (
+            inbox_tasks_for_project,
+            inbox_tasks_grouped,
+            open_messages,
+        )
+
+        # Build the project_db_paths map for the downstream plan_review
+        # filter without opening anything — the helper just walks paths.
+        for project_key, db_path, project_path in _inbox_db_sources(config):
+            if project_key:
+                project_db_paths[project_key] = (db_path, project_path)
+            else:
+                project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
+
+        # Messages — one pg query for the whole workspace.
+        pg_messages = open_messages(config, known_projects=known_projects)
+        if pg_messages:
+            for row in pg_messages:
+                if _row_is_dev_channel(row.get("labels")):
+                    continue
+                scope = (row.get("scope") or "").strip()
+                if scope and scope in known_projects:
+                    source_key = scope
+                    entry_db = project_db_paths.get(scope, (None, None))[0]
+                else:
+                    source_key = _WORKSPACE_DB_KEY
+                    entry_db = project_db_paths.get(
+                        _WORKSPACE_DB_KEY, (None, None),
+                    )[0]
+                item = annotate_inbox_entry(
+                    message_row_to_inbox_entry(
+                        row,
+                        source_key=source_key,
+                        db_path=entry_db or Path("."),
+                    ),
+                    known_projects=known_projects,
+                )
+                items.append(item)
+                if item.task_id not in session_read_ids:
+                    unread.add(item.task_id)
+
+        # Tasks — one pg query, partitioned by project alias.
+        pg_inbox_grouped = inbox_tasks_grouped(config)
+
+        # Read-markers + replies — one shared svc handle for the
+        # whole-workspace context-entry queries. The per-project
+        # signatures on ``task_numbers_with_context_entry`` /
+        # ``bulk_list_replies`` haven't changed, but with one handle
+        # the cost is N pg queries (cheap; same pool) instead of N
+        # fresh service opens.
+        shared_svc = None
         try:
-            store = SQLAlchemyStore(f"sqlite:///{db_path}")
+            shared_svc = create_work_service(config=config)
         except Exception:  # noqa: BLE001
             logger.warning(
-                "load_inbox_entries: SQLAlchemyStore(%s) init failed; "
-                "skipping message rows for this source",
-                db_path, exc_info=True,
+                "load_inbox_entries: pg shared create_work_service failed; "
+                "treating read-markers + replies as empty",
+                exc_info=True,
             )
-            store = None
-        if store is not None:
-            try:
-                try:
-                    rows = store.query_messages(
-                        recipient="user",
-                        state="open",
-                        type=["notify", "inbox_task", "alert"],
+
+        try:
+            for project_key, db_path, _project_path in _inbox_db_sources(config):
+                if pg_inbox_grouped is None:
+                    project_tasks = []
+                elif project_key:
+                    project_tasks = inbox_tasks_for_project(
+                        pg_inbox_grouped, config, project_key,
                     )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "load_inbox_entries: query_messages on %s failed; "
-                        "treating as empty",
-                        db_path, exc_info=True,
-                    )
-                    rows = []
-                for row in rows:
-                    if _row_is_dev_channel(row.get("labels")):
+                else:
+                    # Workspace-root source has no tasks of its own —
+                    # workspace notifications live in ``messages``.
+                    project_tasks = []
+                if not project_tasks:
+                    continue
+                project_for_query = project_key if project_key else "inbox"
+                read_marker_numbers: set[int] = set()
+                replies_by_number: dict[int, list] = {}
+                if shared_svc is not None:
+                    try:
+                        read_marker_numbers = (
+                            shared_svc.task_numbers_with_context_entry(
+                                project=project_for_query, entry_type="read",
+                            )
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "load_inbox_entries: task_numbers_with_context_entry"
+                            "(project=%s) failed; treating as empty read-marker set",
+                            project_for_query, exc_info=True,
+                        )
+                    try:
+                        replies_by_number = shared_svc.bulk_list_replies(
+                            project=project_for_query,
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "load_inbox_entries: bulk_list_replies(project=%s) "
+                            "failed; treating as empty replies map",
+                            project_for_query, exc_info=True,
+                        )
+                for task in project_tasks:
+                    if task.task_id in seen_task_ids:
                         continue
-                    item = annotate_inbox_entry(
-                        message_row_to_inbox_entry(
-                            row,
-                            source_key=source_key,
-                            db_path=db_path,
-                        ),
-                        known_projects=known_projects,
+                    seen_task_ids.add(task.task_id)
+                    task_labels = {
+                        str(lbl) for lbl in (getattr(task, "labels", []) or [])
+                    }
+                    if "plan_review" in task_labels:
+                        emit = not _task_user_approval_is_approved(task)
+                        logger.warning(
+                            "PLAN_REVIEW_SYNTH project=%s task_id=%s emit=%s "
+                            "reason=%s",
+                            getattr(task, "project", "") or "",
+                            task.task_id,
+                            emit,
+                            "user_approval_pending"
+                            if emit else "user_approval_approved",
+                        )
+                        if not emit:
+                            continue
+                    items.append(
+                        annotate_inbox_entry(
+                            task_to_inbox_entry(task, db_path=db_path),
+                            known_projects=known_projects,
+                        )
                     )
-                    items.append(item)
-                    if item.task_id not in session_read_ids:
-                        unread.add(item.task_id)
-            finally:
+                    if task.task_number not in read_marker_numbers:
+                        unread.add(task.task_id)
+                    replies = replies_by_number.get(task.task_number, [])
+                    if replies:
+                        replies_by_task[task.task_id] = replies
+        finally:
+            if shared_svc is not None:
                 try:
-                    store.close()
+                    shared_svc.close()
                 except Exception:  # noqa: BLE001
                     pass
-        try:
-            svc = create_work_service(
-                db_path=db_path, project_path=project_path, config=config,
-            )
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "load_inbox_entries: create_work_service(%s) failed; "
-                "skipping task rows for project=%s",
-                db_path, project_key, exc_info=True,
-            )
-            continue
-        try:
+    else:
+        # ------------------------------------------------------------------ #
+        # sqlite path: per-project state.db walk (canonical on sqlite where
+        # each project owns its own file).
+        # ------------------------------------------------------------------ #
+        for project_key, db_path, project_path in _inbox_db_sources(config):
+            if not db_path.exists():
+                continue
+            source_key = project_key or _WORKSPACE_DB_KEY
+            if project_key:
+                project_db_paths[project_key] = (db_path, project_path)
+            else:
+                project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
             try:
-                project_tasks = inbox_tasks(svc, project=project_key)
+                store = SQLAlchemyStore(f"sqlite:///{db_path}")
             except Exception:  # noqa: BLE001
                 logger.warning(
-                    "load_inbox_entries: inbox_tasks(project=%s) failed; "
-                    "treating as empty",
-                    project_key, exc_info=True,
+                    "load_inbox_entries: SQLAlchemyStore(%s) init failed; "
+                    "skipping message rows for this source",
+                    db_path, exc_info=True,
                 )
-                project_tasks = []
-            # N+1 escape: pre-fetch read-markers and replies for every
-            # task in this project in one query each, then bucket
-            # locally. Was 2 roundtrips per task on the 8s refresh tick.
-            project_for_query = project_key if project_key else "inbox"
+                store = None
+            if store is not None:
+                try:
+                    try:
+                        rows = store.query_messages(
+                            recipient="user",
+                            state="open",
+                            type=["notify", "inbox_task", "alert"],
+                        )
+                    except Exception:  # noqa: BLE001
+                        logger.warning(
+                            "load_inbox_entries: query_messages on %s failed; "
+                            "treating as empty",
+                            db_path, exc_info=True,
+                        )
+                        rows = []
+                    for row in rows:
+                        if _row_is_dev_channel(row.get("labels")):
+                            continue
+                        item = annotate_inbox_entry(
+                            message_row_to_inbox_entry(
+                                row,
+                                source_key=source_key,
+                                db_path=db_path,
+                            ),
+                            known_projects=known_projects,
+                        )
+                        items.append(item)
+                        if item.task_id not in session_read_ids:
+                            unread.add(item.task_id)
+                finally:
+                    try:
+                        store.close()
+                    except Exception:  # noqa: BLE001
+                        pass
             try:
-                read_marker_numbers = svc.task_numbers_with_context_entry(
-                    project=project_for_query, entry_type="read",
+                svc = create_work_service(
+                    db_path=db_path, project_path=project_path, config=config,
                 )
             except Exception:  # noqa: BLE001
                 logger.warning(
-                    "load_inbox_entries: task_numbers_with_context_entry"
-                    "(project=%s) failed; treating as empty read-marker set",
-                    project_for_query, exc_info=True,
+                    "load_inbox_entries: create_work_service(%s) failed; "
+                    "skipping task rows for project=%s",
+                    db_path, project_key, exc_info=True,
                 )
-                read_marker_numbers = set()
+                continue
             try:
-                replies_by_number = svc.bulk_list_replies(project=project_for_query)
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "load_inbox_entries: bulk_list_replies(project=%s) failed; "
-                    "treating as empty replies map",
-                    project_for_query, exc_info=True,
-                )
-                replies_by_number = {}
-            for task in project_tasks:
-                if task.task_id in seen_task_ids:
-                    continue
-                seen_task_ids.add(task.task_id)
-                # Synth-source filter for plan_review (#1103, 4th
-                # attempt). Check the task's own user_approval
-                # execution directly: if it's COMPLETED + APPROVED,
-                # the plan review is already done and emitting the row
-                # would be a phantom action.
-                task_labels = {str(lbl) for lbl in (getattr(task, "labels", []) or [])}
-                if "plan_review" in task_labels:
-                    emit = not _task_user_approval_is_approved(task)
+                try:
+                    project_tasks = inbox_tasks(svc, project=project_key)
+                except Exception:  # noqa: BLE001
                     logger.warning(
-                        "PLAN_REVIEW_SYNTH project=%s task_id=%s emit=%s "
-                        "reason=%s",
-                        getattr(task, "project", "") or "",
-                        task.task_id,
-                        emit,
-                        "user_approval_pending" if emit else "user_approval_approved",
+                        "load_inbox_entries: inbox_tasks(project=%s) failed; "
+                        "treating as empty",
+                        project_key, exc_info=True,
                     )
-                    if not emit:
+                    project_tasks = []
+                # N+1 escape: pre-fetch read-markers and replies for every
+                # task in this project in one query each, then bucket
+                # locally. Was 2 roundtrips per task on the 8s refresh tick.
+                project_for_query = project_key if project_key else "inbox"
+                try:
+                    read_marker_numbers = svc.task_numbers_with_context_entry(
+                        project=project_for_query, entry_type="read",
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "load_inbox_entries: task_numbers_with_context_entry"
+                        "(project=%s) failed; treating as empty read-marker set",
+                        project_for_query, exc_info=True,
+                    )
+                    read_marker_numbers = set()
+                try:
+                    replies_by_number = svc.bulk_list_replies(
+                        project=project_for_query,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "load_inbox_entries: bulk_list_replies(project=%s) failed; "
+                        "treating as empty replies map",
+                        project_for_query, exc_info=True,
+                    )
+                    replies_by_number = {}
+                for task in project_tasks:
+                    if task.task_id in seen_task_ids:
                         continue
-                items.append(
-                    annotate_inbox_entry(
-                        task_to_inbox_entry(task, db_path=db_path),
-                        known_projects=known_projects,
+                    seen_task_ids.add(task.task_id)
+                    # Synth-source filter for plan_review (#1103, 4th
+                    # attempt). Check the task's own user_approval
+                    # execution directly: if it's COMPLETED + APPROVED,
+                    # the plan review is already done and emitting the row
+                    # would be a phantom action.
+                    task_labels = {
+                        str(lbl) for lbl in (getattr(task, "labels", []) or [])
+                    }
+                    if "plan_review" in task_labels:
+                        emit = not _task_user_approval_is_approved(task)
+                        logger.warning(
+                            "PLAN_REVIEW_SYNTH project=%s task_id=%s emit=%s "
+                            "reason=%s",
+                            getattr(task, "project", "") or "",
+                            task.task_id,
+                            emit,
+                            "user_approval_pending"
+                            if emit else "user_approval_approved",
+                        )
+                        if not emit:
+                            continue
+                    items.append(
+                        annotate_inbox_entry(
+                            task_to_inbox_entry(task, db_path=db_path),
+                            known_projects=known_projects,
+                        )
                     )
-                )
-                if task.task_number not in read_marker_numbers:
-                    unread.add(task.task_id)
-                replies = replies_by_number.get(task.task_number, [])
-                if replies:
-                    replies_by_task[task.task_id] = replies
-        finally:
-            try:
-                svc.close()
-            except Exception:  # noqa: BLE001
-                pass
+                    if task.task_number not in read_marker_numbers:
+                        unread.add(task.task_id)
+                    replies = replies_by_number.get(task.task_number, [])
+                    if replies:
+                        replies_by_task[task.task_id] = replies
+            finally:
+                try:
+                    svc.close()
+                except Exception:  # noqa: BLE001
+                    pass
     items = _dedupe_replayed_plan_reviews(items)
     items = _dedupe_message_vs_task_plan_reviews(items)
     items = _filter_approved_plan_reviews(
@@ -827,52 +1001,101 @@ def load_inbox_action_preview(
     This helper is only for the cockpit-pane prepaint path, where showing the
     first action rows quickly matters more than reply counts or task-backed
     rows that will arrive with the Textual app's normal refresh.
+
+    Backend-aware (#1817). On pg this is one bulk pg query via
+    :func:`pollypm.cockpit_pg_aggregates.open_messages`; the historic
+    per-project SQLAlchemyStore fanout would otherwise surface stale
+    sqlite data on a pg workspace.
     """
+    from pollypm.work.factory import _resolve_backend
+
     preview_limit = max(int(limit), 1)
     rows_per_source = max(preview_limit * 4, 48)
     known_projects = set(getattr(config, "projects", {}).keys())
     items: list[InboxEntry] = []
+    backend = _resolve_backend(config)
 
-    for project_key, db_path, _project_path in _inbox_db_sources(config):
-        if not db_path.exists():
-            continue
-        try:
-            store = SQLAlchemyStore(f"sqlite:///{db_path}")
-        except Exception:  # noqa: BLE001
-            continue
-        try:
+    if backend == "postgres":
+        from pollypm.cockpit_pg_aggregates import open_messages
+
+        # Build a project -> db_path lookup so the entries carry a
+        # plausible db_path (downstream filters key off it).
+        project_db_paths: dict[str, Path] = {}
+        ws_db: Path | None = None
+        for project_key, db_path, _project_path in _inbox_db_sources(config):
+            if project_key:
+                project_db_paths[project_key] = db_path
+            else:
+                ws_db = db_path
+        pg_messages = open_messages(config, known_projects=known_projects)
+        rows_iter: list[dict] = list(pg_messages or [])
+        # Match the sqlite path's per-source cap roughly — pg returns
+        # rows newest-first already, slice to keep the prepaint snappy.
+        rows_iter = rows_iter[: max(rows_per_source * 4, 96)]
+        for row in rows_iter:
+            if _row_is_dev_channel(row.get("labels")):
+                continue
+            scope = (row.get("scope") or "").strip()
+            if scope and scope in known_projects:
+                source_key = scope
+                entry_db = project_db_paths.get(scope, ws_db) or Path(".")
+            else:
+                source_key = _WORKSPACE_DB_KEY
+                entry_db = ws_db or Path(".")
+            item = annotate_inbox_entry(
+                message_row_to_inbox_entry(
+                    row, source_key=source_key, db_path=entry_db,
+                ),
+                known_projects=known_projects,
+            )
+            if project and (getattr(item, "project", "") or "") != project:
+                continue
+            if getattr(item, "is_orphaned", False):
+                continue
+            if not getattr(item, "needs_action", False):
+                continue
+            items.append(item)
+    else:
+        for project_key, db_path, _project_path in _inbox_db_sources(config):
+            if not db_path.exists():
+                continue
             try:
-                rows = store.query_messages(
-                    recipient="user",
-                    state="open",
-                    type=["notify", "inbox_task", "alert"],
-                    limit=rows_per_source,
-                )
+                store = SQLAlchemyStore(f"sqlite:///{db_path}")
             except Exception:  # noqa: BLE001
-                rows = []
-            for row in rows:
-                if _row_is_dev_channel(row.get("labels")):
-                    continue
-                item = annotate_inbox_entry(
-                    message_row_to_inbox_entry(
-                        row,
-                        source_key=project_key or _WORKSPACE_DB_KEY,
-                        db_path=db_path,
-                    ),
-                    known_projects=known_projects,
-                )
-                if project and (getattr(item, "project", "") or "") != project:
-                    continue
-                if getattr(item, "is_orphaned", False):
-                    continue
-                if not getattr(item, "needs_action", False):
-                    continue
-                items.append(item)
-        finally:
+                continue
             try:
-                store.close()
-            except Exception:  # noqa: BLE001
-                pass
+                try:
+                    rows = store.query_messages(
+                        recipient="user",
+                        state="open",
+                        type=["notify", "inbox_task", "alert"],
+                        limit=rows_per_source,
+                    )
+                except Exception:  # noqa: BLE001
+                    rows = []
+                for row in rows:
+                    if _row_is_dev_channel(row.get("labels")):
+                        continue
+                    item = annotate_inbox_entry(
+                        message_row_to_inbox_entry(
+                            row,
+                            source_key=project_key or _WORKSPACE_DB_KEY,
+                            db_path=db_path,
+                        ),
+                        known_projects=known_projects,
+                    )
+                    if project and (getattr(item, "project", "") or "") != project:
+                        continue
+                    if getattr(item, "is_orphaned", False):
+                        continue
+                    if not getattr(item, "needs_action", False):
+                        continue
+                    items.append(item)
+            finally:
+                try:
+                    store.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     if not items:
         return [], set(), 0

@@ -596,16 +596,29 @@ def render_inbox_panel(service, projects: list[object] | None = None) -> str:
 def _render_inbox_panel(config) -> str:
     """Render the inbox panel for the active cockpit config.
 
-    Opens every tracked project's work-service DB, queries the inbox from
-    each, and renders the combined view. Projects with no DB are silently
-    skipped so a fresh install stays usable.
+    Backend-aware (#1817). On the configured backend:
+
+    * ``postgres`` — open ONE shared work-service handle and fetch every
+      task in a single bulk query, then group locally. The previous
+      per-project ``state.db`` fanout silently opened a fresh sqlite
+      handle (emitting ``work_db.opened`` 15×/min into
+      ``_workspace.jsonl``) AND rendered stale sqlite data on a pg
+      workspace.
+    * ``sqlite`` — walk the per-project state.db files as before; this
+      is the only correct path on sqlite where each project owns its
+      own file.
+
+    Projects with no DB are silently skipped so a fresh install stays
+    usable.
     """
     from typing import Any
 
     from pollypm.work import create_work_service
+    from pollypm.work.factory import _resolve_backend
 
-    # Aggregate inbox tasks across all tracked projects. Each project has its
-    # own SQLite db; we open each, query, then close.
+    # Aggregate inbox tasks across all tracked projects. On sqlite each
+    # project has its own DB so we open per-project; on pg we collapse
+    # to a single shared handle (#1817).
     class _AggregateService:
         """Adapter exposing the subset of WorkService used by inbox_view."""
 
@@ -635,26 +648,47 @@ def _render_inbox_panel(config) -> str:
     agg = _AggregateService()
     opened: list[Any] = []
     seen_task_ids: set[str] = set()
+    backend = _resolve_backend(config)
     try:
-        for project_key, db_path, project_path in _inbox_db_sources(config):
-            if not db_path.exists():
-                continue
+        if backend == "postgres":
+            # One shared svc, one bulk list_tasks (no project filter) —
+            # zero per-project SQLite opens, zero ``work_db.opened``
+            # noise.
             try:
-                svc = create_work_service(
-                    db_path=db_path, project_path=project_path, config=config,
-                )
+                svc = create_work_service(config=config)
             except Exception:  # noqa: BLE001
-                continue
-            opened.append(svc)
-            agg._flows_by_svc.append(svc)
-            try:
-                for task in svc.list_tasks(project=project_key):
-                    if task.task_id in seen_task_ids:
-                        continue
-                    seen_task_ids.add(task.task_id)
-                    agg._tasks.append(task)
-            except Exception:  # noqa: BLE001
-                pass
+                svc = None
+            if svc is not None:
+                opened.append(svc)
+                agg._flows_by_svc.append(svc)
+                try:
+                    for task in svc.list_tasks():
+                        if task.task_id in seen_task_ids:
+                            continue
+                        seen_task_ids.add(task.task_id)
+                        agg._tasks.append(task)
+                except Exception:  # noqa: BLE001
+                    pass
+        else:
+            for project_key, db_path, project_path in _inbox_db_sources(config):
+                if not db_path.exists():
+                    continue
+                try:
+                    svc = create_work_service(
+                        db_path=db_path, project_path=project_path, config=config,
+                    )
+                except Exception:  # noqa: BLE001
+                    continue
+                opened.append(svc)
+                agg._flows_by_svc.append(svc)
+                try:
+                    for task in svc.list_tasks(project=project_key):
+                        if task.task_id in seen_task_ids:
+                            continue
+                        seen_task_ids.add(task.task_id)
+                        agg._tasks.append(task)
+                except Exception:  # noqa: BLE001
+                    pass
 
         projects_iter = list(getattr(config, "projects", {}).values())
         return render_inbox_panel(agg, projects=projects_iter)

@@ -7772,11 +7772,14 @@ class PollyInboxApp(App[None]):
         return tasks, unread, replies_by_task
 
     def _svc_for_task(self, task_id: str):
-        """Open a SQLiteWorkService rooted at the project owning ``task_id``.
+        """Open a WorkService rooted at the project owning ``task_id``.
 
         The cockpit inbox spans every tracked project, so archive/reply
-        actions must target the project-specific DB. We resolve the
-        project from the task_id prefix and look up its path in config.
+        actions must target the project-specific service. We resolve
+        the project from the task_id prefix and route through
+        :func:`open_work_service_for_task` which honours
+        ``[storage] backend`` (#1812 — pg-aware after the sqlite-only
+        gate was dropped).
         """
         config = load_config(self.config_path)
         from pollypm.work.inbox_actions import open_work_service_for_task
@@ -7784,12 +7787,14 @@ class PollyInboxApp(App[None]):
         return open_work_service_for_task(config, task_id)
 
     def _resolve_inbox_svc(self, item, task_id: str):
-        """Best-effort resolve a SQLiteWorkService for a cockpit inbox row.
+        """Best-effort resolve a work service for a cockpit inbox row.
 
-        First tries :meth:`_svc_for_task` (the project-key path), then
-        falls back to opening the work-service directly at the inbox
-        entry's ``db_path`` — this is the unified resolver that fixes
-        the family of "Could not open project database" toast bugs
+        Returns whichever backend the configured ``[storage] backend``
+        selects (sqlite or postgres — #1812). First tries
+        :meth:`_svc_for_task` (the project-key path), then falls back to
+        opening the work-service directly at the inbox entry's
+        ``db_path`` — this is the unified resolver that fixes the
+        family of "Could not open project database" toast bugs
         (#1087, #1091, #1099, #1101) where the task row's project key
         doesn't match the registered key (e.g. ``polly_remote`` vs.
         ``polly-remote``) but the entry was loaded from a known DB.

@@ -41,7 +41,7 @@ graph TB
     end
 
     subgraph data["Shared State"]
-        DB[("SQLite state.db<br/>16,569 heartbeats<br/>16,528 checkpoints<br/>13,063 events")]
+        DB[("Postgres workspace DB<br/>heartbeats<br/>checkpoints<br/>events")]
         Issues["File-based Issues<br/>23 issues / 6 states"]
         Jobs["jobs.json<br/>Scheduler config"]
     end
@@ -94,7 +94,7 @@ flowchart TD
     H -->|"error message / auth fail"| K["BLOCKED"]
     H -->|"task complete signal"| L["DONE"]
 
-    I --> M["Record heartbeat +<br/>level0 checkpoint<br/>in SQLite"]
+    I --> M["Record heartbeat +<br/>level0 checkpoint<br/>in Postgres"]
     J --> M
     K --> M
     L --> M

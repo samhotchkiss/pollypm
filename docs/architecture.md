@@ -9,7 +9,7 @@ System design, components, boundaries, data flow, and dependencies.
 - Multi-session orchestration layer for parallel AI coding sessions
 - Heartbeat supervision and monitoring with idle detection (5+ cycle threshold)
 - Heartbeat status classification based on tmux pane content snapshots
-- SQLite storage layer for state management
+- Postgres storage layer for state management (pgvector for semantic recall)
 - tmux integration for terminal-based control and visibility
 - Role-based permission enforcement system (Heartbeat vs Operator)
 - Issue state machine with review gates (states 03-needs-review, 04-in-review)

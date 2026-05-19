@@ -75,7 +75,7 @@ The central orchestration layer. Responsibilities:
 - **Transcript and pane access**: Provide transcript ingestion and pane capture to all callers
 - **LLM account/session plumbing**: Manage credentials, session routing, and provider connections
 - **Scheduling/cron trigger**: Drive recurring and one-shot orchestration jobs
-- **State store**: Record all events, heartbeats, launches, and alerts to SQLite (durable state store)
+- **State store**: Record all events, heartbeats, launches, and alerts to Postgres (durable state store)
 - **Stable internal API**: Expose a defined API surface that plugins call; plugins never reach into core internals
 - **CLI and TUI**: Expose `pm` commands via Typer and a Textual-based dashboard
 
@@ -120,7 +120,7 @@ The tmux layer manages the execution surface:
 
 ### State Store
 
-SQLite database at `<project>/.pollypm/state/pollypm.db` (project-scoped) with these core tables:
+Postgres workspace database (DSN from `[storage] url` in `pollypm.toml`) with these core tables:
 
 | Table | Purpose |
 |-------|---------|
@@ -178,7 +178,7 @@ The recovery prompt is the bridge between the old session and the new one. It mu
 | Language | Python 3.13+ | Ecosystem support, rapid iteration, Textual/Typer compatibility |
 | TUI | Textual | Rich terminal UI, async-native, good tmux coexistence |
 | CLI | Typer | Clean CLI framework, integrates with Textual |
-| State store | SQLite | Zero-config, single-file, sufficient for local supervisor workloads |
+| State store | Postgres + pgvector | Single DB across projects, pgvector for semantic recall (#1737) |
 | Execution surface | tmux | Universal, scriptable, human-attachable terminal multiplexer |
 | Package management | uv | Fast Python package installer, lockfile support |
 | Config format | TOML | Python-native, readable, hierarchical |
@@ -206,7 +206,7 @@ PollyPM does not:
 
 1. **Tmux as execution surface.** Every agent session is a real tmux window. This gives humans direct access, enables pane logging and capture, and avoids reinventing terminal multiplexing. The alternative (pty management in Python) was rejected for complexity and fragility.
 
-2. **SQLite, not Postgres.** PollyPM is a single-host local supervisor. SQLite is zero-config, embedded, and more than sufficient. Postgres adds deployment complexity with no benefit for this workload.
+2. **Postgres + pgvector, single DB.** PollyPM standardized on Postgres (#1737) so semantic recall can use `pgvector` and cross-project reads no longer fan out across per-project SQLite files. Operators install Postgres locally before first run (see operator-runbook).
 
 3. **Python, not Go.** The ecosystem (Textual, Typer, rich async support, rapid prototyping) outweighs Go's performance advantages. PollyPM is I/O-bound, not CPU-bound.
 

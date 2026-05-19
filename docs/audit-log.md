@@ -89,7 +89,7 @@ Common lifecycle examples:
 ```
 
 ```json
-{"schema":1,"ts":"2026-05-06T17:27:10.000000+00:00","project":"_workspace","event":"work_db.opened","subject":"/workspace/.pollypm/state.db","actor":"system","status":"ok","metadata":{"had_messages_table_pre_open":false,"tables_created":false,"project_path":"/path/to/demo"}}
+{"schema":1,"ts":"2026-05-06T17:27:10.000000+00:00","project":"_workspace","event":"work_db.opened","subject":"postgresql://localhost:5432/pollypm","actor":"system","status":"ok","metadata":{"had_messages_table_pre_open":false,"tables_created":false,"project_path":"/path/to/demo"}}
 ```
 
 ## Core Events
@@ -98,14 +98,14 @@ The current event families are:
 
 | Event | Emitted by | Key metadata |
 |---|---|---|
-| `task.created` | `SQLiteWorkService.create_task` helper | `title`, `type`, `flow_template`, `priority`, `requires_human_review` |
+| `task.created` | `PgWorkService.create_task` helper | `title`, `type`, `flow_template`, `priority`, `requires_human_review` |
 | `task.status_changed` | work-service transition writer | `from`, `to`, `reason` |
 | `task.deleted` | work-service prune path | `reason`, `flow_template`, `title` |
 | `marker.created` | worker provisioning | `window_name`, `marker_kind`, `error` |
 | `marker.create_failed` | worker provisioning failure path | `window_name`, `marker_kind`, `error` |
 | `marker.released` | tmux session service after kickoff delivery | `window_name`, `session_role`, `error` |
 | `marker.leaked` | tmux identity/persona guard branches | `window_name`, `session_role`, `error` |
-| `work_db.opened` | `SQLiteWorkService.__init__` | `had_messages_table_pre_open`, `tables_created`, `project_path` |
+| `work_db.opened` | `PgWorkService.__init__` | `had_messages_table_pre_open`, `tables_created`, `project_path` |
 | `work_table.cleared` | Reserved for future wholesale work-table reset paths | reset reason and affected scope |
 | `heartbeat.tick` | audit watchdog cadence | cadence metadata |
 | `audit.finding` | audit watchdog findings | `rule`, `message`, `recommendation`, plus rule-specific data |

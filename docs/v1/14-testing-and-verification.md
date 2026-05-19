@@ -31,7 +31,7 @@ Unit tests verify individual functions, classes, and modules in isolation.
 Scope:
 
 - Config parsing: `pollypm.toml` loading, validation, default handling
-- State management: SQLite operations, event recording, query correctness
+- State management: Postgres operations, event recording, query correctness
 - Plugin loading: Discovery, registration, lifecycle hooks
 - Health classification: State machine transitions, classification logic
 - Checkpoint creation: Schema validation, delta computation, serialization
@@ -45,7 +45,7 @@ Properties:
 - Deterministic: same inputs always produce same outputs
 - Located in: `tests/unit/` within the pollypm repository
 
-Unit tests use standard Python testing tools (pytest) and may use lightweight test doubles for external interfaces (e.g., a fake SQLite database, mock filesystem). Heavy mocking of internal components is discouraged — if a unit test requires extensive mocking, the code under test may need better interfaces.
+Unit tests use standard Python testing tools (pytest) and may use lightweight test doubles for external interfaces (e.g., a fake DB pool, mock filesystem). Heavy mocking of internal components is discouraged — if a unit test requires extensive mocking, the code under test may need better interfaces.
 
 ### Layer 2: Integration Tests
 
@@ -63,7 +63,7 @@ Scope:
 Properties:
 
 - Slower than unit tests but still automated
-- Hit real systems where feasible: real SQLite databases, real filesystem operations, real tmux sessions
+- Hit real systems where feasible: a real Postgres database, real filesystem operations, real tmux sessions
 - May use real provider CLIs in test mode or with test accounts
 - Located in: `tests/integration/` within the pollypm repository
 
@@ -286,7 +286,7 @@ PollyPM is a live system in daily use. The testing requirements exist to protect
 
 Tests use a separate configuration that does not interfere with production PollyPM state:
 
-- Test SQLite database in a temporary directory
+- Test Postgres database (or a temp schema in the workspace DB) for the test session
 - Test tmux session with a unique name (avoids collision with production sessions)
 - Test account homes in temporary directories
 - Test configs that reference test accounts and test projects
@@ -394,7 +394,7 @@ This pattern — strong defaults that are fully replaceable — applies througho
 
 3. **Agents must use tmux for verification.** PollyPM agents have the ability to launch and interact with running systems. They are expected to use this ability for every feature and bug fix, not just rely on test output.
 
-4. **Integration tests use real systems, not mocks.** Where feasible, integration tests hit real SQLite databases, real filesystems, and real tmux sessions. Mocking is reserved for external services that cannot be used in tests.
+4. **Integration tests use real systems, not mocks.** Where feasible, integration tests hit a real Postgres database, real filesystems, and real tmux sessions. Mocking is reserved for external services that cannot be used in tests.
 
 5. **PM review is the final gate.** Automated tests and agent verification are necessary but the work is not done until a human or PM agent reviews it. This catches design issues, UX problems, and strategic misalignment that automated testing cannot.
 

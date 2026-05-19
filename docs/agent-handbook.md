@@ -8,8 +8,8 @@ trial-and-error, you are in the right place.
 
 This page is the discoverable reference for the agent-facing surface. It
 exists because earlier agents trial-and-errored through `--help` and fell
-through to raw `sqlite3 state.db` to inspect tables (see issue #1629). The
-fix is: every common verb has a CLI; this page lists them.
+through to raw SQL on the workspace DB to inspect tables (see issue
+#1629). The fix is: every common verb has a CLI; this page lists them.
 
 The full Typer command tree is also machine-readable — grep
 `pm cli-reference --json` into your working context if you need flags this
@@ -132,7 +132,7 @@ authoritative reality.
 | ---------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Error: Required task roles are missing. The 'standard' requires worker, reviewer.`      | Pre-#1637 behavior. The `standard` flow now auto-adds `worker`+`reviewer` when no `--role` is passed.             | Just rerun without the role flags: `pm task create "<title>" -p <project>`. Or explicitly: `--role worker=worker --role reviewer=reviewer`.       |
 | `Error: No such option: '--reason'. Did you mean '--json'?` on `pm task queue`           | `task queue` does **not** accept `--reason`. The `--json` suggestion is wrong (distance match, not semantic).      | Queue first, then record context as a separate call: `pm task queue <id>` followed by `pm task context <id> "<reason text>" --actor <your-role>`. |
-| `Error: in prepare, no such column: source` (from a raw sqlite3 query on `work_context_entries`) | The schema doesn't have a `source` column — the columns are `entry_type`, `actor`, `text`, `task_id`, `timestamp`, etc. | Don't shell into sqlite. Use `pm task context <id>` (lists entries) and `pm task transitions <id>` (lists state changes).                          |
+| `ERROR: column "source" does not exist` (from a raw psql query on `work_context_entries`) | The schema doesn't have a `source` column — the columns are `entry_type`, `actor`, `text`, `task_id`, `timestamp`, etc. | Don't shell into the workspace DB. Use `pm task context <id>` (lists entries) and `pm task transitions <id>` (lists state changes).                          |
 | `Required: --role`                                                                       | The non-`standard` flow you picked has required role keys you didn't pass.                                         | Either switch back to `--flow standard` (auto-fills) or pass `--role <key>=<agent>` for each required role. See `pm flow list`.                    |
 | `worker-start --role worker` prints DEPRECATED                                           | The managed-worker pattern is gone (memory-leak hazard). Per-task workers are spawned by `pm task claim`.          | Use `pm task next -p <project>` then `pm task claim <id>`. For a long-running planner, use `--role architect`.                                     |
 | `WARNING: task claim recorded, but worker session provisioning failed`                   | The DB row claim succeeded; the tmux session did not.                                                              | Either continue inside an existing session, or `pm task hold <id> --reason "provision failed"` and `pm task resume <id>` after fixing.             |
@@ -143,10 +143,10 @@ authoritative reality.
 These are things autonomous agents have repeatedly tried that are wrong.
 Avoid them.
 
-- **Don't shell out to `sqlite3 state.db`.** The schema is internal and
-  has shifted (column renames, table splits) several times. The CLI is
-  the contract; `pm task context`, `pm task transitions`, `pm task get
-  --json`, and `pm cli-reference --json` cover the read paths.
+- **Don't shell out to `psql` against the workspace DB.** The schema is
+  internal and has shifted (column renames, table splits) several times.
+  The CLI is the contract; `pm task context`, `pm task transitions`,
+  `pm task get --json`, and `pm cli-reference --json` cover the read paths.
 - **Don't `pm task approve` from a hot loop.** Reviewer approval is a
   one-shot decision per `review` node. Repeated calls either no-op or
   raise; if you're polling for "is this done yet," read `pm task status`

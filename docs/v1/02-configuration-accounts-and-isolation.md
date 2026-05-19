@@ -171,14 +171,14 @@ system_prompt = "prompts/worker.md"
 ```toml
 [plugins]
 issue_backend = "github-issues"
-memory_backend = "sqlite"
+memory_backend = "postgres"
 doc_backend = "filesystem"
 ```
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `issue_backend` | string | no | Issue tracker plugin. Default: `folder-tracker` |
-| `memory_backend` | string | no | Memory storage plugin. Default: `sqlite` |
+| `memory_backend` | string | no | Memory storage plugin. Default: `postgres` |
 | `doc_backend` | string | no | Documentation plugin. Default: `filesystem` |
 
 
@@ -238,7 +238,7 @@ The following are isolated per account:
 The following are shared across accounts:
 
 - **Project source code**: Workers access the same project directories (or worktrees)
-- **PollyPM state store**: SQLite database per project at `<project>/.pollypm/state/pollypm.db`
+- **PollyPM state store**: Shared Postgres workspace database (DSN from `[storage] url`). Per-project rows are namespaced by `project_key`.
 - **PollyPM logs**: Project-scoped under `<project>/.pollypm/logs/`
 - **Git configuration**: System-level git config is inherited (user-level is isolated via HOME)
 
@@ -263,7 +263,7 @@ Each managed project has a single `.pollypm/` directory at its root containing a
   .pollypm/              # Operational state (gitignored)
     config/              # Project-specific config (plugin selections, overrides, project.toml)
     logs/                # Pane output logs, supervisor logs, snapshots
-    state/               # SQLite database, lock files, session-scoped state
+    state/               # session-scoped state and lock files (workspace rows live in the shared Postgres DB)
     transcripts/         # PollyPM-owned transcript archive (standardized JSONL)
     artifacts/           # Build artifacts, reports, generated outputs
     plugins/             # Project-local plugins (highest discovery precedence)
@@ -369,7 +369,7 @@ When multiple sessions need recovery simultaneously, PollyPM prioritizes:
 
 ## Capacity Registry
 
-Account capacity state is persisted in the SQLite state store in the `account_capacity` table.
+Account capacity state is persisted in the Postgres state store in the `account_capacity` table.
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -395,7 +395,7 @@ The capacity registry is the source of truth for failover decisions. Config defi
 
 4. **Controller accounts eligible last.** Controller accounts (used for heartbeat and operator) are eligible for worker failover, but only as a last resort. This prevents a cascade where worker failover starves the control plane.
 
-5. **File-based capacity registry.** Capacity state is stored in SQLite alongside other operational state. No external service or file-watching needed. The registry is updated on every probe and consulted on every account selection.
+5. **Centralized capacity registry.** Capacity state is stored in Postgres alongside other operational state. No external service or file-watching needed. The registry is updated on every probe and consulted on every account selection.
 
 
 ## Cross-Doc References

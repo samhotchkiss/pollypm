@@ -49,7 +49,7 @@ worker-process control, multi-tenant authentication.
 ### Process model
 
 `pm serve --port N` is a **separate process** from the cockpit. It is a
-peer that reads and writes the same `state.db` and `audit.jsonl` via the
+peer that reads and writes the same Postgres workspace database and `audit.jsonl` via the
 existing `create_work_service` factory (see #1389) and the existing
 `pollypm.service_api.v1.PollyPMService` facade. The cockpit and the API
 server are independent — the frontend keeps working when the cockpit
@@ -67,9 +67,9 @@ is down, and vice versa.
                 └────────┬────────┘
                          │ SDK (PollyPMService, create_work_service)
                          ▼
-              ┌──────────────────────┐
-              │ state.db, audit.jsonl│  ← shared with cockpit
-              └──────────────────────┘
+              ┌──────────────────────────────┐
+              │ Postgres + audit.jsonl files │  ← shared with cockpit
+              └──────────────────────────────┘
 ```
 
 ### Why a separate process?
@@ -106,11 +106,11 @@ resistance.
 
 ### Concurrency model
 
-`pm serve` is a single-process, single-worker server in v1. SQLite
-WAL handles multi-reader / single-writer fine for personal-use
-volumes; the audit log is append-only JSONL. If we need to scale,
-the upgrade path is documented separately (process-per-request or
-SQLite → Postgres).
+`pm serve` is a single-process, single-worker server in v1. The
+Postgres pool handles multi-reader / single-writer fine for
+personal-use volumes; the audit log is append-only JSONL. If we need
+to scale, the upgrade path is documented separately (process-per-request
+or hosted Postgres).
 
 ---
 
@@ -276,7 +276,7 @@ Every 4xx and 5xx response body is:
 | 422 | `validation_error` | Body shape valid, but values failed validation (e.g. empty `reason`) |
 | 429 | `rate_limited` | Burst protection (future) |
 | 500 | `internal_error` | Unhandled server exception |
-| 503 | `service_unavailable` | Backing store unreachable (`state.db` lock contention beyond retry) |
+| 503 | `service_unavailable` | Backing store unreachable (Postgres pool exhausted or DSN unreachable beyond retry) |
 
 Validation errors carry an extra `details` field shaped like
 `[{"field": "reason", "message": "must be non-empty"}]`.

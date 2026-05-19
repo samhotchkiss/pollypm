@@ -1,3 +1,9 @@
+> ⚠️ **Archived.** This document predates the Postgres cutover (#1737)
+> and references SQLite / per-project `state.db` / dual-backend mode that no
+> longer exist. Kept for historical context only; consult
+> `docs/architecture.md` and `src/pollypm/defaults/docs/reference/operator-runbook.md`
+> for the current storage model.
+
 # Cockpit QA — Automated Testing Prompt
 
 **Goal**: Systematically test every clickable element in the PollyPM cockpit, fix every bug found, and make the dashboard and task views genuinely useful. When Sam tests tonight, nothing should be broken.

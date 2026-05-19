@@ -28,10 +28,10 @@ Defined in `src/pollypm/work/service.py`. The central protocol covering:
 - Queries: state_counts, my_tasks, blocked_tasks
 
 Two implementations exist:
-- `SQLiteWorkService` (production, backed by SQLite)
+- `PgWorkService` (production, backed by Postgres)
 - `MockWorkService` (testing, in-memory dicts)
 
-Current status: the Protocol, `SQLiteWorkService`, and `MockWorkService` share
+Current status: the Protocol, `PgWorkService`, and `MockWorkService` share
 the same public signatures for the task lifecycle, flow progression, context,
 and worker-session methods. The conformance test in
 `tests/test_work_service_protocol_conformance.py` guards the parameters that
@@ -97,7 +97,7 @@ The `configure_work_plugins()` function reads this config and instantiates the a
 
 ## Interop Guarantees
 
-1. Code should accept `WorkService` and work identically with `MockWorkService` or `SQLiteWorkService`.
+1. Code should accept `WorkService` and work identically with `MockWorkService` or `PgWorkService`.
 2. Custom gates implementing the `Gate` protocol integrate into the gate registry without modification
 3. Custom sync adapters implementing `SyncAdapter` receive events via the `SyncManager`
 4. The `PluginRegistry` enforces that all required plugins are registered before use

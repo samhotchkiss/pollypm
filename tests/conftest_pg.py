@@ -1,8 +1,32 @@
-"""Shared fixtures for the pg-backed tests (issue #1737, Slice A).
+"""Shared fixtures for the pg-backed tests (issue #1737, Slices A + F).
 
 Imported from ``tests/conftest.py`` via ``pytest_plugins`` so every
-``test_pg_*.py`` module in this directory has access to the
-``_pg_container`` + ``pg_schema_pool`` fixtures without re-importing.
+``test_pg_*.py`` module in this directory has access to the pg fixtures
+without re-importing.
+
+Layered surface
+---------------
+
+* ``_pg_container`` (session-scoped) — one pg+pgvector container per
+  pytest run. The container start cost (~5 s on a warm Docker host) is
+  paid once instead of per test. Slice A shipped this.
+* ``pg_schema_pool`` (function-scoped) — fresh ``test_<uuid>`` schema
+  with ``search_path`` patched into a per-test pool factory. Lets tests
+  parallelize safely within one container. Slice A shipped this.
+* ``pg_work_service`` (function-scoped, Slice F) — ready-to-use
+  :class:`pollypm.work.pg_service.PgWorkService` backed by
+  ``pg_schema_pool``. Replaces the per-test boilerplate of building one
+  by hand.
+* ``pg_state_store`` (function-scoped, Slice F) — placeholder shim for
+  the future pg port of :class:`pollypm.storage.state.StateStore`. Until
+  the state.py tables port (#342-followup), this fixture returns a
+  ``tmp_path``-backed sqlite StateStore so test authors writing
+  pg-style state tests have a hook today. Swap the implementation once
+  ``PgStateStore`` lands.
+* ``seeded_pg_workspace`` (function-scoped, Slice F) — a
+  ``pg_work_service`` with a small canned project + handful of tasks
+  pre-created. The common case "I want to test queries / lists against
+  a non-empty workspace" without repeating the create boilerplate.
 """
 
 from __future__ import annotations
@@ -10,6 +34,7 @@ from __future__ import annotations
 import importlib
 import os
 import uuid
+from pathlib import Path
 from typing import Iterator
 
 import pytest
@@ -180,3 +205,89 @@ def pg_schema_pool(_pg_container, monkeypatch) -> Iterator[object]:
         with psycopg.connect(_pg_container) as conn:
             with conn.cursor() as cur:
                 cur.execute(f'DROP SCHEMA IF EXISTS "{schema}" CASCADE')
+
+
+# --------------------------------------------------------------------- #
+# Slice F additions: ergonomic fixtures on top of ``pg_schema_pool``.
+# --------------------------------------------------------------------- #
+
+
+@pytest.fixture()
+def pg_work_service(pg_schema_pool):
+    """Pre-built :class:`PgWorkService` against the per-test schema.
+
+    Most pg-backed work-service tests don't care about the pool itself —
+    they want a ready service. This fixture wraps the boilerplate from
+    ``tests/test_pg_work_service.py``'s local ``pg_service`` fixture so
+    it can be shared across the parity suite and any future pg-backed
+    tests.
+
+    The service runs the schema migration applier on construction (see
+    :meth:`PgWorkService.__init__`), so the per-test schema gets the
+    full ``work_tasks`` / ``work_transitions`` / ... DDL applied.
+    """
+    from pollypm.work.pg_service import PgWorkService
+
+    return PgWorkService(pool=pg_schema_pool, ro_pool=None)
+
+
+@pytest.fixture()
+def pg_state_store(tmp_path: Path):
+    """Placeholder for the future pg port of :class:`StateStore`.
+
+    :mod:`pollypm.storage.state` is sqlite-only today (see the module's
+    own ``TODO(#342-followup)``). Until that port lands, this fixture
+    returns a tmp-path-backed sqlite :class:`StateStore` so test authors
+    writing "state.py reads" tests have a stable fixture name they can
+    rebind to a real ``PgStateStore`` once the port ships, without
+    touching the test bodies.
+
+    The fixture deliberately does NOT use the pg pool — there is no pg
+    schema for these tables yet. Slice F's job is to make the seam
+    available; the actual implementation flips when the state-table
+    migration slice merges.
+    """
+    from pollypm.storage.state import StateStore
+
+    db_path = tmp_path / "state.db"
+    store = StateStore(db_path)
+    try:
+        yield store
+    finally:
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+
+
+@pytest.fixture()
+def seeded_pg_workspace(pg_work_service):
+    """A ``PgWorkService`` pre-seeded with one project + a few tasks.
+
+    Returns a ``(service, tasks)`` tuple where ``tasks`` is a list of
+    the three created :class:`Task` objects in creation order. The
+    project key is ``"demo"``. The seed is intentionally small — tests
+    that need different shapes should build on top via the underlying
+    ``service``.
+
+    Why a fixture at all: the "I just want a non-empty workspace to
+    query against" case is the single most repeated pattern in the
+    sqlite work-service tests (``svc`` + three ``_create_standard_task``
+    calls at the top of half the test bodies). One fixture is cheaper
+    than rewriting that incantation in every parity test.
+    """
+    svc = pg_work_service
+    tasks = [
+        svc.create(
+            title=f"seed-{i}",
+            description=f"seeded task {i}",
+            type="task",
+            project="demo",
+            flow_template="default",
+            roles={"worker": "alice"},
+            priority="normal",
+            created_by="seed",
+        )
+        for i in range(3)
+    ]
+    return svc, tasks

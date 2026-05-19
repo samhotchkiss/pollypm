@@ -7,6 +7,7 @@ from pollypm.config import write_config
 from pollypm.models import AccountConfig, KnownProject, ProjectKind, ProjectSettings, PollyPMConfig, PollyPMSettings, ProviderKind
 from pollypm.transcript_ledger import sync_token_ledger
 from pollypm.storage.state import StateStore
+
 def _config(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
     root.mkdir()

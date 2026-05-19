@@ -21,6 +21,7 @@ from pollypm.models import (
     SessionConfig,
 )
 from pollypm.storage.state import StateStore
+
 def _config(tmp_path: Path) -> PollyPMConfig:
     project_root = tmp_path / "repo"
     project_root.mkdir()

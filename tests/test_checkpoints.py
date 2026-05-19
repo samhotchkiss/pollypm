@@ -14,6 +14,7 @@ from pollypm.models import (
 )
 from pollypm.memory_backends import get_memory_backend
 from pollypm.storage.state import StateStore
+
 def test_mechanical_checkpoint_persists_files_and_state(tmp_path: Path) -> None:
     config = PollyPMConfig(
         project=ProjectSettings(root_dir=tmp_path, base_dir=tmp_path / ".pollypm", logs_dir=tmp_path / ".pollypm/logs", snapshots_dir=tmp_path / ".pollypm/snapshots", state_db=tmp_path / ".pollypm/state.db"),

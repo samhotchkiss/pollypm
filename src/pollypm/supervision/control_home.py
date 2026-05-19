@@ -27,6 +27,7 @@ from pollypm.onboarding import _prime_claude_home
 
 if TYPE_CHECKING:
     from pollypm.storage.state import StateStore
+
 @dataclass(slots=True)
 class ControlHomeManager:
     """Own control-home sync and account runtime metadata refresh."""

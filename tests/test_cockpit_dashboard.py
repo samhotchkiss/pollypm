@@ -29,6 +29,7 @@ from pollypm.plugins_builtin.morning_briefing.inbox import (
     list_briefings,
 )
 from pollypm.storage.records import AccountUsageRecord, TokenUsageHourlyRecord
+
 NOW = datetime(2026, 4, 21, 15, 0, tzinfo=UTC)
 
 

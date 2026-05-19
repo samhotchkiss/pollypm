@@ -15,6 +15,8 @@ from pollypm.dashboard_data import (
     load_dashboard,
 )
 from pollypm.storage.records import AccountUsageRecord
+
+
 def _run(coro) -> None:
     asyncio.run(coro)
 

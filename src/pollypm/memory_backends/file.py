@@ -27,6 +27,7 @@ from pollypm.memory_backends.base import (
 
 if TYPE_CHECKING:
     from pollypm.storage.state import StateStore
+
 class _PluginHook(Protocol):
     """Narrow subset of ExtensionHost the file backend consumes.
 

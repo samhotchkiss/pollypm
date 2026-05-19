@@ -153,12 +153,22 @@ def store_snapshot_learnings(
 
 
 def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -> int:
-    """Store extracted knowledge as memory entries in SQLite."""
-    from pollypm.storage.state import StateStore
-    try:
-        store = StateStore(config.project.state_db)
-    except Exception:  # noqa: BLE001
-        return 0
+    """Store extracted knowledge as memory entries (pg or sqlite, per config)."""
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if is_pg_backend(config):
+        from pollypm.storage.pg_memory import PgMemoryStore
+
+        store: object = PgMemoryStore()
+        close_after = False
+    else:
+        from pollypm.storage.state import StateStore
+
+        try:
+            store = StateStore(config.project.state_db)
+            close_after = True
+        except Exception:  # noqa: BLE001
+            return 0
     count = 0
     project_key = project_root.name
     kind_map = {
@@ -177,25 +187,30 @@ def _store_memory_entries(config, project_root: Path, delta: "KnowledgeDelta") -
         "architecture": project_root / "docs" / "project-overview.md",
         "convention": project_root / "docs" / "project-overview.md",
     }
-    for kind, items in kind_map.items():
-        summary_path = summary_paths[kind]
-        for item in items:
-            # Check for duplicates by title+scope
-            existing = store.list_memory_entries(scope=project_key, kind=kind, limit=200)
-            if any(e.title == item for e in existing):
-                continue
-            store.record_memory_entry(
-                scope=project_key,
-                kind=kind,
-                title=item,
-                body="",
-                tags=[project_key, kind],
-                source="knowledge_extract",
-                file_path=str(summary_path),
-                summary_path=str(summary_path),
-            )
-            count += 1
-    store.close()
+    try:
+        for kind, items in kind_map.items():
+            summary_path = summary_paths[kind]
+            for item in items:
+                # Check for duplicates by title+scope
+                existing = store.list_memory_entries(scope=project_key, kind=kind, limit=200)
+                if any(e.title == item for e in existing):
+                    continue
+                store.record_memory_entry(
+                    scope=project_key,
+                    kind=kind,
+                    title=item,
+                    body="",
+                    tags=[project_key, kind],
+                    source="knowledge_extract",
+                    file_path=str(summary_path),
+                    summary_path=str(summary_path),
+                )
+                count += 1
+    finally:
+        if close_after:
+            close = getattr(store, "close", None)
+            if callable(close):
+                close()
     return count
 
 

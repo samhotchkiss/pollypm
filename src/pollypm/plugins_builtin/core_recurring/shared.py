@@ -32,9 +32,21 @@ def _load_config(payload: dict[str, Any]):
 
 @contextmanager
 def _load_config_and_store(payload: dict[str, Any]):
-    """Yield ``(config, store)`` and close the store deterministically."""
-    from pollypm.storage.state import StateStore
+    """Yield ``(config, store)`` and close the store deterministically.
+
+    On the pg backend ``store`` is ``None`` — recurring handlers that
+    write alerts already route through the unified :class:`Store` via
+    :func:`_open_msg_store`, which is backend-aware. This helper just
+    needs to expose the config for those code paths.
+    """
     config = _load_config(payload)
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if is_pg_backend(config):
+        yield config, None
+        return
+    from pollypm.storage.state import StateStore
+
     store = StateStore(config.project.state_db)
     try:
         yield config, store
@@ -223,18 +235,21 @@ def sweep_ephemeral_sessions(supervisor: Any, store: Any) -> dict[str, int]:
 
         failure_kind, failure_message = failure
         alert_type = _ephemeral_alert_type(name, failure_kind)
+        alert_message = (
+            f"{failure_message}. "
+            f"Why it matters: parent task is blocked because the "
+            f"ephemeral session that was driving it is gone. "
+            f"Fix: inspect the parent task's status and re-spawn the "
+            f"session via the originating handler "
+            f"(critic / downtime / `pm worker-start`)."
+        )
         try:
-            store.upsert_alert(
-                name,
-                alert_type,
-                "warn",
-                f"{failure_message}. "
-                f"Why it matters: parent task is blocked because the "
-                f"ephemeral session that was driving it is gone. "
-                f"Fix: inspect the parent task's status and re-spawn the "
-                f"session via the originating handler "
-                f"(critic / downtime / `pm worker-start`).",
-            )
+            if store is not None:
+                store.upsert_alert(name, alert_type, "warn", alert_message)
+            else:
+                from pollypm.storage.pg_alerts import upsert_alert as pg_upsert_alert
+
+                pg_upsert_alert(name, alert_type, "warn", alert_message)
             summary["alerts_raised"] += 1
         except Exception:  # noqa: BLE001
             logger.debug(

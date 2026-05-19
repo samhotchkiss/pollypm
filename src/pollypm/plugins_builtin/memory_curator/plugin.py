@@ -40,9 +40,13 @@ def _load_config_and_store(payload: dict[str, Any]):
         )
     config = load_config(config_path)
 
-    from pollypm.storage.state import StateStore
-    store = StateStore(config.project.state_db)
-    return config, store
+    # Slice K-state-port phase 2d (#1737): the memory curator handler
+    # doesn't actually touch the state store — it iterates project
+    # roots and calls into ``pollypm.memory_backends`` which owns its
+    # own per-project backend handle. Returning ``None`` here avoids
+    # opening a short-lived StateStore that the pg backend can't
+    # service anyway.
+    return config, None
 
 
 def memory_curate_handler(payload: dict[str, Any]) -> dict[str, Any]:

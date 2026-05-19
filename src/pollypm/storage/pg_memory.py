@@ -636,7 +636,60 @@ def latest_memory_summary(
     )
 
 
+class PgMemoryStore:
+    """Lightweight adapter exposing StateStore-shaped memory methods on pg.
+
+    :class:`pollypm.memory_backends.file.FileMemoryBackend` was written
+    against :class:`pollypm.storage.state.StateStore` and calls a
+    handful of memory_* methods on it. This adapter offers the same
+    method names but routes each call through the module-level pg
+    functions above. Backend selection happens at
+    :func:`pollypm.memory_backends.get_memory_backend` time.
+
+    The instance is stateless (no pool kept on ``self``) so it is
+    cheap to construct and safe to share across threads — each call
+    pulls a connection from the process-wide pool.
+    """
+
+    def record_memory_entry(self, **kwargs) -> MemoryEntryRecord:
+        return record_memory_entry(**kwargs)
+
+    def get_memory_entry(self, entry_id: int) -> MemoryEntryRecord | None:
+        return get_memory_entry(entry_id)
+
+    def list_memory_entries(self, **kwargs) -> list[MemoryEntryRecord]:
+        return list_memory_entries(**kwargs)
+
+    def recall_memory_entries(self, **kwargs):
+        return recall_memory_entries(**kwargs)
+
+    def purge_session_scope(self, session_id: str) -> int:
+        return purge_session_scope(session_id)
+
+    def expire_task_scope(self, task_id: str, **kwargs) -> int:
+        return expire_task_scope(task_id, **kwargs)
+
+    def delete_memory_entry(self, entry_id: int) -> bool:
+        return delete_memory_entry(entry_id)
+
+    def update_memory_entry(self, entry_id: int, **kwargs) -> bool:
+        return update_memory_entry(entry_id, **kwargs)
+
+    def record_memory_summary(self, **kwargs) -> MemorySummaryRecord:
+        return record_memory_summary(**kwargs)
+
+    def latest_memory_summary(self, scope: str) -> MemorySummaryRecord | None:
+        return latest_memory_summary(scope)
+
+    def sweep_expired_memory_entries(self) -> int:
+        return sweep_expired_memory_entries()
+
+    def close(self) -> None:
+        """No-op — the pg adapter doesn't own a connection lifetime."""
+
+
 __all__ = [
+    "PgMemoryStore",
     "delete_memory_entry",
     "expire_task_scope",
     "get_memory_entry",

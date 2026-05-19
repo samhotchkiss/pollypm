@@ -2507,8 +2507,26 @@ class CockpitRouter:
                 storage_session = supervisor.storage_closet_session_name()
                 window_name = self._mounted_window_name(supervisor, mounted)
                 if window_name is not None and self.tmux.has_session(storage_session):
+                    # #1631 follow-up — idempotent break-pane.  When the
+                    # rail crashes mid-conversation and the worker pane
+                    # is the lone survivor, the prior behaviour broke
+                    # it back into storage even if storage already held
+                    # the canonical name (the live conversation we just
+                    # left).  That double would then cause the user's
+                    # next click on PM Chat to mount onto the wrong
+                    # window and lose state.
                     try:
-                        self.tmux.break_pane(panes[0].pane_id, storage_session, window_name)
+                        from pollypm.cockpit_storage_park import (
+                            safe_break_pane_to_storage,
+                        )
+                        safe_break_pane_to_storage(
+                            self.tmux,
+                            source_pane_id=panes[0].pane_id,
+                            storage_session=storage_session,
+                            window_name=window_name,
+                            audit_emit=self._audit_emit_for_storage_park,
+                            subject=mounted,
+                        )
                     except Exception:  # noqa: BLE001
                         pass
             state.pop("right_pane_id", None)
@@ -4045,6 +4063,30 @@ class CockpitRouter:
                 "storage_windows_after": sorted(w.name for w in after),
                 "reoccupied_dead_indices": [w.index for w in dead_existing],
             },
+        )
+
+    def _audit_emit_for_storage_park(
+        self,
+        event_name: str,
+        status: str,
+        metadata: dict,
+    ) -> None:
+        """Adapter for :func:`cockpit_storage_park.safe_break_pane_to_storage`.
+
+        #1631 follow-up — the helper takes a small callback so it can
+        emit audit events without importing ``cockpit_rail``.  This
+        method routes the helper's events through
+        :meth:`_emit_cockpit_audit` so they land on the same audit
+        surface as the original ``cockpit.park_skipped_existing`` from
+        :meth:`_park_mounted_session`.  The helper passes ``subject``
+        inside ``metadata``; we lift it back into the audit envelope.
+        """
+        subject = metadata.pop("subject", metadata.get("window_name", "unknown"))
+        self._emit_cockpit_audit(
+            event_name=event_name,
+            subject=subject,
+            status=status,
+            metadata=metadata,
         )
 
     def _storage_window_is_live(self, window) -> bool:

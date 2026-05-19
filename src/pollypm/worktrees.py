@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import subprocess
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import typer
 
@@ -14,10 +15,105 @@ from pollypm.projects import (
     release_session_lock,
     session_scoped_dir,
 )
+from pollypm.storage._backend_dispatch import is_pg_backend
 from pollypm.storage.records import WorktreeRecord
-from pollypm.storage.state import StateStore
+
+if TYPE_CHECKING:
+    from pollypm.models import PollyPMConfig
 
 _SAFE_WORKTREE_KEY_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+
+
+def _list_worktrees_for_backend(
+    config: "PollyPMConfig", project_key: str | None
+) -> list[WorktreeRecord]:
+    """Backend-aware list helper.
+
+    On the pg path we go straight through the new pg_worktrees facade
+    (no per-process StateStore lifecycle); on the sqlite path we open
+    a short-lived StateStore for back-compat. Both branches return the
+    same :class:`WorktreeRecord` shape so callers don't have to care.
+    """
+    if is_pg_backend(config):
+        from pollypm.storage.pg_worktrees import list_worktrees as pg_list
+
+        return pg_list(project_key)
+    from pollypm.storage.state import StateStore
+
+    store = StateStore(config.project.state_db)
+    try:
+        return store.list_worktrees(project_key)
+    finally:
+        store.close()
+
+
+def _upsert_worktree_for_backend(
+    config: "PollyPMConfig",
+    *,
+    project_key: str,
+    lane_kind: str,
+    lane_key: str,
+    session_name: str | None,
+    issue_key: str | None,
+    path: str,
+    branch: str,
+    status: str,
+) -> None:
+    """Backend-aware upsert wrapper. See :func:`_list_worktrees_for_backend`."""
+    if is_pg_backend(config):
+        from pollypm.storage.pg_worktrees import upsert_worktree as pg_upsert
+
+        pg_upsert(
+            project_key=project_key,
+            lane_kind=lane_kind,
+            lane_key=lane_key,
+            session_name=session_name,
+            issue_key=issue_key,
+            path=path,
+            branch=branch,
+            status=status,
+        )
+        return
+    from pollypm.storage.state import StateStore
+
+    store = StateStore(config.project.state_db)
+    try:
+        store.upsert_worktree(
+            project_key=project_key,
+            lane_kind=lane_kind,
+            lane_key=lane_key,
+            session_name=session_name,
+            issue_key=issue_key,
+            path=path,
+            branch=branch,
+            status=status,
+        )
+    finally:
+        store.close()
+
+
+def _update_worktree_status_for_backend(
+    config: "PollyPMConfig",
+    project_key: str,
+    lane_kind: str,
+    lane_key: str,
+    status: str,
+) -> None:
+    """Backend-aware status-promotion wrapper."""
+    if is_pg_backend(config):
+        from pollypm.storage.pg_worktrees import (
+            update_worktree_status as pg_update,
+        )
+
+        pg_update(project_key, lane_kind, lane_key, status)
+        return
+    from pollypm.storage.state import StateStore
+
+    store = StateStore(config.project.state_db)
+    try:
+        store.update_worktree_status(project_key, lane_kind, lane_key, status)
+    finally:
+        store.close()
 
 
 def _validate_worktree_key(param_name: str, param_value: str) -> None:
@@ -54,8 +150,7 @@ def ensure_worktree(
     if not (project.path / ".git").exists():
         return None
 
-    store = StateStore(config.project.state_db)
-    existing = _active_worktree(store, project_key, lane_kind, lane_key)
+    existing = _active_worktree(config, project_key, lane_kind, lane_key)
     if existing is not None and Path(existing.path).exists():
         return existing
 
@@ -74,7 +169,8 @@ def ensure_worktree(
             release_session_lock(worktree_root, session_id)
             raise RuntimeError(result.stderr.strip() or result.stdout.strip() or "git worktree add failed")
 
-    store.upsert_worktree(
+    _upsert_worktree_for_backend(
+        config,
         project_key=project_key,
         lane_kind=lane_kind,
         lane_key=lane_key,
@@ -84,7 +180,7 @@ def ensure_worktree(
         branch=branch,
         status="active",
     )
-    return _active_worktree(store, project_key, lane_kind, lane_key)
+    return _active_worktree(config, project_key, lane_kind, lane_key)
 
 
 def cleanup_worktree(
@@ -106,8 +202,7 @@ def cleanup_worktree(
     project = config.projects.get(project_key)
     if project is None:
         raise typer.BadParameter(f"Unknown project: {project_key}")
-    store = StateStore(config.project.state_db)
-    record = _active_worktree(store, project_key, lane_kind, lane_key)
+    record = _active_worktree(config, project_key, lane_kind, lane_key)
     if record is None:
         raise typer.BadParameter(f"No active worktree for {project_key}:{lane_kind}:{lane_key}")
     path = Path(record.path)
@@ -134,18 +229,19 @@ def cleanup_worktree(
         timeout=60,
     )
     release_session_lock(path.parent, record.session_name)
-    store.update_worktree_status(project_key, lane_kind, lane_key, "closed")
+    _update_worktree_status_for_backend(config, project_key, lane_kind, lane_key, "closed")
     return path
 
 
 def list_worktrees(config_path: Path, project_key: str | None = None) -> list[WorktreeRecord]:
     config = load_config(config_path)
-    store = StateStore(config.project.state_db)
-    return store.list_worktrees(project_key)
+    return _list_worktrees_for_backend(config, project_key)
 
 
-def _active_worktree(store: StateStore, project_key: str, lane_kind: str, lane_key: str) -> WorktreeRecord | None:
-    for item in store.list_worktrees(project_key):
+def _active_worktree(
+    config: "PollyPMConfig", project_key: str, lane_kind: str, lane_key: str
+) -> WorktreeRecord | None:
+    for item in _list_worktrees_for_backend(config, project_key):
         if item.lane_kind == lane_kind and item.lane_key == lane_key and item.status == "active":
             return item
     return None

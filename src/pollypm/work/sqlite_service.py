@@ -26,9 +26,9 @@ import os
 import re
 import sqlite3
 import subprocess
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -43,23 +43,16 @@ def _work_db_opened_audit_disabled() -> bool:
 # #894 — register the work_service module as an emitter that routes
 # through SignalEnvelope. The release gate's
 # signal_routing_emitters check inspects ROUTED_EMITTERS for this
-# name. Representative migration site: ``maybe_record_first_shipped``
-# below builds a SignalEnvelope before the underlying
-# ``store.enqueue_message`` write, so the canonical routing policy
-# (audience / actionability / dedupe) is exercised on a real path.
+# name. The actual envelope/route_signal call lives in
+# ``pollypm.work.first_shipped._record_first_shipped_activity``
+# (extracted in #1737); the registration stays here so the
+# work-service module remains a known emitter at import time.
 from pollypm.signal_routing import (  # noqa: E402
-    SignalActionability,
-    SignalAudience,
-    SignalEnvelope,
-    SignalSeverity,
-    compute_dedupe_key,
     register_routed_emitter,
-    route_signal,
 )
 
 register_routed_emitter("work_service")
 
-from pollypm.atomic_io import atomic_write_json
 from pollypm.inbox.kind import InboxItemKind, coerce_kind as _coerce_inbox_kind
 from pollypm.work.flow_engine import resolve_flow
 from pollypm.work.gates import GateRegistry, evaluate_gates
@@ -133,38 +126,23 @@ from pollypm.work.service_transitions import (
 from pollypm.work.service_transition_manager import WorkTransitionManager
 from pollypm.work.sync import SyncManager
 
-
-_STATE_FILENAME = "state.json"
-
-
-class _HasExecutions(Protocol):
-    def get_execution(
-        self,
-        task_id: str,
-        node_id: str | None = None,
-        visit: int | None = None,
-    ) -> list[Any]:
-        ...
-
-
-def state_path() -> Path:
-    return Path.home() / ".pollypm" / _STATE_FILENAME
-
-
-def load_state(path: Path | None = None) -> dict[str, Any]:
-    resolved = path or state_path()
-    if not resolved.exists():
-        return {}
-    try:
-        payload = json.loads(resolved.read_text())
-    except (OSError, ValueError, json.JSONDecodeError):
-        return {}
-    return payload if isinstance(payload, dict) else {}
-
-
-def first_shipped_at(path: Path | None = None) -> str | None:
-    value = load_state(path).get("first_shipped_at")
-    return str(value) if isinstance(value, str) and value else None
+# #1737: the first-shipped milestone helpers (and their backend-neutral
+# state-file + Protocol support) were extracted to a leaf module so
+# ``pg_service`` can record the milestone without importing this
+# sqlite-only module. Re-export here under the original names so
+# in-tree callers (including the ``maybe_record_first_shipped``
+# monkeypatch in ``tests/test_pg_gap_sweep_2.py``) keep working.
+from pollypm.work.first_shipped import (  # noqa: F401
+    _HasExecutions,
+    _record_first_shipped_activity,
+    _STATE_FILENAME,
+    first_shipped_at,
+    load_state,
+    mark_first_shipped,
+    maybe_record_first_shipped,
+    state_path,
+    task_landed_commit,
+)
 
 
 def _row_get(row: object, column: str, default: object = None) -> object:
@@ -560,143 +538,11 @@ def _resolve_disjoint_addition_conflicts(text: str) -> str | None:
     return "".join(out)
 
 
-def mark_first_shipped(
-    *,
-    path: Path | None = None,
-    when: datetime | None = None,
-) -> bool:
-    resolved = path or state_path()
-    state = load_state(resolved)
-    if isinstance(state.get("first_shipped_at"), str) and state["first_shipped_at"]:
-        return False
-    state["first_shipped_at"] = (when or datetime.now(UTC)).isoformat()
-    atomic_write_json(resolved, state)
-    return True
-
-
-def _record_first_shipped_activity(
-    *,
-    project_path: Path | None,
-    project_key: str | None,
-    when: datetime | None = None,
-) -> None:
-    """Persist the one-time shipment milestone into the project feed."""
-    if project_path is None:
-        return
-    try:
-        from pollypm.store import SQLAlchemyStore
-    except Exception:  # noqa: BLE001
-        # #1355: previously silent. A failed SQLAlchemyStore import
-        # drops the first-shipment celebration without a trace; log
-        # so a broken store package stops masking the milestone.
-        logger.warning(
-            "first_shipped: SQLAlchemyStore import failed for %s",
-            project_key,
-            exc_info=True,
-        )
-        return
-
-    state_db = project_path / ".pollypm" / "state.db"
-    state_db.parent.mkdir(parents=True, exist_ok=True)
-    shipped_at = (when or datetime.now(UTC)).isoformat()
-    body = json.dumps(
-        {
-            "summary": "First PR shipped with Polly 🎉",
-            "severity": "routine",
-            "verb": "celebrated",
-            "subject": "first shipment",
-            "project": project_key,
-            "shipped_at": shipped_at,
-        }
-    )
-    payload = {
-        "kind": "first_shipped",
-        "project": project_key,
-        "pinned": True,
-        "shipped_at": shipped_at,
-    }
-    # #894 — route through SignalEnvelope before the legacy
-    # store.enqueue_message write. first_shipped is informational —
-    # it lands on Activity + Inbox without toasting (the user
-    # discovers the celebration in their feed).
-    route_signal(
-        SignalEnvelope(
-            audience=SignalAudience.USER,
-            severity=SignalSeverity.INFO,
-            actionability=SignalActionability.INFORMATIONAL,
-            source="work_service",
-            subject="First PR shipped",
-            body="First PR shipped with Polly 🎉",
-            project=project_key,
-            dedupe_key=compute_dedupe_key(
-                source="work_service",
-                kind="first_shipped",
-                target=project_key,
-            ),
-            payload=payload,
-        )
-    )
-    store = SQLAlchemyStore(f"sqlite:///{state_db}")
-    try:
-        store.enqueue_message(
-            type="event",
-            tier="immediate",
-            recipient="*",
-            sender="polly",
-            subject="first_shipped",
-            body=body,
-            scope="polly",
-            payload=payload,
-            kind=InboxItemKind.COMPLETION_FYI.value,
-        )
-    finally:
-        store.close()
-
-
-def task_landed_commit(service: _HasExecutions, task_id: str) -> bool:
-    try:
-        executions = service.get_execution(task_id)
-    except Exception:  # noqa: BLE001
-        # #1355: previously silent. A broken get_execution call
-        # forces the "first PR shipped" celebration to skip; log
-        # so we stop swallowing the underlying query failure.
-        logger.warning(
-            "task_landed_commit: get_execution failed for %s",
-            task_id,
-            exc_info=True,
-        )
-        return False
-    for execution in reversed(executions):
-        work_output = getattr(execution, "work_output", None)
-        if work_output is None:
-            continue
-        artifacts = getattr(work_output, "artifacts", None) or []
-        for artifact in artifacts:
-            if getattr(artifact, "kind", None) == ArtifactKind.COMMIT:
-                return True
-    return False
-
-
-def maybe_record_first_shipped(
-    service: _HasExecutions,
-    task_id: str,
-    *,
-    path: Path | None = None,
-    project_path: Path | None = None,
-    when: datetime | None = None,
-) -> bool:
-    if not task_landed_commit(service, task_id):
-        return False
-    created = mark_first_shipped(path=path, when=when)
-    if not created:
-        return False
-    project_key = task_id.split("/", 1)[0] if "/" in task_id else None
-    _record_first_shipped_activity(
-        project_path=project_path,
-        project_key=project_key,
-        when=when,
-    )
-    return True
+# #1737: ``mark_first_shipped``, ``_record_first_shipped_activity``,
+# ``task_landed_commit``, and ``maybe_record_first_shipped`` were
+# extracted to ``pollypm.work.first_shipped``. They are re-exported
+# at the top of this module (see the ``first_shipped`` import block)
+# so existing callers keep working unchanged.
 
 
 # ---------------------------------------------------------------------------

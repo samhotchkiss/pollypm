@@ -2002,8 +2002,10 @@ class PgWorkService:
             # checks whether the task landed a commit artifact and, if
             # so, writes the ``first_shipped_at`` state file + pinned
             # activity event. Best-effort; failures are swallowed.
+            # #1737: helper now lives in a backend-neutral leaf module
+            # so pg_service.py no longer imports from sqlite_service.
             try:
-                from pollypm.work.sqlite_service import (
+                from pollypm.work.first_shipped import (
                     maybe_record_first_shipped,
                 )
 

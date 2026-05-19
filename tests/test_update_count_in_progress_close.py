@@ -23,16 +23,24 @@ from pollypm import update as update_mod
 def _install_fake_modules(
     monkeypatch: pytest.MonkeyPatch, db_path: Path, fake_svc_cls: type,
 ) -> None:
-    """Stub the three imports inside ``count_in_progress_tasks`` so the
-    test never touches a real SQLite file or config."""
+    """Stub the imports inside ``count_in_progress_tasks`` so the test
+    never touches a real SQLite file or config.
+
+    Slice J-C (#1369, #1737) — ``count_in_progress_tasks`` now also
+    calls ``load_config`` and forwards the config to ``resolve_work_db_path``
+    so backend dispatch sees ``[storage] backend``. The fakes accept
+    ``**kwargs`` so the test stays focused on the close-on-exit
+    contract that #1377 introduced.
+    """
     fake_resolver = types.ModuleType("pollypm.work.db_resolver")
-    fake_resolver.resolve_work_db_path = lambda: db_path  # type: ignore[attr-defined]
+    fake_resolver.resolve_work_db_path = lambda **_kwargs: db_path  # type: ignore[attr-defined]
 
     fake_service = types.ModuleType("pollypm.work.sqlite_service")
     fake_service.SQLiteWorkService = fake_svc_cls  # type: ignore[attr-defined]
 
     fake_config = types.ModuleType("pollypm.config")
     fake_config.DEFAULT_CONFIG_PATH = Path("/tmp/ignored")  # type: ignore[attr-defined]
+    fake_config.load_config = lambda *_args, **_kwargs: None  # type: ignore[attr-defined]
 
     monkeypatch.setitem(sys.modules, "pollypm.work.db_resolver", fake_resolver)
     monkeypatch.setitem(sys.modules, "pollypm.work.sqlite_service", fake_service)
@@ -53,7 +61,7 @@ def test_count_in_progress_tasks_closes_workservice(
     events: list[str] = []
 
     class _FakeSvc:
-        def __init__(self, *, db_path: Path) -> None:
+        def __init__(self, *, db_path: Path, **_kwargs: object) -> None:
             events.append("init")
 
         def __enter__(self) -> "_FakeSvc":
@@ -92,7 +100,7 @@ def test_count_in_progress_tasks_closes_workservice_on_query_error(
     events: list[str] = []
 
     class _FakeSvc:
-        def __init__(self, *, db_path: Path) -> None:
+        def __init__(self, *, db_path: Path, **_kwargs: object) -> None:
             events.append("init")
 
         def __enter__(self) -> "_FakeSvc":

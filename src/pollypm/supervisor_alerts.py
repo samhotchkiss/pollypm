@@ -154,7 +154,9 @@ def _task_is_re_review(task: object) -> bool:
 
 
 def _review_tasks_for_project(
-    project_key: str, db_path: Path,
+    project_key: str,
+    db_path: Path,
+    config: "PollyPMConfig | None" = None,
 ) -> tuple[list[str], int]:
     """Return nudge lines + re-review count for a project's review-queue tasks.
 
@@ -176,7 +178,7 @@ def _review_tasks_for_project(
     entries: list[str] = []
     re_review_count = 0
     try:
-        with create_work_service(db_path=db_path) as svc:
+        with create_work_service(db_path=db_path, config=config) as svc:
             tasks = svc.list_tasks(work_status="review", project=project_key)
             for task in tasks:
                 if task.current_node_id and "human" in task.current_node_id:
@@ -535,7 +537,7 @@ def _build_review_nudge(supervisor: SupervisorAlertBoundary) -> str | None:
             continue
         try:
             entries, re_review_count = _review_tasks_for_project(
-                project_key, db_path,
+                project_key, db_path, config=supervisor.config,
             )
         except Exception:  # noqa: BLE001
             _logger.exception(
@@ -591,7 +593,7 @@ def _build_task_nudge(supervisor: SupervisorAlertBoundary, launch: SessionLaunch
         db_path = resolve_work_db_path(project=project, config=supervisor.config)
         if not db_path.exists():
             return None
-        with create_work_service(db_path=db_path) as svc:
+        with create_work_service(db_path=db_path, config=supervisor.config) as svc:
             task = svc.next(project=project)
             if task is None:
                 return None

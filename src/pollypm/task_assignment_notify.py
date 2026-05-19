@@ -1010,6 +1010,7 @@ def _open_project_work_service(project: Any, services: Any) -> Any | None:
         svc = create_work_service(
             db_path=db_path,
             project_path=Path(project_path),
+            config=getattr(services, "config", None),
         )
     except Exception:  # noqa: BLE001
         logger.debug(

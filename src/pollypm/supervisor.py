@@ -2865,7 +2865,9 @@ class Supervisor:
         for db_path in candidate_db_paths:
             try:
                 svc = create_work_service(
-                    db_path=db_path, project_path=project_path,
+                    db_path=db_path,
+                    project_path=project_path,
+                    config=self.config,
                 )
             except Exception:  # noqa: BLE001
                 continue

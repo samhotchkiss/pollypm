@@ -240,7 +240,7 @@ def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | Non
                 continue
             try:
                 with create_work_service(
-                    db_path=db_path, project_path=project.path,
+                    db_path=db_path, project_path=project.path, config=config,
                 ) as svc:
                     tasks = inbox_tasks(svc, project=project_key)
             except Exception:  # noqa: BLE001

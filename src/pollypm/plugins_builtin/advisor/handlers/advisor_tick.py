@@ -80,6 +80,7 @@ def detect_changes(
     *,
     project_key: str | None = None,
     work_service: Any | None = None,
+    config: Any | None = None,
 ) -> bool:
     """Return True when the project has a commit or task transition since ``since``.
 
@@ -88,6 +89,9 @@ def detect_changes(
     monkeypatch this symbol to force particular outcomes; ad03's
     context-packing imports the full :class:`ChangeReport` directly
     from ``detect_changes.py``.
+
+    ``config`` is forwarded so PG transition reads honour the active
+    ``[storage].backend`` (#1757).
     """
     from pollypm.plugins_builtin.advisor.handlers.detect_changes import (
         detect_changes as _detect,
@@ -97,6 +101,7 @@ def detect_changes(
         since,
         project_key=project_key,
         work_service=work_service,
+        config=config,
     )
     return report.has_changes
 
@@ -513,11 +518,22 @@ def _should_review(
                     project_path, since,
                     project_key=project_key,
                     work_service=work_service,
+                    config=config,
                 )
             )
         except TypeError:
-            # Backwards-compat: some tests patch a two-arg stub.
-            changed = bool(_self.detect_changes(project_path, since))
+            # Backwards-compat: some tests patch a two-arg stub, or an
+            # older signature that doesn't accept ``config``.
+            try:
+                changed = bool(
+                    _self.detect_changes(
+                        project_path, since,
+                        project_key=project_key,
+                        work_service=work_service,
+                    )
+                )
+            except TypeError:
+                changed = bool(_self.detect_changes(project_path, since))
     except Exception as exc:  # noqa: BLE001
         logger.debug("advisor: detect_changes failed for %s: %s", project_key, exc)
         return False, "detect-error"

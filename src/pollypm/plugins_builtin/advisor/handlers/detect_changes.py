@@ -249,19 +249,47 @@ def _transitions_db_path(project_path: Path) -> Path | None:
     return db_path
 
 
+def _is_pg_backend(config: Any | None) -> bool:
+    """Return ``True`` when the active storage backend is Postgres.
+
+    Mirrors :func:`pollypm.storage._backend_dispatch.is_pg_backend` but
+    inlined to keep the advisor handler decoupled from the storage
+    package's private dispatch helper. Defaults to sqlite when the
+    config can't be read.
+    """
+    if config is None:
+        try:
+            from pollypm.config import load_config
+
+            config = load_config()
+        except Exception:  # noqa: BLE001
+            return False
+    storage = getattr(config, "storage", None)
+    if storage is None:
+        return False
+    backend = getattr(storage, "backend", "sqlite")
+    if not isinstance(backend, str):
+        return False
+    return backend.strip().lower() == "postgres"
+
+
 def _gather_task_transitions(
     project_path: Path,
     project_key: str,
     since: datetime | None,
     *,
     work_service: Any | None = None,
+    config: Any | None = None,
 ) -> list[TaskTransitionRecord]:
     """Return transitions for ``project_key`` after ``since``.
 
     Prefers a caller-supplied work-service handle (tests inject an
-    in-memory fake). Falls back to a read-only sqlite open of the
-    project's ``.pollypm/state.db`` through the storage query facade so
-    the advisor doesn't own raw SQLite connection details.
+    in-memory fake). On the Postgres backend, calls the
+    :func:`pollypm.storage.work_transition_queries.advisor_transition_rows`
+    facade directly with ``db_path=None`` — there's no per-project
+    SQLite file to gate on (#1757). On the SQLite backend, falls back
+    to a read-only open of the project's workspace-root ``state.db``
+    through the same facade.
     """
     since_iso = since.isoformat() if since else _default_since_iso()
 
@@ -276,17 +304,34 @@ def _gather_task_transitions(
                 rows = []
             return list(rows)
 
-    db_path = _transitions_db_path(project_path)
-    if db_path is None or not db_path.exists():
-        return []
-
     from pollypm.storage.work_transition_queries import advisor_transition_rows
 
-    rows = advisor_transition_rows(
-        db_path,
-        project_key=project_key,
-        since_iso=since_iso,
-    )
+    # #1757: the SQLite existence gate must NOT short-circuit the PG
+    # branch. On a migrated install with `[storage].backend = "postgres"`
+    # the per-project state.db is intentionally absent, so probing for
+    # its existence dropped every advisor tick to zero transitions and
+    # suppressed assessment signals.
+    if _is_pg_backend(config):
+        # ``db_path`` is unused by the facade on the pg branch — pass
+        # a placeholder so the signature matches without resolving the
+        # legacy sqlite path. Thread ``config`` through so a non-default
+        # ``--config`` reaches the right pg pool (#1755 dovetail).
+        rows = advisor_transition_rows(
+            project_path,  # placeholder; facade discards on pg backend
+            project_key=project_key,
+            since_iso=since_iso,
+            config=config,
+        )
+    else:
+        db_path = _transitions_db_path(project_path)
+        if db_path is None or not db_path.exists():
+            return []
+        rows = advisor_transition_rows(
+            db_path,
+            project_key=project_key,
+            since_iso=since_iso,
+            config=config,
+        )
 
     out: list[TaskTransitionRecord] = []
     for r in rows:
@@ -331,12 +376,17 @@ def detect_changes(
     project_key: str | None = None,
     work_service: Any | None = None,
     git_timeout: float = DEFAULT_GIT_TIMEOUT,
+    config: Any | None = None,
 ) -> ChangeReport:
     """Build a :class:`ChangeReport` for a project since ``since``.
 
     ``project_key`` defaults to the basename of ``project_path`` when
     not supplied — the advisor tick always passes it explicitly, but
     the default keeps stand-alone testing cheap.
+
+    ``config`` is forwarded to the transition-row facade so the
+    advisor honours the active ``[storage].backend`` (#1757) and any
+    non-default ``[storage.pg].dsn`` (#1755 dovetail).
 
     Results are cached per-tick keyed by ``(project_path, since)`` so
     a tick that makes multiple passes over the same project (e.g.
@@ -353,7 +403,9 @@ def detect_changes(
     commit_shas = _gather_commits(project_path, since, timeout=git_timeout)
     changed_files = _gather_changed_files(project_path, commit_shas, timeout=git_timeout)
     transitions = _gather_task_transitions(
-        project_path, key_name, since, work_service=work_service,
+        project_path, key_name, since,
+        work_service=work_service,
+        config=config,
     )
 
     n_commits = len(commit_shas)

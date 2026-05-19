@@ -20,6 +20,7 @@ Wedge of the cockpit_ui.py god-module split tracked by #1354.
 
 from __future__ import annotations
 
+import logging
 import os
 
 from textual.app import ComposeResult
@@ -27,6 +28,8 @@ from textual.binding import Binding
 from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Static
+
+logger = logging.getLogger(__name__)
 
 
 _FIRST_SHIPPED_FRAMES = (
@@ -82,11 +85,24 @@ class _FirstShippedCelebrationModal(ModalScreen[None]):
         try:
             self.set_interval(0.16, self._advance_frame)
         except Exception:  # noqa: BLE001
-            pass
+            # #1355: previously silent. If the confetti animation timer
+            # cannot be installed, log so a static modal doesn't quietly
+            # mask a Textual harness regression.
+            logger.warning(
+                "cockpit_first_shipped: set_interval(_advance_frame) failed; "
+                "modal will not animate",
+                exc_info=True,
+            )
         try:
             self.set_timer(2.0, self.dismiss)
         except Exception:  # noqa: BLE001
-            pass
+            # #1355: previously silent. A failed auto-dismiss timer leaves
+            # the modal sticky — surface so we can spot the harness gap.
+            logger.warning(
+                "cockpit_first_shipped: set_timer(dismiss) failed; "
+                "modal will not auto-dismiss",
+                exc_info=True,
+            )
 
     def _advance_frame(self) -> None:
         self._frame_index = (self._frame_index + 1) % len(_FIRST_SHIPPED_FRAMES)
@@ -95,7 +111,14 @@ class _FirstShippedCelebrationModal(ModalScreen[None]):
                 _FIRST_SHIPPED_FRAMES[self._frame_index],
             )
         except Exception:  # noqa: BLE001
-            pass
+            # #1355: previously silent. A missing confetti node would
+            # otherwise let the animation tick fail every 0.16s without
+            # any signal — log at debug so we still notice in -v runs
+            # but don't spam the operator's normal log on every frame.
+            logger.debug(
+                "cockpit_first_shipped: _advance_frame query_one miss",
+                exc_info=True,
+            )
 
 
 def _celebrate_first_shipped(app) -> None:
@@ -106,7 +129,14 @@ def _celebrate_first_shipped(app) -> None:
     try:
         app.push_screen(_FirstShippedCelebrationModal())
     except Exception:  # noqa: BLE001
-        pass
+        # #1355: previously silent. The toast already fired; log here
+        # so a push_screen regression (e.g. no screen stack on the
+        # smoke harness) doesn't quietly disable the confetti modal.
+        logger.warning(
+            "cockpit_first_shipped: push_screen(_FirstShippedCelebrationModal) "
+            "failed; toast fired but modal skipped",
+            exc_info=True,
+        )
 
 
 __all__ = [

@@ -189,6 +189,15 @@ def _review_tasks_for_project(
                 else:
                     entries.append(f"  - {task.task_id}: {task.title}")
     except Exception:  # noqa: BLE001
+        # #1355: previously silent. A swallowed query here makes the
+        # review nudge skip the project entirely — surface so a broken
+        # DB read doesn't mask review backlog accumulation.
+        _logger.warning(
+            "supervisor_alerts: review-task query failed for %s; "
+            "skipping project in nudge",
+            project_key,
+            exc_info=True,
+        )
         return [], 0
 
     _REVIEW_NUDGE_CACHE[project_key] = (db_mtime, entries, re_review_count)
@@ -591,5 +600,13 @@ def _build_task_nudge(supervisor: SupervisorAlertBoundary, launch: SessionLaunch
                 f"is queued for your project. "
                 "Open Tasks to review the queue; Polly will claim it when worker capacity is available."
             )
-    except Exception:
+    except Exception:  # noqa: BLE001
+        # #1355: previously silent. A failed work-DB resolve / svc.next
+        # quietly disables the task nudge for the project — surface so
+        # a regression doesn't leave queued work invisible.
+        _logger.warning(
+            "supervisor_alerts: task nudge build failed for %s; skipping",
+            launch.session.project,
+            exc_info=True,
+        )
         return None

@@ -120,6 +120,10 @@ from pollypm.cockpit_rail_listview import (  # noqa: F401  (re-exported)
 from pollypm.cockpit_rail_item import (  # noqa: F401  (re-exported)
     RailItem,
 )
+from pollypm.cockpit_route_controls import (  # noqa: F401  (re-exported)
+    _CockpitRouteContentResolver,
+    _CockpitRouteWindowApplier,
+)
 from pollypm.cockpit_live_chat_notice import (
     LIVE_CHAT_NETWORK_DEAD_TMUX_MESSAGE,
     clear_live_chat_network_dead_notice,
@@ -215,25 +219,6 @@ _PLAN_REVIEW_UNAVAILABLE_HINT_RE = _re.compile(
     _re.IGNORECASE,
 )
 _PLAN_REVIEW_DISCUSSION_ENTRY_TYPE = "plan_review_discussed"
-
-
-class _CockpitRouteContentResolver:
-    """Navigation resolver for the root cockpit rail.
-
-    The router still owns full content resolution during this integration
-    step; the navigation controller owns acknowledgement/cancellation state.
-    """
-
-    def resolve(self, request: NavigationCommand) -> NavigationContent:
-        return NavigationContent(request.key)
-
-
-class _CockpitRouteWindowApplier:
-    def __init__(self, app: "PollyCockpitApp") -> None:
-        self._app = app
-
-    def apply(self, request: NavigationCommand, _content: object) -> str:
-        return self._app._route_selected_with_deadline(request.key)
 
 
 def _md_to_rich(text: str) -> str:
@@ -12220,6 +12205,151 @@ def _dashboard_plan_review_decision(
     }
 
 
+def _dashboard_build_blocker_summary_item(
+    row: dict[str, object],
+    payload: dict[str, object],
+    project_key: str,
+    *,
+    sort_value: float,
+) -> dict[str, object]:
+    """Build the dashboard inbox item for a ``project.blocker_summary`` row.
+
+    Extracted from ``_dashboard_inbox`` (issue #1356 wedge) so the
+    payload-normalisation + decision-dispatch logic is unit-testable
+    in isolation. Caller is responsible for filtering the row by
+    project and for passing in the already-computed ``sort_value``
+    (the only closure capture that doesn't have a module-level twin).
+    """
+    updated_at = row.get("updated_at") or row.get("created_at") or ""
+    if hasattr(updated_at, "isoformat"):
+        updated_at = updated_at.isoformat()
+    required_actions = payload.get("required_actions") or []
+    if not isinstance(required_actions, list):
+        required_actions = []
+    owner = str(payload.get("owner") or "").strip().lower()
+    reason = str(payload.get("reason") or "").strip()
+    item_id = row.get("id")
+    affected_tasks = payload.get("affected_tasks") or []
+    if not isinstance(affected_tasks, list):
+        affected_tasks = []
+    primary_ref = (
+        payload.get("task_id")
+        or (affected_tasks[0] if affected_tasks else None)
+        or f"blocker-summary:{item_id}"
+    )
+    clean_required_actions = [
+        _dashboard_plain_text(step)
+        for step in required_actions
+        if _dashboard_plain_text(step)
+    ][:4]
+    blocker_body = "\n".join([reason, *clean_required_actions])
+    decision = _dashboard_plain_decision_from_body(
+        "project blocker", blocker_body, clean_required_actions,
+    )
+    user_prompt_decision = _dashboard_user_prompt_decision(
+        payload.get("user_prompt"),
+        fallback_task_id=(
+            primary_ref
+            if _PROJECT_TASK_REF_RE.fullmatch(str(primary_ref))
+            else None
+        ),
+    )
+    if user_prompt_decision is not None:
+        decision = user_prompt_decision
+    return {
+        "task_id": f"blocker-summary:{item_id}",
+        "title": f"Unblock {project_key}",
+        "updated_at": updated_at,
+        "sort_value": sort_value,
+        "triage_label": "project blocker",
+        "triage_rank": 0,
+        "needs_action": owner in {"user", "sam", "human"},
+        "source": "blocker_summary",
+        "has_user_prompt": user_prompt_decision is not None,
+        "summary": _dashboard_trim(reason) if reason else "",
+        "steps": clean_required_actions,
+        "next_action": _dashboard_trim(
+            ("Complete: " + "; ".join(clean_required_actions)),
+            limit=260,
+        ) if clean_required_actions else "",
+        "primary_ref": primary_ref,
+        **decision,
+    }
+
+
+def _dashboard_plain_decision_from_body(
+    subject: str, body: str, steps: list[str],
+) -> dict[str, object]:
+    """Build a generic "plain decision" dict from a blocker subject/body.
+
+    Dispatches to the deployment-decision branch when the body/subject
+    mention deploy infra (Fly.io, Postgres, /v1/ping, etc.), the
+    reachability/walkthrough branch when those tokens appear, or a
+    generic "decide" fallback otherwise.
+
+    Extracted from ``_dashboard_inbox`` (issue #1356 wedge) so the
+    token-driven branch table can be exercised in isolation. Pure
+    function — depends only on module-level
+    ``_dashboard_decision_prompt_from_body`` and
+    ``_dashboard_deployment_decision``.
+    """
+    haystack = f"{subject}\n{body}".lower()
+    if any(token in haystack for token in ("reachability", "walkthrough")):
+        return {
+            "plain_prompt": (
+                "The reachability work is ready, but Polly cannot walk through "
+                "it end to end until the backend deployment exists."
+            ),
+            "unblock_steps": [
+                "Make the backend deployment available to Polly.",
+                "Give Polly any access needed to run the walkthrough.",
+            ],
+            "steps_heading": "What you need to set up",
+            "decision_question": (
+                "Approve the work now with a follow-up walkthrough, or wait "
+                "until the live environment is available?"
+            ),
+            "primary_label": "Approve it anyway",
+            "secondary_label": "Wait for live environment",
+            "primary_response": (
+                "Approve it anyway. Accept the current work and create a "
+                "follow-up task for the live walkthrough."
+            ),
+            "secondary_response": (
+                "Wait for the live environment. Keep this work pending until "
+                "Polly can complete the walkthrough."
+            ),
+            "other_placeholder": "Tell Polly what to do instead...",
+        }
+    if any(
+        token in haystack
+        for token in (
+            "fly.io",
+            "fly-enabled",
+            "deploy token",
+            "postgres",
+            "redis",
+            "deployment",
+            "deploy pipeline",
+            "rollback",
+            "/v1/ping",
+        )
+    ):
+        return _dashboard_deployment_decision(body, steps)
+    prompt = _dashboard_decision_prompt_from_body(subject, body, steps)
+    return {
+        "plain_prompt": prompt or "Polly needs your decision before this project can continue.",
+        "unblock_steps": steps[:4],
+        "steps_heading": "What to do",
+        "decision_question": "Choose how Polly should proceed.",
+        "primary_label": "Approve it anyway",
+        "secondary_label": "Wait",
+        "primary_response": "Approve it anyway and keep the project moving.",
+        "secondary_response": "Wait. Do not approve this yet.",
+        "other_placeholder": "Tell Polly what to do instead...",
+    }
+
+
 def _dashboard_task_blocker_body(task: object) -> str:
     """Pick the clearest human-facing blocker text from a task."""
     body, _ = _dashboard_task_blocker_body_with_kind(task)
@@ -13063,66 +13193,11 @@ def _dashboard_inbox(
             fallback_task_id=fallback_task_id,
         )
 
-    _deployment_decision = _dashboard_deployment_decision
-
-    def _plain_decision_from_body(
-        subject: str, body: str, steps: list[str],
-    ) -> dict[str, object]:
-        haystack = f"{subject}\n{body}".lower()
-        if any(token in haystack for token in ("reachability", "walkthrough")):
-            return {
-                "plain_prompt": (
-                    "The reachability work is ready, but Polly cannot walk through "
-                    "it end to end until the backend deployment exists."
-                ),
-                "unblock_steps": [
-                    "Make the backend deployment available to Polly.",
-                    "Give Polly any access needed to run the walkthrough.",
-                ],
-                "steps_heading": "What you need to set up",
-                "decision_question": (
-                    "Approve the work now with a follow-up walkthrough, or wait "
-                    "until the live environment is available?"
-                ),
-                "primary_label": "Approve it anyway",
-                "secondary_label": "Wait for live environment",
-                "primary_response": (
-                    "Approve it anyway. Accept the current work and create a "
-                    "follow-up task for the live walkthrough."
-                ),
-                "secondary_response": (
-                    "Wait for the live environment. Keep this work pending until "
-                    "Polly can complete the walkthrough."
-                ),
-                "other_placeholder": "Tell Polly what to do instead...",
-            }
-        if any(
-            token in haystack
-            for token in (
-                "fly.io",
-                "fly-enabled",
-                "deploy token",
-                "postgres",
-                "redis",
-                "deployment",
-                "deploy pipeline",
-                "rollback",
-                "/v1/ping",
-            )
-        ):
-            return _deployment_decision(body, steps)
-        prompt = _decision_prompt_from_body(subject, body, steps)
-        return {
-            "plain_prompt": prompt or "Polly needs your decision before this project can continue.",
-            "unblock_steps": steps[:4],
-            "steps_heading": "What to do",
-            "decision_question": "Choose how Polly should proceed.",
-            "primary_label": "Approve it anyway",
-            "secondary_label": "Wait",
-            "primary_response": "Approve it anyway and keep the project moving.",
-            "secondary_response": "Wait. Do not approve this yet.",
-            "other_placeholder": "Tell Polly what to do instead...",
-        }
+    # #1356 wedge: ``_plain_decision_from_body`` is now a module-level
+    # ``_dashboard_plain_decision_from_body`` so the token-driven branch
+    # table is unit-testable. Keep the local alias to minimise call-site
+    # churn below.
+    _plain_decision_from_body = _dashboard_plain_decision_from_body
 
     known_projects = set(getattr(config, "projects", {}).keys())
     items: list[dict] = []
@@ -13212,65 +13287,18 @@ def _dashboard_inbox(
                 if project_key not in _message_projects(row):
                     continue
                 if is_blocker_summary:
-                    updated_at = row.get("updated_at") or row.get("created_at") or ""
-                    if hasattr(updated_at, "isoformat"):
-                        updated_at = updated_at.isoformat()
-                    required_actions = payload.get("required_actions") or []
-                    if not isinstance(required_actions, list):
-                        required_actions = []
-                    owner = str(payload.get("owner") or "").strip().lower()
-                    reason = str(payload.get("reason") or "").strip()
-                    item_id = row.get("id")
-                    affected_tasks = payload.get("affected_tasks") or []
-                    if not isinstance(affected_tasks, list):
-                        affected_tasks = []
-                    primary_ref = (
-                        payload.get("task_id")
-                        or (affected_tasks[0] if affected_tasks else None)
-                        or f"blocker-summary:{item_id}"
+                    raw_updated_at = (
+                        row.get("updated_at") or row.get("created_at") or ""
                     )
-                    clean_required_actions = [
-                        _plain_text(step)
-                        for step in required_actions
-                        if _plain_text(step)
-                    ][:4]
-                    blocker_body = "\n".join([reason, *clean_required_actions])
-                    decision = _plain_decision_from_body(
-                        "project blocker", blocker_body, clean_required_actions,
-                    )
-                    user_prompt_decision = _user_prompt_decision(
-                        payload.get("user_prompt"),
-                        fallback_task_id=(
-                            primary_ref
-                            if _PROJECT_TASK_REF_RE.fullmatch(str(primary_ref))
-                            else None
-                        ),
-                    )
-                    if user_prompt_decision is not None:
-                        decision = user_prompt_decision
+                    if hasattr(raw_updated_at, "isoformat"):
+                        raw_updated_at = raw_updated_at.isoformat()
                     items.append(
-                        {
-                            "task_id": f"blocker-summary:{item_id}",
-                            "title": f"Unblock {project_key}",
-                            "updated_at": updated_at,
-                            "sort_value": _sort_value(updated_at),
-                            "triage_label": "project blocker",
-                            "triage_rank": 0,
-                        "needs_action": owner in {"user", "sam", "human"},
-                        "source": "blocker_summary",
-                        "has_user_prompt": user_prompt_decision is not None,
-                        "summary": _trim(reason) if reason else "",
-                            "steps": clean_required_actions,
-                            "next_action": _trim(
-                                (
-                                    "Complete: "
-                                    + "; ".join(clean_required_actions)
-                                ),
-                                limit=260,
-                            ) if clean_required_actions else "",
-                            "primary_ref": primary_ref,
-                            **decision,
-                        }
+                        _dashboard_build_blocker_summary_item(
+                            row,
+                            payload,
+                            project_key,
+                            sort_value=_sort_value(raw_updated_at),
+                        )
                     )
                     continue
                 entry = annotate_inbox_entry(

@@ -37,6 +37,15 @@ table. It exposes:
 * :func:`check_and_flush_on_done`  — transition hook: milestone-or-idle flush
 * :func:`check_regression_on_reopen` — transition hook: milestone regression ping
 * :func:`prune_old_staging`        — 30-day hygiene for the plugin handler
+
+Backend (issue #1737, Slice K-misc): every direct-DB helper here talks
+to Postgres via psycopg connections obtained from the process-wide
+:mod:`pollypm.storage.pg_pool` (or an explicit psycopg connection
+passed by the caller). The canonical DDL lives in
+:data:`pollypm.storage.pg_schema.INITIAL_SCHEMA_DDL` group D; the
+inline ``CREATE TABLE IF NOT EXISTS`` mirror below stays as a test-
+friendly fallback so a bare-empty pg schema can be lit up without
+first running the migration applier.
 """
 
 from __future__ import annotations
@@ -44,12 +53,14 @@ from __future__ import annotations
 import json
 import logging
 import re
-import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pollypm.inbox.kind import InboxItemKind
+
+if TYPE_CHECKING:
+    import psycopg
 
 logger = logging.getLogger(__name__)
 
@@ -64,43 +75,55 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _now_iso() -> str:
-    return datetime.now(UTC).isoformat()
+# Idempotent DDL kept inline so a freshly-created schema (e.g. the
+# per-test schema fixture) can host writes without the test having to
+# bootstrap the full migration set. The shape is a faithful port of
+# the sqlite original; ``bigserial`` replaces ``INTEGER PRIMARY KEY
+# AUTOINCREMENT`` and ``timestamptz`` replaces ``TEXT`` for the two
+# timestamp columns. Matches group D of
+# :data:`pollypm.storage.pg_schema.INITIAL_SCHEMA_DDL`.
+_STAGING_DDL = """
+CREATE TABLE IF NOT EXISTS notification_staging (
+    id              bigserial PRIMARY KEY,
+    project         text NOT NULL,
+    subject         text NOT NULL,
+    body            text NOT NULL,
+    actor           text NOT NULL,
+    priority        text NOT NULL,
+    payload_json    jsonb NOT NULL,
+    milestone_key   text,
+    created_at      timestamptz NOT NULL,
+    flushed_at      timestamptz,
+    rollup_task_id  text
+);
+CREATE INDEX IF NOT EXISTS idx_notification_staging_pending
+    ON notification_staging(project, milestone_key, flushed_at);
+CREATE INDEX IF NOT EXISTS idx_notification_staging_created
+    ON notification_staging(created_at);
+"""
 
 
-def _ensure_staging_table(conn: sqlite3.Connection) -> None:
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _ensure_staging_table(conn: "psycopg.Connection") -> None:
     """Create the staging table (and indexes) if missing.
 
-    The canonical migration lives in :mod:`pollypm.work.schema`; this
-    helper is a fallback for direct-connection callers (e.g. the
-    ``pm notify`` path which opens a bare ``StateStore`` before any
-    ``SQLiteWorkService`` ran migrations).
+    The canonical DDL lives in
+    :data:`pollypm.storage.pg_schema.INITIAL_SCHEMA_DDL` (applied via
+    :mod:`pollypm.storage.pg_migrations`); this helper is a fallback
+    for callers that hold a bare psycopg connection on a schema that
+    doesn't have the migration applied yet (test fixtures that mount
+    a per-test schema namespace, mostly).
     """
-    conn.executescript(
-        """
-        CREATE TABLE IF NOT EXISTS notification_staging (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            project TEXT NOT NULL,
-            subject TEXT NOT NULL,
-            body TEXT NOT NULL,
-            actor TEXT NOT NULL,
-            priority TEXT NOT NULL,
-            payload_json TEXT NOT NULL,
-            milestone_key TEXT,
-            created_at TEXT NOT NULL,
-            flushed_at TEXT,
-            rollup_task_id TEXT
-        );
-        CREATE INDEX IF NOT EXISTS idx_notification_staging_pending
-            ON notification_staging(project, milestone_key, flushed_at);
-        CREATE INDEX IF NOT EXISTS idx_notification_staging_created
-            ON notification_staging(created_at);
-        """
-    )
+    with conn.cursor() as cur:
+        cur.execute(_STAGING_DDL)
+    conn.commit()
 
 
 def stage_notification(
-    conn: sqlite3.Connection,
+    conn: "psycopg.Connection",
     *,
     project: str,
     subject: str,
@@ -125,56 +148,66 @@ def stage_notification(
     payload_dict.setdefault("body", body)
     payload_dict.setdefault("actor", actor)
     payload_dict.setdefault("project", project)
-    cur = conn.execute(
-        "INSERT INTO notification_staging "
-        "(project, subject, body, actor, priority, payload_json, "
-        "milestone_key, created_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-        (
-            project,
-            subject,
-            body,
-            actor,
-            priority,
-            json.dumps(payload_dict, separators=(",", ":"), default=str),
-            milestone_key,
-            _now_iso(),
-        ),
-    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO notification_staging "
+            "(project, subject, body, actor, priority, payload_json, "
+            "milestone_key, created_at) "
+            "VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s) RETURNING id",
+            (
+                project,
+                subject,
+                body,
+                actor,
+                priority,
+                json.dumps(payload_dict, separators=(",", ":"), default=str),
+                milestone_key,
+                _now(),
+            ),
+        )
+        row = cur.fetchone()
     conn.commit()
-    return int(cur.lastrowid or 0)
+    return int(row[0]) if row else 0
 
 
 def list_pending(
-    conn: sqlite3.Connection,
+    conn: "psycopg.Connection",
     *,
     project: str,
     milestone_key: str | None,
-) -> list[sqlite3.Row]:
+) -> list[dict[str, Any]]:
     """Return pending digest rows for (project, milestone_key), oldest first.
 
     "Pending" = ``flushed_at IS NULL`` AND ``priority = 'digest'``. Silent
     rows are skipped — they're audit-only and never show up in rollups.
     ``milestone_key IS NULL`` is matched when ``milestone_key`` is None.
+
+    Returns a list of dict rows (psycopg's ``dict_row`` factory) so
+    callers can access columns by name. The sqlite-era predecessor
+    returned ``list[sqlite3.Row]`` — semantically identical for the
+    mapping-access call sites the legacy ``list_pending`` had.
     """
+    from psycopg.rows import dict_row
+
     _ensure_staging_table(conn)
-    conn.row_factory = sqlite3.Row
-    if milestone_key is None:
-        rows = conn.execute(
-            "SELECT * FROM notification_staging "
-            "WHERE project = ? AND milestone_key IS NULL "
-            "AND flushed_at IS NULL AND priority = 'digest' "
-            "ORDER BY created_at, id",
-            (project,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM notification_staging "
-            "WHERE project = ? AND milestone_key = ? "
-            "AND flushed_at IS NULL AND priority = 'digest' "
-            "ORDER BY created_at, id",
-            (project, milestone_key),
-        ).fetchall()
+    with conn.cursor(row_factory=dict_row) as cur:
+        if milestone_key is None:
+            cur.execute(
+                "SELECT * FROM notification_staging "
+                "WHERE project = %s AND milestone_key IS NULL "
+                "AND flushed_at IS NULL AND priority = 'digest' "
+                "ORDER BY created_at, id",
+                (project,),
+            )
+        else:
+            cur.execute(
+                "SELECT * FROM notification_staging "
+                "WHERE project = %s AND milestone_key = %s "
+                "AND flushed_at IS NULL AND priority = 'digest' "
+                "ORDER BY created_at, id",
+                (project, milestone_key),
+            )
+        rows = cur.fetchall()
     return list(rows)
 
 
@@ -359,7 +392,7 @@ def flush_milestone_digest(
     svc.mark_rollup_candidates_flushed(
         merged,
         rollup_task_id=task.task_id,
-        flushed_at=_now_iso(),
+        flushed_at=_now().isoformat(),
     )
     return task.task_id
 
@@ -487,7 +520,7 @@ def detect_milestone_completion(
         return None
 
     # Late import to avoid a circular import at module load; the status
-    # enum lives alongside SQLiteWorkService.
+    # enum lives alongside the work service implementations.
     from pollypm.work.models import WorkStatus
 
     for milestone_key, spec in specs:
@@ -599,7 +632,7 @@ def check_regression_on_reopen(
 
 
 # ---------------------------------------------------------------------------
-# Transition hook — called from sqlite_service after a task moves to done.
+# Transition hook — called from the work service after a task moves to done.
 # ---------------------------------------------------------------------------
 
 
@@ -661,7 +694,7 @@ def check_and_flush_on_done(
 
 
 def prune_old_staging(
-    conn: sqlite3.Connection,
+    conn: "psycopg.Connection",
     *,
     retain_days: int = 30,
 ) -> dict[str, int]:
@@ -671,21 +704,22 @@ def prune_old_staging(
     that simply hasn't closed yet. Returns a summary for logging.
     """
     _ensure_staging_table(conn)
-    cutoff = (datetime.now(UTC) - timedelta(days=retain_days)).isoformat()
+    cutoff = _now() - timedelta(days=retain_days)
 
-    cur = conn.execute(
-        "DELETE FROM notification_staging "
-        "WHERE flushed_at IS NOT NULL AND flushed_at <= ?",
-        (cutoff,),
-    )
-    flushed_deleted = cur.rowcount or 0
+    with conn.cursor() as cur:
+        cur.execute(
+            "DELETE FROM notification_staging "
+            "WHERE flushed_at IS NOT NULL AND flushed_at <= %s",
+            (cutoff,),
+        )
+        flushed_deleted = cur.rowcount or 0
 
-    cur = conn.execute(
-        "DELETE FROM notification_staging "
-        "WHERE priority = 'silent' AND created_at <= ?",
-        (cutoff,),
-    )
-    silent_deleted = cur.rowcount or 0
+        cur.execute(
+            "DELETE FROM notification_staging "
+            "WHERE priority = 'silent' AND created_at <= %s",
+            (cutoff,),
+        )
+        silent_deleted = cur.rowcount or 0
 
     conn.commit()
     return {

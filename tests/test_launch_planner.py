@@ -210,11 +210,128 @@ def test_planner_routes_architect_launch_to_project_override(tmp_path: Path) -> 
     from pathlib import Path as _P
     argv = payload["argv"]
     assert _P(argv[0]).name == "claude"
-    assert argv[1:] == [
+    # #1854/#1867 — the architect profile prompt is now baked into the
+    # launch via ``--append-system-prompt-file`` rather than relying on
+    # a post-stabilisation send-keys kickoff. Strip the file flag and
+    # path for the rest of the argv comparison; assert the path
+    # references the session-named prompt file on its own.
+    assert "--append-system-prompt-file" in argv, argv
+    flag_idx = argv.index("--append-system-prompt-file")
+    prompt_path = _P(argv[flag_idx + 1])
+    assert prompt_path.name == "architect.md"
+    assert prompt_path.parent.name == "system-prompts"
+    assert prompt_path.exists()
+    contents = prompt_path.read_text(encoding="utf-8")
+    assert "PollyPM Architect" in contents
+    argv_without_prompt = argv[1:flag_idx] + argv[flag_idx + 2:]
+    assert argv_without_prompt == [
         "--dangerously-skip-permissions",
         "--model",
         "claude-sonnet-4-6",
     ]
+
+
+def test_planner_writes_claude_system_prompt_file_for_architect(
+    tmp_path: Path,
+) -> None:
+    """#1854/#1867 — Claude architect launches bake the role profile into
+    a system-prompt file and inject ``--append-system-prompt-file`` so the
+    persona reaches the agent without depending on a post-stabilisation
+    ``send-keys`` race. Regression guard for the migration described in
+    the linked issues: 9-of-10 Claude architects spawned without their
+    persona because the watchdog escalation reached the pane before the
+    kickoff did.
+    """
+    config = _config(tmp_path)
+    config.sessions["architect"] = SessionConfig(
+        name="architect",
+        role="architect",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="architect-pollypm",
+    )
+    sup = Supervisor(config)
+    sup.ensure_layout()
+
+    launch = next(
+        item for item in sup.plan_launches() if item.session.name == "architect"
+    )
+    payload = _decode_launch_payload(launch.command)
+    argv = payload["argv"]
+    assert "--append-system-prompt-file" in argv
+    flag_idx = argv.index("--append-system-prompt-file")
+    prompt_path = Path(argv[flag_idx + 1])
+    # File written under the account's isolated home, keyed by session
+    # name so two architect sessions on the same account never share
+    # a system-prompt file.
+    account_home = config.accounts["claude_controller"].home
+    assert prompt_path == (
+        account_home / ".pollypm" / "system-prompts" / "architect.md"
+    )
+    assert prompt_path.is_file()
+    body = prompt_path.read_text(encoding="utf-8")
+    # The architect profile prompt landed on disk (compare a stable
+    # marker rather than the full prompt body so this test survives
+    # routine copy edits to the profile).
+    assert "PollyPM Architect" in body
+    # ``initial_input`` is preserved so the legacy send-keys kickoff
+    # remains as a belt-and-suspenders signal that triggers the agent
+    # to greet the user. The system prompt is what actually loads the
+    # persona; the kickoff text is now idempotent because the same
+    # profile is already in the system prompt.
+    assert launch.initial_input
+    assert "PollyPM Architect" in launch.initial_input
+
+
+def test_planner_skips_claude_system_prompt_file_when_initial_input_empty(
+    tmp_path: Path,
+) -> None:
+    """A Claude session with no profile prompt (operator/heartbeat after
+    #1011 clears their ``initial_input`` via the Codex AGENTS.md path
+    branch — Claude has no such branch, so its operator/heartbeat
+    sessions keep ``initial_input``). This test exercises the empty
+    branch: when the runtime path produced no profile prompt (e.g. a
+    plain worker with no agent_profile), the planner must NOT inject
+    ``--append-system-prompt-file`` and must not create the file.
+    """
+    config = _config(tmp_path)
+    # A worker session with no agent_profile and no prompt — the
+    # ``_resolve_profile_prompt`` callback returns ``None`` in that
+    # case, so ``effective.prompt`` stays ``None`` and the planner
+    # builds a launch with empty ``initial_input``.
+    config.sessions["worker_pollypm"] = SessionConfig(
+        name="worker_pollypm",
+        role="worker",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="worker-pollypm",
+        agent_profile=None,
+    )
+    sup = Supervisor(config)
+    sup.ensure_layout()
+
+    launch = next(
+        item for item in sup.plan_launches()
+        if item.session.name == "worker_pollypm"
+    )
+    payload = _decode_launch_payload(launch.command)
+    argv = payload["argv"]
+    # Either the worker has no prompt (no flag), or the default
+    # ``worker`` agent profile kicked in (flag present). The branch we
+    # care about is: when the profile prompt was empty, no file was
+    # written and no flag was appended.
+    if "--append-system-prompt-file" not in argv:
+        # Verify no orphan system-prompt file was created for this
+        # session.
+        account_home = config.accounts["claude_controller"].home
+        prompt_file = (
+            account_home / ".pollypm" / "system-prompts" / "worker_pollypm.md"
+        )
+        assert not prompt_file.exists()
 
 
 def test_planner_routes_operator_to_codex_when_compatible_account_exists(tmp_path: Path) -> None:

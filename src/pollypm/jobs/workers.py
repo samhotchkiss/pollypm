@@ -14,8 +14,23 @@ Metrics per handler:
   * ``jobs_failed`` — total jobs that raised or timed out
   * ``avg_duration_ms`` — exponential-moving average of runtime
 
-The registry dependency is pluggable (see issue #163); for tests a plain
-dict ``{handler_name: HandlerSpec}`` is fine.
+Postgres translation notes (#1737 Slice K-jobs)
+-----------------------------------------------
+Two predicates moved from sqlite-shaped recovery hooks to their
+psycopg equivalents:
+
+* :func:`_is_closed_db_error` now recognises ``psycopg_pool.PoolClosed``
+  and ``psycopg.InterfaceError: connection is closed``. The behaviour
+  is unchanged — a closed pool / connection trips the stop event so
+  sibling workers exit cleanly instead of tight-looping a traceback
+  (the #1006 failure mode).
+* :func:`_is_database_locked_error` now recognises the pg analogues
+  of "transient writer contention": ``LockNotAvailable`` and
+  ``SerializationFailure``. In practice the queue's ``SELECT ... FOR
+  UPDATE SKIP LOCKED`` claim path eliminates the locked-row stall that
+  motivated the original sqlite retry loop, but handlers themselves
+  may still hit serialisation failures against shared tables, so the
+  retry-on-lock loop is preserved.
 """
 
 from __future__ import annotations
@@ -27,11 +42,6 @@ import time
 import traceback
 from dataclasses import dataclass, field
 from typing import Any, Callable, Protocol
-
-from pollypm.storage.sqlite_pragmas import (
-    is_closed_database_error,
-    is_database_locked_error,
-)
 
 
 __all__ = [
@@ -45,41 +55,63 @@ __all__ = [
 
 
 def _is_closed_db_error(exc: BaseException) -> bool:
-    """True iff ``exc`` looks like SQLite's closed-connection error.
+    """True iff ``exc`` looks like a pg pool / connection closed error.
 
-    The cockpit hits this whenever some other code path closes the
-    JobQueue's connection underneath a live worker — the canonical
-    cause is ``pm migrate --apply`` archiving a per-project DB the
-    cockpit was still pointing at (#1006). Treating the symptom as a
-    clean-shutdown signal stops the worker pool tight-looping on
-    full-traceback log spam, which is what was actually killing
-    rail_daemon in the production trace.
+    The pg analogue of sqlite's ``ProgrammingError: Cannot operate on
+    a closed database``. Production hits this when
+    :func:`pollypm.storage.pg_pool.pg_pool_shutdown` runs (test
+    teardown, ``pm reset``) while a worker is still calling
+    ``queue.claim``. Treating the symptom as a clean-shutdown signal
+    keeps the pool from tight-looping a full traceback into
+    ``errors.log`` — the original #1006 failure mode.
     """
-    return is_closed_database_error(exc)
+    from pollypm.jobs.queue import _is_pool_closed_error
+
+    return _is_pool_closed_error(exc)
 
 
 def _is_database_locked_error(exc: BaseException) -> bool:
-    """True iff ``exc`` is SQLite's transient ``database is locked``.
+    """True iff ``exc`` is a transient pg lock / serialisation failure.
+
+    The pg analogue of sqlite's ``database is locked``. Two pg
+    conditions qualify:
+
+    * ``LockNotAvailable`` (SQLSTATE 55P03) — raised when a query that
+      requires a row/table lock cannot acquire it within the configured
+      ``lock_timeout`` window.
+    * ``SerializationFailure`` (SQLSTATE 40001) — raised when a
+      ``SERIALIZABLE`` or ``REPEATABLE READ`` transaction detects a
+      conflict at commit. PollyPM's default isolation is ``READ
+      COMMITTED`` so this is rare in practice, but handlers that bump
+      isolation can still emit it.
 
     Different from :func:`_is_closed_db_error` (#1006) — that one is a
-    permanent ``ProgrammingError: Cannot operate on a closed database``
-    and there is nothing to retry. ``database is locked`` is
-    ``OperationalError`` and means the DB was busy past the
-    ``busy_timeout`` window: the operation has not been performed but
-    the connection is still alive and the next attempt will likely
+    permanent state and there is nothing to retry. The lock /
+    serialisation case is transient: the next attempt will likely
     succeed once the contending writer commits.
-
-    Symptom is alert ``#67108 critical error_log/critical_error:
-    JobWorkerPool: unexpected error running job ... (session.health_sweep):
-    database is locked``. We retry the handler invocation a small
-    number of times before falling through to the regular ``fail()``
-    path — far less disruptive than escalating every transient lock
-    to a critical alert.
     """
-    return is_database_locked_error(exc)
+    try:
+        from psycopg import errors as pg_errors
+
+        if isinstance(
+            exc,
+            (pg_errors.LockNotAvailable, pg_errors.SerializationFailure),
+        ):
+            return True
+    except ImportError:  # pragma: no cover - psycopg is a hard runtime dep
+        pass
+    # Fall back to substring matching for wrapped exceptions
+    # (sqlalchemy.exc.OperationalError, etc.) — same shape as the
+    # sqlite predicate so legacy callers see consistent behaviour.
+    msg = str(exc).lower()
+    if "could not obtain lock" in msg or "lock timeout" in msg:
+        return True
+    if "could not serialize access" in msg:
+        return True
+    return False
 
 
-# #1018 — exponential backoff for the database-locked retry. Three
+# Exponential backoff for the lock / serialisation retry. Three
 # attempts at 0.1 s / 0.5 s / 2.0 s (total ~2.6 s ceiling) gives the
 # competing writer time to commit, while keeping the worker thread
 # from stalling past the next @every 10 s sweep window.
@@ -185,7 +217,7 @@ class JobWorkerPool:
     ) -> None:
         # ``poll_interval`` is the short-poll cadence when the queue is
         # empty. The default of 0.2 s (5 polls/worker/s × 4 workers ≈ 20
-        # SQLite queries/s) pinned the rail daemon at 160% CPU on an
+        # SQL queries/s) pinned the rail daemon at 160% CPU on an
         # otherwise-idle system on 2026-04-20. Bumping to 1.0 s brings
         # idle CPU down ~5× with worst-case pickup latency ~1 s — well
         # inside the @every 10 s cadence of the fastest recurring
@@ -316,11 +348,12 @@ class JobWorkerPool:
                         self._handle_closed_db(worker_id, "claim")
                         break
                     if _is_database_locked_error(exc):
-                        # #1018 — transient WAL contention on claim; back
-                        # off briefly and retry on the next poll. Don't log
-                        # a full traceback (would spam ``errors.log`` and,
-                        # via the heartbeat alert pipeline, raise a
-                        # ``critical_error`` for a recoverable condition).
+                        # Transient lock / serialisation failure on
+                        # claim. Back off briefly and retry on the next
+                        # poll. Don't log a full traceback (would spam
+                        # ``errors.log`` and, via the heartbeat alert
+                        # pipeline, raise a ``critical_error`` for a
+                        # recoverable condition).
                         logger.debug(
                             "JobWorkerPool: claim hit transient lock for %s; "
                             "backing off",
@@ -344,11 +377,6 @@ class JobWorkerPool:
                     if self._stop_event.is_set():
                         break
         finally:
-            # ``cancel_futures=True`` drops anything still queued behind
-            # an in-flight handler; ``wait=False`` lets a wedged handler
-            # die at process exit instead of pinning the worker thread
-            # in ``executor.__exit__``. Both are deliberate — the
-            # alternative is exactly the leak this PR is fixing.
             try:
                 executor.shutdown(wait=False, cancel_futures=True)
             except Exception:  # noqa: BLE001 — never block worker exit
@@ -361,27 +389,24 @@ class JobWorkerPool:
         logger.debug("JobWorkerPool: worker %s stopping", worker_id)
 
     def _handle_closed_db(self, worker_id: str, operation: str) -> None:
-        """Log once and trip the stop event when the DB connection is gone.
+        """Log once and trip the stop event when the pool is gone.
 
-        Called when claim/complete/fail raises ``sqlite3.ProgrammingError:
-        Cannot operate on a closed database``. Workers that hit this can
-        never make progress against the dead connection — re-raising on
+        Called when claim/complete/fail raises ``PoolClosed`` or
+        ``InterfaceError: connection is closed``. Workers that hit this
+        can never make progress against the dead pool — re-raising on
         every poll burns CPU and floods ``errors.log`` with full
         tracebacks (see #1006). Setting ``_stop_event`` lets sibling
         workers exit on their next short-poll without waiting for the
         join timeout to lapse.
         """
-        # Best-effort: only the first worker to notice gets the warning,
-        # so we don't print N copies of the same line. Any worker setting
-        # the event is sufficient — Event.set() is idempotent.
         already_signalled = self._stop_event.is_set()
         self._stop_event.set()
         if not already_signalled:
             logger.warning(
-                "JobWorkerPool: %s by %s hit closed-DB; stopping pool. "
-                "Likely cause: another process (e.g. `pm migrate --apply`) "
-                "closed the queue connection underneath us. Restart the "
-                "cockpit to recover.",
+                "JobWorkerPool: %s by %s hit closed pool/connection; "
+                "stopping pool. Likely cause: another process closed the "
+                "pg pool underneath us (test teardown, ``pm reset``). "
+                "Restart the cockpit to recover.",
                 operation, worker_id,
             )
 
@@ -413,24 +438,19 @@ class JobWorkerPool:
 
         start = time.monotonic()
         try:
-            # #1018 — retry-on-lock loop. SQLite ``database is locked``
-            # is a transient WAL contention, not a programming bug, so
-            # we re-invoke the handler with exponential backoff before
-            # falling through to the regular ``fail()`` path. Without
-            # this, every transient lock during ``session.health_sweep``
-            # bubbled up as a ``critical_error`` alert (#67108).
+            # Retry-on-lock loop. Transient pg lock / serialisation
+            # failures are not programming bugs, so we re-invoke the
+            # handler with exponential backoff before falling through
+            # to the regular ``fail()`` path. Without this, every
+            # transient contention during a sweep would bubble up as a
+            # ``critical_error`` alert (#67108).
             #
             # #1370 — invocations route through a single-slot
             # ``ThreadPoolExecutor`` owned by the worker thread, not a
             # fresh ``threading.Thread`` per attempt. ``future.result()``
             # gives the same per-attempt timeout semantics as
             # ``Thread.join(timeout=)`` without spawning a new OS thread
-            # each retry. On timeout we abandon the future (the
-            # underlying handler keeps running in the executor's worker
-            # thread) and bail out of the retry loop — re-submitting
-            # while the previous attempt is still alive would either
-            # block on the executor's single slot or, pre-fix, double
-            # up handler threads against the same job.
+            # each retry.
             attempts = 1 + len(_DB_LOCK_RETRY_BACKOFF)
             timed_out = False
             last_err: BaseException | None = None
@@ -440,21 +460,12 @@ class JobWorkerPool:
                     future = executor.submit(spec.handler, payload_copy)
                 except RuntimeError:
                     # Executor was shut down underneath us (pool stopping).
-                    # Treat as a stop signal and exit without bookkeeping —
-                    # ``stop()`` already accounts for in-flight work.
                     return
 
                 try:
                     future.result(timeout=spec.timeout_seconds)
                     last_err = None
                 except concurrent.futures.TimeoutError:
-                    # Handler is still running on the executor's worker
-                    # thread. Abandon the future — the executor will
-                    # not accept a new submit() until this one finishes
-                    # (single-slot), and re-trying while it's stuck
-                    # would just block here on the next submit(). Mark
-                    # timed_out and break so the regular timeout-fail
-                    # path runs.
                     future.cancel()  # no-op once running, but cheap.
                     timed_out = True
                     break
@@ -464,24 +475,19 @@ class JobWorkerPool:
                 if last_err is None or not _is_database_locked_error(last_err):
                     break
 
-                # Lock-retry path. Last attempt falls through with the
-                # error preserved so the regular fail() route runs.
                 if attempt_index >= len(_DB_LOCK_RETRY_BACKOFF):
                     break
                 backoff_seconds = _DB_LOCK_RETRY_BACKOFF[attempt_index]
                 logger.debug(
-                    "JobWorkerPool: job %s (%s) hit database-locked "
+                    "JobWorkerPool: job %s (%s) hit transient lock "
                     "(attempt %d/%d); retrying after %.2fs",
                     job.id, job.handler_name,
                     attempt_index + 1, attempts, backoff_seconds,
                 )
-                # ``Event.wait`` returns True if stop_event was set —
-                # honour shutdown by breaking out before the next try.
                 if self._stop_event.wait(backoff_seconds):
                     break
 
             if timed_out:
-                # Timeout — mark failed (with retry) and move on.
                 elapsed_ms = (time.monotonic() - start) * 1000
                 self.queue.fail(
                     job.id,
@@ -498,14 +504,10 @@ class JobWorkerPool:
                 err = last_err
                 tb = "".join(traceback.format_exception(type(err), err, err.__traceback__))
                 elapsed_ms = (time.monotonic() - start) * 1000
-                # #1018 — log lock-exhaustion at WARNING (not ERROR /
-                # critical_error). The job is queued for a normal retry;
-                # the operator sees one warn line per exhaustion, not a
-                # full traceback escalated to a critical alert.
                 if _is_database_locked_error(err):
                     logger.warning(
                         "JobWorkerPool: job %s (%s) gave up after "
-                        "%d database-locked retries — queue.fail with "
+                        "%d lock/serialisation retries — queue.fail with "
                         "retry=True for the regular backoff path",
                         job.id, job.handler_name, attempts,
                     )
@@ -524,22 +526,13 @@ class JobWorkerPool:
                 )
 
         except Exception as exc:  # noqa: BLE001
-            # Defensive — bookkeeping or queue interaction failed.
             if _is_closed_db_error(exc):
-                # Don't log a full traceback — closed-DB errors are
-                # operational, not programming bugs, and four workers
-                # spamming tracebacks each poll is what zombied
-                # rail_daemon in #1006.
                 self._handle_closed_db("worker", "complete/fail")
                 return
             if _is_database_locked_error(exc):
-                # #1018 — queue.complete()/fail() lost the WAL race.
-                # Log at warning (not exception) so the heartbeat
-                # alert pipeline does not escalate the transient
-                # contention to a ``critical_error`` alert.
                 logger.warning(
                     "JobWorkerPool: queue bookkeeping for job %s (%s) "
-                    "hit transient database-locked: %s",
+                    "hit transient lock/serialisation: %s",
                     job.id, job.handler_name, exc,
                 )
                 elapsed_ms = (time.monotonic() - start) * 1000

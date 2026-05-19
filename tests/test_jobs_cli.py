@@ -1,13 +1,12 @@
-"""Unit tests for the ``pm jobs`` CLI.
+"""Unit tests for the ``pm jobs`` CLI (#1737 Slice K-jobs).
 
-All tests wire a fresh ``JobQueue`` on a tmp_path DB via
+All tests wire a fresh ``JobQueue`` against the per-test pg schema via
 ``set_queue_factory`` so the commands do not touch the user's config.
 """
 
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -21,14 +20,15 @@ runner = CliRunner()
 
 
 @pytest.fixture
-def queue(tmp_path: Path):
-    """A fresh queue on a tmp DB, wired into the CLI via the factory hook."""
-    db_path = tmp_path / "jobs.db"
+def queue(pg_schema_pool):
+    """A fresh queue on the per-test schema, wired into the CLI."""
+    from pollypm.storage.pg_migrations import apply_migrations
 
-    # Tight retry policy so queued jobs show up as queued without delay.
+    apply_migrations(pg_schema_pool)
+
     def factory(_config_path: Path) -> JobQueue:
         return JobQueue(
-            db_path=db_path,
+            pool=pg_schema_pool,
             retry_policy=exponential_backoff(
                 base_seconds=0.01, factor=1.0, max_seconds=0.01, jitter=0
             ),
@@ -36,8 +36,7 @@ def queue(tmp_path: Path):
 
     set_queue_factory(factory)
     try:
-        # One long-lived handle for test assertions.
-        q = JobQueue(db_path=db_path)
+        q = JobQueue(pool=pg_schema_pool)
         yield q
         q.close()
     finally:
@@ -196,7 +195,6 @@ def test_purge_failed_deletes_only_failed(queue: JobQueue) -> None:
     (bad_job,) = queue.claim("w1")
     queue.fail(bad_job.id, "x", retry=False)
 
-    # Confirm both terminal.
     assert queue.get(ok_id).status is JobStatus.DONE  # type: ignore[union-attr]
     assert queue.get(bad_id).status is JobStatus.FAILED  # type: ignore[union-attr]
 

@@ -189,6 +189,23 @@ class HeartbeatRail:
 
         state_db = Path(state_db)
         state_db.parent.mkdir(parents=True, exist_ok=True)
+        # #1737 Slice K-jobs: the queue is pg-backed now. Apply
+        # migrations on boot so the ``work_jobs`` table is present —
+        # mirrors :meth:`PgWorkService.__init__`'s schema-on-open
+        # contract. ``state_db`` is retained in the signature for
+        # source-compat with the legacy caller (``from_config``);
+        # the queue itself reads its DSN from the process-wide pool.
+        try:
+            from pollypm.storage.pg_migrations import apply_migrations
+            from pollypm.storage.pg_pool import get_rw_pool
+
+            apply_migrations(get_rw_pool())
+        except Exception:  # noqa: BLE001 — schema is a best-effort here
+            logger.exception(
+                "HeartbeatRail.from_plugin_host: pg migration applier "
+                "raised; continuing — the queue will surface "
+                "UndefinedTable on first use if schema is genuinely missing",
+            )
         queue = JobQueue(db_path=state_db)
         pool = JobWorkerPool(
             queue, registry=registry, poll_interval=worker_settings.poll_interval,

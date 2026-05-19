@@ -179,27 +179,31 @@ def _prune_stale_cadence_jobs(state_db: Any) -> int:
     enqueued thousands of identical rows. After the fix, the freshest
     dedupe-keyed enqueue will no-op when one is already queued, so
     deleting old un-keyed rows simply lets the most-recent run win.
+
+    Ported to pg (#1737 Slice K-jobs): runs against the process-wide
+    pg pool. The ``state_db`` argument is retained for source-compat
+    with the legacy caller (``alerts_gc_handler``) but ignored — the
+    pool's DSN is resolved from config / env.
     """
     from datetime import UTC, datetime, timedelta
 
-    from pollypm.jobs import JobQueue
+    from pollypm.storage.pg_pool import get_rw_pool
 
     cutoff = datetime.now(UTC) - timedelta(seconds=_STALE_QUEUED_CUTOFF_SECONDS)
-    cutoff_iso = cutoff.isoformat()
-    placeholders = ",".join("?" for _ in _DEDUPED_CADENCE_HANDLERS)
-    params = (*sorted(_DEDUPED_CADENCE_HANDLERS), cutoff_iso)
+    handler_names = tuple(sorted(_DEDUPED_CADENCE_HANDLERS))
     try:
-        with JobQueue(db_path=state_db) as q:
-            cursor = q._conn.execute(  # noqa: SLF001 — internal maintenance path
-                f"""
+        pool = get_rw_pool()
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
                 DELETE FROM work_jobs
                 WHERE status = 'queued'
-                  AND handler_name IN ({placeholders})
-                  AND enqueued_at < ?
+                  AND handler_name = ANY(%s)
+                  AND enqueued_at < %s
                 """,
-                params,
+                (list(handler_names), cutoff),
             )
-            return int(cursor.rowcount or 0)
+            return int(cur.rowcount or 0)
     except Exception:  # noqa: BLE001
         logger.debug(
             "alerts.gc: stale-cadence prune failed", exc_info=True,

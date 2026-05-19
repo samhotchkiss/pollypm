@@ -449,101 +449,102 @@ class TestStaleCadencePurge:
     """The alerts.gc handler drains the legacy un-keyed backlog (#1052)."""
 
     def test_purge_drops_stale_queued_rows_for_deduped_handlers(
-        self, tmp_path: Path,
+        self, pg_schema_pool,
     ) -> None:
-        from pollypm.jobs import JobQueue
         from pollypm.plugins_builtin.core_recurring.plugin import (
             _DEDUPED_CADENCE_HANDLERS,
             _STALE_QUEUED_CUTOFF_SECONDS,
             _prune_stale_cadence_jobs,
         )
+        from pollypm.storage.pg_migrations import apply_migrations
 
-        db_path = tmp_path / "state.db"
+        apply_migrations(pg_schema_pool)
         # Seed: stale queued rows for every deduped handler, plus a fresh
         # row that must survive, plus a stale-but-not-queued row that
         # must survive (terminal-state rows are untouched).
-        old_iso = (
-            datetime.now(UTC)
-            - timedelta(seconds=_STALE_QUEUED_CUTOFF_SECONDS + 600)
-        ).isoformat()
-        fresh_iso = datetime.now(UTC).isoformat()
+        old_ts = datetime.now(UTC) - timedelta(
+            seconds=_STALE_QUEUED_CUTOFF_SECONDS + 600,
+        )
+        fresh_ts = datetime.now(UTC)
 
-        with JobQueue(db_path=db_path) as q:
-            cur = q._conn  # noqa: SLF001 — direct seed for the maintenance test
-            for handler in _DEDUPED_CADENCE_HANDLERS:
+        with pg_schema_pool.connection() as conn:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                for handler in _DEDUPED_CADENCE_HANDLERS:
+                    cur.execute(
+                        """
+                        INSERT INTO work_jobs (
+                            handler_name, payload_json, status,
+                            enqueued_at, run_after
+                        ) VALUES (%s, '{}'::jsonb, 'queued', %s, %s)
+                        """,
+                        (handler, old_ts, old_ts),
+                    )
+                # Fresh queued row for one of the handlers — must survive.
                 cur.execute(
                     """
                     INSERT INTO work_jobs (
                         handler_name, payload_json, status,
                         enqueued_at, run_after
-                    ) VALUES (?, '{}', 'queued', ?, ?)
+                    ) VALUES ('session.health_sweep', '{}'::jsonb,
+                              'queued', %s, %s)
                     """,
-                    (handler, old_iso, old_iso),
+                    (fresh_ts, fresh_ts),
                 )
-            # Fresh queued row for one of the handlers — must survive.
-            cur.execute(
-                """
-                INSERT INTO work_jobs (
-                    handler_name, payload_json, status,
-                    enqueued_at, run_after
-                ) VALUES ('session.health_sweep', '{}', 'queued', ?, ?)
-                """,
-                (fresh_iso, fresh_iso),
-            )
-            # Stale claimed row — must survive (only queued rows are
-            # purged so we don't yank work in flight).
-            cur.execute(
-                """
-                INSERT INTO work_jobs (
-                    handler_name, payload_json, status,
-                    enqueued_at, run_after, claimed_at, claimed_by
-                ) VALUES (
-                    'session.health_sweep', '{}', 'claimed',
-                    ?, ?, ?, 'worker-1'
+                # Stale claimed row — must survive (only queued rows
+                # are purged so we don't yank work in flight).
+                cur.execute(
+                    """
+                    INSERT INTO work_jobs (
+                        handler_name, payload_json, status,
+                        enqueued_at, run_after, claimed_at, claimed_by
+                    ) VALUES (
+                        'session.health_sweep', '{}'::jsonb, 'claimed',
+                        %s, %s, %s, 'worker-1'
+                    )
+                    """,
+                    (old_ts, old_ts, old_ts),
                 )
-                """,
-                (old_iso, old_iso, old_iso),
-            )
-            # Stale queued row for an *unknown* handler — must survive
-            # (we only sweep handlers we authored a dedupe_key for).
-            cur.execute(
-                """
-                INSERT INTO work_jobs (
-                    handler_name, payload_json, status,
-                    enqueued_at, run_after
-                ) VALUES ('user.custom_handler', '{}', 'queued', ?, ?)
-                """,
-                (old_iso, old_iso),
-            )
+                # Stale queued row for an *unknown* handler — must
+                # survive (we only sweep handlers we authored a
+                # dedupe_key for).
+                cur.execute(
+                    """
+                    INSERT INTO work_jobs (
+                        handler_name, payload_json, status,
+                        enqueued_at, run_after
+                    ) VALUES ('user.custom_handler', '{}'::jsonb,
+                              'queued', %s, %s)
+                    """,
+                    (old_ts, old_ts),
+                )
 
-        deleted = _prune_stale_cadence_jobs(db_path)
+        # ``state_db`` is the legacy argument shape — the pg
+        # implementation ignores it and routes through ``get_rw_pool``.
+        deleted = _prune_stale_cadence_jobs(state_db=None)
         assert deleted == len(_DEDUPED_CADENCE_HANDLERS)
 
         # Survivors: 1 fresh + 1 claimed + 1 unknown handler row = 3.
-        with JobQueue(db_path=db_path) as q:
-            survivors = q._conn.execute(  # noqa: SLF001
+        with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
                 "SELECT handler_name, status FROM work_jobs "
                 "ORDER BY id ASC",
-            ).fetchall()
+            )
+            survivors = cur.fetchall()
         assert len(survivors) == 3
         kinds = {(row[0], row[1]) for row in survivors}
         assert ("session.health_sweep", "queued") in kinds
         assert ("session.health_sweep", "claimed") in kinds
         assert ("user.custom_handler", "queued") in kinds
 
-    def test_purge_is_noop_on_empty_db(self, tmp_path: Path) -> None:
+    def test_purge_is_noop_on_empty_db(self, pg_schema_pool) -> None:
         from pollypm.plugins_builtin.core_recurring.plugin import (
             _prune_stale_cadence_jobs,
         )
+        from pollypm.storage.pg_migrations import apply_migrations
 
-        db_path = tmp_path / "state.db"
-        # Force schema creation by opening + closing the queue once.
-        from pollypm.jobs import JobQueue
-
-        with JobQueue(db_path=db_path):
-            pass
-
-        assert _prune_stale_cadence_jobs(db_path) == 0
+        apply_migrations(pg_schema_pool)
+        assert _prune_stale_cadence_jobs(state_db=None) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -20,13 +20,10 @@ import shutil
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any
 
 from pollypm.models import AccountConfig, ProjectSettings, ProviderKind, SessionConfig
 from pollypm.onboarding import _prime_claude_home
-
-if TYPE_CHECKING:
-    from pollypm.storage.state import StateStore
 
 @dataclass(slots=True)
 class ControlHomeManager:
@@ -39,7 +36,7 @@ class ControlHomeManager:
 
     def refresh_account_runtime_metadata(
         self,
-        store: "StateStore",
+        store: Any,
         account_name: str,
         account: AccountConfig,
     ) -> None:

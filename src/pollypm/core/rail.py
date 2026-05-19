@@ -15,13 +15,12 @@ from __future__ import annotations
 import importlib
 import logging
 import time
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
 
 if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
     from pollypm.heartbeat.boot import HeartbeatRail
     from pollypm.plugin_host import ExtensionHost
-    from pollypm.storage.state import StateStore
 logger = logging.getLogger(__name__)
 
 
@@ -86,7 +85,7 @@ class CoreRail:
     def __init__(
         self,
         config: "PollyPMConfig",
-        state_store: "StateStore",
+        state_store: Any,
         plugin_host: "ExtensionHost",
     ) -> None:
         self._config = config
@@ -104,7 +103,7 @@ class CoreRail:
     def get_config(self) -> "PollyPMConfig":
         return self._config
 
-    def get_state_store(self) -> "StateStore":
+    def get_state_store(self) -> Any:
         return self._state_store
 
     def get_plugin_host(self) -> "ExtensionHost":

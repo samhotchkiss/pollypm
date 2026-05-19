@@ -35,12 +35,11 @@ from __future__ import annotations
 import logging
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from pollypm.acct.protocol import ProviderAdapter
     from pollypm.acct.model import AccountConfig
-    from pollypm.storage.state import StateStore
 logger = logging.getLogger(__name__)
 
 DEFAULT_IDLE_THRESHOLD = timedelta(hours=2)
@@ -57,7 +56,7 @@ def _is_architect_role(role: str) -> bool:
 
 
 def architect_idle_for(
-    store: "StateStore",
+    store: Any,
     session_name: str,
     *,
     now: datetime | None = None,
@@ -99,7 +98,7 @@ def architect_idle_for(
 
 
 def should_close_architect(
-    store: "StateStore",
+    store: Any,
     session_name: str,
     role: str,
     *,
@@ -121,7 +120,7 @@ def should_close_architect(
 
 def close_idle_architect(
     *,
-    store: "StateStore",
+    store: Any,
     provider: "ProviderAdapter",
     account: "AccountConfig",
     project_key: str,
@@ -172,7 +171,7 @@ def close_idle_architect(
 
 def resolve_launch_argv(
     *,
-    store: "StateStore",
+    store: Any,
     provider: "ProviderAdapter",
     account: "AccountConfig",
     project_key: str,
@@ -199,7 +198,7 @@ def resolve_launch_argv(
     return argv, True
 
 
-def clear_resume_token(store: "StateStore", project_key: str) -> None:
+def clear_resume_token(store: Any, project_key: str) -> None:
     """Drop a stored resume token (call after a successful resume)."""
     store.clear_architect_resume_token(project_key)
 

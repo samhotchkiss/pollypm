@@ -869,3 +869,360 @@ def test_pg_notifications_recent_notifications_shape(pg_schema_pool, pg_config):
         project="gamma", limit=10, pool=pg_schema_pool,
     )
     assert [r["task_id"] for r in only_gamma] == ["gamma:5"]
+
+
+# --------------------------------------------------------------------- #
+# pg_architect_resume — resume tokens (Slice K-state-port phase 2b)
+# --------------------------------------------------------------------- #
+
+
+def test_pg_architect_resume_upsert_get_clear_roundtrip(pg_schema_pool, pg_config):
+    """The pg facade must mirror StateStore's upsert / get / clear contract."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_architect_resume import (
+        clear_architect_resume_token,
+        get_architect_resume_token,
+        list_architect_resume_tokens,
+        upsert_architect_resume_token,
+    )
+
+    assert get_architect_resume_token("alpha", pool=pg_schema_pool) is None
+
+    upsert_architect_resume_token(
+        project_key="alpha",
+        provider="claude",
+        session_id="sess-uuid-1",
+        last_active_at="2025-01-01T12:00:00+00:00",
+        pool=pg_schema_pool,
+    )
+    record = get_architect_resume_token("alpha", pool=pg_schema_pool)
+    assert record is not None
+    assert record.project_key == "alpha"
+    assert record.provider == "claude"
+    assert record.session_id == "sess-uuid-1"
+    # captured_at is stamped server-side; just confirm it's a non-empty string.
+    assert isinstance(record.captured_at, str) and record.captured_at
+    # last_active_at round-trips as the iso-8601 datetime we passed in.
+    assert record.last_active_at.startswith("2025-01-01")
+
+    # Re-upsert replaces the row (same project_key — primary key).
+    upsert_architect_resume_token(
+        project_key="alpha",
+        provider="codex",
+        session_id="sess-uuid-2",
+        last_active_at="2025-01-02T12:00:00+00:00",
+        pool=pg_schema_pool,
+    )
+    record2 = get_architect_resume_token("alpha", pool=pg_schema_pool)
+    assert record2 is not None
+    assert record2.provider == "codex"
+    assert record2.session_id == "sess-uuid-2"
+
+    # list returns every row.
+    upsert_architect_resume_token(
+        project_key="beta",
+        provider="claude",
+        session_id="sess-uuid-3",
+        last_active_at="2025-01-03T12:00:00+00:00",
+        pool=pg_schema_pool,
+    )
+    rows = list_architect_resume_tokens(pool=pg_schema_pool)
+    keys = {r.project_key for r in rows}
+    assert keys == {"alpha", "beta"}
+
+    # clear is a no-op on miss, removes on hit.
+    clear_architect_resume_token("alpha", pool=pg_schema_pool)
+    assert get_architect_resume_token("alpha", pool=pg_schema_pool) is None
+    clear_architect_resume_token("missing", pool=pg_schema_pool)  # no raise
+
+
+# --------------------------------------------------------------------- #
+# pg_checkpoints — checkpoint ring (Slice K-state-port phase 2b)
+# --------------------------------------------------------------------- #
+
+
+def test_pg_checkpoints_record_and_latest(pg_schema_pool, pg_config):
+    """Each record_checkpoint inserts a new row; latest_checkpoint returns newest."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_checkpoints import (
+        latest_checkpoint,
+        record_checkpoint,
+    )
+
+    assert latest_checkpoint("worker-alpha", pool=pg_schema_pool) is None
+
+    record_checkpoint(
+        session_name="worker-alpha",
+        project_key="alpha",
+        level="L0",
+        json_path="/tmp/cp1.json",
+        summary_path="/tmp/cp1.md",
+        snapshot_path="/tmp/cp1.snap",
+        summary_text="first checkpoint",
+        pool=pg_schema_pool,
+    )
+    record_checkpoint(
+        session_name="worker-alpha",
+        project_key="alpha",
+        level="L1",
+        json_path="/tmp/cp2.json",
+        summary_path="/tmp/cp2.md",
+        snapshot_path="/tmp/cp2.snap",
+        summary_text="second checkpoint",
+        pool=pg_schema_pool,
+    )
+    # A different session must not bleed into the lookup.
+    record_checkpoint(
+        session_name="worker-beta",
+        project_key="beta",
+        level="L0",
+        json_path="/tmp/other.json",
+        summary_path="/tmp/other.md",
+        snapshot_path="/tmp/other.snap",
+        summary_text="unrelated",
+        pool=pg_schema_pool,
+    )
+
+    latest = latest_checkpoint("worker-alpha", pool=pg_schema_pool)
+    assert latest is not None
+    assert latest.level == "L1"
+    assert latest.summary_text == "second checkpoint"
+    assert latest.session_name == "worker-alpha"
+    assert isinstance(latest.created_at, str) and latest.created_at
+
+
+# --------------------------------------------------------------------- #
+# pg_worktrees — worktree inventory (Slice K-state-port phase 2b)
+# --------------------------------------------------------------------- #
+
+
+def test_pg_worktrees_upsert_status_list(pg_schema_pool, pg_config):
+    """upsert dedupes on (project, lane, status); list returns newest first."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_worktrees import (
+        list_worktrees,
+        update_worktree_status,
+        upsert_worktree,
+    )
+
+    assert list_worktrees(pool=pg_schema_pool) == []
+
+    upsert_worktree(
+        project_key="alpha",
+        lane_kind="main",
+        lane_key="alpha",
+        session_name="sess-1",
+        issue_key=None,
+        path="/tmp/wt-alpha",
+        branch="main",
+        status="active",
+        pool=pg_schema_pool,
+    )
+    # Re-upserting the same (project, lane, status) updates in place.
+    upsert_worktree(
+        project_key="alpha",
+        lane_kind="main",
+        lane_key="alpha",
+        session_name="sess-1b",
+        issue_key="alpha#42",
+        path="/tmp/wt-alpha",
+        branch="main",
+        status="active",
+        pool=pg_schema_pool,
+    )
+    rows = list_worktrees("alpha", pool=pg_schema_pool)
+    assert len(rows) == 1
+    assert rows[0].session_name == "sess-1b"
+    assert rows[0].issue_key == "alpha#42"
+
+    # Promoting active → closed leaves a single row in the closed state.
+    update_worktree_status("alpha", "main", "alpha", "closed", pool=pg_schema_pool)
+    rows = list_worktrees("alpha", pool=pg_schema_pool)
+    assert len(rows) == 1
+    assert rows[0].status == "closed"
+
+    # A fresh active row coexists with the historical closed row.
+    upsert_worktree(
+        project_key="alpha",
+        lane_kind="main",
+        lane_key="alpha",
+        session_name="sess-2",
+        issue_key=None,
+        path="/tmp/wt-alpha-2",
+        branch="main",
+        status="active",
+        pool=pg_schema_pool,
+    )
+    rows = list_worktrees("alpha", pool=pg_schema_pool)
+    assert len(rows) == 2
+    statuses = {r.status for r in rows}
+    assert statuses == {"active", "closed"}
+
+    # Scoped list filters by project.
+    upsert_worktree(
+        project_key="beta",
+        lane_kind="issue",
+        lane_key="beta#1",
+        session_name=None,
+        issue_key="beta#1",
+        path="/tmp/wt-beta",
+        branch="issue/beta-1",
+        status="active",
+        pool=pg_schema_pool,
+    )
+    all_rows = list_worktrees(pool=pg_schema_pool)
+    alpha_rows = list_worktrees("alpha", pool=pg_schema_pool)
+    assert len(all_rows) == 3
+    assert len(alpha_rows) == 2
+
+
+# --------------------------------------------------------------------- #
+# pg_token_usage — token samples + hourly aggregate (Slice K-state-port phase 2b)
+# --------------------------------------------------------------------- #
+
+
+def test_pg_token_usage_record_sample_rolls_hourly(pg_schema_pool, pg_config):
+    """record_token_sample computes delta + rolls forward the hourly bucket."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_token_usage import (
+        get_token_sample,
+        record_token_sample,
+        recent_token_usage,
+    )
+
+    assert get_token_sample("worker-alpha", pool=pg_schema_pool) is None
+
+    # First sample: no previous row, so delta is zero and the hourly
+    # aggregate stays empty.
+    delta1 = record_token_sample(
+        session_name="worker-alpha",
+        account_name="acct-1",
+        provider="claude",
+        model_name="sonnet",
+        project_key="alpha",
+        cumulative_tokens=100,
+        observed_at="2025-01-01T12:30:00+00:00",
+        pool=pg_schema_pool,
+    )
+    assert delta1 == 0
+    assert recent_token_usage(pool=pg_schema_pool) == []
+
+    sample = get_token_sample("worker-alpha", pool=pg_schema_pool)
+    assert sample is not None
+    assert sample.cumulative_tokens == 100
+
+    # Second sample (same tuple, higher cumulative): delta = 150,
+    # lands in the 12:00 hour bucket.
+    delta2 = record_token_sample(
+        session_name="worker-alpha",
+        account_name="acct-1",
+        provider="claude",
+        model_name="sonnet",
+        project_key="alpha",
+        cumulative_tokens=250,
+        observed_at="2025-01-01T12:45:00+00:00",
+        pool=pg_schema_pool,
+    )
+    assert delta2 == 150
+    rows = recent_token_usage(pool=pg_schema_pool)
+    assert len(rows) == 1
+    assert rows[0].tokens_used == 150
+    assert rows[0].hour_bucket.startswith("2025-01-01T12")
+
+    # Third sample (switched accounts): delta resets to zero, no
+    # hourly write.
+    delta3 = record_token_sample(
+        session_name="worker-alpha",
+        account_name="acct-2",
+        provider="claude",
+        model_name="sonnet",
+        project_key="alpha",
+        cumulative_tokens=400,
+        observed_at="2025-01-01T13:15:00+00:00",
+        pool=pg_schema_pool,
+    )
+    assert delta3 == 0
+    rows = recent_token_usage(pool=pg_schema_pool)
+    # Still one row — the acct-1 12:00 bucket; acct-2 never wrote.
+    assert len(rows) == 1
+
+
+def test_pg_token_usage_replace_hourly_and_daily(pg_schema_pool, pg_config):
+    """replace_token_usage_hourly + daily_token_usage parity shape."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_token_usage import (
+        daily_token_usage,
+        recent_token_usage,
+        replace_token_usage_hourly,
+    )
+    from pollypm.storage.records import TokenUsageHourlyRecord
+
+    seed = [
+        TokenUsageHourlyRecord(
+            hour_bucket="2025-01-01T12:00:00+00:00",
+            account_name="acct-1",
+            provider="claude",
+            model_name="sonnet",
+            project_key="alpha",
+            tokens_used=100,
+            updated_at="2025-01-01T12:45:00+00:00",
+        ),
+        TokenUsageHourlyRecord(
+            hour_bucket="2025-01-02T08:00:00+00:00",
+            account_name="acct-1",
+            provider="claude",
+            model_name="sonnet",
+            project_key="alpha",
+            tokens_used=250,
+            updated_at="2025-01-02T08:30:00+00:00",
+        ),
+        TokenUsageHourlyRecord(
+            hour_bucket="2025-01-02T09:00:00+00:00",
+            account_name="acct-2",
+            provider="codex",
+            model_name="gpt-5",
+            project_key="beta",
+            tokens_used=50,
+            updated_at="2025-01-02T09:15:00+00:00",
+        ),
+    ]
+    replace_token_usage_hourly(seed, pool=pg_schema_pool)
+
+    rows = recent_token_usage(limit=10, pool=pg_schema_pool)
+    assert len(rows) == 3
+    # ORDER BY hour_bucket DESC, tokens_used DESC.
+    assert rows[0].hour_bucket.startswith("2025-01-02T09")
+    assert rows[1].hour_bucket.startswith("2025-01-02T08")
+    assert rows[2].hour_bucket.startswith("2025-01-01T12")
+
+    days = daily_token_usage(days=10, pool=pg_schema_pool)
+    # oldest-first per the StateStore contract.
+    by_day = dict(days)
+    assert by_day["2025-01-01"] == 100
+    assert by_day["2025-01-02"] == 300
+    assert days[0][0] == "2025-01-01"
+    assert days[-1][0] == "2025-01-02"
+
+    # Scoped replace only clears the named accounts.
+    replace_token_usage_hourly(
+        [
+            TokenUsageHourlyRecord(
+                hour_bucket="2025-01-03T10:00:00+00:00",
+                account_name="acct-1",
+                provider="claude",
+                model_name="sonnet",
+                project_key="alpha",
+                tokens_used=999,
+                updated_at="2025-01-03T10:15:00+00:00",
+            ),
+        ],
+        account_names=["acct-1"],
+        pool=pg_schema_pool,
+    )
+    rows = recent_token_usage(limit=10, pool=pg_schema_pool)
+    # acct-1 rows are gone except the new one; acct-2 row is preserved.
+    by_acct = sorted({(r.account_name, r.hour_bucket[:10]) for r in rows})
+    assert by_acct == [
+        ("acct-1", "2025-01-03"),
+        ("acct-2", "2025-01-02"),
+    ]

@@ -45,10 +45,6 @@ def _move_to_review(svc, task_id: str, *, summary: str = "Implemented the work."
 import pytest
 
 
-@pytest.mark.xfail(
-    reason="PgWorkService.node_done() doesn't invoke review_summary generator yet (#1768)",
-    strict=False,
-)
 def test_node_done_writes_llm_generated_plain_summary(pg_work_service, monkeypatch) -> None:
     monkeypatch.delenv("POLLYPM_DISABLE_AGENTIC_REVIEW_SUMMARIES", raising=False)
     prompts: list[str] = []
@@ -76,10 +72,6 @@ def test_node_done_writes_llm_generated_plain_summary(pg_work_service, monkeypat
     assert "Do not tell the user to run pm commands" in prompts[0]
 
 
-@pytest.mark.xfail(
-    reason="PgWorkService.node_done() doesn't invoke review_summary generator yet (#1768)",
-    strict=False,
-)
 def test_rework_review_summary_prompt_includes_previous_rejection(
     pg_work_service, monkeypatch,
 ) -> None:

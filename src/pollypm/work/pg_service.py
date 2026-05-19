@@ -42,7 +42,7 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
-from pollypm.inbox.kind import coerce_kind as _coerce_inbox_kind
+from pollypm.inbox.kind import InboxItemKind, coerce_kind as _coerce_inbox_kind
 from pollypm.work.models import (
     ActorType,
     ArtifactKind,
@@ -59,6 +59,7 @@ from pollypm.work.models import (
     Priority,
     Task,
     TaskType,
+    TERMINAL_STATUSES,
     WorkOutput,
     WorkStatus,
     WorkerSessionRecord,
@@ -483,19 +484,184 @@ class PgWorkService:
         self,
         task_id: str,
         actor: str,
-        skip_gates: bool = False,  # noqa: ARG002 — Slice B wires gates
+        skip_gates: bool = False,
     ) -> Task:
         """Move a ``draft`` task to ``queued``.
 
-        Slice A skips gate evaluation entirely. The transition row is
-        still written so the audit history is sane.
+        Mirrors the sqlite ``queue`` gate semantics (#1767): when the
+        task is flagged ``requires_human_review`` we refuse to transition
+        unless either (a) a ``human_review_approved`` context entry has
+        been recorded via :meth:`approve_human_review` or (b) the caller
+        passes ``skip_gates=True``, in which case we still record an
+        audit entry that the bypass happened. When the gate trips we
+        also materialise a user-owned inbox task so the operator has a
+        place to land the approval/reject decision.
         """
+        task = self.get(task_id)
+        if (
+            task.requires_human_review
+            and not skip_gates
+            and not self.has_human_review_approval(task_id)
+        ):
+            approval_task = self.ensure_human_review_request_task(
+                task_id, actor
+            )
+            raise InvalidTransitionError(
+                "Task requires human review before queueing.\n"
+                "\n"
+                "Why: this task is marked requires_human_review, so it "
+                "must be approved by the user or explicitly fast-tracked "
+                "by an authorized operator before workers can pick it up.\n"
+                "\n"
+                f"Created user inbox task: {approval_task.task_id}\n"
+                "\n"
+                "Fix: approve it with "
+                f"`pm task approve-human-review {task_id} --actor user`, "
+                "or have the operator use "
+                f"`pm task approve-human-review {task_id} --actor polly "
+                '--fast-track-authorized --reason "..."`.'
+            )
+        if (
+            task.requires_human_review
+            and skip_gates
+            and not self.has_human_review_approval(task_id)
+        ):
+            self.add_context(
+                task_id,
+                actor,
+                "fast-track queue bypass recorded via --skip-gates",
+                entry_type="human_review_approved",
+            )
         return self._simple_transition(
             task_id,
             from_state=WorkStatus.DRAFT,
             to_state=WorkStatus.QUEUED,
             actor=actor,
         )
+
+    def has_human_review_approval(self, task_id: str) -> bool:
+        """Return True when a pre-queue human review approval is recorded.
+
+        Mirrors :meth:`SQLiteWorkService.has_human_review_approval`. A
+        task that doesn't require human review is trivially "approved";
+        otherwise we look for at least one ``human_review_approved``
+        context entry.
+        """
+        task = self.get(task_id)
+        if not task.requires_human_review:
+            return True
+        rows = self.get_context(
+            task_id, entry_type="human_review_approved", limit=1
+        )
+        return bool(rows)
+
+    def ensure_human_review_request_task(
+        self,
+        task_id: str,
+        actor: str,
+    ) -> Task:
+        """Materialize a user-owned task requesting pre-queue approval.
+
+        Mirrors :meth:`SQLiteWorkService.ensure_human_review_request_task`.
+        Idempotent: if a non-terminal request task already exists for
+        ``task_id`` we return it instead of creating a duplicate.
+        """
+        target = self.get(task_id)
+        label = f"target_task:{target.task_id}"
+        for candidate in self.list_tasks(project=target.project):
+            labels = set(candidate.labels or [])
+            if (
+                "human_review_request" in labels
+                and label in labels
+                and candidate.work_status not in TERMINAL_STATUSES
+            ):
+                return candidate
+
+        description = "\n".join(
+            [
+                f"Review whether `{target.task_id}` should enter the worker queue.",
+                "",
+                f"Task: {target.title}",
+                target.description or "(no description)",
+                "",
+                "Approve if this work is authorized to proceed. Reject or reply "
+                "with clarification if it needs changes before delegation.",
+            ]
+        )
+        return self.create(
+            title=f"Human review required before queueing {target.task_id}",
+            description=description,
+            type="task",
+            project=target.project,
+            flow_template="chat",
+            roles={"requester": "user", "operator": actor or "polly"},
+            priority=target.priority.value,
+            created_by=actor or "system",
+            labels=[
+                "human_review_request",
+                f"project:{target.project}",
+                label,
+            ],
+            requires_human_review=False,
+            kind=InboxItemKind.APPROVAL_REQUEST.value,
+        )
+
+    def approve_human_review(
+        self,
+        task_id: str,
+        actor: str,
+        reason: str | None = None,
+        *,
+        fast_track_authorized: bool = False,
+    ) -> Task:
+        """Record pre-queue approval for a ``requires_human_review`` task.
+
+        Mirrors :meth:`SQLiteWorkService.approve_human_review`. Only the
+        human user can approve unless an authorised operator passes
+        ``fast_track_authorized=True``. On approval we close any open
+        approval-request inbox task so the operator's queue clears.
+        """
+        task = self.get(task_id)
+        actor_norm = (actor or "").strip().lower()
+        is_user = actor_norm in {"user", "sam", "human"}
+        if not is_user and not fast_track_authorized:
+            raise InvalidTransitionError(
+                "Only the user can approve this review unless the operator "
+                "explicitly records --fast-track-authorized."
+            )
+        detail = reason.strip() if reason else "approved"
+        if fast_track_authorized and not is_user:
+            detail = f"fast-track authorized by {actor}: {detail}"
+        self.add_context(
+            task_id,
+            actor or "user",
+            detail,
+            entry_type="human_review_approved",
+        )
+
+        label = f"target_task:{task.task_id}"
+        for candidate in self.list_tasks(project=task.project):
+            labels = set(candidate.labels or [])
+            if (
+                "human_review_request" in labels
+                and label in labels
+                and candidate.work_status not in TERMINAL_STATUSES
+            ):
+                try:
+                    self.add_context(
+                        candidate.task_id,
+                        actor or "user",
+                        f"approved target {task.task_id}",
+                        entry_type="reply",
+                    )
+                    self.mark_done(candidate.task_id, actor or "user")
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "failed to close human review request %s",
+                        candidate.task_id,
+                        exc_info=True,
+                    )
+        return self.get(task_id)
 
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:
         """Move any non-terminal task to ``cancelled``."""
@@ -1031,7 +1197,70 @@ class PgWorkService:
                     cur, task, flow, node.next_node_id, actor, from_status
                 )
             conn.commit()
-        return self.get(task_id)
+        result = self.get(task_id)
+        self._write_review_summary_after_transition(result)
+        return result
+
+    def _write_review_summary_after_transition(self, task: Task) -> None:
+        """Invoke the LLM review-summary hook after a transition (#1768).
+
+        Mirrors :meth:`_TransitionManager._write_review_summary_after_transition`
+        in the sqlite path: when a task lands in ``review`` or ``on_hold``
+        we ask :mod:`pollypm.task_review_summary` to generate and persist
+        a plain-language summary. Any failure is swallowed with a warning
+        so the transition itself remains durable.
+
+        Note: pg's :meth:`get` does not yet hydrate ``executions`` /
+        ``context`` (Slice B carryover), so the summary helper would see
+        an empty work-output history if called against the raw ``get``
+        result. We hydrate those fields locally before invoking the
+        generator so the prompt has the worker's submission to summarise.
+        """
+        if task.work_status not in {WorkStatus.REVIEW, WorkStatus.ON_HOLD}:
+            return
+        try:
+            from pollypm.task_review_summary import (
+                PLAIN_SUMMARY_ENTRY_TYPE,
+                REVIEW_SUMMARY_ACTOR,
+                generate_review_plain_summary,
+            )
+
+            hydrated = self._hydrate_task_for_review_summary(task)
+            if any(
+                entry.entry_type == PLAIN_SUMMARY_ENTRY_TYPE
+                for entry in hydrated.context
+            ):
+                return
+            summary = generate_review_plain_summary(hydrated)
+            if not summary:
+                return
+            self.add_context(
+                task.task_id,
+                REVIEW_SUMMARY_ACTOR,
+                summary,
+                entry_type=PLAIN_SUMMARY_ENTRY_TYPE,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "review plain summary generation skipped for %s: %s",
+                task.task_id,
+                exc,
+            )
+
+    def _hydrate_task_for_review_summary(self, task: Task) -> Task:
+        """Return ``task`` with ``executions`` and ``context`` populated.
+
+        The review-summary generator reads ``task.executions`` (for the
+        latest worker output) and ``task.context`` (to short-circuit
+        when a summary already exists). pg's :meth:`get` returns a thin
+        Task in Slice A; we attach the extra lists here so the generator
+        sees the same shape sqlite would have produced.
+        """
+        executions = self.get_execution(task.task_id)
+        context_entries = self.get_context(task.task_id)
+        task.executions = executions
+        task.context = context_entries
+        return task
 
     def approve(
         self,

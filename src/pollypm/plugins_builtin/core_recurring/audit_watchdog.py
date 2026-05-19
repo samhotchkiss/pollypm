@@ -985,7 +985,17 @@ def _gather_worker_cap_back_pressure(
                     legacy = getattr(proj, "max_concurrent_workers", None)
                     if isinstance(legacy, int) and legacy > 0:
                         cap = legacy
-        svc = create_work_service(project_path=project_path)
+        # #1884 — thread the loaded config through so the work-service
+        # factory picks the configured backend (postgres) instead of
+        # silently falling back to sqlite. Without ``config=cfg`` the
+        # cap probe opens a sqlite DB on a pg workspace, reads zero
+        # rows, and either spuriously declares back-pressure off or
+        # racks up phantom findings against an empty sidecar file.
+        svc = create_work_service(
+            project_path=project_path,
+            project_key=project_key,
+            config=cfg,
+        )
         try:
             records = svc.list_worker_sessions(
                 project=project_key, active_only=True,
@@ -1504,9 +1514,17 @@ def _self_heal_role_session_missing(
             counters["worker_lane_failed"] += 1
             return counters
         try:
+            # #1887 — thread ``config=cfg`` through the factory so the
+            # work-service picks the configured backend (postgres) on
+            # pg workspaces. Without it the factory falls back to
+            # sqlite, the reviewer self-heal then queries an empty
+            # sidecar DB, and the reviewer either silently no-ops
+            # (existing-window lookup never matches) or duplicates
+            # provisioning on the next tick.
             with create_work_service(
                 project_path=project_path,
                 project_key=project_key,
+                config=cfg,
             ) as svc:
                 from pollypm.tmux.client import TmuxClient
 

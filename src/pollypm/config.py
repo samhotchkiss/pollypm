@@ -1122,6 +1122,25 @@ def _render_global_config(config: PollyPMConfig) -> str:
             lines.append(f'kind = "{project.kind.value}"')
         if project.tracked:
             lines.append("tracked = true")
+        # #1885 — round-trip per-project worker/cap overrides so an
+        # operator who sets them in pollypm.toml doesn't lose them on
+        # any code path that calls ``write_config`` (e.g. the toml
+        # patcher, ``pm example-config``-style serialisers, or the
+        # bootstrap re-emit). Pre-fix the emitter only carried
+        # name/persona/kind/tracked, silently dropping ``auto_claim``,
+        # ``max_concurrent_workers``, and ``max_parallel_workers``.
+        if project.auto_claim is not None:
+            lines.append(
+                f"auto_claim = {'true' if project.auto_claim else 'false'}"
+            )
+        if project.max_concurrent_workers is not None:
+            lines.append(
+                f"max_concurrent_workers = {int(project.max_concurrent_workers)}"
+            )
+        if project.max_parallel_workers is not None:
+            lines.append(
+                f"max_parallel_workers = {int(project.max_parallel_workers)}"
+            )
         lines.append("")
         _append_role_assignment_tables(
             lines,

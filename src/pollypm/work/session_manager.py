@@ -418,6 +418,92 @@ class SessionManager:
         """Public entry point for the pre-claim cap probe (#1737)."""
         self._enforce_parallel_cap(project, task_id)
 
+    def _reserve_cap_slot_atomic(
+        self, project: str, task_number: int, agent_name: str,
+    ) -> None:
+        """Atomically reserve a worker-cap slot or raise (#1883).
+
+        Pre-#1883 the cap check (count active rows) and the worker
+        session row insert (at the end of ``_provision_locked``) ran
+        in separate transactions on separate connections. Two
+        concurrent ``provision_worker`` calls for *different* tasks
+        on the same project could both pass the count and then both
+        insert — silently exceeding ``max_parallel_workers``. The
+        existing per-task filesystem lock only serialised same-task
+        re-claims; it did nothing for inter-task races.
+
+        This method delegates the check-and-reserve to the work
+        service, which performs it inside a single transaction under
+        a project-scoped advisory lock (pg) or write-immediate
+        transaction (sqlite). The placeholder row inserted on success
+        is upgraded by the existing ``upsert_worker_session`` call at
+        the end of ``_provision_locked``; on provisioning failure the
+        caller releases the slot via ``mark_worker_session_ended``.
+
+        Falls back to the legacy two-step check when the work-service
+        implementation doesn't expose ``reserve_worker_cap_slot``
+        (test doubles narrower than the full ``WorkService``
+        Protocol).
+        """
+        # Re-resolve the cap inside the atomic critical region so a
+        # concurrent config reload can't widen the cap while a claim
+        # is in flight.
+        cap = self._resolve_parallel_cap(project)
+        reserve = getattr(self._svc, "reserve_worker_cap_slot", None)
+        if reserve is None:
+            # Legacy fallback: best-effort non-atomic check so
+            # narrower test doubles still get back-pressure semantics
+            # (just without the TOCTOU guarantee).
+            self._enforce_parallel_cap(
+                project, f"{project}/{task_number}",
+            )
+            return
+        now_iso = _now_dt().isoformat()
+        reserved = reserve(
+            task_project=project,
+            task_number=task_number,
+            agent_name=agent_name,
+            started_at=now_iso,
+            cap=cap,
+        )
+        if reserved:
+            return
+        active = self._count_active_workers(project)
+        raise WorkerCapExceededError(
+            f"Cannot spawn worker for {project}/{task_number}: "
+            f"project {project!r} already has {active} active worker "
+            f"sessions (cap={cap}). "
+            "Why it matters: per-task workers run in parallel up to a "
+            "per-project ceiling so a queue burst doesn't burn every "
+            "provider session at once. "
+            "Fix: wait for one of the running workers to finish, or "
+            "raise the cap by setting "
+            f"`max_parallel_workers = <N>` under `[projects.{project}]` "
+            "in pollypm.toml."
+        )
+
+    def _release_cap_slot_on_failure(
+        self, project: str, task_number: int,
+    ) -> None:
+        """Free a reserved cap slot when provisioning failed downstream.
+
+        Stamps ``ended_at`` on the placeholder row so it no longer
+        counts toward ``max_parallel_workers``. Best-effort: any error
+        is swallowed because the surfaced provisioning failure is the
+        primary signal.
+        """
+        try:
+            self._svc.mark_worker_session_ended(
+                task_project=project,
+                task_number=task_number,
+                ended_at=_now_dt().isoformat(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "provision_worker[%s/%d]: cap-slot release failed: %s",
+                project, task_number, exc, exc_info=True,
+            )
+
     # ------------------------------------------------------------------
     # Existing-session liveness (#1012)
     # ------------------------------------------------------------------
@@ -565,74 +651,98 @@ class SessionManager:
         branch_name: str,
     ) -> WorkerSession:
         """Inner provision body — runs under the per-task session lock."""
-        # Create worktree
-        worktree_path = self._create_worktree(task_id, task_slug, self._project_path)
+        # #1883 — reserve a worker-cap slot atomically BEFORE any
+        # filesystem / tmux mutation. The work-service insert serves as
+        # the project-scoped serialisation point so two concurrent
+        # claims for different tasks can't both pass the count and
+        # silently exceed ``max_parallel_workers``. The reservation
+        # writes a placeholder row that's overwritten by the real
+        # binding on success (``upsert_worker_session`` below) and
+        # cleared on any downstream failure.
+        self._reserve_cap_slot_atomic(project, task_number, agent_name)
+        slot_reserved = True
 
-        # Build task prompt for the worker
-        task_prompt = self._build_task_prompt(task_id, worktree_path)
-        prompt_path = worktree_path / ".pollypm-task-prompt.md"
         try:
-            prompt_path.parent.mkdir(parents=True, exist_ok=True)
-            prompt_path.write_text(task_prompt)
-        except OSError as exc:
-            worktree_removed = self._remove_worktree(worktree_path)
-            raise ProvisionError(
-                f"Could not write the worker prompt at {prompt_path}: {exc}. "
-                f"Why it matters: the worker launch depends on that file, so "
-                f"starting the session would boot an uninitialized worker. "
-                f"Fix: free up the filesystem or repair the worktree path, "
-                f"then retry the claim. Cleanup "
-                f"{'succeeded' if worktree_removed else 'failed'} for "
-                f"{worktree_path}."
+            # Create worktree
+            worktree_path = self._create_worktree(task_id, task_slug, self._project_path)
+
+            # Build task prompt for the worker
+            task_prompt = self._build_task_prompt(task_id, worktree_path)
+            prompt_path = worktree_path / ".pollypm-task-prompt.md"
+            try:
+                prompt_path.parent.mkdir(parents=True, exist_ok=True)
+                prompt_path.write_text(task_prompt)
+            except OSError as exc:
+                worktree_removed = self._remove_worktree(worktree_path)
+                raise ProvisionError(
+                    f"Could not write the worker prompt at {prompt_path}: {exc}. "
+                    f"Why it matters: the worker launch depends on that file, so "
+                    f"starting the session would boot an uninitialized worker. "
+                    f"Fix: free up the filesystem or repair the worktree path, "
+                    f"then retry the claim. Cleanup "
+                    f"{'succeeded' if worktree_removed else 'failed'} for "
+                    f"{worktree_path}."
+                )
+
+            window_name = f"task-{task_slug}"
+            session_name = self._storage_closet_name
+
+            # Kickoff string sent after stabilization so the worker reads the
+            # prompt file and signals done when finished.
+            kickoff = (
+                f"Read .pollypm-task-prompt.md, follow the instructions, "
+                f"commit your work, then run `pm task done {task_id}`."
             )
 
-        window_name = f"task-{task_slug}"
-        session_name = self._storage_closet_name
+            pane_id, provider_name, provider_home = self._launch_worker_window(
+                session_name=session_name,
+                window_name=window_name,
+                worktree_path=worktree_path,
+                agent_name=agent_name,
+                project=project,
+                kickoff=kickoff,
+            )
 
-        # Kickoff string sent after stabilization so the worker reads the
-        # prompt file and signals done when finished.
-        kickoff = (
-            f"Read .pollypm-task-prompt.md, follow the instructions, "
-            f"commit your work, then run `pm task done {task_id}`."
-        )
+            now = _now_dt()
 
-        pane_id, provider_name, provider_home = self._launch_worker_window(
-            session_name=session_name,
-            window_name=window_name,
-            worktree_path=worktree_path,
-            agent_name=agent_name,
-            project=project,
-            kickoff=kickoff,
-        )
+            # Store binding through the work service. Upsert so a re-claim
+            # after cancel reuses the row (teardown stamps ended_at but
+            # doesn't delete) instead of hitting the PK constraint.
+            # ``provider`` + ``provider_home`` (#809) let teardown locate
+            # the right transcript tree without depending on the
+            # supervisor process's ambient env. The upsert here also
+            # upgrades the #1883 placeholder row to the real binding;
+            # from this point onward the reservation is "committed" and
+            # the failure-path cleanup must NOT fire.
+            self._svc.upsert_worker_session(
+                task_project=project,
+                task_number=task_number,
+                agent_name=agent_name,
+                pane_id=pane_id,
+                worktree_path=str(worktree_path),
+                branch_name=branch_name,
+                started_at=now.isoformat(),
+                provider=provider_name,
+                provider_home=str(provider_home) if provider_home else None,
+            )
+            slot_reserved = False
 
-        now = _now_dt()
-
-        # Store binding through the work service. Upsert so a re-claim
-        # after cancel reuses the row (teardown stamps ended_at but
-        # doesn't delete) instead of hitting the PK constraint.
-        # ``provider`` + ``provider_home`` (#809) let teardown locate
-        # the right transcript tree without depending on the
-        # supervisor process's ambient env.
-        self._svc.upsert_worker_session(
-            task_project=project,
-            task_number=task_number,
-            agent_name=agent_name,
-            pane_id=pane_id,
-            worktree_path=str(worktree_path),
-            branch_name=branch_name,
-            started_at=now.isoformat(),
-            provider=provider_name,
-            provider_home=str(provider_home) if provider_home else None,
-        )
-
-        return WorkerSession(
-            task_id=task_id,
-            agent_name=agent_name,
-            pane_id=pane_id,
-            worktree_path=worktree_path,
-            branch_name=branch_name,
-            started_at=now,
-        )
+            return WorkerSession(
+                task_id=task_id,
+                agent_name=agent_name,
+                pane_id=pane_id,
+                worktree_path=worktree_path,
+                branch_name=branch_name,
+                started_at=now,
+            )
+        except BaseException:
+            # #1883 — any failure between the reservation and the final
+            # binding upsert means the slot would leak. Stamp ended_at
+            # so the placeholder no longer counts toward the per-project
+            # parallel-worker cap.
+            if slot_reserved:
+                self._release_cap_slot_on_failure(project, task_number)
+            raise
 
     # ------------------------------------------------------------------
     # Worker launch helpers
@@ -1416,7 +1526,26 @@ class SessionManager:
             role="reviewer",
             model=session_model,
         )
-        session_cwd = self._project_path
+        # #1886 — the reviewer must read the worker's in-flight work,
+        # not the project's master branch. Pre-fix the cwd was the
+        # project root so the per-task reviewer window launched idle
+        # on whatever ``main`` happened to be, completely missing the
+        # changes it was supposed to review.
+        #
+        # Prefer the worker's task worktree when it exists on disk
+        # (``<project_path>/.pollypm/worktrees/<project>-<N>`` — same
+        # shape used by ``_create_worktree``). Fall back to the
+        # project root for review nodes that entered ``review``
+        # without a per-task worktree (the legacy review-from-main
+        # path, kept for back-compat with tasks created pre-#1737).
+        task_slug = f"{project}-{int(task_number)}"
+        worker_worktree = (
+            self._project_path / ".pollypm" / "worktrees" / task_slug
+        )
+        if worker_worktree.exists():
+            session_cwd = worker_worktree
+        else:
+            session_cwd = self._project_path
 
         session = SessionConfig(
             name=window_name,

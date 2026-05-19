@@ -2984,3 +2984,198 @@ def test_plan_missing_alert_churn_skips_non_plan_gate_scopes(
     assert not any(
         f.rule == RULE_PLAN_MISSING_ALERT_CHURN for f in findings
     )
+
+
+# ---------------------------------------------------------------------------
+# #1884 — worker-cap back-pressure probe threads config to work service
+# ---------------------------------------------------------------------------
+
+
+def test_gather_worker_cap_back_pressure_threads_config_to_factory(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#1884 — the probe must pass ``config=`` to ``create_work_service``.
+
+    Pre-fix the probe called ``create_work_service(project_path=...)``
+    without forwarding the loaded config. On a pg workspace the
+    factory then fell back to the sqlite branch, queried an empty
+    sidecar DB, and produced phantom back-pressure findings (or
+    quietly suppressed legitimate ``role_session_missing`` alerts).
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.demo]
+path = "demo"
+max_parallel_workers = 2
+"""
+    )
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+
+    captured: dict[str, object] = {}
+
+    class _Stub:
+        def list_worker_sessions(self, *, project=None, active_only=True):
+            return []
+
+        def close(self) -> None:
+            pass
+
+    def _fake_factory(**kwargs):
+        captured.update(kwargs)
+        return _Stub()
+
+    import pollypm.work as work_mod
+    monkeypatch.setattr(work_mod, "create_work_service", _fake_factory)
+
+    aw._gather_worker_cap_back_pressure(
+        "demo", project_path, config_path,
+    )
+
+    assert "config" in captured, captured
+    assert captured["config"] is not None
+    assert captured.get("project_key") == "demo"
+    assert captured.get("project_path") == project_path
+
+
+# ---------------------------------------------------------------------------
+# #1887 — reviewer role-session self-heal threads config to factory
+# ---------------------------------------------------------------------------
+
+
+def test_self_heal_reviewer_spawn_threads_config_to_factory(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#1887 — the reviewer self-heal branch must forward ``config=``.
+
+    Pre-fix the branch called ``create_work_service(project_path=...,
+    project_key=...)`` without ``config=cfg``. On a pg workspace the
+    factory then opened a sqlite sidecar DB, the reviewer
+    existing-window lookup queried an empty table, and the self-heal
+    either silently no-oped or duplicated the spawn next tick.
+    """
+    from pollypm.audit.watchdog import Finding
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.demo]
+path = "demo"
+"""
+    )
+    project_path = tmp_path / "demo"
+    project_path.mkdir()
+
+    captured: dict[str, object] = {}
+
+    class _Stub:
+        def ensure_worker_session_schema(self):
+            pass
+
+        def list_worker_sessions(self, *, project=None, active_only=True):
+            return []
+
+        def close(self) -> None:
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def _fake_factory(**kwargs):
+        captured.update(kwargs)
+        return _Stub()
+
+    import pollypm.work as work_mod
+    monkeypatch.setattr(work_mod, "create_work_service", _fake_factory)
+
+    class _StubMgr:
+        def __init__(self, *a, **kw):
+            pass
+
+        def provision_reviewer(self, task_id):
+            return "reviewer-demo-4"
+
+    import pollypm.work.session_manager as sm_mod
+    monkeypatch.setattr(sm_mod, "SessionManager", _StubMgr)
+
+    # Stub the TmuxClient so a missing tmux binary doesn't blow up.
+    class _StubTmux:
+        pass
+
+    import pollypm.tmux.client as _tmux_mod
+    monkeypatch.setattr(_tmux_mod, "TmuxClient", _StubTmux)
+
+    finding = Finding(
+        rule="role_session_missing",
+        project="demo",
+        subject="demo/4",
+        severity="warn",
+        message="reviewer for demo/4 missing",
+        recommendation="spawn reviewer",
+        metadata={"role": "reviewer", "task_id": "demo/4"},
+    )
+
+    counters = aw._self_heal_role_session_missing(
+        finding,
+        project_key="demo",
+        project_path=project_path,
+        config_path=config_path,
+    )
+
+    assert "config" in captured, captured
+    assert captured["config"] is not None
+    # The self-heal succeeded -> reviewer-spawn counter incremented.
+    assert counters["worker_lane_spawned"] == 1

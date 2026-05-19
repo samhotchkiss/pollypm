@@ -3455,6 +3455,90 @@ class PgWorkService:
                 )
             conn.commit()
 
+    def reserve_worker_cap_slot(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        agent_name: str,
+        started_at: str,
+        cap: int,
+    ) -> bool:
+        """Atomically reserve a per-project worker-cap slot (#1883).
+
+        Holds a transaction-scoped ``pg_advisory_xact_lock`` keyed on
+        ``"worker_cap:{task_project}"`` while counting active rows and
+        inserting the placeholder. Two concurrent ``provision_worker``
+        calls for different ``task_number``\\s on the same project
+        therefore serialise on the lock; once the first commits its
+        placeholder, the second's COUNT sees the new row and (if at
+        cap) returns ``False`` without inserting.
+
+        Idempotent for the same ``(task_project, task_number)``: an
+        existing row (active or not) short-circuits to ``True`` without
+        another insert. The caller's per-task filesystem lock handles
+        the duplicate-provision check upstream; this branch is the
+        belt-and-suspenders so a racing harness can't double-count.
+        """
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT pg_advisory_xact_lock("
+                    "hashtextextended(%s, 0))",
+                    (f"work_sessions.worker_cap:{task_project}",),
+                )
+                # Idempotent path: an existing row for this task
+                # consumes its own slot already.
+                cur.execute(
+                    "SELECT ended_at FROM work_sessions "
+                    "WHERE task_project = %s AND task_number = %s",
+                    (task_project, task_number),
+                )
+                existing = cur.fetchone()
+                if existing is not None and existing[0] is None:
+                    conn.commit()
+                    return True
+                cur.execute(
+                    "SELECT COUNT(*) FROM work_sessions "
+                    "WHERE task_project = %s AND ended_at IS NULL",
+                    (task_project,),
+                )
+                active = int(cur.fetchone()[0])
+                if active >= int(cap):
+                    conn.rollback()
+                    return False
+                # Insert/resurrect a placeholder row so subsequent
+                # concurrent callers see the higher count BEFORE the
+                # caller finishes worktree creation. ``pane_id=""``
+                # is the sentinel for "reservation in flight" — the
+                # successful provision upserts real values; a failed
+                # provision stamps ``ended_at`` so the slot is freed.
+                cur.execute(
+                    "INSERT INTO work_sessions ("
+                    "task_project, task_number, agent_name, pane_id, "
+                    "worktree_path, branch_name, started_at"
+                    ") VALUES (%s, %s, %s, %s, %s, %s, %s) "
+                    "ON CONFLICT (task_project, task_number) DO UPDATE SET "
+                    "agent_name = EXCLUDED.agent_name, "
+                    "pane_id = EXCLUDED.pane_id, "
+                    "worktree_path = EXCLUDED.worktree_path, "
+                    "branch_name = EXCLUDED.branch_name, "
+                    "started_at = EXCLUDED.started_at, "
+                    "ended_at = NULL, archive_path = NULL",
+                    (
+                        task_project,
+                        task_number,
+                        agent_name,
+                        "",
+                        "",
+                        "",
+                        started_at,
+                    ),
+                )
+            conn.commit()
+        return True
+
     def get_worker_session(
         self,
         *,

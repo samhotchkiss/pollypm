@@ -468,6 +468,119 @@ max_parallel_workers = 3
     assert config.projects["samblog"].max_concurrent_workers is None
 
 
+def test_render_config_round_trips_project_max_parallel_workers(
+    tmp_path: Path,
+) -> None:
+    """#1885 — TOML emitter preserves per-project worker-cap overrides.
+
+    Pre-fix, ``_render_global_config`` only carried name/persona/
+    kind/tracked; ``auto_claim``, ``max_concurrent_workers``, and
+    ``max_parallel_workers`` were silently dropped. Any code path
+    that round-trips (``write_config``, the toml patcher) erased an
+    operator-set cap, restoring the runtime default.
+    """
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.samblog]
+path = "samblog"
+auto_claim = true
+max_parallel_workers = 7
+max_concurrent_workers = 4
+"""
+    )
+    (tmp_path / "samblog").mkdir()
+
+    config = load_config(config_path)
+    assert config.projects["samblog"].max_parallel_workers == 7
+    assert config.projects["samblog"].max_concurrent_workers == 4
+    assert config.projects["samblog"].auto_claim is True
+
+    # Round-trip: write_config -> reload must preserve every override.
+    output_path = tmp_path / "out.toml"
+    write_config(config, output_path, force=True)
+    rendered = output_path.read_text()
+    assert "max_parallel_workers = 7" in rendered, rendered
+    assert "max_concurrent_workers = 4" in rendered, rendered
+    assert "auto_claim = true" in rendered, rendered
+
+    reloaded = load_config(output_path)
+    assert reloaded.projects["samblog"].max_parallel_workers == 7
+    assert reloaded.projects["samblog"].max_concurrent_workers == 4
+    assert reloaded.projects["samblog"].auto_claim is True
+
+
+def test_render_config_omits_project_overrides_when_unset(
+    tmp_path: Path,
+) -> None:
+    """A project with no overrides round-trips clean (no spurious keys).
+
+    Guards against the over-eager emitter pattern where ``None``
+    serialises as ``"None"`` or ``0`` and re-loads as a real value.
+    """
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.samblog]
+path = "samblog"
+"""
+    )
+    (tmp_path / "samblog").mkdir()
+    config = load_config(config_path)
+    output_path = tmp_path / "out.toml"
+    write_config(config, output_path, force=True)
+    rendered = output_path.read_text()
+    assert "max_parallel_workers" not in rendered, rendered
+    assert "max_concurrent_workers" not in rendered, rendered
+    assert "auto_claim" not in rendered, rendered
+
+
 def test_load_config_reads_project_local_planner_enforce_plan(tmp_path: Path) -> None:
     """Per-project ``[planner].enforce_plan`` lands on KnownProject."""
     project_root = tmp_path / "wire"

@@ -786,6 +786,50 @@ class MockWorkService:
         )
         self._worker_sessions[key] = existing
 
+    def reserve_worker_cap_slot(
+        self,
+        *,
+        task_project: str,
+        task_number: int,
+        agent_name: str,
+        started_at: str,
+        cap: int,
+    ) -> bool:
+        """In-memory equivalent of the atomic cap-reserve (#1883).
+
+        The mock has no concurrency model so the "atomic" half of the
+        contract is trivially satisfied; the visible behaviour mirrors
+        the pg/sqlite path: idempotent on an already-active row, count
+        check against the cap, insert a placeholder on success.
+        """
+        key = (task_project, task_number)
+        existing = self._worker_sessions.get(key)
+        if existing is not None and existing.get("ended_at") is None:
+            return True
+        active = sum(
+            1
+            for (proj, _), row in self._worker_sessions.items()
+            if proj == task_project and row.get("ended_at") is None
+        )
+        if active >= int(cap):
+            return False
+        self._worker_sessions[key] = {
+            "task_project": task_project,
+            "task_number": task_number,
+            "agent_name": agent_name,
+            "pane_id": "",
+            "worktree_path": "",
+            "branch_name": "",
+            "started_at": started_at,
+            "ended_at": None,
+            "archive_path": None,
+            "total_input_tokens": 0,
+            "total_output_tokens": 0,
+            "provider": None,
+            "provider_home": None,
+        }
+        return True
+
     def get_worker_session(
         self,
         *,

@@ -272,21 +272,50 @@ class PgStorageSettings:
 
 
 @dataclass(slots=True)
+class EmbeddingScoreWeights:
+    """Hybrid-recall scoring knobs (#1737, Slice D).
+
+    The pg memory recall layer blends four components into one
+    final score:
+
+    * ``semantic`` — cosine similarity from pgvector
+    * ``fts`` — Postgres ``ts_rank_cd`` against the generated
+      ``tsvector`` columns
+    * ``importance`` — ``memory_entries.importance`` normalised to
+      ``[0, 1]``
+    * ``recency`` — exponential decay over ``created_at`` age
+
+    Weights are non-negative; the recall query normalises them to sum
+    to 1 before blending so an operator can leave one knob alone.
+    Defaults mirror the design doc at #1737 §3.4.
+    """
+
+    semantic: float = 0.5
+    fts: float = 0.25
+    importance: float = 0.15
+    recency: float = 0.1
+
+
+@dataclass(slots=True)
 class EmbeddingSettings:
     """``[storage.embedding]`` knobs — embedding provider for pgvector.
 
-    Slice A only carries the dataclass shape; the writer lands in
-    Slice D. Knobs:
+    Slice A laid the dataclass shape; Slice D wires the writer +
+    recall path. Knobs:
 
     ``model`` — provider-namespaced model name (``openai:text-embedding-3-small``).
     ``provider`` — short id used by the resolver (``openai``, ``ollama``, ...).
     ``api_key_env`` — name of the env var that holds the provider's
         API key. Defaults to ``OPENAI_API_KEY``.
+    ``score_weights`` — hybrid-recall blend weights (#1737 Slice D).
     """
 
     model: str = "openai:text-embedding-3-small"
     provider: str = "openai"
     api_key_env: str = "OPENAI_API_KEY"
+    score_weights: EmbeddingScoreWeights = field(
+        default_factory=EmbeddingScoreWeights,
+    )
 
 
 @dataclass(slots=True)

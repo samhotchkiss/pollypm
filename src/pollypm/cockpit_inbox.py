@@ -157,6 +157,18 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     except Exception:  # noqa: BLE001
         return []
 
+    # Slice H (#1737): under the pg backend we collapse the entire
+    # per-project sqlite + per-project SQLAlchemyStore fanout into TWO
+    # bulk pg queries (tasks + messages). Falls back to the legacy
+    # sqlite walk on any pg failure so a pool outage doesn't blank the
+    # rail badge.
+    from pollypm.cockpit_pg_aggregates import (
+        inbox_tasks_for_project,
+        inbox_tasks_grouped,
+        is_pg_backend,
+        open_messages,
+    )
+
     try:
         from pollypm.store import SQLAlchemyStore
     except Exception:  # noqa: BLE001
@@ -170,13 +182,44 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     project_db_paths: dict[str, tuple[Path, Path]] = {}
     known_projects = set(getattr(config, "projects", {}).keys())
 
+    pg_inbox_grouped: dict[str, list[object]] | None = None
+    pg_messages: list[dict[str, object]] | None = None
+    pg_active = is_pg_backend(config)
+    if pg_active:
+        pg_inbox_grouped = inbox_tasks_grouped(config)
+        pg_messages = open_messages(config, known_projects=known_projects)
+        if pg_inbox_grouped is None and pg_messages is None:
+            # Pool entirely unreachable — give up on the pg path and
+            # let the per-source sqlite fallback below run. A partial
+            # failure (one of the two queries succeeded) still uses pg
+            # for whatever it could gather.
+            pg_active = False
+
     for project_key, db_path, project_path in _inbox_db_sources(config):
-        if not db_path.exists():
+        if not pg_active and not db_path.exists():
             continue
         if project_key:
             project_db_paths[project_key] = (db_path, project_path)
         else:
             project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
+        if pg_active:
+            # pg path: pull this project's slice from the bulk result.
+            # No sqlite open, no SQLAlchemyStore open. The workspace-
+            # root source (project_key is None) has no tasks of its
+            # own under pg — workspace-level notifications live in the
+            # ``messages`` table only, handled below.
+            if project_key and pg_inbox_grouped is not None:
+                for task in inbox_tasks_for_project(
+                    pg_inbox_grouped, config, project_key,
+                ):
+                    item = annotate_inbox_entry(
+                        task_to_inbox_entry(task, db_path=db_path),
+                        known_projects=known_projects,
+                    )
+                    if awaits_user(item):
+                        task_entries.setdefault(task.task_id, item)
+            continue
+
         try:
             with create_work_service(
                 db_path=db_path, project_path=project_path,
@@ -251,6 +294,45 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
                 store.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    # Slice H pg-path messages: one query covered the whole workspace
+    # above. Apply the same filters the sqlite branch applies per-row.
+    if pg_active and pg_messages:
+        for row in pg_messages:
+            row_id = row.get("id") or row.get("message_id")
+            if row_id is None:
+                continue
+            scope = row.get("scope", "") or ""
+            labels_raw = row.get("labels")
+            if scope and scope != "inbox" and scope not in known_projects:
+                continue
+            refs = _row_project_refs(row)
+            if any(ref not in known_projects for ref in refs):
+                continue
+            if _row_is_dev_channel(labels_raw):
+                continue
+            # Pick the per-project db_path from the source map for the
+            # downstream filter; falls back to the workspace path.
+            source_key = (
+                scope if (scope and scope in known_projects) else "__workspace__"
+            )
+            entry_dbpath = (
+                project_db_paths.get(scope, (None, None))[0]
+                if scope and scope in known_projects
+                else project_db_paths.get(_WORKSPACE_DB_KEY, (None, None))[0]
+            )
+            item = annotate_inbox_entry(
+                message_row_to_inbox_entry(
+                    row,
+                    source_key=source_key,
+                    db_path=entry_dbpath or Path("."),
+                ),
+                known_projects=known_projects,
+            )
+            if awaits_user(item):
+                msg_key = (str(scope), row_id)
+                message_entries.setdefault(msg_key, item)
+
     # #1107 — drop ``plan_review`` rows whose underlying user_approval
     # has already been APPROVED so the rail badge tracks the inbox
     # list view (which already runs this filter inside
@@ -328,6 +410,15 @@ def pm_inbox_filtered_list(
     except Exception:  # noqa: BLE001
         return []
 
+    # Slice H (#1737): pg backend → bulk-query path (see
+    # ``pm_inbox_awaits_user_list`` for the same shape).
+    from pollypm.cockpit_pg_aggregates import (
+        inbox_tasks_for_project,
+        inbox_tasks_grouped,
+        is_pg_backend,
+        open_messages,
+    )
+
     try:
         from pollypm.store import SQLAlchemyStore
     except Exception:  # noqa: BLE001
@@ -343,13 +434,35 @@ def pm_inbox_filtered_list(
     project_db_paths: dict[str, tuple[Path, Path]] = {}
     known_projects = set(getattr(config, "projects", {}).keys())
 
+    pg_inbox_grouped: dict[str, list[object]] | None = None
+    pg_messages: list[dict[str, object]] | None = None
+    pg_active = is_pg_backend(config)
+    if pg_active:
+        pg_inbox_grouped = inbox_tasks_grouped(config)
+        pg_messages = open_messages(config, known_projects=known_projects)
+        if pg_inbox_grouped is None and pg_messages is None:
+            pg_active = False
+
     for project_key, db_path, project_path in _inbox_db_sources(config):
-        if not db_path.exists():
+        if not pg_active and not db_path.exists():
             continue
         if project_key:
             project_db_paths[project_key] = (db_path, project_path)
         else:
             project_db_paths[_WORKSPACE_DB_KEY] = (db_path, project_path)
+        if pg_active:
+            if project_key and pg_inbox_grouped is not None:
+                for task in inbox_tasks_for_project(
+                    pg_inbox_grouped, config, project_key,
+                ):
+                    item = annotate_inbox_entry(
+                        task_to_inbox_entry(task, db_path=db_path),
+                        known_projects=known_projects,
+                    )
+                    if _matches(item):
+                        task_entries.setdefault(task.task_id, item)
+            continue
+
         try:
             with create_work_service(
                 db_path=db_path, project_path=project_path,
@@ -419,6 +532,41 @@ def pm_inbox_filtered_list(
                 store.close()
             except Exception:  # noqa: BLE001
                 pass
+
+    # Slice H pg-path messages — see ``pm_inbox_awaits_user_list``.
+    if pg_active and pg_messages:
+        for row in pg_messages:
+            row_id = row.get("id") or row.get("message_id")
+            if row_id is None:
+                continue
+            scope = row.get("scope", "") or ""
+            labels_raw = row.get("labels")
+            if scope and scope != "inbox" and scope not in known_projects:
+                continue
+            refs = _row_project_refs(row)
+            if any(ref not in known_projects for ref in refs):
+                continue
+            if _row_is_dev_channel(labels_raw):
+                continue
+            source_key = (
+                scope if (scope and scope in known_projects) else "__workspace__"
+            )
+            entry_dbpath = (
+                project_db_paths.get(scope, (None, None))[0]
+                if scope and scope in known_projects
+                else project_db_paths.get(_WORKSPACE_DB_KEY, (None, None))[0]
+            )
+            item = annotate_inbox_entry(
+                message_row_to_inbox_entry(
+                    row,
+                    source_key=source_key,
+                    db_path=entry_dbpath or Path("."),
+                ),
+                known_projects=known_projects,
+            )
+            if _matches(item):
+                msg_key = (str(scope), row_id)
+                message_entries.setdefault(msg_key, item)
 
     collected = list(task_entries.values()) + list(message_entries.values())
     if collected and project_db_paths:

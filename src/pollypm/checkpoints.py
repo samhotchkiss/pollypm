@@ -13,7 +13,6 @@ from typing import Any
 from pollypm.models import PollyPMConfig, SessionLaunchSpec
 from pollypm.memory_backends import get_memory_backend
 from pollypm.projects import ensure_project_scaffold, ensure_session_lock, project_checkpoints_dir, session_scoped_dir
-from pollypm.storage.state import StateStore
 
 HAIKU_MODEL = "claude-3-5-haiku-latest"
 TRANSCRIPT_CAP_CHARS = 16000  # ~4000 tokens
@@ -632,7 +631,7 @@ def write_mechanical_checkpoint(
 
 
 def record_checkpoint(
-    store: StateStore,
+    store: object | None,
     launch: SessionLaunchSpec,
     *,
     project_key: str,
@@ -642,7 +641,20 @@ def record_checkpoint(
     memory_backend_name: str = "file",
     config: PollyPMConfig | None = None,
 ) -> None:
-    store.record_checkpoint(
+    """Record a checkpoint row and refresh the session_runtime stamp.
+
+    ``store`` and ``config`` are retained for caller compatibility but
+    are no longer used — writes go through the pg facades.
+    """
+    del store  # unused on pg backend
+    del config  # unused on pg backend
+    from pollypm.storage.pg_checkpoints import record_checkpoint as _pg_record_checkpoint
+    from pollypm.storage.pg_sessions import (
+        get_session_runtime as _pg_get_session_runtime,
+        upsert_session_runtime as _pg_upsert_session_runtime,
+    )
+
+    _pg_record_checkpoint(
         session_name=launch.session.name,
         project_key=project_key,
         level=level,
@@ -651,40 +663,12 @@ def record_checkpoint(
         snapshot_path=str(snapshot_path),
         summary_text=artifact.summary_text,
     )
-    # #1830: route the session_runtime read/write through pg_sessions
-    # when running on the postgres backend. ``agent_profiles.defaults``
-    # already reads ``last_checkpoint_path`` from pg_sessions in pg
-    # mode (#1828); without this dispatch newly written checkpoints
-    # land on the legacy SQLite StateStore and are invisible to prompt/
-    # recovery readers. Fall back to ``store`` (StateStore) when no
-    # config is threaded or the sqlite backend is active.
-    use_pg = False
-    if config is not None:
-        try:
-            from pollypm.storage._backend_dispatch import is_pg_backend
-
-            use_pg = is_pg_backend(config)
-        except Exception:  # noqa: BLE001
-            use_pg = False
-    if use_pg:
-        from pollypm.storage.pg_sessions import (
-            get_session_runtime as _pg_get_runtime,
-            upsert_session_runtime as _pg_upsert_runtime,
-        )
-
-        current = _pg_get_runtime(launch.session.name)
-        _pg_upsert_runtime(
-            session_name=launch.session.name,
-            status=current.status if current is not None else "healthy",
-            last_checkpoint_path=str(artifact.summary_path),
-        )
-    else:
-        current = store.get_session_runtime(launch.session.name)
-        store.upsert_session_runtime(
-            session_name=launch.session.name,
-            status=current.status if current is not None else "healthy",
-            last_checkpoint_path=str(artifact.summary_path),
-        )
+    current = _pg_get_session_runtime(launch.session.name)
+    _pg_upsert_session_runtime(
+        session_name=launch.session.name,
+        status=current.status if current is not None else "healthy",
+        last_checkpoint_path=str(artifact.summary_path),
+    )
     try:
         memory_backend = get_memory_backend(launch.session.cwd, memory_backend_name)
         memory_backend.write_entry(

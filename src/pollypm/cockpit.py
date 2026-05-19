@@ -836,12 +836,21 @@ def _gather_metrics_snapshot(config) -> MetricsSnapshot:
         )
 
     # Throughput + failures share a single 24h-event read.
-    store = None
+    # Slice K-state-callers-port: read events via the pg facade.
+    store: object | None = None
     try:
-        state_db = getattr(getattr(config, "project", None), "state_db", None)
-        if state_db is not None:
-            from pollypm.storage.state import StateStore
-            store = StateStore(Path(state_db), readonly=True)
+        from pollypm.storage import pg_sessions
+
+        class _PgEventReader:
+            """Adapter exposing the ``recent_events`` shape ``_metrics_24h_events`` expects."""
+
+            def recent_events(self, limit: int = 2000):
+                return pg_sessions.recent_events(limit=limit)
+
+            def close(self) -> None:
+                return None
+
+        store = _PgEventReader()
     except Exception:  # noqa: BLE001
         store = None
 

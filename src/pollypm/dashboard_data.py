@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from pollypm.config import PollyPMConfig, load_config
-from pollypm.storage.state import StateStore
+
 logger = logging.getLogger(__name__)
 
 
@@ -539,60 +539,22 @@ def _session_description(status: str, role: str, snapshot_path: str | None) -> s
 
 def _count_inbox_tasks(config: PollyPMConfig) -> int:
     """Total inbox tasks across all tracked projects (work-service backed)."""
-    try:
-        from pollypm.work import create_work_service
-        from pollypm.work.inbox_view import inbox_tasks
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "_count_inbox_tasks: failed to import work service helpers",
-            exc_info=True,
-        )
-        return 0
 
-    # Slice H (#1737): under the pg backend, one bulk query replaces
-    # the per-project sqlite open. Falls back to the sqlite walk on a
-    # pool / query failure.
+    # Slice H (#1737): pg backend collapses the per-project fanout
+    # into one bulk query.
     from pollypm.cockpit_pg_aggregates import (
         inbox_tasks_for_project,
         inbox_tasks_grouped,
-        is_pg_backend,
     )
 
-    if is_pg_backend(config):
-        grouped = inbox_tasks_grouped(config)
-        if grouped is not None:
-            total = 0
-            for project_key, project in getattr(config, "projects", {}).items():
-                if not getattr(project, "tracked", False):
-                    continue
-                total += len(inbox_tasks_for_project(grouped, config, project_key))
-            return total
-
+    grouped = inbox_tasks_grouped(config)
+    if grouped is None:
+        return 0
     total = 0
     for project_key, project in getattr(config, "projects", {}).items():
-        # Same invariant as recovery_prompt._pending_inbox_section
-        # (cycle 85) and the doctor's sweeper-dbs check: only tracked
-        # projects' state.db files are PollyPM-owned. A registered-
-        # but-not-tracked project may have a stale .pollypm/state.db
-        # left over from a prior tracking run; counting its leftover
-        # inbox tasks inflates the morning-briefing count and the
-        # doctor's "open inbox items" check.
         if not getattr(project, "tracked", False):
             continue
-        db_path = project.path / ".pollypm" / "state.db"
-        if not db_path.exists():
-            continue
-        try:
-            with create_work_service(
-                db_path=db_path, project_path=project.path, config=config,
-            ) as svc:
-                total += len(inbox_tasks(svc, project=project_key))
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "_count_inbox_tasks: project=%s db=%s inbox lookup failed",
-                project_key, db_path, exc_info=True,
-            )
-            continue
+        total += len(inbox_tasks_for_project(grouped, config, project_key))
     return total
 
 
@@ -656,21 +618,10 @@ def _inbox_sender(task) -> str:
 
 
 def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[InboxPreview]:
-    try:
-        from pollypm.work import create_work_service
-        from pollypm.work.inbox_view import inbox_tasks
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "_recent_inbox_messages: failed to import work service helpers",
-            exc_info=True,
-        )
-        return []
-
     # Slice H (#1737): one pg query replaces N per-project sqlite opens.
     from pollypm.cockpit_pg_aggregates import (
         inbox_tasks_for_project,
         inbox_tasks_grouped,
-        is_pg_backend,
     )
 
     now = datetime.now(UTC)
@@ -679,8 +630,8 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
     sources: list[tuple[str | None, str, Path, Path]] = []
     for project_key, project in getattr(config, "projects", {}).items():
         # Same tracked-only invariant as _count_inbox_tasks (cycle 86):
-        # a non-tracked project's leftover state.db would leak stale
-        # tasks into the polly-dashboard's "Recent messages" preview.
+        # a non-tracked project's leftover state would leak stale tasks
+        # into the polly-dashboard's "Recent messages" preview.
         if not getattr(project, "tracked", False):
             continue
         sources.append((project_key, project.display_label(), project.path / ".pollypm" / "state.db", project.path))
@@ -689,12 +640,9 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         workspace_path = Path(workspace_root)
         sources.append((None, "Workspace", workspace_path / ".pollypm" / "state.db", workspace_path))
 
-    pg_grouped: dict[str, list[object]] | None = None
-    pg_active = is_pg_backend(config)
-    if pg_active:
-        pg_grouped = inbox_tasks_grouped(config)
-        if pg_grouped is None:
-            pg_active = False
+    pg_grouped = inbox_tasks_grouped(config)
+    if pg_grouped is None:
+        return []
 
     def _emit_preview(task: object, project_label: str) -> None:
         if task.task_id in seen_task_ids:
@@ -721,55 +669,13 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
             )
         )
 
-    if pg_active and pg_grouped is not None:
-        # Single in-memory partition + emit; no per-source DB opens.
-        for project_key, project_label, _db_path, _project_path in sources:
-            if not project_key:
-                # workspace-root source has no task rows under pg.
-                continue
-            for task in inbox_tasks_for_project(pg_grouped, config, project_key):
-                _emit_preview(task, project_label)
-        previews.sort(key=lambda item: item.age_seconds)
-        return previews[:limit]
-
-    for project_key, project_label, db_path, project_path in sources:
-        if not db_path.exists():
+    # Single in-memory partition + emit; no per-source DB opens.
+    for project_key, project_label, _db_path, _project_path in sources:
+        if not project_key:
+            # workspace-root source has no task rows under pg.
             continue
-        try:
-            with create_work_service(
-                db_path=db_path, project_path=project_path, config=config,
-            ) as svc:
-                for task in inbox_tasks(svc, project=project_key):
-                    if task.task_id in seen_task_ids:
-                        continue
-                    seen_task_ids.add(task.task_id)
-                    stamped = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
-                    if hasattr(stamped, "timestamp"):
-                        age_seconds = max(0.0, now.timestamp() - float(stamped.timestamp()))
-                    else:
-                        try:
-                            age_seconds = max(
-                                0.0,
-                                (now - datetime.fromisoformat(str(stamped))).total_seconds(),
-                            )
-                        except (ValueError, TypeError):
-                            age_seconds = 0.0
-                    previews.append(
-                        InboxPreview(
-                            sender=_inbox_sender(task),
-                            title=(getattr(task, "title", "") or "(untitled)")[:80],
-                            project=project_label,
-                            task_id=task.task_id,
-                            age_seconds=age_seconds,
-                        )
-                    )
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "_recent_inbox_messages: project=%s db=%s scan failed",
-                project_key, db_path, exc_info=True,
-            )
-            continue
-
+        for task in inbox_tasks_for_project(pg_grouped, config, project_key):
+            _emit_preview(task, project_label)
     previews.sort(key=lambda item: item.age_seconds)
     return previews[:limit]
 
@@ -805,8 +711,15 @@ def _quota_limit_label(period_label: object) -> str:
     return "limit"
 
 
-def _account_quota_usage(config: PollyPMConfig, store: StateStore) -> list[AccountQuotaUsage]:
-    """Return cached LLM account quota percentages for the Home dashboard."""
+def _account_quota_usage(config: PollyPMConfig, store: object | None) -> list[AccountQuotaUsage]:
+    """Return cached LLM account quota percentages for the Home dashboard.
+
+    ``store`` is unused (kept for caller compatibility); usage rows are
+    read through :mod:`pollypm.storage.pg_accounts`.
+    """
+    del store  # unused on pg backend
+    from pollypm.storage.pg_accounts import get_account_usage
+
     rows: list[AccountQuotaUsage] = []
     seen_emails: set[str] = set()
     for account_name, account in getattr(config, "accounts", {}).items():
@@ -816,7 +729,7 @@ def _account_quota_usage(config: PollyPMConfig, store: StateStore) -> list[Accou
                 continue
             seen_emails.add(email)
         try:
-            usage = store.get_account_usage(account_name)
+            usage = get_account_usage(account_name)
         except Exception:  # noqa: BLE001
             usage = None
         used_pct = getattr(usage, "used_pct", None) if usage is not None else None
@@ -849,38 +762,35 @@ def _account_quota_usage(config: PollyPMConfig, store: StateStore) -> list[Accou
 
 
 def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
-    """Load config + state store and gather one blocking dashboard snapshot."""
+    """Load config and gather one blocking dashboard snapshot."""
     config = load_config(config_path)
-    store = StateStore(config.project.state_db)
-    try:
-        data = gather(config, store)
-    finally:
-        store.close()
+    data = gather(config, None)
     return config, data
 
 
-def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
-    """Gather all dashboard data."""
+def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
+    """Gather all dashboard data.
+
+    ``store`` is retained for caller compatibility but unused — every
+    read goes through the pg facades.
+    """
+    del store  # unused on pg backend
     from pollypm.service_api import plan_launches_readonly
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    from pollypm.storage.pg_accounts import get_account_usage  # noqa: F401  (imported for side-effect path resolution)
+    from pollypm.storage.pg_alerts import open_alerts as pg_open_alerts
+    from pollypm.storage.pg_heartbeats import latest_heartbeat as pg_latest_heartbeat
+    from pollypm.storage.pg_sessions import (
+        list_session_runtimes as pg_list_session_runtimes,
+        recent_events as pg_recent_events,
+    )
+    from pollypm.storage.pg_token_usage import daily_token_usage as pg_daily_token_usage
 
     now = datetime.now(UTC)
-    pg_active = is_pg_backend(config)
 
-    # Active sessions — Slice K-state-port phase 2c (#1737): on the pg
-    # path go straight through pg_sessions; sqlite path uses the legacy
-    # StateStore reader. Both branches yield the same SessionRuntimeRecord
-    # shape, so the runtime_map build is unchanged.
-    if pg_active:
-        from pollypm.storage.pg_sessions import (
-            list_session_runtimes as pg_list_session_runtimes,
-        )
-
-        all_runtimes = pg_list_session_runtimes()
-    else:
-        all_runtimes = store.list_session_runtimes()
+    # Active sessions — pg facade reads.
+    all_runtimes = pg_list_session_runtimes()
     runtime_map = {rt.session_name: rt for rt in all_runtimes}
-    launches = plan_launches_readonly(config, store)
+    launches = plan_launches_readonly(config, None)
 
     active: list[SessionActivity] = []
     for launch in launches:
@@ -890,7 +800,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
         label = project.display_label() if project else launch.session.project
 
         # Get last snapshot path for description
-        hb = store.latest_heartbeat(launch.session.name)
+        hb = pg_latest_heartbeat(launch.session.name)
         snapshot_path = hb.snapshot_path if hb else None
 
         desc = _session_description(status, launch.session.role, snapshot_path)
@@ -907,24 +817,17 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
             status=status, description=desc, age_seconds=age,
         ))
 
-    # Events summary — Slice K-state-port phase 2c (#1737).
-    if pg_active:
-        from pollypm.storage.pg_sessions import (
-            recent_events as pg_recent_events,
-        )
-
-        recent = pg_recent_events(limit=300)
-    else:
-        recent = store.recent_events(limit=300)
+    # Events summary — pg facade read.
+    recent = pg_recent_events(limit=300)
     cutoff = (now - timedelta(hours=24)).isoformat()
     day_events = [e for e in recent if e.created_at >= cutoff]
 
     # Token data
-    daily = store.daily_token_usage(days=30)
+    daily = pg_daily_token_usage(days=30)
     values = [t for _, t in daily]
     today_str = now.strftime("%Y-%m-%d")
     today_tokens = next((t for d, t in daily if d == today_str), 0)
-    account_usages = _account_quota_usage(config, store)
+    account_usages = _account_quota_usage(config, None)
 
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
@@ -974,7 +877,7 @@ def gather(config: PollyPMConfig, store: StateStore) -> DashboardData:
     # / 53 / 55 dedup at the global polly-dashboard count level.
     user_waiting = _user_waiting_task_ids_across_projects(config)
     alert_count = sum(
-        1 for a in store.open_alerts()
+        1 for a in pg_open_alerts()
         if not is_operational_alert(a.alert_type)
         and not _stuck_alert_already_user_waiting(
             a.alert_type, user_waiting,

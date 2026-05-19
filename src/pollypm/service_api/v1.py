@@ -61,7 +61,6 @@ from pollypm.projects import (
 from pollypm.role_routing import RoleRoutingFacade
 from pollypm.schedulers.base import ScheduledJob
 from pollypm.storage.records import AlertRecord
-from pollypm.storage.state import StateStore
 from pollypm.supervisor import Supervisor
 from pollypm.task_backends import FileTaskBackend, get_task_backend
 from pollypm.task_backends.base import TaskRecord
@@ -846,13 +845,10 @@ class PollyPMService:
             review_summary=review_summary,
             verification=verification,
         )
-        store = StateStore(config.project.state_db)
-        # Note: ``record_checkpoint`` still writes the ``checkpoints``
-        # domain table through StateStore. The original #342 cleanup
-        # (CLOSED) didn't migrate this surface; revisit if the
-        # checkpoint surface ever moves to a Core Table def.
+        # ``record_checkpoint`` writes through the pg facades (Slice
+        # K-state-callers-port); ``store`` is unused.
         record_checkpoint(
-            store,
+            None,
             launch,
             project_key=project_key,
             level="level1",

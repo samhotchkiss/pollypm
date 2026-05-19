@@ -44,6 +44,7 @@ pollypm = "pollypm.cli:app"
 
 [project.entry-points."pollypm.store_backend"]
 sqlite = "pollypm.store.sqlalchemy_store:SQLAlchemyStore"
+postgres = "pollypm.store.backends.pg_store:PgStore"
 
 # Phase B (#397) — both providers extracted into their own packages.
 # Phase A shipped the substrate (Protocol + registry + legacy shims);

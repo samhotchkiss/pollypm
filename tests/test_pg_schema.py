@@ -25,11 +25,14 @@ import pytest
 
 def test_initial_migration_applies_cleanly(pg_schema_pool):
     from pollypm.storage.pg_migrations import apply_migrations
-    from pollypm.storage.pg_schema import all_table_names
+    from pollypm.storage.pg_schema import MIGRATIONS, all_table_names
 
     result = apply_migrations(pg_schema_pool)
     assert result.did_anything
-    assert [v for v, _ in result.applied] == [1]
+    # Slice I appended migration 0002; the applier walks every entry in
+    # ``MIGRATIONS`` so this list must match the registered versions
+    # rather than hard-coding ``[1]``.
+    assert [v for v, _ in result.applied] == [v for v, _, _ in MIGRATIONS]
 
     expected = set(all_table_names())
     with pg_schema_pool.connection() as conn, conn.cursor() as cur:
@@ -45,15 +48,19 @@ def test_migration_is_idempotent(pg_schema_pool):
     """Apply twice — the second pass must be a no-op."""
     from pollypm.storage.pg_migrations import apply_migrations
 
+    from pollypm.storage.pg_schema import MIGRATIONS
+
     first = apply_migrations(pg_schema_pool)
     assert first.did_anything
     second = apply_migrations(pg_schema_pool)
     assert not second.did_anything
-    assert [v for v, _ in second.already_applied] == [1]
+    assert [v for v, _ in second.already_applied] == [v for v, _, _ in MIGRATIONS]
 
 
 def test_schema_migrations_table_records_label(pg_schema_pool):
     from pollypm.storage.pg_migrations import apply_migrations
+
+    from pollypm.storage.pg_schema import MIGRATIONS
 
     apply_migrations(pg_schema_pool)
     with pg_schema_pool.connection() as conn, conn.cursor() as cur:
@@ -61,7 +68,7 @@ def test_schema_migrations_table_records_label(pg_schema_pool):
             "SELECT version, label FROM schema_migrations ORDER BY version"
         )
         rows = cur.fetchall()
-    assert rows == [(1, "0001_initial")]
+    assert rows == [(v, label) for v, label, _ in MIGRATIONS]
 
 
 def test_vector_extension_installed(pg_schema_pool):

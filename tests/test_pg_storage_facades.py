@@ -195,13 +195,17 @@ def test_pg_applied_schema_version_returns_max(pg_schema_pool, pg_config, tmp_pa
     from pollypm.storage.doctor_state_probes import applied_schema_version_ro
 
     # Both the sqlite ``schema_version`` and ``work_schema_version`` map
-    # to the unified ``schema_migrations`` table on pg.
+    # to the unified ``schema_migrations`` table on pg. The probe returns
+    # ``max(version)``, so this tracks whatever the head migration is.
+    from pollypm.storage.pg_schema import MIGRATIONS
+
+    expected_head = max(v for v, _, _ in MIGRATIONS)
     assert applied_schema_version_ro(
         tmp_path / "x.db", "schema_version", config=pg_config,
-    ) == 1
+    ) == expected_head
     assert applied_schema_version_ro(
         tmp_path / "x.db", "work_schema_version", config=pg_config,
-    ) == 1
+    ) == expected_head
 
 
 def test_pg_count_work_tasks(pg_schema_pool, pg_config, tmp_path):

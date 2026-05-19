@@ -539,52 +539,108 @@ def _build_project_pm_primer(
     inbox_titles: list[str] = []
     inbox_total = 0
     try:
+        from pollypm.cockpit_pg_aggregates import (
+            all_tasks_for_project,
+            all_tasks_grouped,
+            inbox_tasks_for_project,
+            inbox_tasks_grouped,
+            is_pg_backend,
+        )
         from pollypm.work import create_work_service
         from pollypm.work.inbox_view import inbox_tasks
         from pollypm.work.models import WorkStatus
 
-        db_path = project.path / ".pollypm" / "state.db"
-        if db_path.exists():
-            with create_work_service(
-                db_path=db_path, project_path=project.path,
-            ) as svc:
-                tasks = list(svc.list_tasks(project=project_key))
-                for task in tasks:
-                    status = task.work_status
-                    if status == WorkStatus.QUEUED:
-                        queued += 1
-                    elif status == WorkStatus.IN_PROGRESS:
-                        in_progress += 1
-                    elif status == WorkStatus.REVIEW:
-                        review += 1
-                    elif status == WorkStatus.DONE:
-                        done_recent += 1
-                inbox_items = inbox_tasks(svc, project=project_key)
-                inbox_total = len(inbox_items)
-                for task in inbox_items[:3]:
-                    title = (task.title or "").strip()
-                    if title:
-                        inbox_titles.append(f"{task.task_id}: {title}")
-                # Plan status — look for a plan_review or plan_approved
-                # marker in the task list. A project with at least one
-                # done plan task counts as approved; otherwise the plan
-                # is missing.
-                has_plan_done = any(
-                    "plan" in (t.labels or [])
-                    and t.work_status == WorkStatus.DONE
-                    for t in tasks
+        pg_tasks: list | None = None
+        pg_inbox: list | None = None
+        if is_pg_backend(supervisor.config):
+            all_grouped = all_tasks_grouped(supervisor.config)
+            inbox_grouped = inbox_tasks_grouped(supervisor.config)
+            if all_grouped is not None:
+                pg_tasks = all_tasks_for_project(
+                    all_grouped, supervisor.config, project_key,
                 )
-                has_plan_open = any(
-                    "plan_review" in (t.labels or [])
-                    or "plan" in (t.labels or [])
-                    for t in tasks
+            if inbox_grouped is not None:
+                pg_inbox = inbox_tasks_for_project(
+                    inbox_grouped, supervisor.config, project_key,
                 )
-                if has_plan_done:
-                    plan_status = "approved"
-                elif has_plan_open:
-                    plan_status = "in review"
-                else:
-                    plan_status = "missing"
+
+        if pg_tasks is not None and pg_inbox is not None:
+            tasks = pg_tasks
+            inbox_items = pg_inbox
+            for task in tasks:
+                status = task.work_status
+                if status == WorkStatus.QUEUED:
+                    queued += 1
+                elif status == WorkStatus.IN_PROGRESS:
+                    in_progress += 1
+                elif status == WorkStatus.REVIEW:
+                    review += 1
+                elif status == WorkStatus.DONE:
+                    done_recent += 1
+            inbox_total = len(inbox_items)
+            for task in inbox_items[:3]:
+                title = (task.title or "").strip()
+                if title:
+                    inbox_titles.append(f"{task.task_id}: {title}")
+            has_plan_done = any(
+                "plan" in (t.labels or [])
+                and t.work_status == WorkStatus.DONE
+                for t in tasks
+            )
+            has_plan_open = any(
+                "plan_review" in (t.labels or [])
+                or "plan" in (t.labels or [])
+                for t in tasks
+            )
+            if has_plan_done:
+                plan_status = "approved"
+            elif has_plan_open:
+                plan_status = "in review"
+            else:
+                plan_status = "missing"
+        else:
+            db_path = project.path / ".pollypm" / "state.db"
+            if db_path.exists():
+                with create_work_service(
+                    db_path=db_path, project_path=project.path,
+                ) as svc:
+                    tasks = list(svc.list_tasks(project=project_key))
+                    for task in tasks:
+                        status = task.work_status
+                        if status == WorkStatus.QUEUED:
+                            queued += 1
+                        elif status == WorkStatus.IN_PROGRESS:
+                            in_progress += 1
+                        elif status == WorkStatus.REVIEW:
+                            review += 1
+                        elif status == WorkStatus.DONE:
+                            done_recent += 1
+                    inbox_items = inbox_tasks(svc, project=project_key)
+                    inbox_total = len(inbox_items)
+                    for task in inbox_items[:3]:
+                        title = (task.title or "").strip()
+                        if title:
+                            inbox_titles.append(f"{task.task_id}: {title}")
+                    # Plan status — look for a plan_review or plan_approved
+                    # marker in the task list. A project with at least one
+                    # done plan task counts as approved; otherwise the plan
+                    # is missing.
+                    has_plan_done = any(
+                        "plan" in (t.labels or [])
+                        and t.work_status == WorkStatus.DONE
+                        for t in tasks
+                    )
+                    has_plan_open = any(
+                        "plan_review" in (t.labels or [])
+                        or "plan" in (t.labels or [])
+                        for t in tasks
+                    )
+                    if has_plan_done:
+                        plan_status = "approved"
+                    elif has_plan_open:
+                        plan_status = "in review"
+                    else:
+                        plan_status = "missing"
     except Exception:  # noqa: BLE001 — primer is best-effort
         pass
 
@@ -660,6 +716,22 @@ def _build_operator_primer(supervisor) -> str | None:
         inbox_tasks = None  # type: ignore[assignment]
         create_work_service = None  # type: ignore[assignment]
 
+    # Slice H (#1737): pg backend → one bulk query for every project's
+    # inbox slice. Loop below partitions in Python instead of opening N
+    # sqlite DBs.
+    from pollypm.cockpit_pg_aggregates import (
+        inbox_tasks_for_project,
+        inbox_tasks_grouped,
+        is_pg_backend,
+    )
+
+    pg_inbox_grouped: dict[str, list[object]] | None = None
+    pg_active_operator = is_pg_backend(supervisor.config)
+    if pg_active_operator:
+        pg_inbox_grouped = inbox_tasks_grouped(supervisor.config)
+        if pg_inbox_grouped is None:
+            pg_active_operator = False
+
     projects = getattr(supervisor.config, "projects", {}) or {}
     for project_key, project in projects.items():
         project_count += 1
@@ -671,6 +743,16 @@ def _build_operator_primer(supervisor) -> str | None:
                 "_", "-"
             )
         project_lines.append(f"  - {project_name}")
+        if pg_active_operator and pg_inbox_grouped is not None:
+            items = inbox_tasks_for_project(
+                pg_inbox_grouped, supervisor.config, project_key,
+            )
+            inbox_total += len(items)
+            for task in items[:2]:
+                title = (task.title or "").strip()
+                if title:
+                    inbox_titles.append((project_name, title))
+            continue
         if inbox_tasks is None or create_work_service is None:
             continue
         db_path = project.path / ".pollypm" / "state.db"
@@ -1823,6 +1905,14 @@ class CockpitRouter:
         ``rail_refresh`` worker and contended with route workers + pane
         loaders. The TTL collapses navigation-burst refreshes into a
         single sweep while keeping glyph staleness bounded.
+
+        Slice H decision (#1737): the TTL cache STAYS under both
+        backends. Under sqlite it remains the only thing keeping the
+        per-project fanout off the hot tick. Under pg the underlying
+        sweep collapses to one or two pool checkouts — strictly
+        cheaper, but redundant work across navigation-burst refreshes
+        is still wasted work, and the cache costs ~nothing to keep.
+        Slice K may revisit this when the sqlite path is gone.
         """
         cache_key = self._config_identity(config)
         now = time.monotonic()
@@ -1861,11 +1951,27 @@ class CockpitRouter:
     ) -> dict[str, ProjectStateRollup]:
         projects = getattr(config, "projects", {}) or {}
         rollups: dict[str, ProjectStateRollup] = {}
+
+        # Slice H (#1737): under pg, one bulk query feeds every
+        # per-project rollup. ``pg_all_grouped`` is None when the
+        # backend is sqlite (or pg is unreachable) — the per-project
+        # walk in :meth:`_project_tasks_for_rollup` then falls through
+        # to its legacy DB-resolution order.
+        from pollypm.cockpit_pg_aggregates import (
+            all_tasks_grouped,
+            is_pg_backend,
+        )
+
+        pg_all_grouped: dict[str, list[object]] | None = None
+        if is_pg_backend(config):
+            pg_all_grouped = all_tasks_grouped(config)
+
         for project_key, project in projects.items():
             tasks, plan_blocked = self._project_tasks_for_rollup(
                 str(project_key),
                 project,
                 config=config,
+                pg_all_grouped=pg_all_grouped,
             )
             rollup = rollup_project_state(
                 str(project_key),
@@ -1885,6 +1991,7 @@ class CockpitRouter:
         project: object,
         *,
         config: object,
+        pg_all_grouped: dict[str, list[object]] | None = None,
     ) -> tuple[list[object], bool]:
         project_path = getattr(project, "path", None)
         if not isinstance(project_path, Path):
@@ -1893,6 +2000,32 @@ class CockpitRouter:
         from pollypm.plan_presence import has_acceptable_plan
         from pollypm.work import create_work_service
         from pollypm.work.project_aliases import project_storage_aliases
+
+        # Slice H (#1737): pg fast path. The caller already paid for
+        # one bulk task fetch; partition it here and skip the sqlite
+        # candidate walk entirely.
+        #
+        # The plan-acceptability gate (#281) is intentionally skipped
+        # on the pg path until Slice B lands ``executions`` / context
+        # entry reads on :class:`PgWorkService` — those reads are what
+        # ``has_acceptable_plan`` consumes. Skipping is the same
+        # behaviour the sqlite path takes when ``enforce_plan`` is
+        # falsey, and Slice A's pg backend is a transitional flag the
+        # default sqlite config doesn't reach yet.
+        if pg_all_grouped is not None:
+            tasks: list = []
+            seen_ids: set[str] = set()
+            for alias in project_storage_aliases(config, project_key):
+                for task in pg_all_grouped.get(alias, []):
+                    tid = getattr(task, "task_id", None)
+                    if tid and tid in seen_ids:
+                        continue
+                    if is_notify_inbox_task(task):
+                        continue
+                    if tid:
+                        seen_ids.add(tid)
+                    tasks.append(task)
+            return tasks, False
 
         # #1542 — mirror the dashboard's DB-resolution order. Pre-#1542
         # the rail rollup only looked at the legacy per-project DB

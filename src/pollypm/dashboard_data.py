@@ -554,6 +554,26 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
             exc_info=True,
         )
         return 0
+
+    # Slice H (#1737): under the pg backend, one bulk query replaces
+    # the per-project sqlite open. Falls back to the sqlite walk on a
+    # pool / query failure.
+    from pollypm.cockpit_pg_aggregates import (
+        inbox_tasks_for_project,
+        inbox_tasks_grouped,
+        is_pg_backend,
+    )
+
+    if is_pg_backend(config):
+        grouped = inbox_tasks_grouped(config)
+        if grouped is not None:
+            total = 0
+            for project_key, project in getattr(config, "projects", {}).items():
+                if not getattr(project, "tracked", False):
+                    continue
+                total += len(inbox_tasks_for_project(grouped, config, project_key))
+            return total
+
     total = 0
     for project_key, project in getattr(config, "projects", {}).items():
         # Same invariant as recovery_prompt._pending_inbox_section
@@ -652,6 +672,13 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         )
         return []
 
+    # Slice H (#1737): one pg query replaces N per-project sqlite opens.
+    from pollypm.cockpit_pg_aggregates import (
+        inbox_tasks_for_project,
+        inbox_tasks_grouped,
+        is_pg_backend,
+    )
+
     now = datetime.now(UTC)
     seen_task_ids: set[str] = set()
     previews: list[InboxPreview] = []
@@ -667,6 +694,49 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
     if workspace_root is not None:
         workspace_path = Path(workspace_root)
         sources.append((None, "Workspace", workspace_path / ".pollypm" / "state.db", workspace_path))
+
+    pg_grouped: dict[str, list[object]] | None = None
+    pg_active = is_pg_backend(config)
+    if pg_active:
+        pg_grouped = inbox_tasks_grouped(config)
+        if pg_grouped is None:
+            pg_active = False
+
+    def _emit_preview(task: object, project_label: str) -> None:
+        if task.task_id in seen_task_ids:
+            return
+        seen_task_ids.add(task.task_id)
+        stamped = getattr(task, "updated_at", None) or getattr(task, "created_at", None)
+        if hasattr(stamped, "timestamp"):
+            age_seconds = max(0.0, now.timestamp() - float(stamped.timestamp()))
+        else:
+            try:
+                age_seconds = max(
+                    0.0,
+                    (now - datetime.fromisoformat(str(stamped))).total_seconds(),
+                )
+            except (ValueError, TypeError):
+                age_seconds = 0.0
+        previews.append(
+            InboxPreview(
+                sender=_inbox_sender(task),
+                title=(getattr(task, "title", "") or "(untitled)")[:80],
+                project=project_label,
+                task_id=task.task_id,
+                age_seconds=age_seconds,
+            )
+        )
+
+    if pg_active and pg_grouped is not None:
+        # Single in-memory partition + emit; no per-source DB opens.
+        for project_key, project_label, _db_path, _project_path in sources:
+            if not project_key:
+                # workspace-root source has no task rows under pg.
+                continue
+            for task in inbox_tasks_for_project(pg_grouped, config, project_key):
+                _emit_preview(task, project_label)
+        previews.sort(key=lambda item: item.age_seconds)
+        return previews[:limit]
 
     for project_key, project_label, db_path, project_path in sources:
         if not db_path.exists():

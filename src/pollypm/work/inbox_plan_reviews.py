@@ -44,6 +44,24 @@ def is_plan_task_approved(svc: Any, project: str, task_number: int) -> bool:
     return task_user_approval_is_approved(task)
 
 
+def _resolve_backend_name(config: object | None) -> str:
+    """Return the configured backend string, defaulting to ``"sqlite"``.
+
+    Mirrors :func:`pollypm.work.factory._resolve_backend` defensively
+    without importing the private symbol so callers (#1880) can pick
+    between shared-pg and per-sqlite paths without coupling.
+    """
+    if config is None:
+        return "sqlite"
+    storage = getattr(config, "storage", None)
+    if storage is None:
+        return "sqlite"
+    backend = getattr(storage, "backend", "sqlite")
+    if not isinstance(backend, str) or not backend.strip():
+        return "sqlite"
+    return backend.strip()
+
+
 def approved_plan_review_refs(
     *,
     refs_by_db: dict[str, set[tuple[str, int]]],
@@ -53,23 +71,25 @@ def approved_plan_review_refs(
 ) -> set[str]:
     """Return ``project/N`` refs whose plan-review task is already approved.
 
-    ``config`` is forwarded to the factory so the resolver routes to
-    the configured backend; without it the factory fell back to sqlite
-    even on a pg workspace, opening a stale ``state.db`` per project
-    refs ref-set (#1634).
+    Backend-aware (#1880):
+
+    * On Postgres every ``db_key`` resolves to the same pool, so a
+      single shared service handles every ref-set. We open it via
+      ``service_factory(config=config)``.
+    * On sqlite each ``db_key`` still maps to its own per-project
+      ``state.db``. The caller has already collected explicit
+      ``(db_path, project_path)`` pairs in ``project_db_paths``; we
+      walk them per ref-set so legacy per-project DBs are not bypassed.
     """
     if service_factory is None:
         from pollypm.work.factory import create_work_service
 
         service_factory = create_work_service
     approved_refs: set[str] = set()
-    # On the pg backend every db_key resolves to the same pool, so
-    # one shared svc handles every ref-set. On sqlite each db_key
-    # still maps to its own canonical workspace ``state.db`` (which
-    # the factory resolves identically per call), so the shared
-    # handle is also correct there.
+    backend = _resolve_backend_name(config)
+    use_shared = backend == "postgres" and config is not None
     shared_svc = None
-    if config is not None:
+    if use_shared:
         try:
             shared_svc = service_factory(config=config)
         except Exception:  # noqa: BLE001
@@ -83,7 +103,14 @@ def approved_plan_review_refs(
             svc = shared_svc
             opened_local = False
         else:
-            db_path, project_path = project_db_paths[db_key]
+            try:
+                db_path, project_path = project_db_paths[db_key]
+            except KeyError:
+                logger.debug(
+                    "inbox: no db_path for %s during plan-review check",
+                    db_key,
+                )
+                continue
             try:
                 svc = service_factory(
                     db_path=db_path,

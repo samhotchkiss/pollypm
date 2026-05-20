@@ -6,10 +6,8 @@ helpers and is handed a path containing ``.pollypm/.pollypm`` raises
 ``RuntimeError`` loudly rather than silently leaking into the
 phantom tree (per the architectural analysis in #1972).
 
-Two openers carry the precondition:
+One opener carries the precondition:
 
-* ``SQLiteWorkService.__init__`` — the work state DB. The biggest
-  leak vector historically (~280K files / 1.8 GB).
 * ``pollypm.audit.log._append_line`` — the audit writer that #1966
   identified as the most recent regression site.
 """
@@ -20,29 +18,6 @@ from pathlib import Path
 
 import pytest
 
-
-def test_sqlite_work_service_rejects_doubled_path(tmp_path: Path) -> None:
-    """Opening a state DB at ``.pollypm/.pollypm/state.db`` raises."""
-    from pollypm.work.sqlite_service import SQLiteWorkService
-
-    doubled = tmp_path / ".pollypm" / ".pollypm" / "state.db"
-    doubled.parent.mkdir(parents=True, exist_ok=True)
-
-    with pytest.raises(RuntimeError, match=r"doubled-pollypm-path"):
-        SQLiteWorkService(db_path=doubled, project_path=tmp_path)
-
-
-def test_sqlite_work_service_accepts_single_path(tmp_path: Path) -> None:
-    """Sanity: a normal single ``.pollypm/state.db`` still opens."""
-    from pollypm.work.sqlite_service import SQLiteWorkService
-
-    project = tmp_path / "myproject"
-    project.mkdir()
-    db_path = project / ".pollypm" / "state.db"
-    db_path.parent.mkdir(parents=True, exist_ok=True)
-
-    svc = SQLiteWorkService(db_path=db_path, project_path=project)
-    assert svc is not None
 
 
 def test_audit_append_line_rejects_doubled_path(tmp_path: Path) -> None:

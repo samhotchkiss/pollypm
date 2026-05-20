@@ -1691,13 +1691,19 @@ class PgWorkService:
                 if _is_cap_exceeded_error(exc) and target_status is (
                     WorkStatus.IN_PROGRESS
                 ):
-                    self._rollback_claim_to_queued(
+                    rollback_committed = self._rollback_claim_to_queued(
                         task.project,
                         task.task_number,
                         node_id,
                         actor,
                         exc,
                     )
+                    if rollback_committed:
+                        # #1953 — refetch so the caller sees the
+                        # rolled-back row (queued, abandoned execution)
+                        # instead of the stale in_progress snapshot
+                        # captured pre-provisioning.
+                        result = self.get(task_id)
         return result
 
     def _rollback_claim_to_queued(
@@ -1707,7 +1713,7 @@ class PgWorkService:
         node_id: str,
         actor: str,
         exc: BaseException,
-    ) -> None:
+    ) -> bool:
         """Revert an in_progress claim back to queued (#1906).
 
         Postgres counterpart of
@@ -1715,6 +1721,11 @@ class PgWorkService:
         a failed rollback is logged so the operator still sees
         ``last_provision_error`` and can run ``pm task release``
         manually rather than silently wedging the task.
+
+        Returns ``True`` when the rollback committed so ``claim()`` can
+        refetch the queued row instead of returning the stale
+        in_progress snapshot it captured before provisioning fired
+        (#1953). ``False`` on rollback failure.
         """
         now = _now_iso()
         try:
@@ -1761,12 +1772,14 @@ class PgWorkService:
                 "post-commit provision failure (%s)",
                 project, task_number, exc,
             )
+            return True
         except Exception as rollback_exc:  # noqa: BLE001
             logger.warning(
                 "claim rollback failed for %s/%d: %s (task remains "
                 "in_progress; operator must release manually)",
                 project, task_number, rollback_exc,
             )
+            return False
 
     def next(  # noqa: A003
         self,

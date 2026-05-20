@@ -35,18 +35,31 @@ The migration PRs (PR 2 + PR 3 under #1972) shrink the baseline
 counts to zero. Once everything's zero, this test enforces "no
 raw joins, ever."
 
-Exclusion list
---------------
-The gate is intentionally strict. The only allowed call sites are:
+Line-scoped allowlist (PR 4 under #1972)
+----------------------------------------
+Two files legitimately need ``.pollypm`` joins to define the
+helpers + the canonical constant. **Previously** the gate excluded
+those files wholesale, so any future operational join hidden inside
+them slipped past the ratchet — Sam's review on PR #2003 / #2004
+found exactly that footgun (3 ops joins outside the helper surface).
 
-* ``src/pollypm/projects.py`` — the helper module itself defines
-  ``_resolve_pollypm_root`` and the typed helpers, all of which
-  construct the ``.pollypm`` segment internally. This is the one
-  legitimate constructor.
-* ``src/pollypm/config.py`` — defines ``GLOBAL_CONFIG_DIR =
-  Path.home() / ".pollypm"``, the canonical source of truth that
-  the resolver and helpers reference. Allowed at the constant
-  definition only; other joins in this file should use the helpers.
+The gate now scopes the allowance per-line, not per-file:
+
+* ``src/pollypm/config.py`` — the **only** allowed line is the
+  module-level ``GLOBAL_CONFIG_DIR = Path.home() / ".pollypm"``
+  constant at module top. Any other join in this file is treated
+  exactly like a join in any other file: counted against the
+  ratchet, fails the gate.
+* ``src/pollypm/projects.py`` — joins are allowed **only** inside
+  the typed-helper surface (``_resolve_pollypm_root`` and the
+  ``project_*`` helpers funnelled through it). Joins anywhere
+  else in the file (module-level, inside an unrelated function,
+  inside a future helper that bypasses the resolver) fail the gate.
+
+The allowlist is keyed off the Python AST: a join is allowed if
+its line is inside a function whose name appears in
+``_ALLOWED_FUNCTIONS[<filename>]``, OR if its line matches one of
+``_ALLOWED_LINE_PATTERNS[<filename>]`` for module-level constants.
 
 Per-line escape hatch
 ---------------------
@@ -59,6 +72,7 @@ where no project root exists).
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 
@@ -74,15 +88,92 @@ _SRC_ROOT = _REPO_ROOT / "src" / "pollypm"
 # matching the string ``".pollypm"`` in comments / docstrings.
 _BAN_PATTERN = re.compile(r'/\s*"\.pollypm"')
 
-# Files that ARE allowed to construct the ``.pollypm`` segment — see
-# module docstring for rationale.
-_ALLOWED_FILES = {
-    "projects.py",  # typed helpers + resolver
-    "config.py",    # GLOBAL_CONFIG_DIR constant
-}
-
 # Per-line escape hatch.
 _NOQA_PRAGMA = "noqa: pollypm-path-join"
+
+
+# ---------------------------------------------------------------------------
+# Line-scoped allowlist (PR 4 under #1972).
+#
+# Allowlist keys are filename (NOT full path) so the package can move on
+# disk without breaking the gate. Match is restricted to files directly
+# under ``src/pollypm/`` to avoid third-party plugin shadowing.
+#
+# ``_ALLOWED_FUNCTIONS[<filename>]`` — set of function names. A join is
+# allowed if its line falls inside one of these functions' AST span.
+#
+# ``_ALLOWED_LINE_PATTERNS[<filename>]`` — list of compiled regexes. A
+# join is allowed if its line matches at least one pattern AND lives at
+# module scope (not inside any function).
+# ---------------------------------------------------------------------------
+
+# Functions in ``projects.py`` that legitimately construct ``.pollypm``
+# segments. ``_resolve_pollypm_root`` is the single physical join; the
+# typed helpers below it chain through the resolver (so the doubled-path
+# guard fires) but textually their bodies contain
+# ``.../ "<subdir>"`` joins built off the resolver's result — those are
+# the legitimate constructors of the typed surface. We list each helper
+# explicitly so a future helper added without going through the resolver
+# (i.e. one that joins ``.pollypm`` raw) lands outside this set and
+# fails the gate.
+_PROJECTS_ALLOWED_FUNCTIONS = frozenset({
+    "_resolve_pollypm_root",
+    "project_pollypm_dir",
+    "project_instruction_dir",
+    "project_instruction_file",
+    "project_dossier_dir",
+    "project_logs_dir",
+    "project_artifacts_dir",
+    "project_checkpoints_dir",
+    "project_worktrees_dir",
+    "project_transcripts_dir",
+    "project_state_db_path",
+    "project_audit_log_path",
+    "project_advisor_log_path",
+    "project_plugins_dir",
+    "project_gates_dir",
+    "project_flows_dir",
+    "project_rules_dir",
+    "project_magic_dir",
+    "project_config_dir",
+    "project_docs_dir",
+    "project_content_dir",
+    "project_inbox_dir",
+    "project_worker_markers_dir",
+    "project_session_markers_dir",
+    "project_system_prompts_dir",
+    "project_project_guides_dir",
+    "project_control_prompts_dir",
+    "global_pollypm_dir",
+})
+
+_ALLOWED_FUNCTIONS: dict[str, frozenset[str]] = {
+    "projects.py": _PROJECTS_ALLOWED_FUNCTIONS,
+    # config.py: NO functions are allowlisted. Any join inside a
+    # function in config.py is a regression. The only legitimate
+    # join is the module-level GLOBAL_CONFIG_DIR constant, handled
+    # below.
+    "config.py": frozenset(),
+}
+
+# Module-level join patterns that are allowlisted in each file.
+# These are constants (not function bodies). Any other module-level
+# join in these files fails the gate.
+_ALLOWED_LINE_PATTERNS: dict[str, tuple[re.Pattern[str], ...]] = {
+    "config.py": (
+        # GLOBAL_CONFIG_DIR is the canonical source-of-truth constant
+        # the resolver + helpers reference. This line is THE definition.
+        re.compile(r'^\s*GLOBAL_CONFIG_DIR\s*=\s*Path\.home\(\)\s*/\s*"\.pollypm"\s*$'),
+    ),
+    "projects.py": (
+        # PROJECT_INSTRUCTIONS_TEMPLATE points at the repo-rooted
+        # template under the package install tree; not a project root.
+        re.compile(
+            r'^\s*PROJECT_INSTRUCTIONS_TEMPLATE\s*=\s*Path\(__file__\)\.resolve\(\)'
+            r'\.parents\[2\]\s*/\s*"\.pollypm"\s*/\s*"INSTRUCT\.md"\s*$'
+        ),
+    ),
+}
 
 
 # ---------------------------------------------------------------------------
@@ -115,46 +206,147 @@ def _iter_src_files() -> list[Path]:
     return sorted(_SRC_ROOT.rglob("*.py"))
 
 
-def _is_excluded(path: Path) -> bool:
-    """Return True for files allowed to construct ``.pollypm`` joins.
+def _docstring_line_ranges(tree: ast.AST) -> set[int]:
+    """Return all line numbers that fall inside a docstring.
 
-    Exclusion is by filename, not full path, because the helper file
-    is ``pollypm/projects.py`` regardless of where the package lives
-    on disk. ``config.py`` likewise.
+    Docstrings appear textually in the source but contain example
+    syntax that may match our ban pattern (see
+    ``global_pollypm_dir.__doc__`` for the canonical case). We drop
+    those lines from the offender list so callers don't have to
+    sprinkle ``# noqa`` on documentation prose.
     """
-    if path.name not in _ALLOWED_FILES:
-        return False
-    # Sanity check the file lives directly under ``src/pollypm/``,
-    # not a third-party plugin shadowing the name.
-    return path.parent == _SRC_ROOT
+    docstring_lines: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(
+            node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+        ):
+            continue
+        body = getattr(node, "body", None)
+        if not body:
+            continue
+        first = body[0]
+        if not isinstance(first, ast.Expr):
+            continue
+        value = first.value
+        if not isinstance(value, ast.Constant) or not isinstance(value.value, str):
+            continue
+        start = first.lineno
+        end = getattr(first, "end_lineno", start) or start
+        for lineno in range(start, end + 1):
+            docstring_lines.add(lineno)
+    return docstring_lines
+
+
+def _function_spans(tree: ast.AST) -> list[tuple[str, int, int]]:
+    """Return ``(qualname, start_lineno, end_lineno)`` for every function.
+
+    Uses the simple function name (NOT a dotted qualname) because the
+    allowlist keys on the function name itself. If two functions share
+    a name (e.g. a nested helper), both spans are returned and either
+    can match.
+    """
+    spans: list[tuple[str, int, int]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        end = getattr(node, "end_lineno", node.lineno) or node.lineno
+        spans.append((node.name, node.lineno, end))
+    return spans
+
+
+def _enclosing_function(
+    spans: list[tuple[str, int, int]], lineno: int
+) -> str | None:
+    """Return the innermost function name enclosing ``lineno``, or None."""
+    candidates = [
+        (name, start, end)
+        for name, start, end in spans
+        if start <= lineno <= end
+    ]
+    if not candidates:
+        return None
+    # Innermost = the span with the latest start that still contains lineno.
+    candidates.sort(key=lambda t: t[1])
+    return candidates[-1][0]
+
+
+def _is_allowed_line(filename: str, line: str, enclosing_func: str | None) -> bool:
+    """Return True if this offending line is in the per-file allowlist."""
+    # Inside an allowlisted function?
+    allowed_funcs = _ALLOWED_FUNCTIONS.get(filename, frozenset())
+    if enclosing_func is not None and enclosing_func in allowed_funcs:
+        return True
+    # Module-level allowlisted pattern? Only valid OUTSIDE any function.
+    if enclosing_func is None:
+        for pattern in _ALLOWED_LINE_PATTERNS.get(filename, ()):
+            if pattern.match(line):
+                return True
+    return False
 
 
 def _find_offending_lines(path: Path) -> list[tuple[int, str]]:
+    """Return ``(lineno, line)`` pairs that fail the gate for ``path``.
+
+    Filters applied in order:
+
+    1. Line must contain ``/ ".pollypm"`` (the ban pattern).
+    2. Line not tagged ``# noqa: pollypm-path-join``.
+    3. Line not a comment-only line (starts with ``#``).
+    4. Line not inside a docstring (resolved via AST).
+    5. Line not in the per-file allowlist (``_ALLOWED_FUNCTIONS`` /
+       ``_ALLOWED_LINE_PATTERNS``).
+    """
     out: list[tuple[int, str]] = []
     try:
         text = path.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError):
         return out
+
+    # Parse the AST once so we can resolve docstrings + enclosing
+    # function for each candidate line.
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        # If the file doesn't parse, we can't apply the AST-driven
+        # filters. Fall back to the regex-only check so we don't
+        # silently let the file off the hook.
+        tree = None
+
+    docstring_lines = _docstring_line_ranges(tree) if tree is not None else set()
+    func_spans = _function_spans(tree) if tree is not None else []
+    filename = path.name
+    file_in_allowlist = (
+        filename in _ALLOWED_FUNCTIONS or filename in _ALLOWED_LINE_PATTERNS
+    ) and path.parent == _SRC_ROOT
+
     for lineno, line in enumerate(text.splitlines(), start=1):
         if not _BAN_PATTERN.search(line):
             continue
-        # Skip if the line carries the noqa escape hatch.
         if _NOQA_PRAGMA in line:
             continue
-        # Skip comment-only lines (docstrings are harder to detect
-        # without parsing; rely on the noqa pragma for those).
         stripped = line.lstrip()
         if stripped.startswith("#"):
             continue
+        if lineno in docstring_lines:
+            continue
+        if file_in_allowlist:
+            enclosing = _enclosing_function(func_spans, lineno)
+            if _is_allowed_line(filename, line, enclosing):
+                continue
         out.append((lineno, line.rstrip()))
     return out
 
 
 def _current_counts() -> dict[str, int]:
+    """Return ``{relative_path: offender_count}`` for files with offenders.
+
+    NOTE: with the line-scoped allowlist (PR 4), even files in
+    ``_ALLOWED_FUNCTIONS`` / ``_ALLOWED_LINE_PATTERNS`` can appear
+    here if they contain joins outside the allowlisted surface. The
+    whole-file exclusion is gone.
+    """
     counts: dict[str, int] = {}
     for path in _iter_src_files():
-        if _is_excluded(path):
-            continue
         n = len(_find_offending_lines(path))
         if n:
             rel = str(path.relative_to(_REPO_ROOT))
@@ -216,11 +408,11 @@ def test_lint_gate_ratchet() -> None:
 def test_helper_module_only_internal_joins() -> None:
     """The helper module is the ONLY constructor of ``.pollypm``.
 
-    Sanity-check the exclusion list: the helper file must still
-    contain the joins (otherwise the helpers can't construct
-    paths), and ``config.py`` must still define ``GLOBAL_CONFIG_DIR``.
-    If a future refactor moves the resolver elsewhere, this test
-    catches the drift so the exclusion list gets updated.
+    Sanity-check the allowlist: the helper file must still contain
+    the joins (otherwise the helpers can't construct paths), and
+    ``config.py`` must still define ``GLOBAL_CONFIG_DIR``. If a
+    future refactor moves the resolver elsewhere, this test catches
+    the drift so the allowlist gets updated.
     """
     helpers = _SRC_ROOT / "projects.py"
     config = _SRC_ROOT / "config.py"
@@ -228,13 +420,13 @@ def test_helper_module_only_internal_joins() -> None:
     helpers_text = helpers.read_text(encoding="utf-8")
     assert "_resolve_pollypm_root" in helpers_text, (
         f"{helpers}: expected to host _resolve_pollypm_root (helper module). "
-        "If this moved, update _ALLOWED_FILES in this test."
+        "If this moved, update _ALLOWED_FUNCTIONS in this test."
     )
     assert 'GLOBAL_CONFIG_DIR = Path.home() / ".pollypm"' in (
         config.read_text(encoding="utf-8")
     ), (
         f"{config}: expected to define GLOBAL_CONFIG_DIR. "
-        "If this moved, update _ALLOWED_FILES in this test."
+        "If this moved, update _ALLOWED_LINE_PATTERNS in this test."
     )
 
 
@@ -267,3 +459,223 @@ def test_inline_join_without_pragma_caught(tmp_path: Path) -> None:
         f"Expected gate to catch raw join but got: {offenders}"
     )
     assert offenders[0][0] == 1
+
+
+# ---------------------------------------------------------------------------
+# Line-scoped allowlist regression tests (PR 4 under #1972).
+#
+# Sam's review on #2003 / #2004 found 3 operational joins hiding
+# inside whole-file-excluded ``config.py`` / ``projects.py``. These
+# tests pin that the new line-scoped allowlist actually catches the
+# class of leak — without them, future refactors could re-introduce
+# whole-file behaviour and the gate would silently shrink coverage.
+# ---------------------------------------------------------------------------
+
+
+def _write_pkg(tmp_path: Path, **files: str) -> Path:
+    """Build a fake ``src/pollypm/`` under ``tmp_path`` for the gate to scan."""
+    src_root = tmp_path / "src" / "pollypm"
+    src_root.mkdir(parents=True)
+    for name, content in files.items():
+        (src_root / name).write_text(content)
+    return src_root
+
+
+def _scan_pkg(src_root: Path) -> dict[str, list[tuple[int, str]]]:
+    """Mirror ``_find_offending_lines`` over a custom ``src/pollypm/`` root."""
+    out: dict[str, list[tuple[int, str]]] = {}
+    for path in sorted(src_root.rglob("*.py")):
+        offenders = _find_offending_lines_with_root(path, src_root)
+        if offenders:
+            out[path.name] = offenders
+    return out
+
+
+def _find_offending_lines_with_root(
+    path: Path, src_root: Path
+) -> list[tuple[int, str]]:
+    """Variant of ``_find_offending_lines`` that uses ``src_root`` for the
+    allowlist parent-dir check. Lets the regression tests drop a fake
+    ``config.py`` / ``projects.py`` under a tmp path and have the gate
+    treat them as if they lived under the real ``src/pollypm/``.
+    """
+    out: list[tuple[int, str]] = []
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return out
+    try:
+        tree = ast.parse(text, filename=str(path))
+    except SyntaxError:
+        tree = None
+    docstring_lines = _docstring_line_ranges(tree) if tree is not None else set()
+    func_spans = _function_spans(tree) if tree is not None else []
+    filename = path.name
+    file_in_allowlist = (
+        filename in _ALLOWED_FUNCTIONS or filename in _ALLOWED_LINE_PATTERNS
+    ) and path.parent == src_root
+    for lineno, line in enumerate(text.splitlines(), start=1):
+        if not _BAN_PATTERN.search(line):
+            continue
+        if _NOQA_PRAGMA in line:
+            continue
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        if lineno in docstring_lines:
+            continue
+        if file_in_allowlist:
+            enclosing = _enclosing_function(func_spans, lineno)
+            if _is_allowed_line(filename, line, enclosing):
+                continue
+        out.append((lineno, line.rstrip()))
+    return out
+
+
+def test_config_py_allows_only_global_config_dir_constant(tmp_path: Path) -> None:
+    """``config.py`` allowlist is line-scoped to the GLOBAL_CONFIG_DIR constant.
+
+    A module-level ``base_dir = root / ".pollypm"`` (the exact shape of
+    the line the previous whole-file exclusion hid in PR #2003) must
+    fail the gate.
+    """
+    src_root = _write_pkg(
+        tmp_path,
+        **{
+            "config.py": (
+                'from pathlib import Path\n'
+                'GLOBAL_CONFIG_DIR = Path.home() / ".pollypm"\n'
+                'def _build_example_config(root):\n'
+                '    base_dir = root / ".pollypm"\n'  # operational join — must fail
+                '    return base_dir\n'
+            ),
+        },
+    )
+    offenders = _scan_pkg(src_root)
+    assert "config.py" in offenders, (
+        "Expected the operational join inside _build_example_config "
+        "to fail the gate, but config.py reported zero offenders."
+    )
+    # The GLOBAL_CONFIG_DIR line must NOT count as an offender.
+    flagged_linenos = {ln for ln, _ in offenders["config.py"]}
+    assert 4 in flagged_linenos, (
+        f"Expected line 4 (`base_dir = root / \".pollypm\"`) to be "
+        f"flagged. Got: {offenders['config.py']}"
+    )
+    assert 2 not in flagged_linenos, (
+        f"Expected line 2 (GLOBAL_CONFIG_DIR) to be allowlisted. "
+        f"Got: {offenders['config.py']}"
+    )
+
+
+def test_config_py_module_level_non_global_join_fails(tmp_path: Path) -> None:
+    """A module-level join in config.py that isn't GLOBAL_CONFIG_DIR fails.
+
+    Closes the "rename the constant, keep the join" footgun: the
+    allowlist pattern matches the LHS too, so a future
+    ``SOMETHING_ELSE = Path.home() / ".pollypm"`` is caught.
+    """
+    src_root = _write_pkg(
+        tmp_path,
+        **{
+            "config.py": (
+                'from pathlib import Path\n'
+                'OTHER_DIR = Path.home() / ".pollypm"\n'
+            ),
+        },
+    )
+    offenders = _scan_pkg(src_root)
+    assert "config.py" in offenders, (
+        "Expected a module-level join with a non-GLOBAL_CONFIG_DIR LHS "
+        "to fail the gate."
+    )
+
+
+def test_projects_py_join_outside_helper_function_fails(tmp_path: Path) -> None:
+    """``projects.py`` allowlist is line-scoped to the typed-helper surface.
+
+    A raw ``project.path / ".pollypm" / "state.db"`` inside a non-helper
+    function (the shape of the line PR #2003 migrated at projects.py:796)
+    must fail the gate.
+    """
+    src_root = _write_pkg(
+        tmp_path,
+        **{
+            "projects.py": (
+                'from pathlib import Path\n'
+                'def _resolve_pollypm_root(p):\n'
+                '    return p / ".pollypm"\n'  # allowed (inside helper)
+                'def rename_project_slug(project):\n'
+                '    work_db = project.path / ".pollypm" / "state.db"\n'  # must fail
+                '    return work_db\n'
+            ),
+        },
+    )
+    offenders = _scan_pkg(src_root)
+    assert "projects.py" in offenders, (
+        "Expected the operational join inside rename_project_slug() "
+        "to fail the gate, but projects.py reported zero offenders."
+    )
+    flagged_linenos = {ln for ln, _ in offenders["projects.py"]}
+    assert 5 in flagged_linenos, (
+        f"Expected line 5 (work_db = ...) to be flagged. "
+        f"Got: {offenders['projects.py']}"
+    )
+    assert 3 not in flagged_linenos, (
+        f"Expected line 3 (inside _resolve_pollypm_root) to be "
+        f"allowlisted. Got: {offenders['projects.py']}"
+    )
+
+
+def test_projects_py_join_in_new_unlisted_helper_fails(tmp_path: Path) -> None:
+    """A new ``project_*`` helper not in the allowlist still fails.
+
+    A future helper added without going through the resolver (i.e. one
+    that builds the ``.pollypm`` segment raw instead of chaining
+    through ``_resolve_pollypm_root``) lands outside the allowlist
+    and fails. This guards against drift where someone adds a helper
+    that *looks* like a typed helper but skips the doubled-path
+    resolver.
+    """
+    src_root = _write_pkg(
+        tmp_path,
+        **{
+            "projects.py": (
+                'from pathlib import Path\n'
+                'def project_some_new_thing(p):\n'
+                '    return p / ".pollypm" / "new-thing"\n'  # not in allowlist
+            ),
+        },
+    )
+    offenders = _scan_pkg(src_root)
+    assert "projects.py" in offenders, (
+        "Expected a join in a non-allowlisted project_* helper to "
+        "fail the gate."
+    )
+
+
+def test_projects_py_docstring_join_does_not_trip_gate(tmp_path: Path) -> None:
+    """Docstring prose containing ``.pollypm`` joins is not flagged.
+
+    ``global_pollypm_dir`` and friends document their behaviour with
+    code-shaped prose like ``Path.home() / ".pollypm"``. Those are
+    docs, not joins, and must not count.
+    """
+    src_root = _write_pkg(
+        tmp_path,
+        **{
+            "projects.py": (
+                'from pathlib import Path\n'
+                'def global_pollypm_dir():\n'
+                '    """Wrapper.\n'
+                '\n'
+                '    Example: ``Path.home() / ".pollypm"`` is what this returns.\n'
+                '    """\n'
+                '    return None\n'
+            ),
+        },
+    )
+    offenders = _scan_pkg(src_root)
+    assert "projects.py" not in offenders, (
+        f"Docstring text should not trip the gate, but got: {offenders}"
+    )

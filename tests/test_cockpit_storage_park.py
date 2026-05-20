@@ -11,16 +11,20 @@ wipe surface was reachable through those paths.
 
 These tests pin the contract of :func:`safe_break_pane_to_storage`:
 
-* Live duplicate in storage → break-pane is skipped, the source pane
-  is killed (no orphan pile-up), the audit fires, and the helper
-  returns ``False`` so callers can branch.
+* Live duplicate in storage → the duplicate is treated as a stale
+  ORPHAN (the cockpit pane being parked is by construction the
+  user's active mount).  The orphan is killed, ``break-pane`` runs,
+  audit fires with ``cockpit.park_killed_orphan``, helper returns
+  ``True``.  See #1994 — the original "skip break-pane and kill the
+  cockpit pane" policy wiped Sam's live architect chat on every
+  rail-navigation and back.
 * Dead duplicates → killed before break-pane so the freshly-parked
   pane re-occupies the canonical name.
 * No duplicates → unconditional break-pane.
 
 The smoking-gun scenario from Sam's 2026-05-19 wipe (architect-samblog
 duplicated at indices 22 and 42 in the closet) is reproduced as
-``test_safe_break_does_not_add_third_when_two_duplicates_exist``.
+``test_safe_break_kills_all_live_orphans_when_two_duplicates_exist``.
 """
 
 from __future__ import annotations
@@ -124,12 +128,19 @@ def test_safe_break_unconditional_when_no_existing_window() -> None:
     assert [w.name for w in tmux.windows] == ["architect-samblog"]
 
 
-def test_safe_break_skipped_when_live_duplicate_exists() -> None:
-    """Live duplicate → helper refuses to break-pane.
+def test_safe_break_kills_orphan_when_live_duplicate_exists() -> None:
+    """Live duplicate → helper kills the orphan and breaks the pane.
 
-    This is the #1631 wipe surface: parking on top of an existing live
-    window would silently double the canonical name and the next mount
-    would land on the wrong one.
+    #1994 — Sam's verbatim bug: ``I was talking with the Sam blog
+    architect.  I click into a different area on the rail.  I click
+    back to the Sam blog architect, and it's a new goddamn
+    conversation.``  The cockpit pane (``%99`` here) is the user's
+    active mount — they were just typing into it.  The storage
+    window with the same canonical name is a stale orphan from a
+    prior session.  Old behaviour: refuse break-pane and kill ``%99``
+    (wiping Sam's live chat).  New behaviour: kill the orphan,
+    break-pane our active mount into storage so the next mount picks
+    up the real conversation.
     """
     existing = _FakeWindow(22, "architect-samblog", command="claude")
     tmux = _FakeTmux(windows=[existing])
@@ -144,22 +155,34 @@ def test_safe_break_skipped_when_live_duplicate_exists() -> None:
         subject="architect_samblog",
     )
 
-    assert broke is False
-    assert tmux.break_calls == []
-    # Source pane was killed so it doesn't orphan in the cockpit.
-    assert tmux.kill_pane_calls == ["%99"]
-    # Storage closet still has exactly one architect-samblog window.
+    assert broke is True
+    # The orphan was killed BEFORE the break-pane so the canonical
+    # name was available.
+    assert tmux.kill_window_calls == ["pollypm-storage-closet:22"]
+    # The cockpit's live mount was broken into storage under the
+    # canonical name — the user's conversation is preserved.
+    assert tmux.break_calls == [
+        ("%99", "pollypm-storage-closet", "architect-samblog")
+    ]
+    # The helper must NEVER kill the source pane in the live-duplicate
+    # branch — that was the #1994 regression surface.
+    assert tmux.kill_pane_calls == []
+    # Storage closet still has exactly one architect-samblog window
+    # (the freshly broken-in cockpit pane).
     same_name = [w for w in tmux.windows if w.name == "architect-samblog"]
     assert len(same_name) == 1
-    # Audit captures the skip with the duplicate's index.
+    # Audit captures the orphan kill with the duplicate's index.
     assert len(audit_events) == 1
     event = audit_events[0]
-    assert event["event_name"] == "cockpit.park_skipped_existing"
+    assert event["event_name"] == "cockpit.park_killed_orphan"
     assert event["status"] == "warn"
     assert event["metadata"]["live_duplicate_indices"] == [22]
     assert event["metadata"]["window_name"] == "architect-samblog"
     assert event["metadata"]["storage_session"] == "pollypm-storage-closet"
     assert event["metadata"]["subject"] == "architect_samblog"
+    assert event["metadata"]["reason"] == (
+        "killed_orphan_to_preserve_active_mount"
+    )
 
 
 def test_safe_break_kills_dead_duplicates_then_breaks() -> None:
@@ -189,13 +212,20 @@ def test_safe_break_kills_dead_duplicates_then_breaks() -> None:
     assert audit_events == []  # No skip event for the dead-only case.
 
 
-def test_safe_break_does_not_add_third_when_two_duplicates_exist() -> None:
-    """Smoking gun from Sam's 2026-05-19 wipe.
+def test_safe_break_kills_all_live_orphans_when_two_duplicates_exist() -> None:
+    """Two live orphans → both killed before break-pane.
 
     The storage closet already had two ``architect-samblog`` windows
-    (indices 22 and 42) when the user clicked away from PM Chat.  A
-    naive break-pane would push the count to three.  The helper must
-    refuse and leave the closet exactly as it found it.
+    (indices 22 and 42) when the user clicked away from PM Chat.
+    Both are stale orphans (the user can only be conversing with one
+    pane at a time, and that pane is ``%5099`` — the cockpit mount).
+    The helper must kill both orphans and break-pane the cockpit
+    mount into storage under the canonical name so the next mount
+    finds exactly one ``architect-samblog`` window holding the
+    user's actual conversation.
+
+    Pre-#1994 behaviour: refuse to break and kill ``%5099``,
+    wiping the user's live conversation.
     """
     tmux = _FakeTmux(
         windows=[
@@ -214,15 +244,27 @@ def test_safe_break_does_not_add_third_when_two_duplicates_exist() -> None:
         subject="architect_samblog",
     )
 
-    assert broke is False
-    assert tmux.break_calls == []
-    assert tmux.kill_pane_calls == ["%5099"]
+    assert broke is True
+    # Both orphans killed before the break-pane.
+    assert tmux.kill_window_calls == [
+        "pollypm-storage-closet:22",
+        "pollypm-storage-closet:42",
+    ]
+    # The cockpit mount was broken in under the canonical name.
+    assert tmux.break_calls == [
+        ("%5099", "pollypm-storage-closet", "architect-samblog")
+    ]
+    # The user's source pane was NEVER killed — the conversation is
+    # preserved inside the broken-out window.
+    assert tmux.kill_pane_calls == []
     same_name = [w for w in tmux.windows if w.name == "architect-samblog"]
-    assert len(same_name) == 2, (
-        "Helper must NOT add a third architect-samblog window — that's "
-        "the #1631 conversation-wipe surface"
+    assert len(same_name) == 1, (
+        "After the park, storage must have exactly one architect-"
+        "samblog window — the one holding the user's actual "
+        "conversation (the broken-in cockpit mount)"
     )
     assert len(audit_events) == 1
+    assert audit_events[0]["event_name"] == "cockpit.park_killed_orphan"
     assert audit_events[0]["metadata"]["live_duplicate_indices"] == [22, 42]
 
 
@@ -231,8 +273,9 @@ def test_safe_break_treats_version_string_command_as_live() -> None:
 
     The Claude CLI reports its version string (e.g. ``2.1.144``) as the
     pane command after the first turn.  The helper must treat such
-    panes as live so the user's first-turn-completed conversation
-    isn't classified as dead and silently duplicated.
+    panes as live so a first-turn-completed orphan is recognised and
+    killed (rather than mistaken for a dead window and only re-occupied
+    on top of).
     """
     existing = _FakeWindow(22, "architect-samblog", command="2.1.144")
     tmux = _FakeTmux(windows=[existing])
@@ -247,10 +290,13 @@ def test_safe_break_treats_version_string_command_as_live() -> None:
         subject="architect_samblog",
     )
 
-    assert broke is False
-    assert tmux.break_calls == []
+    assert broke is True
+    assert tmux.kill_window_calls == ["pollypm-storage-closet:22"]
+    assert tmux.break_calls == [
+        ("%99", "pollypm-storage-closet", "architect-samblog")
+    ]
     assert len(audit_events) == 1
-    assert audit_events[0]["event_name"] == "cockpit.park_skipped_existing"
+    assert audit_events[0]["event_name"] == "cockpit.park_killed_orphan"
 
 
 def test_safe_break_swallows_list_windows_errors() -> None:
@@ -282,7 +328,12 @@ def test_safe_break_swallows_list_windows_errors() -> None:
 
 
 def test_safe_break_audit_callback_is_optional() -> None:
-    """Helper must work without an audit callback (low-level callers)."""
+    """Helper must work without an audit callback (low-level callers).
+
+    With #1994's policy reversal, a missing audit callback still
+    causes the orphan to be killed and break-pane to proceed; the
+    audit emit is best-effort and silent without a callback.
+    """
     existing = _FakeWindow(22, "pm-operator", command="claude")
     tmux = _FakeTmux(windows=[existing])
 
@@ -293,6 +344,66 @@ def test_safe_break_audit_callback_is_optional() -> None:
         window_name="pm-operator",
     )
 
-    assert broke is False
-    assert tmux.break_calls == []
-    assert tmux.kill_pane_calls == ["%99"]
+    assert broke is True
+    assert tmux.kill_window_calls == ["pollypm-storage-closet:22"]
+    assert tmux.break_calls == [
+        ("%99", "pollypm-storage-closet", "pm-operator")
+    ]
+    assert tmux.kill_pane_calls == []
+
+
+def test_safe_break_preserves_active_mount_across_rail_navigation() -> None:
+    """#1994 regression: rail nav must NOT wipe the user's chat.
+
+    Reproduces Sam's verbatim bug (2026-05-20):
+
+        I was talking with the Sam blog architect.  I click into a
+        different area on the rail.  I click back to the Sam blog
+        architect, and it's a new goddamn conversation.
+
+    Pre-condition: the storage closet has a stale ``architect-samblog``
+    orphan from a prior cockpit lifetime (a common state — the #1631
+    history is exactly this).  The user has been actively typing into
+    the cockpit's mounted architect pane (``%9001``).  Rail navigation
+    triggers a park of ``%9001`` under the canonical name.
+
+    Old behaviour: helper saw the storage orphan, killed ``%9001``
+    (wiping the user's chat), left the orphan in place; the next
+    mount surfaced the orphan as if it were the user's conversation.
+
+    New behaviour: helper kills the orphan, breaks ``%9001`` into
+    storage under the canonical name; the next mount surfaces the
+    user's actual conversation.
+    """
+    orphan = _FakeWindow(17, "architect-samblog", command="claude")
+    tmux = _FakeTmux(windows=[orphan])
+    audit_events, audit_emit = _collect_audit()
+
+    broke = safe_break_pane_to_storage(
+        tmux,
+        source_pane_id="%9001",
+        storage_session="pollypm-storage-closet",
+        window_name="architect-samblog",
+        audit_emit=audit_emit,
+        subject="architect_samblog",
+    )
+
+    assert broke is True
+    # The orphan was reaped.
+    assert "pollypm-storage-closet:17" in tmux.kill_window_calls
+    # The user's active mount was preserved by being broken into storage.
+    assert tmux.break_calls == [
+        ("%9001", "pollypm-storage-closet", "architect-samblog")
+    ]
+    # CRITICAL: the helper must NEVER kill the active mount in the
+    # rail-navigation case — that's the conversation-wipe surface.
+    assert tmux.kill_pane_calls == [], (
+        "safe_break_pane_to_storage killed the active mount — #1994 "
+        "regression"
+    )
+    # Exactly one architect-samblog window remains in storage and it
+    # is the one we just broke in (its index is one higher than the
+    # killed orphan in the fake tmux).
+    same_name = [w for w in tmux.windows if w.name == "architect-samblog"]
+    assert len(same_name) == 1
+    assert audit_events[0]["event_name"] == "cockpit.park_killed_orphan"

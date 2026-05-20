@@ -173,6 +173,29 @@ class FakeTmux:
                 return
         raise KeyError(target)
 
+    def kill_window(self, target: str) -> None:
+        """#1994 — drop the matching window from its session.
+
+        Mirrors ``tmux kill-window -t <session>:<index>``.  The
+        ``cockpit_storage_park.safe_break_pane_to_storage`` helper
+        calls this to reap stale orphans before its break-pane.
+        """
+        session, raw_index = target.split(":", 1)
+        windows = self.sessions.get(session, [])
+        try:
+            index = int(raw_index)
+        except ValueError:
+            # Tolerate name-targets too (helper only uses int targets
+            # but #1635's _park_mounted_session may also call here).
+            self.sessions[session] = [
+                w for w in windows if w.name != raw_index
+            ]
+        else:
+            self.sessions[session] = [
+                w for w in windows if w.index != index
+            ]
+        self.calls.append(("kill_window", (target,)))
+
     def swap_pane(self, source: str, target: str) -> None:
         _source_window, source_pane = self._find_pane(source)
         _target_window, target_pane = self._find_pane(target)
@@ -626,33 +649,39 @@ def test_park_live_to_storage_breaks_right_and_replaces_static_content() -> None
     assert storage_windows[0].pane_id == right_id
 
 
-def test_park_live_to_storage_skips_when_live_duplicate_exists() -> None:
-    """#1631 follow-up — ``park_live_to_storage`` must NOT silently
-    add a second window when storage already holds a live one of the
-    same name.
+def test_park_live_to_storage_kills_orphan_when_live_duplicate_exists() -> None:
+    """#1994 — ``park_live_to_storage`` must kill a live storage orphan
+    and break-pane the cockpit mount under the canonical name to
+    preserve the user's active conversation.
 
-    Sam's 2026-05-19 wipe: ``architect-samblog`` was duplicated at
-    indices 22 and 42 in the closet, and a click away from PM Chat
-    would have grown that to three before the fix.  The manager now
-    routes through :func:`safe_break_pane_to_storage`, which refuses
-    the break-pane when a live duplicate exists.
+    Sam's 2026-05-20 verbatim repro: ``I was talking with the Sam
+    blog architect.  I click into a different area on the rail.  I
+    click back to the Sam blog architect, and it's a new goddamn
+    conversation.``  The cockpit-mounted pane is the user's actual
+    conversation (they were typing into it); any pre-existing live
+    storage window with the same name is a stale orphan.
+
+    Pre-#1994 behaviour: the helper refused to break-pane and killed
+    the cockpit's right pane (the user's chat), then the next mount
+    surfaced the orphan as if it were the user's conversation.
 
     Regression contract:
-      * Storage closet ends up with exactly one ``architect-samblog``
-        window (the pre-existing live one, untouched).
-      * ``break_pane`` is never called.
-      * The result still ``ok`` — the manager treats this as a
-        successful park because the persistent home already exists.
+      * The pre-existing live storage orphan is killed.
+      * ``break_pane`` IS called so the cockpit mount lands in storage
+        as the canonical ``architect-samblog`` window.
+      * Storage ends up with exactly one ``architect-samblog`` window
+        — the one holding the user's actual conversation.
       * Mount state is cleared so the next mount can re-attach via
         the rail selector.
     """
     tmux = FakeTmux()
-    # Pre-existing live conversation in the closet.
-    tmux.add_window(
+    # Pre-existing orphan in the closet (NOT the user's conversation).
+    orphan_window = tmux.add_window(
         "pollypm-storage-closet",
         "architect-samblog",
         [("claude", 0)],
     )
+    orphan_pane_id = orphan_window.panes[0].pane_id
     cockpit = tmux.add_window("pollypm", "PollyPM", [("uv", 0), ("claude", 100)])
     right_id = cockpit.panes[1].pane_id
     manager = _manager(tmux)
@@ -674,14 +703,24 @@ def test_park_live_to_storage_skips_when_live_duplicate_exists() -> None:
     storage_windows = tmux.list_windows("pollypm-storage-closet")
     same_name = [w for w in storage_windows if w.name == "architect-samblog"]
     assert len(same_name) == 1, (
-        "park_live_to_storage must not duplicate architect-samblog — "
-        "that's the #1631 conversation-wipe surface"
+        "After the park, storage must have exactly one architect-"
+        "samblog window — the broken-in cockpit mount"
     )
-    # No break-pane to storage was emitted.
-    assert not any(
+    # The surviving window must be the user's mount, not the orphan.
+    surviving = same_name[0]
+    assert surviving.pane_id == right_id, (
+        "The surviving architect-samblog window must contain the "
+        "user's actual conversation (the cockpit mount), not the "
+        "killed orphan pane"
+    )
+    # Break-pane DID run — that's the user-preserving action.
+    assert any(
         call[0] == "break_pane" for call in tmux.calls
-    ), "break-pane must be skipped when a live duplicate already exists"
-    assert "park_skipped_live_duplicate:pollypm-storage-closet:architect-samblog" in result.actions
+    ), "break-pane MUST run so the user's active mount is preserved"
+    assert f"break_live:{right_id}->pollypm-storage-closet:architect-samblog" in result.actions
+    assert not any(
+        action.startswith("park_skipped_live_duplicate") for action in result.actions
+    ), "park-skipped action must no longer fire — #1994"
     assert result.state.mounted_session is None
 
 

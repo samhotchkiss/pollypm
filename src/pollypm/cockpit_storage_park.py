@@ -29,6 +29,23 @@ sees more than one live window per name, eliminating the wipe surface.
 The helper is intentionally tmux-shape agnostic: callers pass a
 ``tmux`` client plus a small audit-emit callback, and the helper does
 the rest.  Pure-function design makes testing without tmux trivial.
+
+Live-duplicate policy (#1994, 2026-05-20)
+-----------------------------------------
+The original helper, on finding a same-named LIVE window in storage,
+killed the caller's ``source_pane_id`` and refused the break-pane —
+treating the storage window as the persistent home.
+
+In practice this is wrong for the rail-navigation case: the cockpit
+pane is the user's active conversation (they just unmounted from it by
+clicking a different rail item), and any pre-existing live storage
+window with the same canonical name is a stale orphan from a previous
+session.  Killing the cockpit pane wipes the conversation the user
+just had open.
+
+The helper now kills the storage orphan instead and breaks the
+cockpit pane into storage under the canonical name.  The next mount
+picks up the user's real conversation.
 """
 
 from __future__ import annotations
@@ -72,24 +89,37 @@ def safe_break_pane_to_storage(
 ) -> bool:
     """Break ``source_pane_id`` into ``storage_session`` only if safe.
 
-    Returns ``True`` when the break-pane actually ran (or no duplicate
-    blocked it), ``False`` when the helper refused to break because a
-    live duplicate already owns the canonical name.
+    Returns ``True`` when the break-pane actually ran, ``False`` only
+    when ``break-pane`` itself raised.
 
     Behaviour:
       * If the storage closet already holds a live window of the same
-        name → skip ``break-pane``, kill ``source_pane_id`` (it would
-        otherwise leak as an unparented pane after the cockpit reclaims
-        its real estate), emit ``cockpit.park_skipped_existing`` audit,
-        and return ``False``.  Callers MUST treat this as a successful
-        park: the storage window is already the persistent home.
+        name → that window is an ORPHAN (the user can only be conversing
+        with one pane at a time; ``source_pane_id`` is the cockpit's
+        live mount, which is by definition the user's current session).
+        Kill the orphan, then break-pane ``source_pane_id`` into storage
+        under ``window_name``.  Emits ``cockpit.park_killed_orphan``
+        audit before the kill so forensics can correlate.
       * If only dead-named duplicates exist → kill the dead windows so
         break-pane re-occupies the canonical name, then break.
       * No duplicates → break unconditionally.
 
-    The helper centralizes the #1631/#1635 fix so every break-pane site
-    in the cockpit gets the same dup-check.  See module docstring for
-    the full list of historical bypass sites.
+    Why the live-duplicate path changed (#1631 → #1994 fix):
+    The original #1631 helper assumed the storage window held the
+    user's conversation and skipped the break-pane (killing
+    ``source_pane_id`` as collateral).  That was correct when the
+    cockpit had spawned a fresh placeholder mid-park-collision.  It is
+    WRONG when the user has been actively typing into the cockpit
+    pane — which is the rail-navigation case: the cockpit pane IS the
+    user's session, and the storage duplicate is the stale orphan.
+    Trust the cockpit pane (it is by construction the active mount)
+    and kill the storage orphan instead.  See ``feedback_destructive
+    _refusal`` memory — the cockpit pane is the source of truth at the
+    moment of the park because the rail just unmounted from it.
+
+    The helper centralizes the #1631/#1635/#1994 logic so every
+    break-pane site in the cockpit gets the same handling.  See module
+    docstring for the full list of historical bypass sites.
     """
     try:
         storage_windows = tmux.list_windows(storage_session)
@@ -104,18 +134,15 @@ def safe_break_pane_to_storage(
     dead_existing = [w for w in existing_same_name if not _window_is_live(w)]
 
     if live_existing:
-        # Persistent home already owns the canonical name.  Refuse the
-        # break-pane.  The caller's surviving cockpit pane (the one we
-        # would have parked) is now an orphan duplicate of the storage
-        # window's process — kill it so it doesn't pile up as garbage.
-        try:
-            tmux.kill_pane(source_pane_id)
-        except Exception:  # noqa: BLE001
-            pass
+        # Live duplicate in storage is an ORPHAN — the user has been
+        # interacting with ``source_pane_id`` (the cockpit mount), so
+        # the storage window cannot be the same conversation.  Kill
+        # the orphan(s) so the user's actual conversation can claim
+        # the canonical window name on break-pane below.
         if audit_emit is not None:
             try:
                 audit_emit(
-                    "cockpit.park_skipped_existing",
+                    "cockpit.park_killed_orphan",
                     "warn",
                     {
                         "subject": subject or window_name,
@@ -128,12 +155,18 @@ def safe_break_pane_to_storage(
                         "dead_duplicate_indices": [
                             getattr(w, "index", None) for w in dead_existing
                         ],
-                        "reason": "live_existing_storage_window",
+                        "reason": "killed_orphan_to_preserve_active_mount",
                     },
                 )
             except Exception:  # noqa: BLE001
                 pass
-        return False
+        for window in live_existing:
+            try:
+                tmux.kill_window(
+                    f"{storage_session}:{getattr(window, 'index', '')}"
+                )
+            except Exception:  # noqa: BLE001
+                continue
 
     for window in dead_existing:
         try:
@@ -141,5 +174,8 @@ def safe_break_pane_to_storage(
         except Exception:  # noqa: BLE001
             continue
 
-    tmux.break_pane(source_pane_id, storage_session, window_name)
+    try:
+        tmux.break_pane(source_pane_id, storage_session, window_name)
+    except Exception:  # noqa: BLE001
+        return False
     return True

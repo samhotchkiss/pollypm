@@ -4551,24 +4551,30 @@ def test_cockpit_router_parks_mounted_task_worker(monkeypatch, tmp_path: Path) -
     assert calls["released"] == ("task-demo-7", "cockpit")
 
 
-def test_cockpit_router_park_skips_when_live_duplicate_exists(monkeypatch, tmp_path: Path) -> None:
-    """#1635 — ``_park_mounted_session`` must NOT call ``tmux break-pane``
-    when the storage closet already holds a live window of the same
-    name. Prior behavior unconditionally broke the cockpit's right
-    pane into storage as a fresh ``pm-operator`` window, leaving two
-    same-named windows in storage; #1632's mount selector then often
-    picked the wrong one and the user saw a fresh Polly re-asking the
-    same onboarding questions.
+def test_cockpit_router_park_kills_orphan_when_live_duplicate_exists(monkeypatch, tmp_path: Path) -> None:
+    """#1994 — ``_park_mounted_session`` must kill any pre-existing live
+    same-named storage window (an ORPHAN, by construction) and then
+    break-pane the cockpit mount into storage to preserve the user's
+    active conversation.
+
+    Original #1635 took the opposite tack: refuse the break-pane and
+    let the caller's subsequent ``respawn_pane`` discard the cockpit's
+    right pane.  In the rail-navigation case this wiped the user's
+    live conversation on every nav-and-back (Sam's verbatim repro on
+    2026-05-20: ``I was talking with the Sam blog architect.  I click
+    into a different area on the rail.  I click back to the Sam blog
+    architect, and it's a new goddamn conversation.``)
 
     Regression contract:
-      * ``break_pane`` is never called when a live duplicate exists.
-      * ``rename_window`` is never called.
+      * The orphan storage window is killed.
+      * ``break_pane`` IS called so the cockpit's mount (the user's
+        actual conversation) lands in storage under the canonical
+        name.
       * mounted-session state and cockpit lease are still released.
-      * A ``cockpit.park_skipped_existing`` audit event fires with the
-        live-duplicate indices captured in metadata.
-      * Calling ``_park_mounted_session`` a second time is still a
-        no-op — only one ``pm-operator`` window remains in storage
-        (park → park again → still one window).
+      * A ``cockpit.park_killed_orphan`` audit event fires with the
+        killed-orphan indices captured in metadata.
+      * Calling ``_park_mounted_session`` a second time with the SAME
+        storage state still leaves exactly one canonical window.
     """
     calls: dict[str, object] = {}
     audit_events: list[dict[str, object]] = []
@@ -4674,41 +4680,54 @@ def test_cockpit_router_park_skips_when_live_duplicate_exists(monkeypatch, tmp_p
     )
     router._write_state({"mounted_session": "operator-pm", "right_pane_id": "%2"})
 
-    # First park: storage already has a LIVE pm-operator window. The
-    # park must be a no-op (no break-pane, no rename) to prevent the
-    # upstream duplicate creation.
+    # First park: storage already has a LIVE pm-operator window
+    # (orphan from a prior session — the cockpit's right pane %2 is
+    # the user's actual conversation).  The park must kill the orphan
+    # AND break-pane our right pane into storage under the canonical
+    # name to preserve the live conversation.
     router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
 
-    assert "break" not in calls, "break-pane must not run when a live duplicate exists"
-    assert "renamed" not in calls
+    assert "break" in calls, (
+        "#1994 — break-pane MUST run so the user's active mount is "
+        "preserved as the canonical pm-operator window in storage"
+    )
+    break_calls = calls["break"]
+    assert len(break_calls) == 1
+    assert break_calls[0] == ("%2", "pollypm-storage-closet", "pm-operator")
+    assert "killed" in calls and "pollypm-storage-closet:1" in calls["killed"], (
+        "The orphan storage window must be killed before break-pane "
+        "so the canonical name is free"
+    )
     assert calls["released"] == [("operator-pm", "cockpit")]
-    assert len(storage_state["windows"]) == 1
-    assert storage_state["windows"][0].name == "pm-operator"
+    # After the kill+break, storage has exactly one canonical window
+    # (the one we just broke in).
+    same_name = [
+        w for w in storage_state["windows"] if w.name == "pm-operator"
+    ]
+    assert len(same_name) == 1
 
-    skip_events = [e for e in audit_events if e["event_name"] == "cockpit.park_skipped_existing"]
-    assert len(skip_events) == 1
-    skip = skip_events[0]
-    assert skip["subject"] == "operator-pm"
-    assert skip["status"] == "warn"
-    assert skip["metadata"]["live_duplicate_indices"] == [1]
-    assert skip["metadata"]["window_name"] == "pm-operator"
-    assert skip["metadata"]["storage_session"] == "pollypm-storage-closet"
+    orphan_events = [
+        e for e in audit_events if e["event_name"] == "cockpit.park_killed_orphan"
+    ]
+    assert len(orphan_events) == 1
+    orphan = orphan_events[0]
+    assert orphan["subject"] == "operator-pm"
+    assert orphan["status"] == "warn"
+    assert orphan["metadata"]["live_duplicate_indices"] == [1]
+    assert orphan["metadata"]["window_name"] == "pm-operator"
+    assert orphan["metadata"]["storage_session"] == "pollypm-storage-closet"
+    assert orphan["metadata"]["reason"] == (
+        "killed_orphan_to_preserve_active_mount"
+    )
+    assert not any(
+        e["event_name"] == "cockpit.park_skipped_existing" for e in audit_events
+    ), "park-skipped event must no longer fire — #1994"
 
     # State is cleared so the next mount won't think we still own the
     # cockpit right pane.
     state = router._load_state()
     assert "mounted_session" not in state
     assert "mounted_identity" not in state
-
-    # Park again — same conditions, still a no-op, still ONE window.
-    router._write_state({"mounted_session": "operator-pm", "right_pane_id": "%2"})
-    router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
-
-    assert "break" not in calls
-    assert len(storage_state["windows"]) == 1, (
-        "park → park again must leave exactly one pm-operator window — "
-        "regression for #1635 duplicate-window creation"
-    )
 
 
 def test_cockpit_router_park_reoccupies_dead_storage_window(monkeypatch, tmp_path: Path) -> None:
@@ -4832,6 +4851,204 @@ def test_cockpit_router_park_reoccupies_dead_storage_window(monkeypatch, tmp_pat
     assert park_events[0]["metadata"]["reoccupied_dead_indices"] == [1]
     # No skip event fires when there are no live duplicates.
     assert not any(e["event_name"] == "cockpit.park_skipped_existing" for e in audit_events)
+
+
+def test_rail_navigation_preserves_architect_session_across_nav_and_back(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """#1994 — rail navigation must NOT wipe a live architect chat.
+
+    Sam's verbatim repro on 2026-05-20::
+
+        I was talking with the Sam blog architect.  I click into a
+        different area on the rail.  I click back to the Sam blog
+        architect, and it's a new goddamn conversation.
+
+    Trigger: a stale ``architect-samblog`` orphan from a prior cockpit
+    lifetime is sitting in the storage closet at the moment the user
+    clicks away.  Pre-#1994, ``_park_mounted_session`` saw the orphan,
+    refused to break-pane, and trusted storage as the persistent home;
+    the caller's ``respawn_pane`` then wiped the cockpit's actual
+    architect conversation.  Post-#1994, the helper kills the orphan
+    and break-panes the cockpit mount into storage under the canonical
+    name — the conversation is preserved and the next mount can find
+    it again.
+
+    This test exercises ``_park_mounted_session`` with the exact
+    storage state Sam's bug report described and asserts:
+      * ``break_pane`` IS called (the user's mount goes to storage).
+      * The orphan storage window IS killed before the break.
+      * After the park, storage has exactly ONE architect-samblog
+        window — the broken-in cockpit mount.
+      * The audit fires ``cockpit.park_killed_orphan``.
+      * The ``cockpit.park_skipped_existing`` audit (the old policy
+        marker) does NOT fire.
+    """
+    calls: dict[str, object] = {}
+    audit_events: list[dict[str, object]] = []
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\n"
+        f"base_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    class FakeSupervisor:
+        def plan_launches(self):
+            return []
+
+        def storage_closet_session_name(self) -> str:
+            return "pollypm-storage-closet"
+
+        def release_lease(
+            self, session_name: str, expected_owner: str | None = None
+        ) -> None:
+            calls.setdefault("released", []).append(
+                (session_name, expected_owner)
+            )
+
+    class FakeWindow:
+        def __init__(
+            self,
+            index: int,
+            name: str,
+            command: str = "",
+            pane_dead: bool = False,
+        ) -> None:
+            self.index = index
+            self.name = name
+            self.pane_current_command = command
+            self.pane_dead = pane_dead
+
+    class FakePane:
+        def __init__(
+            self, pane_id: str, pane_left: int, command: str
+        ) -> None:
+            self.pane_id = pane_id
+            self.pane_left = pane_left
+            self.pane_current_command = command
+            self.pane_dead = False
+
+    # Storage already has a live architect-samblog window — the stale
+    # orphan from a prior cockpit lifetime that is the structural
+    # cause of the wipe.
+    storage_state = {
+        "windows": [
+            FakeWindow(17, "architect-samblog", command="claude"),
+        ],
+    }
+
+    class FakeTmux:
+        def list_panes(self, target: str):
+            # The cockpit has the user's actual architect conversation
+            # in the right pane (%9001 is running ``claude``).
+            return [
+                FakePane("%9000", 0, "uv"),
+                FakePane("%9001", 30, "claude"),
+            ]
+
+        def list_windows(self, target: str):
+            assert target == "pollypm-storage-closet"
+            return list(storage_state["windows"])
+
+        def break_pane(
+            self, source: str, target_session: str, window_name: str
+        ) -> None:
+            calls.setdefault("break", []).append(
+                (source, target_session, window_name)
+            )
+            next_index = max(
+                (w.index for w in storage_state["windows"]),
+                default=0,
+            ) + 1
+            storage_state["windows"].append(
+                FakeWindow(next_index, window_name, command="claude")
+            )
+
+        def rename_window(self, target: str, name: str) -> None:
+            calls.setdefault("renamed", []).append((target, name))
+
+        def kill_window(self, target: str) -> None:
+            calls.setdefault("killed", []).append(target)
+            suffix = target.split(":", 1)[1]
+            try:
+                idx = int(suffix)
+            except ValueError:
+                return
+            storage_state["windows"] = [
+                w for w in storage_state["windows"] if w.index != idx
+            ]
+
+    router = CockpitRouter(config_path)
+    router.tmux = FakeTmux()  # type: ignore[assignment]
+    monkeypatch.setattr(
+        router, "_load_supervisor", lambda fresh=False: FakeSupervisor()
+    )
+    monkeypatch.setattr(
+        router,
+        "_mounted_window_name",
+        lambda supervisor, session_name: "architect-samblog",
+    )
+    monkeypatch.setattr(
+        router,
+        "_emit_cockpit_audit",
+        lambda *, event_name, subject, status, metadata: audit_events.append(
+            {
+                "event_name": event_name,
+                "subject": subject,
+                "status": status,
+                "metadata": metadata,
+            }
+        ),
+    )
+    router._write_state(
+        {
+            "mounted_session": "architect_samblog",
+            "right_pane_id": "%9001",
+        }
+    )
+
+    # The rail click flushes through ``_park_mounted_session`` before
+    # respawning the static view in the right pane.
+    router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
+
+    # 1. The orphan storage window was reaped.
+    assert "killed" in calls and "pollypm-storage-closet:17" in calls["killed"], (
+        "The pre-existing storage orphan MUST be killed before "
+        "break-pane so the canonical name is available for the "
+        "user's actual conversation."
+    )
+    # 2. break-pane DID run with the user's actual mount as the source.
+    assert "break" in calls, (
+        "break-pane MUST run — without it the cockpit's "
+        "respawn_pane wipes the live conversation."
+    )
+    assert calls["break"] == [
+        ("%9001", "pollypm-storage-closet", "architect-samblog")
+    ]
+    # 3. Storage ends up with exactly one architect-samblog window
+    #    holding the user's conversation (a new index above the
+    #    killed orphan).
+    same_name = [
+        w for w in storage_state["windows"] if w.name == "architect-samblog"
+    ]
+    assert len(same_name) == 1
+    # 4. Audit captures the orphan-kill action with forensics.
+    orphan_events = [
+        e
+        for e in audit_events
+        if e["event_name"] == "cockpit.park_killed_orphan"
+    ]
+    assert len(orphan_events) == 1
+    assert orphan_events[0]["metadata"]["live_duplicate_indices"] == [17]
+    assert orphan_events[0]["metadata"]["reason"] == (
+        "killed_orphan_to_preserve_active_mount"
+    )
+    # 5. The old policy marker MUST NOT fire (it would mean the
+    #    helper followed the pre-#1994 wipe path).
+    assert not any(
+        e["event_name"] == "cockpit.park_skipped_existing"
+        for e in audit_events
+    )
 
 
 def test_cockpit_router_validation_releases_stale_cockpit_lease(monkeypatch, tmp_path: Path) -> None:

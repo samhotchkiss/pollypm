@@ -115,6 +115,20 @@ def _now_iso() -> datetime:
     return datetime.now(UTC)
 
 
+def _is_cap_exceeded_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` is a ``WorkerCapExceededError`` (#1906).
+
+    Matched by qualified class name to avoid importing
+    ``pollypm.work.session_manager`` at module-load time (the session
+    manager imports this service in some wiring paths, so the explicit
+    import would risk circularity).
+    """
+    for cls in type(exc).__mro__:
+        if cls.__name__ == "WorkerCapExceededError":
+            return True
+    return False
+
+
 def _coerce_status(raw: str) -> WorkStatus:
     try:
         return WorkStatus(raw)
@@ -1667,7 +1681,92 @@ class PgWorkService:
                     actor,
                     exc,
                 )
+                # #1906 — atomic cap reserve can still lose the race
+                # AFTER the claim transition has already committed. The
+                # session manager already released its placeholder cap
+                # slot via _release_cap_slot_on_failure; revert the
+                # task back to queued so auto-claim re-picks it instead
+                # of stranding it ``in_progress`` with no worker. See
+                # the sqlite counterpart in service_transition_manager.
+                if _is_cap_exceeded_error(exc) and target_status is (
+                    WorkStatus.IN_PROGRESS
+                ):
+                    self._rollback_claim_to_queued(
+                        task.project,
+                        task.task_number,
+                        node_id,
+                        actor,
+                        exc,
+                    )
         return result
+
+    def _rollback_claim_to_queued(
+        self,
+        project: str,
+        task_number: int,
+        node_id: str,
+        actor: str,
+        exc: BaseException,
+    ) -> None:
+        """Revert an in_progress claim back to queued (#1906).
+
+        Postgres counterpart of
+        ``WorkTransitionManager._rollback_claim_to_queued``. Best-effort:
+        a failed rollback is logged so the operator still sees
+        ``last_provision_error`` and can run ``pm task release``
+        manually rather than silently wedging the task.
+        """
+        now = _now_iso()
+        try:
+            with self._pool.connection() as conn:
+                conn.autocommit = False
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE work_tasks SET work_status = %s, "
+                        "updated_at = %s "
+                        "WHERE project = %s AND task_number = %s",
+                        (
+                            WorkStatus.QUEUED.value,
+                            now,
+                            project,
+                            task_number,
+                        ),
+                    )
+                    cur.execute(
+                        "UPDATE work_node_executions SET status = %s, "
+                        "ended_at = %s "
+                        "WHERE task_project = %s AND task_number = %s "
+                        "AND node_id = %s AND status = %s",
+                        (
+                            ExecutionStatus.ABANDONED.value,
+                            now,
+                            project,
+                            task_number,
+                            node_id,
+                            ExecutionStatus.ACTIVE.value,
+                        ),
+                    )
+                    self._insert_transition_locked(
+                        cur,
+                        project,
+                        task_number,
+                        WorkStatus.IN_PROGRESS.value,
+                        WorkStatus.QUEUED.value,
+                        actor,
+                        None,
+                    )
+                conn.commit()
+            logger.warning(
+                "claim rollback: %s/%d returned to queued after "
+                "post-commit provision failure (%s)",
+                project, task_number, exc,
+            )
+        except Exception as rollback_exc:  # noqa: BLE001
+            logger.warning(
+                "claim rollback failed for %s/%d: %s (task remains "
+                "in_progress; operator must release manually)",
+                project, task_number, rollback_exc,
+            )
 
     def next(  # noqa: A003
         self,

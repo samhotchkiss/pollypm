@@ -574,14 +574,26 @@ _INBOX_LABEL_HELP: dict[str, list[tuple[str, str]]] = {
 }
 
 _RAIL_GLYPH_HELP: list[tuple[str, str]] = [
+    # Navigation glyphs ------------------------------------------------
     ("▌", "current rail selection"),
+    ("▼ / ▲ N more", "rail has more rows above/below — j/k to scroll"),
+    # Session-level life signals --------------------------------------
     ("♥ / ♡", "tmux attached / detached session pulse"),
     ("·", "idle session"),
     ("… / ◜◝◞◟", "writing or working"),
     ("✎", "reviewing"),
     ("⚠", "stuck or alerting"),
+    ("✕", "session exited"),
+    # Project-rollup glyphs -------------------------------------------
     ("○", "idle or offline project"),
     ("•", "active or unread project"),
+    ("◆", "needs your attention — unread inbox / yellow rollup / plan ready"),
+    ("◇", "paused — inbox empty / task waiting on plan"),
+    ("▲", "alert — error or warn-tier badge on the row"),
+    ("▶", "decision needed — approval or plan review pending"),
+    ("◉", "task in review"),
+    # Footer / system glyphs ------------------------------------------
+    ("⚙", "Settings"),
 ]
 
 

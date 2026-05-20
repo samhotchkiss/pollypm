@@ -50,9 +50,11 @@ def _inbox_tasks_for_tui(config):
         from pollypm.work.inbox_view import inbox_tasks
     except Exception:  # noqa: BLE001
         return []
+    from pollypm.projects import project_state_db_path
+
     out: list = []
     for project_key, project in getattr(config, "projects", {}).items():
-        db_path = project.path / ".pollypm" / "state.db"
+        db_path = project_state_db_path(project.path)
         if not db_path.exists():
             continue
         try:

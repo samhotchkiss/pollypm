@@ -27,6 +27,7 @@ from typing import Any
 import typer
 
 from pollypm.cli_help import help_with_examples
+from pollypm.config import GLOBAL_CONFIG_DIR
 
 
 logger = logging.getLogger(__name__)
@@ -43,7 +44,7 @@ rail_app = typer.Typer(
 )
 
 
-USER_CONFIG_PATH = Path.home() / ".pollypm" / "pollypm.toml"
+USER_CONFIG_PATH = GLOBAL_CONFIG_DIR / "pollypm.toml"
 
 
 # ---------------------------------------------------------------------------
@@ -301,7 +302,7 @@ def _validate_key(key: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-_RAIL_DAEMON_PID_FILE = Path.home() / ".pollypm" / "rail_daemon.pid"
+_RAIL_DAEMON_PID_FILE = GLOBAL_CONFIG_DIR / "rail_daemon.pid"
 _DEFAULT_GRACE_S = 3.0
 
 

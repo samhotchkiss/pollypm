@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
+from pollypm.projects import project_magic_dir, project_rules_dir
 
 _SESSION_MANIFEST_PATH = Path(".pollypm/MANIFEST.md")
 _SESSION_SECTION_LIMIT = 6
@@ -138,9 +139,10 @@ def discover_rules(project_root: Path) -> dict[str, CatalogFile]:
         default_description="Instructions for {name} work",
         default_trigger="When doing {name} work",
     )
+    from pollypm.projects import global_pollypm_dir as _global_dir
     merged.update(
         _scan_catalog_dir(
-            Path.home() / ".pollypm" / "rules",
+            _global_dir() / "rules",
             display_base="~/.pollypm/rules",
             default_description="Instructions for {name} work",
             default_trigger="When doing {name} work",
@@ -148,7 +150,7 @@ def discover_rules(project_root: Path) -> dict[str, CatalogFile]:
     )
     merged.update(
         _scan_catalog_dir(
-            project_root / ".pollypm" / "rules",
+            project_rules_dir(project_root),
             display_base=".pollypm/rules",
             default_description="Instructions for {name} work",
             default_trigger="When doing {name} work",
@@ -164,9 +166,10 @@ def discover_magic(project_root: Path) -> dict[str, CatalogFile]:
         default_description="Capability for {name}",
         default_trigger="When {name} would help",
     )
+    from pollypm.projects import global_pollypm_dir as _global_dir
     merged.update(
         _scan_catalog_dir(
-            Path.home() / ".pollypm" / "magic",
+            _global_dir() / "magic",
             display_base="~/.pollypm/magic",
             default_description="Capability for {name}",
             default_trigger="When {name} would help",
@@ -174,7 +177,7 @@ def discover_magic(project_root: Path) -> dict[str, CatalogFile]:
     )
     merged.update(
         _scan_catalog_dir(
-            project_root / ".pollypm" / "magic",
+            project_magic_dir(project_root),
             display_base=".pollypm/magic",
             default_description="Capability for {name}",
             default_trigger="When {name} would help",

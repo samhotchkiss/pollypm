@@ -39,6 +39,7 @@ from pollypm.cockpit_sections.recent_commits import _section_recent_commits
 from pollypm.cockpit_sections.summary import _section_summary
 from pollypm.cockpit_sections.velocity import _section_velocity
 from pollypm.cockpit_sections.you_need_to import _section_you_need_to
+from pollypm.projects import project_state_db_path
 
 
 # Cache: project_key -> (db_mtime, partitioned, counts).
@@ -56,7 +57,7 @@ def _dashboard_project_tasks(
     the cached partition, so the dashboard's cost scales with changed projects,
     not total projects.
     """
-    db_path = project_path / ".pollypm" / "state.db"
+    db_path = project_state_db_path(project_path)
     if not db_path.exists():
         return {}, {}
     try:
@@ -106,7 +107,7 @@ def _render_project_dashboard(
     """
     from pollypm.work import create_work_service
 
-    db_path = project.path / ".pollypm" / "state.db"
+    db_path = project_state_db_path(project.path)
     if not db_path.exists():
         return None
 

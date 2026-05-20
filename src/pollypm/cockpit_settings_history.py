@@ -83,8 +83,11 @@ class SettingsHistoryEntry:
 
 
 def settings_history_path(home: Path | None = None) -> Path:
-    base = home or Path.home()
-    return base / ".pollypm" / _HISTORY_FILENAME
+    from pollypm.projects import global_pollypm_dir, project_pollypm_dir
+
+    if home is None:
+        return global_pollypm_dir() / _HISTORY_FILENAME
+    return project_pollypm_dir(home) / _HISTORY_FILENAME
 
 
 def make_undo_action(

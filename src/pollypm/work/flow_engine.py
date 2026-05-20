@@ -13,6 +13,7 @@ from pathlib import Path
 import yaml
 
 from pollypm.work.models import ActorType, FlowNode, FlowTemplate, NodeType
+from pollypm.projects import project_flows_dir, project_plugins_dir
 
 
 # ---------------------------------------------------------------------------
@@ -236,12 +237,14 @@ def _builtin_flows_dir() -> Path:
 
 def _user_global_flows_dir() -> Path:
     """Return ~/.pollypm/flows/."""
-    return Path.home() / ".pollypm" / "flows"
+    from pollypm.projects import global_pollypm_dir
+
+    return global_pollypm_dir() / "flows"
 
 
 def _project_flows_dir(project_path: str | Path) -> Path:
     """Return <project>/.pollypm/flows/."""
-    return Path(project_path) / ".pollypm" / "flows"
+    return project_flows_dir(Path(project_path))
 
 
 def _plugin_flow_dirs(project_path: str | Path | None = None) -> list[Path]:
@@ -269,7 +272,9 @@ def _plugin_flow_dirs(project_path: str | Path | None = None) -> list[Path]:
                 dirs.append(plugin_dir / "flows")
 
     # 2. User-global plugins.
-    user_plugin_root = Path.home() / ".pollypm" / "plugins"
+    from pollypm.projects import global_pollypm_dir
+
+    user_plugin_root = global_pollypm_dir() / "plugins"
     if user_plugin_root.is_dir():
         for plugin_dir in sorted(user_plugin_root.iterdir()):
             if plugin_dir.is_dir() and (plugin_dir / "flows").is_dir():
@@ -277,7 +282,7 @@ def _plugin_flow_dirs(project_path: str | Path | None = None) -> list[Path]:
 
     # 3. Project-local plugins.
     if project_path is not None:
-        proj_plugin_root = Path(project_path) / ".pollypm" / "plugins"
+        proj_plugin_root = project_plugins_dir(Path(project_path))
         if proj_plugin_root.is_dir():
             for plugin_dir in sorted(proj_plugin_root.iterdir()):
                 if plugin_dir.is_dir() and (plugin_dir / "flows").is_dir():

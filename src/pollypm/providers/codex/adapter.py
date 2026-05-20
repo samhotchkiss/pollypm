@@ -30,6 +30,7 @@ from pollypm.models import AccountConfig, SessionConfig
 from pollypm.providers.base import LaunchCommand
 from pollypm.provider_sdk import ProviderAdapterBase, ProviderUsageSnapshot, TranscriptSource
 from pollypm.runtime_env import codex_home_dir
+from pollypm.projects import project_session_markers_dir
 
 if TYPE_CHECKING:
     from pollypm.tmux.client import TmuxClient
@@ -53,10 +54,10 @@ class CodexAdapter(ProviderAdapterBase):
         resume_marker: Path | None = None
         fresh_launch_marker: Path | None = None
         if account.home is not None:
-            fresh_launch_marker = account.home / ".pollypm" / "session-markers" / f"{session.name}.fresh"
+            fresh_launch_marker = project_session_markers_dir(account.home) / f"{session.name}.fresh"
         if session.role in {"heartbeat-supervisor", "operator-pm"} and account.home is not None:
             resume_argv = [self.binary, "resume", "--last", *session.args]
-            resume_marker = account.home / ".pollypm" / "session-markers" / f"{session.name}.resume"
+            resume_marker = project_session_markers_dir(account.home) / f"{session.name}.resume"
         return LaunchCommand(
             argv=argv,
             env=dict(account.env),

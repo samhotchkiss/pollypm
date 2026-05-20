@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 # ``claude --continue`` / ``--resume`` on kickoff. Share the
 # definition with :data:`pollypm.models.CONTROL_ROLES`.
 from pollypm.models import CONTROL_ROLES as _RESUMABLE_CONTROL_ROLES
+from pollypm.projects import project_session_markers_dir
 
 
 class ClaudeAdapter(ProviderAdapterBase):
@@ -65,11 +66,11 @@ class ClaudeAdapter(ProviderAdapterBase):
         fresh_launch_marker: Path | None = None
         if account.home is not None:
             fresh_launch_marker = (
-                account.home / ".pollypm" / "session-markers" / f"{session.name}.fresh"
+                project_session_markers_dir(account.home) / f"{session.name}.fresh"
             )
         if session.role in _RESUMABLE_CONTROL_ROLES and account.home is not None:
             resume_marker = (
-                account.home / ".pollypm" / "session-markers" / f"{session.name}.resume"
+                project_session_markers_dir(account.home) / f"{session.name}.resume"
             )
             session_id = _recorded_session_id(resume_marker)
             # #935 — control sessions sharing one ``cwd`` (operator +

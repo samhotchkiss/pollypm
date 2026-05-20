@@ -42,7 +42,7 @@ from pollypm.cockpit_task_review import (
 )
 from pollypm.cockpit_formatting import format_event_time
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
-from pollypm.config import load_config, project_config_path
+from pollypm.config import GLOBAL_CONFIG_DIR, load_config, project_config_path
 from pollypm.plan_presence import (
     plan_approval_task,
     plan_blocked_task_ids,
@@ -60,6 +60,7 @@ from pollypm.rejection_feedback import (
 from pollypm.session_services import create_tmux_client
 from pollypm.task_review_summary import PLAIN_SUMMARY_ENTRY_TYPE, REVIEW_SUMMARY_ACTOR
 from pollypm.tz import format_time as _fmt_time
+from pollypm.projects import project_state_db_path
 
 _TASK_STATUS_ORDER = {
     "in_progress": 0,
@@ -926,7 +927,7 @@ def _render_live(task, active_session) -> str:
         lines.extend(peek_lines)
     else:
         lines.append("unavailable")
-    transcript_root = Path.home() / ".pollypm"
+    transcript_root = GLOBAL_CONFIG_DIR
     transcript_dir = transcript_root / "transcripts" / "tasks" / task.task_id
     if transcript_dir.exists():
         lines.extend(["", "Transcript", "", str(transcript_dir)])
@@ -1628,8 +1629,8 @@ class PollyTasksApp(App[None]):
         project_settings = getattr(config, "project", None)
         workspace_root = getattr(project_settings, "workspace_root", None)
         if workspace_root is not None:
-            _add(Path(workspace_root) / ".pollypm" / "state.db")
-        _add(project.path / ".pollypm" / "state.db")
+            _add(project_state_db_path(Path(workspace_root)))
+        _add(project_state_db_path(project.path))
         state_db = getattr(project_settings, "state_db", None)
         if state_db is not None:
             _add(state_db)

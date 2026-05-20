@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pollypm.plugin_api.v1 import Capability, PollyPMPlugin
+from pollypm.projects import project_state_db_path
 
 if TYPE_CHECKING:
     from pollypm.agent_profiles.base import AgentProfileContext
@@ -197,7 +198,8 @@ def _on_project_created(context) -> None:
                 auto_fire = bool(cfg.planner.auto_on_project_created)
                 workspace_root = getattr(cfg.project, "workspace_root", None)
                 if workspace_root is not None:
-                    workspace_db_path = _Path2(workspace_root) / ".pollypm" / "state.db"
+                    from pollypm.projects import project_state_db_path as _pstate_db
+                    workspace_db_path = _pstate_db(_Path2(workspace_root))
         except Exception as exc:  # noqa: BLE001
             log.debug(
                 "project_planning: config read failed, defaulting auto_fire=True (%s)",
@@ -248,7 +250,7 @@ def _on_project_created(context) -> None:
         from pollypm.work import create_work_service
 
         project_path = _Path(project_path_raw)
-        db_path = workspace_db_path or (project_path / ".pollypm" / "state.db")
+        db_path = workspace_db_path or (project_state_db_path(project_path))
         db_path.parent.mkdir(parents=True, exist_ok=True)
         if is_replan:
             title = f"Replan project {project_key}"

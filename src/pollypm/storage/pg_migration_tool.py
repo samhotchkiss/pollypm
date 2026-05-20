@@ -58,6 +58,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from pollypm.storage.sqlite_pragmas import readonly_uri
+from pollypm.projects import project_state_db_path
 
 if TYPE_CHECKING:
     from psycopg_pool import ConnectionPool
@@ -431,11 +432,11 @@ def _workspace_db_path(config: "PollyPMConfig | None") -> Path | None:
     workspace_root_raw = getattr(config.project, "workspace_root", None)
     if workspace_root_raw is None:
         return None
-    return Path(workspace_root_raw) / ".pollypm" / "state.db"
+    return project_state_db_path(Path(workspace_root_raw))
 
 
 def _project_db_path(project_path: Path) -> Path:
-    return project_path / ".pollypm" / "state.db"
+    return project_state_db_path(project_path)
 
 
 def discover_sources(

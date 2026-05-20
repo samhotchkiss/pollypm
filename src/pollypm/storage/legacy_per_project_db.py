@@ -230,7 +230,9 @@ def migrate_one(
     workspace_db: Path,
 ) -> PerProjectMigrationReport:
     """Migrate a single project's legacy ``state.db`` into the workspace DB."""
-    src_path = project_path / ".pollypm" / "state.db"
+    from pollypm.projects import project_state_db_path
+
+    src_path = project_state_db_path(project_path)
     report = PerProjectMigrationReport(
         project_key=project_key, source_db=src_path,
     )

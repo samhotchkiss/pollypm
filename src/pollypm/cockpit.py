@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pollypm.config import load_config
+from pollypm.config import GLOBAL_CONFIG_DIR, load_config
 from pollypm.cockpit_rail import CockpitItem, CockpitRouter  # noqa: F401
 from pollypm.projects import ensure_project_scaffold
 # Lazy: ``PollyPMService`` pulls supervisor → sqlalchemy on import. Most
@@ -539,7 +539,7 @@ def _resource_section(config) -> MetricsSection:
         rows.append((".claude/worktrees", "(none)", "muted"))
 
     # Log directory size under ~/.pollypm/logs/
-    logs_dir = Path.home() / ".pollypm" / "logs"
+    logs_dir = GLOBAL_CONFIG_DIR / "logs"
     if logs_dir.exists():
         log_bytes = 0
         try:

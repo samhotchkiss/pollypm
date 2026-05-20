@@ -31,6 +31,7 @@ from pollypm.projects import (
     discover_recent_git_repositories,
     ensure_project_scaffold,
     make_project_key,
+    project_state_db_path,
 )
 from pollypm.runtime_env import provider_profile_env_for_provider
 from typing import TYPE_CHECKING
@@ -596,7 +597,7 @@ def seed_demo_project_task(
     from pollypm.work import create_work_service
 
     ensure_project_scaffold(project_path)
-    db_path = project_path / ".pollypm" / "state.db"
+    db_path = project_state_db_path(project_path)
     with create_work_service(
         db_path=db_path, project_path=project_path, config=config,
     ) as svc:
@@ -1161,8 +1162,10 @@ def build_onboarded_config(
     if controller_account not in accounts:
         raise ValueError(f"Unknown controller account: {controller_account}")
 
+    from pollypm.projects import project_pollypm_dir
+
     controller = accounts[controller_account]
-    base_dir = root_dir / ".pollypm"
+    base_dir = project_pollypm_dir(root_dir)
 
     config_accounts = {
         name: AccountConfig(

@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
+from pollypm.projects import project_state_db_path
 from pollypm.storage.sqlite_pragmas import readonly_uri
 from pollypm.inbox.kind import InboxItemKind
 from pollypm.audit.watchdog import (
@@ -696,7 +697,7 @@ def _gather_legacy_db_shadows(
         workspace_root = Path(workspace_root_raw)
     except TypeError:
         return []
-    canonical_db = workspace_root / ".pollypm" / "state.db"
+    canonical_db = project_state_db_path(workspace_root)
     if not canonical_db.exists():
         # No canonical DB yet — nothing can shadow it. Returning empty
         # means we don't pre-emptively migrate a project before its
@@ -721,7 +722,7 @@ def _gather_legacy_db_shadows(
             project_path = Path(project_path_raw)
         except TypeError:
             continue
-        legacy_db = project_path / ".pollypm" / "state.db"
+        legacy_db = project_state_db_path(project_path)
         if not legacy_db.exists():
             continue
         # Skip the project whose path *is* the workspace root — its

@@ -1070,10 +1070,11 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
             return bool(rows)
 
         try:
+            from pollypm.projects import project_state_db_path
             from pollypm.work import create_work_service
 
             project_root = config.project.root_dir
-            db_path = project_root / ".pollypm" / "state.db"
+            db_path = project_state_db_path(project_root)
             work = create_work_service(db_path=db_path, project_path=project_root)
         except Exception:  # noqa: BLE001
             logger.debug(

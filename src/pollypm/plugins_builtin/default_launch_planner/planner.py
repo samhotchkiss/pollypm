@@ -111,9 +111,9 @@ def _write_claude_system_prompt_to_disk(
     """
     if not content or account.home is None:
         return None
-    target = (
-        account.home / ".pollypm" / "system-prompts" / f"{session.name}.md"
-    )
+    from pollypm.projects import project_system_prompts_dir
+
+    target = project_system_prompts_dir(account.home) / f"{session.name}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content.rstrip() + "\n", encoding="utf-8")
     return target

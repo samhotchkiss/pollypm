@@ -246,7 +246,9 @@ def _pending_inbox_section(config: PollyPMConfig) -> RecoveryPromptSection | Non
             # inbox tasks from those leaking into the recovery prompt.
             if not getattr(project, "tracked", False):
                 continue
-            db_path = project.path / ".pollypm" / "state.db"
+            from pollypm.projects import project_state_db_path
+
+            db_path = project_state_db_path(project.path)
             if not db_path.exists():
                 continue
             try:

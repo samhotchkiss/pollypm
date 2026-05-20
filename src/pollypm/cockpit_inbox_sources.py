@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json as _json
 from pathlib import Path
+from pollypm.projects import project_state_db_path
 
 
 def _inbox_db_sources(config) -> list[tuple[str | None, Path, Path]]:
@@ -48,7 +49,7 @@ def _inbox_db_sources(config) -> list[tuple[str | None, Path, Path]]:
     seen: set[Path] = set()
     for project_key, project in getattr(config, "projects", {}).items():
         project_path = Path(project.path)
-        db_path = project_path / ".pollypm" / "state.db"
+        db_path = project_state_db_path(project_path)
         resolved = db_path.resolve() if db_path.exists() else db_path
         if resolved in seen:
             continue
@@ -58,7 +59,7 @@ def _inbox_db_sources(config) -> list[tuple[str | None, Path, Path]]:
     workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
     if workspace_root is not None:
         ws_path = Path(workspace_root)
-        ws_db = ws_path / ".pollypm" / "state.db"
+        ws_db = project_state_db_path(ws_path)
         resolved = ws_db.resolve() if ws_db.exists() else ws_db
         if resolved not in seen:
             seen.add(resolved)

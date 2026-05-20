@@ -21,6 +21,7 @@ from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 from pollypm.projects import (
     commit_initial_scaffold,
     enable_tracked_project,
+    project_state_db_path,
     register_project,
     scan_projects as scan_projects_registry,
 )
@@ -77,7 +78,7 @@ def _emit_auto_plan_status(
             auto_fire = True
         workspace_root = getattr(getattr(cfg, "project", None), "workspace_root", None)
         if workspace_root is not None:
-            workspace_db_path = Path(workspace_root) / ".pollypm" / "state.db"
+            workspace_db_path = project_state_db_path(Path(workspace_root))
 
     if not auto_fire:
         typer.echo(
@@ -87,7 +88,7 @@ def _emit_auto_plan_status(
         )
         return
 
-    db_path = workspace_db_path or (project_path / ".pollypm" / "state.db")
+    db_path = workspace_db_path or (project_state_db_path(project_path))
     task_id: str | None = None
     status: str | None = None
     if db_path.exists():

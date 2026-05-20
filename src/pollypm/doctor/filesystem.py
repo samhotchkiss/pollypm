@@ -7,6 +7,7 @@ import shutil
 from pathlib import Path
 
 import pollypm.doctor as doctor
+from pollypm.projects import project_state_db_path
 
 
 def check_pollypm_home_writable() -> doctor.CheckResult:
@@ -86,7 +87,7 @@ def check_pollypm_plugins_dir() -> doctor.CheckResult:
 
 
 def check_tracked_project_state_parents() -> doctor.CheckResult:
-    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+    from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR, load_config
 
     if not DEFAULT_CONFIG_PATH.exists():
         return doctor._skip("tracked-project check skipped (no config)")
@@ -127,7 +128,7 @@ _LEGACY_STATE_DIRNAME = ".pollypm" + "-state"
 def check_db_layout_canonical() -> doctor.CheckResult:
     from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 
-    user_db = Path.home() / ".pollypm" / "state.db"
+    user_db = GLOBAL_CONFIG_DIR / "state.db"
     workspace_db: Path | None = None
     strays: list[Path] = []
 
@@ -139,7 +140,7 @@ def check_db_layout_canonical() -> doctor.CheckResult:
         if config is not None:
             workspace_root = getattr(config.project, "workspace_root", None)
             if workspace_root is not None:
-                workspace_db = Path(workspace_root) / ".pollypm" / "state.db"
+                workspace_db = project_state_db_path(Path(workspace_root))
                 stray = Path(workspace_root) / _LEGACY_STATE_DIRNAME
                 if stray.exists():
                     strays.append(stray)

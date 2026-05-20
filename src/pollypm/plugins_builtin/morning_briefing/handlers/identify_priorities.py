@@ -201,7 +201,9 @@ def _iter_inbox_message_states(project_root: Path):
 
     Safe against missing directory / corrupt state.json.
     """
-    root = project_root / ".pollypm" / "inbox" / "messages"
+    from pollypm.projects import project_inbox_dir
+
+    root = project_inbox_dir(project_root) / "messages"
     if not root.exists():
         return
     for entry in root.iterdir():

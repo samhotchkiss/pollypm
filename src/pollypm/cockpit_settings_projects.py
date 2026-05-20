@@ -32,8 +32,10 @@ def collect_settings_projects(config, *, format_relative_age) -> list[dict]:
         last_activity = ""
         try:
             if path is not None and path.exists():
+                from pollypm.projects import project_state_db_path
+
                 path_exists = True
-                db_path = path / ".pollypm" / "state.db"
+                db_path = project_state_db_path(path)
                 if db_path.exists():
                     last_activity = _project_last_activity(
                         db_path, format_relative_age=format_relative_age

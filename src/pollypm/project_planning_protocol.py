@@ -30,6 +30,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
+from pollypm.config import GLOBAL_CONFIG_DIR
 
 
 # Canonical on-disk location for the planner's improvement-proposal
@@ -37,7 +38,7 @@ from typing import Any, Iterable
 # ``REJECTIONS_FILE`` for back-compat. Kept here (not in the plugin)
 # because :func:`record_proposal_rejection` / :func:`is_proposal_rejected`
 # live in this module and need a single source of truth.
-REJECTIONS_FILE = Path.home() / ".pollypm" / "memory" / "planner_rejections.jsonl"
+REJECTIONS_FILE = GLOBAL_CONFIG_DIR / "memory" / "planner_rejections.jsonl"
 
 
 def _rejections_path(override: Path | None = None) -> Path:

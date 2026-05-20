@@ -109,6 +109,7 @@ from pollypm.idle_placeholders import (
     CODEX_IDLE_PLACEHOLDERS as _CODEX_IDLE_PLACEHOLDERS,
     is_codex_idle_placeholder as _is_codex_idle_placeholder,
 )
+from pollypm.projects import project_state_db_path
 
 
 def _snapshot_activity_status(line: str) -> str | None:
@@ -634,11 +635,11 @@ def _recent_inbox_messages(config: PollyPMConfig, *, limit: int = 3) -> list[Inb
         # into the polly-dashboard's "Recent messages" preview.
         if not getattr(project, "tracked", False):
             continue
-        sources.append((project_key, project.display_label(), project.path / ".pollypm" / "state.db", project.path))
+        sources.append((project_key, project.display_label(), project_state_db_path(project.path), project.path))
     workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
     if workspace_root is not None:
         workspace_path = Path(workspace_root)
-        sources.append((None, "Workspace", workspace_path / ".pollypm" / "state.db", workspace_path))
+        sources.append((None, "Workspace", project_state_db_path(workspace_path), workspace_path))
 
     pg_grouped = inbox_tasks_grouped(config)
     if pg_grouped is None:

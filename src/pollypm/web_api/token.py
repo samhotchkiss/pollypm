@@ -35,11 +35,11 @@ def _config_home() -> Path:
     even when config loading itself is broken (e.g. corrupt TOML).
     """
     try:
-        from pollypm.config import DEFAULT_CONFIG_PATH
+        from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR
 
         return Path(DEFAULT_CONFIG_PATH).parent
     except Exception:  # noqa: BLE001 — never block token ops on config import
-        return Path.home() / ".pollypm"
+        return GLOBAL_CONFIG_DIR
 
 
 # Module-level constant — useful for tests that want to assert paths.

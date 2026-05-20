@@ -343,7 +343,9 @@ def _iter_worker_markers(project_path: Path) -> Iterable[Path]:
     is missing — fresh installs and projects that have never claimed a
     task simply have nothing to reap.
     """
-    marker_dir = project_path / ".pollypm" / "worker-markers"
+    from pollypm.projects import project_worker_markers_dir
+
+    marker_dir = project_worker_markers_dir(project_path)
     try:
         if not marker_dir.is_dir():
             return ()

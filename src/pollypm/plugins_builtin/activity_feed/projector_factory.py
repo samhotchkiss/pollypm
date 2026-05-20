@@ -25,12 +25,14 @@ def _collect_work_db_paths(config: Any) -> list[tuple[str, Any]]:
     result: list[tuple[str, Any]] = []
     if config is None:
         return result
+    from pollypm.projects import project_state_db_path
+
     projects = getattr(config, "projects", None) or {}
     for key, project in projects.items():
         project_path = getattr(project, "path", None)
         if project_path is None:
             continue
-        result.append((str(key), project_path / ".pollypm" / "state.db"))
+        result.append((str(key), project_state_db_path(project_path)))
     return result
 
 

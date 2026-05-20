@@ -1,6 +1,6 @@
 [project]
 name = "pollypm"
-version = "1.0.0rc2"
+version = "1.0.0rc3-dev"
 description = "Tmux-first orchestration for interactive CLI coding agents."
 readme = "README.md"
 requires-python = ">=3.13"

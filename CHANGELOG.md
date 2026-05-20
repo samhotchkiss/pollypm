@@ -8,6 +8,16 @@ Added, Changed, and Removed.
 
 ## [Unreleased]
 
+### Fixed
+- `render_footer_status()` in `pollypm.cockpit_footer_status` no longer
+  overflows the width budget for very narrow alert-only layouts. The
+  alert-only path previously emitted `"⚠ h…"` (4 plain chars) at
+  `width=3` because `_truncate_alert` returned a 2-char ellipsis stub
+  even when the budget could only fit 1 char. The contract is now
+  enforced explicitly: when the truncation can't fit at least 1 body
+  char plus the ellipsis, the formatter drops to `""` per the existing
+  full → compact → alert-only → empty cascade. PR #2014 review blocker.
+
 ### Added
 - `pm cli-reference --json` dumps the full Typer command tree (commands,
   subcommands, flags, types, help text, defaults) as a single JSON

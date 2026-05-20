@@ -345,6 +345,11 @@ def _parse_sessions(
             args=[str(arg) for arg in session_raw.get("args", [])],
             enabled=bool(session_raw.get("enabled", True)),
             window_name=session_raw.get("window_name"),
+            # #2012 — round-trip the per-session auth token. Empty string
+            # means "legacy session"; the watchdog emitter falls back to
+            # the un-marked brief format and the token gets minted on the
+            # next ``write_config`` (see ``ensure_session_auth_tokens``).
+            auth_token=str(session_raw.get("auth_token", "") or ""),
         )
     return sessions
 
@@ -1111,6 +1116,13 @@ def _render_global_config(config: PollyPMConfig) -> str:
             lines.append(f"args = [{items}]")
         if not session.enabled:
             lines.append("enabled = false")
+        # #2012 — per-session auth token for Lever 2 of the recovery
+        # cascade. Persist so the watchdog emitter and recovery-prompt
+        # builder pick up a stable secret across cockpit restarts. Only
+        # serialize when set — fresh-from-loader legacy sessions stay
+        # markerless until the token-mint helper runs.
+        if session.auth_token:
+            lines.append(f'auth_token = "{session.auth_token}"')
         lines.append("")
 
     for project_key, project in config.projects.items():
@@ -1196,6 +1208,10 @@ def _render_project_local_config(config: PollyPMConfig, project_key: str) -> str
             lines.append(f"args = [{items}]")
         if not session.enabled:
             lines.append("enabled = false")
+        # #2012 — round-trip per-session auth tokens for worker rows
+        # written to the project-local pollypm.toml.
+        if session.auth_token:
+            lines.append(f'auth_token = "{session.auth_token}"')
         lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"

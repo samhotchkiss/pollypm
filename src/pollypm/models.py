@@ -126,6 +126,15 @@ class SessionConfig:
     args: list[str] = field(default_factory=list)
     enabled: bool = True
     window_name: str | None = None
+    # Recovery-cascade Lever 2 (#2012). Per-session shared secret the
+    # watchdog escalation emitter and recovery-prompt builder prepend to
+    # their messages so the agent can distinguish a legitimate PollyPM
+    # injection from a prompt-injection attack. 32-byte hex string from
+    # ``secrets.token_hex(32)`` minted at session-save time. Empty string
+    # for legacy sessions — the auth marker is simply omitted in that
+    # case (the brief renders identically to pre-Lever-2 behaviour) and
+    # the token migrates in lazily on the next ``write_config``.
+    auth_token: str = ""
 
 
 @dataclass(slots=True)

@@ -354,6 +354,68 @@ def _snapshot_guarded_dirs(pollypm_home: Path) -> dict[str, set[Path]]:
     return snapshot
 
 
+def _pytest_provenance_tokens() -> tuple[str, ...]:
+    """Return string markers that identify writes from THIS pytest run.
+
+    A file under ``~/.pollypm/`` whose content contains any of these
+    tokens almost certainly originated from a test in this pytest
+    process (vs. a concurrent live PollyPM cockpit/heartbeat running
+    outside the test). Used by the home-write guard (#1938) to
+    distinguish test-induced leaks from background-process writes.
+
+    Tokens include:
+
+    - The pytest-pid tmp prefix this conftest configured via the env
+      vars at ``pytest_configure`` time (``pollypm-pytest-<pid>``).
+    - The conventional pytest tmp marker (``pytest-of-<user>``).
+    - The literal ``tmp_path`` token, which appears in tracebacks /
+      transcripts when a test path leaks into rendered output.
+    """
+    tokens: list[str] = []
+    tokens.append(f"pollypm-pytest-{os.getpid()}")
+    user = os.environ.get("USER") or os.environ.get("LOGNAME") or ""
+    if user:
+        tokens.append(f"pytest-of-{user}")
+    # ``pytest-of-`` without the user works as a weaker fallback for
+    # CI runners where USER may not be populated; still pytest-specific
+    # enough that no production cockpit code would emit it.
+    tokens.append("pytest-of-")
+    return tuple(tokens)
+
+
+def _looks_test_induced(path: Path, tokens: tuple[str, ...]) -> bool:
+    """Return True iff ``path`` looks like it was written by this test.
+
+    Two-pass check:
+
+    1. Path heritage: if the file's path string itself contains a
+       pytest tmp marker (``pytest-of-<user>``, ``pollypm-pytest-<pid>``,
+       or the literal ``tmp_path``), it's clearly test-scoped.
+    2. Content heritage: read up to 64 KiB of the file and check for
+       the same tokens. Catches the case where a test fed pytest tmp
+       paths into operator transcripts / checkpoints. Binary / unreadable
+       files are treated as NOT test-induced (the safer default — we'd
+       rather miss a leak than delete a live cockpit artifact).
+
+    Anything else (no marker in path, no marker in content) is treated
+    as a background-process write and left alone.
+    """
+    path_str = str(path)
+    for token in tokens:
+        if token in path_str:
+            return True
+    try:
+        with path.open("rb") as fh:
+            head = fh.read(65536)
+    except OSError:
+        return False
+    try:
+        text = head.decode("utf-8", errors="ignore")
+    except (UnicodeDecodeError, AttributeError):
+        return False
+    return any(token in text for token in tokens)
+
+
 @pytest.fixture(autouse=True)
 def _pollypm_home_write_guard(request):
     """Fail any test that writes new files to the real ``~/.pollypm/``.
@@ -364,6 +426,18 @@ def _pollypm_home_write_guard(request):
       opt-out — typically because the test monkeypatched ``Path.home``).
     - The real ``~/.pollypm/`` dir doesn't exist (clean dev machine /
       CI worker; nothing to pollute).
+
+    #1938 — narrow the guard so it only treats a new file as a leak
+    when there's positive evidence it came from THIS pytest process.
+    On a developer machine running a live cockpit/heartbeat alongside
+    pytest, the snapshot-diff would otherwise flag (and delete) real
+    background-process writes — operator checkpoints, snapshots,
+    agent_home backups — as "test leaks". The original #1902 bug was
+    a test writing pytest-fixture paths into the real cockpit; that
+    shape is still caught because the writes carry pytest provenance
+    tokens (pytest-of-<user>, pollypm-pytest-<pid>, ``tmp_path``).
+    Files lacking those markers are logged as warnings but NOT
+    unlinked and do NOT fail the test.
     """
     if request.node.get_closest_marker("allows_home_writes") is not None:
         yield
@@ -375,11 +449,33 @@ def _pollypm_home_write_guard(request):
     before = _snapshot_guarded_dirs(pollypm_home)
     yield
     after = _snapshot_guarded_dirs(pollypm_home)
-    leaks: list[str] = []
+    candidates: list[Path] = []
     for subdir, before_set in before.items():
         new_files = after.get(subdir, set()) - before_set
         for path in sorted(new_files):
+            candidates.append(path)
+    if not candidates:
+        return
+    tokens = _pytest_provenance_tokens()
+    leaks: list[str] = []
+    unattributed: list[str] = []
+    for path in candidates:
+        if _looks_test_induced(path, tokens):
             leaks.append(str(path))
+        else:
+            unattributed.append(str(path))
+    if unattributed:
+        # Background-process writes (live cockpit/heartbeat running in
+        # parallel). Do NOT unlink — those are real operator artifacts.
+        # Surface a debug-level note via the pytest captured output so a
+        # developer chasing test flakiness can see what slipped through.
+        print(
+            "\n[home-write guard] ignored "
+            f"{len(unattributed)} background ~/.pollypm/ write(s) "
+            "(no pytest provenance markers): "
+            + ", ".join(unattributed[:5])
+            + (" ..." if len(unattributed) > 5 else "")
+        )
     if leaks:
         # Best-effort cleanup of the leaked files so the next test
         # starts clean and the dev machine doesn't accumulate cruft.

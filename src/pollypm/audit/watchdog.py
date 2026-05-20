@@ -3903,14 +3903,30 @@ def _brief_fallback(finding: Finding) -> list[str]:
     return lines
 
 
-def format_unstick_brief(finding: Finding) -> str:
+def format_unstick_brief(
+    finding: Finding,
+    *,
+    auth_token: str | None = None,
+) -> str:
     """Render a finding as a structured brief for the architect.
 
     Each rule produces a tailored brief — the framing is the same
     (``WATCHDOG ESCALATION`` header + structured fields + decision
     options) but the ``Observed evidence`` and ``Your job`` lines vary
     so the architect knows which lever to pull first.
+
+    #2012 — Lever 2 of the recovery cascade: when ``auth_token`` is
+    provided, the brief is prepended with
+    ``[PollyPM-Auth: <token>]\\n`` so the receiving agent can verify
+    the message originated from PollyPM (not a prompt-injection
+    attack). Sessions without a token (legacy / pre-migration) pass
+    ``None``/``""`` and the brief renders unchanged. The marker is
+    added LAST so call-site composition stays simple: every body
+    builder still works on plain text. See
+    :mod:`pollypm.session_auth` for the contract.
     """
+    from pollypm.session_auth import format_auth_marker
+
     project = finding.project or "<unknown>"
     subject = finding.subject or "<unknown>"
     meta = finding.metadata or {}
@@ -3938,4 +3954,6 @@ def format_unstick_brief(finding: Finding) -> str:
         lines.extend(_brief_worker_session_dead_loop(finding, subject, meta))
     else:
         lines.extend(_brief_fallback(finding))
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    marker = format_auth_marker(auth_token)
+    return f"{marker}{body}" if marker else body

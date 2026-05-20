@@ -20,6 +20,7 @@ import logging
 import os
 import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import typer
@@ -953,6 +954,274 @@ def _kind_for_notify(
     return InboxItemKind.LEGACY.value
 
 
+@dataclass(frozen=True)
+class _NotifyArgs:
+    """Normalized ``pm notify`` arguments after validation.
+
+    Produced by :func:`_normalize_notify_args`; bundles every field the
+    enqueue path needs so the top-level command stays a thin driver.
+    """
+
+    channel_name: str
+    body: str
+    actor: str
+    current_session_name: str | None
+    project: str
+    resolved_priority: str
+    requester_role: str
+    label_list: list[str]
+    milestone_key: str | None
+    user_prompt_payload: dict[str, object] | None
+
+
+def _normalize_notify_args(
+    helpers,
+    *,
+    subject: str,
+    body: str,
+    actor: str,
+    project: str,
+    priority: str,
+    milestone: str,
+    labels: list[str] | None,
+    requester: str,
+    user_prompt_json: str,
+    channel: str,
+) -> _NotifyArgs:
+    """Validate + normalize the raw ``pm notify`` arguments.
+
+    Centralizes every error-and-exit / classification / inference step
+    so the top-level ``notify`` body can stay focused on the enqueue
+    pipeline. Behavior is identical to the inline version: each
+    ``typer.Exit`` site is preserved verbatim, and the helpers
+    (``_infer_notify_actor``, ``_infer_notify_project``,
+    ``_validate_user_prompt_payload``, the classifier import) are
+    called in the same order with the same arguments.
+    """
+    if not subject.strip():
+        typer.echo("Error: subject must not be empty.", err=True)
+        raise typer.Exit(code=1)
+
+    channel_name = (channel or "inbox").strip().lower()
+    if channel_name not in {"inbox", "dev"}:
+        typer.echo(
+            f"Error: --channel must be 'inbox' or 'dev' (got {channel!r}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    # #1076 — auto-route Polly's "Nth fake RECOVERY MODE injection"
+    # meta-reports to channel:dev so they don't pollute the user-
+    # facing inbox. Gated behind ``POLLYPM_DEV_FAKE_RECOVERY_INBOX``
+    # so harness work that explicitly wants these in the inbox can
+    # still opt in (off by default — the user-facing inbox is the
+    # default surface and dev scaffolding doesn't belong there).
+    if (
+        channel_name == "inbox"
+        and _is_fake_recovery_injection_subject(subject)
+        and not _fake_recovery_inbox_override_enabled()
+    ):
+        channel_name = "dev"
+
+    if body == "-":
+        body = sys.stdin.read()
+    if not body.strip():
+        typer.echo(
+            "Error: body must not be empty (pass '-' to read from stdin).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    resolved_config_path = helpers._discover_config_path(DEFAULT_CONFIG_PATH)
+    actor, current_session_name = _infer_notify_actor(
+        resolved_config_path,
+        actor,
+    )
+
+    # #1425 — when the caller didn't pass ``--project``, infer it
+    # from the calling pane's session config so a reviewer running
+    # in ``reviewer-savethenovel`` lands its notify on
+    # ``project=savethenovel`` instead of the synthetic global
+    # ``inbox`` bucket. Explicit ``--project inbox`` (or any other
+    # value) still wins so global broadcasts and bootstrap scripts
+    # keep working from inside a project-scoped pane.
+    if not (project or "").strip():
+        inferred_project = _infer_notify_project(resolved_config_path)
+        project = inferred_project or "inbox"
+
+    from pollypm.store.classifier import classify_priority, validate_priority
+
+    requested = (priority or "auto").strip().lower()
+    if requested == "auto":
+        resolved_priority = classify_priority(subject, body)
+    else:
+        try:
+            resolved_priority = validate_priority(requested)
+        except ValueError as exc:
+            typer.echo(f"Error: {exc}", err=True)
+            raise typer.Exit(code=1) from exc
+
+    requester_role = (requester or "user").strip().lower()
+    if requester_role not in ("user", "polly"):
+        typer.echo(
+            f"Error: --requester must be 'user' or 'polly' (got {requester!r}).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+    label_list = [label for label in (labels or []) if label and label.strip()]
+    # Channel separation (#754): dev-channel messages carry a
+    # ``channel:dev`` label so the default inbox view (and the
+    # cockpit rail count) can skip them. Regular user-facing
+    # notifications inherit the implicit ``channel:inbox`` label.
+    if channel_name == "dev":
+        if "channel:dev" not in label_list:
+            label_list.append("channel:dev")
+    milestone_key = milestone.strip() or None
+    user_prompt_payload = _validate_user_prompt_payload(user_prompt_json)
+
+    return _NotifyArgs(
+        channel_name=channel_name,
+        body=body,
+        actor=actor,
+        current_session_name=current_session_name,
+        project=project,
+        resolved_priority=resolved_priority,
+        requester_role=requester_role,
+        label_list=label_list,
+        milestone_key=milestone_key,
+        user_prompt_payload=user_prompt_payload,
+    )
+
+
+def _maybe_warn_user_prompt_fallback(args: _NotifyArgs) -> None:
+    """Emit the producer-side diagnostic note about heuristic fallback.
+
+    The dashboard has a heuristic fallback when producers omit
+    ``--user-prompt-json``. Keep that fallback quiet by default: role
+    panes often stream stderr into user-facing logs, where a
+    ``Warning:`` prefix reads like a broken escalation. Developers
+    debugging producer payloads can opt into this diagnostic note via
+    :func:`_notify_user_prompt_fallback_note_enabled`.
+    """
+    if (
+        args.user_prompt_payload is None
+        and args.resolved_priority == "immediate"
+        and args.requester_role == "user"
+        and args.channel_name == "inbox"
+        and _notify_user_prompt_fallback_note_enabled()
+    ):
+        typer.echo(
+            "note: posting an immediate-priority user-facing "
+            "notify without --user-prompt-json. The dashboard's "
+            "Action Needed card is using body-heuristic fallback "
+            "and lose structured steps + decision question + "
+            "contextual buttons. Pass --user-prompt-json '{...}' "
+            "with at least one of summary/steps/question for a "
+            "first-class action surface.",
+            err=True,
+        )
+
+
+def _enqueue_notify_message(
+    store,
+    *,
+    subject: str,
+    args: _NotifyArgs,
+    dedup_key: str,
+    notify_kind: str,
+) -> str:
+    """Dispatch the notify message: dedup-bump or first-write insert.
+
+    #1013 — dedup-key collapsing for repeated alert patterns. When
+    ``--dedup-key`` is set and a matching open notify exists, increment
+    its ``count`` + refresh ``last_seen`` instead of spawning a second
+    row. Empty key (the default) keeps the legacy insert-every-time
+    behavior so existing callers don't silently change semantics.
+
+    The ``store`` is the process-wide singleton from
+    :func:`_resolve_notify_store` (#1790); the caller must NOT close it
+    after this returns.
+    """
+    from pollypm.inbox_dedup import (
+        bump_dedup_message,
+        find_open_dedup_message,
+        initial_dedup_payload,
+    )
+
+    tier_state = {
+        "immediate": "open",
+        "digest": "staged",
+        "silent": "closed",
+    }[args.resolved_priority]
+
+    payload: dict[str, object] = {
+        "actor": args.actor,
+        "project": args.project,
+        "milestone_key": args.milestone_key,
+        "requester": args.requester_role,
+    }
+    if args.user_prompt_payload is not None:
+        payload["user_prompt"] = args.user_prompt_payload
+
+    dedup_key_value = (dedup_key or "").strip()
+    existing_dedup_row = (
+        find_open_dedup_message(
+            store,
+            dedup_key_value,
+            recipient=args.requester_role,
+        )
+        if dedup_key_value
+        else None
+    )
+
+    try:
+        if existing_dedup_row is not None:
+            # Bump path — caller signaled "this is the same alert
+            # I posted before". Refresh subject/body/payload so the
+            # most recent context wins, and increment count.
+            message_id = bump_dedup_message(
+                store,
+                existing_dedup_row,
+                subject=subject,
+                body=args.body,
+                payload={**payload, "dedup_key": dedup_key_value},
+                labels=args.label_list or None,
+                tier=args.resolved_priority,
+            )
+        else:
+            # First-write path. Annotate payload with count=1 +
+            # last_seen so a future bump has a stable shape to
+            # increment.
+            seeded_payload = (
+                initial_dedup_payload(payload, dedup_key_value)
+                if dedup_key_value
+                else payload
+            )
+            message_id = store.enqueue_message(
+                type="notify",
+                tier=args.resolved_priority,
+                recipient=args.requester_role,
+                sender=args.actor,
+                subject=subject,
+                body=args.body,
+                scope=args.project,
+                labels=args.label_list or None,
+                payload=seeded_payload,
+                state=(
+                    "closed"
+                    if args.resolved_priority == "immediate"
+                    else tier_state
+                ),
+                kind=notify_kind,
+            )
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Failed to enqueue notify message: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    return message_id
+
+
 def notify(
     helpers,
     subject: str = typer.Argument(..., help="Short title for the inbox item."),
@@ -1059,225 +1328,75 @@ def notify(
     ),
 ) -> None:
     """Create a work-service inbox item for the human user."""
-    if not subject.strip():
-        typer.echo("Error: subject must not be empty.", err=True)
-        raise typer.Exit(code=1)
-
-    channel_name = (channel or "inbox").strip().lower()
-    if channel_name not in {"inbox", "dev"}:
-        typer.echo(
-            f"Error: --channel must be 'inbox' or 'dev' (got {channel!r}).",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    # #1076 — auto-route Polly's "Nth fake RECOVERY MODE injection"
-    # meta-reports to channel:dev so they don't pollute the user-
-    # facing inbox. Gated behind ``POLLYPM_DEV_FAKE_RECOVERY_INBOX``
-    # so harness work that explicitly wants these in the inbox can
-    # still opt in (off by default — the user-facing inbox is the
-    # default surface and dev scaffolding doesn't belong there).
-    if (
-        channel_name == "inbox"
-        and _is_fake_recovery_injection_subject(subject)
-        and not _fake_recovery_inbox_override_enabled()
-    ):
-        channel_name = "dev"
-
-    if body == "-":
-        body = sys.stdin.read()
-    if not body.strip():
-        typer.echo(
-            "Error: body must not be empty (pass '-' to read from stdin).",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    resolved_config_path = helpers._discover_config_path(DEFAULT_CONFIG_PATH)
-    actor, current_session_name = _infer_notify_actor(
-        resolved_config_path,
-        actor,
+    args = _normalize_notify_args(
+        helpers,
+        subject=subject,
+        body=body,
+        actor=actor,
+        project=project,
+        priority=priority,
+        milestone=milestone,
+        labels=labels,
+        requester=requester,
+        user_prompt_json=user_prompt_json,
+        channel=channel,
     )
-
-    # #1425 — when the caller didn't pass ``--project``, infer it
-    # from the calling pane's session config so a reviewer running
-    # in ``reviewer-savethenovel`` lands its notify on
-    # ``project=savethenovel`` instead of the synthetic global
-    # ``inbox`` bucket. Explicit ``--project inbox`` (or any other
-    # value) still wins so global broadcasts and bootstrap scripts
-    # keep working from inside a project-scoped pane.
-    if not (project or "").strip():
-        inferred_project = _infer_notify_project(resolved_config_path)
-        project = inferred_project or "inbox"
-
-    from pollypm.store.classifier import classify_priority, validate_priority
-
-    requested = (priority or "auto").strip().lower()
-    if requested == "auto":
-        resolved_priority = classify_priority(subject, body)
-    else:
-        try:
-            resolved_priority = validate_priority(requested)
-        except ValueError as exc:
-            typer.echo(f"Error: {exc}", err=True)
-            raise typer.Exit(code=1) from exc
-
-    requester_role = (requester or "user").strip().lower()
-    if requester_role not in ("user", "polly"):
-        typer.echo(
-            f"Error: --requester must be 'user' or 'polly' (got {requester!r}).",
-            err=True,
-        )
-        raise typer.Exit(code=1)
-
-    label_list = [label for label in (labels or []) if label and label.strip()]
-    # Channel separation (#754): dev-channel messages carry a
-    # ``channel:dev`` label so the default inbox view (and the
-    # cockpit rail count) can skip them. Regular user-facing
-    # notifications inherit the implicit ``channel:inbox`` label.
-    if channel_name == "dev":
-        if "channel:dev" not in label_list:
-            label_list.append("channel:dev")
-    milestone_key = milestone.strip() or None
-    user_prompt_payload = _validate_user_prompt_payload(user_prompt_json)
-
-    # The dashboard has a heuristic fallback when producers omit
-    # ``--user-prompt-json``. Keep that fallback quiet by default:
-    # role panes often stream stderr into user-facing logs, where a
-    # "Warning:" prefix reads like a broken escalation. Developers
-    # debugging producer payloads can opt into this diagnostic note.
-    if (
-        user_prompt_payload is None
-        and resolved_priority == "immediate"
-        and requester_role == "user"
-        and channel_name == "inbox"
-        and _notify_user_prompt_fallback_note_enabled()
-    ):
-        typer.echo(
-            "note: posting an immediate-priority user-facing "
-            "notify without --user-prompt-json. The dashboard's "
-            "Action Needed card is using body-heuristic fallback "
-            "and lose structured steps + decision question + "
-            "contextual buttons. Pass --user-prompt-json '{...}' "
-            "with at least one of summary/steps/question for a "
-            "first-class action surface.",
-            err=True,
-        )
+    _maybe_warn_user_prompt_fallback(args)
 
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     store = _resolve_notify_store(db)
-    tier_state = {
-        "immediate": "open",
-        "digest": "staged",
-        "silent": "closed",
-    }[resolved_priority]
-
-    payload = {
-        "actor": actor,
-        "project": project,
-        "milestone_key": milestone_key,
-        "requester": requester_role,
-    }
-    if user_prompt_payload is not None:
-        payload["user_prompt"] = user_prompt_payload
-
-    # #1013 — dedup-key collapsing for repeated alert patterns.
-    # When --dedup-key is set and a matching open notify exists,
-    # increment its ``count`` + refresh ``last_seen`` instead of
-    # spawning a second row. Empty key (the default) keeps the
-    # legacy insert-every-time behavior so existing callers don't
-    # silently change semantics.
-    from pollypm.inbox_dedup import (
-        bump_dedup_message,
-        find_open_dedup_message,
-        initial_dedup_payload,
-    )
-
-    dedup_key_value = (dedup_key or "").strip()
-    existing_dedup_row = (
-        find_open_dedup_message(
-            store,
-            dedup_key_value,
-            recipient=requester_role,
-        )
-        if dedup_key_value
-        else None
-    )
-
     notify_kind = _kind_for_notify(
-        label_list,
-        requester=requester_role,
-        user_prompt_payload=user_prompt_payload,
+        args.label_list,
+        requester=args.requester_role,
+        user_prompt_payload=args.user_prompt_payload,
     )
-    try:
-        if existing_dedup_row is not None:
-            # Bump path — caller signaled "this is the same alert
-            # I posted before". Refresh subject/body/payload so the
-            # most recent context wins, and increment count.
-            message_id = bump_dedup_message(
-                store,
-                existing_dedup_row,
-                subject=subject,
-                body=body,
-                payload={**payload, "dedup_key": dedup_key_value},
-                labels=label_list or None,
-                tier=resolved_priority,
-            )
-        else:
-            # First-write path. Annotate payload with count=1 +
-            # last_seen so a future bump has a stable shape to
-            # increment.
-            seeded_payload = (
-                initial_dedup_payload(payload, dedup_key_value)
-                if dedup_key_value
-                else payload
-            )
-            message_id = store.enqueue_message(
-                type="notify",
-                tier=resolved_priority,
-                recipient=requester_role,
-                sender=actor,
-                subject=subject,
-                body=body,
-                scope=project,
-                labels=label_list or None,
-                payload=seeded_payload,
-                state="closed" if resolved_priority == "immediate" else tier_state,
-                kind=notify_kind,
-            )
-    except Exception as exc:  # noqa: BLE001
-        typer.echo(f"Failed to enqueue notify message: {exc}", err=True)
-        raise typer.Exit(code=1) from exc
-    # ``store`` is the process-wide singleton from
-    # :func:`_resolve_notify_store` (#1790); do NOT close it.
+    message_id = _enqueue_notify_message(
+        store,
+        subject=subject,
+        args=args,
+        dedup_key=dedup_key,
+        notify_kind=notify_kind,
+    )
+
+    # Rebuild the payload shape that ``_create_notify_inbox_task``
+    # consumes. Mirrors the seed dict in :func:`_enqueue_notify_message`
+    # so the inbox-task projection matches the message-row payload.
+    payload: dict[str, object] = {
+        "actor": args.actor,
+        "project": args.project,
+        "milestone_key": args.milestone_key,
+        "requester": args.requester_role,
+    }
+    if args.user_prompt_payload is not None:
+        payload["user_prompt"] = args.user_prompt_payload
 
     inbox_task_id: str | None = None
-    if resolved_priority == "immediate":
+    if args.resolved_priority == "immediate":
         inbox_task_id = _create_notify_inbox_task(
             db=db,
             store=store,
             message_id=message_id,
             subject=subject,
-            body=body,
-            project=project,
-            actor=actor,
-            requester_role=requester_role,
-            label_list=label_list,
+            body=args.body,
+            project=args.project,
+            actor=args.actor,
+            requester_role=args.requester_role,
+            label_list=args.label_list,
             notify_kind=notify_kind,
             payload=payload,
         )
 
     _hold_review_tasks_for_notify(
-        actor=actor,
-        current_session_name=current_session_name,
-        priority=resolved_priority,
+        actor=args.actor,
+        current_session_name=args.current_session_name,
+        priority=args.resolved_priority,
         subject=subject,
-        body=body,
+        body=args.body,
     )
 
-    if resolved_priority == "silent":
+    if args.resolved_priority == "silent":
         typer.echo("silent")
-    elif resolved_priority == "digest":
+    elif args.resolved_priority == "digest":
         typer.echo(f"digest:{message_id}")
     else:
         typer.echo(str(inbox_task_id or message_id))

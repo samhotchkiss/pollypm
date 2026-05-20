@@ -311,11 +311,10 @@ class EventProjector:
         self._work_dbs: list[tuple[str, Path]] = [
             (key, Path(path)) for key, path in work_db_paths
         ]
-        # #1816: when ``config`` is provided and ``[storage] backend ==
-        # "postgres"`` we route state-store reads through the pg-backed
-        # Store instead of the sqlite file. Without the config the
-        # projector keeps its legacy sqlite-only behaviour so existing
-        # callers (mostly tests) don't have to thread a config in.
+        # Post-sqlite-ripout (refs #1971): ``config`` is the canonical
+        # handle to the active backend (pg, post-#1737). The old
+        # ``state_db_path`` argument is retained for source-compat
+        # with existing callers but no longer drives any reads.
         self._config = config
 
     # ------------------------------------------------------------------
@@ -323,16 +322,16 @@ class EventProjector:
     # ------------------------------------------------------------------
 
     def _open_state_store(self):
-        """Return a :class:`Store` for the state DB, or ``None``.
+        """Return the pg-backed :class:`Store`, or ``None``.
 
-        #1816: when the active backend is pg, route through
-        :func:`get_store` so the projector reads ``messages`` rows from
-        pg instead of the (stale) sqlite file. Falls back to the legacy
-        ``sqlite:///<state_db>`` path when no config is in scope or the
-        backend is sqlite.
+        Post-sqlite-ripout (refs #1971) the legacy sqlite fallback is
+        gone — pg is the only supported backend. ``_config`` is the
+        canonical handle; when it's ``None`` (some test doubles), we
+        load the active config.
         """
         try:
-            from pollypm.store.registry import get_store, get_store_by_url
+            from pollypm.config import load_config
+            from pollypm.store.registry import get_store
         except Exception:  # noqa: BLE001
             logger.warning(
                 "activity_feed: failed to import store registry",
@@ -340,22 +339,12 @@ class EventProjector:
             )
             return None
 
-        if self._config is not None:
-            try:
-                from pollypm.storage._backend_dispatch import is_pg_backend
-            except Exception:  # noqa: BLE001
-                is_pg_backend = lambda _config=None: False  # type: ignore[assignment]
-            try:
-                if is_pg_backend(self._config):
-                    return get_store(self._config)
-            except Exception:  # noqa: BLE001
-                logger.exception(
-                    "activity_feed: get_store(pg) failed; falling back to sqlite",
-                )
-
-        # #1971: sqlite store/service classes are removed. Without a pg
-        # config, there's no Store to return. Callers tolerate None.
-        return None
+        try:
+            config = self._config if self._config is not None else load_config()
+            return get_store(config)
+        except Exception:  # noqa: BLE001
+            logger.exception("activity_feed: failed to open pg Store")
+            return None
 
     def _project_from_state_store(
         self,

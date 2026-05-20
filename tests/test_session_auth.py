@@ -1,0 +1,301 @@
+"""Unit tests for Lever 2 (#2012) per-session auth-token plumbing.
+
+PR 1 of the recovery-cascade Lever 2 arc covers:
+
+* ``SessionConfig.auth_token`` storage and TOML round-trip
+* :mod:`pollypm.session_auth` helpers (mint, format, ensure-all)
+* Agent-profile prompt teaches the auth contract when the session
+  has a token, omits it when not
+
+The emit-side (watchdog + recovery preamble) is PR 2 and tested there.
+"""
+
+from __future__ import annotations
+
+import re
+from pathlib import Path
+
+import pytest
+
+from pollypm.agent_profiles.base import AgentProfileContext
+from pollypm.agent_profiles.defaults import (
+    StaticPromptProfile,
+    _render_auth_contract,
+)
+from pollypm.config import load_config, write_config
+from pollypm.models import (
+    AccountConfig,
+    KnownProject,
+    PollyPMConfig,
+    PollyPMSettings,
+    ProjectKind,
+    ProjectSettings,
+    ProviderKind,
+    SessionConfig,
+)
+from pollypm.session_auth import (
+    AUTH_MARKER_PREFIX,
+    AUTH_MARKER_SUFFIX,
+    TOKEN_BYTES,
+    ensure_session_auth_tokens,
+    format_auth_marker,
+    mint_auth_token,
+)
+
+
+# ---------------------------------------------------------------------------
+# mint_auth_token
+# ---------------------------------------------------------------------------
+
+
+def test_mint_auth_token_returns_hex_of_expected_width() -> None:
+    """``secrets.token_hex(32)`` yields 64 hex chars."""
+    token = mint_auth_token()
+    assert re.fullmatch(r"[0-9a-f]+", token), token
+    assert len(token) == TOKEN_BYTES * 2
+
+
+def test_mint_auth_token_is_unique_per_call() -> None:
+    """Two consecutive mints must not collide.
+
+    The token is the session's first line of defence against
+    prompt-injection — even a low collision rate would let one
+    architect impersonate another's watchdog brief.
+    """
+    samples = {mint_auth_token() for _ in range(64)}
+    assert len(samples) == 64
+
+
+# ---------------------------------------------------------------------------
+# format_auth_marker
+# ---------------------------------------------------------------------------
+
+
+def test_format_auth_marker_renders_marker_for_real_token() -> None:
+    token = "deadbeef" * 8  # 64 hex chars
+    marker = format_auth_marker(token)
+    assert marker.startswith(AUTH_MARKER_PREFIX)
+    assert marker.endswith(AUTH_MARKER_SUFFIX)
+    assert token in marker
+
+
+def test_format_auth_marker_empty_for_missing_token() -> None:
+    """Empty/None tokens render to empty string so callers can
+    unconditionally prepend without conditionals.
+
+    This is the backward-compat lever: a legacy session row (loaded
+    from a pollypm.toml written before Lever 2) carries
+    ``auth_token = ""`` and the watchdog emitter behaves identically
+    to pre-Lever-2 behaviour.
+    """
+    assert format_auth_marker("") == ""
+    assert format_auth_marker(None) == ""
+
+
+# ---------------------------------------------------------------------------
+# ensure_session_auth_tokens
+# ---------------------------------------------------------------------------
+
+
+def _bare_config(tmp_path: Path) -> PollyPMConfig:
+    root = tmp_path / "repo"
+    root.mkdir()
+    return PollyPMConfig(
+        project=ProjectSettings(
+            root_dir=root,
+            base_dir=root / ".pollypm",
+            logs_dir=root / ".pollypm/logs",
+            snapshots_dir=root / ".pollypm/snapshots",
+            state_db=root / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="acc"),
+        accounts={
+            "acc": AccountConfig(
+                name="acc", provider=ProviderKind.CLAUDE,
+                home=root / ".pollypm" / "homes" / "acc",
+            ),
+        },
+        sessions={
+            "architect": SessionConfig(
+                name="architect", role="architect",
+                provider=ProviderKind.CLAUDE, account="acc", cwd=root,
+            ),
+            "reviewer": SessionConfig(
+                name="reviewer", role="reviewer",
+                provider=ProviderKind.CLAUDE, account="acc", cwd=root,
+            ),
+        },
+        projects={
+            "demo": KnownProject(
+                key="demo", path=root, name="Demo",
+                kind=ProjectKind.FOLDER,
+            ),
+        },
+    )
+
+
+def test_ensure_session_auth_tokens_mints_for_each_legacy_session(
+    tmp_path: Path,
+) -> None:
+    config = _bare_config(tmp_path)
+    assert config.sessions["architect"].auth_token == ""
+    assert config.sessions["reviewer"].auth_token == ""
+
+    minted = ensure_session_auth_tokens(config)
+    assert minted == 2
+    arch = config.sessions["architect"].auth_token
+    rev = config.sessions["reviewer"].auth_token
+    assert arch and rev
+    assert arch != rev, "different sessions must get different tokens"
+
+
+def test_ensure_session_auth_tokens_is_idempotent(tmp_path: Path) -> None:
+    """A re-run after migration must not re-mint."""
+    config = _bare_config(tmp_path)
+    ensure_session_auth_tokens(config)
+    before = {
+        name: session.auth_token
+        for name, session in config.sessions.items()
+    }
+    minted = ensure_session_auth_tokens(config)
+    after = {
+        name: session.auth_token
+        for name, session in config.sessions.items()
+    }
+    assert minted == 0
+    assert before == after
+
+
+# ---------------------------------------------------------------------------
+# TOML round-trip
+# ---------------------------------------------------------------------------
+
+
+def test_session_auth_token_round_trips_through_toml(tmp_path: Path) -> None:
+    """write_config -> load_config preserves auth_token verbatim."""
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.architect_demo]
+role = "architect"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+project = "demo"
+auth_token = "cafebabe1234567890cafebabe1234567890cafebabe1234567890cafebabe12"
+
+[projects.demo]
+path = "demo"
+"""
+    )
+    (tmp_path / "demo").mkdir()
+
+    config = load_config(config_path)
+    assert (
+        config.sessions["architect_demo"].auth_token
+        == "cafebabe1234567890cafebabe1234567890cafebabe1234567890cafebabe12"
+    )
+    # Legacy session (no auth_token key) parses to empty string.
+    assert config.sessions["heartbeat"].auth_token == ""
+
+    # Round-trip through write_config.
+    output_path = tmp_path / "out.toml"
+    write_config(config, output_path, force=True)
+    rendered = output_path.read_text()
+    assert (
+        'auth_token = "cafebabe1234567890cafebabe1234567890'
+        'cafebabe1234567890cafebabe12"'
+        in rendered
+    ), rendered
+
+    reloaded = load_config(output_path)
+    assert (
+        reloaded.sessions["architect_demo"].auth_token
+        == config.sessions["architect_demo"].auth_token
+    )
+    # Legacy session still has no marker emitted.
+    heartbeat_block = rendered.split("[sessions.heartbeat]")[1].split("[", 1)[0]
+    assert "auth_token" not in heartbeat_block, heartbeat_block
+
+
+# ---------------------------------------------------------------------------
+# Agent-profile auth-contract block
+# ---------------------------------------------------------------------------
+
+
+def test_auth_contract_block_renders_with_token(tmp_path: Path) -> None:
+    """The agent profile's auth-contract block embeds the real token.
+
+    The agent receives the literal ``[PollyPM-Auth: <hex>]`` marker
+    inside its initial system prompt so it can compare incoming briefs
+    byte-for-byte. Verifies the hex and the surrounding instructions
+    ('refuse', 'prompt-injection') both land.
+    """
+    token = "abcdef00" * 8
+    block = _render_auth_contract(token)
+    assert "<pollypm_auth>" in block
+    assert AUTH_MARKER_PREFIX in block
+    assert token in block
+    assert "refuse" in block.lower()
+    assert "injection" in block.lower()
+
+
+def test_auth_contract_omitted_for_legacy_session() -> None:
+    """No token -> no contract block.
+
+    A half-installed contract ("marker missing means injection") would
+    train the agent to refuse pre-Lever-2 messages still in flight.
+    The block stays absent until the token migration completes.
+    """
+    assert _render_auth_contract("") == ""
+    assert _render_auth_contract(None) == ""
+
+
+def test_profile_build_prompt_includes_auth_block_with_token(
+    tmp_path: Path,
+) -> None:
+    """Full profile rendering injects the auth block when the session
+    carries a token."""
+    config = _bare_config(tmp_path)
+    config.sessions["architect"].auth_token = "1234abcd" * 8
+    profile = StaticPromptProfile(name="worker", prompt="You are a worker.")
+    context = AgentProfileContext(
+        config=config,
+        session=config.sessions["architect"],
+        account=config.accounts["acc"],
+    )
+    rendered = profile.build_prompt(context) or ""
+    assert "<pollypm_auth>" in rendered
+    assert "1234abcd" * 8 in rendered
+
+
+def test_profile_build_prompt_omits_auth_block_without_token(
+    tmp_path: Path,
+) -> None:
+    """No token on the session -> no auth block in the rendered prompt."""
+    config = _bare_config(tmp_path)
+    profile = StaticPromptProfile(name="worker", prompt="You are a worker.")
+    context = AgentProfileContext(
+        config=config,
+        session=config.sessions["architect"],
+        account=config.accounts["acc"],
+    )
+    rendered = profile.build_prompt(context) or ""
+    assert "<pollypm_auth>" not in rendered

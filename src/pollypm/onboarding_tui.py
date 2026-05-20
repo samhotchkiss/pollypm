@@ -6,6 +6,7 @@ from pathlib import Path
 import shutil
 import time
 
+import typer
 from rich.console import Console
 from rich.console import Group
 from rich.panel import Panel
@@ -18,8 +19,9 @@ from textual.screen import ModalScreen
 from textual.worker import Worker, WorkerState
 from textual.widgets import Button, Checkbox, Footer, RadioButton, RadioSet, SelectionList, Static
 
+from pollypm import onboarding as _onboarding_module
 from pollypm.cli_shortcuts import shortcut_rows
-from pollypm.config import write_config
+from pollypm.config import DEFAULT_CONFIG_PATH, load_config, write_config
 from pollypm.doctor import (
     AutoFixPlan,
     check_claude_cli,
@@ -43,6 +45,7 @@ from pollypm.onboarding import (
     demo_project_fallback_destination,
     discover_recent_project_candidates,
     provision_demo_project_fallback,
+    seed_demo_project_task,
 )
 from pollypm.onboarding_models import OnboardingResult
 from pollypm.projects import ensure_project_scaffold, make_project_key
@@ -1155,8 +1158,6 @@ class OnboardingApp(App[OnboardingResult | None]):
         self.state.recent_projects = [demo_path]
         self.state.selected_project_paths = [demo_path]
         if choice == "keep":
-            from pollypm.onboarding import seed_demo_project_task
-
             project_key = make_project_key(demo_path, set(self.state.known_projects))
             try:
                 task_id = seed_demo_project_task(demo_path, project_key=project_key)
@@ -1201,4 +1202,56 @@ def run_onboarding_app(config_path: Path, force: bool = False, no_animation: boo
     result = app.run(mouse=True)
     if result is None:
         raise SystemExit(1)
+    return result
+
+
+def run_onboarding(
+    config_path: Path = DEFAULT_CONFIG_PATH,
+    force: bool = False,
+    *,
+    no_animation: bool = False,
+) -> OnboardingResult:
+    # ``_onboarding_module`` indirection (vs a direct ``from pollypm.onboarding
+    # import _launch_onboarding_experience``) keeps the monkeypatch seam used
+    # by ``tests/test_onboarding.py`` honoured — test code replaces the
+    # attribute on the ``pollypm.onboarding`` module and expects this caller
+    # to pick up the substitute. Refactor slice 2 of #1367 moved this entry
+    # point out of ``pollypm.onboarding`` to break the onboarding ↔
+    # onboarding_tui import cycle (the lazy ``run_onboarding_app`` import in
+    # ``onboarding.py`` is now unnecessary).
+    launch = _onboarding_module._launch_onboarding_experience
+    render_welcome_back = _onboarding_module._render_welcome_back_summary
+
+    if not force and config_path.exists():
+        try:
+            config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            config = None
+        if config is not None:
+            for line in render_welcome_back(config):
+                typer.echo(line)
+            typer.echo("")
+            typer.echo("1. Open cockpit")
+            typer.echo("2. Add another account")
+            typer.echo("3. Re-run full onboarding")
+            choice = typer.prompt("Choose", default="1")
+            if choice == "1":
+                result = OnboardingResult(config_path=config_path, launch_requested=True)
+                if launch(result):
+                    raise typer.Exit()
+                return result
+            if choice == "2":
+                result = run_onboarding_app(config_path=config_path, force=False, no_animation=no_animation)
+                if result.launch_requested and launch(result):
+                    raise typer.Exit()
+                return result
+            if choice == "3":
+                result = run_onboarding_app(config_path=config_path, force=True, no_animation=no_animation)
+                if result.launch_requested and launch(result):
+                    raise typer.Exit()
+                return result
+
+    result = run_onboarding_app(config_path=config_path, force=force, no_animation=no_animation)
+    if result.launch_requested and launch(result):
+        raise typer.Exit()
     return result

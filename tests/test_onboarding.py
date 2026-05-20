@@ -320,7 +320,7 @@ def test_run_onboarding_launches_seeded_demo_experience(monkeypatch, tmp_path: P
     )
 
     with pytest.raises(ClickExit):
-        __import__("pollypm.onboarding", fromlist=["run_onboarding"]).run_onboarding(
+        __import__("pollypm.onboarding_tui", fromlist=["run_onboarding"]).run_onboarding(
             config_path=result.config_path,
             force=True,
         )

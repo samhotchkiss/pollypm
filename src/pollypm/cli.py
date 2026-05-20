@@ -435,7 +435,7 @@ def _require_pollypm_session(supervisor) -> None:
 
 
 def _first_run_setup_and_launch(config_path: Path) -> None:
-    from pollypm.onboarding import run_onboarding
+    from pollypm.onboarding_tui import run_onboarding
     path = run_onboarding(config_path=config_path, force=False)
     _install_global_pollypm(path.parent)
     # #1111 — pass phantom_client=False explicitly. Calling the
@@ -621,7 +621,7 @@ def onboard(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="Path to write the onboarding config."),
     force: bool = typer.Option(False, "--force", help="Overwrite an existing config file."),
 ) -> None:
-    from pollypm.onboarding import run_onboarding
+    from pollypm.onboarding_tui import run_onboarding
     path = run_onboarding(config_path=config_path, force=force)
     installed, install_output = _install_global_pollypm(path.parent)
     typer.echo("")

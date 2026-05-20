@@ -14,7 +14,7 @@ from pathlib import Path
 import typer
 
 from pollypm.agent_profiles.defaults import heartbeat_prompt, polly_prompt
-from pollypm.config import DEFAULT_CONFIG_PATH, load_config, write_config
+from pollypm.config import load_config, write_config
 from pollypm.models import (
     AccountConfig,
     KnownProject,
@@ -1320,49 +1320,6 @@ def _render_welcome_back_summary(config: PollyPMConfig) -> list[str]:
         for project in config.projects.values():
             lines.append(f"- {project.display_label()} -> {project.path}")
     return lines
-
-
-def run_onboarding(
-    config_path: Path = DEFAULT_CONFIG_PATH,
-    force: bool = False,
-    *,
-    no_animation: bool = False,
-) -> OnboardingResult:
-    from pollypm.onboarding_tui import run_onboarding_app
-
-    if not force and config_path.exists():
-        try:
-            config = load_config(config_path)
-        except Exception:  # noqa: BLE001
-            config = None
-        if config is not None:
-            for line in _render_welcome_back_summary(config):
-                typer.echo(line)
-            typer.echo("")
-            typer.echo("1. Open cockpit")
-            typer.echo("2. Add another account")
-            typer.echo("3. Re-run full onboarding")
-            choice = typer.prompt("Choose", default="1")
-            if choice == "1":
-                result = OnboardingResult(config_path=config_path, launch_requested=True)
-                if _launch_onboarding_experience(result):
-                    raise typer.Exit()
-                return result
-            if choice == "2":
-                result = run_onboarding_app(config_path=config_path, force=False, no_animation=no_animation)
-                if result.launch_requested and _launch_onboarding_experience(result):
-                    raise typer.Exit()
-                return result
-            if choice == "3":
-                result = run_onboarding_app(config_path=config_path, force=True, no_animation=no_animation)
-                if result.launch_requested and _launch_onboarding_experience(result):
-                    raise typer.Exit()
-                return result
-
-    result = run_onboarding_app(config_path=config_path, force=force, no_animation=no_animation)
-    if result.launch_requested and _launch_onboarding_experience(result):
-        raise typer.Exit()
-    return result
 
 
 def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:

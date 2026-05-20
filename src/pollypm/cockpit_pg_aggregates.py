@@ -20,6 +20,7 @@ crash the rail.
 from __future__ import annotations
 
 import logging
+import time
 from typing import TYPE_CHECKING, Any
 
 from pollypm.work.inbox_view import inbox_tasks
@@ -29,6 +30,32 @@ if TYPE_CHECKING:
     from pollypm.work.models import Task
 
 logger = logging.getLogger(__name__)
+
+
+# #1634 #1945 perf — per-process TTL cache for ``all_tasks_grouped``.
+#
+# Each rail ``build_items()`` tick runs ``_project_state_rollups``
+# (which calls ``all_tasks_grouped(config)``) AND, when the rail's
+# per-router 2s categorization TTL has expired, ``_project_categorizations``
+# (which opens its own shared work-service and runs the same broad
+# ``svc.list_tasks()`` against pg through :mod:`operator_view`). On
+# overlapping rail builds the two paths produce two bulk task reads
+# milliseconds apart. Caching ``all_tasks_grouped`` itself collapses
+# repeat calls within a tick onto a single pg roundtrip; pair this
+# with the ``_prefetch_project_state`` cache in :mod:`operator_view`
+# to handle the second access path.
+#
+# Mirrors the same wedge PRs #1907 + #1928 used for
+# ``pm_inbox_awaits_user_list`` and ``Supervisor.status()``: a tiny
+# module-level dict keyed on ``id(config)`` with a short TTL. The
+# cockpit router invalidates its config cache on mtime change, so a
+# reload yields a fresh identity and bypasses this cache automatically.
+# Callers receive a fresh dict + fresh inner lists so downstream
+# mutation cannot leak into the cached snapshot.
+_ALL_TASKS_GROUPED_TTL_SECONDS = 1.0
+_ALL_TASKS_GROUPED_CACHE: dict[
+    int, tuple[float, "dict[str, tuple[Task, ...]] | None"]
+] = {}
 
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +98,49 @@ def all_tasks_grouped(
 
     Returns ``None`` when the pg backend isn't available so the caller
     falls back to its sqlite walk.
+
+    #1634 #1945 perf — results are memoised per ``id(config)`` with a
+    short TTL (:data:`_ALL_TASKS_GROUPED_TTL_SECONDS`) so the rail
+    rollup path and any other broad-task caller within the same tick
+    share a single pg roundtrip. Callers receive a fresh dict + fresh
+    inner lists so downstream mutation is safe.
+    """
+    cache_key = id(config)
+    now = time.monotonic()
+    cached = _ALL_TASKS_GROUPED_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < _ALL_TASKS_GROUPED_TTL_SECONDS:
+        snapshot = cached[1]
+        if snapshot is None:
+            return None
+        return {key: list(rows) for key, rows in snapshot.items()}
+
+    result = _all_tasks_grouped_uncached(config)
+    # Best-effort eviction so the cache doesn't grow across long-lived
+    # processes with config reloads (each reload yields a fresh
+    # ``id(config)``).
+    if len(_ALL_TASKS_GROUPED_CACHE) > 8:
+        for stale_key in [
+            k for k, (ts, _v) in _ALL_TASKS_GROUPED_CACHE.items()
+            if now - ts >= _ALL_TASKS_GROUPED_TTL_SECONDS
+        ]:
+            _ALL_TASKS_GROUPED_CACHE.pop(stale_key, None)
+    snapshot = (
+        None
+        if result is None
+        else {key: tuple(rows) for key, rows in result.items()}
+    )
+    _ALL_TASKS_GROUPED_CACHE[cache_key] = (now, snapshot)
+    return result
+
+
+def _all_tasks_grouped_uncached(
+    config: "PollyPMConfig | None",
+) -> dict[str, list["Task"]] | None:
+    """Underlying implementation of :func:`all_tasks_grouped`.
+
+    Separated from the public entry point so the cache wrapper stays
+    trivially readable. Tests that need to bypass the cache can call
+    this directly (or clear :data:`_ALL_TASKS_GROUPED_CACHE`).
     """
     svc = _open_pg_service(config)
     if svc is None:

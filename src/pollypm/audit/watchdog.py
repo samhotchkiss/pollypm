@@ -57,6 +57,8 @@ notice when it stops) — the cadence handler calls
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from dataclasses import dataclass, field
@@ -113,6 +115,7 @@ __all__ = [
     "emit_finding",
     "emit_escalation_dispatched",
     "emit_operator_dispatched",
+    "dispatch_dedup_hash",
     "format_unstick_brief",
     "tier_handoff_prompt",
     "build_urgent_human_handoff",
@@ -3014,6 +3017,108 @@ def emit_finding(finding: Finding) -> None:
 # ---------------------------------------------------------------------------
 
 
+def dispatch_dedup_hash(finding: Finding) -> str:
+    """Subject-independent dedup hash for the dispatch throttle (#2015).
+
+    Distinct from :func:`pollypm.audit.tier4.root_cause_hash` — that
+    hash includes ``subject`` because the tier-4 promotion tracker
+    keys per-task accounting on the hash and needs different tasks to
+    accumulate independent dispatch histories.
+
+    The dispatch throttle has the opposite requirement: when the same
+    root-cause spawns multiple draft tasks (samblog/32-35 burst from
+    the 2026-05-19 architect cascade), each task has a different
+    ``subject`` but the operator sees four inbox entries asking the
+    same question with identical evidence. The throttle must collapse
+    those into one dispatch per window, so we hash only the fields
+    that identify the *finding body* — rule, project, and the
+    structured ``evidence`` payload — and deliberately exclude
+    ``subject`` / ``message`` / ``recommendation`` (the latter two are
+    cosmetic copy).
+
+    **Fallback for detectors without ``evidence`` (PR #2020 review).**
+    Most detector paths populate ``metadata`` but not ``evidence``
+    (``stuck_draft`` being the canonical case). Collapsing on
+    rule+project alone would over-dedupe genuinely different findings
+    that happen to share a rule. So:
+
+    1. If ``finding.evidence`` is non-empty, hash rule + project +
+       canonical evidence JSON (the intended #2015 behavior — collapse
+       sibling subjects whose bodies are identical).
+    2. Else if ``finding.metadata`` carries a stable root-cause key
+       (``root_cause_hash`` or ``dedup_key``), hash that instead. This
+       lets a detector opt into root-cause dedup without copying its
+       evidence shape — used by tier-4 callers that already computed
+       a stable hash upstream.
+    3. Else fall back to including ``subject`` in the hash — i.e.
+       legacy single-finding-per-subject behavior. With nothing
+       structured to compare, subject is the only signal that
+       distinguishes ``demo/1`` from ``demo/2``, and we must not
+       collapse them.
+
+    Stable across:
+        - Different ``subject`` (the whole point — same root cause
+          across sibling draft tasks), **iff** ``evidence`` is
+          populated (path 1) or a metadata key is provided (path 2).
+        - Different ``message`` / ``recommendation`` text.
+        - Re-ordering of keys inside ``evidence``.
+
+    Sensitive to:
+        - Different ``rule`` or ``project``.
+        - Any structural change to the ``evidence`` payload.
+        - ``subject`` when neither ``evidence`` nor a metadata
+          dedup key is present (fallback path 3).
+
+    16-hex-char output matches :func:`root_cause_hash` for symmetry;
+    collision resistance is fine for the cardinality the throttle sees
+    (a handful of distinct finding bodies per project per day).
+    """
+    rule = str(getattr(finding, "rule", "") or "")
+    project = str(getattr(finding, "project", "") or "")
+    evidence_raw = getattr(finding, "evidence", None) or {}
+    if not isinstance(evidence_raw, dict):
+        evidence_raw = {}
+    metadata_raw = getattr(finding, "metadata", None) or {}
+    if not isinstance(metadata_raw, dict):
+        metadata_raw = {}
+
+    # Path 1: structured evidence wins — collapse across sibling subjects.
+    if evidence_raw:
+        try:
+            evidence_json = json.dumps(
+                evidence_raw,
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            evidence_json = ""
+        canonical = "|".join(["v1", rule, project, evidence_json])
+    else:
+        # Path 2: opt-in via a stable metadata key (root_cause_hash /
+        # dedup_key). Lets a detector dedupe across subjects without
+        # populating evidence.
+        meta_key = ""
+        for candidate in ("root_cause_hash", "dedup_key"):
+            value = metadata_raw.get(candidate)
+            if isinstance(value, str) and value:
+                meta_key = f"{candidate}={value}"
+                break
+        if meta_key:
+            canonical = "|".join(["meta", rule, project, meta_key])
+        else:
+            # Path 3: fallback. No structured body — subject is the
+            # only signal that distinguishes findings. Including it
+            # restores legacy single-finding-per-subject behavior and
+            # prevents the throttle from suppressing distinct
+            # watchdog dispatches (PR #2020 review).
+            subject = str(getattr(finding, "subject", "") or "")
+            canonical = "|".join(["subj", rule, project, subject])
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return digest[:16]
+
+
 def was_recently_dispatched(
     *,
     project: str,
@@ -3022,6 +3127,7 @@ def was_recently_dispatched(
     now: datetime,
     project_path: Path | str | None = None,
     throttle_seconds: int = ESCALATION_THROTTLE_SECONDS,
+    dedup_hash: str | None = None,
 ) -> bool:
     """Return True iff the audit log shows a matching dispatch in-window.
 
@@ -3029,7 +3135,15 @@ def was_recently_dispatched(
     heartbeat-process restart doesn't reset the dedup window. We scan
     ``EVENT_WATCHDOG_ESCALATION_DISPATCHED`` for the project in the last
     ``throttle_seconds`` and look for a row whose metadata.finding_type
-    and subject both match.
+    matches.
+
+    #2015 — when ``dedup_hash`` is supplied we match on
+    ``metadata.dedup_hash`` so the same finding body across sibling
+    subjects (samblog/32, /33, /34, /35) collapses into one dispatch
+    per window. The ``subject`` arg stays for forensic logging /
+    back-compat with rows emitted by pre-#2015 versions which have no
+    ``dedup_hash`` in metadata — for those we fall back to the
+    pre-fix subject match so old throttle windows still hold.
     """
     from pollypm.audit.log import read_events
 
@@ -3048,10 +3162,17 @@ def was_recently_dispatched(
         return False
     for ev in recent:
         meta = ev.metadata or {}
-        if (
-            meta.get("finding_type") == finding_type
-            and (ev.subject == subject or meta.get("subject") == subject)
-        ):
+        if meta.get("finding_type") != finding_type:
+            continue
+        # #2015 — prefer dedup_hash when both sides have one; fall
+        # back to subject match for legacy rows.
+        ev_hash = meta.get("dedup_hash") or ""
+        if dedup_hash and ev_hash:
+            if ev_hash == dedup_hash:
+                return True
+            continue
+        # Legacy / no-hash path — original subject-based match.
+        if ev.subject == subject or meta.get("subject") == subject:
             return True
     return False
 
@@ -3063,12 +3184,16 @@ def emit_escalation_dispatched(
     subject: str,
     brief: str,
     project_path: Path | str | None = None,
+    dedup_hash: str = "",
 ) -> None:
     """Emit a ``watchdog.escalation_dispatched`` event.
 
     The metadata carries enough to reconstruct the dispatch decision:
-    finding_type, subject, and the brief that was sent. Best-effort —
-    never raises.
+    finding_type, subject, and the brief that was sent. #2015 — also
+    carries ``dedup_hash`` (the subject-independent finding-body hash
+    from :func:`dispatch_dedup_hash`) so the throttle reader can
+    collapse same-root-cause emits across sibling subjects.
+    Best-effort — never raises.
     """
     from pollypm.audit.log import emit as _audit_emit
     try:
@@ -3082,6 +3207,7 @@ def emit_escalation_dispatched(
                 "finding_type": finding_type,
                 "subject": subject,
                 "brief": brief,
+                "dedup_hash": dedup_hash,
             },
             project_path=project_path,
         )
@@ -3097,6 +3223,7 @@ def was_recently_operator_dispatched(
     now: datetime,
     project_path: Path | str | None = None,
     throttle_seconds: int = OPERATOR_DISPATCH_THROTTLE_SECONDS,
+    dedup_hash: str | None = None,
 ) -> bool:
     """Return True iff a matching tier-3 dispatch landed in the throttle window.
 
@@ -3104,6 +3231,12 @@ def was_recently_operator_dispatched(
     ``EVENT_WATCHDOG_OPERATOR_DISPATCHED`` rows. Same idempotence
     model — the audit log itself is the source of truth, so a
     heartbeat-process restart doesn't reset the dedup window.
+
+    #2015 — when ``dedup_hash`` is supplied we match on
+    ``metadata.dedup_hash`` so finding bodies that span sibling
+    subjects (the samblog/32-35 burst) collapse into one inbox dispatch
+    per window. Legacy rows without the field fall back to the
+    pre-fix subject match.
     """
     from pollypm.audit.log import read_events
 
@@ -3123,10 +3256,14 @@ def was_recently_operator_dispatched(
         return False
     for ev in recent:
         meta = ev.metadata or {}
-        if (
-            meta.get("finding_type") == finding_type
-            and (ev.subject == subject or meta.get("subject") == subject)
-        ):
+        if meta.get("finding_type") != finding_type:
+            continue
+        ev_hash = meta.get("dedup_hash") or ""
+        if dedup_hash and ev_hash:
+            if ev_hash == dedup_hash:
+                return True
+            continue
+        if ev.subject == subject or meta.get("subject") == subject:
             return True
     return False
 
@@ -3139,11 +3276,14 @@ def emit_operator_dispatched(
     inbox_task_id: str | None = None,
     dedup_key: str = "",
     project_path: Path | str | None = None,
+    dedup_hash: str = "",
 ) -> None:
     """Emit a ``watchdog.operator_dispatched`` event.
 
     Symmetric to :func:`emit_escalation_dispatched` but for the
-    tier-3 (operator) leg of the cascade. Best-effort — never raises.
+    tier-3 (operator) leg of the cascade. #2015 — also carries
+    ``dedup_hash`` so the throttle reader can collapse same-root-cause
+    emits across sibling subjects. Best-effort — never raises.
     """
     from pollypm.audit.log import emit as _audit_emit
     try:
@@ -3158,6 +3298,7 @@ def emit_operator_dispatched(
                 "subject": subject,
                 "inbox_task_id": inbox_task_id or "",
                 "dedup_key": dedup_key,
+                "dedup_hash": dedup_hash,
             },
             project_path=project_path,
         )

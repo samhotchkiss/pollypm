@@ -145,9 +145,11 @@ def _build_cockpit_detail_dispatch(supervisor, config_path: Path, kind: str, tar
         return _render_metrics_panel(config_path)
 
     if kind == "activity":
-        from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
-            render_activity_feed_text,
-        )
+        # #1363 — resolve via the core protocol module so the cockpit
+        # never reaches into the optional ``activity_feed`` plugin. The
+        # protocol's renderer goes through the projector registry seam,
+        # so a disabled plugin degrades cleanly to the empty placeholder.
+        from pollypm.activity_feed_protocol import render_activity_feed_text
 
         return render_activity_feed_text(config)
 

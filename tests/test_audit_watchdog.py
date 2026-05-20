@@ -915,6 +915,58 @@ def test_format_unstick_brief_dead_loop_quotes_count() -> None:
     assert "pm task cancel demo/4" in brief
 
 
+def test_format_unstick_brief_fallback_is_imperative() -> None:
+    """Stuck-draft / orphan-marker / cancel_no_promotion findings route
+    through ``_brief_fallback``. Issue #1974 (Mode B): the cross-project
+    audit log showed architects ack'ing these briefs with text-only
+    analysis ("X is already cancelled, skipping") and never executing
+    the queue/cancel command, so the cascade never resolved.
+
+    The template must be **imperative**:
+    - contains the verb ``execute`` (the action lead-in)
+    - contains both ``pm task queue`` and ``pm task cancel`` with the
+      finding's subject substituted (so it's copy-pasteable)
+    - forbids analysis-only replies (``Reply only AFTER`` clause), so
+      the architect cannot satisfy the brief by replying with text.
+    - drops the old advisory phrasings ("Your job: investigate", "rather
+      than ratifying the recommendation") that read as optional.
+    """
+    from pollypm.audit.watchdog import (
+        RULE_STUCK_DRAFT,
+        format_unstick_brief,
+    )
+
+    finding = Finding(
+        rule=RULE_STUCK_DRAFT,
+        project="pollypm",
+        subject="pollypm/29",
+        message="Draft task pollypm/29 has sat unpromoted for >30 min.",
+        recommendation=(
+            "Promote with `pm task queue pollypm/29` or discard "
+            "with `pm task cancel pollypm/29`."
+        ),
+        metadata={"detected_via": "state"},
+    )
+    brief = format_unstick_brief(finding)
+
+    # Imperative shape required by #1974 (Lever 3).
+    assert "ACTION REQUIRED" in brief
+    assert "execute" in brief
+    assert "pm task queue pollypm/29" in brief
+    assert "pm task cancel pollypm/29" in brief
+    assert "Reply only AFTER" in brief
+
+    # Old advisory phrasings must be gone — they were the failure mode.
+    assert "Your job: investigate" not in brief
+    assert "ratifying" not in brief
+
+    # Evidence section still leads (the finding's message/recommendation
+    # are not deleted — only the trailing advisory block is replaced).
+    evidence_idx = brief.index("Observed evidence:")
+    action_idx = brief.index("ACTION REQUIRED")
+    assert evidence_idx < action_idx
+
+
 # ---------------------------------------------------------------------------
 # Throttle — was_recently_dispatched
 # ---------------------------------------------------------------------------

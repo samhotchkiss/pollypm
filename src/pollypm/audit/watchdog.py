@@ -3726,7 +3726,16 @@ def _brief_fallback(finding: Finding) -> list[str]:
     Covers orphan_marker / marker_leaked / stuck_draft /
     cancel_no_promotion — all of which already carry human-readable
     ``message``/``recommendation`` fields, so we re-use those.
+
+    Format is **imperative**: the watchdog cascade was failing because
+    architects were treating the brief as advisory (Mode B in issue
+    #1974 — 210 tier-4 escalations, 0 corresponding ``task.queued`` /
+    ``task.cancelled`` events). The evidence section stays at the top;
+    the action block leads with ``ACTION REQUIRED`` and an explicit
+    command list, plus a "reply only AFTER executing" prohibition so
+    text-only acknowledgements stop counting as resolution.
     """
+    subject = finding.subject or "<task-id>"
     lines: list[str] = []
     lines.append("Stuck for: see message")
     lines.append("Observed evidence:")
@@ -3735,15 +3744,20 @@ def _brief_fallback(finding: Finding) -> list[str]:
     if finding.recommendation:
         lines.append(f"- Recommendation: {finding.recommendation}")
     lines.append("")
+    lines.append("ACTION REQUIRED: execute exactly one of:")
     lines.append(
-        "Your job: investigate the evidence above and unstick the "
-        "task. Generate hypotheses fresh from the evidence rather "
-        "than ratifying the recommendation."
+        f"  pm task queue {subject}     "
+        "(if the task should proceed)"
     )
     lines.append(
-        "Cli levers available: act on the recommendation above, take "
-        "a different action you judge appropriate, or escalate to "
-        "user via `pm notify`."
+        f"  pm task cancel {subject}    "
+        "(if the task should be discarded)"
+    )
+    lines.append("")
+    lines.append(
+        "Reply only AFTER executing the command. Do not reply with "
+        "analysis alone — the watchdog is checking for the task-state "
+        "change, not your reasoning."
     )
     return lines
 

@@ -718,6 +718,30 @@ def memory_ttl_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
         return {"deleted": deleted}
 
 
+def _discover_agent_worktrees_root() -> Path | None:
+    """Walk up from cwd + this module's location to find a repo whose
+    ``.claude/worktrees/`` dir exists (#1965).
+
+    Mirrors :func:`pollypm.doctor._agent_worktree_dirs` so the prune
+    handler's target tree matches what the ``agent-worktree-count``
+    alert measures. Without this, the cron-tick path resolves
+    ``repo_root`` from the global config's ``project.root_dir`` —
+    typically ``~/.pollypm/`` for the ``rail_daemon`` — which has no
+    ``.claude/worktrees/`` subtree, so the handler bails before ever
+    inspecting the dev repo where worktrees actually accumulate.
+    """
+    here = Path(__file__).resolve()
+    seen: set[Path] = set()
+    for start in (Path.cwd().resolve(), here):
+        for parent in (start, *start.parents):
+            if parent in seen:
+                continue
+            seen.add(parent)
+            if (parent / ".claude" / "worktrees").is_dir():
+                return parent
+    return None
+
+
 def agent_worktree_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Prune stale Claude Code harness agent worktrees under ``.claude/worktrees/``."""
     import subprocess
@@ -727,8 +751,16 @@ def agent_worktree_prune_handler(payload: dict[str, Any]) -> dict[str, Any]:
     if hint:
         repo_root = Path(hint)
     else:
-        config = _load_config(payload)
-        repo_root = config.project.root_dir
+        # #1965: prefer a walk-up discovery so the cron-tick path
+        # targets the actual dev repo. Fall back to config.root_dir
+        # only when discovery fails — preserves prior behavior for
+        # callers who have set that up correctly.
+        discovered = _discover_agent_worktrees_root()
+        if discovered is not None:
+            repo_root = discovered
+        else:
+            config = _load_config(payload)
+            repo_root = config.project.root_dir
 
     worktrees_dir = repo_root / ".claude" / "worktrees"
     if not worktrees_dir.is_dir():

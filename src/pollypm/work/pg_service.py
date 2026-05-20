@@ -1734,7 +1734,7 @@ class PgWorkService:
                     )
                     cur.execute(
                         "UPDATE work_node_executions SET status = %s, "
-                        "ended_at = %s "
+                        "completed_at = %s "
                         "WHERE task_project = %s AND task_number = %s "
                         "AND node_id = %s AND status = %s",
                         (

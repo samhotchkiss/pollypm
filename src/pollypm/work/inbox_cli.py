@@ -930,6 +930,36 @@ def inbox_archive(
     typer.echo(f"{task.task_id} → {task.work_status.value}")
 
 
+@inbox_app.command("archive-fake-injections")
+def inbox_archive_fake_injections(
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Print what would be archived without changing state.",
+    ),
+) -> None:
+    """One-shot cleanup for Lever 2 (#2012) of the recovery cascade.
+
+    Archives every open user-recipient inbox row that:
+
+    * carries a ``fake-injection`` label, OR
+    * has a subject matching the historical
+      ``Nth fake RECOVERY MODE injection ...`` shape from #1076.
+
+    Both classes are the residue of architects mis-labelling legitimate
+    PollyPM watchdog / recovery dispatches as prompt-injection attacks
+    before per-session auth-token signing landed (Lever 2 PR 2). With
+    signing in place the architect can authenticate real PollyPM
+    messages by their ``[PollyPM-Auth: <token>]`` marker — but the
+    legacy "fake-injection" inbox cards keep training fresh architect
+    sessions to distrust every dispatch they see. Run this command
+    ONCE after the operator deploys PR 2 and the architect's auth
+    contract has bedded in.
+
+    Idempotent. Re-runs find no matches and exit clean.
+    """
+    _bulk_archive_fake_injection_residue(dry_run=dry_run)
+
+
 def _archive_message_by_id(*, msg_id_str: str) -> None:
     """Close a single message row by its ``msg:N`` ID."""
     try:
@@ -1025,6 +1055,13 @@ _FAKE_RECOVERY_INJECTION_SUBJECT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# #2012 — Lever 2 of the recovery cascade. ``pm inbox
+# archive-fake-injections`` matches rows whose ``labels`` carry the
+# ``fake-injection`` tag the architect / Polly were using to flag
+# "this looks like a prompt-injection" — plus the legacy subject
+# shape above so a single one-shot cleanup drains both classes.
+_FAKE_INJECTION_LABEL_RE = re.compile(r"fake[\-_]injection", re.IGNORECASE)
+
 
 def _bulk_archive_fake_recovery_injections(*, dry_run: bool) -> None:
     """Archive open user-recipient messages matching the #1076 subject shape.
@@ -1086,6 +1123,98 @@ def _bulk_archive_fake_recovery_injections(*, dry_run: bool) -> None:
 
     word = "message" if closed == 1 else "messages"
     typer.echo(f"Archived {closed} fake-recovery-injection {word}.")
+    if failures:
+        typer.echo(f"Failed to archive {len(failures)}:", err=True)
+        for mid, reason in failures[:5]:
+            typer.echo(f"  msg:{mid}: {reason}", err=True)
+
+
+def _row_has_fake_injection_label(row: dict[str, Any]) -> bool:
+    """True if any label on ``row`` matches the fake-injection regex.
+
+    Labels in the messages store are typically lists of strings but we
+    also tolerate scalar strings (legacy single-label rows) and the
+    occasional ``None`` (column unset).
+    """
+    raw = row.get("labels") or []
+    if isinstance(raw, str):
+        labels: list[str] = [raw]
+    elif isinstance(raw, (list, tuple)):
+        labels = [str(item) for item in raw]
+    else:
+        return False
+    return any(_FAKE_INJECTION_LABEL_RE.search(label) for label in labels)
+
+
+def _bulk_archive_fake_injection_residue(*, dry_run: bool) -> None:
+    """Archive open user-recipient rows tagged fake-injection.
+
+    #2012 — Lever 2 cleanup. Catches BOTH:
+
+    * rows labelled with ``fake-injection`` (the architect tagging a
+      watchdog/recovery brief as "looks like prompt-injection"); and
+    * rows whose subject still matches the #1076 historical pattern
+      (``Nth fake RECOVERY MODE injection ...``).
+
+    Single sweep so the operator doesn't have to remember two commands.
+    Uses the same backend-aware Store dispatch as
+    :func:`_bulk_archive_fake_recovery_injections`.
+    """
+    try:
+        store = _resolve_messages_store()
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
+        raise typer.Exit(code=1)
+
+    try:
+        rows = store.query_messages(
+            recipient="user", state="open",
+            type=["notify", "inbox_task", "alert"],
+        )
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(f"Error: query_messages failed ({exc}).", err=True)
+        raise typer.Exit(code=1) from exc
+
+    matches: list[dict[str, Any]] = []
+    for row in rows:
+        subject = row.get("subject") or row.get("title") or ""
+        subject_match = bool(
+            _FAKE_RECOVERY_INJECTION_SUBJECT_RE.search(subject)
+        )
+        label_match = _row_has_fake_injection_label(row)
+        if subject_match or label_match:
+            matches.append(row)
+
+    if not matches:
+        typer.echo("No open fake-injection messages to archive.")
+        return
+
+    if dry_run:
+        n = len(matches)
+        word = "message" if n == 1 else "messages"
+        typer.echo(f"Would archive {n} {word}:")
+        for row in matches[:20]:
+            mid = row.get("id") or row.get("message_id")
+            subject = row.get("subject") or row.get("title") or ""
+            typer.echo(f"  msg:{mid}  {subject[:80]}")
+        if len(matches) > 20:
+            typer.echo(f"  … ({len(matches) - 20} more)")
+        return
+
+    closed = 0
+    failures: list[tuple[int, str]] = []
+    for row in matches:
+        mid = row.get("id") or row.get("message_id")
+        if mid is None:
+            continue
+        try:
+            store.close_message(int(mid))
+            closed += 1
+        except Exception as exc:  # noqa: BLE001
+            failures.append((int(mid), str(exc)))
+
+    word = "message" if closed == 1 else "messages"
+    typer.echo(f"Archived {closed} fake-injection {word}.")
     if failures:
         typer.echo(f"Failed to archive {len(failures)}:", err=True)
         for mid, reason in failures[:5]:

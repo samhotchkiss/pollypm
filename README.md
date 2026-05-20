@@ -184,6 +184,24 @@ brew steps fall through to a hint pointing at
 the database / extension / schema / config steps still run against any
 reachable Postgres.
 
+> **Reinstall trap ([#2009](https://github.com/samhotchkiss/pollypm/issues/2009)).**
+> If a previous `python -m build` (or any wheel build via
+> `setuptools.build_meta`) left a `build/` directory at the repo root,
+> a subsequent `uv tool install --force --reinstall .` can silently
+> pick up the stale `build/lib/pollypm/` tree instead of `src/pollypm/`.
+> Symptoms look like "I just edited that file, why is the old behavior
+> still showing up?" or `ImportError` for symbols that exist in `src/`
+> but not in the snapshot. **Wipe it first:**
+>
+> ```bash
+> rm -rf build/ dist/
+> uv tool install --force --reinstall .
+> ```
+>
+> `build/` is gitignored as of #2009 so it never gets committed, but
+> the artifact itself still needs to be cleaned between dev installs
+> when you've run `python -m build` locally.
+
 After onboarding:
 
 ```bash

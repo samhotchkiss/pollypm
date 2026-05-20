@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from pollypm.projects import project_control_prompts_dir, project_project_guides_dir
+from pollypm.projects import (
+    project_control_prompts_dir as _project_control_prompts_dir,
+    project_project_guides_dir,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -213,7 +216,7 @@ def project_control_prompts_dir(project_path: Path) -> Path:
     self-contained per #763. Writers should call :func:`session_control_prompts_dir`
     to pick the right project for a given session name.
     """
-    return project_control_prompts_dir(Path(project_path))
+    return _project_control_prompts_dir(Path(project_path))
 
 
 def session_control_prompts_dir(config, session_name: str) -> Path:

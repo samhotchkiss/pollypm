@@ -822,10 +822,16 @@ class PgStore:
                 params.append(state)
         if exclude_pinned:
             # ``payload_json`` is ``jsonb`` on pg. ``->>`` extracts the
-            # value as text; ``IS DISTINCT FROM`` makes NULL behave like
-            # "not pinned" (matches sqlite's coalesce(...,0) != 1).
+            # value as text, so JSON booleans surface as ``'true'`` /
+            # ``'false'`` and JSON ints as ``'1'`` / ``'0'``. The
+            # protocol (#1912) treats any truthy ``pinned`` payload as
+            # "preserve" — sqlite's ``json_extract(...) != 1`` does so
+            # implicitly because it coerces JSON ``true`` to ``1``. On
+            # pg we have to enumerate the truthy text forms ourselves
+            # (and let NULL fall through to "not pinned" via NOT IN).
             where.append(
-                "(payload_json->>'pinned') IS DISTINCT FROM '1'"
+                "COALESCE(payload_json->>'pinned', '') "
+                "NOT IN ('1', 'true', 't', 'True')"
             )
         sql = f"DELETE FROM messages WHERE {' AND '.join(where)}"
         with self.transaction() as conn, conn.cursor() as cur:

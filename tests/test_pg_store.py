@@ -330,6 +330,49 @@ def test_prune_messages_by_type_and_age(pg_schema_pool):
     assert {row["type"] for row in remaining} == {"notify"}
 
 
+def test_prune_messages_exclude_pinned_preserves_boolean_and_int(pg_schema_pool):
+    """Regression for #1912: ``exclude_pinned=True`` must preserve rows whose
+    ``payload_json`` carries any truthy ``pinned`` value — JSON ``true`` and
+    JSON ``1`` alike — and only delete rows where ``pinned`` is absent or
+    falsy. The previous SQL compared the text form against ``'1'`` only, so
+    JSON booleans (which round-trip as text ``'true'``) were pruned. That
+    silently dropped first-shipped markers written via ``"pinned": True``.
+    """
+    store = _new_store(pg_schema_pool)
+    # Three event rows: pinned via int, pinned via bool, and unpinned.
+    store.enqueue_message(
+        type="event", tier="immediate", recipient="*",
+        sender="s", subject="int-pinned", body="", scope="p",
+        payload={"pinned": 1},
+    )
+    store.enqueue_message(
+        type="event", tier="immediate", recipient="*",
+        sender="s", subject="bool-pinned", body="", scope="p",
+        payload={"pinned": True},
+    )
+    store.enqueue_message(
+        type="event", tier="immediate", recipient="*",
+        sender="s", subject="unpinned", body="", scope="p",
+        payload={"note": "no pin"},
+    )
+    with store.transaction() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE messages SET created_at = now() - interval '7 days' "
+            "WHERE type = 'event'"
+        )
+    cutoff = datetime.now(timezone.utc) - timedelta(days=1)
+    removed = store.prune_messages(
+        type="event", older_than=cutoff, exclude_pinned=True,
+    )
+    assert removed == 1
+    remaining = store.query_messages(type="event")
+    assert len(remaining) == 2
+    pinned_values = sorted(
+        repr((row["payload"] or {}).get("pinned")) for row in remaining
+    )
+    assert pinned_values == ["1", "True"]
+
+
 def test_execute_raises_not_implemented(pg_schema_pool):
     store = _new_store(pg_schema_pool)
     with pytest.raises(NotImplementedError):

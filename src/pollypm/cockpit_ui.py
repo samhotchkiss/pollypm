@@ -1963,6 +1963,12 @@ class PollyCockpitApp(App[None]):
     # types that map to "something worth noticing" pass through.
     _TICKER_SUPPRESSED_EVENT_TYPES = frozenset({
         "heartbeat",
+        # ``heartbeat_error`` is also suppressed so the ticker doesn't
+        # double-up with the stale-heartbeat footer hint. When the
+        # watchdog is already showing ``⚠ Heartbeat offline · open
+        # Settings`` in the footer, the parallel ``events · heartbeat
+        # error`` ticker line reads as two separate failures.
+        "heartbeat_error",
         "token_ledger",
         "lease",
         "launch",
@@ -2363,6 +2369,25 @@ class PollyCockpitApp(App[None]):
 
     _HEARTBEAT_STALE_SECONDS = 180  # warn if no heartbeat in 3 minutes
 
+    @staticmethod
+    def _format_heartbeat_offline_hint(elapsed_seconds: float) -> str:
+        """Format the stale-heartbeat footer line for the 30-col rail.
+
+        Under 60 minutes, keep the precise minute count — the operator
+        is in the "just stalled, click Settings to recover" window and
+        the magnitude is actionable. Past 60 minutes, drop the count:
+        "1568m" is hostile UX once the user already knows the heartbeat
+        is dead, and the 2-line wrap competes with the event ticker.
+
+        Returns a single line that fits the 30-col rail without wrapping.
+        Extracted as a static method so tests can lock the format in
+        without instantiating ``PollyCockpitApp``.
+        """
+        mins = int(elapsed_seconds // 60)
+        if mins < 60:
+            return f"⚠ Heartbeat offline ({mins}m) · open Settings"
+        return "⚠ Heartbeat offline · open Settings"
+
     def _update_hint(self) -> None:
         # Keep this hint short enough to fit a 30-col rail without
         # wrapping. Anything beyond j/k/\u21b5/?/q is discoverable via the
@@ -2391,8 +2416,7 @@ class PollyCockpitApp(App[None]):
                     parsed = parsed.replace(tzinfo=UTC)
                 elapsed = (datetime.now(UTC) - parsed).total_seconds()
                 if elapsed > self._HEARTBEAT_STALE_SECONDS:
-                    mins = int(elapsed // 60)
-                    hint_text = f"\u26a0 Heartbeat offline ({mins}m) \u2014 open Settings to repair recovery"
+                    hint_text = self._format_heartbeat_offline_hint(elapsed)
         except Exception:  # noqa: BLE001
             pass
         self.hint.update(hint_text)

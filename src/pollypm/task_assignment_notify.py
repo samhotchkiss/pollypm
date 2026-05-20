@@ -49,6 +49,160 @@ _ACTIVE_WORKER_STATUSES = (
 # ---------------------------------------------------------------------------
 
 
+def _notify_claim_dedupe_slot(
+    *,
+    store: Any,
+    target_name: str,
+    event: TaskAssignmentEvent,
+    execution_version: int,
+    message: str,
+    throttle_seconds: int,
+    atomic_dedupe_seconds: int | None,
+    dedupe_scope: str,
+) -> tuple[int | None, dict[str, Any] | None]:
+    """Atomically claim the notification slot for this send.
+
+    Returns ``(notification_id, dedupe_result)``. When ``dedupe_result``
+    is non-None the caller should return it immediately (dedupe hit or
+    legacy throttle window matched).
+    """
+    notification_id: int | None = None
+    claim_window_seconds = (
+        throttle_seconds if throttle_seconds > 0 else atomic_dedupe_seconds
+    )
+    can_claim = (
+        store is not None
+        and claim_window_seconds is not None
+        and claim_window_seconds > 0
+        and hasattr(store, "claim_notification_slot")
+    )
+    if can_claim:
+        try:
+            notification_id = store.claim_notification_slot(
+                session_name=target_name,
+                task_id=event.task_id,
+                window_seconds=claim_window_seconds,
+                execution_version=execution_version,
+                project=event.project,
+                message=message,
+                dedupe_scope=dedupe_scope,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify: claim_notification_slot failed for %s",
+                event.task_id, exc_info=True,
+            )
+            notification_id = None
+        else:
+            if notification_id is None:
+                return None, {
+                    "outcome": "deduped",
+                    "task_id": event.task_id,
+                    "session": target_name,
+                    "execution_version": execution_version,
+                }
+
+    if notification_id is None and store is not None and throttle_seconds > 0:
+        # Legacy fallback for stores without the atomic claim helper, and for
+        # transient claim-helper failures. A failed claim must not masquerade
+        # as a dedupe hit — that silently drops the kickoff/resume ping.
+        try:
+            if store.was_notified_within(
+                target_name,
+                event.task_id,
+                throttle_seconds,
+                execution_version,
+            ):
+                return None, {
+                    "outcome": "deduped",
+                    "task_id": event.task_id,
+                    "session": target_name,
+                    "execution_version": execution_version,
+                }
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify: dedupe check failed for %s",
+                event.task_id, exc_info=True,
+            )
+    return notification_id, None
+
+
+def _notify_clear_prior_alerts(
+    *, msg_store: Any, event: TaskAssignmentEvent,
+) -> None:
+    """Clear ``task_assignment`` / ``no_session`` alerts for this task."""
+    if msg_store is None:
+        return
+    try:
+        msg_store.clear_alert("task_assignment", _alert_type_for(event))
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_assignment_notify: clear_alert(task_assignment) failed for %s",
+            event.task_id, exc_info=True,
+        )
+    # #921: also clear the sweep-level ``(worker-<project>, no_session)``
+    # alert raised by ``_emit_no_session_alert``. That alert is
+    # keyed by the candidate session name we *would* expect, not by
+    # the actual matched name (which for a per-task session is
+    # ``task-<project>-<N>``), so we walk the role candidates.
+    from pollypm.work.models import ActorType as _ActorType
+
+    if event.actor_type is _ActorType.ROLE:
+        from pollypm.work.task_assignment import role_candidate_names
+
+        for candidate in role_candidate_names(
+            event.actor_name, event.project,
+        ):
+            try:
+                msg_store.clear_alert(candidate, "no_session")
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "task_assignment_notify: clear_alert(no_session) failed for %s",
+                    candidate, exc_info=True,
+                )
+
+
+def _notify_record_delivery(
+    *,
+    store: Any,
+    notification_id: int | None,
+    target_name: str,
+    event: TaskAssignmentEvent,
+    execution_version: int,
+    message: str,
+    delivery_status: str,
+) -> None:
+    """Update the notification row (or insert a fresh one) with ``delivery_status``."""
+    if store is None:
+        return
+    if notification_id is not None:
+        try:
+            store.update_notification_status(
+                notification_id,
+                delivery_status=delivery_status,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify: update_notification_status failed for %s",
+                event.task_id, exc_info=True,
+            )
+    else:
+        try:
+            store.record_notification(
+                session_name=target_name,
+                task_id=event.task_id,
+                project=event.project,
+                message=message,
+                delivery_status=delivery_status,
+                execution_version=execution_version,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "task_assignment_notify: record_notification failed for %s",
+                event.task_id, exc_info=True,
+            )
+
+
 def notify(
     event: TaskAssignmentEvent,
     *,
@@ -96,111 +250,27 @@ def notify(
     target_name = getattr(handle, "name", "")
 
     # #279: key the dedupe on ``(session, task, execution_version)``.
-    # A rejection that bounces the task back to an earlier node opens a
-    # fresh ``work_node_executions.visit`` — that shows up here as a new
-    # ``execution_version`` and correctly lets the retry ping through
-    # even inside the 30-minute window that originally throttled the
-    # first ping at ``visit=1``. Events with no version (``0``) still
-    # dedupe against pre-migration rows (column DEFAULT 0), preserving
-    # the original throttle semantics across the upgrade.
     execution_version = int(getattr(event, "execution_version", 0) or 0)
 
     message = format_ping_for_role(event)
 
-    # #952: dedupe the slot atomically BEFORE the send, not after. The
-    # legacy flow was [check was_notified_within → send → record_notification],
-    # which let concurrent sweep ticks all see "not yet sent" and each fire.
-    # ``atomic_dedupe_seconds`` lets forced-kickoff callers bypass stale
-    # historical rows while still deduping same-window concurrent sends.
-    notification_id: int | None = None
-    claim_window_seconds = (
-        throttle_seconds if throttle_seconds > 0 else atomic_dedupe_seconds
+    # #952: dedupe the slot atomically BEFORE the send, not after.
+    notification_id, dedupe_result = _notify_claim_dedupe_slot(
+        store=store,
+        target_name=target_name,
+        event=event,
+        execution_version=execution_version,
+        message=message,
+        throttle_seconds=throttle_seconds,
+        atomic_dedupe_seconds=atomic_dedupe_seconds,
+        dedupe_scope=dedupe_scope,
     )
-    can_claim = (
-        store is not None
-        and claim_window_seconds is not None
-        and claim_window_seconds > 0
-        and hasattr(store, "claim_notification_slot")
-    )
-    if can_claim:
-        try:
-            notification_id = store.claim_notification_slot(
-                session_name=target_name,
-                task_id=event.task_id,
-                window_seconds=claim_window_seconds,
-                execution_version=execution_version,
-                project=event.project,
-                message=message,
-                dedupe_scope=dedupe_scope,
-            )
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "task_assignment_notify: claim_notification_slot failed for %s",
-                event.task_id, exc_info=True,
-            )
-            notification_id = None
-        else:
-            if notification_id is None:
-                return {
-                    "outcome": "deduped",
-                    "task_id": event.task_id,
-                    "session": target_name,
-                    "execution_version": execution_version,
-                }
-
-    if notification_id is None and store is not None and throttle_seconds > 0:
-        # Legacy fallback for stores without the atomic claim helper, and for
-        # transient claim-helper failures. A failed claim must not masquerade
-        # as a dedupe hit — that silently drops the kickoff/resume ping.
-        try:
-            if store.was_notified_within(
-                target_name,
-                event.task_id,
-                throttle_seconds,
-                execution_version,
-            ):
-                return {
-                    "outcome": "deduped",
-                    "task_id": event.task_id,
-                    "session": target_name,
-                    "execution_version": execution_version,
-                }
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "task_assignment_notify: dedupe check failed for %s",
-                event.task_id, exc_info=True,
-            )
+    if dedupe_result is not None:
+        return dedupe_result
 
     # Clear any prior "no session" alert for this task — the recipient
     # is back online. #349: writers land in ``messages`` via the Store.
-    if msg_store is not None:
-        try:
-            msg_store.clear_alert("task_assignment", _alert_type_for(event))
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "task_assignment_notify: clear_alert(task_assignment) failed for %s",
-                event.task_id, exc_info=True,
-            )
-        # #921: also clear the sweep-level ``(worker-<project>, no_session)``
-        # alert raised by ``_emit_no_session_alert``. That alert is
-        # keyed by the candidate session name we *would* expect, not by
-        # the actual matched name (which for a per-task session is
-        # ``task-<project>-<N>``), so we walk the role candidates.
-        from pollypm.work.models import ActorType as _ActorType
-
-        if event.actor_type is _ActorType.ROLE:
-            from pollypm.work.task_assignment import role_candidate_names
-
-            for candidate in role_candidate_names(
-                event.actor_name, event.project,
-            ):
-                try:
-                    msg_store.clear_alert(candidate, "no_session")
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "task_assignment_notify: clear_alert(no_session) failed for %s",
-                        candidate, exc_info=True,
-                    )
+    _notify_clear_prior_alerts(msg_store=msg_store, event=event)
 
     try:
         session_svc.send(target_name, message)
@@ -208,34 +278,16 @@ def notify(
         logger.warning(
             "task_assignment_notify: send to %s failed: %s", target_name, exc,
         )
-        if store is not None:
-            failure_status = f"failed: {exc}"[:200]
-            if notification_id is not None:
-                try:
-                    store.update_notification_status(
-                        notification_id,
-                        delivery_status=failure_status,
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "task_assignment_notify: update_notification_status "
-                        "(failure) failed for %s", event.task_id, exc_info=True,
-                    )
-            else:
-                try:
-                    store.record_notification(
-                        session_name=target_name,
-                        task_id=event.task_id,
-                        project=event.project,
-                        message=message,
-                        delivery_status=failure_status,
-                        execution_version=execution_version,
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "task_assignment_notify: record_notification "
-                        "(failure) failed for %s", event.task_id, exc_info=True,
-                    )
+        failure_status = f"failed: {exc}"[:200]
+        _notify_record_delivery(
+            store=store,
+            notification_id=notification_id,
+            target_name=target_name,
+            event=event,
+            execution_version=execution_version,
+            message=message,
+            delivery_status=failure_status,
+        )
         return {
             "outcome": "send_failed",
             "task_id": event.task_id,
@@ -244,33 +296,15 @@ def notify(
             "execution_version": execution_version,
         }
 
-    if store is not None:
-        if notification_id is not None:
-            try:
-                store.update_notification_status(
-                    notification_id,
-                    delivery_status="sent",
-                )
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "task_assignment_notify: update_notification_status failed for %s",
-                    event.task_id, exc_info=True,
-                )
-        else:
-            try:
-                store.record_notification(
-                    session_name=target_name,
-                    task_id=event.task_id,
-                    project=event.project,
-                    message=message,
-                    delivery_status="sent",
-                    execution_version=execution_version,
-                )
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "task_assignment_notify: record_notification failed for %s",
-                    event.task_id, exc_info=True,
-                )
+    _notify_record_delivery(
+        store=store,
+        notification_id=notification_id,
+        target_name=target_name,
+        event=event,
+        execution_version=execution_version,
+        message=message,
+        delivery_status="sent",
+    )
 
     # #923: ``notify()`` deliberately does NOT stamp ``kickoff_sent_at``
     # any more. The transition-time call site (claim → in_process listener)
@@ -287,8 +321,6 @@ def notify(
         "session": target_name,
         "execution_version": execution_version,
     }
-
-
 def _is_worker_kickoff_event(event: TaskAssignmentEvent) -> bool:
     """Return True when this event represents a worker-role kickoff.
 

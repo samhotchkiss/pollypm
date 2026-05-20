@@ -40,27 +40,50 @@ from pollypm.storage.work_task_state import bump_reap_count_and_demote
 
 
 def _make_inprogress_task(svc, *, project: str = "demo", title: str = "T") -> str:
-    """Create a task and drive it to ``in_progress``.
+    """Create a task and drop it directly into ``in_progress``.
 
-    Mirrors the production lifecycle for a task that a worker is
-    actively claiming. The reaper's #1999 branch only triggers when the
-    task is non-terminal — ``in_progress`` is the most common case in
-    the wild (see issue evidence: 10× in_progress, 5× review, 5×
-    queued).
+    The reaper's #1999 branch only triggers when the task is non-terminal —
+    ``in_progress`` is the most common case in the wild (see issue
+    evidence: 10× in_progress, 5× review, 5× queued). We bypass the full
+    ``queue`` + ``claim`` flow (which would need a flow-template wire-up
+    that's orthogonal to what we're testing) and stamp the row directly
+    via the pg pool.
     """
     task = svc.create(
         title=title,
         description="seed",
         type="task",
         project=project,
-        flow_template="default",
+        flow_template="standard",
         roles={"worker": "alice"},
         priority="normal",
         created_by="seed",
     )
-    svc.queue(task.task_id, actor="seed")
-    svc.claim(task.task_id, actor="alice")
+    # Drop straight into ``in_progress`` with an assignee so the demote
+    # path can verify both ``work_status -> queued`` and ``assignee ->
+    # NULL`` mutations.
+    with svc._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_tasks SET work_status = 'in_progress', "
+            "assignee = 'alice', updated_at = now() "
+            "WHERE project = %s AND task_number = %s",
+            (task.project, task.task_number),
+        )
+        conn.commit()
     return task.task_id
+
+
+def _force_inprogress(svc, task_id: str) -> None:
+    """Re-pin a task at ``in_progress`` after a demote (helper for re-reap)."""
+    project, num = task_id.split("/")
+    with svc._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_tasks SET work_status = 'in_progress', "
+            "assignee = 'alice', updated_at = now() "
+            "WHERE project = %s AND task_number = %s",
+            (project, int(num)),
+        )
+        conn.commit()
 
 
 def _fake_config() -> Any:
@@ -109,7 +132,7 @@ class TestBumpReapCountAndDemote:
             project_key=project, task_number=int(num), config=None,
         )
         # Simulate re-claim then re-reap.
-        svc.claim(task_id, actor="alice")
+        _force_inprogress(svc, task_id)
         count = bump_reap_count_and_demote(
             project_key=project, task_number=int(num), config=None,
         )
@@ -123,7 +146,7 @@ class TestBumpReapCountAndDemote:
             bump_reap_count_and_demote(
                 project_key=project, task_number=int(num), config=None,
             )
-            svc.claim(task_id, actor="alice")
+            _force_inprogress(svc, task_id)
         count = bump_reap_count_and_demote(
             project_key=project, task_number=int(num), config=None,
         )
@@ -135,7 +158,17 @@ class TestBumpReapCountAndDemote:
         svc = pg_work_service
         task_id = _make_inprogress_task(svc)
         project, num = task_id.split("/")
-        svc.cancel(task_id, actor="user", reason="not needed")
+        # Force the task into a terminal state via direct SQL — going
+        # through ``svc.cancel`` would need the cancel-gate machinery
+        # wired which is orthogonal to what this test exercises.
+        with svc._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "UPDATE work_tasks SET work_status = 'cancelled', "
+                "updated_at = now() "
+                "WHERE project = %s AND task_number = %s",
+                (project, int(num)),
+            )
+            conn.commit()
         count = bump_reap_count_and_demote(
             project_key=project, task_number=int(num), config=None,
         )
@@ -204,7 +237,7 @@ class TestThreeStrikeEscalation:
 
         _demote_and_maybe_escalate(config=config, decision=marker)
         # Re-claim then re-reap to simulate the wild lifecycle.
-        svc.claim(task_id, actor="alice")
+        _force_inprogress(svc, task_id)
         _demote_and_maybe_escalate(config=config, decision=marker)
 
         assert _count_escalation_inbox_tasks(
@@ -222,7 +255,7 @@ class TestThreeStrikeEscalation:
 
         for _ in range(2):
             _demote_and_maybe_escalate(config=config, decision=marker)
-            svc.claim(task_id, actor="alice")
+            _force_inprogress(svc, task_id)
         # Third reap → demote AND escalate.
         _demote_and_maybe_escalate(config=config, decision=marker)
 

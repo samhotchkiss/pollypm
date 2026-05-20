@@ -721,7 +721,7 @@ class WorkTransitionManager:
                     ),
                     self.service._conn.execute(
                         "UPDATE work_node_executions SET status = ?, "
-                        "ended_at = ? "
+                        "completed_at = ? "
                         "WHERE task_project = ? AND task_number = ? "
                         "AND node_id = ? AND status = ?",
                         (

@@ -34,6 +34,11 @@ from pollypm.dashboard.categorization import (
     what_working,
     why_waiting,
 )
+from pollypm.state_cache.divergence import (
+    DivergenceCounter as _DivergenceCounter,
+    compare_state_maps as _compare_state_maps,
+    log_divergence as _log_divergence,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -528,6 +533,114 @@ def _scan_to_state(
     )
 
 
+# Move A PR 2 — divergence sampler for the cache-routed fast path
+# (``docs/design/move-a-state-cache.md`` §6.2 last bullet). Per-call-site
+# counter so a busy site doesn't borrow samples from a quiet one.
+_STATE_MAP_DIVERGENCE_COUNTER = _DivergenceCounter()
+
+
+def _maybe_cache_route_state_map(config) -> dict[str, ProjectState] | None:
+    """Return the cache-routed state map, or ``None`` to fall through.
+
+    Returns ``None`` when the env flag is off, when the cache is cold
+    (no entries yet — letting the direct path warm it via the
+    refresher), when the cache lacks a state for any tracked project
+    (the direct path is needed to fill the gap), or on any
+    unexpected exception. The 1-in-N divergence sampler then runs
+    both paths and logs a WARN on mismatch.
+    """
+
+    try:
+        from pollypm.state_cache import get_cache, is_enabled
+    except Exception:  # noqa: BLE001
+        return None
+    if not is_enabled():
+        return None
+    try:
+        cache = get_cache()
+        snapshot = cache.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    if not snapshot:
+        return None
+
+    projects = getattr(config, "projects", {}) or {}
+    known_keys = set(projects.keys())
+    if not known_keys:
+        return {}
+    # The cache is authoritative ONLY when it knows every tracked
+    # project. A missing key forces the direct path so the rail
+    # never paints a stale-missing project as PAUSED.
+    if not known_keys.issubset(set(snapshot.keys())):
+        return None
+
+    cached_map: dict[str, ProjectState] = {}
+    for key in known_keys:
+        entry = snapshot.get(key)
+        state = getattr(entry, "state", None) if entry is not None else None
+        if state is None:
+            # Refresher hasn't populated this entry yet (stub entry).
+            # Fall through to the direct path.
+            return None
+        cached_map[key] = state
+
+    if _STATE_MAP_DIVERGENCE_COUNTER.should_sample():
+        try:
+            direct = _direct_project_state_map_from_config(config)
+        except Exception:  # noqa: BLE001
+            direct = None
+        if direct is not None:
+            matched, reason = _compare_state_maps(cached_map, direct)
+            if not matched:
+                _log_divergence("project_state_map_from_config", reason)
+
+    return cached_map
+
+
+def _direct_project_state_map_from_config(
+    config,  # noqa: ANN001
+) -> dict[str, ProjectState]:
+    """Run the direct (non-cache-routed) state-map computation.
+
+    Extracted so the divergence sampler can compare cache vs direct
+    without re-entering ``project_state_map_from_config`` (which
+    would short-circuit back through the cache fast path on hit).
+    """
+
+    scans = _collect_project_scans(config)
+    waiting_by_project = _waiting_items_by_project(config)
+    if not scans:
+        return {}
+    shared_svc = _open_shared_work_service(config)
+    try:
+        tasks_by_alias, workers_by_alias = _prefetch_project_state(
+            config, shared_svc,
+        )
+        pairs: list[tuple[str, ProjectState]] = []
+        for scan in scans:
+            if shared_svc is None:
+                slice_svc = None
+            else:
+                slice_svc = _ProjectSliceService(
+                    project_key=scan.project_key,
+                    aliases=_aliases_for(config, scan.project_key),
+                    tasks_by_alias=tasks_by_alias,
+                    workers_by_alias=workers_by_alias,
+                    shared_svc=shared_svc,
+                )
+            pairs.append(
+                _scan_to_state(
+                    scan,
+                    waiting_by_project.get(scan.project_key, []),
+                    slice_svc=slice_svc,
+                )
+            )
+        return {key: state for key, state in pairs}
+    finally:
+        if shared_svc is not None:
+            _safe_close(shared_svc)
+
+
 def project_state_map_from_config(config) -> dict[str, ProjectState]:  # noqa: ANN001
     """Return ``{project_key: ProjectState}`` for every project in ``config``.
 
@@ -543,7 +656,17 @@ def project_state_map_from_config(config) -> dict[str, ProjectState]:  # noqa: A
     fanout that ran one ``state.db`` open per project per refresh
     (~5–350ms each on a 9MB workspace DB, dominating the dashboard
     mount path even though the system is on postgres).
+
+    Move A PR 2 (#1664): with ``POLLYPM_STATE_CACHE=1`` AND the cache
+    populated, this collapses to ``{key: entry.state for ... in
+    snapshot.items()}`` and skips the bulk work-service open. Flag is
+    OFF by default; PR 4 flips it after divergence-sampler telemetry
+    is green.
     """
+    cached_map = _maybe_cache_route_state_map(config)
+    if cached_map is not None:
+        return cached_map
+
     scans = _collect_project_scans(config)
     waiting_by_project = _waiting_items_by_project(config)
     if not scans:

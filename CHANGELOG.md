@@ -61,6 +61,17 @@ Added, Changed, and Removed.
   Plan card no longer reads anonymously on the very surface that
   invites the user to start a plan. #1540 follow-up.
 
+### Fixed
+- `state_cache` production singleton now constructs
+  `StateCacheRefresher` with a config-backed `project_keys` provider
+  (`lambda: list(load_config().projects.keys())`), so the §9.1 startup
+  full-refresh actually enqueues per-project refreshes. Without the
+  provider, `_initial_full_refresh()` saw `[]` and the cache stayed
+  empty until per-project audit events arrived — meaning workspace-
+  scoped invalidations on a cold cache were no-ops because
+  `ProjectStateCache.invalidate(None)` only iterates known entries.
+  PR #2016 review blocker.
+
 ## [1.0.0] - 2026-04-20
 
 ### Added

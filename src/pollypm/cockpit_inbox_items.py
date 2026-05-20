@@ -1069,11 +1069,19 @@ def load_inbox_action_preview(
                 project_db_paths[project_key] = db_path
             else:
                 ws_db = db_path
-        pg_messages = open_messages(config, known_projects=known_projects)
+        # Push the per-source cap into SQL (#1913): the prepaint preview
+        # only renders ``preview_limit`` rows, so fetching every open
+        # inbox-shaped row before slicing was making first-paint
+        # proportional to total open-message volume. ``open_messages``
+        # orders by ``created_at DESC, id DESC`` so a SQL LIMIT yields
+        # the same newest-first slice the in-memory cap used to.
+        pg_preview_cap = max(rows_per_source * 4, 96)
+        pg_messages = open_messages(
+            config,
+            known_projects=known_projects,
+            limit=pg_preview_cap,
+        )
         rows_iter: list[dict] = list(pg_messages or [])
-        # Match the sqlite path's per-source cap roughly — pg returns
-        # rows newest-first already, slice to keep the prepaint snappy.
-        rows_iter = rows_iter[: max(rows_per_source * 4, 96)]
         for row in rows_iter:
             if _row_is_dev_channel(row.get("labels")):
                 continue

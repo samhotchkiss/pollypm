@@ -252,19 +252,20 @@ def _resolve_messages_store(db: str) -> Any:
     """Return the configured-backend ``Store`` for the inbox CLI.
 
     Mirrors the :func:`pollypm.work.cli._svc` backend dispatch (#1369,
-    #1737, #1811) so ``pm inbox`` and its bulk-archive helpers read the
-    same messages corpus as the rest of the system:
+    #1737, #1811, #1940) so ``pm inbox`` and its bulk-archive helpers
+    read the same messages corpus as the rest of the system:
 
     * When ``--db`` is the canonical workspace default
       (``.pollypm/state.db``), route through
       :func:`pollypm.store.get_store` so the active backend
       (``[storage].backend = "sqlite"`` vs ``"postgres"``) decides
       whether reads land on the sqlite file or the pg pool.
-    * When ``--db`` is a non-default override — the explicit test / CI
-      escape hatch — pin to sqlite at the supplied path via
-      :func:`pollypm.store.get_store_by_url` so harness tests with a
-      bespoke ``state.db`` keep working even on a machine whose
-      ``pollypm.toml`` selects postgres.
+    * When ``--db`` is a Postgres DSN (``postgresql://…``, #1940),
+      pin to the pg backend at the supplied DSN via
+      :func:`pollypm.store.get_store_by_url`.
+    * When ``--db`` is any other non-default value, treat it as a
+      sqlite path override — the explicit test / CI escape hatch —
+      and pin to sqlite at the supplied path.
 
     The returned ``Store`` is a process-wide singleton — callers MUST
     NOT ``close()`` it (see :func:`pollypm.store.registry.get_store`
@@ -273,7 +274,13 @@ def _resolve_messages_store(db: str) -> Any:
     went un-served; this helper closes that gap for the rest of the
     ``pm inbox`` surface (#1790).
     """
+    from pollypm.storage.pg_pool import _looks_like_pg_dsn
     from pollypm.work.db_resolver import WORKSPACE_DEFAULT_DB_PATH
+
+    if _looks_like_pg_dsn(db):
+        from pollypm.store import get_store_by_url
+
+        return get_store_by_url(db.strip(), backend="postgres")
 
     if db != WORKSPACE_DEFAULT_DB_PATH:
         from pollypm.store import get_store_by_url

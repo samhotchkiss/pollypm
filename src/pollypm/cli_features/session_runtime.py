@@ -76,11 +76,13 @@ def _resolve_notify_store(db: str):
     """Return the configured-backend ``Store`` for ``pm notify`` writes.
 
     Mirrors :func:`pollypm.work.cli._svc` backend dispatch (#1369,
-    #1737) and the inbox-CLI helper added for #1790. When ``--db`` is
-    the canonical workspace default, route through
+    #1737, #1940) and the inbox-CLI helper added for #1790. When
+    ``--db`` is the canonical workspace default, route through
     :func:`pollypm.store.get_store` so ``[storage].backend = "postgres"``
-    actually writes to the pg pool. When ``--db`` is overridden (the
-    test / CI escape hatch) pin to sqlite at the supplied path.
+    actually writes to the pg pool. When ``--db`` is a Postgres DSN
+    (``postgresql://…``, #1940) pin to pg at the supplied DSN. Any
+    other override is treated as a sqlite path (the test / CI escape
+    hatch).
 
     The returned ``Store`` is a process-wide singleton — do NOT
     ``close()`` it.
@@ -91,10 +93,16 @@ def _resolve_notify_store(db: str):
     postgres, so live pg readers never saw the alert and the
     immediate-priority inbox task fan-out hit a non-existent row.
     """
+    from pollypm.storage.pg_pool import _looks_like_pg_dsn
     from pollypm.work.db_resolver import (
         WORKSPACE_DEFAULT_DB_PATH,
         resolve_work_db_path,
     )
+
+    if _looks_like_pg_dsn(db):
+        from pollypm.store import get_store_by_url
+
+        return get_store_by_url(db.strip(), backend="postgres")
 
     if db != WORKSPACE_DEFAULT_DB_PATH:
         from pollypm.store import get_store_by_url
@@ -1324,7 +1332,11 @@ def notify(
     db: str = typer.Option(
         ".pollypm/state.db",
         "--db",
-        help="Path to SQLite database (default: same resolution as `pm inbox`).",
+        help=(
+            "Work-service connection: sqlite path (default) or Postgres "
+            "DSN (``postgresql://…``). Default routes through "
+            "``[storage].backend`` (#1940)."
+        ),
     ),
 ) -> None:
     """Create a work-service inbox item for the human user."""

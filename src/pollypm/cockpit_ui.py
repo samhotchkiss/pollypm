@@ -15403,6 +15403,261 @@ class PollyProjectDashboardApp(App[None]):
         budget = width - 9
         return max(32, min(budget, 100))
 
+    def _inbox_remainder_blocked_block(
+        self, data: "ProjectDashboardData",
+    ) -> list[str]:
+        """Render the fallback block for blocked tasks without action cards.
+
+        Suppresses output when the plan-ready pill is already
+        showing (#1716). Otherwise picks one of three calmer copies
+        depending on whether existing blocker context is present and
+        whether every blocked task is queued behind a progressing
+        dependency (#1015 / #1025).
+        """
+        plan_ready_active = (
+            (getattr(data, "status_label", "") == "plan ready")
+            or (
+                bool(getattr(data, "plan_path", None))
+                and not any(
+                    item.get("is_plan_review")
+                    for item in (getattr(data, "action_items", []) or [])
+                )
+            )
+        )
+        if plan_ready_active:
+            return []
+        existing_blocker = _existing_blocker_context(data)
+        lines: list[str] = []
+        if (
+            existing_blocker is None
+            and not _blocked_only_on_progressing_deps(data)
+        ):
+            lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")
+            lines.append(
+                "  [dim]This project is blocked, but Polly has not posted "
+                "an unblock note yet.[/dim]"
+            )
+            lines.append(
+                "  [dim]Press [b]c[/b] to ask the PM for a blocker summary.[/dim]"
+            )
+            lines.append("")
+        elif existing_blocker is None:
+            # All blocked tasks are waiting on progressing deps —
+            # render a short "queued behind" line instead of the
+            # missing-summary nag. The user gets a coherent story
+            # and no false alarm.
+            lines.append("[#3ddc84][b]Blocked on progressing dependencies[/b][/]")
+            lines.append(
+                "  [dim]Each blocked task is queued behind another task "
+                "that is currently in progress or in review — no action "
+                "needed.[/dim]"
+            )
+            lines.append("")
+        else:
+            kind = existing_blocker.get("kind")
+            if kind == "blocker_summary":
+                lines.append("[#f0c45a][b]Blocked[/b][/]")
+                lines.append(
+                    "  [dim]Polly's blocker summary is in the inbox below — "
+                    "press [b]i[/b] to open it.[/dim]"
+                )
+            else:
+                num = existing_blocker.get("task_number")
+                num_part = f" #{num}" if num is not None else ""
+                lines.append("[#f0c45a][b]Blocked[/b][/]")
+                lines.append(
+                    f"  [dim]The blocker reason is on task{num_part} "
+                    "in Task pipeline below.[/dim]"
+                )
+            lines.append("")
+        return lines
+
+    def _inbox_remainder_on_hold_block(
+        self, data: "ProjectDashboardData",
+    ) -> list[str]:
+        """Render the on-hold fallback block when no Action Needed cards
+        render and no blocked tasks pre-empt the slot.
+
+        Surfaces the two oldest on-hold items with a ``Decision:`` lead
+        line first (so overflow never eats the actionable copy —
+        #1542) plus per-item title, summary, and step list. Uses
+        :meth:`_inbox_text_width` to hard-wrap continuation rows on a
+        bullet-aligned hanging indent rather than letting Textual
+        soft-wrap drop them back to column 0.
+        """
+        lines: list[str] = ["[#f0c45a][b]On hold[/b][/]"]
+        on_hold_items = data.task_buckets.get("on_hold", [])[:2]
+        # #1542 — pre-compute the panel-text budget so continuation
+        # lines under each on-hold bullet keep the bullet-aligned
+        # indent. The previous version let Textual soft-wrap the
+        # raw string, which dropped continuation rows back to
+        # column 0 and read as a malformed indent on long
+        # descriptions (and chopped the actionable "Decide
+        # whether to approve…" line mid-clause).
+        wrap_width = self._inbox_text_width()
+        if on_hold_items:
+            # Lift the actionable "Decision" line *above* the
+            # description so it can never be the part overflow
+            # eats. This is the smaller of the two issue-suggested
+            # directions (the other being a "(press i for full)"
+            # hint), and it also dodges the need for an ellipsis
+            # affordance — the actionable line is now first, not
+            # last. The literal ``Decision:`` token is also what
+            # the release-invariants action-copy gate looks for
+            # when classifying on-hold-only dashboards as having
+            # usable action copy (see scripts/release_invariants
+            # ``_dashboard_body_has_action_copy``).
+            lines.append(
+                "  [#f0c45a][b]Decision:[/b][/] [dim]approve, "
+                "split, or provide missing access. Detail "
+                "below.[/dim]"
+            )
+            lines.append(
+                "  [dim]These are the root holds keeping downstream "
+                "work waiting.[/dim]"
+            )
+            for item in on_hold_items:
+                num = item.get("task_number")
+                num_part = f"#{num} " if num is not None else ""
+                title = _escape(item.get("title") or "")
+                lines.append(f"  [#f0c45a]◆[/#f0c45a] [b]{num_part}{title}[/b]")
+                summary = _escape(item.get("summary") or "")
+                if summary:
+                    # Hard-wrap so the second + later lines still
+                    # carry the bullet-aligned 4-space indent.
+                    lines.extend(
+                        _wrap_with_hanging_indent(
+                            summary, indent="    ", width=wrap_width,
+                        )
+                    )
+                for idx, step in enumerate(item.get("steps") or [], start=1):
+                    prefix = f"    [dim]{idx}.[/dim] "
+                    # Step rows pre-pend ``[dim]N.[/dim]``; wrap
+                    # continuation lines on a 7-char-aligned indent
+                    # so they sit under the step text rather than
+                    # under the number.
+                    step_text = _escape(str(step))
+                    wrapped = _wrap_with_hanging_indent(
+                        step_text, indent="    " + "   ",
+                        width=wrap_width,
+                    ) or [""]
+                    first, rest = wrapped[0], wrapped[1:]
+                    # Replace the leading indent on the first line
+                    # with the numbered prefix so ``1. step body``
+                    # aligns with ``2. step body`` continuation.
+                    if first:
+                        first_text = first.lstrip()
+                        lines.append(f"{prefix}{first_text}")
+                    for line in rest:
+                        lines.append(line)
+        else:
+            lines.extend(
+                _wrap_with_hanging_indent(
+                    "No user inbox action is requested yet. Open Tasks "
+                    "for the held work item and resume it when "
+                    "appropriate.",
+                    indent="  ", width=wrap_width, wrap_markup="dim",
+                )
+            )
+        lines.append("")
+        return lines
+
+    def _inbox_remainder_previews_block(
+        self,
+        data: "ProjectDashboardData",
+        *,
+        action_ids: set[str],
+        blocked_total: int,
+        on_hold_total: int,
+    ) -> tuple[list[str], bool]:
+        """Render the inbox preview rows + overflow / empty-state lines.
+
+        Returns ``(lines, has_spillover)``. ``has_spillover`` drives
+        the "Press i to jump to the inbox" CTA in the caller — kept
+        as a return value so the CTA placement stays in the top-level
+        function (it sits *after* the previews block).
+        """
+        count = data.inbox_count
+        preview_items = [
+            item for item in data.inbox_top
+            if str(item.get("task_id") or "") not in action_ids
+            and str(item.get("primary_ref") or "") not in action_ids
+        ]
+        # Only print the ◆ N need action overflow line when the
+        # rendered Action Needed cards do *not* already enumerate the
+        # full set. When count == cards displayed, the user can see
+        # them above and saying "2 need action" under "2 cards" is
+        # noise. When count > cards displayed there's something off
+        # screen and the line tells Sam to jump to the inbox for more.
+        displayed_actions = len(data.action_items[:2])
+        lines: list[str] = []
+        if count and count > displayed_actions:
+            # Verb agreement, sister to cycle 117's action-bar fix:
+            # ``1 needs action``, ``2 need action``. The overflow line
+            # only fires when count > displayed_actions, so the
+            # singular case (1 inbox item, 0 cards rendered) is reachable.
+            verb = "needs" if count == 1 else "need"
+            lines.append(
+                f"[#f0c45a]◆[/#f0c45a] [b]{count}[/b] "
+                f"[dim]{verb} action[/dim]"
+            )
+        # Split preview_items into "actually needs action" vs the
+        # rest. With no action cards rendered, lumping a "completed
+        # update" item under a "2 need action" header (because both
+        # happen to be in the top inbox slice) reads as
+        # "wait, which 2?" — the count says 2 but the list shows 3.
+        # Section the action-needed items first under the count
+        # header, then the remainder under an explicit "Other open
+        # items" subhead.
+        action_previews = [
+            item for item in preview_items
+            if item.get("needs_action")
+        ]
+        info_previews = [
+            item for item in preview_items
+            if not item.get("needs_action")
+        ]
+
+        def _emit_preview_row(item: dict) -> None:
+            title = _escape(item.get("title") or "")
+            age = _format_relative_age(item.get("updated_at") or "")
+            age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+            label = item.get("triage_label") or ""
+            label_part = (
+                f"  [dim]{_escape(str(label))}[/dim]" if label else ""
+            )
+            lines.append(f"  · {title}{label_part}{age_part}")
+
+        for item in action_previews[:3]:
+            _emit_preview_row(item)
+        if info_previews:
+            if data.action_items or action_previews:
+                lines.append("[dim]Other open items[/dim]")
+            for item in info_previews[:3]:
+                _emit_preview_row(item)
+        if (
+            not count
+            and not preview_items
+            and not data.action_items
+            and not on_hold_total
+            and not blocked_total
+        ):
+            # Only print the "no items" reassurance when the section
+            # really is empty. The on-hold / blocked branches above
+            # already rendered something; saying "No project inbox
+            # items are open." right under a held-task card reads as
+            # the panel contradicting itself (#794).
+            lines.append("[dim]No project inbox items are open.[/dim]")
+        # FYI/info preview rows (completed updates, etc.) do *not*
+        # count as spillover: they're already visible under "Other
+        # open items" and there's no hidden user action behind them,
+        # so the CTA would just repeat the footer keybinding (#1650).
+        has_spillover = (
+            (count and count > displayed_actions)
+            or bool(action_previews)
+        )
+        return lines, has_spillover
+
     def _render_inbox_remainder(self, data: ProjectDashboardData) -> str:
         """Render the post-action-cards portion of the inbox section.
 
@@ -15412,7 +15667,6 @@ class PollyProjectDashboardApp(App[None]):
         ``Press i`` CTA. Mounted in the trailing ``inbox_body`` Static
         so it sits under both action-card groups.
         """
-        count = data.inbox_count
         blocked_total = int(data.task_counts.get("blocked", 0))
         on_hold_total = int(data.task_counts.get("on_hold", 0))
         action_ids: set[str] = set()
@@ -15470,237 +15724,25 @@ class PollyProjectDashboardApp(App[None]):
                         )
             lines.append("")
         elif blocked_total:
-            # #1015 — only nag about a missing summary when no blocker
-            # context exists anywhere (no on-hold reason, no blocker
-            # note on a blocked task, no project-level blocker_summary
-            # inbox item). When ANY of those exist, the user already
-            # has the answer on screen and the nag is wrong.
-            # #1025 — also suppress when every blocked task is waiting
-            # on a dependency that is actively progressing (in_progress
-            # or review). Bikepath's #11/#12/#14 were correctly queued
-            # behind #10 (review) and #13 (in_progress); the project
-            # is moving, not halted. Don't claim "summary missing" for
-            # what is actually healthy dep ordering.
-            # #1716 — likewise suppress when the plan-ready pill from
-            # #1715 is showing: the banner's "Plan ready — your turn"
-            # CTA already tells Sam the project's next step, and
-            # rendering the blocked-summary-missing nag directly under
-            # it reads as the panel contradicting itself.
-            plan_ready_active = (
-                (getattr(data, "status_label", "") == "plan ready")
-                or (
-                    bool(getattr(data, "plan_path", None))
-                    and not any(
-                        item.get("is_plan_review")
-                        for item in (getattr(data, "action_items", []) or [])
-                    )
-                )
-            )
-            existing_blocker = _existing_blocker_context(data)
-            if plan_ready_active:
-                pass
-            elif (
-                existing_blocker is None
-                and not _blocked_only_on_progressing_deps(data)
-            ):
-                lines.append("[#f0c45a][b]Blocked, but summary missing[/b][/]")
-                lines.append(
-                    "  [dim]This project is blocked, but Polly has not posted "
-                    "an unblock note yet.[/dim]"
-                )
-                lines.append(
-                    "  [dim]Press [b]c[/b] to ask the PM for a blocker summary.[/dim]"
-                )
-                lines.append("")
-            elif existing_blocker is None:
-                # All blocked tasks are waiting on progressing deps —
-                # render a short "queued behind" line instead of the
-                # missing-summary nag. The user gets a coherent story
-                # and no false alarm.
-                lines.append("[#3ddc84][b]Blocked on progressing dependencies[/b][/]")
-                lines.append(
-                    "  [dim]Each blocked task is queued behind another task "
-                    "that is currently in progress or in review — no action "
-                    "needed.[/dim]"
-                )
-                lines.append("")
-            else:
-                kind = existing_blocker.get("kind")
-                if kind == "blocker_summary":
-                    lines.append("[#f0c45a][b]Blocked[/b][/]")
-                    lines.append(
-                        "  [dim]Polly's blocker summary is in the inbox below — "
-                        "press [b]i[/b] to open it.[/dim]"
-                    )
-                else:
-                    num = existing_blocker.get("task_number")
-                    num_part = f" #{num}" if num is not None else ""
-                    lines.append("[#f0c45a][b]Blocked[/b][/]")
-                    lines.append(
-                        f"  [dim]The blocker reason is on task{num_part} "
-                        "in Task pipeline below.[/dim]"
-                    )
-                lines.append("")
+            # #1015 / #1025 / #1716 — blocked-summary copy variants;
+            # see :meth:`_inbox_remainder_blocked_block`.
+            lines.extend(self._inbox_remainder_blocked_block(data))
         elif on_hold_total:
-            lines.append("[#f0c45a][b]On hold[/b][/]")
-            on_hold_items = data.task_buckets.get("on_hold", [])[:2]
-            # #1542 \u2014 pre-compute the panel-text budget so continuation
-            # lines under each on-hold bullet keep the bullet-aligned
-            # indent. The previous version let Textual soft-wrap the
-            # raw string, which dropped continuation rows back to
-            # column 0 and read as a malformed indent on long
-            # descriptions (and chopped the actionable "Decide
-            # whether to approve\u2026" line mid-clause).
-            wrap_width = self._inbox_text_width()
-            if on_hold_items:
-                # Lift the actionable "Decision" line *above* the
-                # description so it can never be the part overflow
-                # eats. This is the smaller of the two issue-suggested
-                # directions (the other being a "(press i for full)"
-                # hint), and it also dodges the need for an ellipsis
-                # affordance \u2014 the actionable line is now first, not
-                # last. The literal ``Decision:`` token is also what
-                # the release-invariants action-copy gate looks for
-                # when classifying on-hold-only dashboards as having
-                # usable action copy (see scripts/release_invariants
-                # ``_dashboard_body_has_action_copy``).
-                lines.append(
-                    "  [#f0c45a][b]Decision:[/b][/] [dim]approve, "
-                    "split, or provide missing access. Detail "
-                    "below.[/dim]"
-                )
-                lines.append(
-                    "  [dim]These are the root holds keeping downstream "
-                    "work waiting.[/dim]"
-                )
-                for item in on_hold_items:
-                    num = item.get("task_number")
-                    num_part = f"#{num} " if num is not None else ""
-                    title = _escape(item.get("title") or "")
-                    lines.append(f"  [#f0c45a]\u25c6[/#f0c45a] [b]{num_part}{title}[/b]")
-                    summary = _escape(item.get("summary") or "")
-                    if summary:
-                        # Hard-wrap so the second + later lines still
-                        # carry the bullet-aligned 4-space indent.
-                        lines.extend(
-                            _wrap_with_hanging_indent(
-                                summary, indent="    ", width=wrap_width,
-                            )
-                        )
-                    for idx, step in enumerate(item.get("steps") or [], start=1):
-                        prefix = f"    [dim]{idx}.[/dim] "
-                        # Step rows pre-pend ``[dim]N.[/dim]``; wrap
-                        # continuation lines on a 7-char-aligned indent
-                        # so they sit under the step text rather than
-                        # under the number.
-                        step_text = _escape(str(step))
-                        wrapped = _wrap_with_hanging_indent(
-                            step_text, indent="    " + "   ",
-                            width=wrap_width,
-                        ) or [""]
-                        first, rest = wrapped[0], wrapped[1:]
-                        # Replace the leading indent on the first line
-                        # with the numbered prefix so ``1. step body``
-                        # aligns with ``2. step body`` continuation.
-                        if first:
-                            first_text = first.lstrip()
-                            lines.append(f"{prefix}{first_text}")
-                        for line in rest:
-                            lines.append(line)
-            else:
-                lines.extend(
-                    _wrap_with_hanging_indent(
-                        "No user inbox action is requested yet. Open Tasks "
-                        "for the held work item and resume it when "
-                        "appropriate.",
-                        indent="  ", width=wrap_width, wrap_markup="dim",
-                    )
-                )
-            lines.append("")
+            lines.extend(self._inbox_remainder_on_hold_block(data))
 
-        preview_items = [
-            item for item in data.inbox_top
-            if str(item.get("task_id") or "") not in action_ids
-            and str(item.get("primary_ref") or "") not in action_ids
-        ]
-        # Only print the \u25c6 N need action overflow line when the
-        # rendered Action Needed cards do *not* already enumerate the
-        # full set. When count == cards displayed, the user can see
-        # them above and saying "2 need action" under "2 cards" is
-        # noise. When count > cards displayed there's something off
-        # screen and the line tells Sam to jump to the inbox for more.
-        displayed_actions = len(data.action_items[:2])
-        if count and count > displayed_actions:
-            # Verb agreement, sister to cycle 117's action-bar fix:
-            # ``1 needs action``, ``2 need action``. The overflow line
-            # only fires when count > displayed_actions, so the
-            # singular case (1 inbox item, 0 cards rendered) is reachable.
-            verb = "needs" if count == 1 else "need"
-            lines.append(
-                f"[#f0c45a]\u25c6[/#f0c45a] [b]{count}[/b] "
-                f"[dim]{verb} action[/dim]"
-            )
-        # Split preview_items into "actually needs action" vs the
-        # rest. With no action cards rendered, lumping a "completed
-        # update" item under a "2 need action" header (because both
-        # happen to be in the top inbox slice) reads as
-        # "wait, which 2?" \u2014 the count says 2 but the list shows 3.
-        # Section the action-needed items first under the count
-        # header, then the remainder under an explicit "Other open
-        # items" subhead.
-        action_previews = [
-            item for item in preview_items
-            if item.get("needs_action")
-        ]
-        info_previews = [
-            item for item in preview_items
-            if not item.get("needs_action")
-        ]
-
-        def _emit_preview_row(item: dict) -> None:
-            title = _escape(item.get("title") or "")
-            age = _format_relative_age(item.get("updated_at") or "")
-            age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
-            label = item.get("triage_label") or ""
-            label_part = (
-                f"  [dim]{_escape(str(label))}[/dim]" if label else ""
-            )
-            lines.append(f"  \u00b7 {title}{label_part}{age_part}")
-
-        for item in action_previews[:3]:
-            _emit_preview_row(item)
-        if info_previews:
-            if data.action_items or action_previews:
-                lines.append("[dim]Other open items[/dim]")
-            for item in info_previews[:3]:
-                _emit_preview_row(item)
-        if (
-            not count
-            and not preview_items
-            and not data.action_items
-            and not on_hold_total
-            and not blocked_total
-        ):
-            # Only print the "no items" reassurance when the section
-            # really is empty. The on-hold / blocked branches above
-            # already rendered something; saying "No project inbox
-            # items are open." right under a held-task card reads as
-            # the panel contradicting itself (#794).
-            lines.append("[dim]No project inbox items are open.[/dim]")
+        preview_lines, has_spillover = self._inbox_remainder_previews_block(
+            data,
+            action_ids=action_ids,
+            blocked_total=blocked_total,
+            on_hold_total=on_hold_total,
+        )
+        lines.extend(preview_lines)
         # Show the "press i" CTA only when the inbox actually has more
         # to offer than what we just rendered. When every action item
         # is already on screen as a card and there are no other open
         # items, the line is redundant with the screen footer ("i
         # inbox") and just adds vertical noise. Keep it when the
         # inbox has spillover so the user knows where to look.
-        # FYI/info preview rows (completed updates, etc.) do *not*
-        # count as spillover: they're already visible under "Other
-        # open items" and there's no hidden user action behind them,
-        # so the CTA would just repeat the footer keybinding (#1650).
-        has_spillover = (
-            (count and count > displayed_actions)
-            or bool(action_previews)
-        )
         if has_spillover:
             lines.append("")
             lines.append("[dim]Press [b]i[/b] to jump to the inbox[/dim]")

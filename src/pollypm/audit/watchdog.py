@@ -3382,6 +3382,372 @@ def build_urgent_human_handoff(
     )
 
 
+def _brief_task_on_hold_stale(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``task_on_hold_stale`` (DEFAULT: fix and re-submit)."""
+    stuck_minutes = meta.get("stuck_minutes")
+    on_hold_since = meta.get("on_hold_since")
+    from_state = meta.get("from") or "<unknown>"
+    reason = meta.get("reason")
+    routing = meta.get("routing") or ON_HOLD_ARCHITECT_TAG
+    reviewer_evidence = meta.get("reviewer_evidence") or []
+    lines: list[str] = []
+    lines.append(
+        f"Stuck for: {stuck_minutes} minutes" if stuck_minutes
+        else "Stuck for: unknown duration"
+    )
+    lines.append(f"Routing: {routing}")
+    lines.append("Observed evidence:")
+    if on_hold_since:
+        lines.append(
+            f"- Task transitioned {from_state} -> on_hold at {on_hold_since}"
+        )
+    if reviewer_evidence:
+        lines.append(
+            "- Recent reviewer/inbox rationale evidence "
+            "(authoritative if it differs from the transition reason):"
+        )
+        for entry in reviewer_evidence:
+            # Each entry is a one-line string already shaped by
+            # the cadence handler (exec row OR inbox message).
+            lines.append(f"  * {entry}")
+    else:
+        lines.append(
+            "- No additional reviewer execution rows or inbox "
+            "messages were available."
+        )
+    if reason:
+        lines.append(f"- On-hold transition reason: {reason}")
+    else:
+        lines.append("- No transition reason was recorded.")
+    lines.append("")
+    lines.append(
+        "Your job (DEFAULT: fix and re-submit). Read the evidence "
+        "above and generate hypotheses fresh from the reviewer's "
+        "findings — do NOT ratify any framing in this brief."
+    )
+    lines.append(
+        f"Cli levers available: `pm task queue {subject}`, "
+        f"`pm task approve {subject}`, `pm notify --priority immediate`. "
+        "Parking on the user is the failure mode this rule exists "
+        "to prevent."
+    )
+    return lines
+
+
+def _brief_task_review_stale(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``task_review_stale`` (reviewer absent/stuck)."""
+    stuck_minutes = meta.get("stuck_minutes")
+    review_since = meta.get("review_since")
+    lines: list[str] = []
+    lines.append(
+        f"Stuck for: {stuck_minutes} minutes" if stuck_minutes
+        else "Stuck for: unknown duration"
+    )
+    lines.append("Observed evidence:")
+    if review_since:
+        lines.append(f"- Task transitioned to status=review at {review_since}")
+    lines.append(
+        "- No subsequent task.status_changed for this subject"
+    )
+    lines.append(
+        "- Reviewer agent appears to be absent or stuck"
+    )
+    lines.append("")
+    lines.append(
+        "Your job: investigate the evidence above and unstick the "
+        "task. Generate hypotheses fresh from the data — do NOT "
+        "ratify the framing in this brief."
+    )
+    lines.append(
+        f"Cli levers available: `pm task done {subject}`, "
+        "`pm chat <project> --role reviewer`, `pm notify`."
+    )
+    return lines
+
+
+def _brief_task_progress_stale(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``task_progress_stale`` (worker alive but quiet)."""
+    stuck_minutes = meta.get("stuck_minutes")
+    in_progress_minutes = meta.get("in_progress_minutes")
+    in_progress_since = meta.get("in_progress_since")
+    last_activity_at = meta.get("last_activity_at")
+    last_activity_kind = meta.get("last_activity_kind") or "<unknown>"
+    assignee = meta.get("assignee") or "<unknown>"
+    node = meta.get("current_node_id") or "<unknown>"
+    lines: list[str] = []
+    lines.append(
+        f"Stuck for: {stuck_minutes} minutes without progress activity"
+        if stuck_minutes else "Stuck for: unknown duration"
+    )
+    if in_progress_minutes:
+        lines.append(f"In progress for: {in_progress_minutes} minutes")
+    lines.append("Observed evidence:")
+    if in_progress_since:
+        lines.append(
+            f"- Task transitioned to status=in_progress at {in_progress_since}"
+        )
+    if last_activity_at:
+        lines.append(
+            f"- Last progress signal: {last_activity_kind} at {last_activity_at}"
+        )
+    lines.append(f"- Assignee: {assignee}; node: {node}")
+    lines.append(
+        "- Worker pane may be alive but unproductive: common causes "
+        "include auth failure, sandbox denial, quota/capacity, or "
+        "worker logic stuck after a nudge."
+    )
+    lines.append("")
+    lines.append(
+        "Your job: investigate the evidence above and unstick the "
+        "task. Auth / sandbox / quota / worker logic are the usual "
+        "root-cause families — generate hypotheses fresh from the "
+        "evidence rather than ratifying any framing in this brief."
+    )
+    lines.append(
+        f"Cli levers available: `pm task cancel {subject}`, "
+        "`pm chat <project>`, `pm notify`."
+    )
+    return lines
+
+
+def _brief_role_session_missing(
+    finding: Finding,
+    project: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``role_session_missing`` (missing tmux role lane)."""
+    expected = meta.get("expected_window") or "<unknown>"
+    role = meta.get("role") or "<unknown>"
+    status = meta.get("status") or "<unknown>"
+    lines: list[str] = []
+    lines.append("Stuck for: a watchdog cycle (>= 5 minutes)")
+    lines.append("Observed evidence:")
+    lines.append(f"- Task at status={status} with role={role}")
+    lines.append(
+        f"- No '{expected}' window in the storage-closet "
+        f"tmux session"
+    )
+    lines.append(
+        "- Without the role session, the task cannot make progress"
+    )
+    lines.append("")
+    lines.append(
+        "Your job: spawn the missing role lane or reassign the task. "
+        "Generate hypotheses fresh from the evidence — do NOT ratify "
+        "the framing in this brief."
+    )
+    lines.append(
+        f"Cli levers available: `pm chat {project} --role {role}`, "
+        "`pm notify`."
+    )
+    return lines
+
+
+def _brief_plan_review_missing(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``plan_review_missing`` (backfill is automatic)."""
+    plan_task_id = meta.get("plan_task_id") or subject
+    flow_id = meta.get("flow_template_id") or "<unknown>"
+    labels = meta.get("labels") or []
+    created_at = meta.get("created_at")
+    lines: list[str] = []
+    lines.append("Stuck for: plan_review never emitted")
+    lines.append("Observed evidence:")
+    lines.append(
+        f"- Plan-shaped task {plan_task_id} reached done on flow={flow_id}"
+    )
+    if labels:
+        label_preview = ", ".join(str(label) for label in labels[:6])
+        lines.append(f"- Labels: {label_preview}")
+    if created_at:
+        lines.append(f"- Created at: {created_at}")
+    lines.append(
+        "- The cockpit's plan_review approval card needs a "
+        "messages-table row with labels=[plan_review, "
+        f"plan_task:{plan_task_id}] but none exists."
+    )
+    lines.append("")
+    lines.append(
+        "Your job: the watchdog will backfill the plan_review row on "
+        "this tick via plan_review_emit.emit_plan_review_for_task. "
+        "No manual action required unless the backfill itself fails "
+        "in the cadence logs."
+    )
+    return lines
+
+
+def _brief_plan_review_bypassed_approval(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``plan_review_bypassed_approval`` (synthesize card)."""
+    plan_task_id = meta.get("plan_task_id") or subject
+    actor = meta.get("approval_actor") or "<unknown>"
+    completed = meta.get("approval_completed_at")
+    lines: list[str] = []
+    lines.append("Stuck for: plan approved by non-user actor")
+    lines.append("Observed evidence:")
+    lines.append(
+        f"- plan_project task {plan_task_id} reached done with "
+        f"user_approval completed by actor='{actor}'"
+    )
+    if completed:
+        lines.append(f"- Approval completed at: {completed}")
+    lines.append(
+        "- No plan_review inbox card exists for the task. The user "
+        "never saw the 'approve the plan?' surface."
+    )
+    lines.append("")
+    lines.append(
+        "Your job: the watchdog will synthesize a plan_review inbox "
+        "card on this tick via "
+        "plan_review_emit.emit_plan_review_for_task. The user gets "
+        "the gate they were supposed to get; nothing else changes."
+    )
+    return lines
+
+
+def _brief_rejection_loop(
+    finding: Finding,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``rejection_loop`` (structural rejection cycle)."""
+    evidence = finding.evidence or {}
+    node_id = evidence.get("node_id") or meta.get("node_id") or "<unknown>"
+    reject_count = (
+        evidence.get("reject_count")
+        or meta.get("reject_count")
+        or "?"
+    )
+    attempts = evidence.get("attempts") or []
+    shared_tokens = evidence.get("shared_tokens") or []
+    window_seconds = (
+        evidence.get("window_seconds")
+        or meta.get("window_seconds")
+        or REJECTION_LOOP_WINDOW_SECONDS
+    )
+    try:
+        window_minutes = max(1, int(window_seconds) // 60)
+    except (TypeError, ValueError):
+        window_minutes = 120
+    lines: list[str] = []
+    lines.append(
+        f"Stuck for: {reject_count} rejections at node '{node_id}' in the "
+        f"last {window_minutes} min"
+    )
+    lines.append("Observed evidence:")
+    for entry in attempts:
+        if not isinstance(entry, dict):
+            continue
+        attempt_node = entry.get("node") or "?"
+        completed = entry.get("completed_at") or "?"
+        reason = entry.get("reason") or ""
+        line = (
+            f"- attempt at {attempt_node} @ {completed}"
+        )
+        if reason:
+            clipped = reason.strip().splitlines()[0][:240]
+            line = f"{line} reason: {clipped}"
+        lines.append(line)
+    if shared_tokens:
+        lines.append(
+            "- Pattern across rejections (shared tokens): "
+            f"{', '.join(str(t) for t in shared_tokens[:8])}"
+        )
+    lines.append("")
+    lines.append(
+        "Your job: this task is in a structural rejection loop. The "
+        "worker can't escape its dependency-and-runtime context "
+        "locally. Generate hypotheses fresh from the evidence above "
+        "rather than ratifying any framing in this brief."
+    )
+    lines.append(
+        "Decisions in scope: retry-with-structural-change, "
+        "restructure-the-work-itself (cancel + recreate with a "
+        "different approach), or escalate-to-Polly. Do NOT "
+        "auto-cancel — let the PM choose."
+    )
+    return lines
+
+
+def _brief_worker_session_dead_loop(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``worker_session_dead_loop`` (reap-respawn cycle)."""
+    reap_count = meta.get("reap_count") or "?"
+    latest_reason = meta.get("latest_reason") or "<unknown>"
+    lines: list[str] = []
+    lines.append(
+        f"Stuck for: {reap_count} reaps in the last 10 minutes"
+    )
+    lines.append("Observed evidence:")
+    lines.append(
+        f"- Worker session for {subject} reaped {reap_count} times"
+    )
+    lines.append(f"- Most recent reaper reason: {latest_reason}")
+    lines.append(
+        "- The reaper is firing in a loop — the session keeps "
+        "dying after spawn"
+    )
+    lines.append("")
+    lines.append(
+        "Your job: investigate the evidence above and unstick the "
+        "task. The reaper firing in a loop is a session-spawn root "
+        "cause — generate hypotheses fresh from the evidence rather "
+        "than ratifying any framing in this brief."
+    )
+    lines.append(
+        f"Cli levers available: `pm task cancel {subject}`, `pm notify`."
+    )
+    return lines
+
+
+def _brief_fallback(finding: Finding) -> list[str]:
+    """Generic brief body for rules without a tailored template.
+
+    Covers orphan_marker / marker_leaked / stuck_draft /
+    cancel_no_promotion — all of which already carry human-readable
+    ``message``/``recommendation`` fields, so we re-use those.
+    """
+    lines: list[str] = []
+    lines.append("Stuck for: see message")
+    lines.append("Observed evidence:")
+    if finding.message:
+        lines.append(f"- {finding.message}")
+    if finding.recommendation:
+        lines.append(f"- Recommendation: {finding.recommendation}")
+    lines.append("")
+    lines.append(
+        "Your job: investigate the evidence above and unstick the "
+        "task. Generate hypotheses fresh from the evidence rather "
+        "than ratifying the recommendation."
+    )
+    lines.append(
+        "Cli levers available: act on the recommendation above, take "
+        "a different action you judge appropriate, or escalate to "
+        "user via `pm notify`."
+    )
+    return lines
+
+
 def format_unstick_brief(finding: Finding) -> str:
     """Render a finding as a structured brief for the architect.
 
@@ -3400,291 +3766,21 @@ def format_unstick_brief(finding: Finding) -> str:
     lines.append(f"Subject: {subject}")
 
     if finding.rule == RULE_TASK_ON_HOLD_STALE:
-        stuck_minutes = meta.get("stuck_minutes")
-        on_hold_since = meta.get("on_hold_since")
-        from_state = meta.get("from") or "<unknown>"
-        reason = meta.get("reason")
-        routing = meta.get("routing") or ON_HOLD_ARCHITECT_TAG
-        reviewer_evidence = meta.get("reviewer_evidence") or []
-        lines.append(
-            f"Stuck for: {stuck_minutes} minutes" if stuck_minutes
-            else "Stuck for: unknown duration"
-        )
-        lines.append(f"Routing: {routing}")
-        lines.append("Observed evidence:")
-        if on_hold_since:
-            lines.append(
-                f"- Task transitioned {from_state} -> on_hold at {on_hold_since}"
-            )
-        if reviewer_evidence:
-            lines.append(
-                "- Recent reviewer/inbox rationale evidence "
-                "(authoritative if it differs from the transition reason):"
-            )
-            for entry in reviewer_evidence:
-                # Each entry is a one-line string already shaped by
-                # the cadence handler (exec row OR inbox message).
-                lines.append(f"  * {entry}")
-        else:
-            lines.append(
-                "- No additional reviewer execution rows or inbox "
-                "messages were available."
-            )
-        if reason:
-            lines.append(f"- On-hold transition reason: {reason}")
-        else:
-            lines.append("- No transition reason was recorded.")
-        lines.append("")
-        lines.append(
-            "Your job (DEFAULT: fix and re-submit). Read the evidence "
-            "above and generate hypotheses fresh from the reviewer's "
-            "findings — do NOT ratify any framing in this brief."
-        )
-        lines.append(
-            f"Cli levers available: `pm task queue {subject}`, "
-            f"`pm task approve {subject}`, `pm notify --priority immediate`. "
-            "Parking on the user is the failure mode this rule exists "
-            "to prevent."
-        )
+        lines.extend(_brief_task_on_hold_stale(finding, subject, meta))
     elif finding.rule == RULE_TASK_REVIEW_STALE:
-        stuck_minutes = meta.get("stuck_minutes")
-        review_since = meta.get("review_since")
-        lines.append(
-            f"Stuck for: {stuck_minutes} minutes" if stuck_minutes
-            else "Stuck for: unknown duration"
-        )
-        lines.append("Observed evidence:")
-        if review_since:
-            lines.append(f"- Task transitioned to status=review at {review_since}")
-        lines.append(
-            "- No subsequent task.status_changed for this subject"
-        )
-        lines.append(
-            "- Reviewer agent appears to be absent or stuck"
-        )
-        lines.append("")
-        lines.append(
-            "Your job: investigate the evidence above and unstick the "
-            "task. Generate hypotheses fresh from the data — do NOT "
-            "ratify the framing in this brief."
-        )
-        lines.append(
-            f"Cli levers available: `pm task done {subject}`, "
-            "`pm chat <project> --role reviewer`, `pm notify`."
-        )
+        lines.extend(_brief_task_review_stale(finding, subject, meta))
     elif finding.rule == RULE_TASK_PROGRESS_STALE:
-        stuck_minutes = meta.get("stuck_minutes")
-        in_progress_minutes = meta.get("in_progress_minutes")
-        in_progress_since = meta.get("in_progress_since")
-        last_activity_at = meta.get("last_activity_at")
-        last_activity_kind = meta.get("last_activity_kind") or "<unknown>"
-        assignee = meta.get("assignee") or "<unknown>"
-        node = meta.get("current_node_id") or "<unknown>"
-        lines.append(
-            f"Stuck for: {stuck_minutes} minutes without progress activity"
-            if stuck_minutes else "Stuck for: unknown duration"
-        )
-        if in_progress_minutes:
-            lines.append(f"In progress for: {in_progress_minutes} minutes")
-        lines.append("Observed evidence:")
-        if in_progress_since:
-            lines.append(
-                f"- Task transitioned to status=in_progress at {in_progress_since}"
-            )
-        if last_activity_at:
-            lines.append(
-                f"- Last progress signal: {last_activity_kind} at {last_activity_at}"
-            )
-        lines.append(f"- Assignee: {assignee}; node: {node}")
-        lines.append(
-            "- Worker pane may be alive but unproductive: common causes "
-            "include auth failure, sandbox denial, quota/capacity, or "
-            "worker logic stuck after a nudge."
-        )
-        lines.append("")
-        lines.append(
-            "Your job: investigate the evidence above and unstick the "
-            "task. Auth / sandbox / quota / worker logic are the usual "
-            "root-cause families — generate hypotheses fresh from the "
-            "evidence rather than ratifying any framing in this brief."
-        )
-        lines.append(
-            f"Cli levers available: `pm task cancel {subject}`, "
-            "`pm chat <project>`, `pm notify`."
-        )
+        lines.extend(_brief_task_progress_stale(finding, subject, meta))
     elif finding.rule == RULE_ROLE_SESSION_MISSING:
-        expected = meta.get("expected_window") or "<unknown>"
-        role = meta.get("role") or "<unknown>"
-        status = meta.get("status") or "<unknown>"
-        lines.append("Stuck for: a watchdog cycle (>= 5 minutes)")
-        lines.append("Observed evidence:")
-        lines.append(f"- Task at status={status} with role={role}")
-        lines.append(
-            f"- No '{expected}' window in the storage-closet "
-            f"tmux session"
-        )
-        lines.append(
-            "- Without the role session, the task cannot make progress"
-        )
-        lines.append("")
-        lines.append(
-            "Your job: spawn the missing role lane or reassign the task. "
-            "Generate hypotheses fresh from the evidence — do NOT ratify "
-            "the framing in this brief."
-        )
-        lines.append(
-            f"Cli levers available: `pm chat {project} --role {role}`, "
-            "`pm notify`."
-        )
+        lines.extend(_brief_role_session_missing(finding, project, meta))
     elif finding.rule == RULE_PLAN_REVIEW_MISSING:
-        plan_task_id = meta.get("plan_task_id") or subject
-        flow_id = meta.get("flow_template_id") or "<unknown>"
-        labels = meta.get("labels") or []
-        created_at = meta.get("created_at")
-        lines.append("Stuck for: plan_review never emitted")
-        lines.append("Observed evidence:")
-        lines.append(
-            f"- Plan-shaped task {plan_task_id} reached done on flow={flow_id}"
-        )
-        if labels:
-            label_preview = ", ".join(str(label) for label in labels[:6])
-            lines.append(f"- Labels: {label_preview}")
-        if created_at:
-            lines.append(f"- Created at: {created_at}")
-        lines.append(
-            "- The cockpit's plan_review approval card needs a "
-            "messages-table row with labels=[plan_review, "
-            f"plan_task:{plan_task_id}] but none exists."
-        )
-        lines.append("")
-        lines.append(
-            "Your job: the watchdog will backfill the plan_review row on "
-            "this tick via plan_review_emit.emit_plan_review_for_task. "
-            "No manual action required unless the backfill itself fails "
-            "in the cadence logs."
-        )
+        lines.extend(_brief_plan_review_missing(finding, subject, meta))
     elif finding.rule == RULE_PLAN_REVIEW_BYPASSED_APPROVAL:
-        plan_task_id = meta.get("plan_task_id") or subject
-        actor = meta.get("approval_actor") or "<unknown>"
-        completed = meta.get("approval_completed_at")
-        lines.append("Stuck for: plan approved by non-user actor")
-        lines.append("Observed evidence:")
-        lines.append(
-            f"- plan_project task {plan_task_id} reached done with "
-            f"user_approval completed by actor='{actor}'"
-        )
-        if completed:
-            lines.append(f"- Approval completed at: {completed}")
-        lines.append(
-            "- No plan_review inbox card exists for the task. The user "
-            "never saw the 'approve the plan?' surface."
-        )
-        lines.append("")
-        lines.append(
-            "Your job: the watchdog will synthesize a plan_review inbox "
-            "card on this tick via "
-            "plan_review_emit.emit_plan_review_for_task. The user gets "
-            "the gate they were supposed to get; nothing else changes."
-        )
+        lines.extend(_brief_plan_review_bypassed_approval(finding, subject, meta))
     elif finding.rule == RULE_REJECTION_LOOP:
-        node_id = (finding.evidence or {}).get("node_id") or meta.get(
-            "node_id",
-        ) or "<unknown>"
-        reject_count = (
-            (finding.evidence or {}).get("reject_count")
-            or meta.get("reject_count")
-            or "?"
-        )
-        attempts = (finding.evidence or {}).get("attempts") or []
-        shared_tokens = (finding.evidence or {}).get("shared_tokens") or []
-        window_seconds = (
-            (finding.evidence or {}).get("window_seconds")
-            or meta.get("window_seconds")
-            or REJECTION_LOOP_WINDOW_SECONDS
-        )
-        try:
-            window_minutes = max(1, int(window_seconds) // 60)
-        except (TypeError, ValueError):
-            window_minutes = 120
-        lines.append(
-            f"Stuck for: {reject_count} rejections at node '{node_id}' in the "
-            f"last {window_minutes} min"
-        )
-        lines.append("Observed evidence:")
-        for entry in attempts:
-            if not isinstance(entry, dict):
-                continue
-            attempt_node = entry.get("node") or "?"
-            completed = entry.get("completed_at") or "?"
-            reason = entry.get("reason") or ""
-            line = (
-                f"- attempt at {attempt_node} @ {completed}"
-            )
-            if reason:
-                clipped = reason.strip().splitlines()[0][:240]
-                line = f"{line} reason: {clipped}"
-            lines.append(line)
-        if shared_tokens:
-            lines.append(
-                "- Pattern across rejections (shared tokens): "
-                f"{', '.join(str(t) for t in shared_tokens[:8])}"
-            )
-        lines.append("")
-        lines.append(
-            "Your job: this task is in a structural rejection loop. The "
-            "worker can't escape its dependency-and-runtime context "
-            "locally. Generate hypotheses fresh from the evidence above "
-            "rather than ratifying any framing in this brief."
-        )
-        lines.append(
-            "Decisions in scope: retry-with-structural-change, "
-            "restructure-the-work-itself (cancel + recreate with a "
-            "different approach), or escalate-to-Polly. Do NOT "
-            "auto-cancel — let the PM choose."
-        )
+        lines.extend(_brief_rejection_loop(finding, meta))
     elif finding.rule == RULE_WORKER_SESSION_DEAD_LOOP:
-        reap_count = meta.get("reap_count") or "?"
-        latest_reason = meta.get("latest_reason") or "<unknown>"
-        lines.append(
-            f"Stuck for: {reap_count} reaps in the last 10 minutes"
-        )
-        lines.append("Observed evidence:")
-        lines.append(
-            f"- Worker session for {subject} reaped {reap_count} times"
-        )
-        lines.append(f"- Most recent reaper reason: {latest_reason}")
-        lines.append(
-            "- The reaper is firing in a loop — the session keeps "
-            "dying after spawn"
-        )
-        lines.append("")
-        lines.append(
-            "Your job: investigate the evidence above and unstick the "
-            "task. The reaper firing in a loop is a session-spawn root "
-            "cause — generate hypotheses fresh from the evidence rather "
-            "than ratifying any framing in this brief."
-        )
-        lines.append(
-            f"Cli levers available: `pm task cancel {subject}`, `pm notify`."
-        )
+        lines.extend(_brief_worker_session_dead_loop(finding, subject, meta))
     else:
-        # Fallback: orphan_marker / marker_leaked / stuck_draft / cancel_no_promotion
-        # all have human-readable messages already; we re-use those.
-        lines.append("Stuck for: see message")
-        lines.append("Observed evidence:")
-        if finding.message:
-            lines.append(f"- {finding.message}")
-        if finding.recommendation:
-            lines.append(f"- Recommendation: {finding.recommendation}")
-        lines.append("")
-        lines.append(
-            "Your job: investigate the evidence above and unstick the "
-            "task. Generate hypotheses fresh from the evidence rather "
-            "than ratifying the recommendation."
-        )
-        lines.append(
-            "Cli levers available: act on the recommendation above, take "
-            "a different action you judge appropriate, or escalate to "
-            "user via `pm notify`."
-        )
+        lines.extend(_brief_fallback(finding))
     return "\n".join(lines)

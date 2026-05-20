@@ -43,6 +43,7 @@ from rich.text import Text
 from pollypm.cockpit_inbox import InboxThreadRow
 from pollypm.cockpit_inbox_items import is_task_inbox_entry
 from pollypm.cockpit_markup import _escape
+from pollypm.cockpit_theme import State
 from pollypm.config import load_config
 from pollypm.notify_task import strip_routing_tag_prefix
 from pollypm.rejection_feedback import (
@@ -195,7 +196,7 @@ def _render_user_prompt_block(payload: object) -> str | None:
 
     lines: list[str] = []
     if summary:
-        lines.append(f"[#f0c45a]◆[/#f0c45a] {_escape(summary)}")
+        lines.append(f"[{State.WAITING}]◆[/{State.WAITING}] {_escape(summary)}")
     heading = _plain(prompt.get("steps_heading")) or "What to do"
     if steps:
         lines.append(f"  [b]{_escape(heading)}[/b]")
@@ -236,7 +237,7 @@ def _render_heuristic_action_block(body: object) -> str | None:
         return None
     lines: list[str] = []
     if summary:
-        lines.append(f"[#f0c45a]◆[/#f0c45a] {_escape(summary)}")
+        lines.append(f"[{State.WAITING}]◆[/{State.WAITING}] {_escape(summary)}")
     if steps:
         lines.append("  [b]What to do[/b]")
         for idx, step in enumerate(steps, start=1):
@@ -262,13 +263,13 @@ def _render_inbox_triage_banner(item) -> str | None:
     project = (getattr(item, "project", "") or "").strip()
     if bucket == "action":
         return (
-            f"[b #f0c45a]Action Required[/b #f0c45a]"
+            f"[b {State.WAITING}]Action Required[/b {State.WAITING}]"
             f"  [dim]· {_escape(label)}[/dim]"
         )
     if bucket == "orphaned":
         detail = f"{project} is no longer a tracked project." if project else "This project is no longer tracked."
         return (
-            f"[b #97a6b2]Deleted Project[/b #97a6b2]"
+            f"[b {State.NEUTRAL}]Deleted Project[/b {State.NEUTRAL}]"
             f"  [dim]· {_escape(detail)}[/dim]"
         )
     if label and label != "update":
@@ -297,15 +298,15 @@ def _format_inbox_row(
 
     text = Text(no_wrap=True, overflow="ellipsis")
     if tree_marker:
-        text.append(tree_marker, style="#6b7a88")
+        text.append(tree_marker, style=State.MUTED)
     if is_unread:
-        text.append("◆ ", style="#f0c45a")  # yellow diamond
+        text.append("◆ ", style=State.WAITING)  # yellow diamond
     else:
-        text.append("○ ", style="#4a5568")  # dim circle
+        text.append("○ ", style=State.IDLE)  # dim circle
     subject_prefix = ""
     if is_rejection_feedback_task(task):
         subject_prefix = "🔄 "
-        text.append(subject_prefix, style="#ffb454")
+        text.append(subject_prefix, style=State.ATTENTION_BRIGHT)
     subject = task.title or "(no subject)"
     # Drop the "[Action]" prefix from action-bucket rows. The inbox
     # already groups action-needed items under their own header, so
@@ -324,10 +325,10 @@ def _format_inbox_row(
     )
     if len(subject) > max_subject:
         subject = subject[: max_subject - 1] + "…"
-    subject_style = "bold #eef2f4" if is_unread else "bold #b8c4cf"
+    subject_style = f"bold {State.HEADING}" if is_unread else f"bold {State.LABEL}"
     text.append(subject, style=subject_style)
     if reply_suffix:
-        text.append(reply_suffix, style="#6b7a88")
+        text.append(reply_suffix, style=State.MUTED)
 
     # Line 2: project · age, dim. Indent by 2 so it lines up under the
     # subject text (past the marker glyph).
@@ -349,7 +350,7 @@ def _format_inbox_row(
     meta_indent = " " * max(2, len(tree_marker) + 2)
     meta_line = meta_indent + "  ·  ".join(meta_bits)
     text.append("\n")
-    text.append(meta_line, style="#6b7a88")
+    text.append(meta_line, style=State.MUTED)
     return text
 
 
@@ -419,11 +420,13 @@ def _format_inbox_plan_review_row(
     """
     text = Text(no_wrap=True, overflow="ellipsis")
     if tree_marker:
-        text.append(tree_marker, style="#6b7a88")
+        text.append(tree_marker, style=State.MUTED)
 
     # Red play glyph — same affordance as the rail's "needs decision"
-    # signal so the operator's eye trains to the same shape.
-    text.append("▶ ", style="bold #ff6b5b")
+    # signal so the operator's eye trains to the same shape. Standardised
+    # on ``State.BLOCKED`` (``#ff5f6d``); historical drift to ``#ff6b5b``
+    # was an accidental copy-paste flagged in the 2026-05-20 audit.
+    text.append("▶ ", style=f"bold {State.BLOCKED}")
 
     # Heading: ``Approve plan: <project>/<task_number>`` (the inbox
     # task_id is already in ``<project>/<n>`` shape, so we don't need
@@ -439,7 +442,7 @@ def _format_inbox_plan_review_row(
         ref = "?"
     heading_label = "Approve plan: "
     heading_ref = ref
-    heading_style = "bold #f0c45a" if is_unread else "bold #d6a93f"
+    heading_style = f"bold {State.WAITING}" if is_unread else f"bold {State.WAITING_DIM}"
     text.append(heading_label, style=heading_style)
     text.append(heading_ref, style=heading_style)
 
@@ -470,8 +473,8 @@ def _format_inbox_plan_review_row(
 
     indent = " " * max(2, len(tree_marker) + 2)
     text.append("\n")
-    text.append(indent, style="#6b7a88")
-    text.append(summary_line, style="#c8d2da")
+    text.append(indent, style=State.MUTED)
+    text.append(summary_line, style=State.BODY)
 
     # Optional flagged-judgment-calls sub-section — only shown when the
     # row is highlighted/expanded so the list stays compact at rest.
@@ -492,8 +495,8 @@ def _format_inbox_plan_review_row(
             if not trimmed:
                 continue
             text.append("\n")
-            text.append(indent + "  • ", style="#f0c45a")
-            text.append(trimmed, style="#a9b4be")
+            text.append(indent + "  • ", style=State.WAITING)
+            text.append(trimmed, style=State.LABEL_DIM)
 
     return text
 
@@ -513,15 +516,15 @@ def _format_inbox_reply_row(task, reply, *, width: int = 38) -> Text:
     max_subject = max(8, width - len(prefix) - len(header))
     if len(subject) > max_subject:
         subject = subject[: max_subject - 1] + "…"
-    text.append(prefix, style="#6b7a88")
-    text.append(header, style="#97a6b2")
-    text.append(subject, style="#c8d2da")
+    text.append(prefix, style=State.MUTED)
+    text.append(header, style=State.NEUTRAL)
+    text.append(subject, style=State.BODY)
 
     stamped = getattr(reply, "timestamp", None)
     iso = stamped.isoformat() if hasattr(stamped, "isoformat") else str(stamped or "")
     age = format_relative(iso) if iso else ""
     text.append("\n")
-    text.append("    " + (age or "reply"), style="#586773")
+    text.append("    " + (age or "reply"), style=State.MUTED_DIM)
     return text
 
 

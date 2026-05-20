@@ -874,7 +874,16 @@ def _create_notify_inbox_task(
     :class:`PollyPMConfig` so ``[storage].backend = "postgres"`` lands
     on the pg pool. ``--db`` non-default values force sqlite dispatch
     via ``db_path`` (mirrors :func:`pollypm.work.cli._svc`).
+
+    #1951 — ``--db <pg-dsn>`` (``postgresql://…``) is treated like
+    :func:`pollypm.work.cli._svc`: synthesize a pg-pinned config carrying
+    the override DSN and call the factory with ``db_path=None`` so the
+    inbox-task row lands on the same Postgres backend as the message.
+    Without this, a non-default ``Path("postgresql://…")`` falls into
+    the sqlite branch (since ``db != WORKSPACE_DEFAULT_DB_PATH``) and
+    the immediate-priority fan-out splits message/task across backends.
     """
+    from pollypm.storage.pg_pool import _looks_like_pg_dsn
     from pollypm.work import create_work_service
     from pollypm.work.db_resolver import (
         WORKSPACE_DEFAULT_DB_PATH,
@@ -882,15 +891,27 @@ def _create_notify_inbox_task(
     )
 
     config_obj = None
-    if db == WORKSPACE_DEFAULT_DB_PATH:
-        try:
-            from pollypm.config import load_config
+    try:
+        from pollypm.config import load_config
 
-            config_obj = load_config()
-        except Exception:  # noqa: BLE001
-            config_obj = None
+        config_obj = load_config()
+    except Exception:  # noqa: BLE001
+        config_obj = None
 
-    if config_obj is not None:
+    if _looks_like_pg_dsn(db):
+        # #1951 — pg DSN override. Mirror ``pollypm.work.cli._svc``:
+        # build a pg-pinned config that carries the override DSN, then
+        # call the factory with ``db_path=None`` so the pg dispatch
+        # branch fires instead of being forced down sqlite by an
+        # explicit ``db_path``.
+        from pollypm.work.cli import _config_with_pg_dsn_override
+
+        backend_config = _config_with_pg_dsn_override(config_obj, db)
+        svc = create_work_service(
+            config=backend_config,
+            project_key=project,
+        )
+    elif db == WORKSPACE_DEFAULT_DB_PATH and config_obj is not None:
         svc = create_work_service(config=config_obj, project_key=project)
     else:
         db_path = resolve_work_db_path(db, project=None)

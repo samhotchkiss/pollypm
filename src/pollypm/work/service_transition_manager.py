@@ -645,6 +645,15 @@ class WorkTransitionManager:
 
         self._commit(_mutate)
 
+        # #1953 — ``_after_sync`` receives the post-commit Task snapshot
+        # that ``_finish`` reloads from the store. When the worker-cap
+        # rollback fires, that snapshot becomes stale (in_progress with
+        # an active execution) even though the DB row is back to
+        # queued/abandoned. Capture the rollback outcome via a closure
+        # cell so the outer claim() can refetch and return the fresh
+        # queued Task instead of the stale in_progress one.
+        rollback_committed = [False]
+
         def _after_sync(_: Task) -> None:
             self.service.last_provision_error = None
             if self.service._session_mgr is not None:
@@ -673,7 +682,7 @@ class WorkTransitionManager:
                     # that's left is reverting the work_tasks row + the
                     # active node execution so the next tick re-claims.
                     if _is_cap_exceeded_error(exc):
-                        self._rollback_claim_to_queued(
+                        rollback_committed[0] = self._rollback_claim_to_queued(
                             task, node_id, actor, exc,
                         )
 
@@ -682,6 +691,11 @@ class WorkTransitionManager:
             WorkStatus.QUEUED.value,
             after_sync=_after_sync,
         )
+        if rollback_committed[0]:
+            # #1953 — refetch so the caller sees the rolled-back row
+            # (queued, no active execution) instead of the stale
+            # in_progress snapshot ``_finish`` captured pre-rollback.
+            result = self.service.get(task_id)
         return result
 
     def _rollback_claim_to_queued(
@@ -690,7 +704,7 @@ class WorkTransitionManager:
         node_id: str,
         actor: str,
         exc: BaseException,
-    ) -> None:
+    ) -> bool:
         """Revert an in_progress claim back to queued (#1906).
 
         Called when post-commit ``provision_worker`` fails with a
@@ -703,6 +717,13 @@ class WorkTransitionManager:
         operator signal. Without the rollback the task is silently
         wedged; with a failed rollback the operator still sees the
         provision error and can run ``pm task release`` manually.
+
+        Returns ``True`` when the rollback committed successfully so
+        callers can refetch the now-queued task instead of returning
+        the stale in_progress snapshot they captured before
+        provisioning fired (#1953). ``False`` on rollback failure —
+        the row is still in_progress, the stale snapshot is still
+        accurate.
         """
         now = _now()
         try:
@@ -747,12 +768,14 @@ class WorkTransitionManager:
                 "post-commit provision failure (%s)",
                 task.project, task.task_number, exc,
             )
+            return True
         except Exception as rollback_exc:  # noqa: BLE001
             logger.warning(
                 "claim rollback failed for %s/%d: %s (task remains "
                 "in_progress; operator must release manually)",
                 task.project, task.task_number, rollback_exc,
             )
+            return False
 
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:
         task = self.service.get(task_id)

@@ -809,270 +809,292 @@ class StateStore:
                 continue
             for sql in stmts:
                 self.execute(sql)
-            # Migrations 2-4 are column additions — run them via helper
-            if version == 2:
-                self._safe_add_column("sessions", "project", "TEXT NOT NULL DEFAULT 'pollypm'")
-            elif version == 3:
-                self._safe_add_column("heartbeats", "snapshot_hash", "TEXT NOT NULL DEFAULT ''")
-            elif version == 4:
-                self._safe_add_column("token_usage_hourly", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0")
-            elif version == 8:
-                # Back-fill typed-schema columns on pre-existing memory_entries
-                # rows. Each _safe_add_column call is a no-op if the column
-                # already exists (fresh DBs already have them from SCHEMA).
-                # Existing rows get type='project', importance=3 via column
-                # DEFAULTs — the spec's migration contract (§3.2, #230).
-                self._safe_add_column("memory_entries", "type", "TEXT NOT NULL DEFAULT 'project'")
-                self._safe_add_column("memory_entries", "importance", "INTEGER NOT NULL DEFAULT 3")
-                self._safe_add_column("memory_entries", "superseded_by", "INTEGER")
-                self._safe_add_column("memory_entries", "ttl_at", "TEXT")
-                # Index created last, once the column is guaranteed to exist.
-                self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_memory_entries_type "
-                    "ON memory_entries(type, id DESC)"
-                )
-            elif version == 9:
-                # Back-fill the FTS5 index for rows that existed before the
-                # after_insert trigger was installed. Use the 'rebuild'
-                # command form so SQLite repopulates the index from the
-                # content table atomically — cheaper and safer than a
-                # row-by-row insert loop. This is a no-op on a fresh DB
-                # (the table is empty) and idempotent otherwise.
-                self.execute(
-                    "INSERT INTO memory_entries_fts(memory_entries_fts) VALUES('rebuild')"
-                )
-            elif version == 10:
-                # Tiered scope model. Add ``scope_tier`` as NOT NULL with
-                # DEFAULT 'project' so any pre-M03 row is treated as
-                # project-tier memory — matching the acceptance contract
-                # that existing entries survive the upgrade with the
-                # "never auto-expire" lifecycle. Fresh DBs already have
-                # the column from SCHEMA; _safe_add_column is a no-op.
-                self._safe_add_column(
-                    "memory_entries",
-                    "scope_tier",
-                    "TEXT NOT NULL DEFAULT 'project'",
-                )
-                # Composite (tier, scope) index supports the two hot
-                # paths introduced by M03: "recall across tier X" and
-                # "purge session-tier entries with scope=S".
-                self.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_memory_entries_tier "
-                    "ON memory_entries(scope_tier, scope, id DESC)"
-                )
-            elif version == 12:
-                # Reject-bounce retry fix (#279). The dedupe key now
-                # includes the current node's execution version (the
-                # ``work_node_executions.visit`` counter at ping time).
-                # Existing rows back-fill to ``0`` via the column
-                # DEFAULT, which matches the default version emitted by
-                # freshly-rebuilt events whose work service can't
-                # compute a visit — so pre-migration dedupe semantics
-                # survive the upgrade intact.
-                if self.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
-                ).fetchone():
-                    self._safe_add_column(
-                        "task_notifications",
-                        "execution_version",
-                        "INTEGER NOT NULL DEFAULT 0",
-                    )
-                    # Composite index supports the new dedupe query path —
-                    # ``WHERE session = ? AND task = ? AND version = ? AND
-                    # notified_at >= ?``. The original per-session-task
-                    # index (migration 11) stays in place for pickup-log
-                    # filters that don't care about version.
-                    self.execute(
-                        "CREATE INDEX IF NOT EXISTS "
-                        "idx_task_notifications_session_task_version "
-                        "ON task_notifications("
-                        "session_name, task_id, execution_version, "
-                        "notified_at DESC)"
-                    )
-            elif version == 14:
-                self._safe_add_column("account_usage", "used_pct", "INTEGER")
-                self._safe_add_column("account_usage", "remaining_pct", "INTEGER")
-                self._safe_add_column("account_usage", "reset_at", "TEXT")
-                self._safe_add_column("account_usage", "period_label", "TEXT")
-            elif version == 15:
-                if self.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
-                ).fetchone():
-                    rows = self.execute(
-                        "SELECT session_name, event_type, message, created_at FROM events ORDER BY id"
-                    ).fetchall()
-                    for session_name, event_type, message, created_at in rows:
-                        self.execute(
-                            """
-                            INSERT INTO messages (
-                                scope, type, tier, recipient, sender, state,
-                                subject, body, payload_json, labels,
-                                created_at, updated_at
-                            )
-                            VALUES (?, 'event', 'immediate', '*', ?, 'open', ?, ?, ?, '[]', ?, ?)
-                            """,
-                            (
-                                session_name,
-                                session_name,
-                                event_type,
-                                message,
-                                json.dumps(
-                                    {
-                                        "session_name": session_name,
-                                        "event_type": event_type,
-                                        "message": message,
-                                    }
-                                ),
-                                created_at,
-                                created_at,
-                            ),
-                        )
-                if self.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'"
-                ).fetchone():
-                    rows = self.execute(
-                        "SELECT session_name, alert_type, severity, message, status, created_at, updated_at FROM alerts ORDER BY id"
-                    ).fetchall()
-                    for session_name, alert_type, severity, message, status, created_at, updated_at in rows:
-                        state = "open" if status == "open" else "closed"
-                        closed_at = None if state == "open" else updated_at
-                        self.execute(
-                            """
-                            INSERT INTO messages (
-                                scope, type, tier, recipient, sender, state,
-                                subject, body, payload_json, labels,
-                                created_at, updated_at, closed_at
-                            )
-                            VALUES (?, 'alert', 'immediate', 'user', ?, ?, ?, '', ?, '[]', ?, ?, ?)
-                            """,
-                            (
-                                session_name,
-                                alert_type,
-                                state,
-                                f"[Alert] {message}",
-                                json.dumps(
-                                    {
-                                        "severity": severity,
-                                        "session_name": session_name,
-                                    }
-                                ),
-                                created_at,
-                                updated_at,
-                                closed_at,
-                            ),
-                        )
-                if self.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
-                ).fetchone():
-                    cols = {
-                        row[1]
-                        for row in self.execute("PRAGMA table_info(task_notifications)").fetchall()
-                    }
-                    execution_sql = (
-                        "COALESCE(execution_version, 0)"
-                        if "execution_version" in cols
-                        else "0"
-                    )
-                    rows = self.execute(
-                        f"SELECT session_name, task_id, project, notified_at, "
-                        f"delivery_status, message, {execution_sql} "
-                        f"FROM task_notifications ORDER BY id"
-                    ).fetchall()
-                    for session_name, task_id, project, notified_at, delivery_status, message, execution_version in rows:
-                        self.execute(
-                            """
-                            INSERT INTO messages (
-                                scope, type, tier, recipient, sender, state,
-                                subject, body, payload_json, labels,
-                                created_at, updated_at
-                            )
-                            VALUES (?, 'task_notification', 'immediate', ?, ?, 'open', ?, ?, ?, '[]', ?, ?)
-                            """,
-                            (
-                                session_name,
-                                project,
-                                task_id,
-                                task_id,
-                                message,
-                                json.dumps(
-                                    {
-                                        "project": project,
-                                        "delivery_status": delivery_status,
-                                        "execution_version": int(execution_version or 0),
-                                    }
-                                ),
-                                notified_at,
-                                notified_at,
-                            ),
-                        )
-                self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task_version")
-                self.execute("DROP INDEX IF EXISTS idx_task_notifications_recent")
-                self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task")
-                self.execute("DROP INDEX IF EXISTS idx_alerts_open")
-                self.execute("DROP INDEX IF EXISTS idx_events_session_type")
-                self.execute("DROP TABLE IF EXISTS task_notifications")
-                self.execute("DROP TABLE IF EXISTS alerts")
-                self.execute("DROP TABLE IF EXISTS events")
-            elif version == 16:
-                # #1044 — backfill duplicates first, then install the
-                # partial unique index. The ``messages`` table only
-                # exists if migration 15 has run (or the schema was
-                # bootstrapped fresh after 15), but on fresh DBs the
-                # SQLAlchemyStore bootstrap creates the table via
-                # ``metadata.create_all`` before this migration runs,
-                # so we feature-detect the table to stay safe on the
-                # rare DB that opens StateStore without ever having
-                # opened SQLAlchemyStore.
-                if self.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
-                ).fetchone():
-                    now = self._now()
-                    # Close every duplicate open alert row, keeping the
-                    # oldest id per ``(scope, sender, recipient)``
-                    # group. The index DDL below would fail on a DB
-                    # that still has dupes, so order matters.
-                    self.execute(
-                        """
-                        UPDATE messages
-                        SET state = 'closed', closed_at = ?, updated_at = ?
-                        WHERE type = 'alert'
-                          AND state = 'open'
-                          AND id NOT IN (
-                              SELECT MIN(id)
-                              FROM messages
-                              WHERE type = 'alert' AND state = 'open'
-                              GROUP BY scope, sender, recipient
-                          )
-                        """,
-                        (now, now),
-                    )
-                    self.execute(
-                        """
-                        CREATE UNIQUE INDEX IF NOT EXISTS messages_open_alert_uniq
-                        ON messages(scope, sender, recipient, type)
-                        WHERE state = 'open' AND type = 'alert'
-                        """
-                    )
-            elif version == 18:
-                # #1565 — add ``kind`` column. Pre-bootstrap DBs that
-                # opened StateStore before SQLAlchemyStore won't have
-                # the table yet; that case is handled by SCHEMA on
-                # next open (fresh-bootstrap path). For upgraded DBs
-                # that have the messages table already, ALTER TABLE
-                # adds the column with the default backfill. Fresh DBs
-                # whose SCHEMA already declares the column hit the
-                # ``_safe_add_column`` no-op.
-                if self.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
-                ).fetchone():
-                    self._safe_add_column(
-                        "messages",
-                        "kind",
-                        "TEXT NOT NULL DEFAULT 'legacy'",
-                    )
+            self._apply_migration_step(version)
             self.execute(
                 "INSERT INTO schema_version (version, description, applied_at) VALUES (?, ?, ?)",
                 (version, description, datetime.now(UTC).isoformat()),
+            )
+
+    def _apply_migration_step(self, version: int) -> None:
+        """Apply per-version post-DDL fixups (column adds, backfills)."""
+        # Migrations 2-4 are column additions — run them via helper
+        if version == 2:
+            self._safe_add_column("sessions", "project", "TEXT NOT NULL DEFAULT 'pollypm'")
+        elif version == 3:
+            self._safe_add_column("heartbeats", "snapshot_hash", "TEXT NOT NULL DEFAULT ''")
+        elif version == 4:
+            self._safe_add_column("token_usage_hourly", "cache_read_tokens", "INTEGER NOT NULL DEFAULT 0")
+        elif version == 8:
+            self._migrate_v8_memory_typed_columns()
+        elif version == 9:
+            # Back-fill the FTS5 index for rows that existed before the
+            # after_insert trigger was installed. Use the 'rebuild'
+            # command form so SQLite repopulates the index from the
+            # content table atomically — cheaper and safer than a
+            # row-by-row insert loop. This is a no-op on a fresh DB
+            # (the table is empty) and idempotent otherwise.
+            self.execute(
+                "INSERT INTO memory_entries_fts(memory_entries_fts) VALUES('rebuild')"
+            )
+        elif version == 10:
+            self._migrate_v10_memory_tier_scope()
+        elif version == 12:
+            self._migrate_v12_reject_bounce_dedup()
+        elif version == 14:
+            self._safe_add_column("account_usage", "used_pct", "INTEGER")
+            self._safe_add_column("account_usage", "remaining_pct", "INTEGER")
+            self._safe_add_column("account_usage", "reset_at", "TEXT")
+            self._safe_add_column("account_usage", "period_label", "TEXT")
+        elif version == 15:
+            self._migrate_v15_messages_unification()
+        elif version == 16:
+            self._migrate_v16_unique_open_alert_index()
+        elif version == 18:
+            self._migrate_v18_messages_kind_column()
+
+    def _migrate_v8_memory_typed_columns(self) -> None:
+        # Back-fill typed-schema columns on pre-existing memory_entries
+        # rows. Each _safe_add_column call is a no-op if the column
+        # already exists (fresh DBs already have them from SCHEMA).
+        # Existing rows get type='project', importance=3 via column
+        # DEFAULTs — the spec's migration contract (§3.2, #230).
+        self._safe_add_column("memory_entries", "type", "TEXT NOT NULL DEFAULT 'project'")
+        self._safe_add_column("memory_entries", "importance", "INTEGER NOT NULL DEFAULT 3")
+        self._safe_add_column("memory_entries", "superseded_by", "INTEGER")
+        self._safe_add_column("memory_entries", "ttl_at", "TEXT")
+        # Index created last, once the column is guaranteed to exist.
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_entries_type "
+            "ON memory_entries(type, id DESC)"
+        )
+
+    def _migrate_v10_memory_tier_scope(self) -> None:
+        # Tiered scope model. Add ``scope_tier`` as NOT NULL with
+        # DEFAULT 'project' so any pre-M03 row is treated as
+        # project-tier memory — matching the acceptance contract
+        # that existing entries survive the upgrade with the
+        # "never auto-expire" lifecycle. Fresh DBs already have
+        # the column from SCHEMA; _safe_add_column is a no-op.
+        self._safe_add_column(
+            "memory_entries",
+            "scope_tier",
+            "TEXT NOT NULL DEFAULT 'project'",
+        )
+        # Composite (tier, scope) index supports the two hot
+        # paths introduced by M03: "recall across tier X" and
+        # "purge session-tier entries with scope=S".
+        self.execute(
+            "CREATE INDEX IF NOT EXISTS idx_memory_entries_tier "
+            "ON memory_entries(scope_tier, scope, id DESC)"
+        )
+
+    def _migrate_v12_reject_bounce_dedup(self) -> None:
+        # Reject-bounce retry fix (#279). The dedupe key now
+        # includes the current node's execution version (the
+        # ``work_node_executions.visit`` counter at ping time).
+        # Existing rows back-fill to ``0`` via the column
+        # DEFAULT, which matches the default version emitted by
+        # freshly-rebuilt events whose work service can't
+        # compute a visit — so pre-migration dedupe semantics
+        # survive the upgrade intact.
+        if self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
+        ).fetchone():
+            self._safe_add_column(
+                "task_notifications",
+                "execution_version",
+                "INTEGER NOT NULL DEFAULT 0",
+            )
+            # Composite index supports the new dedupe query path —
+            # ``WHERE session = ? AND task = ? AND version = ? AND
+            # notified_at >= ?``. The original per-session-task
+            # index (migration 11) stays in place for pickup-log
+            # filters that don't care about version.
+            self.execute(
+                "CREATE INDEX IF NOT EXISTS "
+                "idx_task_notifications_session_task_version "
+                "ON task_notifications("
+                "session_name, task_id, execution_version, "
+                "notified_at DESC)"
+            )
+
+    def _migrate_v15_messages_unification(self) -> None:
+        if self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='events'"
+        ).fetchone():
+            rows = self.execute(
+                "SELECT session_name, event_type, message, created_at FROM events ORDER BY id"
+            ).fetchall()
+            for session_name, event_type, message, created_at in rows:
+                self.execute(
+                    """
+                    INSERT INTO messages (
+                        scope, type, tier, recipient, sender, state,
+                        subject, body, payload_json, labels,
+                        created_at, updated_at
+                    )
+                    VALUES (?, 'event', 'immediate', '*', ?, 'open', ?, ?, ?, '[]', ?, ?)
+                    """,
+                    (
+                        session_name,
+                        session_name,
+                        event_type,
+                        message,
+                        json.dumps(
+                            {
+                                "session_name": session_name,
+                                "event_type": event_type,
+                                "message": message,
+                            }
+                        ),
+                        created_at,
+                        created_at,
+                    ),
+                )
+        if self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='alerts'"
+        ).fetchone():
+            rows = self.execute(
+                "SELECT session_name, alert_type, severity, message, status, created_at, updated_at FROM alerts ORDER BY id"
+            ).fetchall()
+            for session_name, alert_type, severity, message, status, created_at, updated_at in rows:
+                state = "open" if status == "open" else "closed"
+                closed_at = None if state == "open" else updated_at
+                self.execute(
+                    """
+                    INSERT INTO messages (
+                        scope, type, tier, recipient, sender, state,
+                        subject, body, payload_json, labels,
+                        created_at, updated_at, closed_at
+                    )
+                    VALUES (?, 'alert', 'immediate', 'user', ?, ?, ?, '', ?, '[]', ?, ?, ?)
+                    """,
+                    (
+                        session_name,
+                        alert_type,
+                        state,
+                        f"[Alert] {message}",
+                        json.dumps(
+                            {
+                                "severity": severity,
+                                "session_name": session_name,
+                            }
+                        ),
+                        created_at,
+                        updated_at,
+                        closed_at,
+                    ),
+                )
+        if self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='task_notifications'"
+        ).fetchone():
+            cols = {
+                row[1]
+                for row in self.execute("PRAGMA table_info(task_notifications)").fetchall()
+            }
+            execution_sql = (
+                "COALESCE(execution_version, 0)"
+                if "execution_version" in cols
+                else "0"
+            )
+            rows = self.execute(
+                f"SELECT session_name, task_id, project, notified_at, "
+                f"delivery_status, message, {execution_sql} "
+                f"FROM task_notifications ORDER BY id"
+            ).fetchall()
+            for session_name, task_id, project, notified_at, delivery_status, message, execution_version in rows:
+                self.execute(
+                    """
+                    INSERT INTO messages (
+                        scope, type, tier, recipient, sender, state,
+                        subject, body, payload_json, labels,
+                        created_at, updated_at
+                    )
+                    VALUES (?, 'task_notification', 'immediate', ?, ?, 'open', ?, ?, ?, '[]', ?, ?)
+                    """,
+                    (
+                        session_name,
+                        project,
+                        task_id,
+                        task_id,
+                        message,
+                        json.dumps(
+                            {
+                                "project": project,
+                                "delivery_status": delivery_status,
+                                "execution_version": int(execution_version or 0),
+                            }
+                        ),
+                        notified_at,
+                        notified_at,
+                    ),
+                )
+        self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task_version")
+        self.execute("DROP INDEX IF EXISTS idx_task_notifications_recent")
+        self.execute("DROP INDEX IF EXISTS idx_task_notifications_session_task")
+        self.execute("DROP INDEX IF EXISTS idx_alerts_open")
+        self.execute("DROP INDEX IF EXISTS idx_events_session_type")
+        self.execute("DROP TABLE IF EXISTS task_notifications")
+        self.execute("DROP TABLE IF EXISTS alerts")
+        self.execute("DROP TABLE IF EXISTS events")
+
+    def _migrate_v16_unique_open_alert_index(self) -> None:
+        # #1044 — backfill duplicates first, then install the
+        # partial unique index. The ``messages`` table only
+        # exists if migration 15 has run (or the schema was
+        # bootstrapped fresh after 15), but on fresh DBs the
+        # SQLAlchemyStore bootstrap creates the table via
+        # ``metadata.create_all`` before this migration runs,
+        # so we feature-detect the table to stay safe on the
+        # rare DB that opens StateStore without ever having
+        # opened SQLAlchemyStore.
+        if self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone():
+            now = self._now()
+            # Close every duplicate open alert row, keeping the
+            # oldest id per ``(scope, sender, recipient)``
+            # group. The index DDL below would fail on a DB
+            # that still has dupes, so order matters.
+            self.execute(
+                """
+                UPDATE messages
+                SET state = 'closed', closed_at = ?, updated_at = ?
+                WHERE type = 'alert'
+                  AND state = 'open'
+                  AND id NOT IN (
+                      SELECT MIN(id)
+                      FROM messages
+                      WHERE type = 'alert' AND state = 'open'
+                      GROUP BY scope, sender, recipient
+                  )
+                """,
+                (now, now),
+            )
+            self.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS messages_open_alert_uniq
+                ON messages(scope, sender, recipient, type)
+                WHERE state = 'open' AND type = 'alert'
+                """
+            )
+
+    def _migrate_v18_messages_kind_column(self) -> None:
+        # #1565 — add ``kind`` column. Pre-bootstrap DBs that
+        # opened StateStore before SQLAlchemyStore won't have
+        # the table yet; that case is handled by SCHEMA on
+        # next open (fresh-bootstrap path). For upgraded DBs
+        # that have the messages table already, ALTER TABLE
+        # adds the column with the default backfill. Fresh DBs
+        # whose SCHEMA already declares the column hit the
+        # ``_safe_add_column`` no-op.
+        if self.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone():
+            self._safe_add_column(
+                "messages",
+                "kind",
+                "TEXT NOT NULL DEFAULT 'legacy'",
             )
 
     @staticmethod

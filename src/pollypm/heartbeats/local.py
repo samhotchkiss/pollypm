@@ -934,52 +934,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
         alerts.extend(self._handle_persona_drift(api, context))
 
-        combined_text = "\n".join(part for part in [context.transcript_delta, context.pane_text] if part).lower()
-        status_locked = False
-        if any(pattern in combined_text for pattern in self._AUTH_FAILURE_PATTERNS):
-            _emit_routed_alert(
-                api,
-                session_name=context.session_name,
-                alert_type="auth_broken",
-                severity="error",
-                message=(
-                    f"Window {context.window_name} reported "
-                    f"authentication failure"
-                ),
-                subject=f"{context.session_name} authentication failure",
-                suggested_action=(
-                    "Open Settings to fix the account, then restart the session from Workers."
-                ),
-            )
-            api.mark_account_auth_broken(
-                context.account_name,
-                context.provider,
-                reason="live session reported authentication failure",
-            )
-            self._set_session_status(
-                api,
-                context,
-                "auth_broken",
-                reason="Authentication failure reported",
-            )
-            alerts.append("auth_broken")
-            status_locked = True
-            # #1437 — without this call the recovery ladder never fires
-            # for per-task workers that hit an auth-block on their
-            # provider account. The heartbeat would mark the account
-            # ``auth_broken`` and pin the session status, but the wedged
-            # tmux window kept running until manual ``pm reset``.
-            # ``recover_session`` routes through Supervisor.maybe_recover
-            # which (combined with #1437 Fix #3 in session_manager.py)
-            # picks a healthy failover account on the relaunch.
-            self._recover_session(
-                api,
-                context,
-                failure_type="auth_broken",
-                message="Authentication failure reported",
-            )
-        else:
-            api.clear_alert(context.session_name, "auth_broken")
+        status_locked = self._handle_auth_failure(api, context, alerts)
 
         if context.pane_dead:
             status_locked = True
@@ -1123,6 +1078,73 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 self._escalate(api, context, intervention.reason)
         except Exception:  # noqa: BLE001
             pass
+
+    def _handle_auth_failure(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        alerts: list[str],
+    ) -> bool:
+        """Detect provider auth failures in the live transcript and react.
+
+        Extracted from ``_process_session`` (#1356). When a known
+        auth-broken pattern is present in the recent pane/transcript
+        text, this emits the routed alert, marks the underlying
+        provider account broken, pins the session status, kicks off
+        the recovery ladder (#1437), and returns ``True`` so the
+        caller can avoid further status writes that would clobber the
+        ``auth_broken`` pin. When no pattern matches, the
+        ``auth_broken`` alert (if any) is cleared and ``False`` is
+        returned. Appends to ``alerts`` in place to match the prior
+        inline behaviour.
+        """
+        combined_text = "\n".join(
+            part for part in [context.transcript_delta, context.pane_text] if part
+        ).lower()
+        if any(pattern in combined_text for pattern in self._AUTH_FAILURE_PATTERNS):
+            _emit_routed_alert(
+                api,
+                session_name=context.session_name,
+                alert_type="auth_broken",
+                severity="error",
+                message=(
+                    f"Window {context.window_name} reported "
+                    f"authentication failure"
+                ),
+                subject=f"{context.session_name} authentication failure",
+                suggested_action=(
+                    "Open Settings to fix the account, then restart the session from Workers."
+                ),
+            )
+            api.mark_account_auth_broken(
+                context.account_name,
+                context.provider,
+                reason="live session reported authentication failure",
+            )
+            self._set_session_status(
+                api,
+                context,
+                "auth_broken",
+                reason="Authentication failure reported",
+            )
+            alerts.append("auth_broken")
+            # #1437 — without this call the recovery ladder never fires
+            # for per-task workers that hit an auth-block on their
+            # provider account. The heartbeat would mark the account
+            # ``auth_broken`` and pin the session status, but the wedged
+            # tmux window kept running until manual ``pm reset``.
+            # ``recover_session`` routes through Supervisor.maybe_recover
+            # which (combined with #1437 Fix #3 in session_manager.py)
+            # picks a healthy failover account on the relaunch.
+            self._recover_session(
+                api,
+                context,
+                failure_type="auth_broken",
+                message="Authentication failure reported",
+            )
+            return True
+        api.clear_alert(context.session_name, "auth_broken")
+        return False
 
     def _handle_persona_drift(
         self, api, context: HeartbeatSessionContext

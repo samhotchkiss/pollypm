@@ -108,14 +108,19 @@ class FileMemoryBackend(MemoryBackend):
             # on test / ad-hoc construction.
             from pollypm.storage.state import StateStore
 
-            self._state_db = state_db or (self._project_path / ".pollypm" / "state.db")
+            # Route through ``project_pollypm_dir`` so the doubled-path
+            # guard (#1810/#1950) collapses ``GLOBAL_CONFIG_DIR /
+            # ".pollypm"`` back to ``GLOBAL_CONFIG_DIR``.
+            from pollypm.projects import project_pollypm_dir
+            self._state_db = state_db or (project_pollypm_dir(self._project_path) / "state.db")
             self._state_store = StateStore(self._state_db)
         else:
             self._state_db = state_db
             self._state_store = state_store
         self._plugins: _PluginHook = plugins if plugins is not None else _NullHook()
         # Conventional layout under .pollypm/ — callers may override.
-        dossier_root = self._project_path / ".pollypm"
+        from pollypm.projects import project_pollypm_dir
+        dossier_root = project_pollypm_dir(self._project_path)
         self._memory_root = memory_root or (dossier_root / "memory")
         self._artifacts_root = artifacts_root or (dossier_root / "artifacts")
 

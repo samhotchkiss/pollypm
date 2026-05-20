@@ -22,7 +22,7 @@ from typing import Any
 
 from pollypm.knowledge_extract import _sanitize_text
 from pollypm.llm_runner import run_haiku_json
-from pollypm.projects import project_transcripts_dir
+from pollypm.projects import project_pollypm_dir, project_transcripts_dir
 
 PROVIDER_TRANSCRIPT_DIRS = (".claude", ".codex")
 
@@ -839,7 +839,11 @@ def copy_provider_transcripts(project_root: Path, sources: DiscoveredSources) ->
 
 
 def _import_state_path(project_root: Path) -> Path:
-    return project_root / ".pollypm" / "history-import" / "state.json"
+    # Route through ``project_pollypm_dir`` (#1810/#1950) so importing
+    # against ``GLOBAL_CONFIG_DIR`` writes the checkpoint into
+    # ``~/.pollypm/history-import/state.json`` rather than the doubled
+    # ``~/.pollypm/.pollypm/history-import/state.json``.
+    return project_pollypm_dir(project_root) / "history-import" / "state.json"
 
 
 def load_import_state(project_root: Path) -> dict[str, Any]:

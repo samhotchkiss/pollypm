@@ -714,11 +714,14 @@ def _quota_limit_label(period_label: object) -> str:
 def _account_quota_usage(config: PollyPMConfig, store: object | None) -> list[AccountQuotaUsage]:
     """Return cached LLM account quota percentages for the Home dashboard.
 
-    ``store`` is unused (kept for caller compatibility); usage rows are
-    read through :mod:`pollypm.storage.pg_accounts`.
+    Routes through :mod:`pollypm.storage.pg_accounts` on the pg backend;
+    falls back to the injected ``store`` on sqlite.
     """
-    del store  # unused on pg backend
-    from pollypm.storage.pg_accounts import get_account_usage
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    use_pg = is_pg_backend(config)
+    if use_pg:
+        from pollypm.storage.pg_accounts import get_account_usage
 
     rows: list[AccountQuotaUsage] = []
     seen_emails: set[str] = set()
@@ -729,7 +732,12 @@ def _account_quota_usage(config: PollyPMConfig, store: object | None) -> list[Ac
                 continue
             seen_emails.add(email)
         try:
-            usage = get_account_usage(account_name)
+            if use_pg:
+                usage = get_account_usage(account_name)
+            elif store is not None:
+                usage = store.get_account_usage(account_name)  # type: ignore[attr-defined]
+            else:
+                usage = None
         except Exception:  # noqa: BLE001
             usage = None
         used_pct = getattr(usage, "used_pct", None) if usage is not None else None
@@ -762,35 +770,53 @@ def _account_quota_usage(config: PollyPMConfig, store: object | None) -> list[Ac
 
 
 def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
-    """Load config and gather one blocking dashboard snapshot."""
+    """Load config + state store and gather one blocking dashboard snapshot."""
     config = load_config(config_path)
-    data = gather(config, None)
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    if is_pg_backend(config):
+        data = gather(config, None)
+        return config, data
+    from pollypm.storage.state import StateStore
+
+    store = StateStore(config.project.state_db)
+    try:
+        data = gather(config, store)
+    finally:
+        store.close()
     return config, data
 
 
 def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
     """Gather all dashboard data.
 
-    ``store`` is retained for caller compatibility but unused — every
-    read goes through the pg facades.
+    Backend-aware: pg installs read through the pg facades; sqlite
+    installs read through the injected ``store`` (StateStore).
     """
-    del store  # unused on pg backend
     from pollypm.service_api import plan_launches_readonly
-    from pollypm.storage.pg_accounts import get_account_usage  # noqa: F401  (imported for side-effect path resolution)
-    from pollypm.storage.pg_alerts import open_alerts as pg_open_alerts
-    from pollypm.storage.pg_heartbeats import latest_heartbeat as pg_latest_heartbeat
-    from pollypm.storage.pg_sessions import (
-        list_session_runtimes as pg_list_session_runtimes,
-        recent_events as pg_recent_events,
-    )
-    from pollypm.storage.pg_token_usage import daily_token_usage as pg_daily_token_usage
+    from pollypm.storage._backend_dispatch import is_pg_backend
+
+    use_pg = is_pg_backend(config)
+    if use_pg:
+        from pollypm.storage.pg_alerts import open_alerts as pg_open_alerts
+        from pollypm.storage.pg_heartbeats import latest_heartbeat as pg_latest_heartbeat
+        from pollypm.storage.pg_sessions import (
+            list_session_runtimes as pg_list_session_runtimes,
+            recent_events as pg_recent_events,
+        )
+        from pollypm.storage.pg_token_usage import daily_token_usage as pg_daily_token_usage
 
     now = datetime.now(UTC)
 
-    # Active sessions — pg facade reads.
-    all_runtimes = pg_list_session_runtimes()
+    # Active sessions — backend-aware reads.
+    if use_pg:
+        all_runtimes = pg_list_session_runtimes()
+    elif store is not None:
+        all_runtimes = store.list_session_runtimes()  # type: ignore[attr-defined]
+    else:
+        all_runtimes = []
     runtime_map = {rt.session_name: rt for rt in all_runtimes}
-    launches = plan_launches_readonly(config, None)
+    launches = plan_launches_readonly(config, store)
 
     active: list[SessionActivity] = []
     for launch in launches:
@@ -800,7 +826,12 @@ def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
         label = project.display_label() if project else launch.session.project
 
         # Get last snapshot path for description
-        hb = pg_latest_heartbeat(launch.session.name)
+        if use_pg:
+            hb = pg_latest_heartbeat(launch.session.name)
+        elif store is not None:
+            hb = store.latest_heartbeat(launch.session.name)  # type: ignore[attr-defined]
+        else:
+            hb = None
         snapshot_path = hb.snapshot_path if hb else None
 
         desc = _session_description(status, launch.session.role, snapshot_path)
@@ -817,17 +848,27 @@ def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
             status=status, description=desc, age_seconds=age,
         ))
 
-    # Events summary — pg facade read.
-    recent = pg_recent_events(limit=300)
+    # Events summary — backend-aware read.
+    if use_pg:
+        recent = pg_recent_events(limit=300)
+    elif store is not None:
+        recent = store.recent_events(limit=300)  # type: ignore[attr-defined]
+    else:
+        recent = []
     cutoff = (now - timedelta(hours=24)).isoformat()
     day_events = [e for e in recent if e.created_at >= cutoff]
 
     # Token data
-    daily = pg_daily_token_usage(days=30)
+    if use_pg:
+        daily = pg_daily_token_usage(days=30)
+    elif store is not None:
+        daily = store.daily_token_usage(days=30)  # type: ignore[attr-defined]
+    else:
+        daily = []
     values = [t for _, t in daily]
     today_str = now.strftime("%Y-%m-%d")
     today_tokens = next((t for d, t in daily if d == today_str), 0)
-    account_usages = _account_quota_usage(config, None)
+    account_usages = _account_quota_usage(config, store)
 
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
@@ -876,8 +917,14 @@ def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
     # not a fault to surface as a separate alert. Mirrors cycles 45
     # / 53 / 55 dedup at the global polly-dashboard count level.
     user_waiting = _user_waiting_task_ids_across_projects(config)
+    if use_pg:
+        open_alerts = pg_open_alerts()
+    elif store is not None:
+        open_alerts = store.open_alerts()  # type: ignore[attr-defined]
+    else:
+        open_alerts = []
     alert_count = sum(
-        1 for a in pg_open_alerts()
+        1 for a in open_alerts
         if not is_operational_alert(a.alert_type)
         and not _stuck_alert_already_user_waiting(
             a.alert_type, user_waiting,

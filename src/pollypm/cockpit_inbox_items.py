@@ -654,6 +654,65 @@ def _filter_approved_plan_reviews(
     return kept
 
 
+def _emit_task_inbox_entries(
+    project_tasks,
+    *,
+    db_path: Path,
+    known_projects: set[str],
+    seen_task_ids: set[str],
+    items: list,
+    unread: set[str],
+    replies_by_task: dict[str, list],
+    read_marker_numbers: set[int],
+    replies_by_number: dict[int, list],
+) -> None:
+    """Append task-backed inbox entries from one project's task list.
+
+    Shared between the pg and sqlite branches of
+    ``load_inbox_entries`` (#1356). Both branches perform the same
+    per-task work — dedupe by ``task_id``, run the plan_review
+    synth-source filter (#1103), annotate, and bookkeep unread /
+    replies — only the upstream task fetch + read-marker / replies
+    fetch differ. All bookkeeping mutates the passed-in containers in
+    place to match the prior inline behaviour.
+    """
+    for task in project_tasks:
+        if task.task_id in seen_task_ids:
+            continue
+        seen_task_ids.add(task.task_id)
+        # Synth-source filter for plan_review (#1103, 4th attempt).
+        # Check the task's own user_approval execution directly: if
+        # it's COMPLETED + APPROVED, the plan review is already done
+        # and emitting the row would be a phantom action.
+        task_labels = {
+            str(lbl) for lbl in (getattr(task, "labels", []) or [])
+        }
+        if "plan_review" in task_labels:
+            emit = not _task_user_approval_is_approved(task)
+            logger.warning(
+                "PLAN_REVIEW_SYNTH project=%s task_id=%s emit=%s "
+                "reason=%s",
+                getattr(task, "project", "") or "",
+                task.task_id,
+                emit,
+                "user_approval_pending"
+                if emit else "user_approval_approved",
+            )
+            if not emit:
+                continue
+        items.append(
+            annotate_inbox_entry(
+                task_to_inbox_entry(task, db_path=db_path),
+                known_projects=known_projects,
+            )
+        )
+        if task.task_number not in read_marker_numbers:
+            unread.add(task.task_id)
+        replies = replies_by_number.get(task.task_number, [])
+        if replies:
+            replies_by_task[task.task_id] = replies
+
+
 def load_inbox_entries(
     config,
     *,
@@ -800,37 +859,17 @@ def load_inbox_entries(
                             "failed; treating as empty replies map",
                             project_for_query, exc_info=True,
                         )
-                for task in project_tasks:
-                    if task.task_id in seen_task_ids:
-                        continue
-                    seen_task_ids.add(task.task_id)
-                    task_labels = {
-                        str(lbl) for lbl in (getattr(task, "labels", []) or [])
-                    }
-                    if "plan_review" in task_labels:
-                        emit = not _task_user_approval_is_approved(task)
-                        logger.warning(
-                            "PLAN_REVIEW_SYNTH project=%s task_id=%s emit=%s "
-                            "reason=%s",
-                            getattr(task, "project", "") or "",
-                            task.task_id,
-                            emit,
-                            "user_approval_pending"
-                            if emit else "user_approval_approved",
-                        )
-                        if not emit:
-                            continue
-                    items.append(
-                        annotate_inbox_entry(
-                            task_to_inbox_entry(task, db_path=db_path),
-                            known_projects=known_projects,
-                        )
-                    )
-                    if task.task_number not in read_marker_numbers:
-                        unread.add(task.task_id)
-                    replies = replies_by_number.get(task.task_number, [])
-                    if replies:
-                        replies_by_task[task.task_id] = replies
+                _emit_task_inbox_entries(
+                    project_tasks,
+                    db_path=db_path,
+                    known_projects=known_projects,
+                    seen_task_ids=seen_task_ids,
+                    items=items,
+                    unread=unread,
+                    replies_by_task=replies_by_task,
+                    read_marker_numbers=read_marker_numbers,
+                    replies_by_number=replies_by_number,
+                )
         finally:
             if shared_svc is not None:
                 try:
@@ -940,42 +979,17 @@ def load_inbox_entries(
                         project_for_query, exc_info=True,
                     )
                     replies_by_number = {}
-                for task in project_tasks:
-                    if task.task_id in seen_task_ids:
-                        continue
-                    seen_task_ids.add(task.task_id)
-                    # Synth-source filter for plan_review (#1103, 4th
-                    # attempt). Check the task's own user_approval
-                    # execution directly: if it's COMPLETED + APPROVED,
-                    # the plan review is already done and emitting the row
-                    # would be a phantom action.
-                    task_labels = {
-                        str(lbl) for lbl in (getattr(task, "labels", []) or [])
-                    }
-                    if "plan_review" in task_labels:
-                        emit = not _task_user_approval_is_approved(task)
-                        logger.warning(
-                            "PLAN_REVIEW_SYNTH project=%s task_id=%s emit=%s "
-                            "reason=%s",
-                            getattr(task, "project", "") or "",
-                            task.task_id,
-                            emit,
-                            "user_approval_pending"
-                            if emit else "user_approval_approved",
-                        )
-                        if not emit:
-                            continue
-                    items.append(
-                        annotate_inbox_entry(
-                            task_to_inbox_entry(task, db_path=db_path),
-                            known_projects=known_projects,
-                        )
-                    )
-                    if task.task_number not in read_marker_numbers:
-                        unread.add(task.task_id)
-                    replies = replies_by_number.get(task.task_number, [])
-                    if replies:
-                        replies_by_task[task.task_id] = replies
+                _emit_task_inbox_entries(
+                    project_tasks,
+                    db_path=db_path,
+                    known_projects=known_projects,
+                    seen_task_ids=seen_task_ids,
+                    items=items,
+                    unread=unread,
+                    replies_by_task=replies_by_task,
+                    read_marker_numbers=read_marker_numbers,
+                    replies_by_number=replies_by_number,
+                )
             finally:
                 try:
                     svc.close()

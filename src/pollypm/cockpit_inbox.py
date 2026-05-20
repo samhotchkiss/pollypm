@@ -42,6 +42,11 @@ from pollypm.cockpit_worker_identity import (
 )
 from pollypm.heartbeats.snapshots import read_recent_heartbeat_snapshot
 from pollypm.inbox_message_refs import row_project_refs as _row_project_refs
+from pollypm.state_cache.divergence import (
+    DivergenceCounter as _DivergenceCounter,
+    compare_awaits_user_lists as _compare_awaits_user_lists,
+    log_divergence as _log_divergence,
+)
 
 if TYPE_CHECKING:
     from pollypm.inbox.kind import InboxItemKind
@@ -154,6 +159,13 @@ _AWAITS_USER_TTL_SECONDS = 1.0
 _AWAITS_USER_CACHE: dict[int, tuple[float, tuple[object, ...]]] = {}
 
 
+# Move A PR 2 — divergence sampler for the cache-routed fast path
+# (``docs/design/move-a-state-cache.md`` §6.2 last bullet). One
+# counter per routed call site so the sampling rate is local; the
+# busy site doesn't borrow samples from a quiet site.
+_AWAITS_USER_DIVERGENCE_COUNTER = _DivergenceCounter()
+
+
 def pm_inbox_awaits_user_list(config) -> list[object]:
     """Return every inbox entry across the config that ``awaits_user``.
 
@@ -175,7 +187,19 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     the rail glyph categorization share a single computation per tick
     instead of each running their own (~2 pg queries + the plan-review
     filter). Callers receive a fresh ``list`` copy so mutation is safe.
+
+    Move A PR 2 (#1664): when ``POLLYPM_STATE_CACHE=1`` is set AND the
+    in-process cache has at least one populated entry, this function
+    short-circuits to concatenating each entry's ``awaits_user_items``
+    and skips the workspace-wide pg sweep entirely. The flag is OFF
+    by default; PR 4 will flip it after divergence-sampler telemetry
+    is green. A 1-in-N sampler runs both paths and logs a WARN on
+    mismatch (see :mod:`pollypm.state_cache.divergence`).
     """
+    cached_result = _maybe_cache_route_awaits_user(config)
+    if cached_result is not None:
+        return cached_result
+
     import time as _time
 
     cache_key = id(config)
@@ -197,6 +221,63 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
             _AWAITS_USER_CACHE.pop(stale_key, None)
     _AWAITS_USER_CACHE[cache_key] = (now, tuple(result))
     return result
+
+
+def _maybe_cache_route_awaits_user(config) -> list[object] | None:
+    """Return the cache-routed result, or ``None`` to fall through.
+
+    Returns ``None`` when:
+
+    * The env flag is off (cache is the shim — ``snapshot()`` is ``{}``).
+    * The cache has no entries yet (cold start — the refresher hasn't
+      populated anything; falling through avoids serving an empty list
+      while the cache warms up).
+    * Any unexpected exception (defensive — broken cache must never
+      crash the rail badge).
+
+    On a hit the divergence sampler MAY also run the direct path and
+    log a WARN if the two disagree. The sampler runs at most 1-in-N
+    so the cache fast-path stays a single dict scan in the common case.
+    """
+
+    try:
+        from pollypm.state_cache import get_cache, is_enabled
+    except Exception:  # noqa: BLE001
+        return None
+    if not is_enabled():
+        return None
+    try:
+        cache = get_cache()
+        snapshot = cache.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    if not snapshot:
+        # Cold cache — let the direct path populate the legacy TTL
+        # cache; the refresher will fill the state cache on the next
+        # audit-log event.
+        return None
+
+    known_projects = set(getattr(config, "projects", {}).keys())
+    cached_items: list[object] = []
+    for project_key, entry in snapshot.items():
+        if project_key not in known_projects:
+            # The cache may carry an entry for a project that was just
+            # untracked. Skip — the direct path also drops it.
+            continue
+        for item in getattr(entry, "awaits_user_items", ()) or ():
+            cached_items.append(item)
+
+    if _AWAITS_USER_DIVERGENCE_COUNTER.should_sample():
+        try:
+            direct = _pm_inbox_awaits_user_list_uncached(config)
+        except Exception:  # noqa: BLE001
+            direct = None
+        if direct is not None:
+            matched, reason = _compare_awaits_user_lists(cached_items, direct)
+            if not matched:
+                _log_divergence("pm_inbox_awaits_user_list", reason)
+
+    return cached_items
 
 
 def _pm_inbox_awaits_user_list_uncached(config) -> list[object]:

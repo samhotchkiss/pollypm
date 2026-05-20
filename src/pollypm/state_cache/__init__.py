@@ -28,8 +28,19 @@ import os
 import threading
 from typing import Protocol
 
+from pollypm.state_cache.divergence import (
+    DIVERGENCE_SAMPLE_RATE,
+    DivergenceCounter,
+    compare_awaits_user_lists,
+    compare_state_maps,
+    log_divergence,
+)
 from pollypm.state_cache.entry import ProjectStateCacheEntry, empty_entry
 from pollypm.state_cache.project_state_cache import ProjectStateCache, RefreshFn
+from pollypm.state_cache.refresh_impl import (
+    build_refresh_fn,
+    compute_entry_for_project,
+)
 from pollypm.state_cache.refresher import StateCacheRefresher, stub_refresh_fn
 
 logger = logging.getLogger(__name__)
@@ -40,16 +51,23 @@ logger = logging.getLogger(__name__)
 ENV_FLAG = "POLLYPM_STATE_CACHE"
 
 __all__ = [
+    "DIVERGENCE_SAMPLE_RATE",
+    "DivergenceCounter",
     "ENV_FLAG",
     "ProjectStateCache",
     "ProjectStateCacheEntry",
     "RefreshFn",
     "StateCacheLike",
     "StateCacheRefresher",
+    "build_refresh_fn",
+    "compare_awaits_user_lists",
+    "compare_state_maps",
+    "compute_entry_for_project",
     "empty_entry",
     "get_cache",
     "get_refresher",
     "is_enabled",
+    "log_divergence",
     "reset_for_test",
 ]
 
@@ -147,7 +165,25 @@ def get_cache() -> StateCacheLike:
 
     with _singleton_lock:
         if _cache_singleton is None:
-            cache = ProjectStateCache(refresh_fn=stub_refresh_fn)
+            # PR 2: wire the real per-project refresh through a
+            # ``load_config``-backed provider. A failure to import
+            # ``pollypm.config`` (e.g. during a circular-import
+            # bootstrap, very unlikely at this leaf module's depth)
+            # falls back to the PR 1 stub so the cache still loads.
+            try:
+                from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+                def _config_provider() -> object:
+                    return load_config(DEFAULT_CONFIG_PATH)
+
+                refresh_fn = build_refresh_fn(_config_provider)
+            except Exception:  # noqa: BLE001
+                logger.exception(
+                    "state_cache: real refresh wiring failed; "
+                    "falling back to stub",
+                )
+                refresh_fn = stub_refresh_fn
+            cache = ProjectStateCache(refresh_fn=refresh_fn)
             refresher = StateCacheRefresher(cache)
             try:
                 refresher.start()

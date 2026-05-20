@@ -18,6 +18,243 @@ import typer
 from pollypm.config import DEFAULT_CONFIG_PATH
 
 
+def _worker_start_impl(
+    project_key: str,
+    prompt: str | None,
+    role: str,
+    agent_profile: str | None,
+    config_path: Path,
+) -> None:
+    if role == "worker":
+        # Per-task workers replaced the managed-worker pattern — each
+        # task now provisions its own isolated `task-<project>-<n>`
+        # session via `pm task claim`, and the supervisor tears the
+        # session down on task done/cancel. A long-running managed
+        # `worker-<project>` session is pure overhead: it holds a
+        # ~500MB Claude process that outlives the task that needed it,
+        # and PollyPM has no cleanup hook for it (see the 2026-04-19
+        # OOM incident where 12 shipped projects each leaked a
+        # managed worker).
+        typer.echo(
+            "ERROR: `pm worker-start --role worker` is deprecated.\n\n"
+            "Why: per-task workers (provisioned automatically by "
+            "`pm task claim`) replaced the managed-worker pattern. "
+            "Managed workers leak memory because they outlive the "
+            "task that needed them and PollyPM has no cleanup hook.\n\n"
+            f"Fix: to get a worker for {project_key}, queue + claim "
+            f"a task:\n"
+            f"  pm task next -p {project_key}\n"
+            f"  pm task claim <task-id>\n\n"
+            f"If you need a long-running project-scoped session "
+            f"(e.g. the planner), use `--role architect` instead.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    from pollypm import cli as cli_mod
+
+    # ``pm worker-start`` deliberately does NOT require the caller to
+    # be inside the ``pollypm`` tmux session. The actual spawn uses
+    # ``tmux new-window -t <pollypm-storage-closet>:...`` (see
+    # ``Supervisor.tmux_session_for_launch``), which targets the
+    # storage-closet session by name rather than the current
+    # session — so a tmux gate would just push users into ``pm up``
+    # for no functional reason. This matters for #1055: alerts emit
+    # ``Try: pm worker-start --role architect <project>`` as a hint
+    # the user is meant to copy-paste from any shell when triaging
+    # ``no_session`` faults; gating that command behind tmux makes
+    # the alert hint dead-on-arrival. If you reintroduce a tmux
+    # check here, also fix the alert hint in
+    # ``plugins_builtin/task_assignment_notify/resolver.py`` so the
+    # two stay in sync.
+    supervisor = cli_mod._load_supervisor(config_path)
+    existing = next(
+        (
+            session
+            for session in supervisor.config.sessions.values()
+            if session.role == role and session.project == project_key and session.enabled
+        ),
+        None,
+    )
+    session = existing or cli_mod.create_worker_session(
+        config_path,
+        project_key=project_key,
+        prompt=prompt,
+        role=role,
+        agent_profile=agent_profile,
+    )
+    cli_mod.launch_worker_session(config_path, session.name)
+    refreshed = cli_mod._load_supervisor(config_path)
+    launch = next(
+        item for item in refreshed.plan_launches()
+        if item.session.name == session.name
+    )
+    typer.echo(
+        f"Managed {role} {session.name} ready for project {project_key} "
+        f"in {refreshed.tmux_session_for_launch(launch)}:{launch.window_name}"
+    )
+
+
+def _switch_provider_impl(
+    session_name: str,
+    provider: str,
+    account: str | None,
+    config_path: Path,
+) -> None:
+    """Switch a worker's provider (e.g., from Codex to Claude) with checkpoint preservation."""
+    from pollypm import cli as cli_mod
+    from pollypm.models import ProviderKind
+    from pollypm.onboarding import default_session_args
+
+    supervisor = cli_mod._load_supervisor(config_path)
+    config = supervisor.config
+
+    session = config.sessions.get(session_name)
+    if session is None:
+        typer.echo(f"Unknown session: {session_name}")
+        raise typer.Exit(code=1)
+
+    try:
+        new_provider = ProviderKind(provider)
+    except ValueError:
+        typer.echo(f"Invalid provider: {provider}. Use 'claude' or 'codex'.")
+        raise typer.Exit(code=1)
+
+    if account is None:
+        candidates = [
+            (name, acct)
+            for name, acct in config.accounts.items()
+            if acct.provider == new_provider
+        ]
+        if not candidates:
+            typer.echo(f"No {provider} accounts configured.")
+            raise typer.Exit(code=1)
+        account = candidates[0][0]
+
+    if account not in config.accounts:
+        typer.echo(f"Unknown account: {account}")
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"Switching {session_name} from {session.provider.value} "
+        f"to {new_provider.value} (account: {account})..."
+    )
+    typer.echo("  Saving checkpoint...")
+    typer.echo("  Stopping old session...")
+    try:
+        supervisor.release_lease(session_name)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        supervisor.stop_session(session_name)
+    except Exception:  # noqa: BLE001
+        pass
+
+    typer.echo(f"  Updating config to {new_provider.value}/{account}...")
+    new_args = default_session_args(
+        new_provider,
+        open_permissions=config.pollypm.open_permissions_by_default,
+    )
+    project = config.projects.get(session.project)
+    if project:
+        from pollypm.config import project_config_path
+
+        local_path = project_config_path(project.path)
+        if local_path.exists():
+            local_content = local_path.read_text()
+            import re
+
+            local_content = re.sub(
+                r'provider\s*=\s*"[^"]*"',
+                f'provider = "{new_provider.value}"',
+                local_content,
+            )
+            local_content = re.sub(
+                r'account\s*=\s*"[^"]*"',
+                f'account = "{account}"',
+                local_content,
+            )
+            args_str = ", ".join(f'"{arg}"' for arg in new_args)
+            local_content = re.sub(
+                r'args\s*=\s*\[.*?\]',
+                f'args = [{args_str}]',
+                local_content,
+            )
+            local_path.write_text(local_content)
+            typer.echo(f"  Updated project-local config with new args: {new_args}")
+    # #1830: route through supervisor facade for pg/sqlite parity.
+    supervisor.upsert_session_runtime(
+        session_name=session_name,
+        status="switching",
+        effective_account=account,
+        effective_provider=new_provider.value,
+    )
+
+    typer.echo("  Relaunching...")
+    try:
+        supervisor.restart_session(
+            session_name,
+            account,
+            failure_type="provider_switch",
+        )
+    except Exception as exc:
+        typer.echo(f"  Relaunch failed: {exc}")
+        raise typer.Exit(code=1)
+
+    typer.echo(
+        f"Switched {session_name} to {new_provider.value}/{account}. "
+        "Recovery prompt injected."
+    )
+
+
+def _worker_stop_impl(session_name: str, config_path: Path) -> None:
+    """Stop a worker and mark it disabled so the heartbeat won't recover it."""
+    from pollypm import cli as cli_mod
+    from pollypm.events.summaries import activity_summary
+
+    supervisor = cli_mod._load_supervisor(config_path)
+    session = supervisor.config.sessions.get(session_name)
+    if session is None:
+        typer.echo(f"Unknown session: {session_name}")
+        raise typer.Exit(code=1)
+    if session.role != "worker":
+        typer.echo(f"Can only stop workers, not {session.role} sessions.")
+        raise typer.Exit(code=1)
+
+    try:
+        supervisor.stop_session(session_name)
+        typer.echo(f"Stopped {session_name}")
+    except Exception:  # noqa: BLE001
+        typer.echo(f"Session {session_name} was not running")
+
+    # #1830: route through supervisor facade for pg/sqlite parity.
+    supervisor.upsert_session_runtime(
+        session_name=session_name,
+        status="disabled",
+    )
+    for alert_type in [
+        "missing_window",
+        "pane_dead",
+        "recovery_limit",
+        "suspected_loop",
+        "needs_followup",
+    ]:
+        supervisor.msg_store.clear_alert(session_name, alert_type)
+    supervisor.msg_store.append_event(
+        scope=session_name,
+        sender=session_name,
+        subject="decommissioned",
+        payload={
+            "message": activity_summary(
+                summary=f"Worker {session_name} stopped and disabled",
+                severity="recommendation",
+                verb="decommissioned",
+                subject=session_name,
+            ),
+        },
+    )
+    typer.echo(f"Marked {session_name} as disabled. Heartbeat will not recover it.")
+
+
 def register_worker_commands(app: typer.Typer) -> None:
     @app.command(
         "worker-start",
@@ -51,73 +288,7 @@ def register_worker_commands(app: typer.Typer) -> None:
         ),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        if role == "worker":
-            # Per-task workers replaced the managed-worker pattern — each
-            # task now provisions its own isolated `task-<project>-<n>`
-            # session via `pm task claim`, and the supervisor tears the
-            # session down on task done/cancel. A long-running managed
-            # `worker-<project>` session is pure overhead: it holds a
-            # ~500MB Claude process that outlives the task that needed it,
-            # and PollyPM has no cleanup hook for it (see the 2026-04-19
-            # OOM incident where 12 shipped projects each leaked a
-            # managed worker).
-            typer.echo(
-                "ERROR: `pm worker-start --role worker` is deprecated.\n\n"
-                "Why: per-task workers (provisioned automatically by "
-                "`pm task claim`) replaced the managed-worker pattern. "
-                "Managed workers leak memory because they outlive the "
-                "task that needed them and PollyPM has no cleanup hook.\n\n"
-                f"Fix: to get a worker for {project_key}, queue + claim "
-                f"a task:\n"
-                f"  pm task next -p {project_key}\n"
-                f"  pm task claim <task-id>\n\n"
-                f"If you need a long-running project-scoped session "
-                f"(e.g. the planner), use `--role architect` instead.",
-                err=True,
-            )
-            raise typer.Exit(code=2)
-        from pollypm import cli as cli_mod
-
-        # ``pm worker-start`` deliberately does NOT require the caller to
-        # be inside the ``pollypm`` tmux session. The actual spawn uses
-        # ``tmux new-window -t <pollypm-storage-closet>:...`` (see
-        # ``Supervisor.tmux_session_for_launch``), which targets the
-        # storage-closet session by name rather than the current
-        # session — so a tmux gate would just push users into ``pm up``
-        # for no functional reason. This matters for #1055: alerts emit
-        # ``Try: pm worker-start --role architect <project>`` as a hint
-        # the user is meant to copy-paste from any shell when triaging
-        # ``no_session`` faults; gating that command behind tmux makes
-        # the alert hint dead-on-arrival. If you reintroduce a tmux
-        # check here, also fix the alert hint in
-        # ``plugins_builtin/task_assignment_notify/resolver.py`` so the
-        # two stay in sync.
-        supervisor = cli_mod._load_supervisor(config_path)
-        existing = next(
-            (
-                session
-                for session in supervisor.config.sessions.values()
-                if session.role == role and session.project == project_key and session.enabled
-            ),
-            None,
-        )
-        session = existing or cli_mod.create_worker_session(
-            config_path,
-            project_key=project_key,
-            prompt=prompt,
-            role=role,
-            agent_profile=agent_profile,
-        )
-        cli_mod.launch_worker_session(config_path, session.name)
-        refreshed = cli_mod._load_supervisor(config_path)
-        launch = next(
-            item for item in refreshed.plan_launches()
-            if item.session.name == session.name
-        )
-        typer.echo(
-            f"Managed {role} {session.name} ready for project {project_key} "
-            f"in {refreshed.tmux_session_for_launch(launch)}:{launch.window_name}"
-        )
+        _worker_start_impl(project_key, prompt, role, agent_profile, config_path)
 
     @app.command("switch-provider")
     def switch_provider(
@@ -127,109 +298,7 @@ def register_worker_commands(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
         """Switch a worker's provider (e.g., from Codex to Claude) with checkpoint preservation."""
-        from pollypm import cli as cli_mod
-        from pollypm.models import ProviderKind
-        from pollypm.onboarding import default_session_args
-
-        supervisor = cli_mod._load_supervisor(config_path)
-        config = supervisor.config
-
-        session = config.sessions.get(session_name)
-        if session is None:
-            typer.echo(f"Unknown session: {session_name}")
-            raise typer.Exit(code=1)
-
-        try:
-            new_provider = ProviderKind(provider)
-        except ValueError:
-            typer.echo(f"Invalid provider: {provider}. Use 'claude' or 'codex'.")
-            raise typer.Exit(code=1)
-
-        if account is None:
-            candidates = [
-                (name, acct)
-                for name, acct in config.accounts.items()
-                if acct.provider == new_provider
-            ]
-            if not candidates:
-                typer.echo(f"No {provider} accounts configured.")
-                raise typer.Exit(code=1)
-            account = candidates[0][0]
-
-        if account not in config.accounts:
-            typer.echo(f"Unknown account: {account}")
-            raise typer.Exit(code=1)
-
-        typer.echo(
-            f"Switching {session_name} from {session.provider.value} "
-            f"to {new_provider.value} (account: {account})..."
-        )
-        typer.echo("  Saving checkpoint...")
-        typer.echo("  Stopping old session...")
-        try:
-            supervisor.release_lease(session_name)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            supervisor.stop_session(session_name)
-        except Exception:  # noqa: BLE001
-            pass
-
-        typer.echo(f"  Updating config to {new_provider.value}/{account}...")
-        new_args = default_session_args(
-            new_provider,
-            open_permissions=config.pollypm.open_permissions_by_default,
-        )
-        project = config.projects.get(session.project)
-        if project:
-            from pollypm.config import project_config_path
-
-            local_path = project_config_path(project.path)
-            if local_path.exists():
-                local_content = local_path.read_text()
-                import re
-
-                local_content = re.sub(
-                    r'provider\s*=\s*"[^"]*"',
-                    f'provider = "{new_provider.value}"',
-                    local_content,
-                )
-                local_content = re.sub(
-                    r'account\s*=\s*"[^"]*"',
-                    f'account = "{account}"',
-                    local_content,
-                )
-                args_str = ", ".join(f'"{arg}"' for arg in new_args)
-                local_content = re.sub(
-                    r'args\s*=\s*\[.*?\]',
-                    f'args = [{args_str}]',
-                    local_content,
-                )
-                local_path.write_text(local_content)
-                typer.echo(f"  Updated project-local config with new args: {new_args}")
-        # #1830: route through supervisor facade for pg/sqlite parity.
-        supervisor.upsert_session_runtime(
-            session_name=session_name,
-            status="switching",
-            effective_account=account,
-            effective_provider=new_provider.value,
-        )
-
-        typer.echo("  Relaunching...")
-        try:
-            supervisor.restart_session(
-                session_name,
-                account,
-                failure_type="provider_switch",
-            )
-        except Exception as exc:
-            typer.echo(f"  Relaunch failed: {exc}")
-            raise typer.Exit(code=1)
-
-        typer.echo(
-            f"Switched {session_name} to {new_provider.value}/{account}. "
-            "Recovery prompt injected."
-        )
+        _switch_provider_impl(session_name, provider, account, config_path)
 
     @app.command("worker-stop")
     def worker_stop(
@@ -237,48 +306,4 @@ def register_worker_commands(app: typer.Typer) -> None:
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
         """Stop a worker and mark it disabled so the heartbeat won't recover it."""
-        from pollypm import cli as cli_mod
-        from pollypm.events.summaries import activity_summary
-
-        supervisor = cli_mod._load_supervisor(config_path)
-        session = supervisor.config.sessions.get(session_name)
-        if session is None:
-            typer.echo(f"Unknown session: {session_name}")
-            raise typer.Exit(code=1)
-        if session.role != "worker":
-            typer.echo(f"Can only stop workers, not {session.role} sessions.")
-            raise typer.Exit(code=1)
-
-        try:
-            supervisor.stop_session(session_name)
-            typer.echo(f"Stopped {session_name}")
-        except Exception:  # noqa: BLE001
-            typer.echo(f"Session {session_name} was not running")
-
-        # #1830: route through supervisor facade for pg/sqlite parity.
-        supervisor.upsert_session_runtime(
-            session_name=session_name,
-            status="disabled",
-        )
-        for alert_type in [
-            "missing_window",
-            "pane_dead",
-            "recovery_limit",
-            "suspected_loop",
-            "needs_followup",
-        ]:
-            supervisor.msg_store.clear_alert(session_name, alert_type)
-        supervisor.msg_store.append_event(
-            scope=session_name,
-            sender=session_name,
-            subject="decommissioned",
-            payload={
-                "message": activity_summary(
-                    summary=f"Worker {session_name} stopped and disabled",
-                    severity="recommendation",
-                    verb="decommissioned",
-                    subject=session_name,
-                ),
-            },
-        )
-        typer.echo(f"Marked {session_name} as disabled. Heartbeat will not recover it.")
+        _worker_stop_impl(session_name, config_path)

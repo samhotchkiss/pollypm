@@ -374,58 +374,42 @@ def _settings_session_refs_by_account(config) -> dict[str, list[dict[str, object
     return refs
 
 
-def _gather_settings_data(
+def _gather_account_statuses(
     config_path: Path,
     *,
-    service: "PollyPMService | None" = None,
-    account_statuses: list | None = None,
-) -> SettingsData:
-    """Build a :class:`SettingsData` snapshot in a single pass.
-
-    All fields are loaded once so the cockpit settings pane can render
-    instantly without firing per-tick subprocesses (the source of the
-    legacy lag). ``service`` and ``account_statuses`` are injection
-    hooks for tests.
-    """
-    errors: list[str] = []
+    service: "PollyPMService | None",
+    account_statuses: list | None,
+    errors: list[str],
+) -> list:
+    """Return raw account-status records, deferring to the service when not provided."""
+    if account_statuses is not None:
+        return list(account_statuses)
+    if service is None:
+        from pollypm.service_api import PollyPMService
+        service = PollyPMService(config_path)
     try:
-        config = load_config(config_path)
+        list_cached = getattr(service, "list_cached_account_statuses", None)
+        if callable(list_cached):
+            return list(list_cached())
+        return list(service.list_account_statuses())
     except Exception as exc:  # noqa: BLE001
-        errors.append(f"Config load failed: {exc}")
-        config = None
+        errors.append(f"Accounts unavailable: {exc}")
+        return []
 
+
+def _build_account_rows(
+    *,
+    config_path: Path,
+    config,
+    account_statuses: list,
+    history: list,
+    session_refs_by_account: dict,
+    cached_usages: dict,
+    ctrl: str,
+    fo_list: list,
+) -> list[dict]:
+    """Transform account-status records into cockpit-settings dict rows."""
     accounts: list[dict] = []
-    if account_statuses is None:
-        if service is None:
-            from pollypm.service_api import PollyPMService
-            service = PollyPMService(config_path)
-        try:
-            list_cached = getattr(service, "list_cached_account_statuses", None)
-            if callable(list_cached):
-                account_statuses = list(list_cached())
-            else:
-                account_statuses = list(service.list_account_statuses())
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"Accounts unavailable: {exc}")
-            account_statuses = []
-    pp = getattr(config, "pollypm", None) if config is not None else None
-    ctrl = getattr(pp, "controller_account", "") if pp is not None else ""
-    fo_list = (
-        list(getattr(pp, "failover_accounts", []) or [])
-        if pp is not None else []
-    )
-    session_refs_by_account = (
-        _settings_session_refs_by_account(config)
-        if config is not None else {}
-    )
-    try:
-        cached_usages = load_cached_account_usage(config_path) if config is not None else {}
-    except Exception:  # noqa: BLE001
-        cached_usages = {}
-    try:
-        history = load_settings_history()
-    except Exception:  # noqa: BLE001
-        history = []
     for idx, status in enumerate(account_statuses):
         provider = getattr(status, "provider", None)
         provider_name = (
@@ -478,64 +462,58 @@ def _gather_settings_data(
                 "index": idx,
             }
         )
+    return accounts
 
-    projects: list[dict] = []
-    if config is not None:
-        projects = collect_settings_projects(
-            config,
-            format_relative_age=_format_relative_age,
+
+def _build_settings_project_rows(config, history: list) -> list[dict]:
+    """Return cockpit-settings project rows with rationale overlay."""
+    if config is None:
+        return []
+    projects = collect_settings_projects(
+        config,
+        format_relative_age=_format_relative_age,
+    )
+    for project in projects:
+        project.setdefault(
+            "rationale",
+            "Tracked projects stay visible in the cockpit and feed task counts.",
         )
-        for project in projects:
-            project.setdefault(
-                "rationale",
-                "Tracked projects stay visible in the cockpit and feed task counts.",
-            )
-            history_rationale = history_rationale_for_project(
-                project["key"],
-                entries=history,
-            )
-            if history_rationale:
-                project["rationale"] = history_rationale
-
-    if config is not None and accounts:
-        recent_by_account = _collect_recent_tasks_by_account(
-            config,
-            account_statuses or [],
+        history_rationale = history_rationale_for_project(
+            project["key"],
+            entries=history,
         )
-        for account in accounts:
-            account["recent_tasks"] = recent_by_account.get(account["key"], [])
-    else:
-        for account in accounts:
-            account["recent_tasks"] = []
+        if history_rationale:
+            project["rationale"] = history_rationale
+    return projects
 
-    roles: list[dict] = []
-    if config is not None:
-        try:
-            registry = load_registry()
-            roles = _build_settings_role_rows(config, registry)
-        except Exception as exc:  # noqa: BLE001
-            errors.append(f"Role registry unavailable: {exc}")
 
-    heartbeat: list[tuple[str, str]] = []
-    if pp is not None:
-        failover_accounts = getattr(pp, "failover_accounts", []) or []
-        heartbeat = [
-            ("Controller account", getattr(pp, "controller_account", "") or "-"),
-            ("Failover enabled", "yes" if getattr(pp, "failover_enabled", False) else "no"),
-            (
-                "Failover order",
-                ", ".join(failover_accounts) if failover_accounts else "none",
-            ),
-            ("Lease timeout", f"{getattr(pp, 'lease_timeout_minutes', 30)} min"),
-            ("Heartbeat backend", getattr(pp, "heartbeat_backend", "") or "-"),
-            ("Scheduler backend", getattr(pp, "scheduler_backend", "") or "-"),
-            (
-                "Open permissions",
-                "on" if getattr(pp, "open_permissions_by_default", False) else "off",
-            ),
-            ("Timezone", getattr(pp, "timezone", "") or "(auto-detect)"),
-        ]
+def _build_heartbeat_rows(pp) -> list[tuple[str, str]]:
+    """Return the heartbeat / scheduler tuple list for the settings pane."""
+    if pp is None:
+        return []
+    failover_accounts = getattr(pp, "failover_accounts", []) or []
+    return [
+        ("Controller account", getattr(pp, "controller_account", "") or "-"),
+        ("Failover enabled", "yes" if getattr(pp, "failover_enabled", False) else "no"),
+        (
+            "Failover order",
+            ", ".join(failover_accounts) if failover_accounts else "none",
+        ),
+        ("Lease timeout", f"{getattr(pp, 'lease_timeout_minutes', 30)} min"),
+        ("Heartbeat backend", getattr(pp, "heartbeat_backend", "") or "-"),
+        ("Scheduler backend", getattr(pp, "scheduler_backend", "") or "-"),
+        (
+            "Open permissions",
+            "on" if getattr(pp, "open_permissions_by_default", False) else "off",
+        ),
+        ("Timezone", getattr(pp, "timezone", "") or "(auto-detect)"),
+    ]
 
+
+def _build_plugin_rows(
+    config_path: Path, config, errors: list[str],
+) -> list[dict]:
+    """Return the plugin status rows (loaded, disabled, load-failed)."""
     plugins: list[dict] = []
     try:
         from pollypm.plugin_host import ExtensionHost
@@ -597,19 +575,27 @@ def _gather_settings_data(
             )
     except Exception as exc:  # noqa: BLE001
         errors.append(f"Plugin host unavailable: {exc}")
+    return plugins
 
-    planner: list[tuple[str, str]] = []
+
+def _build_planner_rows(config) -> list[tuple[str, str]]:
     pl = getattr(config, "planner", None) if config is not None else None
-    if pl is not None:
-        planner = [
-            (
-                "Auto-fire on project created",
-                "yes" if getattr(pl, "auto_on_project_created", False) else "no",
-            ),
-            ("Enforce plan gate", "yes" if getattr(pl, "enforce_plan", False) else "no"),
-            ("Plan directory", getattr(pl, "plan_dir", "") or "docs/plan"),
-        ]
+    if pl is None:
+        return []
+    return [
+        (
+            "Auto-fire on project created",
+            "yes" if getattr(pl, "auto_on_project_created", False) else "no",
+        ),
+        ("Enforce plan gate", "yes" if getattr(pl, "enforce_plan", False) else "no"),
+        ("Plan directory", getattr(pl, "plan_dir", "") or "docs/plan"),
+    ]
 
+
+def _build_inbox_about_sections(
+    config, config_path: Path,
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Return (inbox_section, about_section) tuples for the settings pane."""
     inbox_section: list[tuple[str, str]] = []
     project_settings = (
         getattr(config, "project", None) if config is not None else None
@@ -640,6 +626,91 @@ def _gather_settings_data(
             about_section.append(("State DB", str(sdb)))
     about_section.append(
         (f"Disk usage ({config_path.parent.name}/)", "loading…")
+    )
+    return inbox_section, about_section
+
+
+def _gather_settings_data(
+    config_path: Path,
+    *,
+    service: "PollyPMService | None" = None,
+    account_statuses: list | None = None,
+) -> SettingsData:
+    """Build a :class:`SettingsData` snapshot in a single pass.
+
+    All fields are loaded once so the cockpit settings pane can render
+    instantly without firing per-tick subprocesses (the source of the
+    legacy lag). ``service`` and ``account_statuses`` are injection
+    hooks for tests.
+    """
+    errors: list[str] = []
+    try:
+        config = load_config(config_path)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"Config load failed: {exc}")
+        config = None
+
+    account_statuses = _gather_account_statuses(
+        config_path,
+        service=service,
+        account_statuses=account_statuses,
+        errors=errors,
+    )
+    pp = getattr(config, "pollypm", None) if config is not None else None
+    ctrl = getattr(pp, "controller_account", "") if pp is not None else ""
+    fo_list = (
+        list(getattr(pp, "failover_accounts", []) or [])
+        if pp is not None else []
+    )
+    session_refs_by_account = (
+        _settings_session_refs_by_account(config)
+        if config is not None else {}
+    )
+    try:
+        cached_usages = load_cached_account_usage(config_path) if config is not None else {}
+    except Exception:  # noqa: BLE001
+        cached_usages = {}
+    try:
+        history = load_settings_history()
+    except Exception:  # noqa: BLE001
+        history = []
+    accounts = _build_account_rows(
+        config_path=config_path,
+        config=config,
+        account_statuses=account_statuses,
+        history=history,
+        session_refs_by_account=session_refs_by_account,
+        cached_usages=cached_usages,
+        ctrl=ctrl,
+        fo_list=fo_list,
+    )
+
+    projects = _build_settings_project_rows(config, history)
+
+    if config is not None and accounts:
+        recent_by_account = _collect_recent_tasks_by_account(
+            config,
+            account_statuses or [],
+        )
+        for account in accounts:
+            account["recent_tasks"] = recent_by_account.get(account["key"], [])
+    else:
+        for account in accounts:
+            account["recent_tasks"] = []
+
+    roles: list[dict] = []
+    if config is not None:
+        try:
+            registry = load_registry()
+            roles = _build_settings_role_rows(config, registry)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"Role registry unavailable: {exc}")
+
+    heartbeat = _build_heartbeat_rows(pp)
+    plugins = _build_plugin_rows(config_path, config, errors)
+    planner = _build_planner_rows(config)
+    inbox_section, about_section = _build_inbox_about_sections(
+        config, config_path,
     )
 
     return SettingsData(

@@ -3026,22 +3026,9 @@ def _gather_state_db_probes(
     return probes
 
 
-def _scan_one_project(
-    *,
-    project_key: str,
-    project_path: Path | None,
-    msg_store: Any,
-    state_store: Any,
-    now: datetime,
-    config: WatchdogConfig,
-    storage_closet_name: str | None = None,
-    legacy_db_shadows: list[_LegacyDbShadow] | None = None,
-    plan_missing_clears: list[_PlanMissingClear] | None = None,
-    state_db_probes: list[_StateDbProbe] | None = None,
-    config_path: Path | None = None,
-) -> dict[str, int]:
-    """Scan one project and route every finding. Returns counters."""
-    counters: dict[str, int] = {
+def _scan_one_project_counters() -> dict[str, int]:
+    """Fresh per-scan counters dict with every key pre-zeroed."""
+    return {
         "findings": 0,
         "alerts_raised": 0,
         "alert_failures": 0,
@@ -3074,6 +3061,206 @@ def _scan_one_project(
         "tier4_demoted_cleared": 0,
         "tier4_budget_exhausted": 0,
     }
+
+
+def _route_one_finding(
+    finding: Any,
+    *,
+    project_key: str,
+    project_path: Path | None,
+    msg_store: Any,
+    state_store: Any,
+    storage_closet_name: str | None,
+    config_path: Path | None,
+    now: datetime,
+    counters: dict[str, int],
+) -> None:
+    """Apply alert routing + tier-1/3/4 dispatch for a single finding."""
+    counters["findings"] += 1
+    emit_finding(finding)
+    if _route_to_alert_sink(
+        finding, msg_store=msg_store, state_store=state_store,
+    ):
+        counters["alerts_raised"] += 1
+    else:
+        counters["alert_failures"] += 1
+        # Last-resort surface so a finding with no alert sink
+        # still lands somewhere visible to operators.
+        logger.warning(
+            "audit.watchdog finding [%s] %s/%s: %s | %s",
+            finding.rule, finding.project, finding.subject,
+            finding.message, finding.recommendation,
+        )
+
+    # #1546 — tier-1 healer registry replaces the pre-#1546 if/elif
+    # branches. Each healer returns ``dict[str, int]`` of counter
+    # increments and the dispatcher folds them into the totals
+    # generically. Behaviour for existing self-heal rules is
+    # byte-identical (the registry adapters wrap the original
+    # helpers — see ``_self_heal_*_counter`` shims above).
+    healer = _TIER1_HEALERS.get(finding.rule)
+    if healer is not None:
+        try:
+            heal_counters = healer(
+                finding,
+                project_key=project_key,
+                project_path=project_path,
+                config_path=config_path,
+            ) or {}
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "audit.watchdog: tier-1 healer raised for %s",
+                finding.rule, exc_info=True,
+            )
+            heal_counters = {}
+        for key, value in heal_counters.items():
+            counters[key] = counters.get(key, 0) + int(value)
+        # Tier-1 finishes the rule — no architect / operator dispatch.
+        return
+
+    # #1524 — plan_missing_alert_churn is detection-only. The repair
+    # is Part A (the deterministic precompute in the task-assignment
+    # sweep). The finding + alert + audit-log row are the canary so
+    # future-us notices when the regression returns; no architect
+    # dispatch and no self-heal action.
+    if finding.rule == RULE_PLAN_MISSING_ALERT_CHURN:
+        counters["plan_missing_churn_detected"] += 1
+        return
+
+    # #1546 — tier-3 operator dispatchable rules route to the
+    # operator inbox via ``_maybe_dispatch_to_operator``. The
+    # dispatcher returns "skipped" for non-operator rules so the
+    # architect leg below still runs for tier-2.
+    # #1553 — auto-promote: if the same root_cause_hash has hit
+    # tier-3 K times in 24h, route to tier-4 instead. The tracker
+    # is best-effort — failures fall back to tier-3 unchanged.
+    if finding.rule in _OPERATOR_DISPATCHABLE_RULES:
+        _dispatch_operator_or_tier4(
+            finding,
+            project_path=project_path,
+            now=now,
+            config_path=config_path,
+            counters=counters,
+        )
+        return
+
+    # #1414 — eligible findings get an architect dispatch on top
+    # of the alert. Throttle window is owned by the audit log so
+    # repeat dispatches are deduped across cadence-process restarts.
+    # #1424 — for ``task_on_hold_stale`` we enrich the finding with
+    # the reviewer's recent execution rows + inbox messages so the
+    # architect's brief carries the rejection rationale, not just
+    # the bare on_hold timestamp.
+    dispatch_finding = _enrich_finding_metadata(
+        finding,
+        project_key=project_key,
+        project_path=project_path,
+        msg_store=msg_store,
+    )
+    outcome = _maybe_dispatch_to_architect(
+        dispatch_finding,
+        project_path=project_path,
+        storage_closet_name=storage_closet_name,
+        now=now,
+    )
+    if outcome == "dispatched":
+        counters["dispatches_sent"] += 1
+    elif outcome == "throttled":
+        counters["dispatches_throttled"] += 1
+    elif outcome == "send_failed":
+        counters["dispatches_failed"] += 1
+
+
+def _dispatch_operator_or_tier4(
+    finding: Any,
+    *,
+    project_path: Path | None,
+    now: datetime,
+    config_path: Path | None,
+    counters: dict[str, int],
+) -> None:
+    """Route a tier-3-eligible finding, auto-promoting to tier-4 when warranted."""
+    tracker = _build_tier4_tracker()
+    promoted = False
+    if tracker is not None:
+        try:
+            if tracker.should_auto_promote(finding, now=now):
+                # #1914 fix — thread ``config_path`` so
+                # alternate-config heartbeat runs route the
+                # tier-4 inbox write to the same backend the
+                # tier-3 fix already covers. Pre-fix tier-4
+                # always resolved ``DEFAULT_CONFIG_PATH``.
+                outcome = _dispatch_to_operator_tier4(
+                    finding,
+                    project_path=project_path,
+                    now=now,
+                    promotion_path="watchdog",
+                    tracker=tracker,
+                    config_path=config_path,
+                )
+                if outcome == "dispatched":
+                    counters["tier4_dispatches_sent"] += 1
+                    promoted = True
+                elif outcome == "throttled":
+                    counters["tier4_dispatches_throttled"] += 1
+                    # Throttled means a tier-4 run is already
+                    # active for this hash — skip the tier-3
+                    # path so we don't double-dispatch.
+                    promoted = True
+                elif outcome == "send_failed":
+                    counters["tier4_dispatches_failed"] += 1
+                    # Fall through to tier-3 so we don't drop
+                    # the dispatch entirely.
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "tier4: auto-promote check raised for %s/%s",
+                finding.rule, finding.project, exc_info=True,
+            )
+
+    if not promoted:
+        # #1546 fix — thread ``config_path`` so alternate-config
+        # heartbeat runs route the inbox task to the right
+        # workspace DB (preserved across the #1553 tier-4 leg).
+        op_outcome = _maybe_dispatch_to_operator(
+            finding,
+            project_path=project_path,
+            now=now,
+            config_path=config_path,
+        )
+        if op_outcome == "dispatched":
+            counters["operator_dispatches_sent"] += 1
+            # #1553 — record the dispatch in the tracker so the
+            # next time this hash appears we count it toward K.
+            if tracker is not None:
+                try:
+                    tracker.record_tier3_dispatch(finding, now=now)
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "tier4: record_tier3_dispatch raised",
+                        exc_info=True,
+                    )
+        elif op_outcome == "throttled":
+            counters["operator_dispatches_throttled"] += 1
+        elif op_outcome == "send_failed":
+            counters["operator_dispatches_failed"] += 1
+
+
+def _scan_one_project(
+    *,
+    project_key: str,
+    project_path: Path | None,
+    msg_store: Any,
+    state_store: Any,
+    now: datetime,
+    config: WatchdogConfig,
+    storage_closet_name: str | None = None,
+    legacy_db_shadows: list[_LegacyDbShadow] | None = None,
+    plan_missing_clears: list[_PlanMissingClear] | None = None,
+    state_db_probes: list[_StateDbProbe] | None = None,
+    config_path: Path | None = None,
+) -> dict[str, int]:
+    """Scan one project and route every finding. Returns counters."""
+    counters = _scan_one_project_counters()
     open_tasks = _gather_open_tasks(project_key, project_path)
     storage_window_names = _gather_storage_windows(storage_closet_name)
     done_plan_tasks = _gather_done_plan_tasks(project_key, project_path)
@@ -3158,157 +3345,18 @@ def _scan_one_project(
     counters["_seen_root_cause_hashes"] = seen_hashes  # type: ignore[assignment]
 
     for finding in findings:
-        counters["findings"] += 1
-        emit_finding(finding)
-        if _route_to_alert_sink(
-            finding, msg_store=msg_store, state_store=state_store,
-        ):
-            counters["alerts_raised"] += 1
-        else:
-            counters["alert_failures"] += 1
-            # Last-resort surface so a finding with no alert sink
-            # still lands somewhere visible to operators.
-            logger.warning(
-                "audit.watchdog finding [%s] %s/%s: %s | %s",
-                finding.rule, finding.project, finding.subject,
-                finding.message, finding.recommendation,
-            )
-
-        # #1546 — tier-1 healer registry replaces the pre-#1546 if/elif
-        # branches. Each healer returns ``dict[str, int]`` of counter
-        # increments and the dispatcher folds them into the totals
-        # generically. Behaviour for existing self-heal rules is
-        # byte-identical (the registry adapters wrap the original
-        # helpers — see ``_self_heal_*_counter`` shims above).
-        healer = _TIER1_HEALERS.get(finding.rule)
-        if healer is not None:
-            try:
-                heal_counters = healer(
-                    finding,
-                    project_key=project_key,
-                    project_path=project_path,
-                    config_path=config_path,
-                ) or {}
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "audit.watchdog: tier-1 healer raised for %s",
-                    finding.rule, exc_info=True,
-                )
-                heal_counters = {}
-            for key, value in heal_counters.items():
-                counters[key] = counters.get(key, 0) + int(value)
-            # Tier-1 finishes the rule — no architect / operator dispatch.
-            continue
-
-        # #1524 — plan_missing_alert_churn is detection-only. The repair
-        # is Part A (the deterministic precompute in the task-assignment
-        # sweep). The finding + alert + audit-log row are the canary so
-        # future-us notices when the regression returns; no architect
-        # dispatch and no self-heal action.
-        if finding.rule == RULE_PLAN_MISSING_ALERT_CHURN:
-            counters["plan_missing_churn_detected"] += 1
-            continue
-
-        # #1546 — tier-3 operator dispatchable rules route to the
-        # operator inbox via ``_maybe_dispatch_to_operator``. The
-        # dispatcher returns "skipped" for non-operator rules so the
-        # architect leg below still runs for tier-2.
-        # #1553 — auto-promote: if the same root_cause_hash has hit
-        # tier-3 K times in 24h, route to tier-4 instead. The tracker
-        # is best-effort — failures fall back to tier-3 unchanged.
-        if finding.rule in _OPERATOR_DISPATCHABLE_RULES:
-            tracker = _build_tier4_tracker()
-            promoted = False
-            if tracker is not None:
-                try:
-                    if tracker.should_auto_promote(finding, now=now):
-                        # #1914 fix — thread ``config_path`` so
-                        # alternate-config heartbeat runs route the
-                        # tier-4 inbox write to the same backend the
-                        # tier-3 fix already covers. Pre-fix tier-4
-                        # always resolved ``DEFAULT_CONFIG_PATH``.
-                        outcome = _dispatch_to_operator_tier4(
-                            finding,
-                            project_path=project_path,
-                            now=now,
-                            promotion_path="watchdog",
-                            tracker=tracker,
-                            config_path=config_path,
-                        )
-                        if outcome == "dispatched":
-                            counters["tier4_dispatches_sent"] += 1
-                            promoted = True
-                        elif outcome == "throttled":
-                            counters["tier4_dispatches_throttled"] += 1
-                            # Throttled means a tier-4 run is already
-                            # active for this hash — skip the tier-3
-                            # path so we don't double-dispatch.
-                            promoted = True
-                        elif outcome == "send_failed":
-                            counters["tier4_dispatches_failed"] += 1
-                            # Fall through to tier-3 so we don't drop
-                            # the dispatch entirely.
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "tier4: auto-promote check raised for %s/%s",
-                        finding.rule, finding.project, exc_info=True,
-                    )
-
-            if not promoted:
-                # #1546 fix — thread ``config_path`` so alternate-config
-                # heartbeat runs route the inbox task to the right
-                # workspace DB (preserved across the #1553 tier-4 leg).
-                op_outcome = _maybe_dispatch_to_operator(
-                    finding,
-                    project_path=project_path,
-                    now=now,
-                    config_path=config_path,
-                )
-                if op_outcome == "dispatched":
-                    counters["operator_dispatches_sent"] += 1
-                    # #1553 — record the dispatch in the tracker so the
-                    # next time this hash appears we count it toward K.
-                    if tracker is not None:
-                        try:
-                            tracker.record_tier3_dispatch(finding, now=now)
-                        except Exception:  # noqa: BLE001
-                            logger.debug(
-                                "tier4: record_tier3_dispatch raised",
-                                exc_info=True,
-                            )
-                elif op_outcome == "throttled":
-                    counters["operator_dispatches_throttled"] += 1
-                elif op_outcome == "send_failed":
-                    counters["operator_dispatches_failed"] += 1
-            continue
-
-        # #1414 — eligible findings get an architect dispatch on top
-        # of the alert. Throttle window is owned by the audit log so
-        # repeat dispatches are deduped across cadence-process restarts.
-        # #1424 — for ``task_on_hold_stale`` we enrich the finding with
-        # the reviewer's recent execution rows + inbox messages so the
-        # architect's brief carries the rejection rationale, not just
-        # the bare on_hold timestamp.
-        dispatch_finding = _enrich_finding_metadata(
+        _route_one_finding(
             finding,
             project_key=project_key,
             project_path=project_path,
             msg_store=msg_store,
-        )
-        outcome = _maybe_dispatch_to_architect(
-            dispatch_finding,
-            project_path=project_path,
+            state_store=state_store,
             storage_closet_name=storage_closet_name,
+            config_path=config_path,
             now=now,
+            counters=counters,
         )
-        if outcome == "dispatched":
-            counters["dispatches_sent"] += 1
-        elif outcome == "throttled":
-            counters["dispatches_throttled"] += 1
-        elif outcome == "send_failed":
-            counters["dispatches_failed"] += 1
     return counters
-
 
 def audit_watchdog_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Cadence handler entry point.

@@ -1436,6 +1436,123 @@ def _apply_state_purge(
         )
 
 
+def _remove_purge_sessions_step(path: Path, project_key: str) -> None:
+    """Kill + drop project-scoped sessions for ``pm project remove --purge-sessions``."""
+    purged = _purge_project_sessions(path, project_key)
+    for name, live, killed in purged:
+        if live and killed:
+            typer.echo(f"Killed tmux session {name} and dropped config entry.")
+        elif live and not killed:
+            typer.echo(
+                f"Dropped [sessions.{name}] from config; tmux kill "
+                "failed (session may still be running — run "
+                "`tmux kill-session -t " + name + "` manually)."
+            )
+        else:
+            typer.echo(
+                f"Dropped [sessions.{name}] from config "
+                "(tmux session was not running)."
+            )
+
+
+def _remove_purge_worktrees_step(
+    path: Path,
+    project_key: str,
+    *,
+    force: bool,
+    yes: bool,
+    force_discard_worktree_changes: bool,
+) -> None:
+    """Worktree directory teardown branch for ``pm project remove --purge-worktrees``.
+
+    Mirrors the inline behaviour: confirmation gate, dirty-worktree
+    abort that surfaces a hard error before ``remove_project`` runs.
+    """
+    wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+    if not wt_preview:
+        return
+    dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
+    if not (force or yes):
+        # Destructive — explicit confirm, default No. Same gate
+        # shape as --purge-state.
+        typer.echo(
+            f"--purge-worktrees will remove {len(wt_preview)} "
+            f"worktree director{'y' if len(wt_preview) == 1 else 'ies'} "
+            f"under .pollypm/worktrees/ for '{project_key}'."
+        )
+        if dirty_count > 0 and not force_discard_worktree_changes:
+            typer.echo(
+                f"  ({dirty_count} have uncommitted changes and "
+                "will be skipped without "
+                "--force-discard-worktree-changes)"
+            )
+        proceed = typer.confirm(
+            f"Permanently remove worktree directories for '{project_key}'?",
+            default=False,
+        )
+        if not proceed:
+            typer.echo("Aborted. No changes made.")
+            raise typer.Exit(code=1)
+    wt_purge_failed = False
+    try:
+        wt_results = _purge_project_worktrees(
+            path, project_key,
+            force_discard_changes=force_discard_worktree_changes,
+        )
+    except _PurgeWorktreesError as exc:
+        # Dirty worktrees were skipped. Surface the same
+        # per-entry summary as the happy path, then abort BEFORE
+        # ``remove_project`` so the project entry survives in
+        # pollypm.toml and the operator can retry (issue #1692).
+        wt_results = exc.results
+        wt_purge_failed = True
+
+    removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
+    skipped_dirty = [
+        p for p, _g, _d, ok, reason in wt_results
+        if not ok and reason == "dirty"
+    ]
+    skipped_locked = [
+        p for p, _g, _d, ok, reason in wt_results
+        if not ok and reason == "locked"
+    ]
+    failed = [
+        (p, reason) for p, _g, _d, ok, reason in wt_results
+        if not ok and reason not in ("dirty", "locked")
+    ]
+    typer.echo(
+        f"Removed {removed_count} worktree director"
+        f"{'y' if removed_count == 1 else 'ies'} for '{project_key}'."
+    )
+    for p in skipped_dirty:
+        typer.echo(
+            f"  Skipped (uncommitted changes): {p} — re-run with "
+            "--force-discard-worktree-changes to discard."
+        )
+    for p in skipped_locked:
+        typer.echo(
+            f"  Skipped (locked worktree): {p} — re-run with "
+            "--force-discard-worktree-changes to unlock and remove."
+        )
+    for p, reason in failed:
+        typer.echo(f"  Failed to remove {p} ({reason}).")
+
+    if wt_purge_failed:
+        typer.echo(
+            f"Error: --purge-worktrees left {len(skipped_dirty)} "
+            f"dirty worktree(s) in place for '{project_key}'.",
+            err=True,
+        )
+        typer.echo(
+            "Aborted. Project entry left in pollypm.toml so you "
+            "can retry once the worktrees are clean (or re-run "
+            "with --force-discard-worktree-changes to discard "
+            "the changes).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+
+
 @project_app.command("remove")
 def remove_cmd(
     project_key: str = typer.Argument(
@@ -1597,23 +1714,8 @@ def remove_cmd(
     # Kill + drop project-scoped sessions BEFORE calling
     # ``remove_project`` so its session-reference invariant doesn't
     # refuse the removal. Best-effort — see ``_purge_project_sessions``.
-    purged: list[tuple[str, bool, bool]] = []
     if purge_sessions and session_names:
-        purged = _purge_project_sessions(path, project_key)
-        for name, live, killed in purged:
-            if live and killed:
-                typer.echo(f"Killed tmux session {name} and dropped config entry.")
-            elif live and not killed:
-                typer.echo(
-                    f"Dropped [sessions.{name}] from config; tmux kill "
-                    "failed (session may still be running — run "
-                    "`tmux kill-session -t " + name + "` manually)."
-                )
-            else:
-                typer.echo(
-                    f"Dropped [sessions.{name}] from config "
-                    "(tmux session was not running)."
-                )
+        _remove_purge_sessions_step(path, project_key)
 
     # state.db row teardown. Runs BEFORE ``remove_project`` so the
     # post-removal config doesn't drift relative to the rows: if
@@ -1637,88 +1739,13 @@ def remove_cmd(
     # the operator can re-run with --purge-worktrees once they've
     # resolved the underlying issue.
     if purge_worktrees:
-        wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
-        if wt_preview:
-            dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
-            if not (force or yes):
-                # Destructive — explicit confirm, default No. Same gate
-                # shape as --purge-state.
-                typer.echo(
-                    f"--purge-worktrees will remove {len(wt_preview)} "
-                    f"worktree director{'y' if len(wt_preview) == 1 else 'ies'} "
-                    f"under .pollypm/worktrees/ for '{project_key}'."
-                )
-                if dirty_count > 0 and not force_discard_worktree_changes:
-                    typer.echo(
-                        f"  ({dirty_count} have uncommitted changes and "
-                        "will be skipped without "
-                        "--force-discard-worktree-changes)"
-                    )
-                proceed = typer.confirm(
-                    f"Permanently remove worktree directories for '{project_key}'?",
-                    default=False,
-                )
-                if not proceed:
-                    typer.echo("Aborted. No changes made.")
-                    raise typer.Exit(code=1)
-            wt_purge_failed = False
-            try:
-                wt_results = _purge_project_worktrees(
-                    path, project_key,
-                    force_discard_changes=force_discard_worktree_changes,
-                )
-            except _PurgeWorktreesError as exc:
-                # Dirty worktrees were skipped. Surface the same
-                # per-entry summary as the happy path, then abort BEFORE
-                # ``remove_project`` so the project entry survives in
-                # pollypm.toml and the operator can retry (issue #1692).
-                wt_results = exc.results
-                wt_purge_failed = True
-
-            removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
-            skipped_dirty = [
-                p for p, _g, _d, ok, reason in wt_results
-                if not ok and reason == "dirty"
-            ]
-            skipped_locked = [
-                p for p, _g, _d, ok, reason in wt_results
-                if not ok and reason == "locked"
-            ]
-            failed = [
-                (p, reason) for p, _g, _d, ok, reason in wt_results
-                if not ok and reason not in ("dirty", "locked")
-            ]
-            typer.echo(
-                f"Removed {removed_count} worktree director"
-                f"{'y' if removed_count == 1 else 'ies'} for '{project_key}'."
-            )
-            for p in skipped_dirty:
-                typer.echo(
-                    f"  Skipped (uncommitted changes): {p} — re-run with "
-                    "--force-discard-worktree-changes to discard."
-                )
-            for p in skipped_locked:
-                typer.echo(
-                    f"  Skipped (locked worktree): {p} — re-run with "
-                    "--force-discard-worktree-changes to unlock and remove."
-                )
-            for p, reason in failed:
-                typer.echo(f"  Failed to remove {p} ({reason}).")
-
-            if wt_purge_failed:
-                typer.echo(
-                    f"Error: --purge-worktrees left {len(skipped_dirty)} "
-                    f"dirty worktree(s) in place for '{project_key}'.",
-                    err=True,
-                )
-                typer.echo(
-                    "Aborted. Project entry left in pollypm.toml so you "
-                    "can retry once the worktrees are clean (or re-run "
-                    "with --force-discard-worktree-changes to discard "
-                    "the changes).",
-                    err=True,
-                )
-                raise typer.Exit(code=1)
+        _remove_purge_worktrees_step(
+            path,
+            project_key,
+            force=force,
+            yes=yes,
+            force_discard_worktree_changes=force_discard_worktree_changes,
+        )
 
     try:
         removed = remove_project(path, project_key)
@@ -1740,6 +1767,161 @@ def remove_cmd(
 # ---------------------------------------------------------------------------
 # pm project reinit (#1561)
 # ---------------------------------------------------------------------------
+
+
+def _reinit_print_dry_run(
+    *,
+    path: Path,
+    project_key: str,
+    project_path: Path,
+    active: int,
+    session_names: list[str],
+    force_discard_worktree_changes: bool,
+) -> None:
+    """Print the ``pm project reinit --dry-run`` plan."""
+    typer.echo(f"Dry run: would reinit project '{project_key}'.")
+    typer.echo(f"  path:    {project_path}")
+    if active > 0:
+        task_word = "task" if active == 1 else "tasks"
+        typer.echo(
+            f"  active:  {active} queued/in-flight work-service "
+            f"{task_word} (will be deleted)"
+        )
+    if session_names:
+        preview = _purge_project_sessions(path, project_key, dry_run=True)
+        typer.echo("  sessions to purge:")
+        for name, live, _killed in preview:
+            state = "live" if live else "stale"
+            typer.echo(f"    - {name} ({state})")
+    else:
+        typer.echo("  sessions: (none)")
+
+    state_counts = _count_project_state_rows(path, project_key)
+    nonzero = {
+        table: n for table, n in state_counts.items() if n > 0
+    }
+    if nonzero:
+        typer.echo("  state.db rows to purge:")
+        for table, n in sorted(nonzero.items()):
+            noun = (
+                "file" if table == "audit_tail"
+                else ("row" if n == 1 else "rows")
+            )
+            typer.echo(f"    - {table}: {n} {noun}")
+    else:
+        typer.echo("  state.db rows: (none)")
+
+    wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+    if wt_preview:
+        typer.echo("  worktree directories to purge:")
+        for wt_path, is_git, dirty, _ok, _reason in wt_preview:
+            kind = "git" if is_git else "stale"
+            dirty_marker = " [dirty]" if dirty else ""
+            typer.echo(f"    - {wt_path} ({kind}){dirty_marker}")
+        dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
+        if dirty_count > 0 and not force_discard_worktree_changes:
+            typer.echo(
+                f"Note: {dirty_count} worktree(s) have uncommitted "
+                "changes and will be skipped. Pass "
+                "--force-discard-worktree-changes to remove anyway."
+            )
+    else:
+        typer.echo("  worktree directories: (none)")
+
+    typer.echo(
+        f"  re-register: {project_key} at {project_path}"
+    )
+    typer.echo("Re-run without --dry-run to apply.")
+
+
+def _reinit_kill_sessions(path: Path, project_key: str) -> None:
+    """Step 1: kill tmux sessions + drop [sessions.*] entries."""
+    purged = _purge_project_sessions(path, project_key)
+    for name, live, killed in purged:
+        if live and killed:
+            typer.echo(f"Killed tmux session {name} and dropped config entry.")
+        elif live and not killed:
+            typer.echo(
+                f"Dropped [sessions.{name}] from config; tmux kill "
+                "failed (session may still be running \u2014 run "
+                "`tmux kill-session -t " + name + "` manually)."
+            )
+        else:
+            typer.echo(
+                f"Dropped [sessions.{name}] from config "
+                "(tmux session was not running)."
+            )
+
+
+def _reinit_purge_state_step(path: Path, project_key: str) -> None:
+    """Step 2: state.db rows + audit tail; aborts on hard failure."""
+    state_counts = _count_project_state_rows(path, project_key)
+    total_rows = sum(
+        n for table, n in state_counts.items() if table != "audit_tail"
+    )
+    if total_rows <= 0 and state_counts.get("audit_tail", 0) <= 0:
+        return
+    try:
+        state_summary = _purge_project_state(path, project_key)
+    except _PurgeStateError as exc:
+        typer.echo(
+            f"Error: state.db purge failed for '{project_key}': "
+            f"{exc}",
+            err=True,
+        )
+        typer.echo(
+            "Aborted. Project entry left in pollypm.toml so you "
+            "can retry once the DB is reachable.",
+            err=True,
+        )
+        raise typer.Exit(code=1) from exc
+    removed_total = sum(
+        n for table, n in state_summary.items()
+        if table != "audit_tail"
+    )
+    typer.echo(
+        f"Deleted {removed_total} state.db row(s) for "
+        f"'{project_key}' across "
+        f"{sum(1 for n in state_summary.values() if n > 0)} "
+        "table(s)."
+    )
+    if state_summary.get("audit_tail", 0) > 0:
+        typer.echo(
+            f"Removed central audit-tail JSONL for '{project_key}'."
+        )
+
+
+def _reinit_purge_worktrees_step(
+    path: Path, project_key: str, *, force_discard_worktree_changes: bool,
+) -> None:
+    """Step 3: worktree directory teardown (no abort on dirty worktrees)."""
+    wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
+    if not wt_preview:
+        return
+    wt_results = _purge_project_worktrees(
+        path, project_key,
+        force_discard_changes=force_discard_worktree_changes,
+    )
+    removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
+    skipped_dirty = [
+        p for p, _g, _d, ok, reason in wt_results
+        if not ok and reason == "dirty"
+    ]
+    failed = [
+        (p, reason) for p, _g, _d, ok, reason in wt_results
+        if not ok and reason != "dirty"
+    ]
+    typer.echo(
+        f"Removed {removed_count} worktree director"
+        f"{'y' if removed_count == 1 else 'ies'} for '{project_key}'."
+    )
+    for p in skipped_dirty:
+        typer.echo(
+            f"  Skipped (uncommitted changes): {p} \u2014 re-run with "
+            "--force-discard-worktree-changes to discard."
+        )
+    for p, reason in failed:
+        typer.echo(f"  Failed to remove {p} ({reason}).")
 
 
 @project_app.command("reinit")
@@ -1814,74 +1996,21 @@ def reinit_cmd(
     active = _count_active_tasks(project_key, path)
     session_names = _sessions_for_project(path, project_key)
 
-    # ------------------------------------------------------------------
-    # Dry-run: print the plan and exit 0 without mutating anything.
-    # The shape mirrors ``pm project remove --dry-run`` so an operator
-    # who reaches for ``reinit`` after experimenting with ``remove``
-    # sees a familiar layout.
-    # ------------------------------------------------------------------
     if dry_run:
-        typer.echo(f"Dry run: would reinit project '{project_key}'.")
-        typer.echo(f"  path:    {project_path}")
-        if active > 0:
-            task_word = "task" if active == 1 else "tasks"
-            typer.echo(
-                f"  active:  {active} queued/in-flight work-service "
-                f"{task_word} (will be deleted)"
-            )
-        if session_names:
-            preview = _purge_project_sessions(path, project_key, dry_run=True)
-            typer.echo("  sessions to purge:")
-            for name, live, _killed in preview:
-                state = "live" if live else "stale"
-                typer.echo(f"    - {name} ({state})")
-        else:
-            typer.echo("  sessions: (none)")
-
-        state_counts = _count_project_state_rows(path, project_key)
-        nonzero = {
-            table: n for table, n in state_counts.items() if n > 0
-        }
-        if nonzero:
-            typer.echo("  state.db rows to purge:")
-            for table, n in sorted(nonzero.items()):
-                noun = (
-                    "file" if table == "audit_tail"
-                    else ("row" if n == 1 else "rows")
-                )
-                typer.echo(f"    - {table}: {n} {noun}")
-        else:
-            typer.echo("  state.db rows: (none)")
-
-        wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
-        if wt_preview:
-            typer.echo("  worktree directories to purge:")
-            for wt_path, is_git, dirty, _ok, _reason in wt_preview:
-                kind = "git" if is_git else "stale"
-                dirty_marker = " [dirty]" if dirty else ""
-                typer.echo(f"    - {wt_path} ({kind}){dirty_marker}")
-            dirty_count = sum(1 for _p, _g, d, _o, _r in wt_preview if d)
-            if dirty_count > 0 and not force_discard_worktree_changes:
-                typer.echo(
-                    f"Note: {dirty_count} worktree(s) have uncommitted "
-                    "changes and will be skipped. Pass "
-                    "--force-discard-worktree-changes to remove anyway."
-                )
-        else:
-            typer.echo("  worktree directories: (none)")
-
-        typer.echo(
-            f"  re-register: {project_key} at {project_path}"
+        _reinit_print_dry_run(
+            path=path,
+            project_key=project_key,
+            project_path=project_path,
+            active=active,
+            session_names=session_names,
+            force_discard_worktree_changes=force_discard_worktree_changes,
         )
-        typer.echo("Re-run without --dry-run to apply.")
         return
 
-    # ------------------------------------------------------------------
     # Single destructive-action gate. ``reinit`` is unambiguously
     # destructive — there's no "register fresh, leave the old around"
     # variant — so one confirmation covers the whole cascade. Skipped
     # with ``--yes``.
-    # ------------------------------------------------------------------
     if not yes:
         typer.echo(
             f"Reinit will tear down project '{project_key}' "
@@ -1896,103 +2025,15 @@ def reinit_cmd(
             typer.echo("Aborted. No changes made.")
             raise typer.Exit(code=1)
 
-    # ------------------------------------------------------------------
-    # Step 1: kill tmux sessions + drop [sessions.*] entries.
-    # Mirrors ``remove_cmd``'s --purge-sessions branch.
-    # ------------------------------------------------------------------
     if session_names:
-        purged = _purge_project_sessions(path, project_key)
-        for name, live, killed in purged:
-            if live and killed:
-                typer.echo(f"Killed tmux session {name} and dropped config entry.")
-            elif live and not killed:
-                typer.echo(
-                    f"Dropped [sessions.{name}] from config; tmux kill "
-                    "failed (session may still be running — run "
-                    "`tmux kill-session -t " + name + "` manually)."
-                )
-            else:
-                typer.echo(
-                    f"Dropped [sessions.{name}] from config "
-                    "(tmux session was not running)."
-                )
-
-    # ------------------------------------------------------------------
-    # Step 2: state.db row teardown + audit tail. Hard failure here
-    # aborts BEFORE ``remove_project`` (issue #1673 — keep the config
-    # in sync with the rows). Same exit code + message as
-    # ``remove_cmd``.
-    # ------------------------------------------------------------------
-    state_counts = _count_project_state_rows(path, project_key)
-    total_rows = sum(
-        n for table, n in state_counts.items() if table != "audit_tail"
+        _reinit_kill_sessions(path, project_key)
+    _reinit_purge_state_step(path, project_key)
+    _reinit_purge_worktrees_step(
+        path, project_key,
+        force_discard_worktree_changes=force_discard_worktree_changes,
     )
-    if total_rows > 0 or state_counts.get("audit_tail", 0) > 0:
-        try:
-            state_summary = _purge_project_state(path, project_key)
-        except _PurgeStateError as exc:
-            typer.echo(
-                f"Error: state.db purge failed for '{project_key}': "
-                f"{exc}",
-                err=True,
-            )
-            typer.echo(
-                "Aborted. Project entry left in pollypm.toml so you "
-                "can retry once the DB is reachable.",
-                err=True,
-            )
-            raise typer.Exit(code=1) from exc
-        removed_total = sum(
-            n for table, n in state_summary.items()
-            if table != "audit_tail"
-        )
-        typer.echo(
-            f"Deleted {removed_total} state.db row(s) for "
-            f"'{project_key}' across "
-            f"{sum(1 for n in state_summary.values() if n > 0)} "
-            "table(s)."
-        )
-        if state_summary.get("audit_tail", 0) > 0:
-            typer.echo(
-                f"Removed central audit-tail JSONL for '{project_key}'."
-            )
 
-    # ------------------------------------------------------------------
-    # Step 3: worktree directory teardown. Same shape as
-    # ``remove_cmd``'s --purge-worktrees branch. Failures here don't
-    # abort — leftover worktree dirs are recoverable with a manual
-    # ``git worktree remove`` later.
-    # ------------------------------------------------------------------
-    wt_preview = _purge_project_worktrees(path, project_key, dry_run=True)
-    if wt_preview:
-        wt_results = _purge_project_worktrees(
-            path, project_key,
-            force_discard_changes=force_discard_worktree_changes,
-        )
-        removed_count = sum(1 for _p, _g, _d, ok, _r in wt_results if ok)
-        skipped_dirty = [
-            p for p, _g, _d, ok, reason in wt_results
-            if not ok and reason == "dirty"
-        ]
-        failed = [
-            (p, reason) for p, _g, _d, ok, reason in wt_results
-            if not ok and reason != "dirty"
-        ]
-        typer.echo(
-            f"Removed {removed_count} worktree director"
-            f"{'y' if removed_count == 1 else 'ies'} for '{project_key}'."
-        )
-        for p in skipped_dirty:
-            typer.echo(
-                f"  Skipped (uncommitted changes): {p} — re-run with "
-                "--force-discard-worktree-changes to discard."
-            )
-        for p, reason in failed:
-            typer.echo(f"  Failed to remove {p} ({reason}).")
-
-    # ------------------------------------------------------------------
     # Step 4: remove [projects.<key>] from the config.
-    # ------------------------------------------------------------------
     try:
         removed = remove_project(path, project_key)
     except typer.BadParameter as exc:
@@ -2000,12 +2041,10 @@ def reinit_cmd(
         raise typer.Exit(code=1) from exc
     typer.echo(f"Removed project '{removed.key}' from {path}")
 
-    # ------------------------------------------------------------------
     # Step 5: re-register the project under the same slug + path. The
     # path must still exist on disk — ``reinit`` is "blow away PollyPM
     # state, keep the working tree". If the operator also wiped the
     # repo directory, they should use ``pm project new`` instead.
-    # ------------------------------------------------------------------
     if not project_path.exists() or not project_path.is_dir():
         typer.echo(
             f"Error: project path {project_path} no longer exists. "

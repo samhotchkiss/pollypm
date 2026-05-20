@@ -238,6 +238,115 @@ class TmuxSessionService:
     # Protocol: create
     # ------------------------------------------------------------------
 
+    def _send_initial_input_kickoff(
+        self,
+        *,
+        name: str,
+        initial_input: str,
+        session_role: str,
+        task_title: str | None,
+        task_description: str | None,
+        guide_reference: str | None,
+        user_id: str,
+        wname: str,
+        target: str,
+        provider: str,
+        fresh_launch_marker: Path,
+    ) -> None:
+        """Send the initial kickoff input under the identity-stacking guards.
+
+        On success the fresh-launch marker is consumed; on a refused or
+        crossed identity the marker stays in place and a leak-risk log
+        line fires so reap rates stay visible.
+        """
+        # M05: prepend a "What you should know" section with
+        # recalled memories before the persona prompt is written
+        # to disk. When the memory backend isn't available (or
+        # no relevant memories surface), the helper returns the
+        # prompt unchanged — so a brand-new project boots with
+        # exactly today's behavior.
+        injected_input = self._inject_memory_into_prompt(
+            initial_input=initial_input,
+            session_role=session_role,
+            task_title=task_title,
+            task_description=task_description,
+            guide_reference=guide_reference,
+            user_id=user_id,
+        )
+        # #932 / #931 — primary (launch, target) + pane-banner crossing
+        # guards. Refuses the kickoff if the target pane already shows
+        # another role's canonical role banner.
+        if not (
+            _target_window_matches_expected(self.tmux, wname, target)
+            and not _pane_already_bootstrapped_as_other_role(
+                self.tmux, session_role, target,
+            )
+        ):
+            # #1338 — identity-stacking guards refused the
+            # send. Marker is left in place (matches the
+            # legacy contract) but flagged so leak rates are
+            # visible without instrumenting the reaper.
+            logger.warning(
+                "fresh_launch_marker leak risk: identity guard refused kickoff "
+                "for %s (window=%s); marker %s left in place — worker_marker_reaper "
+                "will reap it once the task is terminal or the window dies.",
+                name, wname, fresh_launch_marker,
+            )
+            return
+        try:
+            # #934 — pass ``target`` so the inner-most guard
+            # in ``_prepare_initial_input`` can refuse a
+            # crossed (session_name, target) tuple even if
+            # the upstream ``_target_window_matches_expected``
+            # check is bypassed by a future caller.
+            kickoff = self._prepare_initial_input(
+                name,
+                injected_input,
+                expected_window=wname,
+                session_role=session_role,
+                target=target,
+            )
+        except RuntimeError as exc:
+            if "persona_swap_detected" not in str(exc):
+                raise
+            # Fresh marker stays so the next correct
+            # send-tuple still bootstraps.
+            # #1338 — flag the leak-prone branch so
+            # marker-reap rates can be correlated with
+            # persona-swap aborts in the heartbeat log.
+            logger.warning(
+                "fresh_launch_marker leak risk: persona_swap_detected for %s "
+                "(window=%s); marker %s left in place — relies on a future "
+                "correct send-tuple OR the worker_marker_reaper sweep.",
+                name, wname, fresh_launch_marker,
+            )
+            # Audit hook (#savethenovel) — record the
+            # leak so the heartbeat can detect a marker
+            # that was created but never consumed.
+            _emit_marker_audit(
+                "marker.leaked",
+                fresh_launch_marker,
+                window_name=wname,
+                session_role=session_role,
+                error=str(exc),
+                status="warn",
+            )
+            return
+        if kickoff is None:
+            return
+        time.sleep(0.5)
+        self.tmux.send_keys(target, kickoff)
+        self._verify_input_submitted(target, kickoff, provider)
+        fresh_launch_marker.unlink(missing_ok=True)
+        # Audit hook (#savethenovel) — successful
+        # consumption of a fresh marker.
+        _emit_marker_audit(
+            "marker.released",
+            fresh_launch_marker,
+            window_name=wname,
+            session_role=session_role,
+        )
+
     def create(
         self,
         name: str,
@@ -334,106 +443,19 @@ class TmuxSessionService:
         # Send initial input if this is a fresh launch
         if initial_input and fresh_launch_marker and fresh_launch_marker.exists():
             if session_role in {"heartbeat-supervisor", "operator-pm", "reviewer", "triage", "worker"}:
-                # M05: prepend a "What you should know" section with
-                # recalled memories before the persona prompt is written
-                # to disk. When the memory backend isn't available (or
-                # no relevant memories surface), the helper returns the
-                # prompt unchanged — so a brand-new project boots with
-                # exactly today's behavior.
-                injected_input = self._inject_memory_into_prompt(
+                self._send_initial_input_kickoff(
+                    name=name,
                     initial_input=initial_input,
                     session_role=session_role,
                     task_title=task_title,
                     task_description=task_description,
                     guide_reference=guide_reference,
                     user_id=user_id,
+                    wname=wname,
+                    target=target,
+                    provider=provider,
+                    fresh_launch_marker=fresh_launch_marker,
                 )
-                # #932 — primary (launch, target) crossing guard. The
-                # banner guard below only catches the *secondary* send
-                # after another role's banner has already landed; a
-                # crossed kickoff into a fresh pane belonging to another
-                # session would otherwise slip through. Refuse before
-                # the banner check fires.
-                # #931 — pre-send pane guard. Refuses the kickoff if the
-                # target pane already shows another role's canonical role
-                # banner (i.e. the pane was already bootstrapped as a
-                # different session). Mirrors the supervisor-side guard
-                # so per-task workers and the parallel session_service
-                # launch paths share one identity-stacking defense.
-                if (
-                    _target_window_matches_expected(self.tmux, wname, target)
-                    and not _pane_already_bootstrapped_as_other_role(
-                        self.tmux, session_role, target,
-                    )
-                ):
-                    try:
-                        # #934 — pass ``target`` so the inner-most guard
-                        # in ``_prepare_initial_input`` can refuse a
-                        # crossed (session_name, target) tuple even if
-                        # the upstream ``_target_window_matches_expected``
-                        # check is bypassed by a future caller.
-                        kickoff = self._prepare_initial_input(
-                            name,
-                            injected_input,
-                            expected_window=wname,
-                            session_role=session_role,
-                            target=target,
-                        )
-                    except RuntimeError as exc:
-                        if "persona_swap_detected" in str(exc):
-                            # Fresh marker stays so the next correct
-                            # send-tuple still bootstraps. The error
-                            # log line above carries the diagnostic.
-                            # #1338 — flag the leak-prone branch so
-                            # marker-reap rates can be correlated with
-                            # persona-swap aborts in the heartbeat log.
-                            logger.warning(
-                                "fresh_launch_marker leak risk: persona_swap_detected for %s "
-                                "(window=%s); marker %s left in place — relies on a future "
-                                "correct send-tuple OR the worker_marker_reaper sweep.",
-                                name, wname, fresh_launch_marker,
-                            )
-                            kickoff = None
-                            # Audit hook (#savethenovel) — record the
-                            # leak so the heartbeat can detect a marker
-                            # that was created but never consumed.
-                            _emit_marker_audit(
-                                "marker.leaked",
-                                fresh_launch_marker,
-                                window_name=wname,
-                                session_role=session_role,
-                                error=str(exc),
-                                status="warn",
-                            )
-                        else:
-                            raise
-                    if kickoff is not None:
-                        time.sleep(0.5)
-                        self.tmux.send_keys(target, kickoff)
-                        self._verify_input_submitted(target, kickoff, provider)
-                        fresh_launch_marker.unlink(missing_ok=True)
-                        # Audit hook (#savethenovel) — successful
-                        # consumption of a fresh marker. Pairs with
-                        # ``marker.created`` from the work-service so
-                        # a forensic reader can confirm the launch
-                        # actually completed.
-                        _emit_marker_audit(
-                            "marker.released",
-                            fresh_launch_marker,
-                            window_name=wname,
-                            session_role=session_role,
-                        )
-                else:
-                    # #1338 — identity-stacking guards refused the
-                    # send. Marker is left in place (matches the
-                    # legacy contract) but flagged so leak rates are
-                    # visible without instrumenting the reaper.
-                    logger.warning(
-                        "fresh_launch_marker leak risk: identity guard refused kickoff "
-                        "for %s (window=%s); marker %s left in place — worker_marker_reaper "
-                        "will reap it once the task is terminal or the window dies.",
-                        name, wname, fresh_launch_marker,
-                    )
 
         # Write resume marker
         if resume_marker:

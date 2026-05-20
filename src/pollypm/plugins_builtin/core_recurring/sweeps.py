@@ -19,6 +19,250 @@ from .shared import (
 logger = logging.getLogger(__name__)
 
 
+def _resolve_sweep_target(
+    *,
+    task: Any,
+    event: Any,
+    work: Any,
+    session_svc: Any,
+    index: Any,
+    counters: dict[str, int],
+) -> str | None:
+    """Resolve the target session for ``task`` or return None.
+
+    Bumps ``counters[skipped_no_session]`` / ``counters[skipped_active_turn]``
+    as appropriate. Returns the session ``target_name`` when the
+    sweep should proceed, or None when it should skip this task.
+    """
+    handle = None
+    if index is not None:
+        try:
+            handle = index.resolve(
+                event.actor_type, event.actor_name, event.project,
+            )
+        except Exception:  # noqa: BLE001
+            handle = None
+    if handle is None:
+        counters["skipped_no_session"] += 1
+        return None
+    target_name = getattr(handle, "name", "")
+    if not target_name:
+        counters["skipped_no_session"] += 1
+        return None
+
+    if session_svc is not None:
+        checker = getattr(session_svc, "is_turn_active", None)
+        if callable(checker):
+            try:
+                if bool(checker(target_name)):
+                    counters["skipped_active_turn"] += 1
+                    return None
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "work.progress_sweep: is_turn_active probe failed for %s",
+                    target_name, exc_info=True,
+                )
+    return target_name
+
+
+def _record_state_drift(
+    *,
+    task: Any,
+    target_name: str,
+    drift: Any,
+    msg_store: Any,
+    state_store: Any,
+    counters: dict[str, int],
+) -> None:
+    """Emit the drift audit event + upsert the drift alert."""
+    audit_store = msg_store or state_store
+    if audit_store is None:
+        return
+    current_node = getattr(task, "current_node_id", "") or ""
+    message = (
+        f"task {task.task_id}: observed "
+        f"{drift.advance_to_node} deliverables, advancing "
+        f"from {current_node} to {drift.advance_to_node} — "
+        f"{drift.reason}"
+    )
+    try:
+        if msg_store is not None:
+            msg_store.append_event(
+                scope=target_name,
+                sender=target_name,
+                subject="state_drift",
+                payload={
+                    "message": message,
+                    "task_id": task.task_id,
+                    "reason": drift.reason,
+                },
+            )
+        else:
+            state_store.record_event(
+                target_name, "state_drift", message,
+            )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "work.progress_sweep: state_drift audit emit failed for %s",
+            task.task_id, exc_info=True,
+        )
+    alert_type = f"state_drift:{task.task_id}"
+    try:
+        is_new = not _open_alert_exists(
+            msg_store=msg_store,
+            state_store=state_store,
+            session_name=target_name,
+            alert_type=alert_type,
+        )
+        if msg_store is not None:
+            msg_store.upsert_alert(
+                target_name,
+                alert_type,
+                "warn",
+                (
+                    f"{target_name} drift on {task.task_id}: "
+                    f"{drift.reason}"
+                ),
+            )
+        else:
+            state_store.upsert_alert(
+                target_name,
+                alert_type,
+                "warn",
+                (
+                    f"{target_name} drift on {task.task_id}: "
+                    f"{drift.reason}"
+                ),
+            )
+        if is_new:
+            counters["drift_alerted"] += 1
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "work.progress_sweep: drift alert upsert failed for %s",
+            task.task_id, exc_info=True,
+        )
+
+
+def _has_recent_session_event(
+    *,
+    target_name: str,
+    msg_store: Any,
+    state_store: Any,
+    now: Any,
+    stale_threshold_seconds: int,
+) -> bool:
+    """Return True when the target session has an event newer than the threshold."""
+    from datetime import UTC, datetime, timedelta
+
+    recent_ts: str | None = None
+    if msg_store is not None:
+        try:
+            events = msg_store.query_messages(
+                type="event",
+                scope=target_name,
+                limit=1,
+            )
+            last_ts_stamp = events[0].get("created_at") if events else None
+            if last_ts_stamp is not None:
+                recent_ts = (
+                    last_ts_stamp.isoformat()
+                    if hasattr(last_ts_stamp, "isoformat")
+                    else str(last_ts_stamp)
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "work.progress_sweep: recent-event probe via msg_store failed for %s",
+                target_name, exc_info=True,
+            )
+    if recent_ts is None and state_store is not None:
+        recent_events = getattr(state_store, "recent_events", None)
+        if callable(recent_events):
+            try:
+                for event_row in recent_events(limit=20):
+                    if getattr(event_row, "session_name", None) != target_name:
+                        continue
+                    stamp = getattr(event_row, "created_at", None)
+                    if stamp:
+                        recent_ts = (
+                            stamp.isoformat()
+                            if hasattr(stamp, "isoformat")
+                            else str(stamp)
+                        )
+                        break
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "work.progress_sweep: recent-event probe via state_store failed for %s",
+                    target_name, exc_info=True,
+                )
+    if recent_ts is None:
+        return False
+    try:
+        last_ts = datetime.fromisoformat(recent_ts)
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.replace(tzinfo=UTC)
+        return (now - last_ts) < timedelta(seconds=stale_threshold_seconds)
+    except ValueError:
+        return False
+
+
+def _emit_resume_ping(
+    *,
+    event: Any,
+    target_name: str,
+    services: Any,
+    work: Any,
+    msg_store: Any,
+    counters: dict[str, int],
+) -> None:
+    """Send the resume-ping notification and record bookkeeping."""
+    from pollypm.task_assignment_notify import (
+        DEDUPE_WINDOW_SECONDS,
+        notify as _notify,
+        record_sweeper_ping as _record_sweeper_ping,
+    )
+
+    try:
+        outcome = _notify(
+            event,
+            services=services,
+            throttle_seconds=DEDUPE_WINDOW_SECONDS,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "work.progress_sweep: notify failed for %s",
+            event.task_id, exc_info=True,
+        )
+        return
+    result = str(outcome.get("outcome", ""))
+    _record_sweeper_ping(
+        work,
+        event.task_id,
+        outcome=result,
+        source="work.progress_sweep",
+    )
+    if result == "deduped":
+        counters["deduped"] += 1
+    elif result == "sent":
+        counters["pinged"] += 1
+        if msg_store is not None:
+            try:
+                msg_store.upsert_alert(
+                    target_name,
+                    f"stuck_on_task:{event.task_id}",
+                    "warning",
+                    (
+                        f"Session {target_name} stuck on "
+                        f"{event.task_id} — resume ping sent"
+                    ),
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "work.progress_sweep: stuck_on_task alert upsert "
+                    "failed for %s/%s", target_name, event.task_id,
+                    exc_info=True,
+                )
+
+
 def _work_progress_sweep_one(
     *,
     work: Any,
@@ -31,15 +275,12 @@ def _work_progress_sweep_one(
     counters: dict[str, int],
 ) -> bool:
     """Run one ``work.progress_sweep`` pass against a single work DB."""
-    from datetime import UTC, datetime, timedelta
+    from datetime import UTC, datetime
 
     # #1365: recurring jobs use the shared task-assignment notification
     # surface, not the sibling task_assignment_notify plugin package.
     from pollypm.task_assignment_notify import (
-        DEDUPE_WINDOW_SECONDS,
         build_event_for_task as _build_event_for_task,
-        notify as _notify,
-        record_sweeper_ping as _record_sweeper_ping,
     )
     from pollypm.recovery.state_reconciliation import (
         reconcile_expected_advance,
@@ -77,34 +318,16 @@ def _work_progress_sweep_one(
             continue
         counters["considered"] += 1
 
-        handle = None
-        if index is not None:
-            try:
-                handle = index.resolve(
-                    event.actor_type, event.actor_name, event.project,
-                )
-            except Exception:  # noqa: BLE001
-                handle = None
-        if handle is None:
-            counters["skipped_no_session"] += 1
+        target_name = _resolve_sweep_target(
+            task=task,
+            event=event,
+            work=work,
+            session_svc=session_svc,
+            index=index,
+            counters=counters,
+        )
+        if target_name is None:
             continue
-        target_name = getattr(handle, "name", "")
-        if not target_name:
-            counters["skipped_no_session"] += 1
-            continue
-
-        if session_svc is not None:
-            checker = getattr(session_svc, "is_turn_active", None)
-            if callable(checker):
-                try:
-                    if bool(checker(target_name)):
-                        counters["skipped_active_turn"] += 1
-                        continue
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "work.progress_sweep: is_turn_active probe failed for %s",
-                        target_name, exc_info=True,
-                    )
 
         try:
             resolver = getattr(work, "_resolve_project_path", None)
@@ -131,71 +354,14 @@ def _work_progress_sweep_one(
             drift = None
         if drift is not None:
             counters["drift_detected"] += 1
-            current_node = getattr(task, "current_node_id", "") or ""
-            message = (
-                f"task {task.task_id}: observed "
-                f"{drift.advance_to_node} deliverables, advancing "
-                f"from {current_node} to {drift.advance_to_node} — "
-                f"{drift.reason}"
+            _record_state_drift(
+                task=task,
+                target_name=target_name,
+                drift=drift,
+                msg_store=msg_store,
+                state_store=state_store,
+                counters=counters,
             )
-            audit_store = msg_store or state_store
-            if audit_store is not None:
-                try:
-                    if msg_store is not None:
-                        msg_store.append_event(
-                            scope=target_name,
-                            sender=target_name,
-                            subject="state_drift",
-                            payload={
-                                "message": message,
-                                "task_id": task.task_id,
-                                "reason": drift.reason,
-                            },
-                        )
-                    else:
-                        state_store.record_event(
-                            target_name, "state_drift", message,
-                        )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "work.progress_sweep: state_drift audit emit failed for %s",
-                        task.task_id, exc_info=True,
-                    )
-                alert_type = f"state_drift:{task.task_id}"
-                try:
-                    is_new = not _open_alert_exists(
-                        msg_store=msg_store,
-                        state_store=state_store,
-                        session_name=target_name,
-                        alert_type=alert_type,
-                    )
-                    if msg_store is not None:
-                        msg_store.upsert_alert(
-                            target_name,
-                            alert_type,
-                            "warn",
-                            (
-                                f"{target_name} drift on {task.task_id}: "
-                                f"{drift.reason}"
-                            ),
-                        )
-                    else:
-                        state_store.upsert_alert(
-                            target_name,
-                            alert_type,
-                            "warn",
-                            (
-                                f"{target_name} drift on {task.task_id}: "
-                                f"{drift.reason}"
-                            ),
-                        )
-                    if is_new:
-                        counters["drift_alerted"] += 1
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "work.progress_sweep: drift alert upsert failed for %s",
-                        task.task_id, exc_info=True,
-                    )
 
             if is_worker_session_name(target_name):
                 try:
@@ -219,102 +385,26 @@ def _work_progress_sweep_one(
                 elif outcome == "reprompt":
                     counters["worker_reprompts"] += 1
 
-        recent_ts: str | None = None
-        if msg_store is not None:
-            try:
-                events = msg_store.query_messages(
-                    type="event",
-                    scope=target_name,
-                    limit=1,
-                )
-                last_ts_stamp = events[0].get("created_at") if events else None
-                if last_ts_stamp is not None:
-                    recent_ts = (
-                        last_ts_stamp.isoformat()
-                        if hasattr(last_ts_stamp, "isoformat")
-                        else str(last_ts_stamp)
-                    )
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "work.progress_sweep: recent-event probe via msg_store failed for %s",
-                    target_name, exc_info=True,
-                )
-        if recent_ts is None and state_store is not None:
-            recent_events = getattr(state_store, "recent_events", None)
-            if callable(recent_events):
-                try:
-                    for event_row in recent_events(limit=20):
-                        if getattr(event_row, "session_name", None) != target_name:
-                            continue
-                        stamp = getattr(event_row, "created_at", None)
-                        if stamp:
-                            recent_ts = (
-                                stamp.isoformat()
-                                if hasattr(stamp, "isoformat")
-                                else str(stamp)
-                            )
-                            break
-                except Exception:  # noqa: BLE001
-                    logger.debug(
-                        "work.progress_sweep: recent-event probe via state_store failed for %s",
-                        target_name, exc_info=True,
-                    )
-        if recent_ts is not None:
-            try:
-                last_ts = datetime.fromisoformat(recent_ts)
-                if last_ts.tzinfo is None:
-                    last_ts = last_ts.replace(tzinfo=UTC)
-                if (now - last_ts) < timedelta(
-                    seconds=stale_threshold_seconds,
-                ):
-                    counters["skipped_recent_event"] += 1
-                    continue
-            except ValueError:
-                pass
-
-        try:
-            outcome = _notify(
-                event,
-                services=services,
-                throttle_seconds=DEDUPE_WINDOW_SECONDS,
-            )
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "work.progress_sweep: notify failed for %s",
-                event.task_id, exc_info=True,
-            )
+        if _has_recent_session_event(
+            target_name=target_name,
+            msg_store=msg_store,
+            state_store=state_store,
+            now=now,
+            stale_threshold_seconds=stale_threshold_seconds,
+        ):
+            counters["skipped_recent_event"] += 1
             continue
-        result = str(outcome.get("outcome", ""))
-        _record_sweeper_ping(
-            work,
-            event.task_id,
-            outcome=result,
-            source="work.progress_sweep",
+
+        _emit_resume_ping(
+            event=event,
+            target_name=target_name,
+            services=services,
+            work=work,
+            msg_store=msg_store,
+            counters=counters,
         )
-        if result == "deduped":
-            counters["deduped"] += 1
-        elif result == "sent":
-            counters["pinged"] += 1
-            if msg_store is not None:
-                try:
-                    msg_store.upsert_alert(
-                        target_name,
-                        f"stuck_on_task:{event.task_id}",
-                        "warning",
-                        (
-                            f"Session {target_name} stuck on "
-                            f"{event.task_id} — resume ping sent"
-                        ),
-                    )
-                except Exception:  # noqa: BLE001
-                    logger.warning(
-                        "work.progress_sweep: stuck_on_task alert upsert "
-                        "failed for %s/%s", target_name, event.task_id,
-                        exc_info=True,
-                    )
 
     return True
-
 
 def work_progress_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Scan in_progress tasks for staleness and emit resume pings (#249)."""
@@ -797,6 +887,161 @@ def _emit_pane_pattern_inbox_item(
     return True
 
 
+def _worktree_audit_clear_clean(
+    *,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    state_alert_types: tuple[str, ...],
+    alert_exists_fn,
+) -> int:
+    """Clear every stale ``worktree_state:*`` alert for a now-clean worktree."""
+    cleared = 0
+    for kind in state_alert_types:
+        alert_type = f"worktree_state:{task_id}:{kind}"
+        if not alert_exists_fn(session_key, alert_type):
+            continue
+        try:
+            (msg_store or store).clear_alert(session_key, alert_type)
+            cleared += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "worktree.state_audit: clear_alert failed for %s/%s",
+                session_key, alert_type, exc_info=True,
+            )
+    return cleared
+
+
+def _worktree_audit_handle_merge_conflict(
+    *,
+    classification,
+    wt_path: Path,
+    sess,
+    agent: str,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    work: Any,
+) -> tuple[int, int]:
+    """Raise the merge-conflict alert and emit the inbox task."""
+    alert_type = f"worktree_state:{task_id}:merge_conflict"
+    files = classification.metadata.get("conflict_files", [])
+    file_blurb = (
+        f" ({len(files)} file{'s' if len(files) != 1 else ''})"
+        if files else ""
+    )
+    message = (
+        f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
+        f"{task_id}. Worker is blocked until the conflict resolves."
+    )
+    _raise_alert(msg_store or store, session_key, alert_type, "error", message)
+    fix_hint = (
+        f"Run `git -C {wt_path} status` to inspect the conflict, "
+        f"then resolve and `git commit` or reassign the task."
+    )
+    file_word = "file" if len(files) == 1 else "files"
+    body = (
+        f"Worker {agent} hit a merge conflict in {wt_path} while "
+        f"working on task {task_id}.\n\n"
+        f"{len(files)} conflicted {file_word} detected.\n\n"
+        f"Fix: {fix_hint}"
+    )
+    emitted = 1 if _emit_inbox_task(
+        work,
+        subject=f"Merge conflict: {task_id}",
+        body=body,
+        actor=agent,
+        dedupe_label=f"worktree_audit:{task_id}:merge_conflict",
+        project=sess.task_project,
+    ) else 0
+    return 1, emitted
+
+
+def _worktree_audit_handle_dirty_stale(
+    *,
+    classification,
+    wt_path: Path,
+    agent: str,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    now_epoch: float,
+    dirty_stale_seconds: int,
+    alert_exists_fn,
+) -> tuple[int, int]:
+    """Either raise or clear the dirty-stale alert based on mtime age."""
+    try:
+        mtime = wt_path.stat().st_mtime
+    except OSError:
+        mtime = now_epoch
+    age_s = now_epoch - mtime
+    alert_type = f"worktree_state:{task_id}:dirty_stale"
+    if age_s >= dirty_stale_seconds:
+        message = (
+            f"{agent}: {wt_path} has uncommitted changes and "
+            f"hasn't been touched in ~{int(age_s // 60)}min "
+            f"(task {task_id}). Fix: check in on the worker \u2014 "
+            f"likely stuck or idle."
+        )
+        _raise_alert(msg_store or store, session_key, alert_type, "warn", message)
+        return 1, 0
+    if alert_exists_fn(session_key, alert_type):
+        try:
+            (msg_store or store).clear_alert(session_key, alert_type)
+            return 0, 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "worktree.state_audit: clear_alert failed for %s/%s",
+                session_key, alert_type, exc_info=True,
+            )
+    return 0, 0
+
+
+def _worktree_audit_handle_orphan_branch(
+    *,
+    classification,
+    wt_path: Path,
+    sess,
+    agent: str,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    work: Any,
+) -> tuple[int, int]:
+    """Raise the orphan-branch alert and emit the inbox task."""
+    age_days = float(classification.metadata.get("age_days", 0.0))
+    alert_type = f"worktree_state:{task_id}:orphan_branch"
+    message = (
+        f"{agent}: {wt_path} on local-only branch "
+        f"{classification.branch or '(unknown)'} with no upstream "
+        f"and no commit in ~{age_days:.1f}d (task {task_id}). "
+        f"Fix: push or archive the branch before the prune "
+        f"handler GCs it."
+    )
+    _raise_alert(msg_store or store, session_key, alert_type, "info", message)
+    body = (
+        f"Worker {agent}'s worktree for task {task_id} is on a "
+        f"local-only branch with no upstream and ~{age_days:.1f} "
+        f"days of inactivity.\n\n"
+        f"Path: {wt_path}\n\n"
+        f"Fix: push the branch, merge/abandon the task, or let "
+        f"the hourly `agent_worktree.prune` handler decide."
+    )
+    emitted = 1 if _emit_inbox_task(
+        work,
+        subject=f"Orphan worktree branch: {task_id}",
+        body=body,
+        actor=agent,
+        dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
+        project=sess.task_project,
+    ) else 0
+    return 1, emitted
+
+
 def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Classify every active worker-session worktree + surface blockers (#251)."""
     import time as _time
@@ -883,53 +1128,30 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 classified[state.value] = classified.get(state.value, 0) + 1
 
                 if state in (WorktreeState.CLEAN, WorktreeState.MISSING):
-                    for kind in STATE_ALERT_TYPES:
-                        alert_type = f"worktree_state:{task_id}:{kind}"
-                        if not _alert_exists(session_key, alert_type):
-                            continue
-                        try:
-                            (msg_store or store).clear_alert(session_key, alert_type)
-                            alerts_cleared += 1
-                        except Exception:  # noqa: BLE001
-                            logger.warning(
-                                "worktree.state_audit: clear_alert failed for %s/%s",
-                                session_key, alert_type, exc_info=True,
-                            )
+                    alerts_cleared += _worktree_audit_clear_clean(
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        state_alert_types=STATE_ALERT_TYPES,
+                        alert_exists_fn=_alert_exists,
+                    )
                     continue
 
                 if state is WorktreeState.MERGE_CONFLICT:
-                    alert_type = f"worktree_state:{task_id}:merge_conflict"
-                    files = classification.metadata.get("conflict_files", [])
-                    file_blurb = (
-                        f" ({len(files)} file{'s' if len(files) != 1 else ''})"
-                        if files else ""
+                    raised, emitted = _worktree_audit_handle_merge_conflict(
+                        classification=classification,
+                        wt_path=wt_path,
+                        sess=sess,
+                        agent=agent,
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        work=work,
                     )
-                    message = (
-                        f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
-                        f"{task_id}. Worker is blocked until the conflict resolves."
-                    )
-                    _raise_alert(msg_store or store, session_key, alert_type, "error", message)
-                    alerts_raised += 1
-                    fix_hint = (
-                        f"Run `git -C {wt_path} status` to inspect the conflict, "
-                        f"then resolve and `git commit` or reassign the task."
-                    )
-                    file_word = "file" if len(files) == 1 else "files"
-                    body = (
-                        f"Worker {agent} hit a merge conflict in {wt_path} while "
-                        f"working on task {task_id}.\n\n"
-                        f"{len(files)} conflicted {file_word} detected.\n\n"
-                        f"Fix: {fix_hint}"
-                    )
-                    if _emit_inbox_task(
-                        work,
-                        subject=f"Merge conflict: {task_id}",
-                        body=body,
-                        actor=agent,
-                        dedupe_label=f"worktree_audit:{task_id}:merge_conflict",
-                        project=sess.task_project,
-                    ):
-                        inbox_emitted += 1
+                    alerts_raised += raised
+                    inbox_emitted += emitted
 
                 elif state is WorktreeState.LOCK_FILE:
                     lock_age = float(
@@ -960,61 +1182,35 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     alerts_raised += 1
 
                 elif state is WorktreeState.DIRTY_EXPECTED:
-                    try:
-                        mtime = wt_path.stat().st_mtime
-                    except OSError:
-                        mtime = now_epoch
-                    age_s = now_epoch - mtime
-                    alert_type = f"worktree_state:{task_id}:dirty_stale"
-                    if age_s >= DIRTY_STALE_SECONDS:
-                        message = (
-                            f"{agent}: {wt_path} has uncommitted changes and "
-                            f"hasn't been touched in ~{int(age_s // 60)}min "
-                            f"(task {task_id}). Fix: check in on the worker — "
-                            f"likely stuck or idle."
-                        )
-                        _raise_alert(msg_store or store, session_key, alert_type, "warn", message)
-                        alerts_raised += 1
-                    else:
-                        if _alert_exists(session_key, alert_type):
-                            try:
-                                (msg_store or store).clear_alert(session_key, alert_type)
-                                alerts_cleared += 1
-                            except Exception:  # noqa: BLE001
-                                logger.warning(
-                                    "worktree.state_audit: clear_alert failed for %s/%s",
-                                    session_key, alert_type, exc_info=True,
-                                )
+                    raised, cleared = _worktree_audit_handle_dirty_stale(
+                        classification=classification,
+                        wt_path=wt_path,
+                        agent=agent,
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        now_epoch=now_epoch,
+                        dirty_stale_seconds=DIRTY_STALE_SECONDS,
+                        alert_exists_fn=_alert_exists,
+                    )
+                    alerts_raised += raised
+                    alerts_cleared += cleared
 
                 elif state is WorktreeState.ORPHAN_BRANCH:
-                    age_days = float(classification.metadata.get("age_days", 0.0))
-                    alert_type = f"worktree_state:{task_id}:orphan_branch"
-                    message = (
-                        f"{agent}: {wt_path} on local-only branch "
-                        f"{classification.branch or '(unknown)'} with no upstream "
-                        f"and no commit in ~{age_days:.1f}d (task {task_id}). "
-                        f"Fix: push or archive the branch before the prune "
-                        f"handler GCs it."
+                    raised, emitted = _worktree_audit_handle_orphan_branch(
+                        classification=classification,
+                        wt_path=wt_path,
+                        sess=sess,
+                        agent=agent,
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        work=work,
                     )
-                    _raise_alert(msg_store or store, session_key, alert_type, "info", message)
-                    alerts_raised += 1
-                    body = (
-                        f"Worker {agent}'s worktree for task {task_id} is on a "
-                        f"local-only branch with no upstream and ~{age_days:.1f} "
-                        f"days of inactivity.\n\n"
-                        f"Path: {wt_path}\n\n"
-                        f"Fix: push the branch, merge/abandon the task, or let "
-                        f"the hourly `agent_worktree.prune` handler decide."
-                    )
-                    if _emit_inbox_task(
-                        work,
-                        subject=f"Orphan worktree branch: {task_id}",
-                        body=body,
-                        actor=agent,
-                        dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
-                        project=sess.task_project,
-                    ):
-                        inbox_emitted += 1
+                    alerts_raised += raised
+                    inbox_emitted += emitted
         finally:
             closer = getattr(work, "close", None)
             if callable(closer):
@@ -1032,7 +1228,6 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
             "alerts_cleared": alerts_cleared,
             "inbox_emitted": inbox_emitted,
         }
-
 
 def _raise_alert(
     store: Any, session_name: str, alert_type: str, severity: str, message: str,

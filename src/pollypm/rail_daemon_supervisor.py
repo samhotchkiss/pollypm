@@ -936,6 +936,154 @@ def _classify_kill_outcome(
     return (False, None)
 
 
+def _try_kill_stuck_daemon(
+    *,
+    diagnosed_pid: int | None,
+    recheck: Any,
+    sleep_fn: Callable[[float], None],
+    config_path: Path,
+    emit_audit: bool,
+) -> tuple[int | None, str | None, RevivalResult | None]:
+    """Terminate a stuck daemon, returning early when the kill is refused.
+
+    Returns ``(killed_pid, kill_signal, abort_result)``. ``abort_result``
+    is non-None when the supervisor should bail without spawning.
+    """
+    killed_pid: int | None = None
+    kill_signal: str | None = None
+    if recheck.state != "stuck_no_tick" or diagnosed_pid is None:
+        return killed_pid, kill_signal, None
+
+    kill_signal = _terminate_with_grace(
+        diagnosed_pid, sleep_fn=sleep_fn, config_path=config_path,
+    )
+    killed, abort_label = _classify_kill_outcome(kill_signal)
+    if killed:
+        killed_pid = diagnosed_pid
+        return killed_pid, kill_signal, None
+    if abort_label is None:
+        return killed_pid, kill_signal, None
+    # Couldn't (or refused to) kill it — bail without
+    # spawning so we don't end up with two daemons or
+    # corrupt an unrelated user process.
+    logger.warning(
+        "rail_daemon_supervisor: skipping respawn for pid=%d "
+        "(%s)", diagnosed_pid, abort_label,
+    )
+    result = RevivalResult(
+        decision=recheck,
+        revived=False,
+        spawn_error=abort_label,
+        killed_pid=None,
+        kill_signal=kill_signal,
+    )
+    if emit_audit:
+        _emit_revival_audit(
+            decision=recheck,
+            revived=False,
+            spawn_error=abort_label,
+            killed_pid=None,
+            kill_signal=kill_signal,
+        )
+    return killed_pid, kill_signal, result
+
+
+def _unlink_diagnosed_pid_file(
+    *,
+    pid_path: Path,
+    diagnosed_pid: int | None,
+    recheck: Any,
+    killed_pid: int | None,
+    kill_signal: str | None,
+) -> RevivalResult | None:
+    """Unlink the PID file when it still names ``diagnosed_pid``.
+
+    Returns a stand-down ``RevivalResult`` when the PID file has been
+    claimed by a concurrent supervisor's spawn, else None.
+    """
+    try:
+        if pid_path.exists():
+            current_pid = _read_pid(pid_path)
+            if current_pid is None or current_pid == diagnosed_pid:
+                pid_path.unlink(missing_ok=True)
+            else:
+                logger.warning(
+                    "rail_daemon_supervisor: pid_path now points at "
+                    "pid=%d (was %s); a concurrent supervisor must "
+                    "have spawned — standing down",
+                    current_pid, diagnosed_pid,
+                )
+                return RevivalResult(
+                    decision=recheck,
+                    revived=False,
+                    spawn_error=None,
+                    killed_pid=killed_pid,
+                    kill_signal=kill_signal,
+                )
+    except OSError as exc:
+        logger.warning(
+            "rail_daemon_supervisor: could not unlink %s: %s — "
+            "_claim_pid_file should still recover", pid_path, exc,
+        )
+    return None
+
+
+def _spawn_and_wait_for_child(
+    *,
+    spawn_fn: Callable[[Path], None] | None,
+    config_path: Path,
+    pid_path: Path,
+    child_wait_seconds: float,
+    sleep_fn: Callable[[float], None],
+) -> str | None:
+    """Spawn the new daemon and wait for it to register a PID file.
+
+    Returns ``spawn_error`` (None on success). Spawn-success but
+    pid-file-timeout produces a warning, not an error: the caller
+    still records ``revived=True`` because the spawn returned ok.
+    """
+    spawner = spawn_fn or _default_spawn_fn()
+    spawn_error: str | None = None
+    try:
+        spawner(config_path)
+    except Exception as exc:  # noqa: BLE001
+        spawn_error = f"{type(exc).__name__}: {exc}"
+        logger.exception("rail_daemon_supervisor: spawn failed")
+
+    # Step 4: wait — still under the supervisor lock — for the
+    # freshly-spawned child to write a matching PID file. The real
+    # spawner is a detached ``Popen`` that returns immediately; if
+    # we release the lock now, a sibling supervisor can re-diagnose
+    # ``missing_pid`` and spawn a *second* daemon before this child
+    # gets to ``_claim_pid_file``. The wait is bounded
+    # (``child_wait_seconds``) so a buggy spawner can't deadlock us.
+    # Skipped if ``spawner`` itself raised — there is no child to
+    # wait for, and the existing "revived=False" reporting is correct.
+    if spawn_error is None:
+        confirmed_pid = _wait_for_child_pid(
+            pid_path,
+            config_path,
+            timeout_seconds=child_wait_seconds,
+            sleep_fn=sleep_fn,
+        )
+        if confirmed_pid is None:
+            # Don't flip revived=False — the spawn itself succeeded
+            # from our POV (Popen returned 0). But we did NOT
+            # observe the child claim the PID file before the
+            # timeout, so warn loudly so operators see chronic
+            # cases (slow imports, container OOM-on-boot, etc).
+            # Subsequent supervisor cycles will diagnose
+            # missing_pid / dead_process and recover the layer
+            # below us.
+            logger.warning(
+                "rail_daemon_supervisor: spawned daemon did not "
+                "register a PID at %s within %.1fs — proceeding "
+                "but next cycle may re-spawn",
+                pid_path, child_wait_seconds,
+            )
+    return spawn_error
+
+
 def check_and_revive_rail_daemon(
     *,
     config_path: Path,
@@ -1088,39 +1236,15 @@ def check_and_revive_rail_daemon(
         # means the PID is alive but unresponsive; SIGTERM it so the
         # new daemon can claim the PID file. ``dead_process`` and
         # ``missing_pid`` skip this entirely.
-        killed_pid: int | None = None
-        kill_signal: str | None = None
-        if recheck.state == "stuck_no_tick" and diagnosed_pid is not None:
-            kill_signal = _terminate_with_grace(
-                diagnosed_pid, sleep_fn=sleep_fn, config_path=config_path,
-            )
-            killed, abort_label = _classify_kill_outcome(kill_signal)
-            if killed:
-                killed_pid = diagnosed_pid
-            elif abort_label is not None:
-                # Couldn't (or refused to) kill it — bail without
-                # spawning so we don't end up with two daemons or
-                # corrupt an unrelated user process.
-                logger.warning(
-                    "rail_daemon_supervisor: skipping respawn for pid=%d "
-                    "(%s)", diagnosed_pid, abort_label,
-                )
-                result = RevivalResult(
-                    decision=recheck,
-                    revived=False,
-                    spawn_error=abort_label,
-                    killed_pid=None,
-                    kill_signal=kill_signal,
-                )
-                if emit_audit:
-                    _emit_revival_audit(
-                        decision=recheck,
-                        revived=False,
-                        spawn_error=abort_label,
-                        killed_pid=None,
-                        kill_signal=kill_signal,
-                    )
-                return result
+        killed_pid, kill_signal, abort = _try_kill_stuck_daemon(
+            diagnosed_pid=diagnosed_pid,
+            recheck=recheck,
+            sleep_fn=sleep_fn,
+            config_path=config_path,
+            emit_audit=emit_audit,
+        )
+        if abort is not None:
+            return abort
 
         # Step 2: compare-and-unlink. Only unlink the PID file if it
         # still names the PID we diagnosed (or is unreadable / empty).
@@ -1129,72 +1253,25 @@ def check_and_revive_rail_daemon(
         # MUST NOT clobber that file: doing so removes the freshly-
         # spawned daemon's ownership marker and the next caller will
         # spawn ANOTHER daemon.
-        try:
-            if pid_path.exists():
-                current_pid = _read_pid(pid_path)
-                if current_pid is None or current_pid == diagnosed_pid:
-                    pid_path.unlink(missing_ok=True)
-                else:
-                    logger.warning(
-                        "rail_daemon_supervisor: pid_path now points at "
-                        "pid=%d (was %s); a concurrent supervisor must "
-                        "have spawned — standing down",
-                        current_pid, diagnosed_pid,
-                    )
-                    return RevivalResult(
-                        decision=recheck,
-                        revived=False,
-                        spawn_error=None,
-                        killed_pid=killed_pid,
-                        kill_signal=kill_signal,
-                    )
-        except OSError as exc:
-            logger.warning(
-                "rail_daemon_supervisor: could not unlink %s: %s — "
-                "_claim_pid_file should still recover", pid_path, exc,
-            )
+        stand_down = _unlink_diagnosed_pid_file(
+            pid_path=pid_path,
+            diagnosed_pid=diagnosed_pid,
+            recheck=recheck,
+            killed_pid=killed_pid,
+            kill_signal=kill_signal,
+        )
+        if stand_down is not None:
+            return stand_down
 
-        # Step 3: spawn the new daemon. Default to the cli helper that
-        # ``pm up`` uses; tests inject a mock.
-        spawner = spawn_fn or _default_spawn_fn()
-        spawn_error: str | None = None
-        try:
-            spawner(config_path)
-        except Exception as exc:  # noqa: BLE001
-            spawn_error = f"{type(exc).__name__}: {exc}"
-            logger.exception("rail_daemon_supervisor: spawn failed")
-
-        # Step 4: wait — still under the supervisor lock — for the
-        # freshly-spawned child to write a matching PID file. The real
-        # spawner is a detached ``Popen`` that returns immediately; if
-        # we release the lock now, a sibling supervisor can re-diagnose
-        # ``missing_pid`` and spawn a *second* daemon before this child
-        # gets to ``_claim_pid_file``. The wait is bounded
-        # (``child_wait_seconds``) so a buggy spawner can't deadlock us.
-        # Skipped if ``spawner`` itself raised — there is no child to
-        # wait for, and the existing "revived=False" reporting is correct.
-        if spawn_error is None:
-            confirmed_pid = _wait_for_child_pid(
-                pid_path,
-                config_path,
-                timeout_seconds=child_wait_seconds,
-                sleep_fn=sleep_fn,
-            )
-            if confirmed_pid is None:
-                # Don't flip revived=False — the spawn itself succeeded
-                # from our POV (Popen returned 0). But we did NOT
-                # observe the child claim the PID file before the
-                # timeout, so warn loudly so operators see chronic
-                # cases (slow imports, container OOM-on-boot, etc).
-                # Subsequent supervisor cycles will diagnose
-                # missing_pid / dead_process and recover the layer
-                # below us.
-                logger.warning(
-                    "rail_daemon_supervisor: spawned daemon did not "
-                    "register a PID at %s within %.1fs — proceeding "
-                    "but next cycle may re-spawn",
-                    pid_path, child_wait_seconds,
-                )
+        # Step 3 + 4: spawn the new daemon and wait for it to claim
+        # the PID file.
+        spawn_error = _spawn_and_wait_for_child(
+            spawn_fn=spawn_fn,
+            config_path=config_path,
+            pid_path=pid_path,
+            child_wait_seconds=child_wait_seconds,
+            sleep_fn=sleep_fn,
+        )
 
         revived = spawn_error is None
         result = RevivalResult(
@@ -1213,7 +1290,6 @@ def check_and_revive_rail_daemon(
                 kill_signal=kill_signal,
             )
         return result
-
 
 def _default_spawn_fn() -> Callable[[Path], None]:
     """Resolve the cli's ``_spawn_rail_daemon`` lazily.

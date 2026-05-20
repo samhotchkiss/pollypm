@@ -2071,82 +2071,22 @@ def task_assignment_sweep_handler(payload: dict[str, Any]) -> dict[str, Any]:
             )
 
 
-def _task_assignment_sweep_body(
+def _sweep_workspace_root(
     *,
     services: Any,
-    payload: dict[str, Any],
-    config_path: Path | None,
-) -> dict[str, Any]:
-    """Inner body of :func:`task_assignment_sweep_handler`.
+    throttle_override: int,
+    totals: dict,
+    alerted_pairs: set,
+    plan_missing_projects: set,
+    plan_decisions: dict,
+    review_pending_tasks: set,
+) -> dict[str, Any] | None:
+    """Pass 1: workspace-root DB sweep.
 
-    Split out so the outer handler can guarantee
-    :meth:`_RuntimeServices.close` runs on every return path (#1069).
+    Returns a ``{"outcome": "skipped", "reason": "no_work_service"}``
+    dict when there's no workspace work service AND no registered
+    projects (caller short-circuits). Returns ``None`` otherwise.
     """
-    # The sweeper uses a shorter throttle so pre-existing queued tasks
-    # get re-pinged every 5 min if they stay unclaimed — that's the
-    # "session came online late" recovery path from the spec.
-    throttle_override = int(payload.get("throttle_seconds", SWEEPER_COOLDOWN_SECONDS))
-    if throttle_override < 1:
-        throttle_override = SWEEPER_COOLDOWN_SECONDS
-
-    totals: dict[str, Any] = {"considered": 0, "by_outcome": {}}
-    alerted_pairs: set[tuple[str, str]] = set()
-    # #1524 — pre-compute the set of projects that are plan-gated this
-    # tick so the emit/clear decision is deterministic across the
-    # workspace pass + per-project pass. Pre-#1524 this set was derived
-    # as a side effect of the auto-claim loop, so a project would only
-    # land in it on ticks that happened to traverse the right path.
-    # After the per-project legacy DB was drained (post-#1519) the
-    # per-project fallback then cleared the alert on every other tick,
-    # producing the "Waiting on you / Queued" banner flash described in
-    # the issue. Computing once up front means the clear paths skip
-    # plan-gated projects every tick, regardless of which loop runs.
-    precomputed_missing = _precompute_plan_missing_projects(services)
-    plan_missing_projects: set[str] = set(precomputed_missing.keys())
-    plan_decisions: dict[str, bool] = {}
-    # Seed the per-tick gate cache with the precomputed answers so the
-    # workspace + per-project sweeps reuse the deterministic decision
-    # instead of recomputing (and potentially diverging) per task.
-    for missing_project in plan_missing_projects:
-        plan_decisions[missing_project] = False
-    # #1053: ``(project, task_number)`` pairs for tasks observed in
-    # ``review`` state during this sweep cycle. After the sweep, any
-    # open ``review_pending`` alert whose key isn't in this set is
-    # stale (task approved / rejected / cancelled) and gets cleared.
-    review_pending_tasks: set[tuple[str, int]] = set()
-    projects_scanned = 0
-    projects_skipped = 0
-
-    # #1524 — refresh the ``plan_missing`` alert row up front for every
-    # project in the precomputed set. This guarantees the alert stays
-    # open across consecutive ticks even when no queued task is reached
-    # in the per-project sweep body (e.g. legacy per-project DB has
-    # been drained but the canonical DB still has blocked work). The
-    # downstream per-task emit paths still fire to refresh the row when
-    # they encounter the first blocked task; the up-front refresh just
-    # ensures the row exists before any clear path could run.
-    for missing_project, example_task_id in precomputed_missing.items():
-        _emit_plan_missing_alert(
-            services,
-            project=missing_project,
-            example_task_id=example_task_id or missing_project,
-        )
-
-    # #1001: clear stale ``no_session*`` alerts whose project key isn't
-    # in the live registry. Run before the per-project sweeps so any
-    # row left over from a deregistered project doesn't survive the
-    # tick. The fire-path guard in ``_emit_no_session_alert`` /
-    # ``_escalate_no_session`` keeps new ghost alerts from being raised
-    # in the same pass.
-    ghost_cleared = _sweep_ghost_project_alerts(services)
-    if ghost_cleared:
-        totals["by_outcome"]["ghost_project_alerts_cleared"] = ghost_cleared
-
-    # Pass 1: workspace-root DB (workspace-level tasks the pollypm repo
-    # itself uses, or tests that point services.work_service at a
-    # tmpdir without registered projects). Workspace-root tasks aren't
-    # anchored to a single project directory, so the plan-presence
-    # gate is intentionally skipped for this pass (``project_path=None``).
     workspace_work = services.work_service
     if workspace_work is not None:
         try:
@@ -2167,11 +2107,13 @@ def _task_assignment_sweep_body(
         # to sweep. Keep the legacy "no_work_service" outcome for
         # observability / existing callers.
         return {"outcome": "skipped", "reason": "no_work_service"}
+    return None
 
-    # Workspace-root task DBs can contain tasks for any registered
-    # project. Reopen that same DB once per project with the project's
-    # filesystem path and session manager before auto-claiming; a generic
-    # workspace-root work service cannot provision a project-scoped worker.
+
+def _sweep_workspace_per_project(
+    *, services: Any, totals: dict, plan_missing_projects: set,
+) -> None:
+    """Open the workspace DB once per registered project and run auto-claim."""
     for project in services.known_projects:
         if not _auto_claim_enabled_for_project(services, project):
             continue
@@ -2192,9 +2134,20 @@ def _task_assignment_sweep_body(
         finally:
             _close_quietly(workspace_project_work)
 
-    # Pass 2: per-project DBs. Each gets its own connection, opened and
-    # closed within the sweep tick so we don't pile up file handles
-    # when many projects are registered.
+
+def _sweep_per_project_dbs(
+    *,
+    services: Any,
+    throttle_override: int,
+    totals: dict,
+    alerted_pairs: set,
+    plan_missing_projects: set,
+    plan_decisions: dict,
+    review_pending_tasks: set,
+) -> tuple[int, int]:
+    """Pass 2: per-project DB sweep. Returns ``(scanned, skipped)``."""
+    projects_scanned = 0
+    projects_skipped = 0
     for project in services.known_projects:
         project_key = getattr(project, "key", None)
         project_work = _open_project_work_service(project, services)
@@ -2241,23 +2194,16 @@ def _task_assignment_sweep_body(
             projects_scanned += 1
         finally:
             _close_quietly(project_work)
+    return projects_scanned, projects_skipped
 
-    # #1053: clear stale ``review_pending`` alerts. Walk every open
-    # alert with ``alert_type == 'review_pending'`` and close any whose
-    # ``(project, task_number)`` key wasn't observed in the review-state
-    # tracking set above. Tasks that were approved, rejected, or
-    # cancelled since the previous sweep tick are no longer in
-    # ``review`` and shouldn't keep nagging the user.
-    review_pending_cleared = _sweep_stale_review_pending_alerts(
-        services, review_pending_tasks,
-    )
 
-    # #1005: after the sweep has refreshed the open alert set, walk any
-    # ``<role>/no_session`` alerts and attempt auto-recovery
-    # (``pm worker-start --role <role> <project>``). The helper bounds
-    # retries, applies an exponential backoff per (role, project), and
-    # escalates to ``<role>/no_session_spawn_failed`` once attempts
-    # exhaust — mirroring the heartbeat's ``recovery_limit`` pattern.
+def _sweep_recovery_passes(
+    *, services: Any, config_path: Path | None,
+) -> tuple[dict[str, int], dict[str, int], dict[str, int]]:
+    """End-of-tick recovery passes.
+
+    Returns ``(spawn_summary, worker_gap_summary, missing_worker_summary)``.
+    """
     spawn_summary: dict[str, int] = {}
     try:
         from pollypm.recovery.no_session_spawn import (
@@ -2276,10 +2222,6 @@ def _task_assignment_sweep_body(
             exc_info=True,
         )
 
-    # #1054: surface projects that have queued tasks but no
-    # ``worker_<project>`` (or ``worker-<project>``) tmux session — the
-    # invisible-failure case where queued work sits forever because no
-    # worker exists to claim it. Sister of #1053.
     worker_gap_summary = {"emitted": 0, "cleared": 0}
     try:
         worker_gap_summary = _sweep_worker_session_gaps(services)
@@ -2289,13 +2231,6 @@ def _task_assignment_sweep_body(
             exc_info=True,
         )
 
-    # #1070: surface tasks that are ``in_progress`` / ``rework`` with a
-    # per-task worker role bound but whose ``task-<project>-<N>`` tmux
-    # window is missing from the storage-closet (worker died, daemon
-    # restart blew it away, etc.). Detection only — recovery is the
-    # operator's job once the alert fires. Independent of
-    # ``auto_claim`` so projects with auto-claim disabled (or with
-    # tripped circuit breakers) still surface the gap.
     missing_worker_summary = {"emitted": 0, "cleared": 0, "considered": 0}
     try:
         missing_worker_summary = _sweep_missing_task_workers(services)
@@ -2304,6 +2239,97 @@ def _task_assignment_sweep_body(
             "task_assignment sweep: missing_task_worker pass failed",
             exc_info=True,
         )
+    return spawn_summary, worker_gap_summary, missing_worker_summary
+
+
+def _task_assignment_sweep_body(
+    *,
+    services: Any,
+    payload: dict[str, Any],
+    config_path: Path | None,
+) -> dict[str, Any]:
+    """Inner body of :func:`task_assignment_sweep_handler`.
+
+    Split out so the outer handler can guarantee
+    :meth:`_RuntimeServices.close` runs on every return path (#1069).
+    """
+    # The sweeper uses a shorter throttle so pre-existing queued tasks
+    # get re-pinged every 5 min if they stay unclaimed — that's the
+    # "session came online late" recovery path from the spec.
+    throttle_override = int(payload.get("throttle_seconds", SWEEPER_COOLDOWN_SECONDS))
+    if throttle_override < 1:
+        throttle_override = SWEEPER_COOLDOWN_SECONDS
+
+    totals: dict[str, Any] = {"considered": 0, "by_outcome": {}}
+    alerted_pairs: set[tuple[str, str]] = set()
+    # #1524 — pre-compute the set of projects that are plan-gated this
+    # tick so the emit/clear decision is deterministic across the
+    # workspace pass + per-project pass.
+    precomputed_missing = _precompute_plan_missing_projects(services)
+    plan_missing_projects: set[str] = set(precomputed_missing.keys())
+    plan_decisions: dict[str, bool] = {}
+    # Seed the per-tick gate cache with the precomputed answers so the
+    # workspace + per-project sweeps reuse the deterministic decision
+    # instead of recomputing (and potentially diverging) per task.
+    for missing_project in plan_missing_projects:
+        plan_decisions[missing_project] = False
+    # #1053: ``(project, task_number)`` pairs for tasks observed in
+    # ``review`` state during this sweep cycle. After the sweep, any
+    # open ``review_pending`` alert whose key isn't in this set is
+    # stale (task approved / rejected / cancelled) and gets cleared.
+    review_pending_tasks: set[tuple[str, int]] = set()
+
+    # #1524 — refresh the ``plan_missing`` alert row up front for every
+    # project in the precomputed set.
+    for missing_project, example_task_id in precomputed_missing.items():
+        _emit_plan_missing_alert(
+            services,
+            project=missing_project,
+            example_task_id=example_task_id or missing_project,
+        )
+
+    # #1001: clear stale ``no_session*`` alerts whose project key isn't
+    # in the live registry.
+    ghost_cleared = _sweep_ghost_project_alerts(services)
+    if ghost_cleared:
+        totals["by_outcome"]["ghost_project_alerts_cleared"] = ghost_cleared
+
+    short_circuit = _sweep_workspace_root(
+        services=services,
+        throttle_override=throttle_override,
+        totals=totals,
+        alerted_pairs=alerted_pairs,
+        plan_missing_projects=plan_missing_projects,
+        plan_decisions=plan_decisions,
+        review_pending_tasks=review_pending_tasks,
+    )
+    if short_circuit is not None:
+        return short_circuit
+
+    _sweep_workspace_per_project(
+        services=services,
+        totals=totals,
+        plan_missing_projects=plan_missing_projects,
+    )
+
+    projects_scanned, projects_skipped = _sweep_per_project_dbs(
+        services=services,
+        throttle_override=throttle_override,
+        totals=totals,
+        alerted_pairs=alerted_pairs,
+        plan_missing_projects=plan_missing_projects,
+        plan_decisions=plan_decisions,
+        review_pending_tasks=review_pending_tasks,
+    )
+
+    # #1053: clear stale ``review_pending`` alerts.
+    review_pending_cleared = _sweep_stale_review_pending_alerts(
+        services, review_pending_tasks,
+    )
+
+    spawn_summary, worker_gap_summary, missing_worker_summary = (
+        _sweep_recovery_passes(services=services, config_path=config_path)
+    )
 
     return {
         "outcome": "swept",

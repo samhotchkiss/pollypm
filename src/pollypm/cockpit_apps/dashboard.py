@@ -170,8 +170,7 @@ class PollyDashboardApp(App[None]):
         self._refresh_error = error
         self._render_cached_dashboard()
 
-    def _render_dashboard(self, config, data) -> None:
-        # ── Header ──
+    def _build_dashboard_header_text(self, config, data) -> str:
         n_projects = len(config.projects)
         n_sessions = len(config.sessions)
         project_word = "project" if n_projects == 1 else "projects"
@@ -209,9 +208,9 @@ class PollyDashboardApp(App[None]):
         header_text = "\n".join(header_lines)
         if data.briefing:
             header_text += f"\n\n  [#58a6ff]{data.briefing}[/#58a6ff]"
-        self.header_w.update(header_text)
+        return header_text
 
-        # ── Now: what's being worked on ──
+    def _build_dashboard_now_lines(self, data) -> list[str]:
         lines: list[str] = []
         for s in data.active_sessions:
             if s.role == "heartbeat-supervisor":
@@ -234,9 +233,9 @@ class PollyDashboardApp(App[None]):
                 icon = "[dim]\u25cb[/dim]"
                 name = f"[dim]{s.project_label}[/dim]" if s.role != "operator-pm" else "[dim]Polly[/dim]"
                 lines.append(f"{icon} {name}  [dim]{s.status}[/dim]")
-        self.now_body.update("\n".join(lines) if lines else "[dim]No active sessions[/dim]")
+        return lines
 
-        # ── Recent messages ──
+    def _build_dashboard_messages_lines(self, data) -> list[str]:
         message_lines: list[str] = []
         if data.recent_messages:
             for item in data.recent_messages:
@@ -269,21 +268,18 @@ class PollyDashboardApp(App[None]):
             noun = "item" if count == 1 else "items"
             message_lines.append(
                 f"[dim]No recent messages from tracked projects "
-                f"· [b]{count}[/b] {noun} in the inbox[/dim]"
+                f"\u00b7 [b]{count}[/b] {noun} in the inbox[/dim]"
             )
-            # #1100 — see sibling comment above; capital ``I`` is the
-            # actual Home-reachable Inbox keystroke post-#1089.
             message_lines.append("[dim]Press [b]I[/b] to jump to the inbox[/dim]")
         else:
             message_lines.append("[dim]Inbox is clear.[/dim]")
-        self.messages_body.update("\n".join(message_lines))
+        return message_lines
 
-        # ── Done: commits + completed issues ──
+    def _build_dashboard_done_lines(self, data) -> list[str]:
         done_lines: list[str] = []
         if data.recent_commits:
             done_lines.append(f"[#3fb950]\u2713[/#3fb950] [b]{len(data.recent_commits)}[/b] commits today")
             for c in data.recent_commits[:6]:
-                age = self._age_str(c.age_seconds)
                 done_lines.append(
                     f"  [dim]{c.hash}[/dim] {c.message}"
                 )
@@ -323,22 +319,21 @@ class PollyDashboardApp(App[None]):
                 done_lines.append("  ".join(summary))
             else:
                 done_lines.append("[dim]No activity in the last 24 hours[/dim]")
+        return done_lines
 
-        self.done_body.update("\n".join(done_lines))
-
-        # ── Token chart + cached LLM account quota ──
+    def _build_dashboard_chart_lines(self, data, account_usages) -> list[str]:
         chart_lines: list[str] = []
         if account_usages:
             chart_lines.append("[b]LLM account quota usage[/b]")
             for usage in account_usages:
                 if usage.severity == "critical":
-                    marker = "[#f85149]▲[/#f85149]"
-                    suffix = " · over limit"
+                    marker = "[#f85149]\u25b2[/#f85149]"
+                    suffix = " \u00b7 over limit"
                 elif usage.severity == "warning":
-                    marker = "[#d29922]◆[/#d29922]"
-                    suffix = " · approaching ceiling"
+                    marker = "[#d29922]\u25c6[/#d29922]"
+                    suffix = " \u00b7 approaching ceiling"
                 else:
-                    marker = "[dim]·[/dim]"
+                    marker = "[dim]\u00b7[/dim]"
                     suffix = ""
                 label = usage.provider or usage.account_name
                 if usage.email:
@@ -348,7 +343,7 @@ class PollyDashboardApp(App[None]):
                     f"[b]{usage.used_pct}%[/b] used of {_escape(usage.limit_label)}"
                 )
                 if usage.reset_at and usage.severity in {"warning", "critical"}:
-                    suffix += f" · resets {_escape(usage.reset_at)}"
+                    suffix += f" \u00b7 resets {_escape(usage.reset_at)}"
                 chart_lines.append(line + suffix)
             chart_lines.append("")
 
@@ -378,12 +373,12 @@ class PollyDashboardApp(App[None]):
             chart_lines.append(
                 f"[b]{data.total_tokens:,}[/b] total  \u00b7  [b]{data.today_tokens:,}[/b] today"
             )
-            self.chart_body.update("\n".join(chart_lines))
         else:
             chart_lines.append("[dim]No token data yet[/dim]")
-            self.chart_body.update("\n".join(chart_lines))
+        return chart_lines
 
-        # ── Footer ──
+    def _build_dashboard_footer(self, config, data) -> str:
+        n_projects = len(config.projects)
         sweep_word = "sweep" if data.sweep_count_24h == 1 else "sweeps"
         msg_word = "message" if data.message_count_24h == 1 else "messages"
         footer_action = (
@@ -399,7 +394,32 @@ class PollyDashboardApp(App[None]):
         if self._refresh_error:
             footer += "  \u00b7  stale cache"
         footer += "[/dim]"
-        self.footer_w.update(footer)
+        return footer
+
+    def _render_dashboard(self, config, data) -> None:
+        # Header
+        self.header_w.update(self._build_dashboard_header_text(config, data))
+
+        # Now: what's being worked on
+        lines = self._build_dashboard_now_lines(data)
+        self.now_body.update("\n".join(lines) if lines else "[dim]No active sessions[/dim]")
+
+        # Recent messages
+        self.messages_body.update(
+            "\n".join(self._build_dashboard_messages_lines(data))
+        )
+
+        # Done: commits + completed issues
+        self.done_body.update("\n".join(self._build_dashboard_done_lines(data)))
+
+        # Token chart + cached LLM account quota
+        account_usages = getattr(data, "account_usages", [])
+        self.chart_body.update(
+            "\n".join(self._build_dashboard_chart_lines(data, account_usages))
+        )
+
+        # Footer
+        self.footer_w.update(self._build_dashboard_footer(config, data))
 
     def action_jump_inbox(self) -> None:
         self.run_worker(

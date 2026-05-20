@@ -680,6 +680,156 @@ def _warn_on_plugin_load_errors(config_path: Path) -> None:
     typer.echo("  Run `pm status` for the full list.", err=True)
 
 
+def _cockpit_impl(config_path: Path) -> None:
+    _enforce_migration_gate(config_path)
+    _warn_on_plugin_load_errors(config_path)
+    _install_cockpit_debug_log_handler(config_path)
+    crash_log = config_path.parent / "cockpit_crash.log"
+    debug_log = config_path.parent / "cockpit_debug.log"
+    try:
+        with open(debug_log, "a") as debug_handle:
+            debug_handle.write(f"\n--- START {datetime.now().isoformat()} ---\n")
+        from pollypm.cockpit_ui import PollyCockpitApp
+
+        PollyCockpitApp(config_path).run(mouse=True)
+        with open(debug_log, "a") as debug_handle:
+            debug_handle.write(f"--- CLEAN EXIT {datetime.now().isoformat()} ---\n")
+    except Exception:
+        with open(crash_log, "a") as crash_handle:
+            crash_handle.write(f"\n--- {datetime.now().isoformat()} ---\n")
+            traceback.print_exc(file=crash_handle)
+        with open(debug_log, "a") as debug_handle:
+            debug_handle.write(f"--- CRASH {datetime.now().isoformat()} ---\n")
+            traceback.print_exc(file=debug_handle)
+        raise
+
+
+def _cockpit_pane_impl(
+    kind: str,
+    target: str | None,
+    config_path: Path,
+    project: str | None,
+    task_id: str | None,
+) -> None:
+    _enforce_migration_gate(config_path)
+    _install_cockpit_debug_log_handler(config_path)
+    # #1694 — standalone cockpit panes run in their own process, so
+    # registration seams (activity projector, approval notifications,
+    # briefings, maintenance handlers) need the plugin host
+    # initialized here. Without this, panes like ``activity`` and
+    # ``project`` render empty even when their backing plugin is
+    # installed.
+    _initialize_plugin_host_for_pane(config_path)
+    if kind == "settings" and target:
+        from pollypm.cockpit_ui import PollyProjectSettingsApp
+
+        PollyProjectSettingsApp(config_path, target).run(mouse=True)
+        return
+    if kind == "settings":
+        from pollypm.cockpit_ui import PollySettingsPaneApp
+
+        PollySettingsPaneApp(config_path).run(mouse=True)
+        return
+    if kind in ("polly", "dashboard"):
+        from pollypm.cockpit_ui import PollyDashboardApp
+
+        PollyDashboardApp(config_path).run(mouse=True)
+        return
+    if kind == "operator":
+        from pollypm.cockpit_apps.operator_dashboard import (
+            PollyOperatorDashboardApp,
+        )
+
+        PollyOperatorDashboardApp(config_path).run(mouse=True)
+        return
+    if kind == "inbox":
+        from pollypm.cockpit_ui import PollyInboxApp
+
+        # #751 — ``--project <key>`` pre-scopes the inbox to the
+        # given project on mount. Used when jumping from a
+        # project dashboard so the user sees only that project's
+        # items on arrival.
+        project_key = project or target
+        PollyInboxApp(config_path, initial_project=project_key).run(mouse=True)
+        return
+    if kind == "workers":
+        from pollypm.cockpit_ui import PollyWorkerRosterApp
+
+        PollyWorkerRosterApp(config_path).run(mouse=True)
+        return
+    if kind == "metrics":
+        from pollypm.cockpit_ui import PollyMetricsApp
+
+        PollyMetricsApp(config_path).run(mouse=True)
+        return
+    if kind == "issues" and target:
+        from pollypm.cockpit_tasks import PollyTasksApp
+
+        PollyTasksApp(
+            config_path,
+            target,
+            initial_task_id=task_id,
+        ).run(mouse=True)
+        return
+    if kind == "activity":
+        from pollypm.cockpit_ui import PollyActivityFeedApp
+
+        project_key = project or target
+        PollyActivityFeedApp(config_path, project_key=project_key).run(mouse=True)
+        return
+    if kind == "project" and target:
+        from pollypm.cockpit_ui import PollyProjectDashboardApp
+
+        PollyProjectDashboardApp(config_path, target).run(mouse=True)
+        return
+    from pollypm.cockpit_ui import PollyCockpitPaneApp
+
+    PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
+
+
+def _cockpit_send_key_impl(key: str, config_path: Path, kind: str) -> None:
+    from pollypm.cockpit_input_bridge import send_key_to_first_live
+
+    if kind == "cockpit":
+        delivered_to_content = _send_help_modal_key_to_recorded_bridge(
+            config_path, key,
+        )
+        if delivered_to_content is not None:
+            typer.echo(f"Delivered {key!r} via {delivered_to_content}")
+            return
+        delivered_to_content = _send_selected_action_key_to_content_bridge(
+            config_path, key,
+        )
+        if delivered_to_content is not None:
+            typer.echo(f"Delivered {key!r} via {delivered_to_content}")
+            return
+        delivered_to_right = _send_key_to_active_live_right_pane(
+            config_path, key,
+        )
+        if delivered_to_right is not None:
+            typer.echo(
+                f"Delivered {key!r} via cockpit right pane {delivered_to_right}"
+            )
+            return
+        delivered_to_content = _send_help_key_to_content_bridge(
+            config_path, key,
+        )
+        if delivered_to_content is not None:
+            typer.echo(f"Delivered {key!r} via {delivered_to_content}")
+            return
+
+    delivered_to = send_key_to_first_live(config_path, key, kind=kind)
+    if delivered_to is None:
+        typer.echo(
+            "No live cockpit input bridge found. Either no cockpit "
+            "is running, or it predates the #1109 follow-up "
+            "(restart the cockpit to pick up the bridge).",
+            err=True,
+        )
+        raise typer.Exit(code=1)
+    typer.echo(f"Delivered {key!r} via {delivered_to}")
+
+
 def register_ui_commands(app: typer.Typer) -> None:
     @app.command(help="Launch the standalone Accounts management TUI.")
     def accounts_ui(
@@ -707,27 +857,7 @@ def register_ui_commands(app: typer.Typer) -> None:
     def cockpit(
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        _enforce_migration_gate(config_path)
-        _warn_on_plugin_load_errors(config_path)
-        _install_cockpit_debug_log_handler(config_path)
-        crash_log = config_path.parent / "cockpit_crash.log"
-        debug_log = config_path.parent / "cockpit_debug.log"
-        try:
-            with open(debug_log, "a") as debug_handle:
-                debug_handle.write(f"\n--- START {datetime.now().isoformat()} ---\n")
-            from pollypm.cockpit_ui import PollyCockpitApp
-
-            PollyCockpitApp(config_path).run(mouse=True)
-            with open(debug_log, "a") as debug_handle:
-                debug_handle.write(f"--- CLEAN EXIT {datetime.now().isoformat()} ---\n")
-        except Exception:
-            with open(crash_log, "a") as crash_handle:
-                crash_handle.write(f"\n--- {datetime.now().isoformat()} ---\n")
-                traceback.print_exc(file=crash_handle)
-            with open(debug_log, "a") as debug_handle:
-                debug_handle.write(f"--- CRASH {datetime.now().isoformat()} ---\n")
-                traceback.print_exc(file=debug_handle)
-            raise
+        _cockpit_impl(config_path)
 
     @app.command(
         "cockpit-pane",
@@ -756,80 +886,7 @@ def register_ui_commands(app: typer.Typer) -> None:
             help="Preselect a task in task-oriented cockpit panes.",
         ),
     ) -> None:
-        _enforce_migration_gate(config_path)
-        _install_cockpit_debug_log_handler(config_path)
-        # #1694 — standalone cockpit panes run in their own process, so
-        # registration seams (activity projector, approval notifications,
-        # briefings, maintenance handlers) need the plugin host
-        # initialized here. Without this, panes like ``activity`` and
-        # ``project`` render empty even when their backing plugin is
-        # installed.
-        _initialize_plugin_host_for_pane(config_path)
-        if kind == "settings" and target:
-            from pollypm.cockpit_ui import PollyProjectSettingsApp
-
-            PollyProjectSettingsApp(config_path, target).run(mouse=True)
-            return
-        if kind == "settings":
-            from pollypm.cockpit_ui import PollySettingsPaneApp
-
-            PollySettingsPaneApp(config_path).run(mouse=True)
-            return
-        if kind in ("polly", "dashboard"):
-            from pollypm.cockpit_ui import PollyDashboardApp
-
-            PollyDashboardApp(config_path).run(mouse=True)
-            return
-        if kind == "operator":
-            from pollypm.cockpit_apps.operator_dashboard import (
-                PollyOperatorDashboardApp,
-            )
-
-            PollyOperatorDashboardApp(config_path).run(mouse=True)
-            return
-        if kind == "inbox":
-            from pollypm.cockpit_ui import PollyInboxApp
-
-            # #751 — ``--project <key>`` pre-scopes the inbox to the
-            # given project on mount. Used when jumping from a
-            # project dashboard so the user sees only that project's
-            # items on arrival.
-            project_key = project or target
-            PollyInboxApp(config_path, initial_project=project_key).run(mouse=True)
-            return
-        if kind == "workers":
-            from pollypm.cockpit_ui import PollyWorkerRosterApp
-
-            PollyWorkerRosterApp(config_path).run(mouse=True)
-            return
-        if kind == "metrics":
-            from pollypm.cockpit_ui import PollyMetricsApp
-
-            PollyMetricsApp(config_path).run(mouse=True)
-            return
-        if kind == "issues" and target:
-            from pollypm.cockpit_tasks import PollyTasksApp
-
-            PollyTasksApp(
-                config_path,
-                target,
-                initial_task_id=task_id,
-            ).run(mouse=True)
-            return
-        if kind == "activity":
-            from pollypm.cockpit_ui import PollyActivityFeedApp
-
-            project_key = project or target
-            PollyActivityFeedApp(config_path, project_key=project_key).run(mouse=True)
-            return
-        if kind == "project" and target:
-            from pollypm.cockpit_ui import PollyProjectDashboardApp
-
-            PollyProjectDashboardApp(config_path, target).run(mouse=True)
-            return
-        from pollypm.cockpit_ui import PollyCockpitPaneApp
-
-        PollyCockpitPaneApp(config_path, kind, target).run(mouse=True)
+        _cockpit_pane_impl(kind, target, config_path, project, task_id)
 
     @app.command(
         "cockpit-send-key",
@@ -865,43 +922,4 @@ def register_ui_commands(app: typer.Typer) -> None:
             ),
         ),
     ) -> None:
-        from pollypm.cockpit_input_bridge import send_key_to_first_live
-
-        if kind == "cockpit":
-            delivered_to_content = _send_help_modal_key_to_recorded_bridge(
-                config_path, key,
-            )
-            if delivered_to_content is not None:
-                typer.echo(f"Delivered {key!r} via {delivered_to_content}")
-                return
-            delivered_to_content = _send_selected_action_key_to_content_bridge(
-                config_path, key,
-            )
-            if delivered_to_content is not None:
-                typer.echo(f"Delivered {key!r} via {delivered_to_content}")
-                return
-            delivered_to_right = _send_key_to_active_live_right_pane(
-                config_path, key,
-            )
-            if delivered_to_right is not None:
-                typer.echo(
-                    f"Delivered {key!r} via cockpit right pane {delivered_to_right}"
-                )
-                return
-            delivered_to_content = _send_help_key_to_content_bridge(
-                config_path, key,
-            )
-            if delivered_to_content is not None:
-                typer.echo(f"Delivered {key!r} via {delivered_to_content}")
-                return
-
-        delivered_to = send_key_to_first_live(config_path, key, kind=kind)
-        if delivered_to is None:
-            typer.echo(
-                "No live cockpit input bridge found. Either no cockpit "
-                "is running, or it predates the #1109 follow-up "
-                "(restart the cockpit to pick up the bridge).",
-                err=True,
-            )
-            raise typer.Exit(code=1)
-        typer.echo(f"Delivered {key!r} via {delivered_to}")
+        _cockpit_send_key_impl(key, config_path, kind)

@@ -793,14 +793,14 @@ def rename_project(
             f"{', '.join(sorted(set(tmux_windows_mentioning_old)))}. "
             "Kill + relaunch each affected session to pick up new names."
         )
-    work_db = project.path / ".pollypm" / "state.db"
+    work_db = project_state_db_path(project.path)
     if work_db.exists():
         warnings.append(
             f"Work-service task IDs in {work_db} still use the old "
             f"slug (e.g. {old_slug}/1). Existing tasks keep their IDs; "
             "new tasks will use the new slug."
         )
-    worktree_root = project.path / ".pollypm" / "worktrees"
+    worktree_root = project_worktrees_dir(project.path)
     if worktree_root.exists():
         old_worktrees = [p.name for p in worktree_root.iterdir() if old_slug in p.name]
         if old_worktrees:

@@ -887,6 +887,161 @@ def _emit_pane_pattern_inbox_item(
     return True
 
 
+def _worktree_audit_clear_clean(
+    *,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    state_alert_types: tuple[str, ...],
+    alert_exists_fn,
+) -> int:
+    """Clear every stale ``worktree_state:*`` alert for a now-clean worktree."""
+    cleared = 0
+    for kind in state_alert_types:
+        alert_type = f"worktree_state:{task_id}:{kind}"
+        if not alert_exists_fn(session_key, alert_type):
+            continue
+        try:
+            (msg_store or store).clear_alert(session_key, alert_type)
+            cleared += 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "worktree.state_audit: clear_alert failed for %s/%s",
+                session_key, alert_type, exc_info=True,
+            )
+    return cleared
+
+
+def _worktree_audit_handle_merge_conflict(
+    *,
+    classification,
+    wt_path: Path,
+    sess,
+    agent: str,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    work: Any,
+) -> tuple[int, int]:
+    """Raise the merge-conflict alert and emit the inbox task."""
+    alert_type = f"worktree_state:{task_id}:merge_conflict"
+    files = classification.metadata.get("conflict_files", [])
+    file_blurb = (
+        f" ({len(files)} file{'s' if len(files) != 1 else ''})"
+        if files else ""
+    )
+    message = (
+        f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
+        f"{task_id}. Worker is blocked until the conflict resolves."
+    )
+    _raise_alert(msg_store or store, session_key, alert_type, "error", message)
+    fix_hint = (
+        f"Run `git -C {wt_path} status` to inspect the conflict, "
+        f"then resolve and `git commit` or reassign the task."
+    )
+    file_word = "file" if len(files) == 1 else "files"
+    body = (
+        f"Worker {agent} hit a merge conflict in {wt_path} while "
+        f"working on task {task_id}.\n\n"
+        f"{len(files)} conflicted {file_word} detected.\n\n"
+        f"Fix: {fix_hint}"
+    )
+    emitted = 1 if _emit_inbox_task(
+        work,
+        subject=f"Merge conflict: {task_id}",
+        body=body,
+        actor=agent,
+        dedupe_label=f"worktree_audit:{task_id}:merge_conflict",
+        project=sess.task_project,
+    ) else 0
+    return 1, emitted
+
+
+def _worktree_audit_handle_dirty_stale(
+    *,
+    classification,
+    wt_path: Path,
+    agent: str,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    now_epoch: float,
+    dirty_stale_seconds: int,
+    alert_exists_fn,
+) -> tuple[int, int]:
+    """Either raise or clear the dirty-stale alert based on mtime age."""
+    try:
+        mtime = wt_path.stat().st_mtime
+    except OSError:
+        mtime = now_epoch
+    age_s = now_epoch - mtime
+    alert_type = f"worktree_state:{task_id}:dirty_stale"
+    if age_s >= dirty_stale_seconds:
+        message = (
+            f"{agent}: {wt_path} has uncommitted changes and "
+            f"hasn't been touched in ~{int(age_s // 60)}min "
+            f"(task {task_id}). Fix: check in on the worker \u2014 "
+            f"likely stuck or idle."
+        )
+        _raise_alert(msg_store or store, session_key, alert_type, "warn", message)
+        return 1, 0
+    if alert_exists_fn(session_key, alert_type):
+        try:
+            (msg_store or store).clear_alert(session_key, alert_type)
+            return 0, 1
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "worktree.state_audit: clear_alert failed for %s/%s",
+                session_key, alert_type, exc_info=True,
+            )
+    return 0, 0
+
+
+def _worktree_audit_handle_orphan_branch(
+    *,
+    classification,
+    wt_path: Path,
+    sess,
+    agent: str,
+    session_key: str,
+    task_id: str,
+    msg_store: Any,
+    store: Any,
+    work: Any,
+) -> tuple[int, int]:
+    """Raise the orphan-branch alert and emit the inbox task."""
+    age_days = float(classification.metadata.get("age_days", 0.0))
+    alert_type = f"worktree_state:{task_id}:orphan_branch"
+    message = (
+        f"{agent}: {wt_path} on local-only branch "
+        f"{classification.branch or '(unknown)'} with no upstream "
+        f"and no commit in ~{age_days:.1f}d (task {task_id}). "
+        f"Fix: push or archive the branch before the prune "
+        f"handler GCs it."
+    )
+    _raise_alert(msg_store or store, session_key, alert_type, "info", message)
+    body = (
+        f"Worker {agent}'s worktree for task {task_id} is on a "
+        f"local-only branch with no upstream and ~{age_days:.1f} "
+        f"days of inactivity.\n\n"
+        f"Path: {wt_path}\n\n"
+        f"Fix: push the branch, merge/abandon the task, or let "
+        f"the hourly `agent_worktree.prune` handler decide."
+    )
+    emitted = 1 if _emit_inbox_task(
+        work,
+        subject=f"Orphan worktree branch: {task_id}",
+        body=body,
+        actor=agent,
+        dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
+        project=sess.task_project,
+    ) else 0
+    return 1, emitted
+
+
 def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Classify every active worker-session worktree + surface blockers (#251)."""
     import time as _time
@@ -973,53 +1128,30 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                 classified[state.value] = classified.get(state.value, 0) + 1
 
                 if state in (WorktreeState.CLEAN, WorktreeState.MISSING):
-                    for kind in STATE_ALERT_TYPES:
-                        alert_type = f"worktree_state:{task_id}:{kind}"
-                        if not _alert_exists(session_key, alert_type):
-                            continue
-                        try:
-                            (msg_store or store).clear_alert(session_key, alert_type)
-                            alerts_cleared += 1
-                        except Exception:  # noqa: BLE001
-                            logger.warning(
-                                "worktree.state_audit: clear_alert failed for %s/%s",
-                                session_key, alert_type, exc_info=True,
-                            )
+                    alerts_cleared += _worktree_audit_clear_clean(
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        state_alert_types=STATE_ALERT_TYPES,
+                        alert_exists_fn=_alert_exists,
+                    )
                     continue
 
                 if state is WorktreeState.MERGE_CONFLICT:
-                    alert_type = f"worktree_state:{task_id}:merge_conflict"
-                    files = classification.metadata.get("conflict_files", [])
-                    file_blurb = (
-                        f" ({len(files)} file{'s' if len(files) != 1 else ''})"
-                        if files else ""
+                    raised, emitted = _worktree_audit_handle_merge_conflict(
+                        classification=classification,
+                        wt_path=wt_path,
+                        sess=sess,
+                        agent=agent,
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        work=work,
                     )
-                    message = (
-                        f"{agent}: merge conflict in {wt_path}{file_blurb} on task "
-                        f"{task_id}. Worker is blocked until the conflict resolves."
-                    )
-                    _raise_alert(msg_store or store, session_key, alert_type, "error", message)
-                    alerts_raised += 1
-                    fix_hint = (
-                        f"Run `git -C {wt_path} status` to inspect the conflict, "
-                        f"then resolve and `git commit` or reassign the task."
-                    )
-                    file_word = "file" if len(files) == 1 else "files"
-                    body = (
-                        f"Worker {agent} hit a merge conflict in {wt_path} while "
-                        f"working on task {task_id}.\n\n"
-                        f"{len(files)} conflicted {file_word} detected.\n\n"
-                        f"Fix: {fix_hint}"
-                    )
-                    if _emit_inbox_task(
-                        work,
-                        subject=f"Merge conflict: {task_id}",
-                        body=body,
-                        actor=agent,
-                        dedupe_label=f"worktree_audit:{task_id}:merge_conflict",
-                        project=sess.task_project,
-                    ):
-                        inbox_emitted += 1
+                    alerts_raised += raised
+                    inbox_emitted += emitted
 
                 elif state is WorktreeState.LOCK_FILE:
                     lock_age = float(
@@ -1050,61 +1182,35 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     alerts_raised += 1
 
                 elif state is WorktreeState.DIRTY_EXPECTED:
-                    try:
-                        mtime = wt_path.stat().st_mtime
-                    except OSError:
-                        mtime = now_epoch
-                    age_s = now_epoch - mtime
-                    alert_type = f"worktree_state:{task_id}:dirty_stale"
-                    if age_s >= DIRTY_STALE_SECONDS:
-                        message = (
-                            f"{agent}: {wt_path} has uncommitted changes and "
-                            f"hasn't been touched in ~{int(age_s // 60)}min "
-                            f"(task {task_id}). Fix: check in on the worker — "
-                            f"likely stuck or idle."
-                        )
-                        _raise_alert(msg_store or store, session_key, alert_type, "warn", message)
-                        alerts_raised += 1
-                    else:
-                        if _alert_exists(session_key, alert_type):
-                            try:
-                                (msg_store or store).clear_alert(session_key, alert_type)
-                                alerts_cleared += 1
-                            except Exception:  # noqa: BLE001
-                                logger.warning(
-                                    "worktree.state_audit: clear_alert failed for %s/%s",
-                                    session_key, alert_type, exc_info=True,
-                                )
+                    raised, cleared = _worktree_audit_handle_dirty_stale(
+                        classification=classification,
+                        wt_path=wt_path,
+                        agent=agent,
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        now_epoch=now_epoch,
+                        dirty_stale_seconds=DIRTY_STALE_SECONDS,
+                        alert_exists_fn=_alert_exists,
+                    )
+                    alerts_raised += raised
+                    alerts_cleared += cleared
 
                 elif state is WorktreeState.ORPHAN_BRANCH:
-                    age_days = float(classification.metadata.get("age_days", 0.0))
-                    alert_type = f"worktree_state:{task_id}:orphan_branch"
-                    message = (
-                        f"{agent}: {wt_path} on local-only branch "
-                        f"{classification.branch or '(unknown)'} with no upstream "
-                        f"and no commit in ~{age_days:.1f}d (task {task_id}). "
-                        f"Fix: push or archive the branch before the prune "
-                        f"handler GCs it."
+                    raised, emitted = _worktree_audit_handle_orphan_branch(
+                        classification=classification,
+                        wt_path=wt_path,
+                        sess=sess,
+                        agent=agent,
+                        session_key=session_key,
+                        task_id=task_id,
+                        msg_store=msg_store,
+                        store=store,
+                        work=work,
                     )
-                    _raise_alert(msg_store or store, session_key, alert_type, "info", message)
-                    alerts_raised += 1
-                    body = (
-                        f"Worker {agent}'s worktree for task {task_id} is on a "
-                        f"local-only branch with no upstream and ~{age_days:.1f} "
-                        f"days of inactivity.\n\n"
-                        f"Path: {wt_path}\n\n"
-                        f"Fix: push the branch, merge/abandon the task, or let "
-                        f"the hourly `agent_worktree.prune` handler decide."
-                    )
-                    if _emit_inbox_task(
-                        work,
-                        subject=f"Orphan worktree branch: {task_id}",
-                        body=body,
-                        actor=agent,
-                        dedupe_label=f"worktree_audit:{task_id}:orphan_branch",
-                        project=sess.task_project,
-                    ):
-                        inbox_emitted += 1
+                    alerts_raised += raised
+                    inbox_emitted += emitted
         finally:
             closer = getattr(work, "close", None)
             if callable(closer):
@@ -1122,7 +1228,6 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
             "alerts_cleared": alerts_cleared,
             "inbox_emitted": inbox_emitted,
         }
-
 
 def _raise_alert(
     store: Any, session_name: str, alert_type: str, severity: str, message: str,

@@ -68,11 +68,17 @@ def _resolve_url(config: "PollyPMConfig") -> str:
     * For the sqlite backend, derives
       ``sqlite:///<project.state_db>`` so the resolver always produces a
       concrete URL — backends never have to re-implement the fallback.
-    * For the postgres backend (#1939), returns an empty string and
-      lets the pg pool resolver pick the DSN up from
-      ``[storage.pg].dsn`` / ``POLLYPM_PG_DSN``. Fabricating a
-      ``sqlite:///`` URL on a postgres install was the silent-fallback
-      failure mode the cutover was supposed to remove.
+    * For the postgres backend (#1939), prefers ``[storage.pg].dsn``
+      (#1952) so the dedicated pg knob is honoured even when the legacy
+      shared ``[storage].url`` is blank. Falls back to an empty string,
+      which lets the pg pool resolver pick the DSN up from
+      ``POLLYPM_PG_DSN`` or the built-in default. Without this, a
+      workspace that set ``[storage.pg].dsn`` saw its work-service
+      writes route to the configured DB while ``get_store(config)``
+      message-store callers silently used the default DB — the
+      split-brain failure mode the sqlite ripout was meant to close.
+      Fabricating a ``sqlite:///`` URL on a postgres install was the
+      original silent-fallback failure the cutover removed.
     """
     url = (config.storage.url or "").strip()
     if url:
@@ -80,6 +86,17 @@ def _resolve_url(config: "PollyPMConfig") -> str:
     backend = (config.storage.backend or "").strip().lower()
     if backend == "sqlite":
         return f"sqlite:///{config.project.state_db.resolve()}"
+    if backend == "postgres":
+        # #1952 — honour ``[storage.pg].dsn`` so the dedicated pg knob
+        # routes ``get_store(config)`` to the same DSN that
+        # ``pollypm.storage.pg_pool.resolve_dsn`` would pick. Mirrors the
+        # priority order there: pg.dsn first, then the legacy shared
+        # ``[storage].url`` (already handled above when non-empty).
+        pg_section = getattr(config.storage, "pg", None)
+        if pg_section is not None:
+            pg_dsn = (getattr(pg_section, "dsn", "") or "").strip()
+            if pg_dsn:
+                return pg_dsn
     return ""
 
 

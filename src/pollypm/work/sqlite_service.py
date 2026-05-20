@@ -4081,12 +4081,30 @@ class SQLiteWorkService:
                 return False
             # Reserve the slot with a placeholder. Subsequent COUNT
             # calls from other concurrent claims see it immediately.
+            #
+            # #1908 — must NOT use ``INSERT OR REPLACE``: that variant
+            # deletes the existing row before insert, wiping
+            # ``total_input_tokens`` / ``total_output_tokens`` that the
+            # ``upsert_worker_session`` path intentionally preserves
+            # across re-provision cycles (#1014 Bug B). Mirror the pg
+            # conflict update shape: insert a placeholder on missing
+            # rows; on conflict update only the active-session
+            # placeholder columns and clear ``ended_at`` / ``archive_path``
+            # so the slot is treated as live again. Token counters fall
+            # through unchanged.
             conn.execute(
-                "INSERT OR REPLACE INTO work_sessions ("
+                "INSERT INTO work_sessions ("
                 "task_project, task_number, agent_name, pane_id, "
-                "worktree_path, branch_name, started_at, ended_at, "
-                "archive_path"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL)",
+                "worktree_path, branch_name, started_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT (task_project, task_number) DO UPDATE SET "
+                "agent_name = excluded.agent_name, "
+                "pane_id = excluded.pane_id, "
+                "worktree_path = excluded.worktree_path, "
+                "branch_name = excluded.branch_name, "
+                "started_at = excluded.started_at, "
+                "ended_at = NULL, "
+                "archive_path = NULL",
                 (
                     task_project,
                     task_number,

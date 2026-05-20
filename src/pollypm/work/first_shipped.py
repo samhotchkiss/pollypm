@@ -110,13 +110,14 @@ def _record_first_shipped_activity(
     if project_path is None:
         return
     try:
-        from pollypm.store import SQLAlchemyStore
+        from pollypm.config import load_config
+        from pollypm.store import get_store
     except Exception:  # noqa: BLE001
-        # #1355: previously silent. A failed SQLAlchemyStore import
-        # drops the first-shipment celebration without a trace; log
-        # so a broken store package stops masking the milestone.
+        # #1355: previously silent. A failed store import drops the
+        # first-shipment celebration without a trace; log so a broken
+        # store package stops masking the milestone.
         logger.warning(
-            "first_shipped: SQLAlchemyStore import failed for %s",
+            "first_shipped: store import failed for %s",
             project_key,
             exc_info=True,
         )
@@ -165,21 +166,28 @@ def _record_first_shipped_activity(
             payload=payload,
         )
     )
-    store = SQLAlchemyStore(f"sqlite:///{state_db}")
+    # Post-sqlite-ripout (refs #1971): pg-backed singleton from
+    # ``get_store(load_config())``. Do NOT close — it's process-wide.
     try:
-        store.enqueue_message(
-            type="event",
-            tier="immediate",
-            recipient="*",
-            sender="polly",
-            subject="first_shipped",
-            body=body,
-            scope="polly",
-            payload=payload,
-            kind=InboxItemKind.COMPLETION_FYI.value,
+        store = get_store(load_config())
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "first_shipped: get_store(load_config()) failed for %s",
+            project_key,
+            exc_info=True,
         )
-    finally:
-        store.close()
+        return
+    store.enqueue_message(
+        type="event",
+        tier="immediate",
+        recipient="*",
+        sender="polly",
+        subject="first_shipped",
+        body=body,
+        scope="polly",
+        payload=payload,
+        kind=InboxItemKind.COMPLETION_FYI.value,
+    )
 
 
 def task_landed_commit(service: _HasExecutions, task_id: str) -> bool:

@@ -2051,25 +2051,17 @@ def _create_operator_inbox_task(
 
     # ``get_store`` returns a process-wide singleton — do NOT call
     # ``.close()`` on it. The registry tears it down on shutdown.
-    store = get_store(resolved_config) if resolved_config is not None else None
-    if store is None:
-        # Fallback for the unlikely case ``load_config`` raised. Keeps
-        # the legacy sqlite path so a config-error doesn't drop the
-        # dispatch entirely.
-        from pollypm.store import SQLAlchemyStore
-
-        if db_path is None:
-            from pollypm.work.db_resolver import resolve_work_db_path
-
-            db_path = resolve_work_db_path(
-                ".pollypm/state.db",
-                project=project_key,
-                config=None,
-            )
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
-        _store_owned = True
-    else:
-        _store_owned = False
+    # Post-sqlite-ripout (refs #1971): the sqlite fallback that
+    # previously caught a ``load_config``-raised path is gone; if
+    # config-load fails the dispatch is dropped on this tick.
+    if resolved_config is None:
+        logger.warning(
+            "audit_watchdog: no resolved_config; dropping dispatch "
+            "(post-sqlite-ripout there is no sqlite fallback)",
+        )
+        return None
+    store = get_store(resolved_config)
+    _store_owned = False
 
     payload = {
         "actor": "audit_watchdog",
@@ -2260,26 +2252,18 @@ def _create_operator_tier4_inbox_task(
 
     resolved_config = _resolve_notify_config(config_path)
 
+    # Post-sqlite-ripout (refs #1971): pg is the only supported
+    # backend, so the sqlite fallback is gone. If config-load failed
+    # ``resolved_config`` is None and we drop the dispatch on this
+    # tick rather than silently opening a sqlite shadow.
+    if resolved_config is None:
+        logger.warning(
+            "audit_watchdog tier4: no resolved_config; dropping dispatch.",
+        )
+        return None
     db_path: Path | None = None
-    if not _is_pg_backend(resolved_config):
-        from pollypm.work.cli import _resolve_db_path
-
-        db_path = _resolve_db_path(".pollypm/state.db", project=project_key)
-
-    store = get_store(resolved_config) if resolved_config is not None else None
-    if store is None:
-        from pollypm.store import SQLAlchemyStore
-
-        if db_path is None:
-            from pollypm.work.cli import _resolve_db_path
-
-            db_path = _resolve_db_path(
-                ".pollypm/state.db", project=project_key,
-            )
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
-        _store_owned = True
-    else:
-        _store_owned = False
+    store = get_store(resolved_config)
+    _store_owned = False
 
     payload = {
         "actor": "audit_watchdog",

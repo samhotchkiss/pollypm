@@ -142,58 +142,57 @@ def already_has_plan_review_message(
     work-service ``messages`` table's row-level dedupe within the
     same transaction; this probe is the cheap pre-check.
     """
+    # Post-sqlite-ripout (refs #1971): route through the configured
+    # backend (pg) singleton via ``get_store``. Do NOT close — the
+    # store is process-wide. ``db_path`` is retained for source
+    # compatibility but no longer drives backend dispatch.
     try:
-        from pollypm.store import SQLAlchemyStore
+        from pollypm.config import load_config
+        from pollypm.store import get_store
     except Exception:  # noqa: BLE001
         logger.debug(
-            "plan_review_emit: SQLAlchemyStore import failed", exc_info=True,
+            "plan_review_emit: store import failed", exc_info=True,
         )
         return False
     target_label = _plan_task_label(plan_task_id)
     seen_message_ids: set[Any] = set()
     try:
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        store = get_store(load_config())
     except Exception:  # noqa: BLE001
         logger.debug(
-            "plan_review_emit: SQLAlchemyStore open failed for %s",
-            db_path, exc_info=True,
+            "plan_review_emit: get_store(load_config()) failed",
+            exc_info=True,
         )
         return False
-    try:
-        scopes = [project] if project else []
-        if "inbox" not in scopes:
-            scopes.append("inbox")
-        for scope in scopes:
-            try:
-                rows = store.query_messages(scope=scope) or []
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "plan_review_emit: query_messages failed for scope=%s",
-                    scope, exc_info=True,
-                )
-                continue
-            for row in rows:
-                row_id = row.get("id")
-                if row_id is not None:
-                    if row_id in seen_message_ids:
-                        continue
-                    seen_message_ids.add(row_id)
-                if (row.get("type") or "").lower() != "notify":
-                    continue
-                raw_labels = row.get("labels")
-                if isinstance(raw_labels, str):
-                    try:
-                        raw_labels = json.loads(raw_labels)
-                    except (TypeError, ValueError):
-                        raw_labels = []
-                labels = set(raw_labels or [])
-                if PLAN_REVIEW_LABEL in labels and target_label in labels:
-                    return True
-    finally:
+    scopes = [project] if project else []
+    if "inbox" not in scopes:
+        scopes.append("inbox")
+    for scope in scopes:
         try:
-            store.close()
+            rows = store.query_messages(scope=scope) or []
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "plan_review_emit: query_messages failed for scope=%s",
+                scope, exc_info=True,
+            )
+            continue
+        for row in rows:
+            row_id = row.get("id")
+            if row_id is not None:
+                if row_id in seen_message_ids:
+                    continue
+                seen_message_ids.add(row_id)
+            if (row.get("type") or "").lower() != "notify":
+                continue
+            raw_labels = row.get("labels")
+            if isinstance(raw_labels, str):
+                try:
+                    raw_labels = json.loads(raw_labels)
+                except (TypeError, ValueError):
+                    raw_labels = []
+            labels = set(raw_labels or [])
+            if PLAN_REVIEW_LABEL in labels and target_label in labels:
+                return True
     return False
 
 
@@ -289,56 +288,52 @@ def emit_plan_review_for_task(
     # cockpit inbox renderer reads from the messages table; the inbox
     # task below is the work-service surface that drives the [A]/[D]
     # keybindings.
+    # Post-sqlite-ripout (refs #1971): pg-backed singleton from
+    # ``get_store``. Do NOT close — process-wide. ``db_path`` is
+    # retained as a callsite-compatibility no-op.
     try:
-        from pollypm.store import SQLAlchemyStore
+        from pollypm.config import load_config
+        from pollypm.store import get_store
     except Exception:  # noqa: BLE001
-        logger.debug(
-            "plan_review_emit: SQLAlchemyStore import failed", exc_info=True,
-        )
+        logger.debug("plan_review_emit: store import failed", exc_info=True)
         return None
     try:
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        store = get_store(load_config())
     except Exception:  # noqa: BLE001
         logger.debug(
-            "plan_review_emit: SQLAlchemyStore open failed for %s",
-            db_path, exc_info=True,
+            "plan_review_emit: get_store(load_config()) failed",
+            exc_info=True,
         )
         return None
     message_id: int | None = None
     try:
-        try:
-            message_id = store.enqueue_message(
-                type="notify",
-                tier="immediate",
-                recipient=requester,
-                sender=actor or "audit_watchdog",
-                subject=subject,
-                body=body,
-                scope=project,
-                labels=labels,
-                payload={
-                    "actor": actor or "audit_watchdog",
-                    "project": project,
-                    "milestone_key": None,
-                    "requester": requester,
-                    "user_prompt": user_prompt,
-                    "plan_task_id": plan_task_id,
-                    "backstop_source": "plan_review_emit",
-                },
-                state="closed",  # mirrors session_runtime.notify for immediate tier
-                kind=InboxItemKind.PLAN_REVIEW_PENDING.value,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "plan_review_emit: enqueue_message failed for %s: %s",
-                plan_task_id, exc, exc_info=True,
-            )
-            return None
-    finally:
-        try:
-            store.close()
-        except Exception:  # noqa: BLE001
-            pass
+        message_id = store.enqueue_message(
+            type="notify",
+            tier="immediate",
+            recipient=requester,
+            sender=actor or "audit_watchdog",
+            subject=subject,
+            body=body,
+            scope=project,
+            labels=labels,
+            payload={
+                "actor": actor or "audit_watchdog",
+                "project": project,
+                "milestone_key": None,
+                "requester": requester,
+                "user_prompt": user_prompt,
+                "plan_task_id": plan_task_id,
+                "backstop_source": "plan_review_emit",
+            },
+            state="closed",  # mirrors session_runtime.notify for immediate tier
+            kind=InboxItemKind.PLAN_REVIEW_PENDING.value,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "plan_review_emit: enqueue_message failed for %s: %s",
+            plan_task_id, exc, exc_info=True,
+        )
+        return None
 
     # 2. Create the inbox task. The cockpit's plan-review surfaces
     # (#1400 / #1401) accept either the message row or the task row;
@@ -384,16 +379,9 @@ def emit_plan_review_for_task(
         return None
 
     # 3. Backfill the message payload with the new task_id so the cockpit
-    # renderer can resolve message → task without a label scan.
+    # renderer can resolve message → task without a label scan. Reuses
+    # the same pg singleton — do NOT close.
     if message_id is not None and inbox_task_id is not None:
-        try:
-            store = SQLAlchemyStore(f"sqlite:///{db_path}")
-        except Exception:  # noqa: BLE001
-            logger.debug(
-                "plan_review_emit: SQLAlchemyStore reopen failed for payload backfill",
-                exc_info=True,
-            )
-            return inbox_task_id
         try:
             store.update_message(
                 message_id,
@@ -413,11 +401,6 @@ def emit_plan_review_for_task(
                 "plan_review_emit: update_message failed for %s",
                 plan_task_id, exc_info=True,
             )
-        finally:
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001
-                pass
     return inbox_task_id
 
 

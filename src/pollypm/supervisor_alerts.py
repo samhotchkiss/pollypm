@@ -205,6 +205,130 @@ def _review_tasks_for_project(
     return entries, re_review_count
 
 
+def _update_alerts_snapshot_stall(
+    supervisor: SupervisorAlertBoundary,
+    launch: SessionLaunchSpec,
+    *,
+    session_name: str,
+    pane_text: str,
+    previous_snapshot_hash: str | None,
+    current_snapshot_hash: str,
+    active_alerts: list[str],
+) -> None:
+    """Handle the snapshot-hash-based stall detection branch."""
+    if not (previous_snapshot_hash and previous_snapshot_hash == current_snapshot_hash):
+        supervisor.msg_store.clear_alert(session_name, "suspected_loop")
+        return
+    history = supervisor.store.recent_heartbeats(session_name, limit=3)
+    recent_hashes = [item.snapshot_hash for item in history[:3]]
+    if not (len(recent_hashes) == 3 and len(set(recent_hashes)) == 1):
+        supervisor.msg_store.clear_alert(session_name, "suspected_loop")
+        return
+    # #765 — route through the single classifier rather than
+    # maintaining a parallel role-exclusion list here. The same
+    # logic already gates heartbeats/local.py's detector.
+    from pollypm.heartbeats.stall_classifier import (
+        StallContext,
+        classify_stall,
+        has_pending_work_for_session,
+    )
+    from pollypm.idle_placeholders import (
+        pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
+        pane_is_idle_placeholder as _pane_is_idle_placeholder,
+    )
+
+    _pane_text_for_classify = pane_text or ""
+    stall_class = classify_stall(
+        StallContext(
+            role=launch.session.role or "",
+            session_name=session_name,
+            has_pending_work=has_pending_work_for_session(
+                supervisor.config, session_name,
+            ),
+            pane_is_idle_placeholder=_pane_is_idle_placeholder(
+                _pane_text_for_classify,
+            ),
+            awaiting_operator_question=_pane_ends_with_unanswered_question(
+                _pane_text_for_classify,
+            ),
+        )
+    )
+    if stall_class == "awaiting_operator":
+        # The agent finished its turn with a question and is
+        # sitting at the empty prompt. Surface the question so
+        # the operator sees it instead of `pm status` reporting
+        # ``healthy`` while the worker silently waits.
+        _question = (
+            _pane_ends_with_unanswered_question(_pane_text_for_classify)
+            or ""
+        ).strip()
+        _short_q = _question if len(_question) <= 140 else (
+            _question[:137].rstrip() + "…"
+        )
+        _question_body = (
+            f"{launch.session.role or 'session'} {session_name} "
+            f"is waiting for an operator answer: {_short_q}"
+        )
+        _route_signal(
+            _envelope_for_alert(
+                source="supervisor_alerts",
+                alert_type="worker_question",
+                severity_label="warn",
+                session_name=session_name,
+                subject=f"{session_name} asked a question",
+                body=_question_body,
+                suggested_action=(
+                    "Open the worker pane and answer, or `pm send "
+                    f"{session_name} \"<answer>\"`."
+                ),
+            )
+        )
+        supervisor.msg_store.upsert_alert(
+            session_name,
+            "worker_question",
+            "warn",
+            _question_body,
+        )
+        active_alerts.append("worker_question")
+        supervisor.msg_store.clear_alert(session_name, "suspected_loop")
+        return
+    if stall_class != "unrecoverable_stall":
+        supervisor.msg_store.clear_alert(session_name, "suspected_loop")
+        return
+    # #760 — action-forward copy matching the heartbeat path.
+    # #894 — route through SignalEnvelope; the helper
+    # ensures supervisor_alerts and the toast tier
+    # classifier (cockpit_alerts.alert_channel) agree
+    # on audience / actionability / dedupe.
+    _suspect_body = (
+        f"{launch.session.role or 'session'} {session_name} "
+        f"stalled — no new output for 3 heartbeats with "
+        "queued work. Open Workers and restart the stalled session."
+    )
+    _route_signal(
+        _envelope_for_alert(
+            source="supervisor_alerts",
+            alert_type="suspected_loop",
+            severity_label="warn",
+            session_name=session_name,
+            subject=f"{session_name} appears stalled",
+            body=_suspect_body,
+            suggested_action="Open Workers and restart the stalled session.",
+        )
+    )
+    supervisor.msg_store.upsert_alert(
+        session_name,
+        "suspected_loop",
+        "warn",
+        _suspect_body,
+    )
+    active_alerts.append("suspected_loop")
+    longer_history = supervisor.store.recent_heartbeats(session_name, limit=5)
+    longer_hashes = [item.snapshot_hash for item in longer_history[:5]]
+    if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
+        _maybe_nudge_stalled_session(supervisor, launch)
+
+
 def _update_alerts(
     supervisor: SupervisorAlertBoundary,
     launch: SessionLaunchSpec,
@@ -253,119 +377,15 @@ def _update_alerts(
     else:
         supervisor.msg_store.clear_alert(session_name, "idle_output")
 
-    if previous_snapshot_hash and previous_snapshot_hash == current_snapshot_hash:
-        history = supervisor.store.recent_heartbeats(session_name, limit=3)
-        recent_hashes = [item.snapshot_hash for item in history[:3]]
-        if len(recent_hashes) == 3 and len(set(recent_hashes)) == 1:
-            # #765 — route through the single classifier rather than
-            # maintaining a parallel role-exclusion list here. The same
-            # logic already gates heartbeats/local.py's detector.
-            from pollypm.heartbeats.stall_classifier import (
-                StallContext,
-                classify_stall,
-            )
-
-            from pollypm.heartbeats.stall_classifier import (
-                has_pending_work_for_session,
-            )
-            from pollypm.idle_placeholders import (
-                pane_ends_with_unanswered_question as _pane_ends_with_unanswered_question,
-                pane_is_idle_placeholder as _pane_is_idle_placeholder,
-            )
-
-            _pane_text_for_classify = pane_text or ""
-            stall_class = classify_stall(
-                StallContext(
-                    role=launch.session.role or "",
-                    session_name=session_name,
-                    has_pending_work=has_pending_work_for_session(
-                        supervisor.config, session_name,
-                    ),
-                    pane_is_idle_placeholder=_pane_is_idle_placeholder(
-                        _pane_text_for_classify,
-                    ),
-                    awaiting_operator_question=_pane_ends_with_unanswered_question(
-                        _pane_text_for_classify,
-                    ),
-                )
-            )
-            if stall_class == "awaiting_operator":
-                # The agent finished its turn with a question and is
-                # sitting at the empty prompt. Surface the question so
-                # the operator sees it instead of `pm status` reporting
-                # ``healthy`` while the worker silently waits.
-                _question = (
-                    _pane_ends_with_unanswered_question(_pane_text_for_classify)
-                    or ""
-                ).strip()
-                _short_q = _question if len(_question) <= 140 else (
-                    _question[:137].rstrip() + "…"
-                )
-                _question_body = (
-                    f"{launch.session.role or 'session'} {session_name} "
-                    f"is waiting for an operator answer: {_short_q}"
-                )
-                _route_signal(
-                    _envelope_for_alert(
-                        source="supervisor_alerts",
-                        alert_type="worker_question",
-                        severity_label="warn",
-                        session_name=session_name,
-                        subject=f"{session_name} asked a question",
-                        body=_question_body,
-                        suggested_action=(
-                            "Open the worker pane and answer, or `pm send "
-                            f"{session_name} \"<answer>\"`."
-                        ),
-                    )
-                )
-                supervisor.msg_store.upsert_alert(
-                    session_name,
-                    "worker_question",
-                    "warn",
-                    _question_body,
-                )
-                active_alerts.append("worker_question")
-                supervisor.msg_store.clear_alert(session_name, "suspected_loop")
-            elif stall_class != "unrecoverable_stall":
-                supervisor.msg_store.clear_alert(session_name, "suspected_loop")
-            else:
-                # #760 — action-forward copy matching the heartbeat path.
-                # #894 — route through SignalEnvelope; the helper
-                # ensures supervisor_alerts and the toast tier
-                # classifier (cockpit_alerts.alert_channel) agree
-                # on audience / actionability / dedupe.
-                _suspect_body = (
-                    f"{launch.session.role or 'session'} {session_name} "
-                    f"stalled — no new output for 3 heartbeats with "
-                    "queued work. Open Workers and restart the stalled session."
-                )
-                _route_signal(
-                    _envelope_for_alert(
-                        source="supervisor_alerts",
-                        alert_type="suspected_loop",
-                        severity_label="warn",
-                        session_name=session_name,
-                        subject=f"{session_name} appears stalled",
-                        body=_suspect_body,
-                        suggested_action="Open Workers and restart the stalled session.",
-                    )
-                )
-                supervisor.msg_store.upsert_alert(
-                    session_name,
-                    "suspected_loop",
-                    "warn",
-                    _suspect_body,
-                )
-                active_alerts.append("suspected_loop")
-                longer_history = supervisor.store.recent_heartbeats(session_name, limit=5)
-                longer_hashes = [item.snapshot_hash for item in longer_history[:5]]
-                if len(longer_hashes) == 5 and len(set(longer_hashes)) == 1:
-                    _maybe_nudge_stalled_session(supervisor, launch)
-        else:
-            supervisor.msg_store.clear_alert(session_name, "suspected_loop")
-    else:
-        supervisor.msg_store.clear_alert(session_name, "suspected_loop")
+    _update_alerts_snapshot_stall(
+        supervisor,
+        launch,
+        session_name=session_name,
+        pane_text=pane_text,
+        previous_snapshot_hash=previous_snapshot_hash,
+        current_snapshot_hash=current_snapshot_hash,
+        active_alerts=active_alerts,
+    )
 
     lowered_pane = pane_text.lower()
     if supervisor.pane_has_auth_failure(lowered_pane):

@@ -1319,6 +1319,29 @@ def _build_synthetic_storage_row(
     )
 
 
+# #1634 #1943 perf — per-process TTL cache for ``_gather_worker_roster``.
+#
+# The roster walk opens a work-service per project, runs
+# ``list_worker_sessions(active_only=True)`` + ``list_tasks(project=...)``,
+# and per-row shells out to ``git log`` (with a 2s subprocess timeout) for
+# the last-commit age. On every rail ``build_items()`` tick the workers
+# rail row invokes it TWICE — once from the label provider (for the count
+# badge) and once from the state provider (for the working/stuck/idle
+# glyph). On a large workspace that doubles a multi-second IO sweep just
+# to paint one rail row.
+#
+# Mirrors the same wedge PRs #1907 + #1928 used for
+# ``pm_inbox_awaits_user_list`` and ``Supervisor.status()``: a tiny
+# module-level dict keyed on ``id(config)`` with a short TTL. The
+# cockpit router invalidates its config cache on mtime change, so a
+# reload yields a fresh identity and bypasses this cache automatically.
+# TTL matches the inbox/status caches (1s) so freshly-stuck workers
+# surface within ~1 rail tick. Callers receive a fresh ``list`` copy
+# so downstream mutation cannot leak into the cached snapshot.
+_WORKER_ROSTER_TTL_SECONDS = 1.0
+_WORKER_ROSTER_CACHE: dict[int, tuple[float, tuple["WorkerRosterRow", ...]]] = {}
+
+
 def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     """Walk every tracked project's work-service + tmux state.
 
@@ -1328,6 +1351,43 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
 
     Always best-effort: a bad DB or missing tmux session degrades one
     project's worth of rows, never the whole roster.
+
+    #1634 #1943 perf — results are memoised per ``config`` identity with
+    a short TTL (:data:`_WORKER_ROSTER_TTL_SECONDS`) so the rail row's
+    label provider (count badge) and state provider (working/stuck/idle
+    glyph) share a single computation per tick instead of each running
+    a full per-project work-service + tmux + git-log sweep. Callers
+    receive a fresh ``list`` copy so mutation is safe.
+    """
+    import time as _time
+
+    cache_key = id(config)
+    now = _time.monotonic()
+    cached = _WORKER_ROSTER_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < _WORKER_ROSTER_TTL_SECONDS:
+        return list(cached[1])
+
+    result = _gather_worker_roster_uncached(config)
+    # Best-effort eviction so the cache doesn't grow across long-lived
+    # processes with config reloads (each reload yields a fresh
+    # ``id(config)``). Cheap because the dict is typically tiny — one
+    # entry per live config.
+    if len(_WORKER_ROSTER_CACHE) > 8:
+        for stale_key in [
+            k for k, (ts, _v) in _WORKER_ROSTER_CACHE.items()
+            if now - ts >= _WORKER_ROSTER_TTL_SECONDS
+        ]:
+            _WORKER_ROSTER_CACHE.pop(stale_key, None)
+    _WORKER_ROSTER_CACHE[cache_key] = (now, tuple(result))
+    return result
+
+
+def _gather_worker_roster_uncached(config) -> list[WorkerRosterRow]:
+    """Underlying implementation of :func:`_gather_worker_roster`.
+
+    Separated from the public entry point so the cache wrapper stays
+    trivially readable. Tests that need to bypass the cache can call
+    this directly (or clear :data:`_WORKER_ROSTER_CACHE`).
     """
     from pollypm.work import create_work_service
 

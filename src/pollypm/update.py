@@ -242,53 +242,19 @@ def _reinstall_command(repo_root: Path) -> list[str]:
     return ["uv", "tool", "install", "--reinstall", str(repo_root)]
 
 
-def update(
+def _update_preflight(
     *,
-    check_only: bool = False,
-    repo_root: Path | None = None,
-    emit: Callable[[str], None] | None = None,
-    in_progress_count: int | None = None,
-    fetcher: Callable[[Path], tuple[bool, str]] | None = None,
-    resolver: Callable[[Path], PendingCommits] | None = None,
-    runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
-    reset_runner: Callable[[Path, str], tuple[bool, str]] | None = None,
-) -> UpdateResult:
-    """Fetch origin/main, fast-forward, and reinstall PollyPM.
+    step,
+    repo: Path,
+    check_only: bool,
+    in_progress_count: int | None,
+) -> UpdateResult | None:
+    """Return an UpdateResult when the preflight refuses to proceed.
 
-    Steps:
-
-    1. Refuse if work-service tasks are ``in_progress`` (override via
-       the ``in_progress_count=0`` test seam).
-    2. Verify ``repo_root`` is a real git checkout — if not, abort
-       with a message pointing the user at ``pm upgrade`` (the
-       package-manager-installed flow).
-    3. ``git fetch origin``.
-    4. Resolve ``origin/main`` vs ``HEAD``.
-    5. If ``check_only``, report the gap and exit.
-    6. ``git reset --hard origin/main``.
-    7. ``uv tool install --reinstall <repo_root>``.
-
-    All side-effecting steps go through small seams so tests can stub
-    them without spawning real shells:
-
-    * ``fetcher(repo) -> (ok, stderr)``
-    * ``resolver(repo) -> PendingCommits``
-    * ``runner(argv) -> CompletedProcess`` (used for the ``uv`` call)
-    * ``reset_runner(repo, target) -> (ok, stderr)``
+    Bundles the agent-worktree refusal, the ``in_progress`` task gate,
+    and the "not a git checkout" check. Returns ``None`` when all
+    gates pass and the caller should continue.
     """
-    step = _Step(emit or print)
-    repo = (repo_root or _repo_root()).resolve()
-    do_fetch = fetcher or _git_fetch
-    resolve = resolver or pending_commits
-    do_run = runner or (
-        lambda argv: subprocess.run(
-            argv, check=False, capture_output=True, text=True, timeout=600.0,
-        )
-    )
-    do_reset = reset_runner or (
-        lambda r, target: _do_reset_hard(r, target)
-    )
-
     if _is_claude_agent_worktree(repo):
         msg = (
             f"refusing to update: repo_root {repo} looks like a Claude "
@@ -342,87 +308,19 @@ def update(
             commits=[],
             message=msg,
         )
+    return None
 
-    step(f"repo_root={repo}")
-    step("fetching origin")
-    fetch_ok, fetch_err = do_fetch(repo)
-    if not fetch_ok:
-        msg = "git fetch failed — check network / remote auth"
-        step(msg)
-        return UpdateResult(
-            ok=False,
-            check_only=check_only,
-            refused=False,
-            old_sha="",
-            new_sha="",
-            commits=[],
-            message=msg,
-            stderr=fetch_err,
-        )
 
-    pending = resolve(repo)
-    head_sha = pending.head_sha
-    target_sha = pending.target_sha
-    if not head_sha or not target_sha:
-        msg = "could not resolve HEAD / origin/main — is the remote configured?"
-        step(msg)
-        return UpdateResult(
-            ok=False,
-            check_only=check_only,
-            refused=False,
-            old_sha=head_sha,
-            new_sha=target_sha,
-            commits=[],
-            message=msg,
-        )
-
-    if pending.up_to_date:
-        step(f"already up to date at {head_sha[:12]}")
-        return UpdateResult(
-            ok=True,
-            check_only=check_only,
-            refused=False,
-            old_sha=head_sha,
-            new_sha=head_sha,
-            commits=[],
-            message=f"already up to date at {head_sha[:12]}",
-        )
-
-    step(
-        f"{pending.count} commit(s) to apply: "
-        f"{head_sha[:12]} → {target_sha[:12]}"
-    )
-
-    if check_only:
-        return UpdateResult(
-            ok=True,
-            check_only=True,
-            refused=False,
-            old_sha=head_sha,
-            new_sha=target_sha,
-            commits=list(pending.commits),
-            message=(
-                f"check-only: {pending.count} commit(s) behind "
-                f"({head_sha[:12]} → {target_sha[:12]})"
-            ),
-        )
-
-    step("git reset --hard origin/main")
-    reset_ok, reset_err = do_reset(repo, "origin/main")
-    if not reset_ok:
-        msg = "git reset --hard failed"
-        step(msg)
-        return UpdateResult(
-            ok=False,
-            check_only=False,
-            refused=False,
-            old_sha=head_sha,
-            new_sha=head_sha,
-            commits=list(pending.commits),
-            message=msg,
-            stderr=reset_err,
-        )
-
+def _update_run_reinstall(
+    *,
+    step,
+    repo: Path,
+    head_sha: str,
+    target_sha: str,
+    pending: PendingCommits,
+    do_run,
+) -> UpdateResult:
+    """Invoke ``uv tool install --reinstall <repo>`` and shape the result."""
     step("uv tool install --reinstall <repo>")
     cmd = _reinstall_command(repo)
     try:
@@ -468,7 +366,7 @@ def update(
         )
 
     msg = (
-        f"updated {head_sha[:12]} → {target_sha[:12]} "
+        f"updated {head_sha[:12]} \u2192 {target_sha[:12]} "
         f"({pending.count} commit(s))"
     )
     step(msg)
@@ -480,6 +378,152 @@ def update(
         new_sha=target_sha,
         commits=list(pending.commits),
         message=msg,
+    )
+
+
+def update(
+    *,
+    check_only: bool = False,
+    repo_root: Path | None = None,
+    emit: Callable[[str], None] | None = None,
+    in_progress_count: int | None = None,
+    fetcher: Callable[[Path], tuple[bool, str]] | None = None,
+    resolver: Callable[[Path], PendingCommits] | None = None,
+    runner: Callable[[list[str]], subprocess.CompletedProcess[str]] | None = None,
+    reset_runner: Callable[[Path, str], tuple[bool, str]] | None = None,
+) -> UpdateResult:
+    """Fetch origin/main, fast-forward, and reinstall PollyPM.
+
+    Steps:
+
+    1. Refuse if work-service tasks are ``in_progress`` (override via
+       the ``in_progress_count=0`` test seam).
+    2. Verify ``repo_root`` is a real git checkout — if not, abort
+       with a message pointing the user at ``pm upgrade`` (the
+       package-manager-installed flow).
+    3. ``git fetch origin``.
+    4. Resolve ``origin/main`` vs ``HEAD``.
+    5. If ``check_only``, report the gap and exit.
+    6. ``git reset --hard origin/main``.
+    7. ``uv tool install --reinstall <repo_root>``.
+
+    All side-effecting steps go through small seams so tests can stub
+    them without spawning real shells:
+
+    * ``fetcher(repo) -> (ok, stderr)``
+    * ``resolver(repo) -> PendingCommits``
+    * ``runner(argv) -> CompletedProcess`` (used for the ``uv`` call)
+    * ``reset_runner(repo, target) -> (ok, stderr)``
+    """
+    step = _Step(emit or print)
+    repo = (repo_root or _repo_root()).resolve()
+    do_fetch = fetcher or _git_fetch
+    resolve = resolver or pending_commits
+    do_run = runner or (
+        lambda argv: subprocess.run(
+            argv, check=False, capture_output=True, text=True, timeout=600.0,
+        )
+    )
+    do_reset = reset_runner or (
+        lambda r, target: _do_reset_hard(r, target)
+    )
+
+    refusal = _update_preflight(
+        step=step,
+        repo=repo,
+        check_only=check_only,
+        in_progress_count=in_progress_count,
+    )
+    if refusal is not None:
+        return refusal
+
+    step(f"repo_root={repo}")
+    step("fetching origin")
+    fetch_ok, fetch_err = do_fetch(repo)
+    if not fetch_ok:
+        msg = "git fetch failed \u2014 check network / remote auth"
+        step(msg)
+        return UpdateResult(
+            ok=False,
+            check_only=check_only,
+            refused=False,
+            old_sha="",
+            new_sha="",
+            commits=[],
+            message=msg,
+            stderr=fetch_err,
+        )
+
+    pending = resolve(repo)
+    head_sha = pending.head_sha
+    target_sha = pending.target_sha
+    if not head_sha or not target_sha:
+        msg = "could not resolve HEAD / origin/main \u2014 is the remote configured?"
+        step(msg)
+        return UpdateResult(
+            ok=False,
+            check_only=check_only,
+            refused=False,
+            old_sha=head_sha,
+            new_sha=target_sha,
+            commits=[],
+            message=msg,
+        )
+
+    if pending.up_to_date:
+        step(f"already up to date at {head_sha[:12]}")
+        return UpdateResult(
+            ok=True,
+            check_only=check_only,
+            refused=False,
+            old_sha=head_sha,
+            new_sha=head_sha,
+            commits=[],
+            message=f"already up to date at {head_sha[:12]}",
+        )
+
+    step(
+        f"{pending.count} commit(s) to apply: "
+        f"{head_sha[:12]} \u2192 {target_sha[:12]}"
+    )
+
+    if check_only:
+        return UpdateResult(
+            ok=True,
+            check_only=True,
+            refused=False,
+            old_sha=head_sha,
+            new_sha=target_sha,
+            commits=list(pending.commits),
+            message=(
+                f"check-only: {pending.count} commit(s) behind "
+                f"({head_sha[:12]} \u2192 {target_sha[:12]})"
+            ),
+        )
+
+    step("git reset --hard origin/main")
+    reset_ok, reset_err = do_reset(repo, "origin/main")
+    if not reset_ok:
+        msg = "git reset --hard failed"
+        step(msg)
+        return UpdateResult(
+            ok=False,
+            check_only=False,
+            refused=False,
+            old_sha=head_sha,
+            new_sha=head_sha,
+            commits=list(pending.commits),
+            message=msg,
+            stderr=reset_err,
+        )
+
+    return _update_run_reinstall(
+        step=step,
+        repo=repo,
+        head_sha=head_sha,
+        target_sha=target_sha,
+        pending=pending,
+        do_run=do_run,
     )
 
 

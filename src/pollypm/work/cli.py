@@ -66,7 +66,15 @@ flow_app = typer.Typer(
 # Helpers
 # ---------------------------------------------------------------------------
 
-_DB_OPTION = typer.Option(".pollypm/state.db", "--db", help="Path to SQLite database.")
+_DB_OPTION = typer.Option(
+    ".pollypm/state.db",
+    "--db",
+    help=(
+        "Work-service connection: sqlite file path (default) or Postgres "
+        "DSN (``postgresql://…``). Default routes through "
+        "``[storage].backend`` (#1940)."
+    ),
+)
 _PROJECT_OPTION = typer.Option(None, "--project", "-p", help="Project filter.")
 _JSON_OPTION = typer.Option(False, "--json", help="Output as JSON.")
 
@@ -194,9 +202,69 @@ def _project_from_task_id(task_id: str) -> str | None:
     return None
 
 
+def _config_with_pg_dsn_override(config: object | None, dsn: str) -> object:
+    """Return a config-shaped object that forces ``backend='postgres'`` + ``dsn``.
+
+    The factory + pg pool resolver both read ``config.storage.backend``
+    and ``config.storage.pg.dsn``. When ``--db`` is a Postgres DSN
+    (#1940) we want to honour the DSN override without making the
+    operator edit their ``pollypm.toml``. We build a thin override on
+    top of the loaded config so other config knobs (projects, plugin
+    settings) remain visible to session-manager wiring downstream.
+
+    When the base ``config`` is ``None`` (config-load failed), fall
+    through to a minimal shim that carries just enough for the factory
+    + pg pool to dispatch.
+    """
+    import dataclasses
+
+    if config is not None:
+        storage = getattr(config, "storage", None)
+        pg = getattr(storage, "pg", None) if storage is not None else None
+        if storage is not None and pg is not None:
+            try:
+                new_pg = dataclasses.replace(pg, dsn=dsn.strip())
+                new_storage = dataclasses.replace(
+                    storage, backend="postgres", pg=new_pg,
+                )
+                return dataclasses.replace(config, storage=new_storage)
+            except TypeError:
+                # ``config`` / ``storage`` may not be a dataclass in test
+                # doubles — fall through to the minimal shim below.
+                pass
+
+    class _PgOverridePg:
+        __slots__ = ("dsn", "pool_min", "pool_max", "min_version")
+
+        def __init__(self, dsn: str) -> None:
+            self.dsn = dsn
+            self.pool_min = 1
+            self.pool_max = 10
+            self.min_version = "16.0"
+
+    class _PgOverrideStorage:
+        __slots__ = ("backend", "url", "pg")
+
+        def __init__(self, dsn: str) -> None:
+            self.backend = "postgres"
+            self.url = ""
+            self.pg = _PgOverridePg(dsn)
+
+    class _PgOverrideConfig:
+        __slots__ = ("storage", "projects", "project")
+
+        def __init__(self, dsn: str) -> None:
+            self.storage = _PgOverrideStorage(dsn)
+            self.projects = {}
+            self.project = None
+
+    return _PgOverrideConfig(dsn.strip())
+
+
 def _svc(db: str, project: str | None = None) -> "WorkService":
     import atexit
 
+    from pollypm.storage.pg_pool import _looks_like_pg_dsn
     from pollypm.work.db_resolver import WORKSPACE_DEFAULT_DB_PATH
     from pollypm.work.factory import create_work_service
     from pollypm.work.sync import SyncManager
@@ -215,17 +283,41 @@ def _svc(db: str, project: str | None = None) -> "WorkService":
     except Exception:  # noqa: BLE001
         config_obj = None
 
-    # ``--db`` is the explicit test / CI escape hatch — a non-default
-    # value means the caller is pinning a specific sqlite file. The
-    # factory normally ignores ``db_path`` on the pg backend, so honour
-    # the override by routing through sqlite dispatch even when config
-    # selects postgres. ``config_obj`` is kept around for the
-    # SessionManager wiring below.
-    backend_config: object | None = config_obj
-    if db != WORKSPACE_DEFAULT_DB_PATH:
-        backend_config = None
+    # #1940 — ``--db`` now accepts either a sqlite path (the canonical
+    # escape hatch for tests / CI) or a Postgres DSN (``postgresql://…``).
+    # Default value routes through ``[storage].backend`` so a pg-configured
+    # workspace transparently lands on the pg pool.
+    db_is_default = db == WORKSPACE_DEFAULT_DB_PATH
+    db_is_pg_dsn = _looks_like_pg_dsn(db)
 
-    db_path = _resolve_db_path(db, project=project)
+    if db_is_pg_dsn:
+        # Synthesize a pg-pinned config that carries the override DSN so
+        # the factory's pg dispatch sees the explicit override. Other
+        # config knobs (project paths, etc.) come from ``config_obj`` so
+        # session-manager wiring downstream still works.
+        backend_config = _config_with_pg_dsn_override(config_obj, db)
+        db_path_for_factory: Path | None = None
+    elif not db_is_default:
+        # Sqlite escape hatch: explicit non-default filesystem path.
+        # Force sqlite dispatch by passing ``config=None`` AND a
+        # concrete ``db_path``; the factory honours the override even
+        # when the configured backend is postgres.
+        backend_config = None
+        db_path_for_factory = _resolve_db_path(db, project=project)
+    else:
+        # Canonical default: honour the configured backend. Pass
+        # ``db_path=None`` so the pg branch isn't forced down sqlite by
+        # the explicit-override rule introduced for #1939.
+        backend_config = config_obj
+        db_path_for_factory = None
+
+    # Resolve a concrete sqlite path for ancillary wiring (sync adapter,
+    # session manager) even when the factory ultimately routes to pg —
+    # ``project_root`` derivation below relies on it.
+    db_path = _resolve_db_path(
+        db if not db_is_pg_dsn else WORKSPACE_DEFAULT_DB_PATH,
+        project=project,
+    )
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db_derived_root = db_path.parent.parent
 
@@ -269,14 +361,16 @@ def _svc(db: str, project: str | None = None) -> "WorkService":
     sync.register(FileSyncAdapter(issues_root=project_root / "issues"))
 
     # Route through the factory so ``[storage] backend`` is honoured
-    # (#1369, #1737). ``db_path`` / ``project_path`` / ``sync_manager``
-    # are sqlite-only; the pg backend ignores them per the factory
-    # docstring. An explicit ``--db`` override forces sqlite dispatch
-    # (see ``backend_config`` above) so the test / CI escape hatch
-    # keeps working on machines whose ``pollypm.toml`` selects postgres.
+    # (#1369, #1737, #1940). ``db_path`` / ``project_path`` /
+    # ``sync_manager`` are sqlite-only; the pg backend ignores them per
+    # the factory docstring. Three dispatch modes (see above):
+    #   * ``--db`` is a pg DSN → factory routes to pg with the override.
+    #   * ``--db`` is a non-default sqlite path → factory routes to sqlite.
+    #   * ``--db`` is the canonical default → factory honours
+    #     ``config.storage.backend``.
     svc = create_work_service(
         config=backend_config,
-        db_path=db_path,
+        db_path=db_path_for_factory,
         project_path=project_root,
         project_key=project,
         sync_manager=sync,

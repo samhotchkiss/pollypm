@@ -561,10 +561,13 @@ def _parse_storage_settings(
     Recognised keys:
 
     * ``backend`` — entry-point name under ``pollypm.store_backend``.
-      Defaults to ``"sqlite"`` (registered by this package).
-    * ``url`` — SQLAlchemy URL. When empty/missing, the resolver derives
-      ``sqlite:///<project.state_db>`` so first-run users don't have to
-      think about connection strings.
+      Defaults to ``"postgres"`` after the #1737 cutover (issue #1939);
+      ``"sqlite"`` remains registered for explicit opt-in.
+    * ``url`` — SQLAlchemy URL. When empty/missing on the sqlite
+      backend, the resolver derives ``sqlite:///<project.state_db>`` so
+      first-run users don't have to think about connection strings. On
+      the postgres backend an empty ``url`` lets the pg pool resolve
+      the DSN itself (``[storage.pg].dsn`` / ``POLLYPM_PG_DSN``).
 
     Missing section yields defaults. Fat-fingered value types (non-str)
     silently fall back to defaults — a broken ``[storage]`` block must
@@ -573,17 +576,20 @@ def _parse_storage_settings(
     storage_raw = raw.get("storage", {})
     if not isinstance(storage_raw, dict):
         storage_raw = {}
-    backend_raw = storage_raw.get("backend", "sqlite")
+    backend_raw = storage_raw.get("backend", "postgres")
     if not isinstance(backend_raw, str) or not backend_raw.strip():
-        backend_raw = "sqlite"
+        backend_raw = "postgres"
     url_raw = storage_raw.get("url", "")
     if not isinstance(url_raw, str):
         url_raw = ""
     url_stripped = url_raw.strip()
-    if not url_stripped:
-        # Default-derive from the already-resolved state_db path. The
-        # resolver downstream uses this URL verbatim, so emit an absolute
-        # path that survives chdir.
+    if not url_stripped and backend_raw.strip().lower() == "sqlite":
+        # Sqlite-only fallback: derive from the already-resolved state_db
+        # path so the legacy escape hatch keeps working without explicit
+        # URLs. The postgres backend reads its DSN from ``[storage.pg]``
+        # (or ``POLLYPM_PG_DSN``); leaving ``url`` empty lets the pool
+        # resolver pick it up rather than fabricating a sqlite URL on a
+        # postgres install (issue #1939).
         url_stripped = f"sqlite:///{project.state_db.resolve()}"
 
     # ``[storage.pg]`` subsection (issue #1737, Slice A). Missing /

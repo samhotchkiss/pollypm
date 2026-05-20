@@ -87,10 +87,11 @@ pythonpath = ["src"]
 testpaths = ["tests"]
 markers = [
   "benchmark: performance benchmark tests (recall latency, etc.)",
-  # #1737 Slice F: the ``work_service`` dispatch fixture in
-  # ``tests/conftest.py`` reads this marker to decide whether a test runs
-  # against ``SQLiteWorkService`` (default), ``PgWorkService``, or both.
-  # Usage: ``@pytest.mark.backend('postgres')`` / ``('sqlite')`` /
-  # ``('both')``. Unmarked tests stay on sqlite until Slice K cuts over.
+  # #1737 Slice F / #1942: the ``work_service`` dispatch fixture in
+  # ``tests/conftest.py`` reads this marker to decide whether a test
+  # runs against ``PgWorkService`` (default after the #1942 flip),
+  # ``SQLiteWorkService`` (legacy opt-in), or both. Usage:
+  # ``@pytest.mark.backend('postgres')`` / ``('sqlite')`` / ``('both')``.
+  # Unmarked tests run against pg; unknown values raise UsageError.
   "backend(name): pin a test to a work-service backend ('sqlite', 'postgres', or 'both')",
 ]

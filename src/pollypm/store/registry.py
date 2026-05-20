@@ -63,16 +63,24 @@ _STORE_LOCK = threading.Lock()
 def _resolve_url(config: "PollyPMConfig") -> str:
     """Return the SQLAlchemy URL for ``config``.
 
-    Honours ``config.storage.url`` verbatim when set. Otherwise derives
-    ``sqlite:///<project.state_db>`` so the resolver always produces a
-    concrete URL — backends never have to re-implement the fallback.
-    The config parser already applies the same default, but we re-check
-    here so test doubles and hand-built configs still work.
+    Honours ``config.storage.url`` verbatim when set. Otherwise:
+
+    * For the sqlite backend, derives
+      ``sqlite:///<project.state_db>`` so the resolver always produces a
+      concrete URL — backends never have to re-implement the fallback.
+    * For the postgres backend (#1939), returns an empty string and
+      lets the pg pool resolver pick the DSN up from
+      ``[storage.pg].dsn`` / ``POLLYPM_PG_DSN``. Fabricating a
+      ``sqlite:///`` URL on a postgres install was the silent-fallback
+      failure mode the cutover was supposed to remove.
     """
     url = (config.storage.url or "").strip()
     if url:
         return url
-    return f"sqlite:///{config.project.state_db.resolve()}"
+    backend = (config.storage.backend or "").strip().lower()
+    if backend == "sqlite":
+        return f"sqlite:///{config.project.state_db.resolve()}"
+    return ""
 
 
 def _available_backends() -> list[str]:

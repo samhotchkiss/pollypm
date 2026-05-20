@@ -148,7 +148,7 @@ pytest_plugins = ["tests.conftest_pg"]
 
 
 # ----------------------------------------------------------------------
-# Work-service backend dispatch (issue #1737, Slice F)
+# Work-service backend dispatch (issue #1737, Slice F; #1942)
 # ----------------------------------------------------------------------
 #
 # The ``work_service`` fixture below is the single entry point tests
@@ -156,15 +156,21 @@ pytest_plugins = ["tests.conftest_pg"]
 # which backend is providing it. Behaviour is controlled by an opt-in
 # ``@pytest.mark.backend(...)`` marker:
 #
-# * ``@pytest.mark.backend("sqlite")`` — force the sqlite path.
 # * ``@pytest.mark.backend("postgres")`` — force the pg path (requires
 #   the ``pg_schema_pool`` machinery in ``conftest_pg.py``; skipped if
-#   Docker / a local pg is unavailable).
+#   Docker / a local pg is unavailable). This is the default.
+# * ``@pytest.mark.backend("sqlite")`` — force the sqlite path.
+#   Retained for explicit opt-in (legacy coverage, migration tests).
 # * ``@pytest.mark.backend("both")`` — parameterise the test against
 #   both backends; the test runs twice and the active backend is
 #   identifiable via ``request.node.callspec.id``.
-# * No marker — sqlite. Slice K (the ripout) flips this default to pg
-#   and deletes the sqlite branch.
+# * No marker — postgres (#1942 default flip). The pre-cutover default
+#   was sqlite, which let large parts of the suite continue exercising
+#   the removed backend long after the #1737 cutover; unknown-marker
+#   typos also fell back to sqlite and silently masked pg regressions.
+#
+# Unknown backend markers now raise ``pytest.UsageError`` so a typo
+# fails the run instead of silently routing through a different backend.
 #
 # Tests that need the concrete service class (i.e. that today instantiate
 # ``SQLiteWorkService(...)`` directly) should migrate to the dispatch
@@ -173,7 +179,12 @@ pytest_plugins = ["tests.conftest_pg"]
 
 
 def _build_sqlite_work_service(tmp_path):
-    """Build a fresh ``SQLiteWorkService`` against a tmp-path DB."""
+    """Build a fresh ``SQLiteWorkService`` against a tmp-path DB.
+
+    Retained for ``@pytest.mark.backend('sqlite')`` opt-in coverage.
+    New tests should not reach for this path without a deliberate
+    reason — the production runtime is pg-only post-cutover (#1737).
+    """
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     return SQLiteWorkService(db_path=tmp_path / "work.db")
@@ -190,27 +201,24 @@ def _build_pg_work_service(request):
 
 
 def _resolve_backend_marker(request) -> str:
-    """Read the ``@pytest.mark.backend(...)`` marker, default ``sqlite``.
+    """Read the ``@pytest.mark.backend(...)`` marker, default ``postgres``.
 
     Returns the marker argument as a lowercase string. Unknown values
-    fall back to sqlite so a typo doesn't silently route to the wrong
-    backend — the dispatch path logs a warning when this happens.
+    raise ``pytest.UsageError`` so a typo fails the run rather than
+    silently routing to the wrong backend. Missing marker → postgres
+    after the #1942 default flip; the pre-cutover default was sqlite.
     """
     marker = request.node.get_closest_marker("backend")
     if marker is None:
-        return "sqlite"
+        return "postgres"
     if not marker.args:
-        return "sqlite"
+        return "postgres"
     raw = str(marker.args[0]).strip().lower()
     if raw not in {"sqlite", "postgres", "both"}:
-        import warnings
-
-        warnings.warn(
-            f"Unknown @pytest.mark.backend({marker.args[0]!r}); "
-            "defaulting to 'sqlite'. Valid values: 'sqlite', 'postgres', 'both'.",
-            stacklevel=2,
+        raise pytest.UsageError(
+            f"Unknown @pytest.mark.backend({marker.args[0]!r}). "
+            "Valid values: 'sqlite', 'postgres', 'both'."
         )
-        return "sqlite"
     return raw
 
 
@@ -230,11 +238,11 @@ def work_service(request, tmp_path):
         # parametrize hook below — when this fixture is invoked under a
         # ``both`` marker, the parametrize layer has already picked one
         # of ``sqlite`` / ``postgres`` and stashed it on the request.
-        chosen = getattr(request, "param", "sqlite")
+        chosen = getattr(request, "param", "postgres")
         backend = chosen
-    if backend == "postgres":
-        return _build_pg_work_service(request)
-    return _build_sqlite_work_service(tmp_path)
+    if backend == "sqlite":
+        return _build_sqlite_work_service(tmp_path)
+    return _build_pg_work_service(request)
 
 
 def pytest_generate_tests(metafunc):

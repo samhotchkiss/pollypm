@@ -8021,13 +8021,15 @@ class PollyInboxApp(App[None]):
             return
         if not is_task_inbox_entry(item):
             try:
-                from pollypm.store import SQLAlchemyStore
+                # #1941 — route messages-store writes through the
+                # configured-backend singleton so a pg-cutover workspace
+                # closes the row on the live pg ``messages`` table
+                # instead of an empty per-project sqlite shadow. The
+                # store is a process-wide singleton — do NOT close().
+                from pollypm.store import get_store
 
-                store = SQLAlchemyStore(f"sqlite:///{item.db_path}")
-                try:
-                    store.close_message(int(item.message_id))
-                finally:
-                    store.close()
+                store = get_store(load_config(self.config_path))
+                store.close_message(int(item.message_id))
             except Exception as exc:  # noqa: BLE001
                 self.notify(f"Archive failed: {exc}", severity="error")
                 return
@@ -9267,13 +9269,14 @@ class PollyInboxApp(App[None]):
             _celebrate_first_shipped(self)
         if is_message_item and item is not None:
             try:
-                from pollypm.store import SQLAlchemyStore
+                # #1941 — backend-aware close_message: route through the
+                # configured-backend singleton instead of the empty
+                # per-project sqlite shadow that the pre-cutover code
+                # opened. Singleton — do NOT close().
+                from pollypm.store import get_store
 
-                store = SQLAlchemyStore(f"sqlite:///{item.db_path}")
-                try:
-                    store.close_message(int(item.message_id))
-                finally:
-                    store.close()
+                store = get_store(load_config(self.config_path))
+                store.close_message(int(item.message_id))
             except Exception:  # noqa: BLE001
                 pass
         else:
@@ -9724,35 +9727,36 @@ class PollyInboxApp(App[None]):
     # ------------------------------------------------------------------
 
     def _emit_event(self, task_id: str, event_type: str, message: str) -> None:
-        """Record an activity-feed event on the project-root state.db.
+        """Record an activity-feed event via the configured store.
 
         Matches the shape used by ``pm notify`` so the same consumers see
         inbox.read / archived / reply alongside inbox.message.created.
         Fire-and-forget — we never block the UI on event bookkeeping.
         #349: routes through the unified ``messages`` table via Store.
+        #1941: backend-aware — uses the configured-backend singleton so
+        a pg-cutover workspace writes events to the live pg pool
+        instead of an empty per-project sqlite shadow.
         """
         try:
-            from pollypm.store import SQLAlchemyStore
+            from pollypm.store import get_store
+
             project_key = task_id.split("/", 1)[0]
             config = load_config(self.config_path)
-            project = config.projects.get(project_key)
-            if project is None:
+            # Gate on a registered project so unsolicited callers can't
+            # fire events for unknown task IDs; the pre-cutover code
+            # used the project's existence + state.db existence as the
+            # gate, and we preserve the project gate even though the
+            # store is no longer per-project.
+            if config.projects.get(project_key) is None:
                 return
-            db_path = project.path / ".pollypm" / "state.db"
-            if not db_path.exists():
-                return
-            store = SQLAlchemyStore(f"sqlite:///{db_path}")
-            try:
-                store.append_event(
-                    scope="cockpit",
-                    sender="cockpit",
-                    subject=event_type,
-                    payload={"message": message},
-                )
-            finally:
-                close = getattr(store, "close", None)
-                if callable(close):
-                    close()
+            store = get_store(config)
+            # Singleton — do NOT close().
+            store.append_event(
+                scope="cockpit",
+                sender="cockpit",
+                subject=event_type,
+                payload={"message": message},
+            )
         except Exception:  # noqa: BLE001
             pass
 
@@ -10978,17 +10982,18 @@ def _project_storage_aliases(config: object, project_key: str) -> list[str]:
 def _dashboard_discover_db_aliases(
     db_path: Path, aliases: list[str],
 ) -> list[str]:
-    """Return DB-stored project labels case-insensitively matching ``aliases``.
+    """Return work-service project labels case-insensitively matching ``aliases``.
 
     #915 — defends against any casing/slug variant that the static alias
-    list may have missed by inspecting what the work DB actually has.
-    Performs a single ``SELECT DISTINCT project`` scan; returns only the
-    labels that case-fold-match an alias OR slugify to the same key as
-    an alias. Failures are swallowed — the caller falls back to the
-    static alias list.
+    list may have missed by inspecting what the work service actually
+    has. #1941 — drops the direct ``sqlite3.connect(readonly_uri(...))``
+    + raw ``SELECT DISTINCT project FROM work_tasks`` scan in favour of
+    the backend-aware :func:`pollypm.work.create_work_service` /
+    ``list_tasks`` path; the pre-cutover code missed live pg rows on a
+    pg-configured workspace because it pointed at the empty per-project
+    sqlite shadow. Failures are swallowed — the caller falls back to
+    the static alias list.
     """
-    import sqlite3
-
     try:
         from pollypm.projects import slugify_project_key
     except Exception:  # noqa: BLE001
@@ -11005,36 +11010,62 @@ def _dashboard_discover_db_aliases(
 
     discovered: list[str] = []
     try:
-        from pollypm.storage.sqlite_pragmas import readonly_uri
-        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
+        from pollypm.config import load_config
+        from pollypm.work import create_work_service
     except Exception:  # noqa: BLE001
         return discovered
+
     try:
+        config = load_config()
+    except Exception:  # noqa: BLE001
+        config = None
+
+    labels: set[str] = set()
+    try:
+        with create_work_service(config=config) as svc:
+            for task in svc.list_tasks():
+                project = getattr(task, "project", None)
+                if isinstance(project, str) and project.strip():
+                    labels.add(project)
+    except Exception:  # noqa: BLE001
+        # Sqlite-install fallback: read the per-project DB directly so
+        # the legacy code path keeps working until the cutover is
+        # complete on every workspace.
+        import sqlite3
+
         try:
-            rows = conn.execute(
-                "SELECT DISTINCT project FROM work_tasks",
-            ).fetchall()
+            from pollypm.storage.sqlite_pragmas import readonly_uri
+            conn = sqlite3.connect(readonly_uri(db_path), uri=True)
         except Exception:  # noqa: BLE001
             return discovered
-        for (label,) in rows:
-            if not isinstance(label, str) or not label.strip():
-                continue
-            if label in aliases or label in discovered:
-                continue
-            if label.casefold() in folded:
-                discovered.append(label)
-                continue
-            if slugify_project_key is not None:
-                try:
-                    if slugify_project_key(label) in slugged:
-                        discovered.append(label)
-                except Exception:  # noqa: BLE001
-                    continue
-    finally:
         try:
-            conn.close()
-        except Exception:  # noqa: BLE001
-            pass
+            try:
+                rows = conn.execute(
+                    "SELECT DISTINCT project FROM work_tasks",
+                ).fetchall()
+            except Exception:  # noqa: BLE001
+                return discovered
+            for (label,) in rows:
+                if isinstance(label, str) and label.strip():
+                    labels.add(label)
+        finally:
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    for label in labels:
+        if label in aliases or label in discovered:
+            continue
+        if label.casefold() in folded:
+            discovered.append(label)
+            continue
+        if slugify_project_key is not None:
+            try:
+                if slugify_project_key(label) in slugged:
+                    discovered.append(label)
+            except Exception:  # noqa: BLE001
+                continue
     return discovered
 
 
@@ -11928,84 +11959,102 @@ def _dashboard_inbox_collect_messages(
     project_path: Path,
     known_projects: set,
 ) -> list[dict]:
-    """Open each message-source DB and append message-shaped inbox items."""
-    from pollypm.store import SQLAlchemyStore
+    """Append message-shaped inbox items via the configured store.
+
+    #1941: routes through :func:`pollypm.store.get_store` so a pg-cutover
+    workspace reads the live ``messages`` table on the pg pool. The
+    ``message_sources`` list is preserved as a parameter (callers may
+    still iterate per-project paths on a sqlite install for legacy
+    layouts) but the open path is now a single backend-aware singleton
+    fetch; ``source_db`` per-row metadata stays the per-source path so
+    downstream item builders preserve the existing cross-source dedup +
+    project-scope filtering. The store is a process-wide singleton —
+    do NOT close().
+    """
     from pollypm.cockpit_inbox_sources import _row_is_dev_channel
+    from pollypm.store import get_store
 
     items: list[dict] = []
-    seen_messages: set[tuple[str, object]] = set()
-    for source_key, source_db in message_sources:
-        try:
-            store = SQLAlchemyStore(f"sqlite:///{source_db}")
-        except Exception:  # noqa: BLE001
+    try:
+        store = get_store(config)
+    except Exception:  # noqa: BLE001
+        return items
+
+    seen_messages: set[object] = set()
+    try:
+        rows = store.query_messages(
+            state="open",
+            type=["notify", "inbox_task", "alert", "event"],
+            limit=250,
+        )
+    except Exception:  # noqa: BLE001
+        rows = []
+
+    # Pick a representative source-key / source-db for the legacy item
+    # builder. Callers historically passed [(project_key, project_db),
+    # ("__workspace__", workspace_db)]; the configured store now serves
+    # both, so collapse to the first entry and let the dedup happen on
+    # the row id alone.
+    primary_source_key = (
+        message_sources[0][0] if message_sources else project_key
+    )
+    primary_source_db = (
+        message_sources[0][1] if message_sources
+        else project_path / ".pollypm" / "state.db"
+    )
+
+    for row in rows:
+        row_id = row.get("id")
+        if row_id is None or row_id in seen_messages:
             continue
-        try:
-            try:
-                rows = store.query_messages(
-                    state="open",
-                    type=["notify", "inbox_task", "alert", "event"],
-                    limit=250,
+        seen_messages.add(row_id)
+        if _row_is_dev_channel(row.get("labels")):
+            continue
+        payload = row.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
+        labels = _dashboard_inbox_labels_from_row(row)
+        is_blocker_summary = (
+            payload.get("event_type") == "project_blocker_summary"
+            or row.get("subject") == "project.blocker_summary"
+        )
+        if row.get("type") == "event" and not is_blocker_summary:
+            continue
+        if project_key not in _dashboard_inbox_message_projects(row, config):
+            continue
+        if is_blocker_summary:
+            raw_updated_at = (
+                row.get("updated_at") or row.get("created_at") or ""
+            )
+            if hasattr(raw_updated_at, "isoformat"):
+                raw_updated_at = raw_updated_at.isoformat()
+            items.append(
+                _dashboard_build_blocker_summary_item(
+                    row,
+                    payload,
+                    project_key,
+                    sort_value=_dashboard_inbox_sort_value(raw_updated_at),
                 )
-            except Exception:  # noqa: BLE001
-                rows = []
-            for row in rows:
-                row_id = row.get("id")
-                message_key = (str(source_db), row_id)
-                if row_id is None or message_key in seen_messages:
-                    continue
-                seen_messages.add(message_key)
-                if _row_is_dev_channel(row.get("labels")):
-                    continue
-                payload = row.get("payload") or {}
-                if not isinstance(payload, dict):
-                    payload = {}
-                labels = _dashboard_inbox_labels_from_row(row)
-                is_blocker_summary = (
-                    payload.get("event_type") == "project_blocker_summary"
-                    or row.get("subject") == "project.blocker_summary"
-                )
-                if row.get("type") == "event" and not is_blocker_summary:
-                    continue
-                if project_key not in _dashboard_inbox_message_projects(row, config):
-                    continue
-                if is_blocker_summary:
-                    raw_updated_at = (
-                        row.get("updated_at") or row.get("created_at") or ""
-                    )
-                    if hasattr(raw_updated_at, "isoformat"):
-                        raw_updated_at = raw_updated_at.isoformat()
-                    items.append(
-                        _dashboard_build_blocker_summary_item(
-                            row,
-                            payload,
-                            project_key,
-                            sort_value=_dashboard_inbox_sort_value(raw_updated_at),
-                        )
-                    )
-                    continue
-                # Some PM handoff notes arrive through shell-escaped paths and
-                # persist literal "\n" sequences. Normalize before extracting
-                # blocker paragraphs and numbered action steps.
-                message_body = str(row.get("body") or "").replace("\\n", "\n")
-                items.append(
-                    _dashboard_inbox_build_message_item(
-                        row=row,
-                        payload=payload,
-                        labels=labels,
-                        source_key=source_key,
-                        source_db=source_db,
-                        project_key=project_key,
-                        project_path=project_path,
-                        known_projects=known_projects,
-                        message_body=message_body,
-                        sort_value=_dashboard_inbox_sort_value,
-                    )
-                )
-        finally:
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001
-                pass
+            )
+            continue
+        # Some PM handoff notes arrive through shell-escaped paths and
+        # persist literal "\n" sequences. Normalize before extracting
+        # blocker paragraphs and numbered action steps.
+        message_body = str(row.get("body") or "").replace("\\n", "\n")
+        items.append(
+            _dashboard_inbox_build_message_item(
+                row=row,
+                payload=payload,
+                labels=labels,
+                source_key=primary_source_key,
+                source_db=primary_source_db,
+                project_key=project_key,
+                project_path=project_path,
+                known_projects=known_projects,
+                message_body=message_body,
+                sort_value=_dashboard_inbox_sort_value,
+            )
+        )
     return items
 
 

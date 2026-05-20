@@ -1983,27 +1983,30 @@ def _open_workspace_project_work_service(project: Any, services: Any) -> Any | N
 
 
 def _open_project_work_service(project: Any, services: Any) -> Any | None:
-    """Open a per-project ``SQLiteWorkService`` if its state.db exists.
+    """Open a backend-aware work service for ``project``.
 
-    Returns ``None`` when the project path has no state.db yet (fresh
-    registration, never-touched project) or when any open-time error
-    prevents connecting. Never raises — the sweeper skips silently and
-    moves on to the next project.
+    #1941 — drops the per-project ``state.db`` precondition + the
+    ``db_path=``-forced sqlite dispatch (which silently picked sqlite
+    even when ``config`` selected postgres, since the previous call
+    omitted ``config=``). Threads ``config`` from ``services`` so the
+    factory honours ``[storage].backend``. Never raises — the sweeper
+    skips silently and moves on to the next project.
     """
     project_path = getattr(project, "path", None)
     if project_path is None:
         return None
-    db_path = Path(project_path) / ".pollypm" / "state.db"
-    if not db_path.exists():
-        return None
     try:
         from pollypm.work import create_work_service
 
-        svc = create_work_service(db_path=db_path, project_path=Path(project_path))
+        svc = create_work_service(
+            project_path=Path(project_path),
+            config=getattr(services, "config", None),
+            project_key=getattr(project, "key", None),
+        )
     except Exception:  # noqa: BLE001
         logger.debug(
-            "task_assignment sweep: failed to open per-project DB at %s",
-            db_path, exc_info=True,
+            "task_assignment sweep: failed to open work service for %s",
+            project_path, exc_info=True,
         )
         return None
 

@@ -1047,25 +1047,30 @@ def _wire_session_manager(svc: Any, project_root: Path, services: Any) -> None:
 
 
 def _open_project_work_service(project: Any, services: Any) -> Any | None:
-    """Open a per-project ``SQLiteWorkService`` if its state DB exists."""
+    """Open a backend-aware work service for ``project``.
+
+    #1941 — drops the per-project ``state.db`` precondition and the
+    ``db_path=`` forced-sqlite dispatch. On a pg-cutover workspace the
+    per-project file no longer exists; gating the sweeper on
+    ``db_path.exists()`` skipped every project. The factory now
+    honours ``config.storage.backend``; the sqlite branch still
+    resolves a path via ``work.db_resolver``.
+    """
     project_path = getattr(project, "path", None)
     if project_path is None:
-        return None
-    db_path = Path(project_path) / ".pollypm" / "state.db"
-    if not db_path.exists():
         return None
     try:
         from pollypm.work import create_work_service
 
         svc = create_work_service(
-            db_path=db_path,
             project_path=Path(project_path),
             config=getattr(services, "config", None),
+            project_key=getattr(project, "key", None),
         )
     except Exception:  # noqa: BLE001
         logger.debug(
-            "task_assignment sweep: failed to open per-project DB at %s",
-            db_path,
+            "task_assignment sweep: failed to open work service for %s",
+            project_path,
             exc_info=True,
         )
         return None

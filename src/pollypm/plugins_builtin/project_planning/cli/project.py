@@ -443,15 +443,11 @@ def blocker_summary_cmd(
         )
         raise typer.Exit(code=1)
     project_path = Path(project_cfg.path)
-    db_path = _planner_db_path(project_path, config_path=config_path)
-    if not db_path.exists():
-        typer.echo(
-            f"Project {project!r} has no work-service DB at {db_path}. "
-            "Initialize the project first with `pm project plan` or "
-            "`pm task new`.",
-            err=True,
-        )
-        raise typer.Exit(code=1)
+    # #1941 — the pre-cutover gate required a per-project ``state.db``;
+    # on a pg-cutover workspace there is no such file and the command
+    # refused every legitimate invocation. Backend-aware ``get_store`` +
+    # ``create_work_service(config=cfg)`` now route through
+    # ``[storage].backend``, so any registered project is fair game.
 
     summary = ProjectBlockerSummary(
         project=project,
@@ -462,25 +458,20 @@ def blocker_summary_cmd(
         unblock_condition=unblock_when,
     )
 
-    from pollypm.store import SQLAlchemyStore
+    from pollypm.store import get_store
     from pollypm.work import create_work_service
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
-    try:
-        with create_work_service(
-            db_path=db_path, project_path=project_path,
-        ) as svc:
-            result = record_project_blocker_summary(
-                store=store,
-                work_service=svc,
-                summary=summary,
-                actor=actor,
-            )
-    finally:
-        try:
-            store.close()
-        except Exception:  # noqa: BLE001
-            pass
+    # Singleton — do NOT close() the store (see registry.get_store).
+    store = get_store(cfg)
+    with create_work_service(
+        project_path=project_path, config=cfg, project_key=project,
+    ) as svc:
+        result = record_project_blocker_summary(
+            store=store,
+            work_service=svc,
+            summary=summary,
+            actor=actor,
+        )
 
     typer.echo(f"Recorded blocker summary for {project} (event {result['event_id']}).")
     if result.get("task_id"):

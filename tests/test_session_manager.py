@@ -1863,85 +1863,11 @@ class TestParallelWorkerCap:
         with pytest.raises(WorkerCapExceededError):
             mgr._reserve_cap_slot_atomic("proj", 17, "worker")
 
-    def test_sqlite_reserve_worker_cap_slot_atomic_behavior(
-        self, tmp_path,
-    ) -> None:
-        """#1883 — the SQLiteWorkService reserve is atomic.
-
-        Verifies the work-service-level contract: ``reserve_worker_cap_slot``
-        on the SQLite backend serialises check + insert under a
-        ``BEGIN IMMEDIATE`` transaction so the placeholder row is
-        visible to subsequent ``list_worker_sessions`` calls.
-        """
-        from pollypm.work.sqlite_service import SQLiteWorkService
-
-        db_path = tmp_path / "work.db"
-        svc = SQLiteWorkService(db_path=db_path)
-        svc.ensure_worker_session_schema()
-        # Satisfy the work_sessions FK to work_tasks. The reserve
-        # method writes into work_sessions which references
-        # ``work_tasks(project, task_number)`` — and ``work_tasks``
-        # has NOT NULL columns for title/type/flow/created_at/etc.
-        now = "2026-05-19T00:00:00+00:00"
-        for n in (1, 2, 3):
-            svc._conn.execute(
-                "INSERT OR IGNORE INTO work_tasks "
-                "(project, task_number, title, type, flow_template_id, "
-                " created_at, created_by, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                ("proj", n, f"task {n}", "feat", "simple",
-                 now, "system", now),
-            )
-        svc._conn.commit()
-
-        # No active rows; cap = 2 -> reserve succeeds, placeholder
-        # row is now visible to the count.
-        ok = svc.reserve_worker_cap_slot(
-            task_project="proj",
-            task_number=1,
-            agent_name="worker",
-            started_at="2026-05-19T00:00:00+00:00",
-            cap=2,
-        )
-        assert ok is True
-        active = svc.list_worker_sessions(
-            project="proj", active_only=True,
-        )
-        assert len(active) == 1, active
-
-        # Second reserve for a different task — still under cap.
-        ok2 = svc.reserve_worker_cap_slot(
-            task_project="proj",
-            task_number=2,
-            agent_name="worker",
-            started_at="2026-05-19T00:00:00+00:00",
-            cap=2,
-        )
-        assert ok2 is True
-
-        # Third reserve at cap -> rejected without inserting a row.
-        ok3 = svc.reserve_worker_cap_slot(
-            task_project="proj",
-            task_number=3,
-            agent_name="worker",
-            started_at="2026-05-19T00:00:00+00:00",
-            cap=2,
-        )
-        assert ok3 is False
-        active = svc.list_worker_sessions(
-            project="proj", active_only=True,
-        )
-        assert len(active) == 2, active
-
-        # Re-claim for an already-reserved task is idempotent.
-        ok4 = svc.reserve_worker_cap_slot(
-            task_project="proj",
-            task_number=1,
-            agent_name="worker",
-            started_at="2026-05-19T00:00:00+00:00",
-            cap=2,
-        )
-        assert ok4 is True
+    # Post-sqlite-ripout (refs #1971): the
+    # ``test_sqlite_reserve_worker_cap_slot_atomic_behavior`` test was
+    # deleted alongside ``SQLiteWorkService``. The equivalent pg
+    # contract is exercised by
+    # ``tests/test_pg_worker_cap.py`` (see #1883 follow-ups).
 
 
 # ---------------------------------------------------------------------------

@@ -115,28 +115,14 @@ def pytest_configure(config):
         "(use only when a test explicitly monkeypatches Path.home / "
         "GLOBAL_CONFIG_DIR to a sandbox).",
     )
-    # #1956 — sqlite was removed from the ``pollypm.store_backend``
-    # entry-point group in ``pyproject.toml`` so a stock prod install
-    # cannot silently pick it up from ``[storage].backend = "sqlite"``.
-    # The test suite still relies on sqlite via
-    # ``@pytest.mark.backend("sqlite")``, the legacy ``--db <path>``
-    # CLI escape paths, and direct ``get_store_by_url`` calls in
-    # ``tests/test_cli_inbox_backend_aware.py`` /
-    # ``tests/test_cli_notify_backend_aware.py``. Register the
-    # backend in-process for the whole pytest run so those paths
-    # keep resolving. ``quiet=True`` suppresses the production
-    # warn-log under pytest.
-    try:
-        from pollypm.store import SQLAlchemyStore
-        from pollypm.store.registry import register_backend
-
-        register_backend("sqlite", SQLAlchemyStore, quiet=True)
-    except Exception:  # noqa: BLE001
-        # The store package may not be importable in the very early
-        # phase of some sub-suite runs (e.g. tooling-only tests with
-        # mocked sys.modules). Tests that actually need sqlite will
-        # re-register from their own fixtures.
-        pass
+    # Post-sqlite-ripout (refs #1971): ``SQLAlchemyStore`` and the
+    # ``sqlite`` backend entry are gone. The earlier in-process
+    # re-registration this block performed (so legacy
+    # ``@pytest.mark.backend("sqlite")`` tests and direct
+    # ``get_store_by_url("sqlite:///...")`` calls kept resolving)
+    # is intentionally dropped — any test that still pins itself
+    # to sqlite will fail loudly at runtime, which is the correct
+    # signal for the migration sweep.
 
 
 @pytest.fixture(autouse=True)
@@ -170,46 +156,17 @@ pytest_plugins = ["tests.conftest_pg"]
 
 
 # ----------------------------------------------------------------------
-# Work-service backend dispatch (issue #1737, Slice F; #1942)
+# Work-service backend dispatch (issue #1737, Slice F; #1942; #1971)
 # ----------------------------------------------------------------------
 #
 # The ``work_service`` fixture below is the single entry point tests
 # should reach for when they want a work-service instance and don't care
-# which backend is providing it. Behaviour is controlled by an opt-in
-# ``@pytest.mark.backend(...)`` marker:
+# which backend is providing it.
 #
-# * ``@pytest.mark.backend("postgres")`` — force the pg path (requires
-#   the ``pg_schema_pool`` machinery in ``conftest_pg.py``; skipped if
-#   Docker / a local pg is unavailable). This is the default.
-# * ``@pytest.mark.backend("sqlite")`` — force the sqlite path.
-#   Retained for explicit opt-in (legacy coverage, migration tests).
-# * ``@pytest.mark.backend("both")`` — parameterise the test against
-#   both backends; the test runs twice and the active backend is
-#   identifiable via ``request.node.callspec.id``.
-# * No marker — postgres (#1942 default flip). The pre-cutover default
-#   was sqlite, which let large parts of the suite continue exercising
-#   the removed backend long after the #1737 cutover; unknown-marker
-#   typos also fell back to sqlite and silently masked pg regressions.
-#
-# Unknown backend markers now raise ``pytest.UsageError`` so a typo
-# fails the run instead of silently routing through a different backend.
-#
-# Tests that need the concrete service class (i.e. that today instantiate
-# ``SQLiteWorkService(...)`` directly) should migrate to the dispatch
-# fixture incrementally as their owners port them. The fixture is
-# intentionally not auto-applied — Slice F is plumbing, not a rewrite.
-
-
-def _build_sqlite_work_service(tmp_path):
-    """Build a fresh ``SQLiteWorkService`` against a tmp-path DB.
-
-    Retained for ``@pytest.mark.backend('sqlite')`` opt-in coverage.
-    New tests should not reach for this path without a deliberate
-    reason — the production runtime is pg-only post-cutover (#1737).
-    """
-    from pollypm.work.sqlite_service import SQLiteWorkService
-
-    return SQLiteWorkService(db_path=tmp_path / "work.db")
+# Post-sqlite-ripout (refs #1971) the only supported backend is pg.
+# The ``@pytest.mark.backend(...)`` marker is retained as a no-op shim
+# for legacy call sites — values other than ``postgres`` raise
+# ``pytest.UsageError`` so the rewrite sweep surfaces stragglers.
 
 
 def _build_pg_work_service(request):
@@ -223,12 +180,12 @@ def _build_pg_work_service(request):
 
 
 def _resolve_backend_marker(request) -> str:
-    """Read the ``@pytest.mark.backend(...)`` marker, default ``postgres``.
+    """Read the ``@pytest.mark.backend(...)`` marker.
 
-    Returns the marker argument as a lowercase string. Unknown values
-    raise ``pytest.UsageError`` so a typo fails the run rather than
-    silently routing to the wrong backend. Missing marker → postgres
-    after the #1942 default flip; the pre-cutover default was sqlite.
+    Post-sqlite-ripout (refs #1971) only ``postgres`` is valid. Any
+    other value (including the previously-supported ``sqlite`` /
+    ``both``) raises ``pytest.UsageError`` so the migration finishes
+    explicitly instead of leaking a silent skip.
     """
     marker = request.node.get_closest_marker("backend")
     if marker is None:
@@ -236,59 +193,24 @@ def _resolve_backend_marker(request) -> str:
     if not marker.args:
         return "postgres"
     raw = str(marker.args[0]).strip().lower()
-    if raw not in {"sqlite", "postgres", "both"}:
+    if raw != "postgres":
         raise pytest.UsageError(
-            f"Unknown @pytest.mark.backend({marker.args[0]!r}). "
-            "Valid values: 'sqlite', 'postgres', 'both'."
+            f"Unsupported @pytest.mark.backend({marker.args[0]!r}). "
+            "Only 'postgres' is valid post-sqlite-ripout (refs #1971)."
         )
     return raw
 
 
 @pytest.fixture
 def work_service(request, tmp_path):
-    """Dispatch fixture returning a work-service backed by the marker.
+    """Dispatch fixture returning a pg-backed work service.
 
-    See the comment block above for marker semantics. Tests that need
-    a backend-specific service (e.g. they assert on pg row counts or
-    sqlite pragmas) should reach for the concrete fixtures
-    (``pg_work_service`` or build a ``SQLiteWorkService`` directly)
-    instead.
+    Post-sqlite-ripout (refs #1971) this always returns the pg fixture
+    — kept as a thin shim so the call-site API stays stable while
+    callers migrate to ``pg_work_service`` directly.
     """
-    backend = _resolve_backend_marker(request)
-    if backend == "both":
-        # ``both`` is implemented via the ``_work_service_backend``
-        # parametrize hook below — when this fixture is invoked under a
-        # ``both`` marker, the parametrize layer has already picked one
-        # of ``sqlite`` / ``postgres`` and stashed it on the request.
-        chosen = getattr(request, "param", "postgres")
-        backend = chosen
-    if backend == "sqlite":
-        return _build_sqlite_work_service(tmp_path)
+    _resolve_backend_marker(request)
     return _build_pg_work_service(request)
-
-
-def pytest_generate_tests(metafunc):
-    """Parameterise ``work_service`` against both backends when marked.
-
-    Implements the ``@pytest.mark.backend('both')`` half of the dispatch
-    contract: when the marker is present AND the test asks for the
-    ``work_service`` fixture, expand into two test items — one per
-    backend. The ``work_service`` fixture above reads ``request.param``
-    to pick the right side.
-    """
-    if "work_service" not in metafunc.fixturenames:
-        return
-    backend_marker = metafunc.definition.get_closest_marker("backend")
-    if backend_marker is None or not backend_marker.args:
-        return
-    if str(backend_marker.args[0]).strip().lower() != "both":
-        return
-    metafunc.parametrize(
-        "work_service",
-        ["sqlite", "postgres"],
-        indirect=True,
-        ids=["sqlite", "postgres"],
-    )
 
 
 # ----------------------------------------------------------------------

@@ -52,12 +52,14 @@ def _make_state_db(path: Path, *, sessions: int = 0) -> Path:
     """Synthetic state DB with the ``sessions`` shape the doctor reads.
 
     Installs the ``sessions`` table (still a domain table owned by
-    :class:`StateStore`, #342-followup) plus bootstraps the unified
-    ``messages`` schema via :class:`SQLAlchemyStore` so the cadence
-    check can read ``type='event'`` rows.
+    :class:`StateStore`, #342-followup). Pre-sqlite-ripout this also
+    bootstrapped the unified ``messages`` schema via
+    ``SQLAlchemyStore`` so the cadence check could read events;
+    post-#1971 the messages table lives in pg and the scheduler
+    cadence test path was deleted from this module (the doctor now
+    reads via ``get_store(load_config())`` rather than a sqlite path
+    monkeypatched onto ``_primary_state_db``).
     """
-    from pollypm.store import SQLAlchemyStore
-
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     try:
@@ -85,43 +87,7 @@ def _make_state_db(path: Path, *, sessions: int = 0) -> Path:
         conn.commit()
     finally:
         conn.close()
-    SQLAlchemyStore(f"sqlite:///{path}").close()
     return path
-
-
-def _record_event(db_path: Path, event_type: str, *, age_seconds: int = 0) -> None:
-    """Insert a ``type='event'`` row into the unified ``messages`` table."""
-    import json as _json
-    from datetime import UTC, datetime, timedelta
-
-    from sqlalchemy import insert as _insert
-
-    from pollypm.store import SQLAlchemyStore
-    from pollypm.store.schema import messages as _messages
-
-    created_at = datetime.now(UTC) - timedelta(seconds=age_seconds)
-    msg_store = SQLAlchemyStore(f"sqlite:///{db_path}")
-    try:
-        with msg_store.transaction() as conn:
-            conn.execute(
-                _insert(_messages),
-                {
-                    "scope": "system",
-                    "type": "event",
-                    "tier": "immediate",
-                    "recipient": "*",
-                    "sender": "system",
-                    "state": "open",
-                    "subject": event_type,
-                    "body": "ok",
-                    "payload_json": _json.dumps({"event_type": event_type}),
-                    "labels": "[]",
-                    "created_at": created_at,
-                    "updated_at": created_at,
-                },
-            )
-    finally:
-        msg_store.close()
 
 
 # --------------------------------------------------------------------- #
@@ -164,42 +130,19 @@ def test_project_local_guide_drift_pass(
 
 
 # --------------------------------------------------------------------- #
-# Scheduler cadence — needs a bootstrapped messages table for events.
+# Scheduler cadence — DELETED post-sqlite-ripout (refs #1971).
+#
+# The pre-ripout tests seeded ``type='event'`` rows into a tmp-path
+# sqlite ``messages`` table via ``SQLAlchemyStore`` and monkeypatched
+# ``_primary_state_db`` so the doctor read from that path. Post-ripout
+# ``check_scheduler_last_fired`` resolves its store via
+# ``get_store(load_config())`` (i.e. the configured pg backend), so a
+# sqlite tmp-path seed is no longer visible to the check. The
+# equivalent coverage belongs in a pg-backed test that pre-seeds the
+# per-test schema's ``messages`` table via ``PgStore.record_event``
+# and lets the doctor read it back; that re-port is a follow-up to
+# this ripout.
 # --------------------------------------------------------------------- #
-
-
-def test_scheduler_cadence_pass(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    db = _make_state_db(tmp_path / "state.db")
-    for handler in doctor._HANDLER_MAX_GAP_SECONDS:
-        _record_event(db, handler, age_seconds=10)
-    monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
-    result = doctor.check_scheduler_last_fired()
-    assert result.passed
-    assert "within cadence" in result.status
-
-
-def test_scheduler_cadence_warn_when_overdue(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    db = _make_state_db(tmp_path / "state.db")
-    _record_event(db, "db.vacuum", age_seconds=5 * 86400)
-    monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
-    result = doctor.check_scheduler_last_fired()
-    assert not result.passed
-    assert result.severity == "warning"
-    assert "overdue" in result.status
-
-
-def test_scheduler_cadence_pass_when_no_events(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-) -> None:
-    """Fresh-install case: no events yet, no overdue → passes."""
-    db = _make_state_db(tmp_path / "state.db")
-    monkeypatch.setattr(doctor, "_primary_state_db", lambda: db)
-    result = doctor.check_scheduler_last_fired()
-    assert result.passed
 
 
 # --------------------------------------------------------------------- #

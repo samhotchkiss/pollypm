@@ -380,6 +380,13 @@ CREATE TABLE IF NOT EXISTS workspace_state (
 -- ``last_finding_signature`` snapshots the structured signature so
 -- forensic reads can reconstruct what hash the row covers without
 -- re-deriving from the original Finding.
+-- #1997 — ``terminal_handoff_at`` is the persistent gate that prevents
+-- the infinite re-promotion loop on a permanently-stuck finding. Once
+-- the budget-exhaustion sweep routes a row to the terminal product-
+-- broken + urgent-inbox path, ``terminal_handoff_at`` is stamped and
+-- ``should_auto_promote`` refuses to re-promote the same root_cause_hash
+-- until the finding actually resolves (``finding_resolved`` /
+-- ``finding_cleared``), at which point ``clear`` NULLs the column.
 CREATE TABLE IF NOT EXISTS tier4_promotion_state (
     root_cause_hash TEXT PRIMARY KEY,
     project TEXT NOT NULL DEFAULT '',
@@ -390,7 +397,8 @@ CREATE TABLE IF NOT EXISTS tier4_promotion_state (
     tier4_entered_at TEXT,
     tier4_active INTEGER NOT NULL DEFAULT 0,
     last_finding_signature TEXT NOT NULL DEFAULT '',
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    terminal_handoff_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_tier4_promotion_state_active
@@ -786,6 +794,21 @@ class StateStore:
         # DBs pick it up on first open. Dispatch block below adds the
         # column on upgraded DBs via ``_safe_add_column``.
         (18, "Add kind column to messages for structured inbox taxonomy (#1565)", []),
+        # --- Migration 19 ----------------------------------------------
+        # #1997 — persistent terminal-handoff gate on tier4_promotion_state.
+        # Without this column, ``tracker.clear(reason='budget_exhausted')``
+        # on the budget-exhaustion sweep flips ``tier4_active`` to 0 and
+        # the next watchdog tick's auto-promote gate sees nothing
+        # preventing a fresh promotion — producing an infinite loop on a
+        # permanently-stuck finding (98 promotions / 81 budget-exhausts /
+        # 0 demotions across 8 projects over 50h in the wild). Adding
+        # the column gates ``should_auto_promote`` so the same hash
+        # can't re-escalate until the finding actually resolves.
+        # Column-only migration; the column is also declared on the
+        # SCHEMA constant so fresh DBs pick it up on first open.
+        # Dispatch block below adds the column on upgraded DBs via
+        # ``_safe_add_column``.
+        (19, "tier4_promotion_state.terminal_handoff_at gate (#1997)", []),
     ]
 
     def _migrate(self) -> None:
@@ -851,6 +874,17 @@ class StateStore:
             self._migrate_v16_unique_open_alert_index()
         elif version == 18:
             self._migrate_v18_messages_kind_column()
+        elif version == 19:
+            # #1997 — column-only migration. ``_safe_add_column`` is a
+            # no-op on fresh DBs (the SCHEMA constant already includes
+            # the column); on upgraded DBs it runs a single ALTER TABLE.
+            # No backfill: NULL is the correct value for pre-existing
+            # rows — "this hash has never had its terminal handoff fire".
+            self._safe_add_column(
+                "tier4_promotion_state",
+                "terminal_handoff_at",
+                "TEXT",
+            )
 
     def _migrate_v8_memory_typed_columns(self) -> None:
         # Back-fill typed-schema columns on pre-existing memory_entries

@@ -175,6 +175,18 @@ class Tier4State:
     tier4_active: bool
     last_finding_signature: str
     updated_at: datetime | None
+    #: #1997 — persistent terminal-handoff gate. Set by
+    #: :meth:`Tier4PromotionTracker.mark_terminal_handoff` when the
+    #: cascade fires the terminal product-broken + urgent-inbox path.
+    #: While non-None the auto-promote gate refuses to re-promote the
+    #: same ``root_cause_hash`` — without this, ``tracker.clear`` on
+    #: budget exhaustion looks identical to a fresh-resolution clear
+    #: and ``should_auto_promote`` would re-greenlight the next cycle,
+    #: producing an infinite tier-4 promotion loop. Cleared (NULLed)
+    #: when the finding actually resolves (``finding_resolved`` /
+    #: ``finding_cleared``) so a future, distinct occurrence of the
+    #: same hash can promote again.
+    terminal_handoff_at: datetime | None = None
 
     def dispatch_count_in_window(
         self, now: datetime, window_seconds: int,
@@ -243,7 +255,8 @@ class Tier4PromotionTracker:
                 """
                 SELECT root_cause_hash, project, rule, dispatch_history_json,
                        last_promotion_at, promotion_path, tier4_entered_at,
-                       tier4_active, last_finding_signature, updated_at
+                       tier4_active, last_finding_signature, updated_at,
+                       terminal_handoff_at
                 FROM tier4_promotion_state
                 WHERE root_cause_hash = ?
                 """,
@@ -334,6 +347,15 @@ class Tier4PromotionTracker:
         # hash — let the existing tier-4 invocation finish (or the
         # budget exhaust) before we issue another promotion.
         if state.tier4_active:
+            return False
+        # #1997 — once the terminal handoff has fired for this hash,
+        # refuse to re-promote until the finding actually resolves
+        # (which NULLs ``terminal_handoff_at`` via ``clear`` with a
+        # non-budget reason). Without this gate, budget-exhausted
+        # ``tracker.clear`` flips ``tier4_active`` to 0 and the next
+        # tick's dispatch counter trivially re-crosses K, producing an
+        # infinite escalation loop on a permanently-stuck finding.
+        if state.terminal_handoff_at is not None:
             return False
         count = state.dispatch_count_in_window(
             now, self.auto_promote_window_seconds,
@@ -462,6 +484,22 @@ class Tier4PromotionTracker:
             return False
         return remaining <= 0
 
+    #: Reasons that signal "the finding actually resolved" (vs the
+    #: cascade timing out). Used by :meth:`clear` to decide whether to
+    #: NULL ``terminal_handoff_at`` — only a real resolution should
+    #: allow a future occurrence of the same hash to promote again.
+    #:
+    #: ``manual_clear`` is the default reason on ``pm tier4 clear`` —
+    #: the operator explicitly told the cascade "this finding is done,"
+    #: which the issue (#1997) calls out as the canonical gate-release
+    #: path. Anything else (``budget_exhausted``, custom reasons) is
+    #: treated as a non-resolution clear and preserves the gate.
+    _RESOLUTION_REASONS = frozenset({
+        "finding_resolved",
+        "finding_cleared",
+        "manual_clear",
+    })
+
     def clear(
         self,
         root_cause_hash_value: str,
@@ -477,6 +515,66 @@ class Tier4PromotionTracker:
         see the prior tier-4 run. ``reason`` is recorded in
         ``last_finding_signature`` as ``"cleared:<reason>"`` for the
         post-clear forensic trail.
+
+        #1997: when ``reason`` indicates a real resolution
+        (``finding_resolved`` / ``finding_cleared``), the persistent
+        ``terminal_handoff_at`` gate is NULLed so a future, distinct
+        occurrence of the same hash can promote again. When ``reason``
+        is a timeout (``budget_exhausted``), ``terminal_handoff_at`` is
+        preserved — the cascade has already escalated to Sam and must
+        not re-escalate on the next tick.
+        """
+        if not root_cause_hash_value:
+            return False
+        clear_terminal = reason in self._RESOLUTION_REASONS
+        store = self._open_store()
+        try:
+            if clear_terminal:
+                cur = store.execute(
+                    """
+                    UPDATE tier4_promotion_state
+                       SET tier4_active = 0,
+                           updated_at = ?,
+                           last_finding_signature = 'cleared:' || ?,
+                           terminal_handoff_at = NULL
+                     WHERE root_cause_hash = ?
+                    """,
+                    (_iso(now), reason, root_cause_hash_value),
+                )
+            else:
+                cur = store.execute(
+                    """
+                    UPDATE tier4_promotion_state
+                       SET tier4_active = 0,
+                           updated_at = ?,
+                           last_finding_signature = 'cleared:' || ?
+                     WHERE root_cause_hash = ?
+                    """,
+                    (_iso(now), reason, root_cause_hash_value),
+                )
+            store.commit()
+            return (cur.rowcount or 0) > 0
+        finally:
+            store.close()
+
+    def mark_terminal_handoff(
+        self,
+        root_cause_hash_value: str,
+        *,
+        now: datetime,
+    ) -> bool:
+        """Stamp the persistent terminal-handoff gate (#1997).
+
+        Called by the budget-exhaustion sweep AFTER it has successfully
+        routed the row to the terminal path (product-broken + urgent
+        inbox). Sets ``terminal_handoff_at`` so the next call to
+        :meth:`should_auto_promote` for the same hash returns False
+        even after ``tracker.clear`` flips ``tier4_active`` to 0 —
+        breaking the infinite re-promotion loop described in #1997.
+
+        Returns True iff a row was updated. Safe to call multiple
+        times — re-stamping ``terminal_handoff_at`` is harmless (the
+        gate only checks IS NOT NULL, not the value).
         """
         if not root_cause_hash_value:
             return False
@@ -485,12 +583,11 @@ class Tier4PromotionTracker:
             cur = store.execute(
                 """
                 UPDATE tier4_promotion_state
-                   SET tier4_active = 0,
-                       updated_at = ?,
-                       last_finding_signature = 'cleared:' || ?
+                   SET terminal_handoff_at = ?,
+                       updated_at = ?
                  WHERE root_cause_hash = ?
                 """,
-                (_iso(now), reason, root_cause_hash_value),
+                (_iso(now), _iso(now), root_cause_hash_value),
             )
             store.commit()
             return (cur.rowcount or 0) > 0
@@ -510,7 +607,8 @@ class Tier4PromotionTracker:
                 """
                 SELECT root_cause_hash, project, rule, dispatch_history_json,
                        last_promotion_at, promotion_path, tier4_entered_at,
-                       tier4_active, last_finding_signature, updated_at
+                       tier4_active, last_finding_signature, updated_at,
+                       terminal_handoff_at
                 FROM tier4_promotion_state
                 WHERE tier4_active = 1
                 ORDER BY tier4_entered_at ASC
@@ -581,6 +679,11 @@ def _row_to_state(row: Any) -> Tier4State:
         parsed = _parse_iso(ts)
         if parsed is not None:
             history.append(parsed)
+    # #1997 — ``terminal_handoff_at`` is read defensively: pre-#1997
+    # rows materialised by callers that still SELECT 10 columns won't
+    # provide row[10], so we fall back to None. Once all SELECTs in
+    # this module include the column, this branch is just belt-and-braces.
+    terminal_handoff_at = _parse_iso(row[10]) if len(row) > 10 else None
     return Tier4State(
         root_cause_hash=str(row[0] or ""),
         project=str(row[1] or ""),
@@ -592,6 +695,7 @@ def _row_to_state(row: Any) -> Tier4State:
         tier4_active=bool(row[7]),
         last_finding_signature=str(row[8] or ""),
         updated_at=_parse_iso(row[9]),
+        terminal_handoff_at=terminal_handoff_at,
     )
 
 

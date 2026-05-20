@@ -591,6 +591,9 @@ CREATE TABLE IF NOT EXISTS workspace_state (
     set_by      text NOT NULL DEFAULT 'system'
 );
 
+-- #1997 — ``terminal_handoff_at`` is the persistent gate that prevents
+-- the infinite re-promotion loop on a permanently-stuck finding (see
+-- the matching block in pollypm.storage.state for the rationale).
 CREATE TABLE IF NOT EXISTS tier4_promotion_state (
     root_cause_hash            text PRIMARY KEY,
     project                    text NOT NULL DEFAULT '',
@@ -601,7 +604,8 @@ CREATE TABLE IF NOT EXISTS tier4_promotion_state (
     tier4_entered_at           timestamptz,
     tier4_active               boolean NOT NULL DEFAULT false,
     last_finding_signature     text NOT NULL DEFAULT '',
-    updated_at                 timestamptz NOT NULL DEFAULT now()
+    updated_at                 timestamptz NOT NULL DEFAULT now(),
+    terminal_handoff_at        timestamptz
 );
 
 CREATE INDEX IF NOT EXISTS idx_tier4_promotion_state_active
@@ -721,6 +725,29 @@ ALTER TABLE IF EXISTS account_runtime
 
 
 # --------------------------------------------------------------------- #
+# 0004 — tier4_promotion_state.terminal_handoff_at gate (#1997).
+# --------------------------------------------------------------------- #
+#
+# Persistent gate against the infinite re-promotion loop described in
+# #1997. Without this column, ``tracker.clear(reason='budget_exhausted')``
+# on the budget-exhaustion sweep flipped ``tier4_active=0`` and the next
+# tick's auto-promote check trivially re-greenlit the same hash — 98
+# promotions / 81 budget-exhausts / 0 demotions across 8 projects over
+# 50h in the wild. With the column present, ``should_auto_promote``
+# refuses to re-promote any hash that has had its terminal handoff fire
+# until the finding actually resolves (which NULLs the column).
+#
+# Column-only migration. Fresh installs already get the column from
+# 0001's INITIAL_SCHEMA_DDL; upgraded DBs run the single ALTER below.
+# ``IF EXISTS`` + ``IF NOT EXISTS`` keep the statement idempotent.
+
+_MIGRATION_0004_TIER4_TERMINAL_HANDOFF = """
+ALTER TABLE IF EXISTS tier4_promotion_state
+    ADD COLUMN IF NOT EXISTS terminal_handoff_at timestamptz;
+"""
+
+
+# --------------------------------------------------------------------- #
 # Migration list — forward-only, append-only.
 # --------------------------------------------------------------------- #
 
@@ -731,6 +758,7 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (1, "0001_initial", INITIAL_SCHEMA_DDL),
     (2, "0002_alert_dedupe_tuple", _MIGRATION_0002_ALERT_DEDUPE),
     (3, "0003_account_columns_text", _MIGRATION_0003_ACCOUNT_COLUMNS_TEXT),
+    (4, "0004_tier4_terminal_handoff", _MIGRATION_0004_TIER4_TERMINAL_HANDOFF),
 ]
 
 

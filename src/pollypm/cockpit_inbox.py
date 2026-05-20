@@ -1341,6 +1341,55 @@ def _build_synthetic_storage_row(
 _WORKER_ROSTER_TTL_SECONDS = 1.0
 _WORKER_ROSTER_CACHE: dict[int, tuple[float, tuple["WorkerRosterRow", ...]]] = {}
 
+# #1958 perf — when the cached roster is stale, return the last-known
+# snapshot immediately and kick a single background refresh so the next
+# rail tick observes fresh data without the click/render path ever
+# blocking on a multi-second tmux/db/git sweep.
+#
+# The "in-flight" set is keyed on ``id(config)`` and guarded by a small
+# lock; we never enqueue two refreshes for the same config in parallel.
+# An empty cache (cold start) still falls through to the sync sweep so
+# the first tick can populate it — subsequent stale reads then surface
+# immediately while the background thread re-walks.
+import threading as _threading  # noqa: E402
+
+_WORKER_ROSTER_REFRESH_LOCK = _threading.Lock()
+_WORKER_ROSTER_REFRESH_INFLIGHT: set[int] = set()
+
+
+def _spawn_worker_roster_refresh(config) -> None:
+    """Kick a single background refresh of ``_gather_worker_roster``.
+
+    Used by callers that hold a stale snapshot and want fresh data on
+    the next rail tick without blocking the current click/render path.
+    Idempotent per ``id(config)``: concurrent calls coalesce.
+    """
+    import time as _time
+
+    cache_key = id(config)
+    with _WORKER_ROSTER_REFRESH_LOCK:
+        if cache_key in _WORKER_ROSTER_REFRESH_INFLIGHT:
+            return
+        _WORKER_ROSTER_REFRESH_INFLIGHT.add(cache_key)
+
+    def _refresh() -> None:
+        try:
+            result = _gather_worker_roster_uncached(config)
+            completed_at = _time.monotonic()
+            _WORKER_ROSTER_CACHE[cache_key] = (completed_at, tuple(result))
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            with _WORKER_ROSTER_REFRESH_LOCK:
+                _WORKER_ROSTER_REFRESH_INFLIGHT.discard(cache_key)
+
+    t = _threading.Thread(
+        target=_refresh,
+        name="worker-roster-refresh",
+        daemon=True,
+    )
+    t.start()
+
 
 def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     """Walk every tracked project's work-service + tmux state.
@@ -1367,7 +1416,20 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     if cached is not None and now - cached[0] < _WORKER_ROSTER_TTL_SECONDS:
         return list(cached[1])
 
+    # #1958 perf — if we have ANY prior snapshot, serve it immediately
+    # and refresh in the background. Only the first cold tick pays for
+    # the full per-project work-service + tmux + git-log sweep; every
+    # subsequent stale read returns the last-known roster instantly so
+    # the click/render path never blocks on the multi-second walk.
+    if cached is not None:
+        _spawn_worker_roster_refresh(config)
+        return list(cached[1])
+
     result = _gather_worker_roster_uncached(config)
+    # #1957 perf — stamp the cache AFTER the uncached sweep returns so a
+    # cold roster build that exceeds the TTL doesn't write a born-expired
+    # entry that forces the next rail tick to recompute.
+    completed_at = _time.monotonic()
     # Best-effort eviction so the cache doesn't grow across long-lived
     # processes with config reloads (each reload yields a fresh
     # ``id(config)``). Cheap because the dict is typically tiny — one
@@ -1375,10 +1437,10 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     if len(_WORKER_ROSTER_CACHE) > 8:
         for stale_key in [
             k for k, (ts, _v) in _WORKER_ROSTER_CACHE.items()
-            if now - ts >= _WORKER_ROSTER_TTL_SECONDS
+            if completed_at - ts >= _WORKER_ROSTER_TTL_SECONDS
         ]:
             _WORKER_ROSTER_CACHE.pop(stale_key, None)
-    _WORKER_ROSTER_CACHE[cache_key] = (now, tuple(result))
+    _WORKER_ROSTER_CACHE[cache_key] = (completed_at, tuple(result))
     return result
 
 

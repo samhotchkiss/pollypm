@@ -115,13 +115,17 @@ def all_tasks_grouped(
         return {key: list(rows) for key, rows in snapshot.items()}
 
     result = _all_tasks_grouped_uncached(config)
+    # #1957 perf — stamp the cache AFTER the uncached scan returns so a
+    # cold ``SELECT * FROM work_tasks`` that exceeds the TTL doesn't
+    # write a born-expired entry that forces the next caller to recompute.
+    completed_at = time.monotonic()
     # Best-effort eviction so the cache doesn't grow across long-lived
     # processes with config reloads (each reload yields a fresh
     # ``id(config)``).
     if len(_ALL_TASKS_GROUPED_CACHE) > 8:
         for stale_key in [
             k for k, (ts, _v) in _ALL_TASKS_GROUPED_CACHE.items()
-            if now - ts >= _ALL_TASKS_GROUPED_TTL_SECONDS
+            if completed_at - ts >= _ALL_TASKS_GROUPED_TTL_SECONDS
         ]:
             _ALL_TASKS_GROUPED_CACHE.pop(stale_key, None)
     snapshot = (
@@ -129,7 +133,7 @@ def all_tasks_grouped(
         if result is None
         else {key: tuple(rows) for key, rows in result.items()}
     )
-    _ALL_TASKS_GROUPED_CACHE[cache_key] = (now, snapshot)
+    _ALL_TASKS_GROUPED_CACHE[cache_key] = (completed_at, snapshot)
     return result
 
 

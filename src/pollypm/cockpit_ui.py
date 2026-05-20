@@ -12537,6 +12537,141 @@ def _dashboard_active_worker(
 _DASHBOARD_INBOX_CACHE: "OrderedDict[tuple[str, float | None], tuple[int, list[dict], list[dict]]]" = OrderedDict()
 
 
+def _dashboard_inbox_build_message_item(
+    *,
+    row: dict[str, object],
+    payload: dict,
+    labels: list[str],
+    source_key: str,
+    source_db: Path,
+    project_key: str,
+    project_path: Path,
+    known_projects: set[str],
+    message_body: str,
+    sort_value,
+) -> dict:
+    """Build a single ``source="message"`` inbox item from a stored message row.
+
+    Pulled out of ``_dashboard_inbox`` (#1356). The row has already been
+    triaged (dev-channel filter, ``project_key`` membership check,
+    blocker-summary short-circuit) by the caller — this helper only
+    handles the message → item projection: decision-producer dispatch
+    (``user_prompt`` → ``plan_review`` → plain body fallback), the
+    #1397 plan-review extras merge, and the final item dict assembly.
+
+    ``message_body`` is the already-normalised body text (caller's
+    ``_message_body`` closure output) and ``sort_value`` is the local
+    iso-or-datetime → epoch float helper. Both are passed in so the
+    helper stays a pure projection.
+    """
+    entry = annotate_inbox_entry(
+        message_row_to_inbox_entry(
+            row,
+            source_key=source_key,
+            db_path=source_db,
+        ),
+        known_projects=known_projects,
+    )
+    updated_at = getattr(entry, "updated_at", "") or ""
+    if hasattr(updated_at, "isoformat"):
+        updated_at = updated_at.isoformat()
+    body = message_body
+    subject = getattr(entry, "title", "") or "(no subject)"
+    steps = _dashboard_steps_from_body(body)
+    task_refs = [
+        match.group(0)
+        for match in _PROJECT_TASK_REF_RE.finditer(
+            "\n".join((subject, body))
+        )
+        if match.group("project") == project_key
+    ]
+    plan_meta = _extract_plan_review_meta(labels)
+    plan_task_id = str(plan_meta.get("plan_task_id") or "")
+    if (
+        plan_task_id
+        and _PROJECT_TASK_REF_RE.fullmatch(plan_task_id)
+        and plan_task_id not in task_refs
+    ):
+        task_refs.insert(0, plan_task_id)
+    primary_ref = task_refs[0] if task_refs else payload.get("task_id")
+    decision = (
+        _dashboard_user_prompt_decision(
+            payload.get("user_prompt"),
+            fallback_task_id=(
+                str(primary_ref)
+                if _PROJECT_TASK_REF_RE.fullmatch(str(primary_ref or ""))
+                else None
+            ),
+        )
+        or _dashboard_plan_review_decision(
+            project_path,
+            labels,
+            body,
+            fallback_task_id=(
+                str(payload.get("task_id") or "")
+                if payload.get("task_id")
+                else None
+            ),
+        )
+        or _dashboard_plain_decision_from_body(subject, body, steps)
+    )
+    # #1397: when this is a plan_review item but
+    # ``_user_prompt_decision`` won the dispatch (the
+    # architect's payload provides a structured user_prompt),
+    # the plan summary / judgment-call points still need to
+    # ride along on the action card so the drilldown surface
+    # renders inline plan content. Always merge those fields
+    # in for plan_review items, regardless of which decision
+    # producer fired.
+    if "plan_review" in labels:
+        plan_review_extras = _dashboard_plan_review_decision(
+            project_path,
+            labels,
+            body,
+            fallback_task_id=(
+                str(payload.get("task_id") or "")
+                if payload.get("task_id")
+                else None
+            ),
+        ) or {}
+        for plan_key in (
+            "plan_summary", "judgment_calls", "plan_text",
+        ):
+            if plan_key in plan_review_extras:
+                decision.setdefault(plan_key, plan_review_extras[plan_key])
+        # Override the prompt with the plan summary when the
+        # user_prompt's summary is the generic boilerplate
+        # (so the card actually surfaces the plan's leading
+        # paragraph instead of "A full project plan is ready
+        # for your review.").
+        plan_summary = plan_review_extras.get("plan_summary") or ""
+        current_prompt = str(decision.get("plain_prompt") or "")
+        if (
+            plan_summary
+            and "ready for your review" in current_prompt.lower()
+        ):
+            decision["plain_prompt"] = plan_summary
+    return {
+        "task_id": entry.task_id,
+        "title": subject,
+        "updated_at": updated_at,
+        "sort_value": sort_value(updated_at),
+        "triage_label": getattr(entry, "triage_label", ""),
+        "triage_rank": int(getattr(entry, "triage_rank", 2) or 2),
+        "needs_action": bool(getattr(entry, "needs_action", False)),
+        "source": "message",
+        "has_user_prompt": payload.get("user_prompt") is not None,
+        "is_plan_review": "plan_review" in labels,
+        "summary": _dashboard_summary_from_body(body),
+        "steps": steps,
+        "next_action": _dashboard_decision_prompt_from_body(
+            subject, body, steps,
+        ),
+        "primary_ref": primary_ref,
+        **decision,
+    }
+
+
 def _dashboard_inbox_finalize(
     items: list[dict],
 ) -> tuple[int, list[dict], list[dict]]:
@@ -12686,35 +12821,10 @@ def _dashboard_inbox(
         return text[: limit - 1].rstrip() + "…"
 
     # Body-parsing helpers (#1356 wedge): the inner ``_summary_from_body``
-    # / ``_steps_from_body`` / ``_requirement_step`` closures here were
-    # near-duplicates of the module-level ``_dashboard_*`` helpers already
-    # used by ``_render_heuristic_action_block`` (line ~6849) and the
-    # blocker-row path in this same function (line ~13359). The bodies
-    # passed in here are pre-normalized via ``_message_body`` so the
-    # module-level versions (which also re-normalize ``\\n``) are
-    # behaviour-compatible supersets. Consolidating trims ~95 LOC and
-    # exposes both legs of the dispatch to the same unit tests.
-    _summary_from_body = _dashboard_summary_from_body
-    _steps_from_body = _dashboard_steps_from_body
-
-    _decision_prompt_from_body = _dashboard_decision_prompt_from_body
-    _user_prompt_decision = _dashboard_user_prompt_decision
-
-    def _plan_review_decision(
-        labels: list[str], body: str, *, fallback_task_id: str | None = None,
-    ) -> dict[str, object] | None:
-        return _dashboard_plan_review_decision(
-            project_path,
-            labels,
-            body,
-            fallback_task_id=fallback_task_id,
-        )
-
-    # #1356 wedge: ``_plain_decision_from_body`` is now a module-level
-    # ``_dashboard_plain_decision_from_body`` so the token-driven branch
-    # table is unit-testable. Keep the local alias to minimise call-site
-    # churn below.
-    _plain_decision_from_body = _dashboard_plain_decision_from_body
+    # / ``_steps_from_body`` / ``_requirement_step`` closures were
+    # already module-level ``_dashboard_*`` helpers; the per-message
+    # builder now calls those directly via
+    # ``_dashboard_inbox_build_message_item``.
 
     known_projects = set(getattr(config, "projects", {}).keys())
     items: list[dict] = []
@@ -12818,111 +12928,19 @@ def _dashboard_inbox(
                         )
                     )
                     continue
-                entry = annotate_inbox_entry(
-                    message_row_to_inbox_entry(
-                        row,
-                        source_key=source_key,
-                        db_path=source_db,
-                    ),
-                    known_projects=known_projects,
-                )
-                updated_at = getattr(entry, "updated_at", "") or ""
-                if hasattr(updated_at, "isoformat"):
-                    updated_at = updated_at.isoformat()
-                body = _message_body(row.get("body"))
-                subject = getattr(entry, "title", "") or "(no subject)"
-                steps = _steps_from_body(body)
-                task_refs = [
-                    match.group(0)
-                    for match in _PROJECT_TASK_REF_RE.finditer(
-                        "\n".join((subject, body))
-                    )
-                    if match.group("project") == project_key
-                ]
-                plan_meta = _extract_plan_review_meta(labels)
-                plan_task_id = str(plan_meta.get("plan_task_id") or "")
-                if (
-                    plan_task_id
-                    and _PROJECT_TASK_REF_RE.fullmatch(plan_task_id)
-                    and plan_task_id not in task_refs
-                ):
-                    task_refs.insert(0, plan_task_id)
-                primary_ref = task_refs[0] if task_refs else payload.get("task_id")
-                decision = (
-                    _user_prompt_decision(
-                        payload.get("user_prompt"),
-                        fallback_task_id=(
-                            str(primary_ref)
-                            if _PROJECT_TASK_REF_RE.fullmatch(str(primary_ref or ""))
-                            else None
-                        ),
-                    )
-                    or _plan_review_decision(
-                        labels,
-                        body,
-                        fallback_task_id=(
-                            str(payload.get("task_id") or "")
-                            if payload.get("task_id")
-                            else None
-                        ),
-                    )
-                    or _plain_decision_from_body(subject, body, steps)
-                )
-                # #1397: when this is a plan_review item but
-                # ``_user_prompt_decision`` won the dispatch (the
-                # architect's payload provides a structured user_prompt),
-                # the plan summary / judgment-call points still need to
-                # ride along on the action card so the drilldown surface
-                # renders inline plan content. Always merge those fields
-                # in for plan_review items, regardless of which decision
-                # producer fired.
-                if "plan_review" in labels:
-                    plan_review_extras = _plan_review_decision(
-                        labels,
-                        body,
-                        fallback_task_id=(
-                            str(payload.get("task_id") or "")
-                            if payload.get("task_id")
-                            else None
-                        ),
-                    ) or {}
-                    for plan_key in (
-                        "plan_summary", "judgment_calls", "plan_text",
-                    ):
-                        if plan_key in plan_review_extras:
-                            decision.setdefault(plan_key, plan_review_extras[plan_key])
-                    # Override the prompt with the plan summary when the
-                    # user_prompt's summary is the generic boilerplate
-                    # (so the card actually surfaces the plan's leading
-                    # paragraph instead of "A full project plan is ready
-                    # for your review.").
-                    plan_summary = plan_review_extras.get("plan_summary") or ""
-                    current_prompt = str(decision.get("plain_prompt") or "")
-                    if (
-                        plan_summary
-                        and "ready for your review" in current_prompt.lower()
-                    ):
-                        decision["plain_prompt"] = plan_summary
                 items.append(
-                    {
-                        "task_id": entry.task_id,
-                        "title": subject,
-                        "updated_at": updated_at,
-                        "sort_value": _sort_value(updated_at),
-                        "triage_label": getattr(entry, "triage_label", ""),
-                        "triage_rank": int(getattr(entry, "triage_rank", 2) or 2),
-                        "needs_action": bool(getattr(entry, "needs_action", False)),
-                        "source": "message",
-                        "has_user_prompt": payload.get("user_prompt") is not None,
-                        "is_plan_review": "plan_review" in labels,
-                        "summary": _summary_from_body(body),
-                        "steps": steps,
-                        "next_action": _decision_prompt_from_body(
-                            subject, body, steps,
-                        ),
-                        "primary_ref": primary_ref,
-                        **decision,
-                    }
+                    _dashboard_inbox_build_message_item(
+                        row=row,
+                        payload=payload,
+                        labels=labels,
+                        source_key=source_key,
+                        source_db=source_db,
+                        project_key=project_key,
+                        project_path=project_path,
+                        known_projects=known_projects,
+                        message_body=_message_body(row.get("body")),
+                        sort_value=_sort_value,
+                    )
                 )
         finally:
             try:

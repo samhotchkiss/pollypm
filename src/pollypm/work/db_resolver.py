@@ -103,7 +103,10 @@ def resolve_work_db_path(
             known = getattr(resolved_config, "projects", {}) or {}
             project_cfg = known.get(project)
             if project_cfg is not None:
-                project_db = Path(project_cfg.path) / ".pollypm" / "state.db"
+                # Typed helper routes through doubled-path guard (#1972).
+                from pollypm.projects import project_state_db_path
+
+                project_db = project_state_db_path(Path(project_cfg.path))
                 if project_db.exists():
                     logger.debug(
                         "db_resolver: ignoring legacy per-project DB at %s "
@@ -123,7 +126,10 @@ def resolve_work_db_path(
         try:
             workspace_root = getattr(resolved_config.project, "workspace_root", None)
             if workspace_root is not None:
-                candidate = Path(workspace_root) / ".pollypm" / "state.db"
+                # Typed helper routes through doubled-path guard (#1972).
+                from pollypm.projects import project_state_db_path
+
+                candidate = project_state_db_path(Path(workspace_root))
                 candidate.parent.mkdir(parents=True, exist_ok=True)
                 return candidate
         except Exception:  # noqa: BLE001

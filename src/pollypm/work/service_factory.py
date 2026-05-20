@@ -22,7 +22,10 @@ def open_project_work_service(project: Any, *, config: Any = None) -> Any | None
     project_path = getattr(project, "path", None)
     if project_path is None:
         return None
-    db_path = Path(project_path) / ".pollypm" / "state.db"
+    # Typed helper routes through the doubled-pollypm-path guard (#1972).
+    from pollypm.projects import project_state_db_path
+
+    db_path = project_state_db_path(Path(project_path))
     try:
         if not db_path.exists():
             return None

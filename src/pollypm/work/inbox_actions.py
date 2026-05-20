@@ -25,7 +25,10 @@ def open_work_service_for_task(config: Any, task_id: str) -> Any | None:
     project = getattr(config, "projects", {}).get(project_key)
     if project is None:
         return None
-    db_path = project.path / ".pollypm" / "state.db"
+    # Typed helper routes through the doubled-pollypm-path guard (#1972).
+    from pollypm.projects import project_state_db_path
+
+    db_path = project_state_db_path(project.path)
     try:
         from pollypm.work.factory import _resolve_backend, create_work_service
     except Exception:  # noqa: BLE001

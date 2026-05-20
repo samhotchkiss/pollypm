@@ -1785,9 +1785,13 @@ class SessionManager:
         if not jsonl_files:
             return None, 0, 0
 
-        # Create archive directory
+        # Create archive directory. Route through the typed helper
+        # so the doubled-pollypm-path guard fires when self._project_path
+        # happens to be GLOBAL_CONFIG_DIR (#1966 / #1972).
+        from pollypm.projects import project_transcripts_dir
+
         archive_dir = (
-            self._project_path / ".pollypm" / "transcripts" / "tasks" / task_id
+            project_transcripts_dir(self._project_path) / "tasks" / task_id
         )
         archive_dir.mkdir(parents=True, exist_ok=True)
 

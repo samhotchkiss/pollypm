@@ -13,6 +13,7 @@ call when the flag is on.
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
 
@@ -136,3 +137,104 @@ def test_reset_for_test_stops_refresher(
     reset_for_test()
     assert not refresher.running
     assert get_refresher() is None
+
+
+def test_singleton_wires_project_keys_provider_for_initial_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex blocker (#2016 review): with ``POLLYPM_STATE_CACHE=1`` the
+    production singleton MUST construct the refresher with a
+    config-backed ``project_keys`` provider so the startup
+    :meth:`StateCacheRefresher._initial_full_refresh` actually enqueues
+    refreshes for every configured project. Without the provider, the
+    cache stays empty until per-project audit events arrive, which is a
+    no-op for projects that never emit an invalidating event.
+    """
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+
+    # Stub ``load_config`` so we don't read the user's real config.
+    # Mirrors the helper-only contract that the provider closure uses
+    # (``getattr(config, "projects", {})``).
+    fake_config = SimpleNamespace(
+        projects={
+            "alpha": SimpleNamespace(path="/tmp/alpha", tracked=True),
+            "beta": SimpleNamespace(path="/tmp/beta", tracked=True),
+            "gamma": SimpleNamespace(path="/tmp/gamma", tracked=True),
+        }
+    )
+
+    def _fake_load_config(_path=None):
+        return fake_config
+
+    import pollypm.config as _config_module
+    monkeypatch.setattr(_config_module, "load_config", _fake_load_config)
+
+    # Stub the per-project compute so we don't pull cockpit_inbox /
+    # dashboard imports into this leaf unit test — we just need to
+    # observe that the refresher enqueues entries for every configured
+    # project key.
+    from pollypm.state_cache.entry import empty_entry
+    monkeypatch.setattr(
+        "pollypm.state_cache.compute_entry_for_project",
+        lambda project_key, config: empty_entry(project_key),
+    )
+    # ``build_refresh_fn`` is imported into ``__init__`` at module
+    # load — replace it on the module namespace so the singleton wiring
+    # picks up the stub.
+    monkeypatch.setattr(
+        "pollypm.state_cache.build_refresh_fn",
+        lambda provider: (lambda key: empty_entry(key)),
+    )
+
+    cache = get_cache()
+    refresher = get_refresher()
+    try:
+        assert refresher is not None
+        # The provider must be wired on the refresher instance — this is
+        # the property whose absence was the Codex blocker.
+        assert refresher._project_keys is not None  # noqa: SLF001
+        assert sorted(refresher._project_keys()) == [  # noqa: SLF001
+            "alpha", "beta", "gamma",
+        ]
+        # And the startup full-refresh must have populated the cache
+        # with entries for every configured project (no audit events
+        # required).
+        snapshot = cache.snapshot()
+        assert set(snapshot.keys()) == {"alpha", "beta", "gamma"}
+    finally:
+        reset_for_test()
+
+
+def test_singleton_provider_degrades_gracefully_on_config_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The provider must catch ``load_config`` failures and return ``[]``
+    — the cache stays empty instead of taking down the cockpit.
+    """
+
+    monkeypatch.setenv(ENV_FLAG, "1")
+
+    def _broken_load_config(_path=None):
+        raise RuntimeError("config file missing")
+
+    import pollypm.config as _config_module
+    monkeypatch.setattr(_config_module, "load_config", _broken_load_config)
+
+    from pollypm.state_cache.entry import empty_entry
+    monkeypatch.setattr(
+        "pollypm.state_cache.build_refresh_fn",
+        lambda provider: (lambda key: empty_entry(key)),
+    )
+
+    cache = get_cache()
+    refresher = get_refresher()
+    try:
+        assert refresher is not None
+        # Provider is wired, but it absorbs the load_config exception
+        # and yields the empty list.
+        assert refresher._project_keys is not None  # noqa: SLF001
+        assert refresher._project_keys() == []  # noqa: SLF001
+        assert cache.snapshot() == {}
+    finally:
+        reset_for_test()

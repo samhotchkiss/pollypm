@@ -26,7 +26,7 @@ from __future__ import annotations
 import logging
 import os
 import threading
-from typing import Protocol
+from typing import Callable, Protocol
 
 from pollypm.state_cache.divergence import (
     DIVERGENCE_SAMPLE_RATE,
@@ -170,13 +170,38 @@ def get_cache() -> StateCacheLike:
             # ``pollypm.config`` (e.g. during a circular-import
             # bootstrap, very unlikely at this leaf module's depth)
             # falls back to the PR 1 stub so the cache still loads.
+            project_keys_provider: Callable[[], list[str]] | None = None
             try:
                 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 
                 def _config_provider() -> object:
                     return load_config(DEFAULT_CONFIG_PATH)
 
+                def _project_keys_provider() -> list[str]:
+                    # Re-read the config on every full-refresh / boot so
+                    # newly-added projects are picked up without having
+                    # to bounce the cache. Failures degrade to the empty
+                    # list (matches the provider-less PR 1 behavior).
+                    try:
+                        config = _config_provider()
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "state_cache: project_keys provider — "
+                            "config load failed",
+                        )
+                        return []
+                    try:
+                        projects = getattr(config, "projects", {}) or {}
+                        return list(projects.keys())
+                    except Exception:  # noqa: BLE001
+                        logger.exception(
+                            "state_cache: project_keys provider — "
+                            "projects access failed",
+                        )
+                        return []
+
                 refresh_fn = build_refresh_fn(_config_provider)
+                project_keys_provider = _project_keys_provider
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "state_cache: real refresh wiring failed; "
@@ -184,7 +209,9 @@ def get_cache() -> StateCacheLike:
                 )
                 refresh_fn = stub_refresh_fn
             cache = ProjectStateCache(refresh_fn=refresh_fn)
-            refresher = StateCacheRefresher(cache)
+            refresher = StateCacheRefresher(
+                cache, project_keys=project_keys_provider,
+            )
             try:
                 refresher.start()
             except Exception:  # noqa: BLE001

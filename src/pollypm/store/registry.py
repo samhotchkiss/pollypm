@@ -8,30 +8,43 @@ public entry point for resolving a backend from a loaded
 Design
 ------
 
-* **Entry points — not a hard-coded switch.** Built-in SQLite is
-  registered by PollyPM itself in ``pyproject.toml``. Third-party
-  packages (e.g. the future ``pollypm-store-postgres`` shipped via
-  :mod:`pollypm.store.backends.postgres_stub`) register their own
-  entry points under the same group and become selectable without any
-  code change in this repo.
+* **Entry points — not a hard-coded switch.** Postgres is registered
+  by PollyPM itself in ``pyproject.toml``. Third-party packages
+  register their own entry points under the same group and become
+  selectable without any code change in this repo.
+* **Sqlite is not entry-pointed (#1956).** The pg cutover (#1737)
+  made postgres the supported production backend; leaving sqlite
+  registered let a misconfigured ``[storage].backend = "sqlite"``
+  silently open an empty shadow alongside the real pg state. Sqlite
+  is now opt-in via :func:`register_backend` — tests and the legacy
+  ``pm notify --db <path>`` / ``pm inbox --db <path>`` escape hatches
+  call it explicitly; ``get_store(config)`` with backend=="sqlite"
+  on a stock install fails loud with :class:`StoreBackendNotFound`.
 * **URL resolution lives in one place.** If ``config.storage.url`` is
-  empty, we derive ``sqlite:///<project.state_db>`` so a first-run user
-  who never touched ``[storage]`` still gets a working DB at the path
-  the rest of PollyPM already uses.
+  empty and the backend is sqlite (i.e. an opt-in caller registered
+  it), we derive ``sqlite:///<project.state_db>`` so a test using
+  the default ``state_db`` path still gets a working DB. On
+  postgres (the production default) an empty URL lets the pg pool
+  resolver pick the DSN up from ``[storage.pg].dsn`` /
+  ``POLLYPM_PG_DSN``.
 * **Unknown backend fails loud.** :class:`StoreBackendNotFound` lists
-  the backends that *are* installed so a typo is immediately visible
-  (three-question rule — issue #240).
+  the backends that *are* installed (entry-point + in-process
+  registry union) so a typo is immediately visible (three-question
+  rule — issue #240).
 
 The registry returns a :class:`pollypm.store.Store`-satisfying object.
-The entry-point target must be a callable taking a ``url=`` keyword —
-both :class:`SQLAlchemyStore` and the Postgres stub honour that shape.
+Every backend factory must be a callable taking a ``url=`` keyword —
+both :class:`SQLAlchemyStore` and the Postgres backend honour that.
 """
 
 from __future__ import annotations
 
 import importlib.metadata
+import logging
+import os
+import sys
 import threading
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from pollypm.errors import StoreBackendNotFound
 
@@ -41,6 +54,121 @@ if TYPE_CHECKING:
 
 
 ENTRY_POINT_GROUP = "pollypm.store_backend"
+
+logger = logging.getLogger(__name__)
+
+# #1956: sqlite was removed from the ``pollypm.store_backend`` entry-point
+# group in ``pyproject.toml`` so a misconfigured ``[storage].backend
+# = "sqlite"`` fails loud at :func:`get_store` instead of silently
+# opening an empty sqlite shadow next to the real pg state. Tests and
+# the legacy ``--db <path>`` CLI escape hatches that legitimately need
+# sqlite call :func:`register_backend` to opt back in.
+#
+# Lookup order in the resolvers below:
+#   1. ``_REGISTERED_BACKENDS`` (this in-process map; tests + opt-in
+#      callers register here).
+#   2. ``importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)``
+#      (installed packages; only ``postgres`` ships by default).
+_REGISTERED_BACKENDS: dict[str, Callable[..., "Store"]] = {}
+_REGISTRATION_LOCK = threading.Lock()
+
+
+def _running_under_pytest() -> bool:
+    """Return True when the active interpreter is a pytest run.
+
+    Used by :func:`register_backend` to suppress the production-sqlite
+    warn-log under the test suite (where re-registering sqlite is the
+    documented opt-in path; see ``tests/conftest.py``). The check is
+    deliberately permissive — either ``PYTEST_CURRENT_TEST`` (set by
+    pytest for the duration of each item) or ``pytest`` being imported
+    is enough; we'd rather under-warn in a niche test harness than
+    spam the rail in production.
+    """
+    if "PYTEST_CURRENT_TEST" in os.environ:
+        return True
+    if "pytest" in sys.modules:
+        return True
+    return False
+
+
+def register_backend(
+    name: str,
+    factory: Callable[..., "Store"],
+    *,
+    quiet: bool = False,
+) -> None:
+    """Register ``factory`` as the in-process backend for ``name``.
+
+    The opt-in companion to removing sqlite from the
+    ``pollypm.store_backend`` entry-point group (#1956). Callers that
+    legitimately need a backend not shipped by the installed
+    distribution — the pytest suite, the ``pm notify --db <path>``
+    escape hatch — call this to plug the factory back in for the rest
+    of the process.
+
+    Parameters
+    ----------
+    name
+        The backend key, e.g. ``"sqlite"``. Matches against
+        ``config.storage.backend`` and the ``backend=`` kwarg on
+        :func:`get_store_by_url`.
+    factory
+        Anything callable with ``url=<str>`` returning a
+        :class:`~pollypm.store.protocol.Store`. Typically
+        :class:`~pollypm.store.sqlalchemy_store.SQLAlchemyStore`.
+    quiet
+        When ``True``, suppress the production warn-log. The test
+        conftest sets this; production opt-ins should leave it
+        ``False`` so the operator sees the sqlite path was reached.
+
+    Notes
+    -----
+    Idempotent: re-registering the same ``(name, factory)`` pair is a
+    no-op. Re-registering with a different factory replaces the prior
+    entry — the test suite relies on that during teardown.
+    """
+    with _REGISTRATION_LOCK:
+        _REGISTERED_BACKENDS[name] = factory
+    if (
+        not quiet
+        and name == "sqlite"
+        and not _running_under_pytest()
+    ):
+        logger.warning(
+            "pollypm.store: sqlite backend registered in a production "
+            "process (#1956). The pg cutover (#1737) made postgres the "
+            "supported backend; sqlite remains reachable only as a "
+            "test / legacy --db escape hatch. Verify the caller is one "
+            "of those before relying on this path."
+        )
+
+
+def unregister_backend(name: str) -> None:
+    """Drop ``name`` from the in-process backend registry.
+
+    Used by test teardown to keep the registry isolated between
+    pytest sessions. Missing keys are silently ignored.
+    """
+    with _REGISTRATION_LOCK:
+        _REGISTERED_BACKENDS.pop(name, None)
+
+
+def _resolve_backend_factory(name: str) -> Callable[..., "Store"] | None:
+    """Return the factory callable for ``name`` or ``None``.
+
+    Checks the in-process registry first (tests / opt-in prod
+    callers), then falls back to the installed
+    ``pollypm.store_backend`` entry-point group. Returning ``None``
+    lets the caller raise :class:`StoreBackendNotFound` with the
+    full list of available names attached.
+    """
+    factory = _REGISTERED_BACKENDS.get(name)
+    if factory is not None:
+        return factory
+    for ep in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
+        if ep.name == name:
+            return ep.load()
+    return None
 
 # Module-level cache of live ``Store`` instances, keyed by
 # ``(backend, resolved_url)``. Every call site that reaches for
@@ -101,11 +229,20 @@ def _resolve_url(config: "PollyPMConfig") -> str:
 
 
 def _available_backends() -> list[str]:
-    """Return sorted entry-point names registered under our group."""
-    return sorted(
+    """Return sorted union of registered + entry-point backend names.
+
+    Includes the in-process :data:`_REGISTERED_BACKENDS` map so a
+    ``StoreBackendNotFound`` raised after a test or escape-hatch
+    caller has registered sqlite still lists it as installed. Without
+    that, the error message would point operators at a backend table
+    that disagrees with the resolver they just hit.
+    """
+    names = {
         ep.name
         for ep in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
-    )
+    }
+    names.update(_REGISTERED_BACKENDS.keys())
+    return sorted(names)
 
 
 def get_store(config: "PollyPMConfig") -> "Store":
@@ -153,12 +290,11 @@ def get_store(config: "PollyPMConfig") -> "Store":
         cached = _STORES.get(key)
         if cached is not None:
             return cached
-        for ep in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
-            if ep.name == backend:
-                cls = ep.load()
-                instance = cls(url=url)
-                _STORES[key] = instance
-                return instance
+        factory = _resolve_backend_factory(backend)
+        if factory is not None:
+            instance = factory(url=url)
+            _STORES[key] = instance
+            return instance
     raise StoreBackendNotFound(
         backend,
         available=_available_backends(),
@@ -174,6 +310,14 @@ def get_store_by_url(url: str, *, backend: str = "sqlite") -> "Store":
     engine pool. Rail-hot callers that used to construct a fresh
     ``SQLAlchemyStore`` per call would pin ~16 SQLite handles per
     invocation; routing through this helper keeps the pool singleton.
+
+    #1956: sqlite is no longer entry-pointed. The default
+    ``backend="sqlite"`` kwarg keeps the historical signature but
+    callers reaching for sqlite must ensure :func:`register_backend`
+    has been invoked first (tests/conftest, ``pm notify --db`` escape
+    hatches). An un-registered sqlite call raises
+    :class:`StoreBackendNotFound` listing the backends that *are*
+    available.
     """
     key = (backend, url)
     cached = _STORES.get(key)
@@ -183,12 +327,11 @@ def get_store_by_url(url: str, *, backend: str = "sqlite") -> "Store":
         cached = _STORES.get(key)
         if cached is not None:
             return cached
-        for ep in importlib.metadata.entry_points(group=ENTRY_POINT_GROUP):
-            if ep.name == backend:
-                cls = ep.load()
-                instance = cls(url=url)
-                _STORES[key] = instance
-                return instance
+        factory = _resolve_backend_factory(backend)
+        if factory is not None:
+            instance = factory(url=url)
+            _STORES[key] = instance
+            return instance
     raise StoreBackendNotFound(
         backend,
         available=_available_backends(),
@@ -227,5 +370,7 @@ __all__ = [
     "ENTRY_POINT_GROUP",
     "get_store",
     "get_store_by_url",
+    "register_backend",
     "reset_store_cache",
+    "unregister_backend",
 ]

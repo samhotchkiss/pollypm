@@ -356,6 +356,17 @@ class EventProjector:
         if not self._state_db.exists():
             return None
         try:
+            # #1956: sqlite is no longer in the
+            # ``pollypm.store_backend`` entry-point group. This
+            # fallback only runs when the operator is still on the
+            # sqlite-shaped state DB (legacy installs, sqlite-pinned
+            # tests). Opt sqlite back in for this process so the call
+            # below resolves; ``register_backend`` warn-logs unless
+            # we're under pytest.
+            from pollypm.store import SQLAlchemyStore
+            from pollypm.store.registry import register_backend
+
+            register_backend("sqlite", SQLAlchemyStore)
             return get_store_by_url(f"sqlite:///{self._state_db}")
         except Exception:  # noqa: BLE001
             logger.exception("activity_feed: failed to open Store")

@@ -82,6 +82,15 @@ def _ensure_staging_table(conn: sqlite3.Connection) -> None:
 
 
 def _message_store(service: _WorkService) -> SQLAlchemyStore:
+    # #1956: sqlite is no longer in the ``pollypm.store_backend``
+    # entry-point group. This helper only runs from inside
+    # ``SQLiteWorkService`` (per the ``_WorkService`` protocol), so we
+    # know the caller has already committed to sqlite — register the
+    # factory if no-one upstream has. ``register_backend`` is
+    # idempotent and warn-logs only outside pytest.
+    from pollypm.store.registry import register_backend
+
+    register_backend("sqlite", SQLAlchemyStore)
     return get_store_by_url(f"sqlite:///{service._db_path}")  # type: ignore[return-value]
 
 

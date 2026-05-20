@@ -22,7 +22,12 @@ from __future__ import annotations
 
 from pollypm.store.engine import is_sqlite, make_engines
 from pollypm.store.protocol import Store
-from pollypm.store.registry import get_store
+from pollypm.store.registry import (
+    get_store,
+    get_store_by_url,
+    register_backend,
+    unregister_backend,
+)
 from pollypm.store.sqlalchemy_store import SQLAlchemyStore
 from pollypm.store.title_contract import apply_title_contract
 
@@ -31,6 +36,9 @@ __all__ = [
     "Store",
     "apply_title_contract",
     "get_store",
+    "get_store_by_url",
     "is_sqlite",
     "make_engines",
+    "register_backend",
+    "unregister_backend",
 ]

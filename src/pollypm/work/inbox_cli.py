@@ -283,8 +283,18 @@ def _resolve_messages_store(db: str) -> Any:
         return get_store_by_url(db.strip(), backend="postgres")
 
     if db != WORKSPACE_DEFAULT_DB_PATH:
-        from pollypm.store import get_store_by_url
+        # #1956: sqlite is no longer entry-pointed. ``--db <path>`` is
+        # the documented sqlite escape hatch (test / CI), so opt the
+        # backend back in here. ``register_backend`` warn-logs unless
+        # we're under pytest, so a prod operator who hits this path
+        # by accident still sees the message.
+        from pollypm.store import (
+            SQLAlchemyStore,
+            get_store_by_url,
+            register_backend,
+        )
 
+        register_backend("sqlite", SQLAlchemyStore)
         db_path = _resolve_db_path(db, project=None)
         return get_store_by_url(f"sqlite:///{db_path}")
 

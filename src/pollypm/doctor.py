@@ -1728,7 +1728,7 @@ def check_doubled_pollypm_path() -> CheckResult:
     # all) but report it as a tiny, informational warn.
     if file_count == 0:
         return _fail(
-            f"empty ~/.pollypm/.pollypm/ directory (artifact)",
+            "empty ~/.pollypm/.pollypm/ directory (artifact)",
             why=(
                 "An empty doubled-path directory is a leftover scaffold "
                 "from a pre-fix config render. Removing it keeps grep / "

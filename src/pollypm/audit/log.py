@@ -360,6 +360,25 @@ def _build_record(
     }
 
 
+def _assert_no_doubled_pollypm(path: Path) -> None:
+    """Raise loudly if ``path`` contains ``.pollypm/.pollypm`` (#1972).
+
+    Belt-and-suspenders for the typed-helpers design fix: a writer that
+    bypasses the helpers and constructs a doubled-path target is a bug.
+    Converting the silent leak (~280K files / 1.8 GB in production —
+    see #1810) into a loud crash makes the regression catch fire in
+    CI / smoke tests instead of accumulating on user disks. The lint
+    gate (``tests/test_no_raw_pollypm_path_joins.py``) is the primary
+    defence; this is the runtime backstop.
+    """
+    if ".pollypm/.pollypm" in str(path) or ".pollypm\\.pollypm" in str(path):
+        raise RuntimeError(
+            f"doubled-pollypm-path write blocked (#1972): {path!s}. "
+            "Construct via pollypm.projects.project_audit_log_path() "
+            "or another typed helper instead of joining '.pollypm' inline."
+        )
+
+
 def _append_line(path: Path, line: str) -> None:
     """Append a single line to ``path``, creating parents as needed.
 
@@ -370,6 +389,7 @@ def _append_line(path: Path, line: str) -> None:
     a long-lived handle, so a crashed writer can't leak an FD into
     the audit file.
     """
+    _assert_no_doubled_pollypm(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     # Newline added here so the encoded record stays a single
     # JSON object on its own line.

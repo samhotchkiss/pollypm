@@ -158,6 +158,130 @@ def project_transcripts_dir(project_path: Path) -> Path:
     return project_instruction_dir(project_path) / "transcripts"
 
 
+# ---------------------------------------------------------------------------
+# Typed path helpers (#1972 design fix slice 1).
+#
+# Every project-scoped ``.pollypm/<subdir>`` path lives behind one of
+# these helpers. The helpers funnel through ``_resolve_pollypm_root``
+# so the doubled-path guard always fires for callers that happen to
+# pass ``GLOBAL_CONFIG_DIR`` itself as the project root. The
+# accompanying lint gate in ``tests/test_no_raw_pollypm_path_joins.py``
+# bans raw ``/ ".pollypm" /`` joins in ``src/pollypm/`` so new features
+# can't reintroduce the bug by skipping the helpers.
+# ---------------------------------------------------------------------------
+
+
+def project_state_db_path(project_path: Path) -> Path:
+    """Per-project work-state SQLite DB (``<project>/.pollypm/state.db``)."""
+    return project_pollypm_dir(project_path) / "state.db"
+
+
+def project_audit_log_path(project_path: Path) -> Path:
+    """Per-project audit JSONL (``<project>/.pollypm/audit.jsonl``)."""
+    return project_pollypm_dir(project_path) / "audit.jsonl"
+
+
+def project_advisor_log_path(project_path: Path) -> Path:
+    """Per-project advisor log JSONL (``<project>/.pollypm/advisor-log.jsonl``)."""
+    return project_pollypm_dir(project_path) / "advisor-log.jsonl"
+
+
+def project_plugins_dir(project_path: Path) -> Path:
+    """Per-project plugin overrides (``<project>/.pollypm/plugins``)."""
+    return project_pollypm_dir(project_path) / "plugins"
+
+
+def project_gates_dir(project_path: Path) -> Path:
+    """Per-project gate config (``<project>/.pollypm/gates``)."""
+    return project_pollypm_dir(project_path) / "gates"
+
+
+def project_flows_dir(project_path: Path) -> Path:
+    """Per-project flow templates (``<project>/.pollypm/flows``)."""
+    return project_pollypm_dir(project_path) / "flows"
+
+
+def project_rules_dir(project_path: Path) -> Path:
+    """Per-project rules (``<project>/.pollypm/rules``)."""
+    return project_pollypm_dir(project_path) / "rules"
+
+
+def project_magic_dir(project_path: Path) -> Path:
+    """Per-project magic commands (``<project>/.pollypm/magic``)."""
+    return project_pollypm_dir(project_path) / "magic"
+
+
+def project_config_dir(project_path: Path) -> Path:
+    """Per-project config dir (``<project>/.pollypm/config``)."""
+    return project_pollypm_dir(project_path) / "config"
+
+
+def project_docs_dir(project_path: Path) -> Path:
+    """Per-project shipped docs (``<project>/.pollypm/docs``)."""
+    return project_pollypm_dir(project_path) / "docs"
+
+
+def project_content_dir(project_path: Path) -> Path:
+    """Per-project content fixtures (``<project>/.pollypm/content``)."""
+    return project_pollypm_dir(project_path) / "content"
+
+
+def project_inbox_dir(project_path: Path) -> Path:
+    """Per-project inbox dir (``<project>/.pollypm/inbox``)."""
+    return project_pollypm_dir(project_path) / "inbox"
+
+
+def project_worker_markers_dir(project_path: Path) -> Path:
+    """Per-project worker markers (``<project>/.pollypm/worker-markers``)."""
+    return project_pollypm_dir(project_path) / "worker-markers"
+
+
+def project_session_markers_dir(home_dir: Path) -> Path:
+    """Per-account session markers (``<account.home>/.pollypm/session-markers``).
+
+    Distinct from the other helpers: this is rooted at an *agent home*
+    (``account.home``), not a project root. It's still routed through
+    the resolver because some callers happen to pass the global config
+    dir as the account home in tests, and we want the same collapse
+    behaviour for consistency.
+    """
+    return project_pollypm_dir(home_dir) / "session-markers"
+
+
+def project_system_prompts_dir(home_dir: Path) -> Path:
+    """Per-account system prompt overrides (``<home>/.pollypm/system-prompts``)."""
+    return project_pollypm_dir(home_dir) / "system-prompts"
+
+
+def project_project_guides_dir(project_path: Path) -> Path:
+    """Per-project role-guide forks (``<project>/.pollypm/project-guides``).
+
+    Mirrors :func:`pollypm.project_guides.project_guides_dir` but lives
+    here so call sites that already import from ``pollypm.projects``
+    don't need to take a second dependency.
+    """
+    return project_pollypm_dir(project_path) / "project-guides"
+
+
+def project_control_prompts_dir(project_path: Path) -> Path:
+    """Per-project kickoff prompts (``<project>/.pollypm/control-prompts``)."""
+    return project_pollypm_dir(project_path) / "control-prompts"
+
+
+def global_pollypm_dir() -> Path:
+    """Return ``~/.pollypm`` (the user-global PollyPM config dir).
+
+    Thin wrapper over :data:`pollypm.config.GLOBAL_CONFIG_DIR` so call
+    sites that want the global tree can express it without a raw
+    ``Path.home() / ".pollypm"`` join (which the #1972 lint gate
+    rejects). Use ``GLOBAL_CONFIG_DIR`` directly when you specifically
+    need the module-level constant.
+    """
+    from pollypm.config import GLOBAL_CONFIG_DIR
+
+    return GLOBAL_CONFIG_DIR
+
+
 def session_scoped_dir(base_dir: Path, session_id: str) -> Path:
     return base_dir / session_id
 

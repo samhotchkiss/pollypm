@@ -614,6 +614,21 @@ class SQLiteWorkService:
         sync_manager: SyncManager | None = None,
         session_manager: object | None = None,
     ) -> None:
+        # #1972 design fix: belt-and-suspenders precondition. If a
+        # caller bypasses the typed helpers (``project_state_db_path``)
+        # and constructs a doubled-pollypm-path target by hand, fail
+        # loudly here instead of silently opening a phantom SQLite DB
+        # under ``~/.pollypm/.pollypm/state.db``. The lint gate
+        # (``tests/test_no_raw_pollypm_path_joins.py``) is the primary
+        # defence; this is the runtime backstop for any join that
+        # slips past it (e.g. dynamically constructed paths).
+        _db_str = str(db_path)
+        if ".pollypm/.pollypm" in _db_str or ".pollypm\\.pollypm" in _db_str:
+            raise RuntimeError(
+                f"doubled-pollypm-path state.db blocked (#1972): {db_path!s}. "
+                "Construct via pollypm.projects.project_state_db_path() "
+                "instead of joining '.pollypm' inline."
+            )
         self._db_path = db_path
         self._project_path = project_path
         self._sync = sync_manager

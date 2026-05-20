@@ -55,6 +55,7 @@ from pollypm.audit.watchdog import (
     RULE_WORKER_SESSION_DEAD_LOOP,
     WATCHDOG_ALERT_TYPE,
     WatchdogConfig,
+    dispatch_dedup_hash,
     emit_escalation_dispatched,
     emit_finding,
     emit_heartbeat_tick,
@@ -1265,6 +1266,10 @@ def _maybe_dispatch_to_architect(
     """
     if finding.rule not in _DISPATCHABLE_RULES:
         return "skipped"
+    # #2015 — throttle on the subject-independent finding-body hash so
+    # the same root-cause across sibling subjects (e.g. samblog/32-35)
+    # collapses to one architect dispatch per window.
+    dedup_hash = dispatch_dedup_hash(finding)
     if was_recently_dispatched(
         project=finding.project,
         finding_type=finding.rule,
@@ -1272,6 +1277,7 @@ def _maybe_dispatch_to_architect(
         now=now,
         project_path=project_path,
         throttle_seconds=ESCALATION_THROTTLE_SECONDS,
+        dedup_hash=dedup_hash,
     ):
         return "throttled"
     brief = format_unstick_brief(finding)
@@ -1284,6 +1290,7 @@ def _maybe_dispatch_to_architect(
         subject=finding.subject,
         brief=brief,
         project_path=project_path,
+        dedup_hash=dedup_hash,
     )
     target = _architect_window_target(storage_closet_name, finding.project)
     if target is None:
@@ -1837,6 +1844,10 @@ def _maybe_dispatch_to_operator(
     """
     if finding.rule not in _OPERATOR_DISPATCHABLE_RULES:
         return "skipped"
+    # #2015 — throttle on the subject-independent finding-body hash so
+    # the same root-cause across sibling subjects collapses to one
+    # operator inbox dispatch per window.
+    dedup_hash = dispatch_dedup_hash(finding)
     if was_recently_operator_dispatched(
         project=finding.project,
         finding_type=finding.rule,
@@ -1844,6 +1855,7 @@ def _maybe_dispatch_to_operator(
         now=now,
         project_path=project_path,
         throttle_seconds=OPERATOR_DISPATCH_THROTTLE_SECONDS,
+        dedup_hash=dedup_hash,
     ):
         return "throttled"
 
@@ -1948,6 +1960,7 @@ def _maybe_dispatch_to_operator(
         inbox_task_id=inbox_task_id,
         dedup_key=dedup_key,
         project_path=project_path,
+        dedup_hash=dedup_hash,
     )
     return "dispatched"
 

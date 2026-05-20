@@ -3231,3 +3231,259 @@ path = "demo"
     assert captured["config"] is not None
     # The self-heal succeeded -> reviewer-spawn counter incremented.
     assert counters["worker_lane_spawned"] == 1
+
+
+# ---------------------------------------------------------------------------
+# #2015 — dispatch_dedup_hash + root-cause-keyed throttle
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_dedup_hash_collapses_across_sibling_subjects() -> None:
+    """Same finding-body across different subjects → same dedup hash.
+
+    The samblog/32-35 case: the watchdog emits one ``stuck_draft``
+    finding per draft task, so subjects differ (samblog/32, /33, /34,
+    /35) but ``rule`` / ``project`` / ``evidence`` are identical. The
+    subject-independent hash must be equal across the four findings.
+    """
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    common_evidence = {
+        "queued_subjects": ["samblog/21", "samblog/26", "samblog/29",
+                            "samblog/31"],
+        "queued_last_updated": "2026-05-19T13:30:00+00:00",
+    }
+    finding_template = dict(
+        rule=RULE_STUCK_DRAFT,
+        project="samblog",
+        evidence=common_evidence,
+    )
+    hashes = {
+        dispatch_dedup_hash(Finding(subject=f"samblog/{n}", **finding_template))
+        for n in (32, 33, 34, 35)
+    }
+    assert len(hashes) == 1
+
+
+def test_dispatch_dedup_hash_distinguishes_different_evidence() -> None:
+    """Different finding-bodies (different evidence) → different hashes."""
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    a = Finding(
+        rule=RULE_STUCK_DRAFT, project="samblog", subject="samblog/32",
+        evidence={"queued_subjects": ["samblog/21"]},
+    )
+    b = Finding(
+        rule=RULE_STUCK_DRAFT, project="samblog", subject="samblog/32",
+        evidence={"queued_subjects": ["samblog/99"]},
+    )
+    assert dispatch_dedup_hash(a) != dispatch_dedup_hash(b)
+
+
+def test_dispatch_dedup_hash_distinguishes_different_rules() -> None:
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    a = Finding(
+        rule=RULE_STUCK_DRAFT, project="samblog", subject="samblog/32",
+        evidence={"x": 1},
+    )
+    b = Finding(
+        rule=RULE_TASK_PROGRESS_STALE, project="samblog",
+        subject="samblog/32", evidence={"x": 1},
+    )
+    assert dispatch_dedup_hash(a) != dispatch_dedup_hash(b)
+
+
+def test_was_recently_dispatched_dedupes_by_root_cause_hash(
+    now: datetime,
+) -> None:
+    """#2015 regression — samblog/32-35 burst collapses to one dispatch.
+
+    Pre-fix: ``was_recently_dispatched`` matched on
+    ``(project, finding_type, subject)``. Four draft tasks with the
+    same root cause all had different subjects, so the throttle never
+    fired across them and the operator got four inbox entries asking
+    the same question.
+
+    Post-fix: passing the same ``dedup_hash`` across sibling subjects
+    matches the seeded event, so the second/third/fourth would-be
+    dispatch returns ``True`` (throttled) even though the subjects
+    differ from the first.
+    """
+    from pollypm.audit.watchdog import (
+        dispatch_dedup_hash,
+        emit_escalation_dispatched,
+        was_recently_dispatched,
+    )
+
+    common_evidence = {
+        "queued_subjects": ["samblog/21", "samblog/26", "samblog/29",
+                            "samblog/31"],
+    }
+    findings = [
+        Finding(
+            rule=RULE_STUCK_DRAFT,
+            project="samblog",
+            subject=f"samblog/{n}",
+            evidence=common_evidence,
+        )
+        for n in (32, 33, 34, 35)
+    ]
+    # All four share the same finding-body hash.
+    shared_hash = dispatch_dedup_hash(findings[0])
+    assert all(dispatch_dedup_hash(f) == shared_hash for f in findings)
+
+    # Seed only the first dispatch (samblog/32).
+    emit_escalation_dispatched(
+        project="samblog",
+        finding_type=RULE_STUCK_DRAFT,
+        subject="samblog/32",
+        brief="...",
+        dedup_hash=shared_hash,
+    )
+
+    # The other three siblings must see themselves as throttled even
+    # though their subjects differ from the seeded one. Pre-fix this
+    # assertion failed for /33, /34, /35 — each presented a unique
+    # subject so the legacy subject-keyed throttle let them through.
+    for f in findings:
+        assert was_recently_dispatched(
+            project=f.project,
+            finding_type=f.rule,
+            subject=f.subject,
+            now=now + timedelta(minutes=5),
+            dedup_hash=shared_hash,
+        ), f"throttle leaked for {f.subject}"
+
+
+def test_was_recently_dispatched_legacy_rows_fall_back_to_subject(
+    now: datetime,
+) -> None:
+    """Pre-#2015 rows have no ``dedup_hash`` in metadata. The throttle
+    must still honour them via the subject-match fallback so old
+    throttle windows don't evaporate at the moment of the rollout.
+    """
+    from pollypm.audit.log import (
+        EVENT_WATCHDOG_ESCALATION_DISPATCHED,
+        central_log_path,
+    )
+    from pollypm.audit.watchdog import was_recently_dispatched
+
+    central = central_log_path("legacydemo")
+    central.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": 1,
+        "ts": (now - timedelta(minutes=5)).isoformat(),
+        "project": "legacydemo",
+        "event": EVENT_WATCHDOG_ESCALATION_DISPATCHED,
+        "subject": "legacydemo/7",
+        "actor": "audit_watchdog",
+        "status": "warn",
+        # No "dedup_hash" key — simulates a pre-fix row.
+        "metadata": {
+            "finding_type": RULE_STUCK_DRAFT,
+            "subject": "legacydemo/7",
+            "brief": "...",
+        },
+    }
+    central.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+    # Caller passes a dedup_hash; row has none → fall back to subject match.
+    assert was_recently_dispatched(
+        project="legacydemo",
+        finding_type=RULE_STUCK_DRAFT,
+        subject="legacydemo/7",
+        now=now,
+        dedup_hash="deadbeefdeadbeef",
+    )
+
+
+def test_cadence_dispatch_throttles_samblog_burst_by_root_cause(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End-to-end #2015 regression: four sibling drafts → one dispatch.
+
+    Drives the real cadence ``_maybe_dispatch_to_architect`` four
+    times with Finding objects matching the samblog/32-35 burst:
+    same rule, project, evidence; subjects differ. Pre-fix all four
+    pass the throttle. Post-fix only the first emits; the next three
+    return ``"throttled"``.
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        aw, "_send_brief_to_architect",
+        lambda target, brief: sent.append((target, brief)) or True,
+    )
+
+    common_evidence = {
+        "queued_subjects": ["samblog/21", "samblog/26", "samblog/29",
+                            "samblog/31"],
+        "queued_last_updated": "2026-05-19T13:30:00+00:00",
+    }
+    outcomes: list[str] = []
+    for n in (32, 33, 34, 35):
+        finding = Finding(
+            rule=RULE_STUCK_DRAFT,
+            tier="2",
+            project="samblog",
+            subject=f"samblog/{n}",
+            message=f"Draft task samblog/{n} has sat unpromoted ...",
+            recommendation="Promote or cancel.",
+            evidence=common_evidence,
+        )
+        outcomes.append(
+            aw._maybe_dispatch_to_architect(
+                finding,
+                project_path=None,
+                storage_closet_name="pollypm-storage-closet",
+                now=now,
+            )
+        )
+
+    assert outcomes[0] == "dispatched"
+    # The remaining three siblings must be throttled — pre-fix every
+    # one would have been "dispatched" because the subject differed.
+    assert outcomes[1:] == ["throttled", "throttled", "throttled"], outcomes
+    # Only one brief was actually sent.
+    assert len(sent) == 1
+
+
+def test_cadence_operator_dispatch_throttles_burst_by_root_cause(
+    now: datetime, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same #2015 collapse for the tier-3 (operator inbox) leg."""
+    from pollypm.audit.watchdog import RULE_QUEUE_WITHOUT_MOTION
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
+
+    created: list[dict] = []
+
+    def _stub_create(**kwargs):
+        created.append(kwargs)
+        return f"task-{len(created)}"
+
+    monkeypatch.setattr(aw, "_create_operator_inbox_task", _stub_create)
+
+    common_evidence = {
+        "queued_subjects": ["proj/1", "proj/2"],
+        "queued_last_updated": "2026-05-19T13:30:00+00:00",
+    }
+    outcomes: list[str] = []
+    for tag in ("a", "b", "c", "d"):
+        finding = Finding(
+            rule=RULE_QUEUE_WITHOUT_MOTION,
+            tier="3",
+            project="proj",
+            subject=f"proj-{tag}",
+            evidence=common_evidence,
+        )
+        outcomes.append(
+            aw._maybe_dispatch_to_operator(
+                finding, project_path=None, now=now,
+            )
+        )
+
+    assert outcomes[0] == "dispatched"
+    assert outcomes[1:] == ["throttled", "throttled", "throttled"], outcomes
+    assert len(created) == 1

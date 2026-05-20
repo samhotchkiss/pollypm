@@ -2371,7 +2371,20 @@ class PollyCockpitApp(App[None]):
             hint_text = "j/k \u21b5open \u00b7 ? help \u00b7 q quit"
         try:
             supervisor = self.router._load_supervisor()
-            last_hb = supervisor.store.last_heartbeat_at()
+            # Backend-aware read: on the pg backend the unified ``messages``
+            # table lives in Postgres, but ``supervisor.store`` is still the
+            # SQLite ``StateStore`` (kept for legacy domain reads). Reading
+            # the sqlite copy yields a stale row from before the pg cutover
+            # and the rail then renders a false-positive "Heartbeat offline
+            # (Nm)" warning. Route through the pg facade when configured.
+            from pollypm.storage._backend_dispatch import is_pg_backend
+            if is_pg_backend(supervisor.config):
+                from pollypm.storage.pg_heartbeats import (
+                    last_heartbeat_at as _pg_last_heartbeat_at,
+                )
+                last_hb = _pg_last_heartbeat_at(config=supervisor.config)
+            else:
+                last_hb = supervisor.store.last_heartbeat_at()
             if last_hb:
                 from datetime import UTC, datetime
                 # Unified ``messages`` table stores SQLite's default

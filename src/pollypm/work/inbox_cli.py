@@ -28,12 +28,10 @@ from pollypm.inbox.backfill_heuristics import (
 from pollypm.inbox.kind import InboxItemKind, coerce_kind as _coerce_inbox_kind
 from pollypm.inbox_message_refs import unknown_project_refs
 from pollypm.work.cli import (
-    _DB_OPTION,
     _JSON_OPTION,
     _PROJECT_OPTION,
     _project_from_task_id,
     _render_work_service_error,
-    _resolve_db_path,
     _svc,
     _task_to_dict,
     task_get,
@@ -248,24 +246,14 @@ def _message_is_inbox_namespace_draft(row: dict[str, Any]) -> bool:
     return scope in {"", "inbox"}
 
 
-def _resolve_messages_store(db: str) -> Any:
+def _resolve_messages_store() -> Any:
     """Return the configured-backend ``Store`` for the inbox CLI.
 
-    Mirrors the :func:`pollypm.work.cli._svc` backend dispatch (#1369,
-    #1737, #1811, #1940) so ``pm inbox`` and its bulk-archive helpers
-    read the same messages corpus as the rest of the system:
-
-    * When ``--db`` is the canonical workspace default
-      (``.pollypm/state.db``), route through
-      :func:`pollypm.store.get_store` so the active backend
-      (``[storage].backend = "sqlite"`` vs ``"postgres"``) decides
-      whether reads land on the sqlite file or the pg pool.
-    * When ``--db`` is a Postgres DSN (``postgresql://…``, #1940),
-      pin to the pg backend at the supplied DSN via
-      :func:`pollypm.store.get_store_by_url`.
-    * When ``--db`` is any other non-default value, treat it as a
-      sqlite path override — the explicit test / CI escape hatch —
-      and pin to sqlite at the supplied path.
+    Routes through :func:`pollypm.store.get_store` so the active
+    ``[storage].backend`` (post-sqlite-ripout: always pg, refs #1971)
+    decides where reads land. ``pm inbox`` and its bulk-archive
+    helpers see the same messages corpus as the rest of the system
+    (#1369, #1737, #1811, #1940).
 
     The returned ``Store`` is a process-wide singleton — callers MUST
     NOT ``close()`` it (see :func:`pollypm.store.registry.get_store`
@@ -274,30 +262,6 @@ def _resolve_messages_store(db: str) -> Any:
     went un-served; this helper closes that gap for the rest of the
     ``pm inbox`` surface (#1790).
     """
-    from pollypm.storage.pg_pool import _looks_like_pg_dsn
-    from pollypm.work.db_resolver import WORKSPACE_DEFAULT_DB_PATH
-
-    if _looks_like_pg_dsn(db):
-        from pollypm.store import get_store_by_url
-
-        return get_store_by_url(db.strip(), backend="postgres")
-
-    if db != WORKSPACE_DEFAULT_DB_PATH:
-        # #1956: sqlite is no longer entry-pointed. ``--db <path>`` is
-        # the documented sqlite escape hatch (test / CI), so opt the
-        # backend back in here. ``register_backend`` warn-logs unless
-        # we're under pytest, so a prod operator who hits this path
-        # by accident still sees the message.
-        from pollypm.store import (
-            SQLAlchemyStore,
-            get_store_by_url,
-            register_backend,
-        )
-
-        register_backend("sqlite", SQLAlchemyStore)
-        db_path = _resolve_db_path(db, project=None)
-        return get_store_by_url(f"sqlite:///{db_path}")
-
     from pollypm.config import load_config
     from pollypm.store import get_store
 
@@ -338,12 +302,12 @@ def _message_is_actionable_default(row: dict[str, Any]) -> bool:
 
 
 def _inbox_collect_messages(
-    *, db: str, project: str | None, channel_filter: str,
+    *, project: str | None, channel_filter: str,
 ) -> list[dict[str, Any]]:
     """Query the messages store and shape rows into display dicts."""
     message_rows: list[dict[str, Any]] = []
     try:
-        store = _resolve_messages_store(db)
+        store = _resolve_messages_store()
         filters: dict[str, Any] = dict(
             recipient="user",
             state="open",
@@ -461,7 +425,6 @@ def _inbox_render_text_listing(
 def inbox_root(
     ctx: typer.Context,
     project: str | None = _PROJECT_OPTION,
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
     channel: str = typer.Option(
         "inbox", "--channel",
@@ -581,13 +544,12 @@ def inbox_root(
     apply_curated_filter = not show_drafts
 
     display_messages = _inbox_collect_messages(
-        db=db,
         project=project,
         channel_filter=channel_filter,
     )
 
     # --- Tasks path (work-service, chat flow) --------------------------
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     tasks = inbox_tasks(svc, project=project)
 
     # #1013 — hide ``pm notify``-backed stub tasks (chat-flow rows
@@ -651,7 +613,6 @@ def inbox_show(
         ...,
         help="Task ID (``project/number``) or message ID (``msg:N``)",
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Show full details of an inbox task or message.
@@ -662,12 +623,12 @@ def inbox_show(
       (``pm notify`` writes, heartbeat alerts, etc.). #760.
     """
     if task_id.startswith("msg:"):
-        _show_message_by_id(db=db, msg_id_str=task_id, output_json=output_json)
+        _show_message_by_id(msg_id_str=task_id, output_json=output_json)
         return
-    task_get(task_id=task_id, db=db, output_json=output_json)
+    task_get(task_id=task_id, output_json=output_json)
 
 
-def _show_message_by_id(*, db: str, msg_id_str: str, output_json: bool) -> None:
+def _show_message_by_id(*, msg_id_str: str, output_json: bool) -> None:
     """Render a single message row identified by ``msg:<N>``."""
     try:
         msg_id = int(msg_id_str.split(":", 1)[1])
@@ -677,7 +638,7 @@ def _show_message_by_id(*, db: str, msg_id_str: str, output_json: bool) -> None:
 
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        store = _resolve_messages_store(db)
+        store = _resolve_messages_store()
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
@@ -822,7 +783,6 @@ def inbox_reply(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     body: str = typer.Argument(..., help="Reply text. Pass '-' to read from stdin."),
     actor: str = typer.Option("user", "--actor", help="Actor to attribute the reply to."),
-    db: str = _DB_OPTION,
 ) -> None:
     """Post a reply on an inbox task (mirrors the cockpit reply action)."""
     import sys
@@ -830,7 +790,7 @@ def inbox_reply(
     if body == "-":
         body = sys.stdin.read()
     project = _project_from_task_id(task_id)
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     try:
         entry = svc.add_reply(task_id, body, actor=actor)
     except Exception as exc:  # noqa: BLE001
@@ -896,7 +856,6 @@ def inbox_archive(
         ),
     ),
     actor: str = typer.Option("user", "--actor", help="Actor to attribute the archive to."),
-    db: str = _DB_OPTION,
 ) -> None:
     """Archive an inbox task or message (mirrors the cockpit archive action).
 
@@ -933,19 +892,19 @@ def inbox_archive(
         raise typer.Exit(code=2)
 
     if match is not None:
-        _bulk_archive_by_match(db=db, pattern=match, dry_run=dry_run)
+        _bulk_archive_by_match(pattern=match, dry_run=dry_run)
         return
 
     if deleted_projects:
-        _bulk_archive_deleted_project_messages(db=db, dry_run=dry_run)
+        _bulk_archive_deleted_project_messages(dry_run=dry_run)
         return
 
     if read:
-        _bulk_archive_all_notifies(db=db, dry_run=dry_run)
+        _bulk_archive_all_notifies(dry_run=dry_run)
         return
 
     if fake_recovery_injections:
-        _bulk_archive_fake_recovery_injections(db=db, dry_run=dry_run)
+        _bulk_archive_fake_recovery_injections(dry_run=dry_run)
         return
 
     if task_id is None:
@@ -958,11 +917,11 @@ def inbox_archive(
 
     # Message IDs (from `pm inbox --json`) use the ``msg:<n>`` prefix.
     if task_id.startswith("msg:"):
-        _archive_message_by_id(db=db, msg_id_str=task_id)
+        _archive_message_by_id(msg_id_str=task_id)
         return
 
     project = _project_from_task_id(task_id)
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     try:
         task = svc.archive_task(task_id, actor=actor)
     except Exception as exc:  # noqa: BLE001
@@ -971,7 +930,7 @@ def inbox_archive(
     typer.echo(f"{task.task_id} → {task.work_status.value}")
 
 
-def _archive_message_by_id(*, db: str, msg_id_str: str) -> None:
+def _archive_message_by_id(*, msg_id_str: str) -> None:
     """Close a single message row by its ``msg:N`` ID."""
     try:
         raw = msg_id_str.split(":", 1)[1]
@@ -982,7 +941,7 @@ def _archive_message_by_id(*, db: str, msg_id_str: str) -> None:
 
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        store = _resolve_messages_store(db)
+        store = _resolve_messages_store()
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
@@ -995,13 +954,13 @@ def _archive_message_by_id(*, db: str, msg_id_str: str) -> None:
     typer.echo(f"msg:{msg_id} → archived")
 
 
-def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
+def _bulk_archive_by_match(*, pattern: str, dry_run: bool) -> None:
     """Archive every open user-recipient message whose title matches ``pattern``."""
     import fnmatch
 
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        store = _resolve_messages_store(db)
+        store = _resolve_messages_store()
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
@@ -1067,7 +1026,7 @@ _FAKE_RECOVERY_INJECTION_SUBJECT_RE = re.compile(
 )
 
 
-def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
+def _bulk_archive_fake_recovery_injections(*, dry_run: bool) -> None:
     """Archive open user-recipient messages matching the #1076 subject shape.
 
     Producer-side gating (``_is_fake_recovery_injection_subject`` in
@@ -1077,7 +1036,7 @@ def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
     """
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        store = _resolve_messages_store(db)
+        store = _resolve_messages_store()
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
@@ -1133,7 +1092,7 @@ def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
             typer.echo(f"  msg:{mid}: {reason}", err=True)
 
 
-def _bulk_archive_all_notifies(*, db: str, dry_run: bool) -> None:
+def _bulk_archive_all_notifies(*, dry_run: bool) -> None:
     """Archive every open user-recipient notify message — bulk \"mark all read\".
 
     The companion to :func:`pollypm.inbox_sweep.sweep_stale_notifies`,
@@ -1145,7 +1104,7 @@ def _bulk_archive_all_notifies(*, db: str, dry_run: bool) -> None:
     """
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        store = _resolve_messages_store(db)
+        store = _resolve_messages_store()
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
@@ -1216,12 +1175,12 @@ def _known_project_keys() -> set[str]:
     return set((getattr(config, "projects", {}) or {}).keys())
 
 
-def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
+def _bulk_archive_deleted_project_messages(*, dry_run: bool) -> None:
     """Archive open user-recipient messages for projects removed from config."""
     known_projects = _known_project_keys()
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        store = _resolve_messages_store(db)
+        store = _resolve_messages_store()
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
@@ -1514,7 +1473,6 @@ def backfill_kinds(
         ),
     ),
     project: str | None = _PROJECT_OPTION,
-    db: str = _DB_OPTION,
 ) -> None:
     """Reclassify legacy inbox rows by heuristic.
 
@@ -1535,13 +1493,6 @@ def backfill_kinds(
 
     # Default = dry-run. --commit is the explicit opt-in to mutation.
     effective_commit = bool(commit)
-
-    # ``--db`` is accepted but no longer used directly — the configured
-    # backend (sqlite vs postgres) is resolved via ``load_config()`` so
-    # the helper reads the same DB ``pm inbox`` reads. See #1811: the
-    # pre-cutover path hard-coded a sqlite URL and silently missed
-    # everything during the pg cutover.
-    del db
 
     try:
         message_rows = _legacy_message_rows(project=project)

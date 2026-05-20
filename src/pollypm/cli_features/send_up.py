@@ -21,19 +21,21 @@ import typer
 from pollypm.worker_milestone import emit_worker_milestone
 
 
-def _load_work_service(db: str, task_id: str):
-    """Construct a SQLiteWorkService scoped to ``task_id``'s project.
+def _load_work_service(task_id: str):
+    """Construct a work-service scoped to ``task_id``'s project.
 
     Reuses :func:`pollypm.work.cli._svc` because that helper already
-    centralizes db-path resolution, project-root discovery, and the
-    sync-manager wiring. CLI-to-CLI imports are allowed by the
-    boundary rules; non-CLI code must continue to use the typed work
-    service or the service_api facade directly.
+    centralizes project-root discovery and the sync-manager wiring.
+    CLI-to-CLI imports are allowed by the boundary rules; non-CLI
+    code must continue to use the typed work service or the
+    service_api facade directly. Post-sqlite-ripout (refs #1971) the
+    legacy ``--db`` override is gone — the configured pg backend is
+    the only routable target.
     """
     from pollypm.work.cli import _project_from_task_id, _svc
 
     project = _project_from_task_id(task_id)
-    return _svc(db, project=project)
+    return _svc(project=project)
 
 
 def _bind_send_up_command(callback, helpers):
@@ -89,11 +91,6 @@ def send_up(
         "--actor",
         help="Sender label recorded on the inbox card (defaults to 'worker').",
     ),
-    db: str = typer.Option(
-        ".pollypm/state.db",
-        "--db",
-        help="Path to SQLite database.",
-    ),
     json_output: bool = typer.Option(
         False, "--json", help="Emit structured JSON."
     ),
@@ -125,7 +122,7 @@ def send_up(
     # CLI modules are not runtime dependency targets for non-CLI
     # code).
     try:
-        svc = _load_work_service(db, task_id)
+        svc = _load_work_service(task_id)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"send-up: could not open work service: {exc}", err=True)
         raise typer.Exit(code=1)

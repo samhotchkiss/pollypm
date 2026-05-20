@@ -132,13 +132,6 @@ def test_dispatch_default_is_sqlite(work_service):
     assert isinstance(work_service, SQLiteWorkService)
 
 
-@pytest.mark.backend("sqlite")
-def test_dispatch_sqlite_marker_routes_to_sqlite(work_service):
-    from pollypm.work.sqlite_service import SQLiteWorkService
-
-    assert isinstance(work_service, SQLiteWorkService)
-
-
 @pytest.mark.backend("postgres")
 def test_dispatch_postgres_marker_routes_to_pg(work_service):
     from pollypm.work.pg_service import PgWorkService

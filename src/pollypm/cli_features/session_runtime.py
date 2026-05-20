@@ -72,53 +72,21 @@ def _notify_user_prompt_fallback_note_enabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _resolve_notify_store(db: str):
+def _resolve_notify_store():
     """Return the configured-backend ``Store`` for ``pm notify`` writes.
 
-    Mirrors :func:`pollypm.work.cli._svc` backend dispatch (#1369,
-    #1737, #1940) and the inbox-CLI helper added for #1790. When
-    ``--db`` is the canonical workspace default, route through
-    :func:`pollypm.store.get_store` so ``[storage].backend = "postgres"``
-    actually writes to the pg pool. When ``--db`` is a Postgres DSN
-    (``postgresql://…``, #1940) pin to pg at the supplied DSN. Any
-    other override is treated as a sqlite path (the test / CI escape
-    hatch).
-
-    The returned ``Store`` is a process-wide singleton — do NOT
-    ``close()`` it.
+    Routes through :func:`pollypm.store.get_store` so
+    ``[storage].backend`` decides where the write lands. The returned
+    ``Store`` is a process-wide singleton — do NOT ``close()`` it.
 
     Issue #1755 / #1790: ``pm notify`` constructing
     ``SQLAlchemyStore("sqlite:///<state>")`` directly silently wrote
     to the empty sqlite shadow whenever the configured backend was
     postgres, so live pg readers never saw the alert and the
     immediate-priority inbox task fan-out hit a non-existent row.
+    The legacy ``--db`` flag was removed in the sqlite-ripout
+    (refs #1971); pg is the only supported backend post-#1737.
     """
-    from pollypm.storage.pg_pool import _looks_like_pg_dsn
-    from pollypm.work.db_resolver import (
-        WORKSPACE_DEFAULT_DB_PATH,
-        resolve_work_db_path,
-    )
-
-    if _looks_like_pg_dsn(db):
-        from pollypm.store import get_store_by_url
-
-        return get_store_by_url(db.strip(), backend="postgres")
-
-    if db != WORKSPACE_DEFAULT_DB_PATH:
-        # #1956: sqlite is no longer entry-pointed. ``--db <path>`` is
-        # the documented sqlite escape hatch (test / CI / legacy
-        # migration), so opt the backend back in for this process.
-        # ``register_backend`` warn-logs unless we're under pytest.
-        from pollypm.store import (
-            SQLAlchemyStore,
-            get_store_by_url,
-            register_backend,
-        )
-
-        register_backend("sqlite", SQLAlchemyStore)
-        db_path = resolve_work_db_path(db, project=None)
-        return get_store_by_url(f"sqlite:///{db_path}")
-
     from pollypm.config import load_config
     from pollypm.store import get_store
 
@@ -855,7 +823,6 @@ def _validate_user_prompt_payload(user_prompt_json: str) -> dict[str, object] | 
 
 def _create_notify_inbox_task(
     *,
-    db: str,
     store,
     message_id: object,
     subject: str,
@@ -880,24 +847,11 @@ def _create_notify_inbox_task(
     process-wide singleton resolved by :func:`_resolve_notify_store`,
     and the work-service is built through
     :func:`pollypm.work.create_work_service` with the active
-    :class:`PollyPMConfig` so ``[storage].backend = "postgres"`` lands
-    on the pg pool. ``--db`` non-default values force sqlite dispatch
-    via ``db_path`` (mirrors :func:`pollypm.work.cli._svc`).
-
-    #1951 — ``--db <pg-dsn>`` (``postgresql://…``) is treated like
-    :func:`pollypm.work.cli._svc`: synthesize a pg-pinned config carrying
-    the override DSN and call the factory with ``db_path=None`` so the
-    inbox-task row lands on the same Postgres backend as the message.
-    Without this, a non-default ``Path("postgresql://…")`` falls into
-    the sqlite branch (since ``db != WORKSPACE_DEFAULT_DB_PATH``) and
-    the immediate-priority fan-out splits message/task across backends.
+    :class:`PollyPMConfig` so ``[storage].backend`` lands the row on
+    the configured backend. Post-sqlite-ripout (refs #1971) there is
+    only the pg backend.
     """
-    from pollypm.storage.pg_pool import _looks_like_pg_dsn
     from pollypm.work import create_work_service
-    from pollypm.work.db_resolver import (
-        WORKSPACE_DEFAULT_DB_PATH,
-        resolve_work_db_path,
-    )
 
     config_obj = None
     try:
@@ -907,27 +861,7 @@ def _create_notify_inbox_task(
     except Exception:  # noqa: BLE001
         config_obj = None
 
-    if _looks_like_pg_dsn(db):
-        # #1951 — pg DSN override. Mirror ``pollypm.work.cli._svc``:
-        # build a pg-pinned config that carries the override DSN, then
-        # call the factory with ``db_path=None`` so the pg dispatch
-        # branch fires instead of being forced down sqlite by an
-        # explicit ``db_path``.
-        from pollypm.work.cli import _config_with_pg_dsn_override
-
-        backend_config = _config_with_pg_dsn_override(config_obj, db)
-        svc = create_work_service(
-            config=backend_config,
-            project_key=project,
-        )
-    elif db == WORKSPACE_DEFAULT_DB_PATH and config_obj is not None:
-        svc = create_work_service(config=config_obj, project_key=project)
-    else:
-        db_path = resolve_work_db_path(db, project=None)
-        svc = create_work_service(
-            db_path=db_path,
-            project_path=db_path.parent.parent,
-        )
+    svc = create_work_service(config=config_obj, project_key=project)
     try:
         task_labels = [
             *label_list,
@@ -1359,15 +1293,6 @@ def notify(
             "the legacy insert-every-time behavior."
         ),
     ),
-    db: str = typer.Option(
-        ".pollypm/state.db",
-        "--db",
-        help=(
-            "Work-service connection: sqlite path (default) or Postgres "
-            "DSN (``postgresql://…``). Default routes through "
-            "``[storage].backend`` (#1940)."
-        ),
-    ),
 ) -> None:
     """Create a work-service inbox item for the human user."""
     args = _normalize_notify_args(
@@ -1386,7 +1311,7 @@ def notify(
     _maybe_warn_user_prompt_fallback(args)
 
     # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
-    store = _resolve_notify_store(db)
+    store = _resolve_notify_store()
     notify_kind = _kind_for_notify(
         args.label_list,
         requester=args.requester_role,
@@ -1415,7 +1340,6 @@ def notify(
     inbox_task_id: str | None = None
     if args.resolved_priority == "immediate":
         inbox_task_id = _create_notify_inbox_task(
-            db=db,
             store=store,
             message_id=message_id,
             subject=subject,

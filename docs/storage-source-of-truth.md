@@ -37,7 +37,7 @@ entry at import time.
 | `PROJECT`           | `pollypm.config:load_config` (`.projects`)               |
 | `SESSION`           | `pollypm.storage.state:StateStore.list_sessions`         |
 | `INBOX_ITEM`        | `pollypm.signal_routing:shared_inbox_count`              |
-| `ACTIVITY_EVENT`    | `pollypm.store.sqlalchemy_store:SQLAlchemyStore.query_messages` |
+| `ACTIVITY_EVENT`    | `pollypm.store.backends.pg_store:PgStore.query_messages` |
 | `ALERT`             | `pollypm.signal_routing:shared_alert_count`              |
 | `TASK`              | `pollypm.work.pg_service:PgWorkService.list_tasks` |
 | `EXECUTION`         | `pollypm.work.pg_service:PgWorkService.get_execution` |

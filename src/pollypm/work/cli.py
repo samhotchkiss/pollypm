@@ -66,15 +66,6 @@ flow_app = typer.Typer(
 # Helpers
 # ---------------------------------------------------------------------------
 
-_DB_OPTION = typer.Option(
-    ".pollypm/state.db",
-    "--db",
-    help=(
-        "Work-service connection: sqlite file path (default) or Postgres "
-        "DSN (``postgresql://…``). Default routes through "
-        "``[storage].backend`` (#1940)."
-    ),
-)
 _PROJECT_OPTION = typer.Option(None, "--project", "-p", help="Project filter.")
 _JSON_OPTION = typer.Option(False, "--json", help="Output as JSON.")
 
@@ -202,70 +193,9 @@ def _project_from_task_id(task_id: str) -> str | None:
     return None
 
 
-def _config_with_pg_dsn_override(config: object | None, dsn: str) -> object:
-    """Return a config-shaped object that forces ``backend='postgres'`` + ``dsn``.
-
-    The factory + pg pool resolver both read ``config.storage.backend``
-    and ``config.storage.pg.dsn``. When ``--db`` is a Postgres DSN
-    (#1940) we want to honour the DSN override without making the
-    operator edit their ``pollypm.toml``. We build a thin override on
-    top of the loaded config so other config knobs (projects, plugin
-    settings) remain visible to session-manager wiring downstream.
-
-    When the base ``config`` is ``None`` (config-load failed), fall
-    through to a minimal shim that carries just enough for the factory
-    + pg pool to dispatch.
-    """
-    import dataclasses
-
-    if config is not None:
-        storage = getattr(config, "storage", None)
-        pg = getattr(storage, "pg", None) if storage is not None else None
-        if storage is not None and pg is not None:
-            try:
-                new_pg = dataclasses.replace(pg, dsn=dsn.strip())
-                new_storage = dataclasses.replace(
-                    storage, backend="postgres", pg=new_pg,
-                )
-                return dataclasses.replace(config, storage=new_storage)
-            except TypeError:
-                # ``config`` / ``storage`` may not be a dataclass in test
-                # doubles — fall through to the minimal shim below.
-                pass
-
-    class _PgOverridePg:
-        __slots__ = ("dsn", "pool_min", "pool_max", "min_version")
-
-        def __init__(self, dsn: str) -> None:
-            self.dsn = dsn
-            self.pool_min = 1
-            self.pool_max = 10
-            self.min_version = "16.0"
-
-    class _PgOverrideStorage:
-        __slots__ = ("backend", "url", "pg")
-
-        def __init__(self, dsn: str) -> None:
-            self.backend = "postgres"
-            self.url = ""
-            self.pg = _PgOverridePg(dsn)
-
-    class _PgOverrideConfig:
-        __slots__ = ("storage", "projects", "project")
-
-        def __init__(self, dsn: str) -> None:
-            self.storage = _PgOverrideStorage(dsn)
-            self.projects = {}
-            self.project = None
-
-    return _PgOverrideConfig(dsn.strip())
-
-
-def _svc(db: str, project: str | None = None) -> "WorkService":
+def _svc(project: str | None = None) -> "WorkService":
     import atexit
 
-    from pollypm.storage.pg_pool import _looks_like_pg_dsn
-    from pollypm.work.db_resolver import WORKSPACE_DEFAULT_DB_PATH
     from pollypm.work.factory import create_work_service
     from pollypm.work.sync import SyncManager
     from pollypm.work.sync_file import FileSyncAdapter
@@ -283,41 +213,12 @@ def _svc(db: str, project: str | None = None) -> "WorkService":
     except Exception:  # noqa: BLE001
         config_obj = None
 
-    # #1940 — ``--db`` now accepts either a sqlite path (the canonical
-    # escape hatch for tests / CI) or a Postgres DSN (``postgresql://…``).
-    # Default value routes through ``[storage].backend`` so a pg-configured
-    # workspace transparently lands on the pg pool.
-    db_is_default = db == WORKSPACE_DEFAULT_DB_PATH
-    db_is_pg_dsn = _looks_like_pg_dsn(db)
-
-    if db_is_pg_dsn:
-        # Synthesize a pg-pinned config that carries the override DSN so
-        # the factory's pg dispatch sees the explicit override. Other
-        # config knobs (project paths, etc.) come from ``config_obj`` so
-        # session-manager wiring downstream still works.
-        backend_config = _config_with_pg_dsn_override(config_obj, db)
-        db_path_for_factory: Path | None = None
-    elif not db_is_default:
-        # Sqlite escape hatch: explicit non-default filesystem path.
-        # Force sqlite dispatch by passing ``config=None`` AND a
-        # concrete ``db_path``; the factory honours the override even
-        # when the configured backend is postgres.
-        backend_config = None
-        db_path_for_factory = _resolve_db_path(db, project=project)
-    else:
-        # Canonical default: honour the configured backend. Pass
-        # ``db_path=None`` so the pg branch isn't forced down sqlite by
-        # the explicit-override rule introduced for #1939.
-        backend_config = config_obj
-        db_path_for_factory = None
-
-    # Resolve a concrete sqlite path for ancillary wiring (sync adapter,
-    # session manager) even when the factory ultimately routes to pg —
-    # ``project_root`` derivation below relies on it.
-    db_path = _resolve_db_path(
-        db if not db_is_pg_dsn else WORKSPACE_DEFAULT_DB_PATH,
-        project=project,
-    )
+    # Resolve the canonical workspace state.db path for ancillary wiring
+    # (sync adapter, session manager). The factory itself ignores
+    # ``db_path`` on the pg backend (which is the only supported
+    # backend post-sqlite-ripout, refs #1971) but the project-root
+    # derivation below still uses this path as a fallback.
+    db_path = _resolve_db_path(project=project)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     db_derived_root = db_path.parent.parent
 
@@ -361,16 +262,10 @@ def _svc(db: str, project: str | None = None) -> "WorkService":
     sync.register(FileSyncAdapter(issues_root=project_root / "issues"))
 
     # Route through the factory so ``[storage] backend`` is honoured
-    # (#1369, #1737, #1940). ``db_path`` / ``project_path`` /
-    # ``sync_manager`` are sqlite-only; the pg backend ignores them per
-    # the factory docstring. Three dispatch modes (see above):
-    #   * ``--db`` is a pg DSN → factory routes to pg with the override.
-    #   * ``--db`` is a non-default sqlite path → factory routes to sqlite.
-    #   * ``--db`` is the canonical default → factory honours
-    #     ``config.storage.backend``.
+    # (#1369, #1737). The legacy ``--db`` flag was removed in the
+    # sqlite-ripout (refs #1971); pg is the only supported backend.
     svc = create_work_service(
-        config=backend_config,
-        db_path=db_path_for_factory,
+        config=config_obj,
         project_path=project_root,
         project_key=project,
         sync_manager=sync,
@@ -794,7 +689,6 @@ def task_create(
         "--requires-human-review",
         help="Gate queue() transition on human sign-off via inbox.",
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Create a new task in draft state."""
@@ -828,7 +722,7 @@ def task_create(
             err=True,
         )
 
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     task = _run(
         svc.create,
         title=title,
@@ -867,11 +761,10 @@ def task_get(
             "user-visible signal like review summaries (#1035)."
         ),
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Get full details of a task."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.get, task_id)
     # Also load context
     task.context = svc.get_context(task_id)
@@ -898,13 +791,12 @@ def task_list(
             "the work view. #1003"
         ),
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """List tasks with optional filters."""
     from pollypm.notify_task import is_notify_inbox_task
 
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     tasks = svc.list_tasks(work_status=status, project=project, assignee=assignee)
     if not include_inbox:
         tasks = [task for task in tasks if not is_notify_inbox_task(task)]
@@ -922,7 +814,6 @@ def task_update(
     acceptance_criteria: str | None = typer.Option(None, "--acceptance-criteria", help="New acceptance criteria"),
     constraints: str | None = typer.Option(None, "--constraints", help="New constraints"),
     relevant_files: list[str] | None = typer.Option(None, "--relevant-files", help="Replace relevant files (repeatable)"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Update mutable fields on a task.
@@ -969,7 +860,7 @@ def task_update(
         )
         raise typer.Exit(code=1)
 
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.update, task_id, **fields)
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
@@ -982,11 +873,10 @@ def task_queue(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     actor: str = typer.Option("cli", "--actor", help="Actor performing the action"),
     skip_gates: bool = typer.Option(False, "--skip-gates", help="Override gate checks (use with caution)"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Move a task from draft to queued."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.queue, task_id, actor, skip_gates=skip_gates)
     if output_json:
         payload = _task_to_dict(task)
@@ -1015,11 +905,10 @@ def task_approve_human_review(
         "--fast-track-authorized",
         help="Record that the operator has prior authorization to approve.",
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Approve a requires_human_review task before it enters the queue."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(
         svc.approve_human_review,
         task_id,
@@ -1038,11 +927,10 @@ def task_claim(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     actor: str = typer.Option("worker", "--actor", help="Actor claiming the task"),
     skip_gates: bool = typer.Option(False, "--skip-gates", help="Override gate checks (use with caution)"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Claim a queued task and start the flow."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.claim, task_id, actor, skip_gates=skip_gates)
     # Surface provisioning trouble instead of silently reporting success
     # (#243). The DB claim is authoritative — the worker can proceed
@@ -1080,11 +968,10 @@ def task_done(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     output: str = typer.Option(..., "--output", "-o", help="Work output as JSON string"),
     actor: str = typer.Option("worker", "--actor", help="Actor completing the node"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Signal that the current work node is complete."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     try:
         wo_dict = json.loads(output)
     except json.JSONDecodeError as exc:
@@ -1211,11 +1098,10 @@ def task_approve(
             "from there."
         ),
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Approve at a review node."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(
         svc.approve,
         task_id,
@@ -1238,7 +1124,6 @@ def task_reject(
         "--actor",
         help="Actor rejecting (defaults to the task's bound reviewer/human approver)",
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Reject at a review node."""
@@ -1259,7 +1144,7 @@ def task_reject(
             err=True,
         )
         raise typer.Exit(code=1)
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(
         svc.reject,
         task_id,
@@ -1276,11 +1161,10 @@ def task_reject(
 def task_next(
     project: str | None = _PROJECT_OPTION,
     agent: str | None = typer.Option(None, "--agent", help="Filter by agent (worker role)"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Return the highest-priority queued+unblocked task."""
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     task = svc.next(agent=agent, project=project)
     if task is None:
         if output_json:
@@ -1299,7 +1183,6 @@ def task_cancel(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     reason: str = typer.Option(..., "--reason", help="Cancellation reason (required)"),
     actor: str = typer.Option("cli", "--actor", help="Actor cancelling"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Cancel a task."""
@@ -1313,7 +1196,7 @@ def task_cancel(
             err=True,
         )
         raise typer.Exit(code=1)
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.cancel, task_id, actor, reason)
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
@@ -1326,7 +1209,6 @@ def task_hold(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     actor: str = typer.Option("cli", "--actor", help="Actor"),
     reason: str | None = typer.Option(None, "--reason", help="Why the task is being held"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Put a task on hold."""
@@ -1345,7 +1227,7 @@ def task_hold(
             err=True,
         )
         raise typer.Exit(code=1)
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.hold, task_id, actor, reason)
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
@@ -1357,11 +1239,10 @@ def task_hold(
 def task_resume(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     actor: str = typer.Option("cli", "--actor", help="Actor"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Resume an on-hold task."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.resume, task_id, actor)
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
@@ -1383,7 +1264,6 @@ def task_repair(
         help="Why this repair is being applied (recorded on the task).",
     ),
     actor: str = typer.Option("cli", "--actor", help="Actor applying repair"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Apply a narrow, audited task-state repair.
@@ -1391,7 +1271,7 @@ def task_repair(
     This is not a general SQL escape hatch. Each case validates the broken
     invariant, uses normal work-service transitions, and records task context.
     """
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     before = _run(svc.get, task_id)
     if repair_case != "review-hold":
         typer.echo(
@@ -1459,10 +1339,9 @@ def task_link(
     from_id: str = typer.Argument(..., help="Source task ID"),
     to_id: str = typer.Argument(..., help="Target task ID"),
     kind: str = typer.Option("blocks", "--kind", "-k", help="Link kind: blocks, relates_to, supersedes, parent"),
-    db: str = _DB_OPTION,
 ) -> None:
     """Create a relationship between two tasks."""
-    svc = _svc(db, project=_project_from_task_id(from_id))
+    svc = _svc(project=_project_from_task_id(from_id))
     _run(svc.link, from_id, to_id, kind)
     typer.echo(f"Linked {from_id} --{kind}--> {to_id}")
 
@@ -1472,10 +1351,9 @@ def task_unlink(
     to_id: str = typer.Argument(..., help="Target task ID (the relationship's destination)"),
     from_id: str = typer.Option(..., "--from", help="Source task ID (the relationship's origin)"),
     kind: str = typer.Option("blocks", "--kind", "-k", help="Link kind: blocks, relates_to, supersedes, parent"),
-    db: str = _DB_OPTION,
 ) -> None:
     """Remove a relationship between two tasks."""
-    svc = _svc(db, project=_project_from_task_id(from_id))
+    svc = _svc(project=_project_from_task_id(from_id))
     _run(svc.unlink, from_id, to_id, kind)
     typer.echo(f"Unlinked {from_id} --{kind}--> {to_id}")
 
@@ -1485,11 +1363,10 @@ def task_block(
     task_id: str = typer.Argument(..., help="Task ID to mark as blocked"),
     blocker: str = typer.Option(..., "--blocker", help="Blocker task ID"),
     actor: str = typer.Option("cli", "--actor", help="Actor performing the block"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Mark a task as blocked by another task."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.block, task_id, actor, blocker)
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
@@ -1500,11 +1377,10 @@ def task_block(
 @task_app.command("dependents")
 def task_dependents(
     task_id: str = typer.Argument(..., help="Task ID"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Show tasks transitively blocked by this task."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     deps = _run(svc.dependents, task_id)
     if output_json:
         typer.echo(json.dumps([_task_to_dict(t) for t in deps], indent=2, default=str))
@@ -1522,11 +1398,10 @@ def task_get_execution(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     node: str | None = typer.Option(None, "--node", help="Filter by node_id"),
     visit: int | None = typer.Option(None, "--visit", help="Filter by visit number"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Show flow node execution records for a task."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     executions = _run(svc.get_execution, task_id, node, visit)
 
     def _exec_to_dict(ex) -> dict:
@@ -1592,7 +1467,6 @@ def task_get_execution(
 def task_validate_advance(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     actor: str = typer.Option(..., "--actor", help="Actor attempting to advance"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Dry-run: would this actor be allowed to advance the current node?
@@ -1600,7 +1474,7 @@ def task_validate_advance(
     Evaluates all gates on the current node plus an actor-vs-role check
     without modifying any state. Exits non-zero if any hard gate fails.
     """
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     results = _run(svc.validate_advance, task_id, actor)
 
     def _result_to_dict(r) -> dict:
@@ -1679,7 +1553,6 @@ def task_context(
             "(sweeper pings, etc.) that are filtered by default."
         ),
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Add or list context entries on a task.
@@ -1689,7 +1562,7 @@ def task_context(
     and agents can inspect ``work_context_entries`` without dropping into
     sqlite3.
     """
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
 
     if text is None:
         # Inspection mode — list entries.
@@ -1772,7 +1645,6 @@ def task_transitions(
         min=1,
         help="Cap the number of transitions returned (most recent first).",
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """List work_status transitions for a task.
@@ -1781,7 +1653,7 @@ def task_transitions(
     Polly and autonomous agents can audit task lifecycle without falling
     through to the raw DB.
     """
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.get, task_id)
     transitions = list(task.transitions or [])
 
@@ -1844,7 +1716,6 @@ def task_backfill_review_summaries(
         min=1,
         help="Maximum number of summaries to generate.",
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Generate missing LLM-written plain summaries for review tasks."""
@@ -1852,7 +1723,7 @@ def task_backfill_review_summaries(
     from pollypm.task_review_summary import backfill_review_plain_summaries
 
     resolved_project = _project_from_task_id(task_id) if task_id else project
-    svc = _svc(db, project=resolved_project)
+    svc = _svc(project=resolved_project)
     results = backfill_review_plain_summaries(
         svc,
         project=None if task_id else project,
@@ -1900,11 +1771,10 @@ def task_status(
             "drown user-visible signal like review summaries (#1035)."
         ),
     ),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Pretty-printed summary: node, owner, status, context, executions."""
-    svc = _svc(db, project=_project_from_task_id(task_id))
+    svc = _svc(project=_project_from_task_id(task_id))
     task = _run(svc.get, task_id)
     # #1035: when filtering sweeper pings, fetch a wider window so we
     # still surface 5 user-visible rows on tasks where sweeper churn
@@ -1959,11 +1829,10 @@ def task_status(
 @task_app.command("counts")
 def task_counts(
     project: str | None = _PROJECT_OPTION,
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Show task counts by status."""
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     counts = svc.state_counts(project=project)
     if output_json:
         typer.echo(json.dumps(counts, indent=2))
@@ -1977,11 +1846,10 @@ def task_counts(
 @task_app.command("mine")
 def task_mine(
     agent: str = typer.Option(..., "--agent", help="Agent name"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Show tasks where agent owns the current node."""
-    svc = _svc(db)
+    svc = _svc()
     tasks = svc.my_tasks(agent)
     _print_task_table(tasks, as_json=output_json)
 
@@ -1989,11 +1857,10 @@ def task_mine(
 @task_app.command("blocked")
 def task_blocked(
     project: str | None = _PROJECT_OPTION,
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Show blocked tasks."""
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     tasks = svc.blocked_tasks(project=project)
     _print_task_table(tasks, as_json=output_json)
 
@@ -2006,11 +1873,10 @@ def task_blocked(
 @flow_app.command("list")
 def flow_list(
     project: str | None = _PROJECT_OPTION,
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """List available flow templates."""
-    svc = _svc(db, project=project)
+    svc = _svc(project=project)
     flows = svc.available_flows(project=project)
     if output_json:
         typer.echo(json.dumps(
@@ -2140,14 +2006,13 @@ def flow_validate(
 def task_sync(
     project: str | None = _PROJECT_OPTION,
     issues_dir: str = typer.Option("issues", "--issues-dir", help="Path to issues directory for file sync"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Run all registered sync adapters for all tasks (or project-filtered)."""
     from pollypm.work.sync import SyncManager
     from pollypm.work.sync_file import FileSyncAdapter
 
-    svc = _svc(db)
+    svc = _svc()
     tasks = svc.list_tasks(project=project)
 
     manager = SyncManager()
@@ -2170,13 +2035,12 @@ def task_migrate(
     issues_dir: str = typer.Argument(..., help="Path to issues directory"),
     project: str = typer.Option(..., "--project", "-p", help="Target project name"),
     flow: str = typer.Option("standard", "--flow", "-f", help="Flow template name"),
-    db: str = _DB_OPTION,
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Import existing issues/ directories into the work service."""
     from pollypm.work.migrate import migrate_issues
 
-    svc = _svc(db)
+    svc = _svc()
     result = migrate_issues(Path(issues_dir), svc, project=project, flow=flow)
 
     if output_json:

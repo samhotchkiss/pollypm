@@ -863,6 +863,13 @@ class CockpitRouter:
         self._project_categorizations_cache_key: int | None = None
         self._project_categorizations_cache: dict[str, str] | None = None
         self._project_categorizations_cached_at: float = 0.0
+        # #1961 perf — per-window-target ``list_panes`` cache so static
+        # rail click bursts don't each shell out to the same tmux
+        # subprocess. value: (cached_at_monotonic, panes_or_None).
+        # ``panes`` may be ``None`` when the underlying subprocess
+        # failed/timed-out; cached so a wedged tmux doesn't keep
+        # spawning more subprocesses inside the TTL window.
+        self._static_list_panes_cache: dict[str, tuple[float, object]] = {}
 
     def _presence(self) -> CockpitPresence:
         presence = getattr(self, "presence", None)
@@ -3270,6 +3277,17 @@ class CockpitRouter:
     # the click as sluggish.
     _ROUTE_TIMING_WARN_SECONDS: float = 0.25
 
+    # #1961 perf — static-route ``list_panes`` cache. Static rail clicks
+    # (Operator, Workers, Inbox, …) all share the same cockpit window
+    # target, so back-to-back clicks repeatedly shell out to the same
+    # ``tmux list-panes -t <session>:polly-cockpit`` subprocess. A short
+    # TTL cache collapses click bursts onto a single subprocess call
+    # without keeping stale layout data past the user's perception
+    # window. Set ``None`` to mark "tmux failed last time" so the static
+    # route still falls through to its safe ``show_static`` path on the
+    # repeat hit instead of a synthetic empty list.
+    _STATIC_LIST_PANES_TTL_SECONDS: float = 0.5
+
     def _route_supervisor_free_static(self, key: str) -> bool:
         if key not in self._SUPERVISOR_FREE_STATIC_KEYS:
             return False
@@ -3293,11 +3311,30 @@ class CockpitRouter:
         # #1832 — wrap each tmux sub-step in a timing probe so a slow
         # subprocess shows up in logs without users needing to enable
         # debug tracing. The probe is a no-op below the warn threshold.
+        #
+        # #1961 perf — collapse static-route click bursts onto a single
+        # ``tmux list-panes`` subprocess via a short-TTL cache keyed on
+        # the window target. Static rail items (Operator, Workers,
+        # Inbox, …) all share the same target; back-to-back clicks
+        # previously each spawned a tmux subprocess gated by the 15s
+        # default timeout, which dominated user-perceived click latency
+        # when the tmux server was slow or contended. The cache also
+        # captures ``None`` (tmux failed) so a wedged server doesn't
+        # keep spawning subprocesses inside the TTL window.
         t_start = time.monotonic()
-        try:
-            panes = self.tmux.list_panes(window_target)
-        except Exception:  # noqa: BLE001
-            panes = None
+        cached_entry = self._static_list_panes_cache.get(window_target)
+        if (
+            cached_entry is not None
+            and t_start - cached_entry[0]
+            < self._STATIC_LIST_PANES_TTL_SECONDS
+        ):
+            panes = cached_entry[1]
+        else:
+            try:
+                panes = self.tmux.list_panes(window_target)
+            except Exception:  # noqa: BLE001
+                panes = None
+            self._static_list_panes_cache[window_target] = (t_start, panes)
         self._maybe_log_route_step("list_panes", key, t_start)
         if has_mount_state:
             if panes is None:

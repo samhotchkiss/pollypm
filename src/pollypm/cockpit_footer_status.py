@@ -74,7 +74,10 @@ def _truncate_alert(alert: str, budget: int) -> str:
     """Trim an alert string to fit ``budget`` chars, ellipsis on overflow.
 
     Returns ``""`` when ``budget <= 0`` so the caller can drop the alert
-    chunk entirely on a very narrow rail.
+    chunk entirely on a very narrow rail. The output is guaranteed to
+    satisfy ``len(result) <= budget`` — when overflow would force the
+    ellipsis to consume the whole budget alone (``budget < 2``), the
+    function returns ``""`` instead of a single ``…``.
     """
     if budget <= 0:
         return ""
@@ -83,8 +86,11 @@ def _truncate_alert(alert: str, budget: int) -> str:
         return ""
     if len(flat) <= budget:
         return flat
-    # Reserve 1 char for the ellipsis.
-    return flat[: max(1, budget - 1)].rstrip() + "…"
+    # Overflow path: need ``head + "…"`` to fit in ``budget``.
+    # That requires at least 1 char of body + 1 char of ellipsis.
+    if budget < 2:
+        return ""
+    return flat[: budget - 1].rstrip() + "…"
 
 
 def render_footer_status(

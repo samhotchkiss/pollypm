@@ -150,6 +150,66 @@ def test_total_width_stays_under_budget() -> None:
         assert len(plain) <= w, f"width={w}, len(plain)={len(plain)}, plain={plain!r}"
 
 
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 5])
+@pytest.mark.parametrize(
+    "project_count,agent_count,inbox_count",
+    [(0, 0, 0), (1, 1, 1), (12, 38, 23), (999, 999, 999)],
+)
+@pytest.mark.parametrize(
+    "alert",
+    [None, "", "x", "heartbeat offline", "heartbeat 999h offline since the dawn of time"],
+)
+def test_narrow_widths_never_overflow_budget(
+    width: int,
+    project_count: int,
+    agent_count: int,
+    inbox_count: int,
+    alert: str | None,
+) -> None:
+    """Regression for PR #2014: very narrow widths (1..5) must never overflow.
+
+    The alert-only layout previously emitted ``"⚠ h…"`` (4 chars) at
+    ``width=3`` because the ellipsis truncation reserved less budget
+    than the glyph-prefix consumed. Per the layout-promotion cascade
+    (full → compact → alert-only → empty), the formatter must drop to
+    empty when even the alert glyph + first body char + ellipsis can't
+    fit, rather than overflow ``width``.
+    """
+    result = render_footer_status(
+        project_count=project_count,
+        agent_count=agent_count,
+        inbox_count=inbox_count,
+        alert=alert,
+        width=width,
+    )
+    plain = _plain(result)
+    assert len(plain) <= width, (
+        f"width={width}, len(plain)={len(plain)}, plain={plain!r}, "
+        f"counts=({project_count},{agent_count},{inbox_count}), alert={alert!r}"
+    )
+
+
+def test_codex_repro_width_3_alert_only_returns_empty() -> None:
+    """Pin the exact Codex repro from PR #2014 comment 4502598259.
+
+    With ``width=3`` and an alert that can't fit alongside the alert
+    glyph + a useful ellipsis-trimmed body, the formatter must return
+    ``""`` rather than ``"⚠ h…"`` (which previously overflowed at 4
+    plain chars vs a budget of 3).
+    """
+    result = render_footer_status(
+        project_count=999,
+        agent_count=999,
+        inbox_count=999,
+        alert="heartbeat offline",
+        width=3,
+    )
+    plain = _plain(result)
+    assert len(plain) <= 3
+    # Specifically, the old overflow string must not reappear.
+    assert plain != "⚠ h…"
+
+
 def test_zero_or_negative_width_returns_empty_string() -> None:
     assert render_footer_status(
         project_count=10, agent_count=10, inbox_count=10, alert="x", width=0,

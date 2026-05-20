@@ -305,3 +305,103 @@ class TestThreeStrikeEscalation:
         # Task should still be in_progress — the helper short-circuited.
         task = svc.get(task_id)
         assert task.work_status.value == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# Re-review guard (Codex blocker on PR #2006): explicit allowlist must
+# protect deliberate non-active statuses (``blocked`` / ``on_hold`` /
+# ``draft``) from being clobbered by a stale marker.
+# ---------------------------------------------------------------------------
+
+
+def _stamp_status(svc, task_id: str, *, status: str, assignee: str | None) -> None:
+    """Force ``work_status`` and ``assignee`` directly via the pg pool."""
+    project, num = task_id.split("/")
+    with svc._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_tasks SET work_status = %s, "
+            "assignee = %s, updated_at = now() "
+            "WHERE project = %s AND task_number = %s",
+            (status, assignee, project, int(num)),
+        )
+        conn.commit()
+
+
+class TestDemoteAllowlistProtectsNonActiveStatuses:
+    """Statuses outside the active/retry allowlist must not be demoted.
+
+    The SQL guard in :func:`bump_reap_count_and_demote` is an explicit
+    allowlist of ``{in_progress, review, queued, rework}``. A stale
+    fresh-launch marker (tmux window vanished) for a task currently in
+    ``blocked`` / ``on_hold`` / ``draft`` must leave the row untouched —
+    no status change, no assignee clear, no ``reap_count`` bump.
+    """
+
+    def test_blocked_task_with_stale_marker_does_not_demote(
+        self, pg_work_service,
+    ):
+        svc = pg_work_service
+        task_id = _make_inprogress_task(svc)
+        project, num = task_id.split("/")
+        _stamp_status(svc, task_id, status="blocked", assignee="alice")
+
+        count = bump_reap_count_and_demote(
+            project_key=project, task_number=int(num), config=None,
+        )
+
+        assert count is None
+        task = svc.get(task_id)
+        assert task.work_status.value == "blocked"
+        assert task.assignee == "alice"
+
+    def test_on_hold_task_with_stale_marker_does_not_demote(
+        self, pg_work_service,
+    ):
+        svc = pg_work_service
+        task_id = _make_inprogress_task(svc)
+        project, num = task_id.split("/")
+        _stamp_status(svc, task_id, status="on_hold", assignee="alice")
+
+        count = bump_reap_count_and_demote(
+            project_key=project, task_number=int(num), config=None,
+        )
+
+        assert count is None
+        task = svc.get(task_id)
+        assert task.work_status.value == "on_hold"
+        assert task.assignee == "alice"
+
+    def test_draft_task_with_stale_marker_does_not_demote(
+        self, pg_work_service,
+    ):
+        svc = pg_work_service
+        task_id = _make_inprogress_task(svc)
+        project, num = task_id.split("/")
+        # Drafts typically have no assignee; clear it to match the wild
+        # shape (and prove the guard short-circuits before assignee=NULL).
+        _stamp_status(svc, task_id, status="draft", assignee=None)
+
+        count = bump_reap_count_and_demote(
+            project_key=project, task_number=int(num), config=None,
+        )
+
+        assert count is None
+        task = svc.get(task_id)
+        assert task.work_status.value == "draft"
+
+    def test_in_progress_task_with_stale_marker_still_demotes(
+        self, pg_work_service,
+    ):
+        """The existing happy-path must still fire under the allowlist."""
+        svc = pg_work_service
+        task_id = _make_inprogress_task(svc)
+        project, num = task_id.split("/")
+
+        count = bump_reap_count_and_demote(
+            project_key=project, task_number=int(num), config=None,
+        )
+
+        assert count == 1
+        task = svc.get(task_id)
+        assert task.work_status.value == "queued"
+        assert task.assignee is None

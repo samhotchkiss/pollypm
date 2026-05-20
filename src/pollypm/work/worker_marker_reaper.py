@@ -86,6 +86,22 @@ WORKER_MARKER_REAPABLE_STATUSES: frozenset[str] = (
 )
 
 
+# Active/retry statuses that the #1999 demote path is allowed to touch.
+#
+# Explicit allowlist — must stay in lockstep with the SQL guard in
+# :func:`pollypm.storage.work_task_state.bump_reap_count_and_demote`.
+# Statuses like ``blocked``, ``on_hold``, and ``draft`` are intentionally
+# excluded: a stale marker (tmux window vanished) must NOT clobber a
+# deliberate user/operator hold or a not-yet-queued draft just because
+# the corresponding tmux window is absent.
+WORKER_MARKER_DEMOTE_ALLOWED_STATUSES: frozenset[str] = frozenset({
+    "in_progress",
+    "review",
+    "queued",
+    "rework",
+})
+
+
 def _emit_worker_session_reaped(decision: "ReapedMarker") -> None:
     """Best-effort audit emit for one reaped marker.
 
@@ -301,10 +317,14 @@ class ReapedMarker:
 
     ``window_missing_for_non_terminal`` flags the specific case the
     #1999 fix targets: the marker is being reaped because the worker's
-    tmux window has vanished but the task is still in a non-terminal
-    status. Only this branch triggers the demote-and-maybe-escalate
-    flow; the terminal-task and missing-row branches leave the task
-    untouched (it's already terminal / already gone).
+    tmux window has vanished AND the task is in one of the
+    active/retry statuses listed in
+    :data:`WORKER_MARKER_DEMOTE_ALLOWED_STATUSES`
+    (``in_progress`` / ``review`` / ``queued`` / ``rework``). Only this
+    branch triggers the demote-and-maybe-escalate flow. Tasks in
+    ``blocked`` / ``on_hold`` / ``draft`` keep their state — a stale
+    marker must not clobber a deliberate user/operator hold. Terminal
+    and missing-row branches likewise leave the task untouched.
     """
 
     project_key: str
@@ -431,6 +451,12 @@ def _classify_marker(
         )
 
     if window_name not in live_window_names:
+        # Only fire the demote/escalate branch when the task is in one
+        # of the active/retry statuses. ``blocked`` / ``on_hold`` /
+        # ``draft`` tasks intentionally keep their state even if the
+        # tmux window is gone — a stale marker must not undo an
+        # operator hold or push a draft into the queue.
+        demote_allowed = status in WORKER_MARKER_DEMOTE_ALLOWED_STATUSES
         return ReapedMarker(
             project_key=project_key,
             window_name=window_name,
@@ -441,7 +467,7 @@ def _classify_marker(
             ),
             task_project=parsed_project,
             task_number=task_number,
-            window_missing_for_non_terminal=True,
+            window_missing_for_non_terminal=demote_allowed,
         )
 
     return None
@@ -605,6 +631,7 @@ def sweep_worker_markers(
 __all__ = [
     "REAP_ESCALATION_THRESHOLD",
     "ReapedMarker",
+    "WORKER_MARKER_DEMOTE_ALLOWED_STATUSES",
     "WORKER_MARKER_REAPABLE_STATUSES",
     "reap_orphan_worker_markers",
     "sweep_worker_markers",

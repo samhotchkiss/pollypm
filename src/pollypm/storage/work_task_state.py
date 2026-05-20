@@ -87,17 +87,19 @@ def bump_reap_count_and_demote(
 
     Called by :func:`pollypm.work.worker_marker_reaper._classify_marker`
     when a fresh-launch marker is reaped because the tmux window has
-    vanished while the task is still non-terminal (#1999). The single
-    UPDATE bumps ``reap_count`` and demotes the task in one round-trip,
-    returning the post-increment count so the caller can decide whether
-    to escalate (3rd+ reap → inbox notify).
+    vanished while the task is in one of the *active/retry* statuses
+    (#1999). The single UPDATE bumps ``reap_count`` and demotes the
+    task in one round-trip, returning the post-increment count so the
+    caller can decide whether to escalate (3rd+ reap → inbox notify).
 
-    The update is conservative: it only fires when the task is still in
-    a non-terminal status (``in_progress`` / ``review`` / ``queued`` /
-    ``rework``). If a competing actor already cancelled or completed the
-    task between marker classification and this call, the row guard
-    prevents us from clobbering the terminal state — we return ``None``
-    in that case and the reaper skips the escalation.
+    The update uses an **explicit allowlist**: it only fires when the
+    task's current ``work_status`` is one of
+    ``{'in_progress', 'review', 'queued', 'rework'}``. Statuses such as
+    ``blocked``, ``on_hold``, ``draft``, ``done``, ``cancelled``, and
+    ``abandoned`` are intentionally excluded — a stale marker must not
+    clobber a deliberate user/operator hold or a terminal state. If the
+    row doesn't match the allowlist we return ``None`` and the reaper
+    skips the escalation.
 
     Returns
     -------
@@ -127,7 +129,9 @@ def bump_reap_count_and_demote(
                     "    assignee = NULL, "
                     "    updated_at = now() "
                     "WHERE project = %s AND task_number = %s "
-                    "  AND work_status NOT IN ('done', 'cancelled', 'abandoned') "
+                    "  AND work_status IN ("
+                    "        'in_progress', 'review', 'queued', 'rework'"
+                    "      ) "
                     "RETURNING reap_count",
                     (project_key, int(task_number)),
                 )
@@ -140,8 +144,9 @@ def bump_reap_count_and_demote(
                 conn.rollback()
                 return None
             if row is None:
-                # No row matched — either the task is gone or it's
-                # already terminal. Either way, no demote, no escalate.
+                # No row matched — either the task is gone, already
+                # terminal, or in a deliberate non-active status
+                # (blocked / on_hold / draft). No demote, no escalate.
                 conn.rollback()
                 return None
             try:

@@ -269,3 +269,44 @@ def test_prunes_locked_merged_worktree(tmp_path: Path) -> None:
     assert result["pruned"] == 1, result
     assert result["errors"] == 0
     assert not wt.exists()
+
+
+def test_empty_payload_discovers_repo_via_cwd_walkup(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#1965 — empty payload (cron-tick path) discovers the repo root
+    by walking up from cwd, not via the global config's ``root_dir``.
+
+    Before the fix, the ``rail_daemon`` cron tick called the handler
+    with ``{}``. The handler resolved ``repo_root`` from
+    ``config.project.root_dir`` (``~/.pollypm/`` for the daemon), which
+    has no ``.claude/worktrees/`` subtree — so the handler bailed
+    immediately while the dev repo's worktree count grew unbounded.
+
+    Predicate semantics this test pins down:
+      * A merged worktree (older than 1h, branch listed by
+        ``git branch --merged main``) IS reaped when the cron-tick
+        path can discover the repo via cwd walk-up.
+      * Discovery looks for a ``.claude/worktrees/`` dir at cwd OR any
+        parent — matching ``doctor._agent_worktree_dirs``.
+    """
+    repo = _make_repo(tmp_path / "repo")
+    wt = _make_agent_worktree(
+        repo, "cron-tick", merge_to_main=True, age_seconds=2 * 3600,
+    )
+    assert wt.exists()
+
+    # Simulate the rail_daemon cron tick: cwd anywhere inside (or
+    # equal to) the dev repo, payload empty. Use a nested subdir so
+    # the walk-up has to traverse a few levels.
+    nested = repo / "src" / "deep" / "nested"
+    nested.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(nested)
+
+    result = agent_worktree_prune_handler({})
+
+    assert result["pruned"] == 1, result
+    assert result["errors"] == 0
+    assert not wt.exists(), "merged worktree must be reaped via cron-tick path"
+    branches = _run("git", "-C", str(repo), "branch").stdout
+    assert "worktree-agent-cron-tick" not in branches

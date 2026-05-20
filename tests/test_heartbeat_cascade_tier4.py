@@ -782,6 +782,80 @@ def test_budget_exhaustion_routes_to_terminal_path(
 # ---------------------------------------------------------------------------
 
 
+def test_sweep_threads_project_path_to_per_project_audit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """#1998 — tier4 sweep emits land in both central + per-project audit.
+
+    Pre-fix: ``_emit_tier4_budget_exhausted`` and ``_emit_tier4_demoted``
+    were called without ``project_path`` from the sweep, so per-project
+    audit (``<root>/.pollypm/audit.jsonl``) carried promotions but never
+    the matching exhaustion/demotion. Operators tailing the per-project
+    log thought tier-4 promoted forever and never resolved or exhausted.
+
+    Post-fix: the sweep resolves project_path from ``services.known_projects``
+    and threads it through both emits so the per-project audit reflects
+    the full cascade lifecycle.
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+    from pollypm.audit.log import project_log_path
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+
+    project_root = tmp_path / "demo-project"
+    (project_root / ".pollypm").mkdir(parents=True)
+
+    class _StubProject:
+        key = "demo"
+        path = project_root
+
+    services = _StubServices(db_path)
+    services.known_projects = (_StubProject(),)
+
+    # --- budget-exhausted leg -------------------------------------------------
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="demo", subject="demo")
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    later = now + timedelta(seconds=TIER4_BUDGET_SECONDS + 600)
+    cadence._sweep_tier4_budget_and_demotion(
+        services=services, now=later,
+    )
+
+    per_project_log = project_log_path(project_root)
+    assert per_project_log is not None and per_project_log.exists(), (
+        "per-project audit log should be created by the sweep emit"
+    )
+    body = per_project_log.read_text()
+    assert "audit.tier4_budget_exhausted" in body, (
+        "per-project audit must carry tier4_budget_exhausted "
+        "(was central-only pre-#1998)"
+    )
+
+    # --- finding-resolved demotion leg ---------------------------------------
+    finding2 = _finding(
+        project="demo", subject="demo",
+        evidence={"queued_subjects": ["demo/9"]},  # distinct hash
+    )
+    tracker.record_promotion(
+        finding2, now=later, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    much_later = later + timedelta(minutes=10)
+    cadence._sweep_tier4_budget_and_demotion(
+        services=services,
+        now=much_later,
+        seen_root_cause_hashes=set(),  # finding gone → demote
+    )
+    body2 = per_project_log.read_text()
+    assert "audit.tier4_demoted" in body2, (
+        "per-project audit must carry tier4_demoted "
+        "(was central-only pre-#1998)"
+    )
+    services.close()
+
+
 def test_clear_tier4_for_finding_emits_demoted(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
 ) -> None:

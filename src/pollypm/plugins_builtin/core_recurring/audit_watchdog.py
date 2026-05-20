@@ -2854,8 +2854,16 @@ def _sweep_tier4_budget_and_demotion(
     except Exception:  # noqa: BLE001
         logger.debug("tier4: list_active raised", exc_info=True)
         return counters
+    # #1998 — build a project_key → project_path map so the per-row
+    # emits can pass ``project_path`` to ``audit.log.emit``. Without
+    # this the sweep's audit lines (tier4_demoted, tier4_budget_exhausted)
+    # only landed in the central tail — operators tailing
+    # ``~/dev/<project>/.pollypm/audit.jsonl`` saw promotions but never
+    # the matching exhaustion/demotion, hiding the cascade's lifecycle.
+    project_paths = _build_project_path_map(services)
     for state in active_rows:
         try:
+            project_path = project_paths.get(state.project)
             # 1) Finding-resolved demotion. Only runs when the caller
             # supplied a seen-hash set — otherwise we can't safely
             # distinguish "finding gone" from "no scan happened yet".
@@ -2873,6 +2881,7 @@ def _sweep_tier4_budget_and_demotion(
                         project=state.project,
                         root_cause_hash_value=state.root_cause_hash,
                         reason="finding_resolved",
+                        project_path=project_path,
                     )
                     counters["tier4_demoted_cleared"] += 1
                 continue
@@ -2891,6 +2900,7 @@ def _sweep_tier4_budget_and_demotion(
                     urgent_handoff_subject=(
                         f"Tier-4 budget exhausted on {state.project}/{state.rule}"
                     ),
+                    project_path=project_path,
                 )
                 _route_tier4_to_terminal(
                     state=state, services=services, now=now,
@@ -2907,6 +2917,30 @@ def _sweep_tier4_budget_and_demotion(
                 state.root_cause_hash, exc_info=True,
             )
     return counters
+
+
+def _build_project_path_map(services: Any) -> dict[str, Path]:
+    """Return ``{project_key: project_path}`` from ``services.known_projects``.
+
+    Used by :func:`_sweep_tier4_budget_and_demotion` to thread the
+    per-project audit log path through ``_emit_tier4_*`` so cascade
+    lifecycle events land in ``<project>/.pollypm/audit.jsonl`` next to
+    the matching promotion rows. Best-effort; non-mappable entries are
+    silently skipped so a malformed project descriptor can't break the
+    sweep for everyone.
+    """
+    paths: dict[str, Path] = {}
+    known = getattr(services, "known_projects", None) or ()
+    for project in known:
+        key = getattr(project, "key", None) or getattr(project, "name", None)
+        path_raw = getattr(project, "path", None)
+        if not key or path_raw is None:
+            continue
+        try:
+            paths[str(key)] = Path(path_raw)
+        except TypeError:
+            continue
+    return paths
 
 
 def clear_tier4_for_finding(

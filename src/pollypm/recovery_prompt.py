@@ -97,6 +97,7 @@ def build_recovery_prompt(
             provider=provider,
             task_prompt=task_prompt,
             max_chars=max_chars,
+            session_name=session_name,
         )
 
     return _build_from_checkpoint(
@@ -104,6 +105,7 @@ def build_recovery_prompt(
         provider=provider,
         task_prompt=task_prompt,
         max_chars=max_chars,
+        session_name=session_name,
     )
 
 
@@ -114,6 +116,7 @@ def _build_from_checkpoint(
     provider: ProviderKind,
     task_prompt: str,
     max_chars: int,
+    session_name: str | None = None,
 ) -> RecoveryPrompt:
     """Build recovery prompt from checkpoint data."""
     sections: list[RecoveryPromptSection] = []
@@ -162,7 +165,15 @@ def _build_from_checkpoint(
         ))
 
     # Section 4: Current Git State (live, not from checkpoint)
-    git_state = _live_git_state(config, checkpoint.project)
+    # Read from the session's worktree cwd when known — architect /
+    # worker sessions live in per-session worktrees under
+    # ``<project>/.pollypm/worktrees/<session>/`` and the branch +
+    # porcelain count there can differ from the project root. Cross-
+    # project audit-log scans (issue #1974) showed architects rejecting
+    # checkpoints as prompt-injection because the ``Branch:`` line read
+    # from project.path described the canonical repo, not the worktree
+    # the agent inhabited.
+    git_state = _live_git_state(config, checkpoint.project, session_name=session_name)
     if git_state:
         sections.append(RecoveryPromptSection(
             key="git_state",
@@ -273,6 +284,7 @@ def _build_fallback_prompt(
     provider: ProviderKind,
     task_prompt: str,
     max_chars: int,
+    session_name: str | None = None,
 ) -> RecoveryPrompt:
     """Build fallback prompt when no checkpoint exists."""
     sections: list[RecoveryPromptSection] = []
@@ -299,7 +311,7 @@ def _build_fallback_prompt(
             priority=SECTION_TRUNCATION_PRIORITY["what_working_on"],
         ))
 
-    git_state = _live_git_state(config, project_key)
+    git_state = _live_git_state(config, project_key, session_name=session_name)
     if git_state:
         sections.append(RecoveryPromptSection(
             key="git_state",
@@ -502,19 +514,45 @@ def _checkpoint_banner(*, checkpoint_id: str, is_fallback: bool, state: str) -> 
     return f"RECOVERY MODE: RESUMING FROM CHECKPOINT {checkpoint_id} — last state was {state}."
 
 
-def _live_git_state(config: PollyPMConfig, project_key: str) -> str:
-    """Get live git state for the project."""
-    project_root = _project_root(config, project_key)
-    if not (project_root / ".git").is_dir():
+def _live_git_state(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    session_name: str | None = None,
+) -> str:
+    """Get live git state for the session's actual working tree.
+
+    Prefers the session's configured ``cwd`` (e.g. a per-session worktree
+    under ``<project>/.pollypm/worktrees/<session>/``) over the project
+    root. This matters because architect/worker sessions check out
+    distinct branches in their own worktrees, and a recovery checkpoint
+    that advertises ``Branch: main`` while the agent is actually on
+    ``fix/foo`` reads to the agent like a prompt-injection attempt and
+    gets refused (issue #1974). Falls back to the project root when no
+    session cwd is known or it is not a git working tree.
+    """
+    git_root = _session_git_root(config, session_name) or _project_root(
+        config, project_key,
+    )
+    if not _is_git_working_tree(git_root):
         return ""
 
     parts: list[str] = ["Git state:"]
 
-    branch = _git_output(str(project_root), ["git", "rev-parse", "--abbrev-ref", "HEAD"])
+    branch = _git_output(
+        str(git_root), ["git", "branch", "--show-current"],
+    )
+    # ``git branch --show-current`` is empty on detached HEAD; fall
+    # back to rev-parse for that case so the section still carries a
+    # useful identifier.
+    if not branch:
+        branch = _git_output(
+            str(git_root), ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+        )
     if branch:
         parts.append(f"- Branch: {branch}")
 
-    status = _git_output(str(project_root), ["git", "status", "--porcelain"])
+    status = _git_output(str(git_root), ["git", "status", "--porcelain"])
     if status:
         changed = len(status.strip().splitlines())
         word = "file" if changed == 1 else "files"
@@ -523,6 +561,36 @@ def _live_git_state(config: PollyPMConfig, project_key: str) -> str:
         parts.append("- Working tree clean")
 
     return "\n".join(parts) if len(parts) > 1 else ""
+
+
+def _session_git_root(
+    config: PollyPMConfig, session_name: str | None,
+) -> Path | None:
+    """Return the session's configured cwd when it exists on disk."""
+    if not session_name:
+        return None
+    sessions = getattr(config, "sessions", None) or {}
+    session = sessions.get(session_name)
+    if session is None:
+        return None
+    cwd = getattr(session, "cwd", None)
+    if cwd is None:
+        return None
+    try:
+        return cwd if Path(cwd).is_dir() else None
+    except OSError:
+        return None
+
+
+def _is_git_working_tree(root: Path) -> bool:
+    """True for both regular checkouts and linked worktrees.
+
+    A linked worktree's ``.git`` is a *file* pointing at the main
+    repo's worktree dir, not a directory; the original ``.is_dir()``
+    check missed those.
+    """
+    dot_git = root / ".git"
+    return dot_git.is_dir() or dot_git.is_file()
 
 
 def _git_output(cwd: str, command: list[str]) -> str:

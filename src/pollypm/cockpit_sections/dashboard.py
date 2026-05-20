@@ -623,14 +623,20 @@ def _render_suggestions(suggestions: list[DashboardSuggestion]) -> list[str]:
     return lines
 
 
-def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str:
-    # Imported lazily to avoid a hard cycle with pollypm.cockpit while the
-    # inbox helpers still live there.
-    from pollypm.cockpit import _count_inbox_tasks_for_label
+@dataclass
+class _DashboardCollection:
+    all_active: list[tuple[str, object]]
+    all_review: list[tuple[str, object]]
+    all_queued: list[tuple[str, object]]
+    all_blocked: list[tuple[str, object]]
+    all_done: list[tuple[str, object]]
+    all_tasks: list[tuple[str, object]]
+    project_scorecards: list[tuple[int, str, str]]
+    total_counts: dict[str, int]
 
-    lines: list[str] = []
-    now = datetime.now(UTC)
 
+def _collect_dashboard_buckets(config, now: datetime) -> _DashboardCollection:
+    """Partition every tracked project's tasks into dashboard buckets."""
     all_active: list[tuple[str, object]] = []
     all_review: list[tuple[str, object]] = []
     all_queued: list[tuple[str, object]] = []
@@ -679,156 +685,104 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
         key=lambda item: _task_done_at(item[1]) or _iso_to_dt(getattr(item[1], "updated_at", None)) or now,
         reverse=True,
     )
-
-    try:
-        open_alerts = supervisor.store.open_alerts()
-    except Exception:  # noqa: BLE001
-        open_alerts = []
-    from pollypm.cockpit_alerts import is_operational_alert
-
-    user_inbox = _count_inbox_tasks_for_label(config)
-    actionable_alerts = [
-        alert
-        for alert in open_alerts
-        if not is_operational_alert(alert.alert_type)
-    ]
-    try:
-        # #1830: route through supervisor facade for pg/sqlite parity.
-        recent = supervisor.recent_events(limit=300)
-    except Exception:  # noqa: BLE001
-        recent = []
-    cutoff_24h = (now - timedelta(hours=24)).isoformat()
-    day_events = [event for event in recent if event.created_at >= cutoff_24h]
-
-    streaks = _shipper_streaks(all_tasks, now=now)
-    streak_header = _render_streak_header(streaks)
-    token_gauge = _build_token_gauge(supervisor, config, now=now)
-    account_rows = _build_account_usage_rows(supervisor, config, now=now)
-    briefing_banner = _briefing_banner(config, config_path=config_path, now=now)
-    suggestions = _rank_dashboard_suggestions(
-        review_tasks=all_review,
-        blocked_tasks=all_blocked,
-        queued_tasks=all_queued,
-        briefing_banner=briefing_banner,
-        user_inbox=user_inbox,
-        config=config,
-        now=now,
+    return _DashboardCollection(
+        all_active=all_active,
+        all_review=all_review,
+        all_queued=all_queued,
+        all_blocked=all_blocked,
+        all_done=all_done,
+        all_tasks=all_tasks,
+        project_scorecards=project_scorecards,
+        total_counts=total_counts,
     )
 
-    lines.append("  PollyPM")
-    if token_gauge is not None:
-        lines.append("  " + _render_token_gauge(token_gauge))
-    if streak_header:
-        lines.append(f"  {streak_header}")
-    if briefing_banner is not None:
-        lines.append(f"  ☀ {briefing_banner.text}")
+
+def _render_dashboard_now_section(
+    lines: list[str],
+    *,
+    all_active: list,
+    all_review: list,
+    streaks,
+    config,
+    now: datetime,
+) -> None:
+    if not (all_active or all_review):
+        return
+    lines.append(_dashboard_divider("Now"))
+    lines.append("")
+    for project_key, task in all_active:
+        project = config.projects.get(project_key)
+        project_label = project.display_label() if project else project_key
+        worker = _task_worker(task)
+        assignee = f" [{worker}{_streak_badge(worker, streaks)}]" if worker else ""
+        node = getattr(task, "current_node_id", None) or ""
+        age = _age_from_dt(_iso_to_dt(getattr(task, "updated_at", None)), now=now)
+        lines.append(f"  ⟳ {getattr(task, 'title', '')}")
+        lines.append(f"    {project_label}{assignee} · {node} · {age}")
+        lines.append("")
+    for project_key, task in all_review:
+        project = config.projects.get(project_key)
+        project_label = project.display_label() if project else project_key
+        worker = _task_worker(task)
+        worker_text = f" · by {worker}{_streak_badge(worker, streaks)}" if worker else ""
+        age = _age_from_dt(_iso_to_dt(getattr(task, "updated_at", None)), now=now)
+        reviewer = _task_reviewer(task)
+        reviewer_text = (
+            f"waiting for {reviewer}" if reviewer else "waiting for review"
+        )
+        lines.append(f"  ◉ {getattr(task, 'title', '')}")
+        lines.append(
+            f"    {project_label}{worker_text} · {reviewer_text} · {age}"
+        )
+        lines.append("")
+
+
+def _render_dashboard_ready_section(
+    lines: list[str], *, all_queued: list, config,
+) -> None:
+    if not all_queued:
+        return
+    lines.append(_dashboard_divider("Ready"))
+    lines.append("")
+    for project_key, task in all_queued[:5]:
+        project = config.projects.get(project_key)
+        project_label = project.display_label() if project else project_key
+        lines.append(f"  ○ {getattr(task, 'title', '')}  ({project_label})")
+    if len(all_queued) > 5:
+        lines.append(f"    + {len(all_queued) - 5} more queued")
     lines.append("")
 
-    # #1093: per-account quota surface. Quota is account-level
-    # (multiple Claude Code sessions on the same Anthropic Max
-    # account share one weekly bucket), so this is one row per
-    # account. The single ``Token burn:`` line above shows the
-    # hottest account; this section shows them all so a 79% → 100%
-    # slide on a non-hottest account is still visible.
-    lines.extend(_render_account_usage_lines(account_rows))
 
-    attention: list[str] = []
-    if all_review:
-        attention.append(f"◉ {len(all_review)} awaiting review")
-    if user_inbox:
-        attention.append(f"✉ {user_inbox} inbox")
-    if actionable_alerts:
-        attention.append(f"▲ {len(actionable_alerts)} alert{'s' if len(actionable_alerts) != 1 else ''}")
-    if attention:
-        lines.append("  " + "  ·  ".join(attention))
-        lines.append("")
-
-    count_parts = []
-    # ``review`` was previously shown here AND on the attention bar
-    # ("◉ N awaiting review") two lines up — same number, two glyphs,
-    # confusing. Drop it from the flow-state breakdown so attention
-    # owns the call-to-action and count_parts shows pure pipeline
-    # state. Cycle 132 / dashboard audit fix.
-    for status in ("in_progress", "queued", "blocked"):
-        count = total_counts.get(status, 0)
-        if count:
-            icon = _STATUS_ICONS.get(status, "·")
-            count_parts.append(f"{icon} {count} {status.replace('_', ' ')}")
-    done_count = total_counts.get("done", 0)
-    if done_count:
-        count_parts.append(f"✓ {done_count} done")
-    if count_parts:
-        lines.append("  " + " · ".join(count_parts))
+def _render_dashboard_done_section(
+    lines: list[str],
+    *,
+    all_done: list,
+    config,
+    streaks,
+    now: datetime,
+) -> None:
+    if not all_done:
+        return
+    lines.append(_dashboard_divider("Done"))
+    lines.append("")
+    for project_key, task in all_done[:8]:
+        project = config.projects.get(project_key)
+        project_label = project.display_label() if project else project_key
+        worker = _task_worker(task)
+        worker_text = f" · {worker}{_streak_badge(worker, streaks)}" if worker else ""
+        age = _age_from_dt(
+            _task_done_at(task) or _iso_to_dt(getattr(task, "updated_at", None)),
+            now=now,
+        )
+        lines.append(f"  ✓ {getattr(task, 'title', '')}  ({project_label}{worker_text})  {age}")
+    if len(all_done) > 8:
+        lines.append(f"    + {len(all_done) - 8} more completed")
     lines.append("")
 
-    if project_scorecards:
-        lines.append(_dashboard_divider("Projects"))
-        lines.append("")
-        for _rank, _label, line in sorted(project_scorecards):
-            lines.append(f"  {line}")
-        lines.append("")
 
-    lines.extend(_render_suggestions(suggestions))
-
-    if all_active or all_review:
-        lines.append(_dashboard_divider("Now"))
-        lines.append("")
-        for project_key, task in all_active:
-            project = config.projects.get(project_key)
-            project_label = project.display_label() if project else project_key
-            worker = _task_worker(task)
-            assignee = f" [{worker}{_streak_badge(worker, streaks)}]" if worker else ""
-            node = getattr(task, "current_node_id", None) or ""
-            age = _age_from_dt(_iso_to_dt(getattr(task, "updated_at", None)), now=now)
-            lines.append(f"  ⟳ {getattr(task, 'title', '')}")
-            lines.append(f"    {project_label}{assignee} · {node} · {age}")
-            lines.append("")
-        for project_key, task in all_review:
-            project = config.projects.get(project_key)
-            project_label = project.display_label() if project else project_key
-            worker = _task_worker(task)
-            worker_text = f" · by {worker}{_streak_badge(worker, streaks)}" if worker else ""
-            age = _age_from_dt(_iso_to_dt(getattr(task, "updated_at", None)), now=now)
-            reviewer = _task_reviewer(task)
-            reviewer_text = (
-                f"waiting for {reviewer}" if reviewer else "waiting for review"
-            )
-            lines.append(f"  ◉ {getattr(task, 'title', '')}")
-            lines.append(
-                f"    {project_label}{worker_text} · {reviewer_text} · {age}"
-            )
-            lines.append("")
-
-    if all_queued:
-        lines.append(_dashboard_divider("Ready"))
-        lines.append("")
-        for project_key, task in all_queued[:5]:
-            project = config.projects.get(project_key)
-            project_label = project.display_label() if project else project_key
-            lines.append(f"  ○ {getattr(task, 'title', '')}  ({project_label})")
-        if len(all_queued) > 5:
-            lines.append(f"    + {len(all_queued) - 5} more queued")
-        lines.append("")
-
-    if all_done:
-        lines.append(_dashboard_divider("Done"))
-        lines.append("")
-        for project_key, task in all_done[:8]:
-            project = config.projects.get(project_key)
-            project_label = project.display_label() if project else project_key
-            worker = _task_worker(task)
-            worker_text = f" · {worker}{_streak_badge(worker, streaks)}" if worker else ""
-            age = _age_from_dt(
-                _task_done_at(task) or _iso_to_dt(getattr(task, "updated_at", None)),
-                now=now,
-            )
-            lines.append(f"  ✓ {getattr(task, 'title', '')}  ({project_label}{worker_text})  {age}")
-        if len(all_done) > 8:
-            lines.append(f"    + {len(all_done) - 8} more completed")
-        lines.append("")
-
-    lines.extend(_section_just_shipped(all_done, now=now))
-
+def _render_dashboard_activity_section(
+    lines: list[str], day_events: list,
+) -> None:
     lines.append(_dashboard_divider("Activity"))
     lines.append("")
     commits = [event for event in day_events if "commit" in event.message.lower()]
@@ -870,6 +824,130 @@ def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str
         lines.append(f"  {clock}  {session}: {message}")
     if notable:
         lines.append("")
+
+
+def _build_dashboard(supervisor, config, config_path: Path | None = None) -> str:
+    # Imported lazily to avoid a hard cycle with pollypm.cockpit while the
+    # inbox helpers still live there.
+    from pollypm.cockpit import _count_inbox_tasks_for_label
+
+    lines: list[str] = []
+    now = datetime.now(UTC)
+
+    collection = _collect_dashboard_buckets(config, now)
+
+    try:
+        open_alerts = supervisor.store.open_alerts()
+    except Exception:  # noqa: BLE001
+        open_alerts = []
+    from pollypm.cockpit_alerts import is_operational_alert
+
+    user_inbox = _count_inbox_tasks_for_label(config)
+    actionable_alerts = [
+        alert
+        for alert in open_alerts
+        if not is_operational_alert(alert.alert_type)
+    ]
+    try:
+        # #1830: route through supervisor facade for pg/sqlite parity.
+        recent = supervisor.recent_events(limit=300)
+    except Exception:  # noqa: BLE001
+        recent = []
+    cutoff_24h = (now - timedelta(hours=24)).isoformat()
+    day_events = [event for event in recent if event.created_at >= cutoff_24h]
+
+    streaks = _shipper_streaks(collection.all_tasks, now=now)
+    streak_header = _render_streak_header(streaks)
+    token_gauge = _build_token_gauge(supervisor, config, now=now)
+    account_rows = _build_account_usage_rows(supervisor, config, now=now)
+    briefing_banner = _briefing_banner(config, config_path=config_path, now=now)
+    suggestions = _rank_dashboard_suggestions(
+        review_tasks=collection.all_review,
+        blocked_tasks=collection.all_blocked,
+        queued_tasks=collection.all_queued,
+        briefing_banner=briefing_banner,
+        user_inbox=user_inbox,
+        config=config,
+        now=now,
+    )
+
+    lines.append("  PollyPM")
+    if token_gauge is not None:
+        lines.append("  " + _render_token_gauge(token_gauge))
+    if streak_header:
+        lines.append(f"  {streak_header}")
+    if briefing_banner is not None:
+        lines.append(f"  ☀ {briefing_banner.text}")
+    lines.append("")
+
+    # #1093: per-account quota surface. Quota is account-level
+    # (multiple Claude Code sessions on the same Anthropic Max
+    # account share one weekly bucket), so this is one row per
+    # account. The single ``Token burn:`` line above shows the
+    # hottest account; this section shows them all so a 79% → 100%
+    # slide on a non-hottest account is still visible.
+    lines.extend(_render_account_usage_lines(account_rows))
+
+    attention: list[str] = []
+    if collection.all_review:
+        attention.append(f"◉ {len(collection.all_review)} awaiting review")
+    if user_inbox:
+        attention.append(f"✉ {user_inbox} inbox")
+    if actionable_alerts:
+        attention.append(f"▲ {len(actionable_alerts)} alert{'s' if len(actionable_alerts) != 1 else ''}")
+    if attention:
+        lines.append("  " + "  ·  ".join(attention))
+        lines.append("")
+
+    count_parts = []
+    # ``review`` was previously shown here AND on the attention bar
+    # ("◉ N awaiting review") two lines up — same number, two glyphs,
+    # confusing. Drop it from the flow-state breakdown so attention
+    # owns the call-to-action and count_parts shows pure pipeline
+    # state. Cycle 132 / dashboard audit fix.
+    for status in ("in_progress", "queued", "blocked"):
+        count = collection.total_counts.get(status, 0)
+        if count:
+            icon = _STATUS_ICONS.get(status, "·")
+            count_parts.append(f"{icon} {count} {status.replace('_', ' ')}")
+    done_count = collection.total_counts.get("done", 0)
+    if done_count:
+        count_parts.append(f"✓ {done_count} done")
+    if count_parts:
+        lines.append("  " + " · ".join(count_parts))
+    lines.append("")
+
+    if collection.project_scorecards:
+        lines.append(_dashboard_divider("Projects"))
+        lines.append("")
+        for _rank, _label, line in sorted(collection.project_scorecards):
+            lines.append(f"  {line}")
+        lines.append("")
+
+    lines.extend(_render_suggestions(suggestions))
+
+    _render_dashboard_now_section(
+        lines,
+        all_active=collection.all_active,
+        all_review=collection.all_review,
+        streaks=streaks,
+        config=config,
+        now=now,
+    )
+    _render_dashboard_ready_section(
+        lines, all_queued=collection.all_queued, config=config,
+    )
+    _render_dashboard_done_section(
+        lines,
+        all_done=collection.all_done,
+        config=config,
+        streaks=streaks,
+        now=now,
+    )
+
+    lines.extend(_section_just_shipped(collection.all_done, now=now))
+
+    _render_dashboard_activity_section(lines, day_events)
 
     if actionable_alerts:
         lines.append(_dashboard_divider("Alerts"))

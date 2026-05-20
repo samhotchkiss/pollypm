@@ -5236,8 +5236,16 @@ class PollyCockpitRail:
     # but carry no user-facing signal (#793, #876). Mirrors the
     # PollyCockpitApp suppression list so the headless rail behaves
     # the same as the Textual cockpit when the user runs ``pm rail``.
+    # ``heartbeat_error`` is also suppressed here so the ticker doesn't
+    # duplicate the stale-heartbeat footer hint — when the watchdog is
+    # already telling the operator ``⚠ Heartbeat offline · open
+    # Settings``, the parallel ``events · heartbeat error`` ticker line
+    # is wasted real estate and reads as two separate failures. The
+    # recurring-maintenance loop already suppresses it from its own
+    # event stream (``core_recurring/maintenance.py``).
     _TICKER_SUPPRESSED_EVENT_TYPES = frozenset({
         "heartbeat",
+        "heartbeat_error",
         "token_ledger",
         "lease",
         "launch",

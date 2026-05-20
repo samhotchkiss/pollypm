@@ -1,103 +1,93 @@
-"""Tripwire for the deferred CLI coverage port (#1790).
+"""Post-port guard for #1790 — CLI is backend-aware.
+
+History
+-------
 
 Slice K-tests part 5 (#1737, commit 04285152) deleted 15 CLI test
-modules. The deletion was deliberate: the CLI surfaces themselves
-still hard-wire to ``SQLAlchemyStore("sqlite:///{db_path}")``, and
-the part-4..N spec disallows production-code edits in the same slice.
+modules because the CLI surfaces themselves still hard-wired to
+``SQLAlchemyStore(f"sqlite:///{db_path}")`` and the part-4..N spec
+disallowed production-code edits in the same slice.
 
-Deleted in part 5 — these all need to come back once the CLI ports
-to pg:
+PR #1920 added the predecessor of this module as a *tripwire* — it
+asserted the status quo (sqlite-only constructions still present) so
+the suite would fail loudly the moment the port lifted that
+precondition.
 
-* ``tests/test_cli_bug_report.py``
-* ``tests/test_cli_inbox_backfill.py``
-* ``tests/test_cli_notify.py``
-* ``tests/test_inbox_aggregator_workspace_root.py``
-* ``tests/test_inbox_dedup.py``
-* ``tests/test_inbox_fake_recovery_injection_gate.py``
-* ``tests/test_inbox_messages_reader.py``
-* ``tests/test_inbox_show_msg.py``
-* ``tests/test_inbox_sweep.py``
-* ``tests/test_inbox_view.py``
-* ``tests/test_notification_tiering.py``
-* ``tests/test_rail_badge_awaits_user.py``
-* ``tests/test_work_cli.py``
-* ``tests/test_work_hold_resume_regressions.py``
-* ``tests/test_work_task_tokens.py``
+This iteration flips the assertion. The CLI has ported (commit at the
+top of #1790's PR), so this module's job is now to *guard* against
+regressions:
 
-What this file does
--------------------
+1. ``src/pollypm/work/inbox_cli.py`` MUST NOT construct
+   ``SQLAlchemyStore(f"sqlite:///...")`` directly. All messages-table
+   reads / writes should go through
+   :func:`pollypm.work.inbox_cli._resolve_messages_store` (which
+   honours ``[storage].backend``).
+2. ``src/pollypm/cli_features/session_runtime.py`` MUST NOT construct
+   ``SQLAlchemyStore(f"sqlite:///...")`` directly. ``pm notify`` writes
+   route through :func:`pollypm.cli_features.session_runtime._resolve_notify_store`.
 
-The tests below are **tripwires**, not coverage. They assert the
-status quo of the blocker: when the CLI ports to pg, the assertions
-fail loudly, prompting whoever ships the port to re-add the deleted
-test suites against a pg-aware ``--db`` resolver + ``pg_cli_runner``
-fixture (the harness sketch in #1790's action-items list).
+A failure means a future edit re-introduced the sqlite-only failure
+mode (#1755 / #1811) that #1790 was filed to close.
 
-Why a tripwire instead of an xfail or a skip
---------------------------------------------
+Why keep this after the port shipped
+------------------------------------
 
-* ``pytest.skip`` would silently drop off the dashboard.
-* ``xfail`` would pass when the gap closed, with no nudge to port the
-  real coverage.
-* A real tripwire fails the suite when the precondition lifts, which
-  is the *exact* signal we want: "you ported the CLI, now port the
-  tests."
+A reviewer looking at a one-line diff that re-adds
+``SQLAlchemyStore(f"sqlite:///{db}")`` won't necessarily remember the
+post-#1790 contract. The grep-style assertion catches the regression
+at PR-test time instead of at runtime when a pg-backed deployment
+loses notify visibility.
 """
 
 from __future__ import annotations
 
 
-def test_inbox_cli_still_hard_wired_to_sqlite():
-    """``src/pollypm/work/inbox_cli.py`` still constructs SQLAlchemyStore.
+_SQLITE_STORE_CONSTRUCTOR = 'SQLAlchemyStore(f"sqlite:///'
 
-    When this assertion fails:
 
-    1. The CLI module no longer hard-wires to sqlite.
-    2. Add the ``pg_cli_runner`` fixture to ``tests/conftest_pg.py``:
-       provisions a per-test schema via ``pg_schema_pool``, returns a
-       typer runner whose env routes ``--db`` to the test schema's DSN.
-    3. Restore the 15 deleted test modules (see the file docstring for
-       the full list) and rebind their ``--db <state.db>`` calls to
-       the new runner.
-    4. Delete this tripwire — its job is done.
+def test_inbox_cli_is_backend_aware() -> None:
+    """``src/pollypm/work/inbox_cli.py`` must not pin sqlite directly.
 
-    The check counts ``SQLAlchemyStore`` occurrences in
-    ``src/pollypm/work/inbox_cli.py``. The expected value is the
-    snapshot at the time the test was written; any decrease means the
-    port is in flight and the deleted CLI tests need to come back.
+    Use :func:`pollypm.work.inbox_cli._resolve_messages_store` (added
+    for #1790) instead. It mirrors :func:`pollypm.work.cli._svc`
+    dispatch: ``--db`` overrides force sqlite at the supplied path;
+    the canonical default routes through
+    :func:`pollypm.store.get_store` so ``[storage].backend`` decides.
     """
     from pathlib import Path
 
     import pollypm.work.inbox_cli as inbox_cli
 
     source = Path(inbox_cli.__file__).read_text(encoding="utf-8")
-    occurrences = source.count("SQLAlchemyStore")
-    assert occurrences > 0, (
-        "src/pollypm/work/inbox_cli.py no longer references "
-        "SQLAlchemyStore — the CLI has ported off sqlite. Time to "
-        "re-add the deleted CLI test modules (see this file's "
-        "docstring for the list) and delete this tripwire (#1790)."
+    occurrences = source.count(_SQLITE_STORE_CONSTRUCTOR)
+    assert occurrences == 0, (
+        "src/pollypm/work/inbox_cli.py reintroduced a direct "
+        f"{_SQLITE_STORE_CONSTRUCTOR!r}... construction. The CLI is "
+        "post-#1790 backend-aware — route every messages-table read / "
+        "write through ``_resolve_messages_store(db)`` so "
+        "``[storage].backend = 'postgres'`` deployments don't silently "
+        "read the empty sqlite shadow (the #1755 / #1811 failure mode)."
     )
 
 
-def test_cli_features_session_runtime_still_hard_wired_to_sqlite():
-    """``src/pollypm/cli_features/session_runtime.py`` still uses
-    ``SQLAlchemyStore("sqlite:///{db_path}")``.
+def test_cli_features_session_runtime_is_backend_aware() -> None:
+    """``src/pollypm/cli_features/session_runtime.py`` must not pin sqlite directly.
 
-    When this assertion fails the ``test_cli_notify.py`` /
-    ``test_notification_tiering.py`` families can be ported alongside
-    the inbox CLI tests — those suites exercised the notification
-    paths owned by ``session_runtime.py``.
+    Use :func:`pollypm.cli_features.session_runtime._resolve_notify_store`
+    (added for #1790). ``pm notify`` and the immediate-priority inbox-task
+    fan-out share a single backend-aware Store singleton so the message
+    write + the task creation land on the same DB.
     """
     from pathlib import Path
 
     import pollypm.cli_features.session_runtime as session_runtime
 
     source = Path(session_runtime.__file__).read_text(encoding="utf-8")
-    occurrences = source.count('SQLAlchemyStore(f"sqlite:///')
-    assert occurrences > 0, (
-        "src/pollypm/cli_features/session_runtime.py no longer "
-        "constructs SQLAlchemyStore with a sqlite URL — the CLI "
-        "notification path has ported off sqlite. Time to re-add the "
-        "deleted notify / tiering tests (#1790)."
+    occurrences = source.count(_SQLITE_STORE_CONSTRUCTOR)
+    assert occurrences == 0, (
+        "src/pollypm/cli_features/session_runtime.py reintroduced a "
+        f"direct {_SQLITE_STORE_CONSTRUCTOR!r}... construction. "
+        "Post-#1790 ``pm notify`` writes route through "
+        "``_resolve_notify_store(db)`` so the messages-store write and "
+        "the work-service task creation share the same backend."
     )

@@ -248,6 +248,45 @@ def _message_is_inbox_namespace_draft(row: dict[str, Any]) -> bool:
     return scope in {"", "inbox"}
 
 
+def _resolve_messages_store(db: str) -> Any:
+    """Return the configured-backend ``Store`` for the inbox CLI.
+
+    Mirrors the :func:`pollypm.work.cli._svc` backend dispatch (#1369,
+    #1737, #1811) so ``pm inbox`` and its bulk-archive helpers read the
+    same messages corpus as the rest of the system:
+
+    * When ``--db`` is the canonical workspace default
+      (``.pollypm/state.db``), route through
+      :func:`pollypm.store.get_store` so the active backend
+      (``[storage].backend = "sqlite"`` vs ``"postgres"``) decides
+      whether reads land on the sqlite file or the pg pool.
+    * When ``--db`` is a non-default override — the explicit test / CI
+      escape hatch — pin to sqlite at the supplied path via
+      :func:`pollypm.store.get_store_by_url` so harness tests with a
+      bespoke ``state.db`` keep working even on a machine whose
+      ``pollypm.toml`` selects postgres.
+
+    The returned ``Store`` is a process-wide singleton — callers MUST
+    NOT ``close()`` it (see :func:`pollypm.store.registry.get_store`
+    docstring). PR #1897 / #1811 ran into the prior failure mode where
+    the CLI silently read an empty sqlite shadow while live pg traffic
+    went un-served; this helper closes that gap for the rest of the
+    ``pm inbox`` surface (#1790).
+    """
+    from pollypm.work.db_resolver import WORKSPACE_DEFAULT_DB_PATH
+
+    if db != WORKSPACE_DEFAULT_DB_PATH:
+        from pollypm.store import get_store_by_url
+
+        db_path = _resolve_db_path(db, project=None)
+        return get_store_by_url(f"sqlite:///{db_path}")
+
+    from pollypm.config import load_config
+    from pollypm.store import get_store
+
+    return get_store(load_config())
+
+
 def _message_is_actionable_default(row: dict[str, Any]) -> bool:
     """The default-view predicate for raw ``messages`` rows.
 
@@ -404,22 +443,20 @@ def inbox_root(
     dedupe_watchdog = not (include_watchdog_repeats or show_all)
 
     # --- Messages path (unified Store, #340 writers) -------------------
-    db_path = _resolve_db_path(db, project=project)
+    # Backend-aware: pg vs sqlite is decided by ``[storage].backend``
+    # via ``_resolve_messages_store`` (#1790). The singleton is shared
+    # process-wide, so do NOT close it.
     message_rows: list[dict[str, Any]] = []
     try:
-        from pollypm.store import SQLAlchemyStore
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
-        try:
-            filters: dict[str, Any] = dict(
-                recipient="user",
-                state="open",
-                type=["notify", "inbox_task", "alert"],
-            )
-            if project:
-                filters["scope"] = project
-            message_rows = store.query_messages(**filters)
-        finally:
-            store.close()
+        store = _resolve_messages_store(db)
+        filters: dict[str, Any] = dict(
+            recipient="user",
+            state="open",
+            type=["notify", "inbox_task", "alert"],
+        )
+        if project:
+            filters["scope"] = project
+        message_rows = store.query_messages(**filters)
     except Exception as exc:  # noqa: BLE001
         typer.echo(
             f"Warning: inbox messages query failed ({exc}); "
@@ -606,22 +643,18 @@ def _show_message_by_id(*, db: str, msg_id_str: str, output_json: bool) -> None:
         typer.echo(f"Error: invalid message id {msg_id_str!r}.", err=True)
         raise typer.Exit(code=2)
 
-    db_path = _resolve_db_path(db, project=None)
+    # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        from pollypm.store import SQLAlchemyStore
+        store = _resolve_messages_store(db)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
-    try:
-        # query_messages has no id filter; scan recent rows and pick the
-        # match. Inbox messages stay under a few hundred thousand rows in
-        # practice and this command is ad-hoc, so a linear scan is fine.
-        rows = store.query_messages(recipient="user")
-        match = next((row for row in rows if row.get("id") == msg_id), None)
-    finally:
-        store.close()
+    # query_messages has no id filter; scan recent rows and pick the
+    # match. Inbox messages stay under a few hundred thousand rows in
+    # practice and this command is ad-hoc, so a linear scan is fine.
+    rows = store.query_messages(recipient="user")
+    match = next((row for row in rows if row.get("id") == msg_id), None)
 
     if match is None:
         typer.echo(
@@ -915,21 +948,18 @@ def _archive_message_by_id(*, db: str, msg_id_str: str) -> None:
         typer.echo(f"Error: invalid message id {msg_id_str!r}.", err=True)
         raise typer.Exit(code=2)
 
-    db_path = _resolve_db_path(db, project=None)
+    # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        from pollypm.store import SQLAlchemyStore
+        store = _resolve_messages_store(db)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
         store.close_message(msg_id)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: failed to archive msg:{msg_id} ({exc}).", err=True)
         raise typer.Exit(code=1) from exc
-    finally:
-        store.close()
     typer.echo(f"msg:{msg_id} → archived")
 
 
@@ -937,21 +967,19 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
     """Archive every open user-recipient message whose title matches ``pattern``."""
     import fnmatch
 
-    db_path = _resolve_db_path(db, project=None)
+    # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        from pollypm.store import SQLAlchemyStore
+        store = _resolve_messages_store(db)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
         rows = store.query_messages(
             recipient="user", state="open",
             type=["notify", "inbox_task", "alert"],
         )
     except Exception as exc:  # noqa: BLE001
-        store.close()
         typer.echo(f"Error: query_messages failed ({exc}).", err=True)
         raise typer.Exit(code=1) from exc
 
@@ -962,7 +990,6 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
             matches.append(row)
 
     if not matches:
-        store.close()
         typer.echo(f"No open messages matched {pattern!r}.")
         return
 
@@ -976,7 +1003,6 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
             typer.echo(f"  msg:{mid}  {subject[:80]}")
         if len(matches) > 20:
             typer.echo(f"  … ({len(matches) - 20} more)")
-        store.close()
         return
 
     closed = 0
@@ -990,7 +1016,6 @@ def _bulk_archive_by_match(*, db: str, pattern: str, dry_run: bool) -> None:
             closed += 1
         except Exception as exc:  # noqa: BLE001
             failures.append((int(mid), str(exc)))
-    store.close()
 
     word = "message" if closed == 1 else "messages"
     typer.echo(f"Archived {closed} {word} matching {pattern!r}.")
@@ -1018,21 +1043,19 @@ def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
     to ``channel:dev``. This helper drains the historical rows that
     were already in the inbox before the gate landed.
     """
-    db_path = _resolve_db_path(db, project=None)
+    # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        from pollypm.store import SQLAlchemyStore
+        store = _resolve_messages_store(db)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
         rows = store.query_messages(
             recipient="user", state="open",
             type=["notify", "inbox_task", "alert"],
         )
     except Exception as exc:  # noqa: BLE001
-        store.close()
         typer.echo(f"Error: query_messages failed ({exc}).", err=True)
         raise typer.Exit(code=1) from exc
 
@@ -1043,7 +1066,6 @@ def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
             matches.append(row)
 
     if not matches:
-        store.close()
         typer.echo("No open fake-recovery-injection messages to archive.")
         return
 
@@ -1057,7 +1079,6 @@ def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
             typer.echo(f"  msg:{mid}  {subject[:80]}")
         if len(matches) > 20:
             typer.echo(f"  … ({len(matches) - 20} more)")
-        store.close()
         return
 
     closed = 0
@@ -1071,7 +1092,6 @@ def _bulk_archive_fake_recovery_injections(*, db: str, dry_run: bool) -> None:
             closed += 1
         except Exception as exc:  # noqa: BLE001
             failures.append((int(mid), str(exc)))
-    store.close()
 
     word = "message" if closed == 1 else "messages"
     typer.echo(f"Archived {closed} fake-recovery-injection {word}.")
@@ -1091,20 +1111,18 @@ def _bulk_archive_all_notifies(*, db: str, dry_run: bool) -> None:
     (label ``pinned``) are exempt so the operator can flag a notify
     that should survive bulk cleanup. (#1013)
     """
-    db_path = _resolve_db_path(db, project=None)
+    # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        from pollypm.store import SQLAlchemyStore
+        store = _resolve_messages_store(db)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
         rows = store.query_messages(
             type="notify", state="open", recipient="user",
         )
     except Exception as exc:  # noqa: BLE001
-        store.close()
         typer.echo(f"Error: query_messages failed ({exc}).", err=True)
         raise typer.Exit(code=1) from exc
 
@@ -1120,7 +1138,6 @@ def _bulk_archive_all_notifies(*, db: str, dry_run: bool) -> None:
         matches.append(row)
 
     if not matches:
-        store.close()
         typer.echo("No open notifies to archive.")
         return
 
@@ -1134,7 +1151,6 @@ def _bulk_archive_all_notifies(*, db: str, dry_run: bool) -> None:
             typer.echo(f"  msg:{mid}  {subject[:80]}")
         if len(matches) > 20:
             typer.echo(f"  … ({len(matches) - 20} more)")
-        store.close()
         return
 
     closed = 0
@@ -1148,7 +1164,6 @@ def _bulk_archive_all_notifies(*, db: str, dry_run: bool) -> None:
             closed += 1
         except Exception as exc:  # noqa: BLE001
             failures.append((int(mid), str(exc)))
-    store.close()
 
     word = "notify" if closed == 1 else "notifies"
     typer.echo(f"Archived {closed} open {word}.")
@@ -1172,21 +1187,19 @@ def _known_project_keys() -> set[str]:
 def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
     """Archive open user-recipient messages for projects removed from config."""
     known_projects = _known_project_keys()
-    db_path = _resolve_db_path(db, project=None)
+    # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
     try:
-        from pollypm.store import SQLAlchemyStore
+        store = _resolve_messages_store(db)
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Error: unified store unavailable ({exc}).", err=True)
         raise typer.Exit(code=1)
 
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
     try:
         rows = store.query_messages(
             recipient="user", state="open",
             type=["notify", "inbox_task", "alert"],
         )
     except Exception as exc:  # noqa: BLE001
-        store.close()
         typer.echo(f"Error: query_messages failed ({exc}).", err=True)
         raise typer.Exit(code=1) from exc
 
@@ -1197,7 +1210,6 @@ def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
             matches.append((row, missing))
 
     if not matches:
-        store.close()
         typer.echo("No open messages referenced deleted projects.")
         return
 
@@ -1212,7 +1224,6 @@ def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
             typer.echo(f"  msg:{mid}  [{refs}]  {subject[:80]}")
         if len(matches) > 20:
             typer.echo(f"  ... ({len(matches) - 20} more)")
-        store.close()
         return
 
     closed = 0
@@ -1226,7 +1237,6 @@ def _bulk_archive_deleted_project_messages(*, db: str, dry_run: bool) -> None:
             closed += 1
         except Exception as exc:  # noqa: BLE001
             failures.append((int(mid), str(exc)))
-    store.close()
 
     word = "message" if closed == 1 else "messages"
     typer.echo(f"Archived {closed} deleted-project {word}.")

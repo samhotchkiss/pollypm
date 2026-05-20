@@ -192,6 +192,7 @@ def open_messages(
     config: "PollyPMConfig | None",
     *,
     known_projects: set[str],
+    limit: int | None = None,
 ) -> list[dict[str, Any]] | None:
     """Return every open inbox-shaped messages row in one pg query.
 
@@ -204,6 +205,10 @@ def open_messages(
     The ``known_projects`` set scopes the SQL to scopes the user owns
     so a workspace row referencing a non-tracked project doesn't leak
     into the badge count.
+
+    Pass ``limit`` to push a SQL ``LIMIT`` into the query (#1913). The
+    prepaint preview path only needs the first dozen newest rows; the
+    rail/cockpit unbounded paths still call without a limit.
 
     Returns ``None`` on pool / query failure so the caller can fall back
     to its per-project walk.
@@ -242,6 +247,9 @@ def open_messages(
         sql += " AND (scope = '' OR scope = 'inbox' OR scope = ANY(%s))"
         params.append(list(known_projects))
     sql += " ORDER BY created_at DESC, id DESC"
+    if limit is not None and limit > 0:
+        sql += " LIMIT %s"
+        params.append(int(limit))
 
     try:
         with pool.connection() as conn, conn.cursor() as cur:

@@ -190,6 +190,18 @@ app.add_typer(plugins_app, name="plugins")
 from pollypm.rail_cli import rail_app
 app.add_typer(rail_app, name="rail")
 
+# ---------------------------------------------------------------------------
+# Built-in plugin CLI registrations (#1363).
+#
+# ``cli.py`` IS the sanctioned plugin-host edge for ``pm <subcommand>``
+# Typer apps — every built-in plugin that ships a CLI is mounted here so
+# the unified ``pm`` help surface is assembled at process start. The
+# original boundary-debt issue called these out as the only acceptable
+# core→``plugins_builtin`` imports, on the condition that no other core
+# module reaches in. With the activity_feed + project_planning slices
+# closed, that condition holds; these stay.
+# ---------------------------------------------------------------------------
+
 from pollypm.plugins_builtin.activity_feed.cli import activity_app
 app.add_typer(activity_app, name="activity")
 

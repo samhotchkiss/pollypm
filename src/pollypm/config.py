@@ -923,6 +923,25 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         events=events,
         storage=storage,
     )
+    # PR #2018 review fix (id 4502598240): mint auth tokens for any
+    # session that lacks one, then persist back to disk. Without this,
+    # legacy sessions stay at auth_token="" and watchdog/recovery
+    # dispatch silently emits unsigned briefs (the advertised Lever 2
+    # signing is inactive). Idempotent — write_config only fires when
+    # ensure_session_auth_tokens actually minted a token.
+    try:
+        from pollypm.session_auth import ensure_session_auth_tokens
+        if ensure_session_auth_tokens(config):
+            try:
+                write_config(config, config_path, force=True)
+            except Exception:  # noqa: BLE001
+                # Persistence failure is non-fatal — tokens stay in
+                # memory for the rest of this process; next load_config
+                # call will re-mint and retry.
+                pass
+    except ImportError:
+        # session_auth not available (older code paths). Skip silently.
+        pass
     try:
         _config_cache[config_path] = (
             config_path.stat().st_mtime,

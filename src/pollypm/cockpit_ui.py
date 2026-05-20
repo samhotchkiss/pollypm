@@ -12537,6 +12537,55 @@ def _dashboard_active_worker(
 _DASHBOARD_INBOX_CACHE: "OrderedDict[tuple[str, float | None], tuple[int, list[dict], list[dict]]]" = OrderedDict()
 
 
+def _dashboard_inbox_finalize(
+    items: list[dict],
+) -> tuple[int, list[dict], list[dict]]:
+    """Sort the raw inbox items and produce the dashboard ``(count, top, action_items)`` triple.
+
+    Pulled out of ``_dashboard_inbox`` (#1356) so the projection rules
+    (triage rank ordering, the top-3 card list, the deduped 2-slot
+    action list, and the cross-source action count) are individually
+    inspectable. Pure: no IO, no caching side effects.
+    """
+    items.sort(
+        key=lambda item: (
+            int(item.get("triage_rank", 2)),
+            0 if item.get("needs_action") else 1,
+            -float(item.get("sort_value", 0.0) or 0.0),
+            str(item.get("title", "")).lower(),
+        )
+    )
+    top = [
+        {
+            "task_id": item.get("task_id"),
+            "primary_ref": item.get("primary_ref"),
+            "title": item.get("title"),
+            "updated_at": item.get("updated_at"),
+            "triage_label": item.get("triage_label", ""),
+            "source": item.get("source", "task"),
+            # Carry ``needs_action`` so the project dashboard can
+            # split spillover into "action just didn't fit" (keep
+            # the ``Press i`` CTA) vs purely FYI/completed rows
+            # (suppress the redundant CTA, #1650).
+            "needs_action": bool(item.get("needs_action")),
+        }
+        for item in items[:3]
+    ]
+    action_items: list[dict] = []
+    seen_action_refs: set[str] = set()
+    for item in items:
+        if item.get("source") not in {"message", "blocker_summary"} or not item.get("needs_action"):
+            continue
+        dedupe_key = str(item.get("primary_ref") or item.get("title") or "")
+        if dedupe_key in seen_action_refs:
+            continue
+        seen_action_refs.add(dedupe_key)
+        action_items.append(item)
+        if len(action_items) >= 2:
+            break
+    return (_action_count(items, action_items), top, action_items)
+
+
 def _dashboard_inbox(
     config_path: Path, project_key: str, project_path: Path,
 ) -> tuple[int, list[dict], list[dict]]:
@@ -12881,43 +12930,7 @@ def _dashboard_inbox(
             except Exception:  # noqa: BLE001
                 pass
 
-    items.sort(
-        key=lambda item: (
-            int(item.get("triage_rank", 2)),
-            0 if item.get("needs_action") else 1,
-            -float(item.get("sort_value", 0.0) or 0.0),
-            str(item.get("title", "")).lower(),
-        )
-    )
-    top = [
-        {
-            "task_id": item.get("task_id"),
-            "primary_ref": item.get("primary_ref"),
-            "title": item.get("title"),
-            "updated_at": item.get("updated_at"),
-            "triage_label": item.get("triage_label", ""),
-            "source": item.get("source", "task"),
-            # Carry ``needs_action`` so the project dashboard can
-            # split spillover into "action just didn't fit" (keep
-            # the ``Press i`` CTA) vs purely FYI/completed rows
-            # (suppress the redundant CTA, #1650).
-            "needs_action": bool(item.get("needs_action")),
-        }
-        for item in items[:3]
-    ]
-    action_items: list[dict] = []
-    seen_action_refs: set[str] = set()
-    for item in items:
-        if item.get("source") not in {"message", "blocker_summary"} or not item.get("needs_action"):
-            continue
-        dedupe_key = str(item.get("primary_ref") or item.get("title") or "")
-        if dedupe_key in seen_action_refs:
-            continue
-        seen_action_refs.add(dedupe_key)
-        action_items.append(item)
-        if len(action_items) >= 2:
-            break
-    result = (_action_count(items, action_items), top, action_items)
+    result = _dashboard_inbox_finalize(items)
     _dashboard_cache_set(_DASHBOARD_INBOX_CACHE, cache_key, result)
     return result
 

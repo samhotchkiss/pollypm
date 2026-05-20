@@ -1410,12 +1410,22 @@ class CockpitRouter:
         grouped_registrations = self._grouped_rail_registrations(config, registry)
         grouped: dict[str, list[CockpitItem]] = {name: [] for name in RAIL_SECTIONS}
         project_session_map = self._project_session_map(launches)
-        project_rollups = self._project_state_rollups(config, alerts)
+        # #1960 perf — the rollup and categorization paths each issue
+        # broad pg scans (``all_tasks_grouped`` + ``list_worker_sessions``
+        # + ``pm_inbox_awaits_user_list``). They have no data dependency
+        # on each other, so we fire them in parallel on a tiny thread
+        # pool instead of running them back-to-back on the rail tick.
+        # Under their own per-call TTL caches a warm tick is still a
+        # ~free dict lookup; the win is on cold/expired ticks where the
+        # sequential ~1s + ~1s collapses to ~max(1s, 1s).
+        #
         # #1572 — canonical operator-facing categorization (Waiting /
         # Working / Idle / Paused). Single source shared with the
         # operator dashboard so the rail glyph and the dashboard
         # section can never disagree on a project.
-        project_states = self._project_categorizations(config)
+        project_rollups, project_states = self._fanout_rail_pg_scans(
+            config, alerts,
+        )
 
         for section, registrations in grouped_registrations.items():
             for reg in registrations:
@@ -1847,6 +1857,44 @@ class CockpitRouter:
         if rollup.state is ProjectRailState.WORKING:
             return "project-working"
         return fallback
+
+    def _fanout_rail_pg_scans(
+        self,
+        config: object,
+        alerts: list[object],
+    ) -> tuple[dict[str, ProjectStateRollup], dict[str, str]]:
+        """Run rollups + categorizations concurrently on a tiny pool.
+
+        #1960 perf — these two helpers each issue broad pg scans on a
+        cold TTL tick (``all_tasks_grouped`` + ``list_worker_sessions``
+        + ``pm_inbox_awaits_user_list``). They have no data dependency
+        on each other; running them sequentially stacks the worst-case
+        latencies. A two-thread fanout collapses cold ticks toward
+        ``max(rollups, categorizations)``. Warm ticks hit per-call TTL
+        caches and complete in microseconds, so the pool overhead is
+        bounded.
+
+        Failures fall back to empty dicts to mirror the existing
+        best-effort contract of each underlying helper.
+        """
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(
+            max_workers=2, thread_name_prefix="rail-pg-scan",
+        ) as pool:
+            rollups_future = pool.submit(
+                self._project_state_rollups, config, alerts,
+            )
+            states_future = pool.submit(self._project_categorizations, config)
+            try:
+                rollups = rollups_future.result()
+            except Exception:  # noqa: BLE001
+                rollups = {}
+            try:
+                states = states_future.result()
+            except Exception:  # noqa: BLE001
+                states = {}
+        return rollups, states
 
     def _project_categorizations(self, config: object) -> dict[str, str]:
         """Canonical operator-facing categorization per project (#1572).

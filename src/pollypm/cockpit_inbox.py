@@ -1368,6 +1368,10 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
         return list(cached[1])
 
     result = _gather_worker_roster_uncached(config)
+    # #1957 perf — stamp the cache AFTER the uncached sweep returns so a
+    # cold roster build that exceeds the TTL doesn't write a born-expired
+    # entry that forces the next rail tick to recompute.
+    completed_at = _time.monotonic()
     # Best-effort eviction so the cache doesn't grow across long-lived
     # processes with config reloads (each reload yields a fresh
     # ``id(config)``). Cheap because the dict is typically tiny — one
@@ -1375,10 +1379,10 @@ def _gather_worker_roster(config) -> list[WorkerRosterRow]:
     if len(_WORKER_ROSTER_CACHE) > 8:
         for stale_key in [
             k for k, (ts, _v) in _WORKER_ROSTER_CACHE.items()
-            if now - ts >= _WORKER_ROSTER_TTL_SECONDS
+            if completed_at - ts >= _WORKER_ROSTER_TTL_SECONDS
         ]:
             _WORKER_ROSTER_CACHE.pop(stale_key, None)
-    _WORKER_ROSTER_CACHE[cache_key] = (now, tuple(result))
+    _WORKER_ROSTER_CACHE[cache_key] = (completed_at, tuple(result))
     return result
 
 

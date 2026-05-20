@@ -121,16 +121,20 @@ def activity_feed_transition_rows(
     result = _activity_feed_transition_rows_uncached(
         since_ts=since_ts, limit=limit, config=config,
     )
+    # #1957 perf — stamp the cache AFTER the uncached call returns so a
+    # cold query that exceeds the TTL doesn't write a born-expired entry
+    # that forces the next caller to recompute.
+    completed_at = time.monotonic()
     # Best-effort eviction so the cache doesn't grow across long-lived
     # processes that build successive configs or vary ``since_ts``.
     if len(_ACTIVITY_FEED_ROWS_CACHE) > 16:
         for stale_key in [
             k for k, (ts, _v) in _ACTIVITY_FEED_ROWS_CACHE.items()
-            if now - ts >= _ACTIVITY_FEED_ROWS_TTL_SECONDS
+            if completed_at - ts >= _ACTIVITY_FEED_ROWS_TTL_SECONDS
         ]:
             _ACTIVITY_FEED_ROWS_CACHE.pop(stale_key, None)
     _ACTIVITY_FEED_ROWS_CACHE[cache_key] = (
-        now, tuple(dict(row) for row in result),
+        completed_at, tuple(dict(row) for row in result),
     )
     return result
 

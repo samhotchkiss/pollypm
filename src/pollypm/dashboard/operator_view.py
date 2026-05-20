@@ -205,18 +205,22 @@ def _prefetch_project_state(config, svc) -> tuple[  # noqa: ANN001
         )
 
     result = _prefetch_project_state_uncached(svc)
+    # #1957 perf — stamp the cache AFTER the uncached prefetch returns so
+    # a cold task+session sweep that exceeds the TTL doesn't write a
+    # born-expired entry that forces the next rail tick to recompute.
+    completed_at = time.monotonic()
     # Best-effort eviction so the cache doesn't grow across long-lived
     # processes with config reloads (each reload yields a fresh
     # ``id(config)``).
     if len(_PREFETCH_PROJECT_STATE_CACHE) > 8:
         for stale_key in [
             k for k, (ts, _v) in _PREFETCH_PROJECT_STATE_CACHE.items()
-            if now - ts >= _PREFETCH_PROJECT_STATE_TTL_SECONDS
+            if completed_at - ts >= _PREFETCH_PROJECT_STATE_TTL_SECONDS
         ]:
             _PREFETCH_PROJECT_STATE_CACHE.pop(stale_key, None)
     tasks_by_alias, workers_by_alias = result
     _PREFETCH_PROJECT_STATE_CACHE[cache_key] = (
-        now,
+        completed_at,
         (
             {key: tuple(rows) for key, rows in tasks_by_alias.items()},
             {key: tuple(rows) for key, rows in workers_by_alias.items()},

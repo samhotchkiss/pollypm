@@ -336,20 +336,22 @@ class StorageSettings:
     dataclass holds the config values the resolver feeds into
     :func:`pollypm.store.registry.get_store`.
 
-    ``backend`` — entry-point name. ``"sqlite"`` is the built-in default
-    registered by this package; third-party packages (e.g. the future
-    ``pollypm-store-postgres``) can register additional names.
+    ``backend`` — entry-point name. ``"postgres"`` is the canonical
+    default after the #1737 cutover (issue #1939); ``"sqlite"`` remains
+    registered for explicit opt-in (tests, legacy migration). Third-party
+    packages can register additional names.
     ``url`` — SQLAlchemy URL passed to the backend constructor. Empty
-    string means "derive from ``config.project.state_db``" —
-    ``sqlite:///<resolved-state-db-path>``.
+    string means "use the backend's own default" — for ``postgres`` that
+    is the DSN resolved by :func:`pollypm.storage.pg_pool.resolve_dsn`;
+    for ``sqlite`` it derives ``sqlite:///<resolved-state-db-path>``.
 
     ``pg`` / ``embedding`` — sub-section knobs for the Postgres backend
-    (#1737, Slice A). Defaults are safe to read on a sqlite install —
-    they're only consulted when ``backend == "postgres"`` or the
-    embedding writer fires.
+    (#1737, Slice A). Defaults are safe to read regardless of backend
+    selection — they're only consulted when the backend resolves to
+    postgres or the embedding writer fires.
     """
 
-    backend: str = "sqlite"
+    backend: str = "postgres"
     url: str = ""
     pg: PgStorageSettings = field(default_factory=PgStorageSettings)
     embedding: EmbeddingSettings = field(default_factory=EmbeddingSettings)

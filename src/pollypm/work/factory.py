@@ -7,28 +7,31 @@ or heartbeat code is suspect — see issue #1369. Migrating those callers
 through this factory means the resolver is the single point of truth
 for "where does work data live".
 
-Backend dispatch (#1737, Slice A)
----------------------------------
+Backend dispatch (#1737, Slice A; #1939)
+----------------------------------------
 
 Reads ``config.storage.backend``:
 
-* ``"sqlite"`` (default) → :class:`pollypm.work.sqlite_service.SQLiteWorkService`,
+* ``"postgres"`` (default after #1737 cutover) →
+  :class:`pollypm.work.pg_service.PgWorkService`, wired against the
+  lazy pool singleton in :mod:`pollypm.storage.pg_pool`.
+* ``"sqlite"`` → :class:`pollypm.work.sqlite_service.SQLiteWorkService`,
   resolved via :func:`pollypm.work.db_resolver.resolve_work_db_path`.
-* ``"postgres"`` → :class:`pollypm.work.pg_service.PgWorkService`, wired
-  against the lazy pool singleton in :mod:`pollypm.storage.pg_pool`.
+  Retained for explicit opt-in (tests, legacy migration).
 
-Any other value falls through to sqlite so a fat-fingered backend
-string doesn't brick the CLI; the doctor's ``storage-backend`` check
-surfaces the typo through its own error path.
+Any other (unknown / fat-fingered) value falls through to ``postgres``
+so the cutover defaults stay consistent (#1939) — the doctor's
+``storage-backend`` check surfaces the typo through its own error path.
 
 Escape valve
 ------------
-A caller that genuinely needs a non-canonical path (legacy migration,
-explicit override, test fixture) may pass ``db_path=...`` directly.
-That keeps the callsite visibly different from the canonical pattern,
-which is the point: "this one is not using the resolver" should never
-be invisible. ``db_path`` is sqlite-specific and is ignored on the pg
-backend.
+A caller that genuinely needs a non-canonical sqlite path (legacy
+migration, explicit override, test fixture) may pass ``db_path=...``
+directly. That keeps the callsite visibly different from the canonical
+pattern, which is the point: "this one is not using the resolver"
+should never be invisible. ``db_path`` is sqlite-specific and forces
+the sqlite dispatch even when ``config.storage.backend`` selects
+postgres.
 """
 
 from __future__ import annotations
@@ -46,20 +49,23 @@ logger = logging.getLogger(__name__)
 
 
 def _resolve_backend(config: "PollyPMConfig | None") -> str:
-    """Return the configured backend string, defaulting to ``"sqlite"``.
+    """Return the configured backend string, defaulting to ``"postgres"``.
 
     Reads ``config.storage.backend`` defensively — a missing attribute
-    or non-string value falls back to sqlite. The doctor's
-    ``storage-backend`` check surfaces real typos.
+    or non-string value falls back to postgres after the #1737 cutover
+    (issue #1939). The previous sqlite default silently routed
+    pg-configured workspaces to an empty sqlite shadow when a caller
+    omitted ``config=``; the doctor's ``storage-backend`` check surfaces
+    real typos through its own error path.
     """
     if config is None:
-        return "sqlite"
+        return "postgres"
     storage = getattr(config, "storage", None)
     if storage is None:
-        return "sqlite"
-    backend = getattr(storage, "backend", "sqlite")
+        return "postgres"
+    backend = getattr(storage, "backend", "postgres")
     if not isinstance(backend, str) or not backend.strip():
-        return "sqlite"
+        return "postgres"
     return backend.strip()
 
 
@@ -104,12 +110,19 @@ def create_work_service(
         instance. The concrete type depends on the configured backend.
     """
     backend = _resolve_backend(config)
-    if backend == "postgres":
+    # An explicit ``db_path`` is the sqlite escape hatch (#1939 / #1369).
+    # It's sqlite-specific by construction (a filesystem path), so a
+    # caller that supplied one is asking for sqlite regardless of the
+    # configured backend. This preserves the test / CI / legacy-migration
+    # contract without re-introducing the silent-fallback failure mode
+    # that #1939 was filed to close.
+    if db_path is None and backend != "sqlite":
         from pollypm.work.pg_service import PgWorkService
 
         return PgWorkService(config=config, project_key=project_key)
 
-    # sqlite (the default, and the fallback for unknown backends).
+    # sqlite path: either ``backend == "sqlite"`` or an explicit
+    # ``db_path=`` override forced us here.
     from pollypm.work.sqlite_service import SQLiteWorkService
 
     resolved_path: Path

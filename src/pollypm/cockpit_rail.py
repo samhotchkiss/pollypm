@@ -3794,6 +3794,206 @@ class CockpitRouter:
         # threshold within a single exchange.
         return len(non_empty) >= 40
 
+    def _show_live_session_identity_match(
+        self,
+        supervisor,
+        session_name: str,
+        window_target: str,
+        expected,
+    ) -> bool:
+        """Return True when the persisted mount identity still matches tmux.
+
+        When ``True``, the caller can early-return without doing any
+        tmux mutation. When ``False``, the cockpit must tear down the
+        right pane and remount fresh.
+        """
+        from pollypm.cockpit_mount_identity import (
+            MountedIdentity,
+            identity_matches,
+            verify_mount_against_tmux,
+        )
+
+        state = self._load_state()
+        persisted = MountedIdentity.from_state_dict(state.get("mounted_identity"))
+        if persisted is None or not identity_matches(persisted, expected):
+            return False
+        try:
+            panes = self.tmux.list_panes(window_target)
+            storage_session = supervisor.storage_closet_session_name()
+            storage_windows = self.tmux.list_windows(storage_session)
+        except Exception:  # noqa: BLE001
+            panes = []
+            storage_windows = []
+        if verify_mount_against_tmux(
+            persisted,
+            panes=panes,
+            storage_windows=storage_windows,
+        ):
+            return True
+        # Mismatch — fall through to tear-down + remount fresh.
+        # #1647 — emit forensics so future rail-latency triage
+        # can see *which* predicate failed (pane gone vs. dead
+        # shell vs. storage-window reindex) instead of guessing
+        # from a stopwatch.
+        try:
+            self._emit_cockpit_audit(
+                event_name="cockpit.mount_verify_failed",
+                subject=session_name,
+                status="info",
+                metadata={
+                    "session_name": session_name,
+                    "rail_key": persisted.rail_key,
+                    "expected_window_name": (
+                        persisted.expected_window_name
+                    ),
+                    "recorded_right_pane_id": persisted.right_pane_id,
+                    "recorded_window_index": persisted.window_index,
+                    "cockpit_pane_ids": [
+                        getattr(p, "pane_id", None) for p in panes
+                    ],
+                    "storage_window_names": [
+                        getattr(w, "name", None)
+                        for w in storage_windows
+                    ],
+                },
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return False
+
+    def _show_live_session_respawn_control(
+        self,
+        *,
+        supervisor,
+        session_name: str,
+        window_target: str,
+        launch,
+        storage_session: str,
+        storage_windows: set,
+        left_pane_id,
+        right_pane_id,
+        expected,
+    ) -> bool:
+        """Respawn missing control session and mount it; return True on success."""
+        from pollypm.cockpit_mount_identity import make_mounted_identity
+
+        # #1562 — respawn here means the user's prior conversation
+        # is about to be wiped. Emit forensics BEFORE the spawn so
+        # the audit row exists even if launch_session raises.
+        self._emit_cockpit_audit(
+            event_name="cockpit.session_respawned",
+            subject=session_name,
+            status="warn",
+            metadata={
+                "session_name": session_name,
+                "role": launch.session.role,
+                "window_name": launch.window_name,
+                "storage_windows_present": sorted(storage_windows),
+                "reason": "storage_window_missing_on_mount",
+            },
+        )
+        try:
+            supervisor.launch_session(session_name)
+            storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
+            if launch.window_name not in storage_windows:
+                return False
+            # Look up the freshly-spawned window's index so
+            # the persisted identity records the
+            # disambiguating index, not just the name.
+            # #1631 — if a duplicate exists (e.g. an orphan
+            # left from a park-collision), prefer the live
+            # provider pane so we don't mount onto the empty
+            # placeholder and lose the user's conversation.
+            live_windows = self.tmux.list_windows(storage_session)
+            target_window_for_identity = self._select_storage_window_for_mount(
+                live_windows, launch.window_name, session_name,
+                project_key=getattr(launch.session, "project", None),
+            )
+            source_pane_id = (
+                getattr(target_window_for_identity, "pane_id", None)
+                if target_window_for_identity is not None
+                else None
+            )
+            source = (
+                source_pane_id
+                if isinstance(source_pane_id, str) and source_pane_id
+                else f"{storage_session}:{launch.window_name}.0"
+            )
+            # #934 follow-up — fifth-layer rail-mount guard.
+            # If the source pane already shows another role's
+            # canonical banner (e.g. a long-running rail
+            # daemon or stale cockpit process wrote heartbeat
+            # content into a pane the cockpit later mounts as
+            # ``operator``), refuse the join. Falling back to
+            # the static view keeps the cockpit usable while
+            # the operator manually clears the bad pane.
+            if not self._source_pane_role_matches_launch(
+                source, launch,
+            ):
+                raise RuntimeError(
+                    "persona_swap_detected: source pane "
+                    "shows another role's banner — refusing "
+                    "to join into cockpit."
+                )
+            right_pane = self._join_storage_pane_into_cockpit(
+                source=source,
+                source_pane_id=source_pane_id,
+                left_pane_id=left_pane_id,
+                previous_right_pane_id=right_pane_id,
+                window_target=window_target,
+            )
+            panes = self.tmux.list_panes(window_target)
+            left_pane = min(panes, key=self._pane_left)
+            self._try_resize_rail(left_pane.pane_id)
+            self.tmux.set_pane_history_limit(right_pane.pane_id, 200)
+            state = self._load_state()
+            state["mounted_session"] = session_name
+            state["right_pane_id"] = right_pane.pane_id
+            if expected is not None:
+                mounted = make_mounted_identity(
+                    expected,
+                    right_pane_id=right_pane.pane_id,
+                    window_index=getattr(
+                        target_window_for_identity, "index", None,
+                    ),
+                )
+                state["mounted_identity"] = mounted.to_state_dict()
+            else:
+                state.pop("mounted_identity", None)
+            self._write_state(state)
+            return True
+        except Exception:  # noqa: BLE001
+            return False  # Fall through to static view if relaunch fails
+
+    def _show_live_session_static_fallback(
+        self,
+        *,
+        session_name: str,
+        window_target: str,
+        launch,
+        left_pane_id,
+        right_pane_id,
+    ) -> None:
+        """Render the static (non-live) view for a session that can't be mounted."""
+        fallback_kind = "polly" if session_name == "operator" else "project"
+        fallback_target = launch.session.project if fallback_kind == "project" else None
+        if right_pane_id is None:
+            right_size = self._right_pane_size(window_target)
+            right_pane_id = self.tmux.split_window(
+                left_pane_id,
+                self._right_pane_command(fallback_kind, fallback_target),
+                horizontal=True,
+                detached=True,
+                size=right_size,
+            )
+        else:
+            self.tmux.respawn_pane(right_pane_id, self._right_pane_command(fallback_kind, fallback_target))
+        state = self._load_state()
+        state.pop("mounted_session", None)
+        state.pop("mounted_identity", None)
+        state["right_pane_id"] = self._right_pane_id(window_target)
+        self._write_state(state)
+
     def _show_live_session(self, supervisor, session_name: str, window_target: str) -> None:
         # Mount-time identity check (replaces the legacy bare-string
         # ``mounted_session == session_name`` early-return). The legacy
@@ -3804,63 +4004,19 @@ class CockpitRouter:
         # Russell. See :mod:`pollypm.cockpit_mount_identity` for the
         # full design.
         from pollypm.cockpit_mount_identity import (
-            MountedIdentity,
             expected_identity_for_session_name,
-            identity_matches,
             make_mounted_identity,
-            verify_mount_against_tmux,
         )
 
         expected = expected_identity_for_session_name(
             session_name, supervisor.config,
         )
         launch = next(item for item in supervisor.plan_launches() if item.session.name == session_name)
-        if expected is not None:
-            state = self._load_state()
-            persisted = MountedIdentity.from_state_dict(state.get("mounted_identity"))
-            if persisted is not None and identity_matches(persisted, expected):
-                try:
-                    panes = self.tmux.list_panes(window_target)
-                    storage_session = supervisor.storage_closet_session_name()
-                    storage_windows = self.tmux.list_windows(storage_session)
-                except Exception:  # noqa: BLE001
-                    panes = []
-                    storage_windows = []
-                if verify_mount_against_tmux(
-                    persisted,
-                    panes=panes,
-                    storage_windows=storage_windows,
-                ):
-                    return  # tmux confirms the persisted identity
-                # Mismatch — fall through to tear-down + remount fresh.
-                # #1647 — emit forensics so future rail-latency triage
-                # can see *which* predicate failed (pane gone vs. dead
-                # shell vs. storage-window reindex) instead of guessing
-                # from a stopwatch.
-                try:
-                    self._emit_cockpit_audit(
-                        event_name="cockpit.mount_verify_failed",
-                        subject=session_name,
-                        status="info",
-                        metadata={
-                            "session_name": session_name,
-                            "rail_key": persisted.rail_key,
-                            "expected_window_name": (
-                                persisted.expected_window_name
-                            ),
-                            "recorded_right_pane_id": persisted.right_pane_id,
-                            "recorded_window_index": persisted.window_index,
-                            "cockpit_pane_ids": [
-                                getattr(p, "pane_id", None) for p in panes
-                            ],
-                            "storage_window_names": [
-                                getattr(w, "name", None)
-                                for w in storage_windows
-                            ],
-                        },
-                    )
-                except Exception:  # noqa: BLE001
-                    pass
+        if expected is not None and self._show_live_session_identity_match(
+            supervisor, session_name, window_target, expected,
+        ):
+            return  # tmux confirms the persisted identity
+
         self._park_mounted_session(supervisor, window_target)
         self._cleanup_extra_panes(window_target)
         left_pane_id = self._left_pane_id(window_target)
@@ -3874,111 +4030,26 @@ class CockpitRouter:
             # when missing — the user clicking on Polly expects to talk to
             # Polly, not see a placeholder.
             if launch.session.role in {"operator-pm", "reviewer"}:
-                # #1562 — respawn here means the user's prior conversation
-                # is about to be wiped. Emit forensics BEFORE the spawn so
-                # the audit row exists even if launch_session raises.
-                self._emit_cockpit_audit(
-                    event_name="cockpit.session_respawned",
-                    subject=session_name,
-                    status="warn",
-                    metadata={
-                        "session_name": session_name,
-                        "role": launch.session.role,
-                        "window_name": launch.window_name,
-                        "storage_windows_present": sorted(storage_windows),
-                        "reason": "storage_window_missing_on_mount",
-                    },
-                )
-                try:
-                    supervisor.launch_session(session_name)
-                    storage_windows = {w.name for w in self.tmux.list_windows(storage_session)}
-                    if launch.window_name in storage_windows:
-                        # Look up the freshly-spawned window's index so
-                        # the persisted identity records the
-                        # disambiguating index, not just the name.
-                        # #1631 — if a duplicate exists (e.g. an orphan
-                        # left from a park-collision), prefer the live
-                        # provider pane so we don't mount onto the empty
-                        # placeholder and lose the user's conversation.
-                        live_windows = self.tmux.list_windows(storage_session)
-                        target_window_for_identity = self._select_storage_window_for_mount(
-                            live_windows, launch.window_name, session_name,
-                            project_key=getattr(launch.session, "project", None),
-                        )
-                        source_pane_id = (
-                            getattr(target_window_for_identity, "pane_id", None)
-                            if target_window_for_identity is not None
-                            else None
-                        )
-                        source = (
-                            source_pane_id
-                            if isinstance(source_pane_id, str) and source_pane_id
-                            else f"{storage_session}:{launch.window_name}.0"
-                        )
-                        # #934 follow-up — fifth-layer rail-mount guard.
-                        # If the source pane already shows another role's
-                        # canonical banner (e.g. a long-running rail
-                        # daemon or stale cockpit process wrote heartbeat
-                        # content into a pane the cockpit later mounts as
-                        # ``operator``), refuse the join. Falling back to
-                        # the static view keeps the cockpit usable while
-                        # the operator manually clears the bad pane.
-                        if not self._source_pane_role_matches_launch(
-                            source, launch,
-                        ):
-                            raise RuntimeError(
-                                "persona_swap_detected: source pane "
-                                "shows another role's banner — refusing "
-                                "to join into cockpit."
-                            )
-                        right_pane = self._join_storage_pane_into_cockpit(
-                            source=source,
-                            source_pane_id=source_pane_id,
-                            left_pane_id=left_pane_id,
-                            previous_right_pane_id=right_pane_id,
-                            window_target=window_target,
-                        )
-                        panes = self.tmux.list_panes(window_target)
-                        left_pane = min(panes, key=self._pane_left)
-                        self._try_resize_rail(left_pane.pane_id)
-                        self.tmux.set_pane_history_limit(right_pane.pane_id, 200)
-                        state = self._load_state()
-                        state["mounted_session"] = session_name
-                        state["right_pane_id"] = right_pane.pane_id
-                        if expected is not None:
-                            mounted = make_mounted_identity(
-                                expected,
-                                right_pane_id=right_pane.pane_id,
-                                window_index=getattr(
-                                    target_window_for_identity, "index", None,
-                                ),
-                            )
-                            state["mounted_identity"] = mounted.to_state_dict()
-                        else:
-                            state.pop("mounted_identity", None)
-                        self._write_state(state)
-                        return
-                except Exception:  # noqa: BLE001
-                    pass  # Fall through to static view if relaunch fails
+                if self._show_live_session_respawn_control(
+                    supervisor=supervisor,
+                    session_name=session_name,
+                    window_target=window_target,
+                    launch=launch,
+                    storage_session=storage_session,
+                    storage_windows=storage_windows,
+                    left_pane_id=left_pane_id,
+                    right_pane_id=right_pane_id,
+                    expected=expected,
+                ):
+                    return
             # Non-control sessions or failed relaunch — show static view
-            fallback_kind = "polly" if session_name == "operator" else "project"
-            fallback_target = launch.session.project if fallback_kind == "project" else None
-            if right_pane_id is None:
-                right_size = self._right_pane_size(window_target)
-                right_pane_id = self.tmux.split_window(
-                    left_pane_id,
-                    self._right_pane_command(fallback_kind, fallback_target),
-                    horizontal=True,
-                    detached=True,
-                    size=right_size,
-                )
-            else:
-                self.tmux.respawn_pane(right_pane_id, self._right_pane_command(fallback_kind, fallback_target))
-            state = self._load_state()
-            state.pop("mounted_session", None)
-            state.pop("mounted_identity", None)
-            state["right_pane_id"] = self._right_pane_id(window_target)
-            self._write_state(state)
+            self._show_live_session_static_fallback(
+                session_name=session_name,
+                window_target=window_target,
+                launch=launch,
+                left_pane_id=left_pane_id,
+                right_pane_id=right_pane_id,
+            )
             return
         # Use window index to avoid ambiguity with duplicate window names.
         # #1631 — when duplicates exist (park-collisions can leave two

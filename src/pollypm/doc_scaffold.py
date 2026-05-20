@@ -20,8 +20,16 @@ def scaffold_docs(project_path: Path, *, force: bool = False) -> list[str]:
     Returns a list of actions taken (for reporting in pm repair).
     If force=True, overwrite existing files. Otherwise skip files that exist.
     """
+    # Route through ``project_instruction_dir`` so the doubled-path guard
+    # in ``_resolve_pollypm_root`` (#1810/#1950) collapses
+    # ``GLOBAL_CONFIG_DIR / ".pollypm"`` back to ``GLOBAL_CONFIG_DIR``.
+    # Without this, the scaffold writes SYSTEM.md / rules-manifest.md /
+    # docs/reference/*.md into ``~/.pollypm/.pollypm/`` on cockpit
+    # startup when no project is in scope. Import is deferred to avoid
+    # the ``projects.py`` ↔ ``doc_scaffold.py`` circular import.
+    from pollypm.projects import project_instruction_dir
     actions: list[str] = []
-    instruction_dir = project_path / ".pollypm"
+    instruction_dir = project_instruction_dir(project_path)
     instruction_dir.mkdir(parents=True, exist_ok=True)
 
     # -- SYSTEM.md (PollyPM system reference, separate from project INSTRUCT.md) --
@@ -86,8 +94,10 @@ def repair_docs(project_path: Path) -> list[str]:
 
 def verify_docs(project_path: Path) -> list[str]:
     """Check which docs are missing or outdated. Returns list of problems."""
+    from pollypm.projects import project_instruction_dir
+
     problems: list[str] = []
-    instruction_dir = project_path / ".pollypm"
+    instruction_dir = project_instruction_dir(project_path)
 
     system_dest = instruction_dir / "docs" / "SYSTEM.md"
     if not system_dest.exists():

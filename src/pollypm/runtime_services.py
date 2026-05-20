@@ -100,9 +100,14 @@ def load_runtime_services(
     )
     work_service: Any | None
     try:
+        from pollypm.projects import project_state_db_path
         from pollypm.work import create_work_service
 
-        db_path = project_root / ".pollypm" / "state.db"
+        # Route through typed helper so the doubled-pollypm-path guard
+        # fires when ``project_root == GLOBAL_CONFIG_DIR`` — the
+        # rail_daemon case where workspace_root is unset and root_dir
+        # falls through to ~/.pollypm (#1972).
+        db_path = project_state_db_path(project_root)
         db_path.parent.mkdir(parents=True, exist_ok=True)
         work_service = create_work_service(
             db_path=db_path, project_path=project_root, config=config,

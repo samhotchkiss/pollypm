@@ -183,7 +183,10 @@ def _collect_work_service_signals(
         if project_cfg is None:
             return out
         project_path: Path = project_cfg.path
-        work_db = project_path / ".pollypm" / "state.db"
+        # Typed helper routes through the doubled-pollypm-path guard (#1972).
+        from pollypm.projects import project_state_db_path
+
+        work_db = project_state_db_path(project_path)
         if not work_db.exists():
             return out
 
@@ -1434,7 +1437,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             project_cfg = config.projects.get(project)
             if project_cfg is None:
                 return
-            work_db = project_cfg.path / ".pollypm" / "state.db"
+            # Typed helper routes through doubled-path guard (#1972).
+            from pollypm.projects import project_state_db_path
+
+            work_db = project_state_db_path(project_cfg.path)
             if not work_db.exists():
                 return
 

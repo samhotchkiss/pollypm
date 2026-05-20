@@ -122,7 +122,10 @@ def _record_first_shipped_activity(
         )
         return
 
-    state_db = project_path / ".pollypm" / "state.db"
+    # Typed helper routes through the doubled-pollypm-path guard (#1972).
+    from pollypm.projects import project_state_db_path
+
+    state_db = project_state_db_path(project_path)
     state_db.parent.mkdir(parents=True, exist_ok=True)
     shipped_at = (when or datetime.now(UTC)).isoformat()
     body = json.dumps(

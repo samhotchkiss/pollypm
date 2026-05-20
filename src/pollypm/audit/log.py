@@ -322,11 +322,20 @@ def project_log_path(project_path: Path | str | None) -> Path | None:
     A ``None`` return means the writer should fall back to central-
     only — used by codepaths that fire after a project root has been
     torn down, or by tests that don't materialize a project tree.
+
+    Routes through :func:`pollypm.projects.project_audit_log_path`
+    (#1972) so the doubled-pollypm-path guard fires when the caller
+    happens to pass ``GLOBAL_CONFIG_DIR`` itself as the project
+    root — the exact reproducer from #1966 (``work_db.opened``
+    emitting with ``project_path = ~/.pollypm`` and landing in
+    ``~/.pollypm/.pollypm/audit.jsonl``).
     """
     if project_path is None:
         return None
-    p = Path(project_path)
-    return p / ".pollypm" / "audit.jsonl"
+    # Lazy import to keep this module dependency-free at top level.
+    from pollypm.projects import project_audit_log_path as _audit_path
+
+    return _audit_path(Path(project_path))
 
 
 # ---------------------------------------------------------------------------

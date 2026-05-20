@@ -14224,6 +14224,283 @@ class PollyProjectDashboardApp(App[None]):
         self.review_cta.update(f"[bold reverse] {_escape(label)} [/]")
         self.review_cta.remove_class("-hidden")
 
+    def _banner_action_items(self, data: ProjectDashboardData) -> str:
+        """Banner string when there are user action items in the inbox."""
+        item = data.action_items[0]
+        prompt = str(
+            item.get("plain_prompt")
+            or item.get("decision_question")
+            or "This project needs your input."
+        ).strip()
+        # The banner already leads with "Waiting on you:" — the
+        # tail count "N need action" is redundant noise on top of
+        # that lede *and* the rendered Action Needed cards. Drop
+        # it specifically while keeping the genuinely-different
+        # categories (dependencies, on hold, approvals, alerts).
+        #
+        # When an action card's primary_ref points at a review
+        # task, the "N approval(s)" suffix double-counts the same
+        # work — booktalk read "Waiting on you: A full project
+        # plan is ready for your review · 1 on hold · 1 approval"
+        # where the "1 approval" was the very task the prompt
+        # already named. Drop the overlap before formatting.
+        # #1025 — count only user-pending reviews; auto-handled
+        # ones (Russell mid-review) shouldn't show as "approval".
+        review_count = _banner_review_count_after_action_overlap(
+            _user_pending_review_count(data),
+            data.action_items,
+            data.task_buckets.get("review", []),
+        )
+        # Same overlap reduction for on_hold — polly_remote (live,
+        # 2026-04-26) had 2 action cards whose primary_refs were
+        # the same 2 on_hold tasks, but the banner suffix still
+        # read ``· 2 on hold`` so the user couldn't tell whether
+        # there were 4 things waiting (2 cards + 2 on_hold) or
+        # 2 things double-named.
+        on_hold_count = _banner_count_after_action_overlap(
+            int(data.task_counts.get("on_hold", 0)),
+            data.action_items,
+            data.task_buckets.get("on_hold", []),
+        )
+        action_only_suffix = render_project_action_bar(
+            review_count=review_count,
+            alert_count=data.alert_count,
+            inbox_count=0,
+            blocker_count=int(data.task_counts.get("blocked", 0)),
+            on_hold_count=on_hold_count,
+        )
+        # When more than one user-facing action is waiting, the
+        # banner prompt only shows the first; surface the rest as
+        # a "+N more action(s)" tag so the user doesn't read the
+        # banner, act on the first item, and miss the others.
+        extras = max(0, int(data.inbox_count) - 1)
+        extras_part = (
+            f" · +{extras} more action"
+            + ("s" if extras != 1 else "")
+            if extras
+            else ""
+        )
+        if action_only_suffix.startswith("▸ Clear"):
+            # No other categories to mention — drop the suffix entirely
+            # so the banner stays a single clean sentence.
+            return f"Waiting on you: {prompt}{extras_part}"
+        suffix = (
+            action_only_suffix[2:]
+            if action_only_suffix.startswith("▸ ")
+            else action_only_suffix
+        )
+        return f"Waiting on you: {prompt}{extras_part} · {suffix}"
+
+    def _banner_alert(
+        self, data: ProjectDashboardData, count_suffix: str,
+    ) -> str | None:
+        """Banner string for an alert family, or None to fall through."""
+        # #1512 — render the specific alert family the supervisor
+        # raised instead of the generic "Polly needs to inspect a
+        # project issue" lede. Falls back to a count + route hint
+        # ("press a to review") when the family is unmapped — never
+        # to a dead-end string that implies the system is going to
+        # handle this on its own.
+        # #1555 (MED-2) — name the effective PM (architect persona
+        # when an architect session is routing this project), not
+        # the raw project ``persona_name``. The topbar uses the same
+        # effective lookup; the banner must match so a project with
+        # ``persona_name="Bea"`` running an architect session reads
+        # ``Press c to plan this with Archie`` (not ``Bea``).
+        pm_persona = (
+            getattr(data, "pm_persona", None)
+            or getattr(data, "persona_name", None)
+        )
+        # #1710 — plumb the on-disk plan signal into the banner so a
+        # ``plan_missing`` alert with no ``plan_task_summary`` but
+        # an actual plan file (canonical OR worktree-fallback path
+        # from #1709) can switch from the "Press c to plan" nag to
+        # the "Plan ready — press p to review" celebration. Without
+        # this branch a project whose plan_project flow finished
+        # ``done`` reads as "go plan this project" because the
+        # backstop matcher intentionally excludes that flow.
+        plan_on_disk = bool(getattr(data, "plan_path", None))
+        counts_map = getattr(data, "task_counts", {}) or {}
+        specific = _alert_banner_copy(
+            getattr(data, "alert_types", []) or [],
+            int(data.alert_count),
+            plan_task_summary=getattr(data, "plan_task_summary", None),
+            persona_name=pm_persona,
+            plan_on_disk=plan_on_disk,
+            queued_count=int(counts_map.get("queued", 0)),
+            blocked_count=int(counts_map.get("blocked", 0)),
+        )
+        if not specific:
+            return None
+        # #1540 — drop the trailing ``· 1 alert`` for the
+        # plan_missing-no-summary "next step" state. The
+        # "no plan yet" framing is the default early state,
+        # not an alert the user should be chastised for. The
+        # action-bar pill still surfaces the count for users
+        # who want it; the banner stays clean.
+        # #1710 — same suppression for the plan-on-disk
+        # celebratory CTA so the banner doesn't trail "· 1
+        # alert" after a Plan-ready handoff.
+        alert_types = list(getattr(data, "alert_types", []) or [])
+        plan_summary = getattr(data, "plan_task_summary", None)
+        if (
+            alert_types == ["plan_missing"]
+            and not plan_summary
+        ):
+            return specific
+        return f"{specific}{count_suffix}"
+
+    def _banner_on_hold(self, data: ProjectDashboardData) -> str:
+        """Banner for the on-hold lead (outranks active worker)."""
+        on_hold_count = int(data.task_counts.get("on_hold", 0))
+        label = "task is" if on_hold_count == 1 else "tasks are"
+        lead = f"Paused: {on_hold_count} {label} on hold"
+        # Drop the redundant ``N on hold`` from the suffix — same
+        # trick the action_items branch above uses for inbox/review
+        # overlap. Without this, the banner read "Paused: 1 task
+        # is on hold · 1 on hold".
+        suffix_without_overlap = render_project_action_bar(
+            review_count=_user_pending_review_count(data),
+            alert_count=data.alert_count,
+            inbox_count=0,
+            blocker_count=int(data.task_counts.get("blocked", 0)),
+            on_hold_count=0,
+        )
+        if data.active_worker is not None:
+            worker = data.active_worker
+            role = str(worker.get("role") or "worker")
+            session = str(worker.get("session_name") or "a session")
+            activity = str(worker.get("activity") or "working")
+            if activity == "working":
+                lead += (
+                    f" · {session} ({role}) active in background"
+                )
+            # idle / awaiting_user → don't claim background work
+            # while a hold is the user-facing lead.
+        if suffix_without_overlap.startswith("▸ Clear"):
+            return lead
+        tail = (
+            suffix_without_overlap[2:]
+            if suffix_without_overlap.startswith("▸ ")
+            else suffix_without_overlap
+        )
+        return f"{lead} · {tail}"
+
+    def _banner_active_worker(
+        self, data: ProjectDashboardData, count_suffix: str,
+    ) -> str | None:
+        """Banner for an active worker; returns None to fall through.
+
+        Returning None means the caller should drop through to the
+        queued / blocked / review branches because the worker's idle
+        state is being deferred to a more user-facing category.
+        """
+        worker = data.active_worker
+        role = str(worker.get("role") or "worker")
+        session = str(worker.get("session_name") or "a session")
+        activity = str(worker.get("activity") or "working")
+        # #990 — only claim "is active" when the agent is genuinely
+        # progressing work. ``idle`` means the session is alive but
+        # standing by (e.g. architect emitted a plan and is waiting
+        # for the user); claiming "is active" there contradicts the
+        # Tasks view ("no active worker is attached") and the pane
+        # itself ("standing by"). ``awaiting_user`` shifts the
+        # banner to surface that the operator is the blocker.
+        if activity == "awaiting_user":
+            return (
+                f"Waiting on you: {session} ({role}) is at a "
+                f"permission prompt{count_suffix}"
+            )
+        if activity == "idle":
+            # Surface the standby state, but defer to category
+            # tails (queued / blocked / review) below by falling
+            # through when there's other work to highlight. Keep
+            # the in-line idle banner only when nothing else is
+            # waiting — that's the pure "alive but not progressing"
+            # state #990 was about.
+            queued = int(data.task_counts.get("queued", 0))
+            blocked = int(data.task_counts.get("blocked", 0))
+            review = int(data.task_counts.get("review", 0))
+            if not (queued or blocked or review):
+                # #1541 — the calm-project banner used to leak
+                # worker internals (``architect_bikepath
+                # (architect)``) and stack four redundant ways
+                # of saying "nothing to do" with no next step.
+                # Reframe as a short, warm note that names the
+                # PM persona and ends with an actionable CTA.
+                #
+                # #1555 (MED-2) — name the effective PM (matches
+                # topbar) instead of the raw project persona.
+                persona = (
+                    getattr(data, "pm_persona", None)
+                    or getattr(data, "persona_name", None)
+                    or ""
+                ).strip()
+                # #1555 (MED-3) — the footer hides the ``p plan``
+                # keystroke when there is no plan_path AND no
+                # plan_task_summary (because ``p`` would open an
+                # empty plan surface). The banner CTA must agree:
+                # advertising ``p to plan`` here points at the same
+                # dead-end the footer just hid. Drop ``or p to
+                # plan`` for that exact state; ``c`` (chat the PM
+                # to plan it) is the live affordance.
+                has_plan_route = bool(
+                    getattr(data, "plan_path", None)
+                    or getattr(data, "plan_task_summary", None)
+                )
+                cta = (
+                    "Press c to chat or p to plan."
+                    if has_plan_route
+                    else "Press c to chat."
+                )
+                if persona:
+                    return f"{persona} is here when you need them. {cta}"
+                # Fallback when no persona is configured: keep
+                # the calm-but-inviting tone without inventing a
+                # name (and without leaking the worker key).
+                return f"All caught up. {cta}"
+            # Fall through to queued/blocked/review banners below
+            # so the user-facing category leads.
+            return None
+        return (
+            f"Moving now: {session} ({role}) is active"
+            f"{count_suffix}"
+        )
+
+    def _banner_review(
+        self, data: ProjectDashboardData, user_pending_review: int,
+    ) -> str:
+        """Banner for waiting-on-user review approvals."""
+        label = "task" if user_pending_review == 1 else "tasks"
+        specific_title = _user_pending_review_title(data)
+        # Drop the redundant ``· N approval`` from the suffix when
+        # the banner lede already names the same approval(s).
+        suffix_without_review = render_project_action_bar(
+            review_count=0,
+            alert_count=data.alert_count,
+            inbox_count=0,
+            blocker_count=int(data.task_counts.get("blocked", 0)),
+            on_hold_count=int(data.task_counts.get("on_hold", 0)),
+        )
+        if suffix_without_review.startswith("▸ Clear"):
+            tail_suffix = ""
+        else:
+            tail = (
+                suffix_without_review[2:]
+                if suffix_without_review.startswith("▸ ")
+                else suffix_without_review
+            )
+            tail_suffix = f" · {tail}"
+        if user_pending_review == 1 and specific_title:
+            return (
+                f"Waiting for your approval: "
+                f"“{specific_title}”{tail_suffix}"
+            )
+        return (
+            f"Waiting for review: {user_pending_review} {label} "
+            f"ready for approval{tail_suffix}"
+        )
+
     def _render_project_state_banner(
         self, data: ProjectDashboardData, counts: str,
     ) -> str:
@@ -14232,124 +14509,11 @@ class PollyProjectDashboardApp(App[None]):
             return f"Needs repair: {internal_failure}"
         count_suffix = f" · {counts[2:]}" if counts.startswith("▸ ") else f" · {counts}"
         if data.action_items:
-            item = data.action_items[0]
-            prompt = str(
-                item.get("plain_prompt")
-                or item.get("decision_question")
-                or "This project needs your input."
-            ).strip()
-            # The banner already leads with "Waiting on you:" — the
-            # tail count "N need action" is redundant noise on top of
-            # that lede *and* the rendered Action Needed cards. Drop
-            # it specifically while keeping the genuinely-different
-            # categories (dependencies, on hold, approvals, alerts).
-            #
-            # When an action card's primary_ref points at a review
-            # task, the "N approval(s)" suffix double-counts the same
-            # work — booktalk read "Waiting on you: A full project
-            # plan is ready for your review · 1 on hold · 1 approval"
-            # where the "1 approval" was the very task the prompt
-            # already named. Drop the overlap before formatting.
-            # #1025 — count only user-pending reviews; auto-handled
-            # ones (Russell mid-review) shouldn't show as "approval".
-            review_count = _banner_review_count_after_action_overlap(
-                _user_pending_review_count(data),
-                data.action_items,
-                data.task_buckets.get("review", []),
-            )
-            # Same overlap reduction for on_hold — polly_remote (live,
-            # 2026-04-26) had 2 action cards whose primary_refs were
-            # the same 2 on_hold tasks, but the banner suffix still
-            # read ``· 2 on hold`` so the user couldn't tell whether
-            # there were 4 things waiting (2 cards + 2 on_hold) or
-            # 2 things double-named.
-            on_hold_count = _banner_count_after_action_overlap(
-                int(data.task_counts.get("on_hold", 0)),
-                data.action_items,
-                data.task_buckets.get("on_hold", []),
-            )
-            action_only_suffix = render_project_action_bar(
-                review_count=review_count,
-                alert_count=data.alert_count,
-                inbox_count=0,
-                blocker_count=int(data.task_counts.get("blocked", 0)),
-                on_hold_count=on_hold_count,
-            )
-            # When more than one user-facing action is waiting, the
-            # banner prompt only shows the first; surface the rest as
-            # a "+N more action(s)" tag so the user doesn't read the
-            # banner, act on the first item, and miss the others.
-            extras = max(0, int(data.inbox_count) - 1)
-            extras_part = (
-                f" · +{extras} more action"
-                + ("s" if extras != 1 else "")
-                if extras
-                else ""
-            )
-            if action_only_suffix.startswith("▸ Clear"):
-                # No other categories to mention — drop the suffix entirely
-                # so the banner stays a single clean sentence.
-                return f"Waiting on you: {prompt}{extras_part}"
-            suffix = (
-                action_only_suffix[2:]
-                if action_only_suffix.startswith("▸ ")
-                else action_only_suffix
-            )
-            return f"Waiting on you: {prompt}{extras_part} · {suffix}"
+            return self._banner_action_items(data)
         if data.alert_count:
-            # #1512 — render the specific alert family the supervisor
-            # raised instead of the generic "Polly needs to inspect a
-            # project issue" lede. Falls back to a count + route hint
-            # ("press a to review") when the family is unmapped — never
-            # to a dead-end string that implies the system is going to
-            # handle this on its own.
-            # #1555 (MED-2) — name the effective PM (architect persona
-            # when an architect session is routing this project), not
-            # the raw project ``persona_name``. The topbar uses the same
-            # effective lookup; the banner must match so a project with
-            # ``persona_name="Bea"`` running an architect session reads
-            # ``Press c to plan this with Archie`` (not ``Bea``).
-            pm_persona = (
-                getattr(data, "pm_persona", None)
-                or getattr(data, "persona_name", None)
-            )
-            # #1710 — plumb the on-disk plan signal into the banner so a
-            # ``plan_missing`` alert with no ``plan_task_summary`` but
-            # an actual plan file (canonical OR worktree-fallback path
-            # from #1709) can switch from the "Press c to plan" nag to
-            # the "Plan ready — press p to review" celebration. Without
-            # this branch a project whose plan_project flow finished
-            # ``done`` reads as "go plan this project" because the
-            # backstop matcher intentionally excludes that flow.
-            plan_on_disk = bool(getattr(data, "plan_path", None))
-            counts = getattr(data, "task_counts", {}) or {}
-            specific = _alert_banner_copy(
-                getattr(data, "alert_types", []) or [],
-                int(data.alert_count),
-                plan_task_summary=getattr(data, "plan_task_summary", None),
-                persona_name=pm_persona,
-                plan_on_disk=plan_on_disk,
-                queued_count=int(counts.get("queued", 0)),
-                blocked_count=int(counts.get("blocked", 0)),
-            )
-            if specific:
-                # #1540 — drop the trailing ``· 1 alert`` for the
-                # plan_missing-no-summary "next step" state. The
-                # "no plan yet" framing is the default early state,
-                # not an alert the user should be chastised for. The
-                # action-bar pill still surfaces the count for users
-                # who want it; the banner stays clean.
-                # #1710 — same suppression for the plan-on-disk
-                # celebratory CTA so the banner doesn't trail "· 1
-                # alert" after a Plan-ready handoff.
-                alert_types = list(getattr(data, "alert_types", []) or [])
-                plan_summary = getattr(data, "plan_task_summary", None)
-                if (
-                    alert_types == ["plan_missing"]
-                    and not plan_summary
-                ):
-                    return specific
-                return f"{specific}{count_suffix}"
+            specific = self._banner_alert(data, count_suffix)
+            if specific is not None:
+                return specific
         # On-hold tasks must outrank an active background worker. Today
         # media renders ``Moving now: worker_media is active · 1 on
         # hold`` while the pill correctly shows "needs attention" —
@@ -14359,112 +14523,12 @@ class PollyProjectDashboardApp(App[None]):
         # attention state; mirror that here. (Sam, media on
         # 2026-04-26: on_hold reason "Awaiting user Phase A approval"
         # was invisible behind a "Moving now" banner.)
-        on_hold_count = int(data.task_counts.get("on_hold", 0))
-        if on_hold_count:
-            label = "task is" if on_hold_count == 1 else "tasks are"
-            lead = f"Paused: {on_hold_count} {label} on hold"
-            # Drop the redundant ``N on hold`` from the suffix — same
-            # trick the action_items branch above uses for inbox/review
-            # overlap. Without this, the banner read "Paused: 1 task
-            # is on hold · 1 on hold".
-            suffix_without_overlap = render_project_action_bar(
-                review_count=_user_pending_review_count(data),
-                alert_count=data.alert_count,
-                inbox_count=0,
-                blocker_count=int(data.task_counts.get("blocked", 0)),
-                on_hold_count=0,
-            )
-            if data.active_worker is not None:
-                worker = data.active_worker
-                role = str(worker.get("role") or "worker")
-                session = str(worker.get("session_name") or "a session")
-                activity = str(worker.get("activity") or "working")
-                if activity == "working":
-                    lead += (
-                        f" · {session} ({role}) active in background"
-                    )
-                # idle / awaiting_user → don't claim background work
-                # while a hold is the user-facing lead.
-            if suffix_without_overlap.startswith("▸ Clear"):
-                return lead
-            tail = (
-                suffix_without_overlap[2:]
-                if suffix_without_overlap.startswith("▸ ")
-                else suffix_without_overlap
-            )
-            return f"{lead} · {tail}"
+        if int(data.task_counts.get("on_hold", 0)):
+            return self._banner_on_hold(data)
         if data.active_worker is not None:
-            worker = data.active_worker
-            role = str(worker.get("role") or "worker")
-            session = str(worker.get("session_name") or "a session")
-            activity = str(worker.get("activity") or "working")
-            # #990 — only claim "is active" when the agent is genuinely
-            # progressing work. ``idle`` means the session is alive but
-            # standing by (e.g. architect emitted a plan and is waiting
-            # for the user); claiming "is active" there contradicts the
-            # Tasks view ("no active worker is attached") and the pane
-            # itself ("standing by"). ``awaiting_user`` shifts the
-            # banner to surface that the operator is the blocker.
-            if activity == "awaiting_user":
-                return (
-                    f"Waiting on you: {session} ({role}) is at a "
-                    f"permission prompt{count_suffix}"
-                )
-            if activity == "idle":
-                # Surface the standby state, but defer to category
-                # tails (queued / blocked / review) below by falling
-                # through when there's other work to highlight. Keep
-                # the in-line idle banner only when nothing else is
-                # waiting — that's the pure "alive but not progressing"
-                # state #990 was about.
-                queued = int(data.task_counts.get("queued", 0))
-                blocked = int(data.task_counts.get("blocked", 0))
-                review = int(data.task_counts.get("review", 0))
-                if not (queued or blocked or review):
-                    # #1541 — the calm-project banner used to leak
-                    # worker internals (``architect_bikepath
-                    # (architect)``) and stack four redundant ways
-                    # of saying "nothing to do" with no next step.
-                    # Reframe as a short, warm note that names the
-                    # PM persona and ends with an actionable CTA.
-                    #
-                    # #1555 (MED-2) — name the effective PM (matches
-                    # topbar) instead of the raw project persona.
-                    persona = (
-                        getattr(data, "pm_persona", None)
-                        or getattr(data, "persona_name", None)
-                        or ""
-                    ).strip()
-                    # #1555 (MED-3) — the footer hides the ``p plan``
-                    # keystroke when there is no plan_path AND no
-                    # plan_task_summary (because ``p`` would open an
-                    # empty plan surface). The banner CTA must agree:
-                    # advertising ``p to plan`` here points at the same
-                    # dead-end the footer just hid. Drop ``or p to
-                    # plan`` for that exact state; ``c`` (chat the PM
-                    # to plan it) is the live affordance.
-                    has_plan_route = bool(
-                        getattr(data, "plan_path", None)
-                        or getattr(data, "plan_task_summary", None)
-                    )
-                    cta = (
-                        "Press c to chat or p to plan."
-                        if has_plan_route
-                        else "Press c to chat."
-                    )
-                    if persona:
-                        return f"{persona} is here when you need them. {cta}"
-                    # Fallback when no persona is configured: keep
-                    # the calm-but-inviting tone without inventing a
-                    # name (and without leaking the worker key).
-                    return f"All caught up. {cta}"
-                # Fall through to queued/blocked/review banners below
-                # so the user-facing category leads.
-            else:
-                return (
-                    f"Moving now: {session} ({role}) is active"
-                    f"{count_suffix}"
-                )
+            worker_banner = self._banner_active_worker(data, count_suffix)
+            if worker_banner is not None:
+                return worker_banner
         if blocker_count := int(data.task_counts.get("blocked", 0)):
             label = "task is" if blocker_count == 1 else "tasks are"
             return (
@@ -14479,35 +14543,7 @@ class PollyProjectDashboardApp(App[None]):
         # branches instead of claiming "ready for approval".
         user_pending_review = _user_pending_review_count(data)
         if user_pending_review:
-            label = "task" if user_pending_review == 1 else "tasks"
-            specific_title = _user_pending_review_title(data)
-            # Drop the redundant ``· N approval`` from the suffix when
-            # the banner lede already names the same approval(s).
-            suffix_without_review = render_project_action_bar(
-                review_count=0,
-                alert_count=data.alert_count,
-                inbox_count=0,
-                blocker_count=int(data.task_counts.get("blocked", 0)),
-                on_hold_count=int(data.task_counts.get("on_hold", 0)),
-            )
-            if suffix_without_review.startswith("▸ Clear"):
-                tail_suffix = ""
-            else:
-                tail = (
-                    suffix_without_review[2:]
-                    if suffix_without_review.startswith("▸ ")
-                    else suffix_without_review
-                )
-                tail_suffix = f" · {tail}"
-            if user_pending_review == 1 and specific_title:
-                return (
-                    f"Waiting for your approval: "
-                    f"“{specific_title}”{tail_suffix}"
-                )
-            return (
-                f"Waiting for review: {user_pending_review} {label} "
-                f"ready for approval{tail_suffix}"
-            )
+            return self._banner_review(data, user_pending_review)
         queued_count = int(data.task_counts.get("queued", 0))
         if queued_count:
             label = "task" if queued_count == 1 else "tasks"

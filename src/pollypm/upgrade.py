@@ -483,6 +483,139 @@ def _parse_iso_timestamp(value: str) -> float | None:
         return None
 
 
+def _upgrade_check_migration(
+    *, step, installer: str, old_version: str,
+) -> UpgradeResult | None:
+    """Run the schema-migration check. Returns a refusal result on failure."""
+    mig_ok, mig_detail = run_migration_check()
+    if mig_ok:
+        return None
+    step("migration check")
+    step(f"migration: {mig_detail}")
+    # #760 — render the refusal as a structured user-facing
+    # message instead of a raw debug-dump line. The four-field
+    # shape (summary / why / next / details) makes the command
+    # the user needs to run unmissable, and pushes the raw
+    # migration list under a collapsed details section.
+    from pollypm.user_messages import (
+        StructuredMessage,
+        known_error,
+        render_cli_message,
+    )
+    canned = known_error("migration_pending")
+    msg = StructuredMessage(
+        summary=(canned or StructuredMessage("")).summary or
+                "Cannot upgrade — pending schema migrations on state.db.",
+        why_it_matters=(canned or StructuredMessage("")).why_it_matters,
+        next_action=(canned or StructuredMessage("")).next_action,
+        details=mig_detail,
+    )
+    return UpgradeResult(
+        ok=False,
+        installer=installer,
+        old_version=old_version,
+        new_version=old_version,
+        migration_checked=True,
+        notified=False,
+        stdout="",
+        stderr=render_cli_message(msg),
+        message="migration check failed \u2014 upgrade aborted",
+    )
+
+
+def _upgrade_run_installer(
+    *, step, plan, installer: str, old_version: str,
+) -> UpgradeResult | subprocess.CompletedProcess:
+    """Spawn the installer subprocess. Returns an UpgradeResult on failure."""
+    step(f"installing: {plan.notes}")
+    try:
+        result = subprocess.run(
+            plan.command,
+            check=False, capture_output=True, text=True, timeout=600.0,
+        )
+    except FileNotFoundError as exc:
+        return UpgradeResult(
+            ok=False,
+            installer=installer,
+            old_version=old_version,
+            new_version=old_version,
+            migration_checked=True,
+            notified=False,
+            stdout="",
+            stderr=str(exc),
+            message=f"installer binary not on PATH: {plan.command[0]}",
+        )
+    except subprocess.TimeoutExpired:
+        return UpgradeResult(
+            ok=False,
+            installer=installer,
+            old_version=old_version,
+            new_version=old_version,
+            migration_checked=True,
+            notified=False,
+            stdout="",
+            stderr="install timed out after 10m",
+            message="install timed out \u2014 network, or installer hung",
+        )
+    if result.returncode != 0:
+        return UpgradeResult(
+            ok=False,
+            installer=installer,
+            old_version=old_version,
+            new_version=old_version,
+            migration_checked=True,
+            notified=False,
+            stdout=result.stdout,
+            stderr=result.stderr,
+            message=f"install failed (exit {result.returncode})",
+        )
+    return result
+
+
+def _upgrade_notify_and_recycle(
+    *,
+    step,
+    old_version: str,
+    new_version: str,
+    recycle_all: bool,
+    recycle_idle: bool,
+) -> tuple[bool, int, int, str | None, int]:
+    """Notify live sessions + apply recycle scope.
+
+    Returns ``(notice_delivered, notified_count, recycled_count,
+    recycle_scope, pending_restart_count)``.
+    """
+    step("notifying live sessions")
+    notify_ok, notify_detail = inject_notice(old_version, new_version)
+    step(f"notify: {notify_detail}")
+    notice_delivered = (
+        notify_ok
+        and not notify_detail.strip().lower().startswith("skipped")
+    )
+    notified_count = _notified_session_count() if notice_delivered else 0
+
+    recycled_count = 0
+    recycle_scope: str | None = None
+    if recycle_all or recycle_idle:
+        recycle_scope = "all" if recycle_all else "idle"
+        recycled_count, _skipped = _perform_recycle(
+            scope=recycle_scope, step=step,
+        )
+
+    # ``pending_restart_count`` is the number of sessions notified
+    # in-conversation that haven't turned over yet (so they're still
+    # running on the old in-memory prompt). When ``--recycle-all``
+    # was used, every notified session was recycled too — pending
+    # is zero. When ``--recycle-idle`` ran, the notified set minus
+    # the recycled set is the rough pending count. Otherwise every
+    # notified session is "pending" until it turns over on its own.
+    if recycle_scope == "all":
+        pending_restart_count = 0
+    else:
+        pending_restart_count = max(0, notified_count - recycled_count)
+    return notice_delivered, notified_count, recycled_count, recycle_scope, pending_restart_count
+
+
 def upgrade(
     *,
     channel: str = "stable",
@@ -528,39 +661,11 @@ def upgrade(
     # to act on); only emit step markers when the check actually
     # surfaced a problem so ``pm upgrade`` doesn't spam migration noise
     # on every run.
-    mig_ok, mig_detail = run_migration_check()
-    if not mig_ok:
-        step("migration check")
-        step(f"migration: {mig_detail}")
-        # #760 — render the refusal as a structured user-facing
-        # message instead of a raw debug-dump line. The four-field
-        # shape (summary / why / next / details) makes the command
-        # the user needs to run unmissable, and pushes the raw
-        # migration list under a collapsed details section.
-        from pollypm.user_messages import (
-            StructuredMessage,
-            known_error,
-            render_cli_message,
-        )
-        canned = known_error("migration_pending")
-        msg = StructuredMessage(
-            summary=(canned or StructuredMessage("")).summary or
-                    "Cannot upgrade — pending schema migrations on state.db.",
-            why_it_matters=(canned or StructuredMessage("")).why_it_matters,
-            next_action=(canned or StructuredMessage("")).next_action,
-            details=mig_detail,
-        )
-        return UpgradeResult(
-            ok=False,
-            installer=installer,
-            old_version=old_version,
-            new_version=old_version,
-            migration_checked=True,
-            notified=False,
-            stdout="",
-            stderr=render_cli_message(msg),
-            message="migration check failed — upgrade aborted",
-        )
+    refusal = _upgrade_check_migration(
+        step=step, installer=installer, old_version=old_version,
+    )
+    if refusal is not None:
+        return refusal
 
     available = _available_upgrade(plan.channel)
     if available is not None:
@@ -607,48 +712,12 @@ def upgrade(
             message=f"plan-only: {plan.notes}",
         )
 
-    step(f"installing: {plan.notes}")
-    try:
-        result = subprocess.run(
-            plan.command,
-            check=False, capture_output=True, text=True, timeout=600.0,
-        )
-    except FileNotFoundError as exc:
-        return UpgradeResult(
-            ok=False,
-            installer=installer,
-            old_version=old_version,
-            new_version=old_version,
-            migration_checked=True,
-            notified=False,
-            stdout="",
-            stderr=str(exc),
-            message=f"installer binary not on PATH: {plan.command[0]}",
-        )
-    except subprocess.TimeoutExpired:
-        return UpgradeResult(
-            ok=False,
-            installer=installer,
-            old_version=old_version,
-            new_version=old_version,
-            migration_checked=True,
-            notified=False,
-            stdout="",
-            stderr="install timed out after 10m",
-            message="install timed out — network, or installer hung",
-        )
-    if result.returncode != 0:
-        return UpgradeResult(
-            ok=False,
-            installer=installer,
-            old_version=old_version,
-            new_version=old_version,
-            migration_checked=True,
-            notified=False,
-            stdout=result.stdout,
-            stderr=result.stderr,
-            message=f"install failed (exit {result.returncode})",
-        )
+    result_or_refusal = _upgrade_run_installer(
+        step=step, plan=plan, installer=installer, old_version=old_version,
+    )
+    if isinstance(result_or_refusal, UpgradeResult):
+        return result_or_refusal
+    result = result_or_refusal
 
     new_version = _read_new_version() or old_version
     step(f"installed {new_version}")
@@ -665,34 +734,15 @@ def upgrade(
             message=f"already up to date on {old_version}",
         )
 
-    step("notifying live sessions")
-    notify_ok, notify_detail = inject_notice(old_version, new_version)
-    step(f"notify: {notify_detail}")
-    notice_delivered = (
-        notify_ok
-        and not notify_detail.strip().lower().startswith("skipped")
-    )
-    notified_count = _notified_session_count() if notice_delivered else 0
-
-    recycled_count = 0
-    recycle_scope: str | None = None
-    if recycle_all or recycle_idle:
-        recycle_scope = "all" if recycle_all else "idle"
-        recycled_count, _skipped = _perform_recycle(
-            scope=recycle_scope, step=step,
+    notice_delivered, notified_count, recycled_count, recycle_scope, pending_restart_count = (
+        _upgrade_notify_and_recycle(
+            step=step,
+            old_version=old_version,
+            new_version=new_version,
+            recycle_all=recycle_all,
+            recycle_idle=recycle_idle,
         )
-
-    # ``pending_restart_count`` is the number of sessions notified
-    # in-conversation that haven't turned over yet (so they're still
-    # running on the old in-memory prompt). When ``--recycle-all``
-    # was used, every notified session was recycled too — pending
-    # is zero. When ``--recycle-idle`` ran, the notified set minus
-    # the recycled set is the rough pending count. Otherwise every
-    # notified session is "pending" until it turns over on its own.
-    if recycle_scope == "all":
-        pending_restart_count = 0
-    else:
-        pending_restart_count = max(0, notified_count - recycled_count)
+    )
 
     _write_post_upgrade_flag(
         old_version, new_version,
@@ -716,14 +766,12 @@ def upgrade(
         notified=notice_delivered,
         stdout=result.stdout,
         stderr=result.stderr,
-        message=f"upgraded {old_version} → {new_version}",
+        message=f"upgraded {old_version} \u2192 {new_version}",
         notified_count=notified_count,
         recycled_count=recycled_count,
         pending_restart_count=pending_restart_count,
         recycle_scope=recycle_scope,
     )
-
-
 def _notified_session_count() -> int:
     """Count live sessions that received the in-conversation notice.
 

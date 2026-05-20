@@ -684,7 +684,13 @@ def repair(
             )
             continue
 
-        state_dir = project_root / ".pollypm"
+        # Route through ``project_pollypm_dir`` so the doubled-path
+        # guard (#1810/#1950) collapses ``GLOBAL_CONFIG_DIR / ".pollypm"``
+        # back to ``GLOBAL_CONFIG_DIR``. ``pm repair`` is one of the few
+        # callers that could create the doubled tree on a user who added
+        # ``~/.pollypm`` itself as a tracked project.
+        from pollypm.projects import project_pollypm_dir
+        state_dir = project_pollypm_dir(project_root)
         for subdir in [
             "dossier",
             "logs",

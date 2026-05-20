@@ -12,6 +12,7 @@ from typing import Any
 from pollypm.llm_runner import HAIKU_MODEL, run_haiku, run_haiku_json
 from pollypm.memory_backends import get_memory_backend
 from pollypm.memory_extractors import CONFIDENCE_THRESHOLD, run_extractors
+from pollypm.projects import project_transcripts_dir
 
 logger = logging.getLogger(__name__)
 
@@ -275,7 +276,11 @@ def _all_project_roots(config) -> list[Path]:
 
 
 def _transcript_root(project_root: Path) -> Path:
-    return project_root / ".pollypm" / "transcripts"
+    # Route through ``project_transcripts_dir`` (#1810/#1950) so the
+    # ``GLOBAL_CONFIG_DIR`` / ``.pollypm`` doubled-path guard fires when
+    # the 15-minute extractor iterates over ``_all_project_roots`` and
+    # hits ``config.project.root_dir == ~/.pollypm``.
+    return project_transcripts_dir(project_root)
 
 
 def _checkpoint_path(project_root: Path) -> Path:

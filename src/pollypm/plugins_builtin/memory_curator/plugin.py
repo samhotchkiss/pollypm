@@ -82,7 +82,12 @@ def memory_curate_handler(payload: dict[str, Any]) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001
             logger.warning("memory.curate[%s]: backend unavailable (%s)", project_root, exc)
             continue
-        log_path = project_root / ".pollypm" / CURATOR_LOG_FILENAME
+        # Route through ``project_pollypm_dir`` so the doubled-path
+        # guard (#1810/#1950) keeps writes out of
+        # ``~/.pollypm/.pollypm/`` when ``_all_project_roots`` yields
+        # ``config.project.root_dir == GLOBAL_CONFIG_DIR``.
+        from pollypm.projects import project_pollypm_dir
+        log_path = project_pollypm_dir(project_root) / CURATOR_LOG_FILENAME
         try:
             result = curate_memory(backend, log_path=log_path, now=datetime.now(UTC))
         except Exception as exc:  # noqa: BLE001
@@ -109,7 +114,8 @@ def _emit_inbox_summary(project_root: Path, summary: str) -> None:
     implementation (the work-service inbox, morning briefing inbox, or
     a future unified inbox all see the same file).
     """
-    inbox_dir = project_root / ".pollypm" / CURATOR_INBOX_DIRNAME
+    from pollypm.projects import project_pollypm_dir
+    inbox_dir = project_pollypm_dir(project_root) / CURATOR_INBOX_DIRNAME
     inbox_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(UTC).strftime("%Y-%m-%d")
     path = inbox_dir / f"{stamp}.md"

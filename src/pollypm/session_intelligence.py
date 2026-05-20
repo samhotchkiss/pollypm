@@ -20,6 +20,7 @@ from typing import Any
 
 from pollypm.atomic_io import atomic_write_text
 from pollypm.llm_runner import run_haiku_json
+from pollypm.projects import project_instruction_dir, project_transcripts_dir
 
 logger = logging.getLogger(__name__)
 
@@ -126,7 +127,12 @@ def _parse_result(raw: dict[str, Any]) -> SessionIntelligenceResult:
 # ---------------------------------------------------------------------------
 
 def _pending_knowledge_dir(project_root: Path) -> Path:
-    return project_root / ".pollypm" / "pending-knowledge"
+    # Route through ``project_instruction_dir`` so the doubled-path
+    # guard (#1810/#1950) collapses ``GLOBAL_CONFIG_DIR / ".pollypm"``
+    # back to ``GLOBAL_CONFIG_DIR`` when ``project_root`` is the global
+    # config dir (e.g. the sweep's first iteration when ``root_dir`` is
+    # ``~/.pollypm``).
+    return project_instruction_dir(project_root) / "pending-knowledge"
 
 
 def stage_pending_knowledge(
@@ -191,7 +197,11 @@ _CURSOR_FILE = ".session-intelligence-state.json"
 
 
 def _cursor_path(project_root: Path) -> Path:
-    return project_root / ".pollypm" / "transcripts" / _CURSOR_FILE
+    # Route through ``project_transcripts_dir`` (#1810/#1950) — without
+    # this, the 5-minute sweep writes
+    # ``~/.pollypm/.pollypm/transcripts/.session-intelligence-state.json``
+    # for the global root iteration.
+    return project_transcripts_dir(project_root) / _CURSOR_FILE
 
 
 def _load_cursors(project_root: Path) -> dict[str, int]:
@@ -230,7 +240,7 @@ def _save_cursors(project_root: Path, cursors: dict[str, int]) -> None:
 
 def _read_new_events(project_root: Path, session_name: str, cursors: dict[str, int]) -> tuple[list[dict], int]:
     """Read new transcript events for one session since the cursor position."""
-    events_path = project_root / ".pollypm" / "transcripts" / session_name / "events.jsonl"
+    events_path = project_transcripts_dir(project_root) / session_name / "events.jsonl"
     if not events_path.exists():
         return [], 0
     key = f"{session_name}/events.jsonl"
@@ -303,7 +313,7 @@ def sweep_all_sessions(config) -> dict[str, int]:
 
     for project_root in _all_project_roots(config):
         cursors = _load_cursors(project_root)
-        transcript_root = project_root / ".pollypm" / "transcripts"
+        transcript_root = project_transcripts_dir(project_root)
         if not transcript_root.exists():
             continue
 

@@ -34,14 +34,22 @@ def get_memory_backend(project_path: Path, backend_name: str = "file") -> Memory
         # imports at module load time (projects imports memory_backends in
         # a few paths).
         from pollypm.plugin_host import extension_host_for_root
-        from pollypm.projects import ensure_project_scaffold, project_artifacts_dir, project_dossier_dir
+        from pollypm.projects import (
+            ensure_project_scaffold,
+            project_artifacts_dir,
+            project_dossier_dir,
+            project_pollypm_dir,
+        )
         from pollypm.storage.pg_memory import PgMemoryStore
 
         resolved = project_path.expanduser().resolve()
         # Scaffold the project up-front so the backend can assume memory
         # roots exist (it used to call ensure_project_scaffold itself).
         ensure_project_scaffold(resolved)
-        state_db = resolved / ".pollypm" / "state.db"
+        # Route through ``project_pollypm_dir`` so the doubled-path guard
+        # (#1810/#1950) collapses ``GLOBAL_CONFIG_DIR / ".pollypm"`` back
+        # to ``GLOBAL_CONFIG_DIR``.
+        state_db = project_pollypm_dir(resolved) / "state.db"
         # FileMemoryBackend is wired to a stateless PgMemoryStore adapter
         # that routes every memory_* call through pollypm.storage.pg_memory.
         state_store: object = PgMemoryStore()

@@ -12,7 +12,7 @@ from pathlib import Path
 
 import typer
 
-from pollypm.config import PROJECT_CONFIG_DIRNAME, load_config, write_config
+from pollypm.config import load_config, write_config
 from pollypm.doc_scaffold import scaffold_docs
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.task_backends import FileTaskBackend, get_task_backend
@@ -266,9 +266,15 @@ def project_issues_dir(project_path: Path) -> Path:
 
 def ensure_project_scaffold(project_path: Path) -> Path:
     pollypm_dir = project_pollypm_dir(project_path)
+    # ``PROJECT_CONFIG_DIRNAME = ".pollypm/config"`` so naive joining
+    # would write ``~/.pollypm/.pollypm/config`` when ``project_path``
+    # is the global config dir. Route through ``project_pollypm_dir``
+    # (which honors the doubled-path guard) and append just ``config``.
+    # See #1810/#1950.
+    project_config_dir = pollypm_dir / "config"
     for directory in [
         project_instruction_dir(project_path),
-        normalize_project_path(project_path) / PROJECT_CONFIG_DIRNAME,
+        project_config_dir,
         project_instruction_dir(project_path) / "rules",
         project_instruction_dir(project_path) / "magic",
         project_transcripts_dir(project_path),

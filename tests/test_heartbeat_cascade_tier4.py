@@ -984,6 +984,194 @@ def test_sweep_without_seen_hashes_keeps_legacy_budget_only_behaviour(
 
 
 # ---------------------------------------------------------------------------
+# #1997 — persistent terminal-handoff gate.
+#
+# Repro: tier-4 promotes on a queue_without_motion finding, exhausts the
+# 2h budget, routes to the terminal product-broken + urgent-inbox path,
+# ``tracker.clear(reason='budget_exhausted')`` flips ``tier4_active=0``
+# — but the underlying condition isn't actually fixed, so on the next
+# watchdog tick the finding re-fires, tier-3 dispatch history re-crosses
+# K, and the auto-promote gate trivially re-greenlights another tier-4
+# promotion. 98 promotions / 81 budget-exhausts / 0 demotions across 8
+# projects over 50h in the wild.
+#
+# Fix: ``terminal_handoff_at`` persists across ``tracker.clear`` and
+# ``should_auto_promote`` refuses to re-promote until the finding
+# actually resolves (which NULLs the column).
+# ---------------------------------------------------------------------------
+
+
+def test_terminal_handoff_gate_blocks_re_promotion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """End-to-end: after budget-exhaust → terminal, the same hash can't re-promote.
+
+    Asserts the three contracts that close #1997:
+
+    (a) First budget-exhaustion sweep stamps ``terminal_handoff_at`` on
+        the row before flipping ``tier4_active=0``. The stamp is what
+        the auto-promote gate keys on.
+    (b) After the stamp lands, ``should_auto_promote`` returns False
+        for the same root_cause_hash even when the tier-3 dispatch
+        history has K+ entries inside the window — i.e. the gate
+        survives ``tracker.clear``.
+    (c) After a real ``finding_resolved`` clear (e.g. the underlying
+        condition truly gets fixed by an operator later), the gate
+        releases and a future occurrence of the same hash can promote
+        again.
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="loopproject", subject="loopproject")
+    rch = root_cause_hash(finding)
+
+    # Pre-seed dispatch history so the post-clear auto-promote gate has
+    # K+ dispatches inside the window — modelling the watchdog re-firing
+    # on the same un-fixed condition after the clear.
+    for i in range(AUTO_PROMOTE_THRESHOLD + 1):
+        tracker.record_tier3_dispatch(
+            finding, now=now - timedelta(minutes=10 * i),
+        )
+
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+
+    # --- (a) Budget-exhaustion sweep stamps terminal_handoff_at. -----------
+    services = _StubServices(db_path)
+    try:
+        later = now + timedelta(seconds=TIER4_BUDGET_SECONDS + 600)
+        counters = cadence._sweep_tier4_budget_and_demotion(
+            services=services, now=later,
+        )
+        assert counters["tier4_budget_exhausted"] >= 1
+    finally:
+        services.close()
+
+    state = tracker.get(rch)
+    assert state is not None
+    assert state.tier4_active is False, "row should be cleared after budget exhaust"
+    assert state.terminal_handoff_at is not None, (
+        "terminal_handoff_at must be stamped before tracker.clear runs "
+        "so the gate persists across budget-exhaust"
+    )
+
+    # --- (b) Auto-promote refuses for the same hash. ---------------------
+    # Refresh dispatch history at the post-exhaust horizon so the
+    # sliding-window count is unambiguously over the threshold — this
+    # models the watchdog re-firing the same finding on the next tick.
+    refresh = later + timedelta(minutes=5)
+    for _ in range(AUTO_PROMOTE_THRESHOLD + 1):
+        tracker.record_tier3_dispatch(finding, now=refresh)
+    assert tracker.should_auto_promote(finding, now=refresh) is False, (
+        "should_auto_promote must respect terminal_handoff_at gate"
+    )
+
+    # --- (c) finding_resolved clear releases the gate. -------------------
+    cleared = tracker.clear(rch, now=refresh, reason="finding_resolved")
+    assert cleared is True
+    state_after = tracker.get(rch)
+    assert state_after is not None
+    assert state_after.terminal_handoff_at is None, (
+        "finding_resolved must NULL terminal_handoff_at so future "
+        "occurrences of the same hash can promote again"
+    )
+    # Re-arm the dispatch history (clear only resets active flags) and
+    # confirm the gate is open again.
+    later2 = refresh + timedelta(minutes=10)
+    for _ in range(AUTO_PROMOTE_THRESHOLD + 1):
+        tracker.record_tier3_dispatch(finding, now=later2)
+    assert tracker.should_auto_promote(finding, now=later2) is True, (
+        "after a finding_resolved clear the same hash must be able to "
+        "promote again on a future, distinct occurrence"
+    )
+
+
+def test_budget_exhausted_clear_preserves_terminal_handoff_at(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """``tracker.clear(reason='budget_exhausted')`` must NOT NULL the gate.
+
+    Without this, the next tick's ``should_auto_promote`` would still
+    re-greenlight the same hash because the gate it keys on was wiped.
+    """
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="demo")
+    rch = root_cause_hash(finding)
+
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    tracker.mark_terminal_handoff(rch, now=now + timedelta(hours=2))
+    tracker.clear(
+        rch, now=now + timedelta(hours=2, minutes=1),
+        reason="budget_exhausted",
+    )
+
+    state = tracker.get(rch)
+    assert state is not None
+    assert state.tier4_active is False
+    assert state.terminal_handoff_at is not None, (
+        "budget_exhausted reason must preserve the persistent gate"
+    )
+
+
+def test_clear_tier4_for_finding_releases_parked_gate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, now: datetime,
+) -> None:
+    """A real finding_resolved on a parked-gate row must release the gate.
+
+    Scenario: cascade fully escalated (tier4_active=0, terminal_handoff_at
+    set), then later the underlying condition is actually fixed and the
+    public helper observes the finding has terminally resolved. The
+    helper must NULL ``terminal_handoff_at`` so a future distinct
+    occurrence of the same hash can promote again — otherwise the row is
+    permanently gated and the cascade is dead for that hash.
+    """
+    from pollypm.plugins_builtin.core_recurring import audit_watchdog as cadence
+
+    db_path = tmp_path / "state.db"
+    _patch_workspace_db(monkeypatch, db_path)
+    tracker = Tier4PromotionTracker(db_path)
+    finding = _finding(project="demo")
+    rch = root_cause_hash(finding)
+
+    tracker.record_promotion(
+        finding, now=now, promotion_path=PROMOTION_PATH_WATCHDOG,
+    )
+    tracker.mark_terminal_handoff(rch, now=now + timedelta(hours=2))
+    tracker.clear(
+        rch, now=now + timedelta(hours=2, minutes=1),
+        reason="budget_exhausted",
+    )
+    # Sanity: row is parked (inactive + gated).
+    state = tracker.get(rch)
+    assert state is not None
+    assert state.tier4_active is False
+    assert state.terminal_handoff_at is not None
+
+    # Now the underlying finding genuinely resolves. The public helper
+    # MUST release the gate even though tier4_active is already 0.
+    cleared = cadence.clear_tier4_for_finding(
+        finding,
+        now=now + timedelta(hours=3),
+        reason="finding_cleared",
+    )
+    assert cleared is True
+    state_after = tracker.get(rch)
+    assert state_after is not None
+    assert state_after.terminal_handoff_at is None, (
+        "clear_tier4_for_finding with a resolution reason must release "
+        "a parked terminal_handoff_at gate"
+    )
+
+
+# ---------------------------------------------------------------------------
 # #1554 HIGH-2 — failed inbox write must not flip tier4_active=1.
 # ---------------------------------------------------------------------------
 

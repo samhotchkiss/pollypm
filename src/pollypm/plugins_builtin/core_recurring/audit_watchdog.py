@@ -2895,6 +2895,23 @@ def _sweep_tier4_budget_and_demotion(
                 _route_tier4_to_terminal(
                     state=state, services=services, now=now,
                 )
+                # #1997 — stamp the persistent terminal-handoff gate
+                # BEFORE clearing tier4_active. Without this, the
+                # ``tracker.clear`` below flips tier4_active to 0 and
+                # the next watchdog tick's auto-promote gate sees
+                # nothing to stop a fresh promotion on the same hash,
+                # producing an infinite re-promotion loop on a
+                # permanently-stuck finding. mark_terminal_handoff is
+                # idempotent so a partial-failure replay is safe.
+                try:
+                    tracker.mark_terminal_handoff(
+                        state.root_cause_hash, now=now,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning(
+                        "tier4: mark_terminal_handoff raised for %s",
+                        state.root_cause_hash, exc_info=True,
+                    )
                 tracker.clear(
                     state.root_cause_hash,
                     now=now,
@@ -2929,7 +2946,16 @@ def clear_tier4_for_finding(
         return False
     rch = root_cause_hash(finding)
     state = tracker.get(rch)
-    if state is None or not state.tier4_active:
+    if state is None:
+        return False
+    # #1997 — if the row is already inactive but still carries a
+    # terminal-handoff gate (the cascade has previously escalated and
+    # is currently parked), a real ``finding_resolved`` observation
+    # still needs to release the gate so a future, distinct occurrence
+    # of the same hash can promote again. ``tracker.clear`` with a
+    # resolution reason NULLs ``terminal_handoff_at`` in-place even
+    # when ``tier4_active`` is already 0.
+    if not state.tier4_active and state.terminal_handoff_at is None:
         return False
     cleared = tracker.clear(rch, now=now, reason=reason)
     if cleared:

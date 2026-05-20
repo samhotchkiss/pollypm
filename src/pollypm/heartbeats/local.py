@@ -1087,29 +1087,42 @@ class LocalHeartbeatBackend(HeartbeatBackend):
 
         # Use the structured classification engine for intervention decisions
         if not mechanical_only:
-            try:
-                signals = self._context_to_signals(context, api)
-                health = _classify_session_health(signals)
-                # #1830: route through supervisor facade for pg/sqlite parity.
-                runtime = api.supervisor.get_session_runtime(context.session_name)
-                prev = runtime.recovery_attempts if runtime else 0
-                intervention = _select_intervention(health, signals, previous_interventions=prev)
-                # #249 — work-aware interventions. These dispatch before
-                # the generic worker-triage path so the policy-chosen
-                # action actually runs.
-                if intervention and intervention.action == "resume_ping":
-                    self._apply_resume_ping(api, context, signals, intervention)
-                elif intervention and intervention.action == "prompt_pm_task_next":
-                    self._apply_prompt_pm_task_next(api, context)
-                elif intervention and context.role == "worker":
-                    # Use Haiku to decide the right action for idle workers.
-                    # The LLM reads the snapshot and classifies: push forward,
-                    # nudge, do nothing, or escalate.
-                    self._triage_stalled_worker(api, context)
-                elif intervention and intervention.action == "escalate":
-                    self._escalate(api, context, intervention.reason)
-            except Exception:  # noqa: BLE001
-                pass
+            self._dispatch_health_intervention(api, context)
+
+    def _dispatch_health_intervention(
+        self, api, context: HeartbeatSessionContext
+    ) -> None:
+        """Run the structured-signals classifier and apply the chosen intervention.
+
+        Extracted from ``_process_session`` (#1356) so the dispatch
+        table (``resume_ping`` / ``prompt_pm_task_next`` / worker
+        triage / ``escalate``) is reviewable on its own.
+
+        #249 — work-aware interventions dispatch before the generic
+        worker-triage path so the policy-chosen action actually runs.
+        Exceptions are swallowed to match the prior inline behaviour:
+        a misbehaving classifier must not crash the heartbeat tick.
+        """
+        try:
+            signals = self._context_to_signals(context, api)
+            health = _classify_session_health(signals)
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            runtime = api.supervisor.get_session_runtime(context.session_name)
+            prev = runtime.recovery_attempts if runtime else 0
+            intervention = _select_intervention(health, signals, previous_interventions=prev)
+            if intervention and intervention.action == "resume_ping":
+                self._apply_resume_ping(api, context, signals, intervention)
+            elif intervention and intervention.action == "prompt_pm_task_next":
+                self._apply_prompt_pm_task_next(api, context)
+            elif intervention and context.role == "worker":
+                # Use Haiku to decide the right action for idle workers.
+                # The LLM reads the snapshot and classifies: push forward,
+                # nudge, do nothing, or escalate.
+                self._triage_stalled_worker(api, context)
+            elif intervention and intervention.action == "escalate":
+                self._escalate(api, context, intervention.reason)
+        except Exception:  # noqa: BLE001
+            pass
 
     def _handle_persona_drift(
         self, api, context: HeartbeatSessionContext

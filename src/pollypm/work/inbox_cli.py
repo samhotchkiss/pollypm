@@ -320,6 +320,126 @@ def _message_is_actionable_default(row: dict[str, Any]) -> bool:
     return True
 
 
+def _inbox_collect_messages(
+    *, db: str, project: str | None, channel_filter: str,
+) -> list[dict[str, Any]]:
+    """Query the messages store and shape rows into display dicts."""
+    message_rows: list[dict[str, Any]] = []
+    try:
+        store = _resolve_messages_store(db)
+        filters: dict[str, Any] = dict(
+            recipient="user",
+            state="open",
+            type=["notify", "inbox_task", "alert"],
+        )
+        if project:
+            filters["scope"] = project
+        message_rows = store.query_messages(**filters)
+    except Exception as exc:  # noqa: BLE001
+        typer.echo(
+            f"Warning: inbox messages query failed ({exc}); "
+            f"falling back to work-service tasks only.",
+            err=True,
+        )
+
+    # Channel filter (#754): ``inbox`` (default) hides dev-channel
+    # messages, ``dev`` shows only dev-channel, ``all`` shows both.
+    if channel_filter != "all":
+        message_rows = [
+            r for r in message_rows
+            if _message_has_channel_label(r, channel_filter)
+        ]
+    return [_message_row_to_display(r) for r in message_rows]
+
+
+def _inbox_split_notifications(
+    display_messages: list[dict[str, Any]], *, show_all: bool,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split ``notify``-type messages into hidden vs actionable buckets."""
+    notification_messages: list[dict[str, Any]] = []
+    actionable_messages: list[dict[str, Any]] = display_messages
+    if not show_all:
+        actionable_messages = []
+        for m in display_messages:
+            if (m.get("type") or "").lower() == "notify":
+                notification_messages.append(m)
+            else:
+                actionable_messages.append(m)
+    return actionable_messages, notification_messages
+
+
+def _inbox_render_text_listing(
+    *,
+    tasks: list,
+    actionable_messages: list[dict[str, Any]],
+    notification_messages: list[dict[str, Any]],
+    display_messages: list[dict[str, Any]],
+    apply_curated_filter: bool,
+    awaits_user_only: bool,
+    watchdog_collapsed: int,
+) -> None:
+    """Render the text-mode ``pm inbox`` listing + footer counts."""
+    total_visible = len(tasks) + len(actionable_messages)
+    total_all = len(tasks) + len(display_messages)
+    item_word = "item" if total_visible == 1 else "items"
+    typer.echo(f"Inbox: {total_visible} {item_word}")
+    if total_all == 0:
+        if apply_curated_filter and not awaits_user_only:
+            # #1806 — curated lens emptied the listing; tell the user
+            # how to widen it rather than the legacy "nothing here" line.
+            typer.echo(
+                "No messages waiting for you. "
+                "Pass --drafts to include scratch drafts / FYIs, or "
+                "--all to show every row."
+            )
+        else:
+            typer.echo("No messages waiting for you.")
+        return
+    if total_visible == 0:
+        # Every row in scope is a hidden notification; announce the
+        # footer alone so the user knows how to surface them.
+        hidden_n = len(notification_messages)
+        word = "notification" if hidden_n == 1 else "notifications"
+        typer.echo(
+            f"… {hidden_n} {word} hidden. Use --all to show."
+        )
+        return
+
+    typer.echo(f"{'ID':<20} {'Type':<10} {'Priority':<10} {'Title'}")
+    typer.echo("-" * 70)
+    for m in actionable_messages:
+        title = _format_inbox_title(m["title"])
+        # #1013 — append "9x - last seen 2d ago" when the row has
+        # dedup state (count > 1). Empty suffix is the no-op default
+        # so the column layout stays stable for non-dedup rows.
+        suffix = m.get("dedup_suffix") or ""
+        if suffix:
+            title = f"{title} ({suffix})"
+        typer.echo(
+            f"{m['id']:<20} {m['type']:<10} "
+            f"{m['priority']:<10} {title}"
+        )
+    for t in tasks:
+        title = _format_inbox_title(t.title or "")
+        typer.echo(
+            f"{t.task_id:<20} {t.work_status.value:<10} "
+            f"{t.priority.value:<10} {title}"
+        )
+
+    if notification_messages:
+        hidden_n = len(notification_messages)
+        word = "notification" if hidden_n == 1 else "notifications"
+        typer.echo(
+            f"… {hidden_n} {word} hidden. Use --all to show."
+        )
+    if watchdog_collapsed:
+        word = "repeat" if watchdog_collapsed == 1 else "repeats"
+        typer.echo(
+            f"… {watchdog_collapsed} watchdog {word} collapsed. "
+            f"Use --include-watchdog-repeats to show."
+        )
+
+
 @inbox_app.callback(invoke_without_command=True)
 def inbox_root(
     ctx: typer.Context,
@@ -441,67 +561,26 @@ def inbox_root(
     # mirrors the legacy "show me everything" mental model.
     show_drafts = drafts or include_inbox or show_all
     dedupe_watchdog = not (include_watchdog_repeats or show_all)
+    apply_curated_filter = not show_drafts
 
-    # --- Messages path (unified Store, #340 writers) -------------------
-    # Backend-aware: pg vs sqlite is decided by ``[storage].backend``
-    # via ``_resolve_messages_store`` (#1790). The singleton is shared
-    # process-wide, so do NOT close it.
-    message_rows: list[dict[str, Any]] = []
-    try:
-        store = _resolve_messages_store(db)
-        filters: dict[str, Any] = dict(
-            recipient="user",
-            state="open",
-            type=["notify", "inbox_task", "alert"],
-        )
-        if project:
-            filters["scope"] = project
-        message_rows = store.query_messages(**filters)
-    except Exception as exc:  # noqa: BLE001
-        typer.echo(
-            f"Warning: inbox messages query failed ({exc}); "
-            f"falling back to work-service tasks only.",
-            err=True,
-        )
-
-    # Channel filter (#754): ``inbox`` (default) hides dev-channel
-    # messages, ``dev`` shows only dev-channel, ``all`` shows both.
-    if channel_filter != "all":
-        message_rows = [
-            r for r in message_rows
-            if _message_has_channel_label(r, channel_filter)
-        ]
-
-    display_messages = [_message_row_to_display(r) for r in message_rows]
+    display_messages = _inbox_collect_messages(
+        db=db,
+        project=project,
+        channel_filter=channel_filter,
+    )
 
     # --- Tasks path (work-service, chat flow) --------------------------
     svc = _svc(db, project=project)
     tasks = inbox_tasks(svc, project=project)
 
     # #1013 — hide ``pm notify``-backed stub tasks (chat-flow rows
-    # carrying the ``notify`` label) by default. They're announcements
-    # with no node-level transition affordance and the architect's
-    # plan_review handoff lands as one of them. The cockpit inbox pane
-    # still surfaces them via its specialised actions; the CLI listing
-    # has no equivalent affordance, so listing them just buries the
-    # genuinely actionable rows. ``--drafts``/``--include-inbox``/``--all``
-    # opt back in.
+    # carrying the ``notify`` label) by default.
     if not show_drafts:
         from pollypm.notify_task import is_notify_inbox_task
         tasks = [task for task in tasks if not is_notify_inbox_task(task)]
 
-    # #1806 — default-lens curation. ``pm inbox`` (no flags) and
-    # ``pm inbox --awaits-user`` are equivalent: both run the curated
-    # actionable filter that mirrors the cockpit's default inbox lens.
-    # Drop the filter when ``--drafts`` / ``--include-inbox`` / ``--all``
-    # opts the user back into the wider view. ``--awaits-user`` is kept
-    # as an explicit equivalent to the default for scriptability.
-    apply_curated_filter = not show_drafts
+    # #1806 — default-lens curation.
     if apply_curated_filter or awaits_user_only:
-        # Tasks pass through the canonical ``awaits_user`` predicate
-        # (which reads ``Task.kind``); messages pass through both the
-        # predicate AND the legacy-corpus-aware actionable filter so a
-        # pre-#1570-backfill DB doesn't degrade to "everything fails open".
         tasks = [task for task in tasks if awaits_user(task)]
         display_messages = [
             m for m in display_messages
@@ -510,30 +589,16 @@ def inbox_root(
         ]
 
     # #1805 — collapse repeat watchdog ``queue_without_motion`` rows.
-    # The query layer returns rows newest-first, so the kept row per
-    # ``(rule, project)`` key is the most recent occurrence; older
-    # repeats are hidden and announced in the footer.
     watchdog_collapsed = 0
     if dedupe_watchdog:
         display_messages, watchdog_collapsed = _dedupe_watchdog_repeats(
             display_messages,
         )
 
-    # #1027 — default-hide pure ``notify``-type messages (completion
-    # announcements, heartbeat alerts, "Done:" / "Repeated stale review
-    # ping" rows) so the single actionable row the user needs to act on
-    # isn't buried under 30 historical FYIs. ``--all`` opts back in.
-    # Counted before split so the footer can announce how many were
-    # collapsed.
-    notification_messages: list[dict[str, Any]] = []
-    actionable_messages: list[dict[str, Any]] = display_messages
-    if not show_all:
-        actionable_messages = []
-        for m in display_messages:
-            if (m.get("type") or "").lower() == "notify":
-                notification_messages.append(m)
-            else:
-                actionable_messages.append(m)
+    # #1027 — split actionable vs hidden notification rows.
+    actionable_messages, notification_messages = _inbox_split_notifications(
+        display_messages, show_all=show_all,
+    )
 
     if output_json:
         # JSON consumers need the canonical "everything we know about"
@@ -552,65 +617,15 @@ def inbox_root(
         )
         return
 
-    total_visible = len(tasks) + len(actionable_messages)
-    total_all = len(tasks) + len(display_messages)
-    item_word = "item" if total_visible == 1 else "items"
-    typer.echo(f"Inbox: {total_visible} {item_word}")
-    if total_all == 0:
-        if apply_curated_filter and not awaits_user_only:
-            # #1806 — curated lens emptied the listing; tell the user
-            # how to widen it rather than the legacy "nothing here" line.
-            typer.echo(
-                "No messages waiting for you. "
-                "Pass --drafts to include scratch drafts / FYIs, or "
-                "--all to show every row."
-            )
-        else:
-            typer.echo("No messages waiting for you.")
-        return
-    if total_visible == 0:
-        # Every row in scope is a hidden notification; announce the
-        # footer alone so the user knows how to surface them.
-        hidden_n = len(notification_messages)
-        word = "notification" if hidden_n == 1 else "notifications"
-        typer.echo(
-            f"… {hidden_n} {word} hidden. Use --all to show."
-        )
-        return
-
-    typer.echo(f"{'ID':<20} {'Type':<10} {'Priority':<10} {'Title'}")
-    typer.echo("-" * 70)
-    for m in actionable_messages:
-        title = _format_inbox_title(m["title"])
-        # #1013 — append "9x - last seen 2d ago" when the row has
-        # dedup state (count > 1). Empty suffix is the no-op default
-        # so the column layout stays stable for non-dedup rows.
-        suffix = m.get("dedup_suffix") or ""
-        if suffix:
-            title = f"{title} ({suffix})"
-        typer.echo(
-            f"{m['id']:<20} {m['type']:<10} "
-            f"{m['priority']:<10} {title}"
-        )
-    for t in tasks:
-        title = _format_inbox_title(t.title or "")
-        typer.echo(
-            f"{t.task_id:<20} {t.work_status.value:<10} "
-            f"{t.priority.value:<10} {title}"
-        )
-
-    if notification_messages:
-        hidden_n = len(notification_messages)
-        word = "notification" if hidden_n == 1 else "notifications"
-        typer.echo(
-            f"… {hidden_n} {word} hidden. Use --all to show."
-        )
-    if watchdog_collapsed:
-        word = "repeat" if watchdog_collapsed == 1 else "repeats"
-        typer.echo(
-            f"… {watchdog_collapsed} watchdog {word} collapsed. "
-            f"Use --include-watchdog-repeats to show."
-        )
+    _inbox_render_text_listing(
+        tasks=tasks,
+        actionable_messages=actionable_messages,
+        notification_messages=notification_messages,
+        display_messages=display_messages,
+        apply_curated_filter=apply_curated_filter,
+        awaits_user_only=awaits_user_only,
+        watchdog_collapsed=watchdog_collapsed,
+    )
 
 
 @inbox_app.command("show")

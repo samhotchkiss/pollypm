@@ -94,9 +94,42 @@ class State:
     # inbox "bold subject"). The brightest neutral in the palette.
     HEADING = "#eef2f4"
 
+    # Topbar / panel-title text — one notch more blue than ``HEADING``.
+    # Activity feed + several other panels use this for the ``[b]Activity[/b]``
+    # style topbar string so the panel title reads as "current view" not
+    # "current row".
+    HEADING_BRIGHT = "#eef6ff"
+
     # Body / label color for non-selected rail rows. One step dimmer
     # than HEADING.
     LABEL = "#b8c4cf"
+
+    # Body text under a selected/highlighted row — one step dimmer than
+    # ``HEADING`` but still readable, used for inbox plan-review summary
+    # text and other multi-line body content where ``LABEL`` would feel
+    # too prominent and ``MUTED`` too dim.
+    BODY = "#c8d2da"
+
+    # Body text for tabular rows (activity feed cells, list-pane rows).
+    # One step brighter than ``BODY`` so cells read as data, not commentary.
+    BODY_BRIGHT = "#d6dee5"
+
+    # Tonal variants used for read/dim states. Promoted from inline hex
+    # in the inbox formatter so all colors flow through ``State.*``:
+    # - ``LABEL_DIM`` — read version of ``LABEL`` (judgment-call bullets)
+    # - ``MUTED_DIM`` — extra-dim age text on reply rows (one step below
+    #   ``MUTED`` so reply metadata sits visually below the parent row)
+    # - ``WAITING_DIM`` — dimmed ``WAITING`` for read plan-review heading
+    # - ``ATTENTION_BRIGHT`` — warmer orange prefix for the rejection
+    #   feedback (🔄) emoji where ``WAITING`` would feel too dull
+    # - ``NEUTRAL`` — warm gray used as the unknown-event fallback in the
+    #   activity feed AND the "deleted project" badge in the inbox; lives
+    #   between ``LABEL`` and ``MUTED`` in tone
+    LABEL_DIM = "#a9b4be"
+    MUTED_DIM = "#586773"
+    WAITING_DIM = "#d6a93f"
+    ATTENTION_BRIGHT = "#ffb454"
+    NEUTRAL = "#97a6b2"
 
 
 class Glyph:

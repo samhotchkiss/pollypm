@@ -26,32 +26,38 @@ from textual.widgets import DataTable, Input, Static
 
 from pollypm.cockpit_alerts import _action_view_alerts
 from pollypm.cockpit_palette import _open_keyboard_help
+from pollypm.cockpit_theme import State
 from pollypm.config import load_config
 
 
+# Event-type to semantic-color map. Rich-markup callers pass the returned
+# hex string straight into a ``[<color>]…[/<color>]`` markup span. Sourced
+# from ``cockpit_theme.State`` so a palette tweak lands here without
+# touching this file — see the 2026-05-20 audit (PR #1988) for why the
+# inline hex literals lived in five duplicated copies before.
 _ACTIVITY_TYPE_COLOURS: dict[str, str] = {
-    "task.done": "#3ddc84",
-    "task_done": "#3ddc84",
-    "task.approved": "#3ddc84",
-    "approve": "#3ddc84",
-    "approved": "#3ddc84",
-    "completed": "#3ddc84",
-    "task.created": "#f0c45a",
-    "task_created": "#f0c45a",
-    "task.queued": "#f0c45a",
-    "queued": "#f0c45a",
-    "created": "#f0c45a",
-    "alert": "#ff5f6d",
-    "error": "#ff5f6d",
-    "stuck": "#ff5f6d",
-    "rejection": "#ff5f6d",
-    "rejected": "#ff5f6d",
-    "state_drift": "#ff5f6d",
-    "persona_swap": "#ff5f6d",
-    "heartbeat": "#6b7a88",
-    "ran": "#6b7a88",
-    "tick": "#6b7a88",
-    "poll": "#6b7a88",
+    "task.done": State.WORKING,
+    "task_done": State.WORKING,
+    "task.approved": State.WORKING,
+    "approve": State.WORKING,
+    "approved": State.WORKING,
+    "completed": State.WORKING,
+    "task.created": State.WAITING,
+    "task_created": State.WAITING,
+    "task.queued": State.WAITING,
+    "queued": State.WAITING,
+    "created": State.WAITING,
+    "alert": State.BLOCKED,
+    "error": State.BLOCKED,
+    "stuck": State.BLOCKED,
+    "rejection": State.BLOCKED,
+    "rejected": State.BLOCKED,
+    "state_drift": State.BLOCKED,
+    "persona_swap": State.BLOCKED,
+    "heartbeat": State.MUTED,
+    "ran": State.MUTED,
+    "tick": State.MUTED,
+    "poll": State.MUTED,
 }
 
 
@@ -62,18 +68,18 @@ def _activity_type_colour(kind: str, severity: str | None = None) -> str:
     if colour is not None:
         return colour
     if "reject" in lowered or "drift" in lowered or "swap" in lowered:
-        return "#ff5f6d"
+        return State.BLOCKED
     if "done" in lowered or "approve" in lowered or "complete" in lowered:
-        return "#3ddc84"
+        return State.WORKING
     if "create" in lowered or "queue" in lowered:
-        return "#f0c45a"
+        return State.WAITING
     if "heartbeat" in lowered or "tick" in lowered or "poll" in lowered or "ran" in lowered:
-        return "#6b7a88"
+        return State.MUTED
     if severity == "critical":
-        return "#ff5f6d"
+        return State.BLOCKED
     if severity == "recommendation":
-        return "#f0c45a"
-    return "#97a6b2"
+        return State.WAITING
+    return State.NEUTRAL
 
 
 def _format_activity_relative(timestamp: str) -> str:
@@ -448,7 +454,7 @@ class PollyActivityFeedApp(App[None]):
     def _paint_loading_skeleton(self) -> None:
         """Render a minimal "Loading…" placeholder before any IO."""
         try:
-            self.topbar.update("[b #eef6ff]Activity[/b #eef6ff]")
+            self.topbar.update(f"[b {State.HEADING_BRIGHT}]Activity[/b {State.HEADING_BRIGHT}]")
         except Exception:  # noqa: BLE001
             pass
         try:
@@ -494,7 +500,7 @@ class PollyActivityFeedApp(App[None]):
         self._initial_load_done = True
         try:
             self.topbar.update(
-                f"[#ff5f6d]Error loading activity:[/#ff5f6d] {_escape(error)}"
+                f"[{State.BLOCKED}]Error loading activity:[/{State.BLOCKED}] {_escape(error)}"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -507,7 +513,7 @@ class PollyActivityFeedApp(App[None]):
             entries = self._gather()
         except Exception as exc:  # noqa: BLE001
             self.topbar.update(
-                f"[#ff5f6d]Error loading activity:[/#ff5f6d] {_escape(str(exc))}"
+                f"[{State.BLOCKED}]Error loading activity:[/{State.BLOCKED}] {_escape(str(exc))}"
             )
             return
         self._entries = list(entries)[: self.MAX_ROWS_IN_MEMORY]
@@ -550,7 +556,7 @@ class PollyActivityFeedApp(App[None]):
     def _refresh_failed(self, error: str) -> None:
         try:
             self.topbar.update(
-                f"[#ff5f6d]Error loading activity:[/#ff5f6d] {_escape(error)}"
+                f"[{State.BLOCKED}]Error loading activity:[/{State.BLOCKED}] {_escape(error)}"
             )
         except Exception:  # noqa: BLE001
             pass
@@ -661,10 +667,10 @@ class PollyActivityFeedApp(App[None]):
             hidden_noise_count = sum(
                 1 for entry in self._entries if _is_low_signal_activity(entry)
             )
-        title_bits = ["[b #eef6ff]Activity[/b #eef6ff]"]
+        title_bits = [f"[b {State.HEADING_BRIGHT}]Activity[/b {State.HEADING_BRIGHT}]"]
         if self._filter_project:
             title_bits.append(
-                f"[#5b8aff]\u00b7 project: [b]{_escape(self._filter_project)}[/b][/#5b8aff]"
+                f"[{State.INFO}]\u00b7 project: [b]{_escape(self._filter_project)}[/b][/{State.INFO}]"
             )
         self.topbar.update("  ".join(title_bits))
 
@@ -674,11 +680,11 @@ class PollyActivityFeedApp(App[None]):
         ]
         filter_description = self._describe_filters()
         if filter_description:
-            chips.append(f"[#97a6b2]filters: {filter_description}[/#97a6b2]")
+            chips.append(f"[{State.NEUTRAL}]filters: {filter_description}[/{State.NEUTRAL}]")
         if hidden_noise_count:
             chips.append(f"[dim]{hidden_noise_count} system noise hidden[/dim]")
         chips.append(
-            "[#3ddc84]follow on[/#3ddc84]" if self._follow_on else "[dim]follow off[/dim]"
+            f"[{State.WORKING}]follow on[/{State.WORKING}]" if self._follow_on else "[dim]follow off[/dim]"
         )
         self.counters.update("  \u00b7  ".join(chips))
 
@@ -712,14 +718,14 @@ class PollyActivityFeedApp(App[None]):
     def _render_table(self, rows: list) -> None:
         self.table.clear()
         for entry in rows:
-            time_text = Text(_format_activity_relative(entry.timestamp), style="#97a6b2")
+            time_text = Text(_format_activity_relative(entry.timestamp), style=State.NEUTRAL)
             project_label = entry.project or "\u2014"
             if self._filter_project and (entry.project or "") == self._filter_project:
-                project_text = Text(project_label, style="bold #eef6ff")
+                project_text = Text(project_label, style=f"bold {State.HEADING_BRIGHT}")
             elif entry.project:
-                project_text = Text(project_label, style="#5b8aff")
+                project_text = Text(project_label, style=State.INFO)
             else:
-                project_text = Text(project_label, style="#6b7a88")
+                project_text = Text(project_label, style=State.MUTED)
             verb_text = entry.verb or entry.kind or ""
             # When the summary literally equals the verb/kind (the
             # legacy ``_fallback_summary`` path picks the event's own
@@ -741,9 +747,9 @@ class PollyActivityFeedApp(App[None]):
             self.table.add_row(
                 time_text,
                 project_text,
-                Text(entry.actor or "system", style="#d6dee5"),
+                Text(entry.actor or "system", style=State.BODY_BRIGHT),
                 Text(verb_text, style=_activity_type_colour(entry.kind or "", entry.severity)),
-                Text(_truncate_summary(summary_text), style="#d6dee5"),
+                Text(_truncate_summary(summary_text), style=State.BODY_BRIGHT),
                 key=entry.id,
             )
 

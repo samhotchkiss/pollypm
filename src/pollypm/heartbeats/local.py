@@ -794,6 +794,189 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         api.record_observation(context)
         api.clear_alert(context.session_name, "missing_window")
 
+        stopped_reason = "Pane process is stopped (SIGSTOP)"
+        self._handle_pane_health_alerts(api, context, alerts, stopped_reason)
+
+        # Sessions parked at a prompt are legitimately idle — not an alert condition.
+        # Only the suspected_loop detector (below) alerts on sustained identical snapshots.
+        api.clear_alert(context.session_name, "idle_output")
+
+        alerts.extend(
+            self._handle_same_snapshot_stall(api, context, mechanical_only=mechanical_only)
+        )
+
+        alerts.extend(self._handle_persona_drift(api, context))
+
+        status_locked = self._handle_auth_failure(api, context, alerts)
+
+        if context.pane_dead:
+            status_locked = True
+
+        if context.pane_stopped:
+            verdict, reason = ("stuck", stopped_reason)
+            api.clear_alert(context.session_name, "needs_followup")
+            if not status_locked:
+                self._set_session_status(
+                    api,
+                    context,
+                    "stuck",
+                    reason=reason,
+                )
+        elif mechanical_only:
+            verdict, reason = ("healthy", "Heartbeat supervisor only checks mechanical session health")
+            api.clear_alert(context.session_name, "needs_followup")
+            if not status_locked:
+                self._set_session_status(api, context, "healthy", reason=reason)
+        else:
+            verdict, reason = self._classify(context)
+            if verdict == "needs_followup":
+                _emit_routed_alert(
+                    api,
+                    session_name=context.session_name,
+                    alert_type="needs_followup",
+                    severity="warn",
+                    message=reason,
+                    subject=f"{context.session_name} needs follow-up",
+                )
+                if not status_locked:
+                    self._set_session_status(
+                        api,
+                        context,
+                        "needs_followup",
+                        reason=reason,
+                    )
+                # Alerts are visible in the cockpit and via `pm alerts`.
+                # No need to inject messages into the operator chat —
+                # the operator gets nudged only when *it* is stalled.
+                alerts.append("needs_followup")
+            else:
+                api.clear_alert(context.session_name, "needs_followup")
+                if not status_locked:
+                    if verdict == "blocked":
+                        self._set_session_status(
+                            api,
+                            context,
+                            "waiting_on_user",
+                            reason=reason,
+                        )
+                    elif verdict == "done":
+                        self._set_session_status(api, context, "idle", reason=reason)
+                    else:
+                        self._set_session_status(
+                            api,
+                            context,
+                            "healthy",
+                            reason=reason,
+                        )
+
+        # Progress-signal accounting (#1501). The classifier treats
+        # "no new transcript output" as the inconclusive bucket, but on
+        # its own that's silent — ``pm status`` reports ``healthy
+        # running=yes`` indefinitely. Track consecutive ticks of that
+        # state for non-event-driven roles, and after the threshold
+        # prepend ``flow=quiet:`` so operators can distinguish "alive
+        # and silent" from "actively producing output." The counter is
+        # persisted in :class:`HeartbeatCursor`.
+        prev_quiet = (
+            context.cursor.quiet_tick_count
+            if context.cursor is not None else 0
+        )
+        if context.role in _PROGRESS_SIGNAL_EXEMPT_ROLES or mechanical_only:
+            quiet_tick_count = 0
+        elif verdict == "unclear" and reason == _NO_TRANSCRIPT_REASON:
+            quiet_tick_count = prev_quiet + 1
+        else:
+            quiet_tick_count = 0
+
+        if (
+            quiet_tick_count >= _QUIET_TICKS_FOR_FLOW_MARKER
+            and not reason.startswith(FLOW_QUIET_REASON_PREFIX)
+            and not status_locked
+        ):
+            flow_quiet_reason = f"{FLOW_QUIET_REASON_PREFIX}{reason}"
+            self._set_session_status(
+                api,
+                context,
+                "healthy",
+                reason=flow_quiet_reason,
+            )
+            reason = flow_quiet_reason
+
+        api.record_checkpoint(context, alerts=alerts)
+        api.update_cursor(
+            context.session_name,
+            source_path=context.source_path,
+            last_offset=context.source_bytes,
+            snapshot_hash=context.snapshot_hash,
+            verdict=verdict,
+            reason=reason,
+            quiet_tick_count=quiet_tick_count,
+        )
+
+        # Use the structured classification engine for intervention decisions
+        if not mechanical_only:
+            self._dispatch_health_intervention(api, context)
+
+    def _dispatch_health_intervention(
+        self, api, context: HeartbeatSessionContext
+    ) -> None:
+        """Run the structured-signals classifier and apply the chosen intervention.
+
+        Extracted from ``_process_session`` (#1356) so the dispatch
+        table (``resume_ping`` / ``prompt_pm_task_next`` / worker
+        triage / ``escalate``) is reviewable on its own.
+
+        #249 — work-aware interventions dispatch before the generic
+        worker-triage path so the policy-chosen action actually runs.
+        Exceptions are swallowed to match the prior inline behaviour:
+        a misbehaving classifier must not crash the heartbeat tick.
+        """
+        try:
+            signals = self._context_to_signals(context, api)
+            health = _classify_session_health(signals)
+            # #1830: route through supervisor facade for pg/sqlite parity.
+            runtime = api.supervisor.get_session_runtime(context.session_name)
+            prev = runtime.recovery_attempts if runtime else 0
+            intervention = _select_intervention(health, signals, previous_interventions=prev)
+            if intervention and intervention.action == "resume_ping":
+                self._apply_resume_ping(api, context, signals, intervention)
+            elif intervention and intervention.action == "prompt_pm_task_next":
+                self._apply_prompt_pm_task_next(api, context)
+            elif intervention and context.role == "worker":
+                # Use Haiku to decide the right action for idle workers.
+                # The LLM reads the snapshot and classifies: push forward,
+                # nudge, do nothing, or escalate.
+                self._triage_stalled_worker(api, context)
+            elif intervention and intervention.action == "escalate":
+                self._escalate(api, context, intervention.reason)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _handle_pane_health_alerts(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        alerts: list[str],
+        stopped_reason: str,
+    ) -> None:
+        """Run the four pane-level health checks and emit/clear their alerts.
+
+        Extracted from ``_process_session`` (#1356). Each check is
+        independent and either emits a routed alert + status update +
+        appends to ``alerts``, or clears the corresponding alert:
+
+          * ``pane_dead`` — whole tmux pane has exited, kick recovery.
+          * ``shell_returned`` — pane is back at a shell prompt
+            (Claude/codex process exited but tmux pane still alive).
+          * Role-respawn-on-crash (#1506) — when shell-returned coincides
+            with pending work for a crash-recovery role; either escalates
+            via ``crash_loop`` or kicks ``role_crashed`` recovery.
+          * ``pane_stopped`` — pane process is SIGSTOPped.
+
+        ``alerts`` is mutated in place to match the prior inline
+        behaviour. ``stopped_reason`` is passed in so the verdict block
+        in the caller can reuse the same string.
+        """
         if context.pane_dead:
             _emit_routed_alert(
                 api,
@@ -903,7 +1086,6 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         else:
             api.clear_alert(context.session_name, "crash_loop")
 
-        stopped_reason = "Pane process is stopped (SIGSTOP)"
         if context.pane_stopped:
             _emit_routed_alert(
                 api,
@@ -924,18 +1106,28 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         else:
             api.clear_alert(context.session_name, "pane_stopped")
 
-        # Sessions parked at a prompt are legitimately idle — not an alert condition.
-        # Only the suspected_loop detector (below) alerts on sustained identical snapshots.
-        api.clear_alert(context.session_name, "idle_output")
+    def _handle_auth_failure(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        alerts: list[str],
+    ) -> bool:
+        """Detect provider auth failures in the live transcript and react.
 
-        alerts.extend(
-            self._handle_same_snapshot_stall(api, context, mechanical_only=mechanical_only)
-        )
-
-        alerts.extend(self._handle_persona_drift(api, context))
-
-        combined_text = "\n".join(part for part in [context.transcript_delta, context.pane_text] if part).lower()
-        status_locked = False
+        Extracted from ``_process_session`` (#1356). When a known
+        auth-broken pattern is present in the recent pane/transcript
+        text, this emits the routed alert, marks the underlying
+        provider account broken, pins the session status, kicks off
+        the recovery ladder (#1437), and returns ``True`` so the
+        caller can avoid further status writes that would clobber the
+        ``auth_broken`` pin. When no pattern matches, the
+        ``auth_broken`` alert (if any) is cleared and ``False`` is
+        returned. Appends to ``alerts`` in place to match the prior
+        inline behaviour.
+        """
+        combined_text = "\n".join(
+            part for part in [context.transcript_delta, context.pane_text] if part
+        ).lower()
         if any(pattern in combined_text for pattern in self._AUTH_FAILURE_PATTERNS):
             _emit_routed_alert(
                 api,
@@ -963,7 +1155,6 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 reason="Authentication failure reported",
             )
             alerts.append("auth_broken")
-            status_locked = True
             # #1437 — without this call the recovery ladder never fires
             # for per-task workers that hit an auth-block on their
             # provider account. The heartbeat would mark the account
@@ -978,138 +1169,9 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 failure_type="auth_broken",
                 message="Authentication failure reported",
             )
-        else:
-            api.clear_alert(context.session_name, "auth_broken")
-
-        if context.pane_dead:
-            status_locked = True
-
-        if context.pane_stopped:
-            verdict, reason = ("stuck", stopped_reason)
-            api.clear_alert(context.session_name, "needs_followup")
-            if not status_locked:
-                self._set_session_status(
-                    api,
-                    context,
-                    "stuck",
-                    reason=reason,
-                )
-        elif mechanical_only:
-            verdict, reason = ("healthy", "Heartbeat supervisor only checks mechanical session health")
-            api.clear_alert(context.session_name, "needs_followup")
-            if not status_locked:
-                self._set_session_status(api, context, "healthy", reason=reason)
-        else:
-            verdict, reason = self._classify(context)
-            if verdict == "needs_followup":
-                _emit_routed_alert(
-                    api,
-                    session_name=context.session_name,
-                    alert_type="needs_followup",
-                    severity="warn",
-                    message=reason,
-                    subject=f"{context.session_name} needs follow-up",
-                )
-                if not status_locked:
-                    self._set_session_status(
-                        api,
-                        context,
-                        "needs_followup",
-                        reason=reason,
-                    )
-                # Alerts are visible in the cockpit and via `pm alerts`.
-                # No need to inject messages into the operator chat —
-                # the operator gets nudged only when *it* is stalled.
-                alerts.append("needs_followup")
-            else:
-                api.clear_alert(context.session_name, "needs_followup")
-                if not status_locked:
-                    if verdict == "blocked":
-                        self._set_session_status(
-                            api,
-                            context,
-                            "waiting_on_user",
-                            reason=reason,
-                        )
-                    elif verdict == "done":
-                        self._set_session_status(api, context, "idle", reason=reason)
-                    else:
-                        self._set_session_status(
-                            api,
-                            context,
-                            "healthy",
-                            reason=reason,
-                        )
-
-        # Progress-signal accounting (#1501). The classifier treats
-        # "no new transcript output" as the inconclusive bucket, but on
-        # its own that's silent — ``pm status`` reports ``healthy
-        # running=yes`` indefinitely. Track consecutive ticks of that
-        # state for non-event-driven roles, and after the threshold
-        # prepend ``flow=quiet:`` so operators can distinguish "alive
-        # and silent" from "actively producing output." The counter is
-        # persisted in :class:`HeartbeatCursor`.
-        prev_quiet = (
-            context.cursor.quiet_tick_count
-            if context.cursor is not None else 0
-        )
-        if context.role in _PROGRESS_SIGNAL_EXEMPT_ROLES or mechanical_only:
-            quiet_tick_count = 0
-        elif verdict == "unclear" and reason == _NO_TRANSCRIPT_REASON:
-            quiet_tick_count = prev_quiet + 1
-        else:
-            quiet_tick_count = 0
-
-        if (
-            quiet_tick_count >= _QUIET_TICKS_FOR_FLOW_MARKER
-            and not reason.startswith(FLOW_QUIET_REASON_PREFIX)
-            and not status_locked
-        ):
-            flow_quiet_reason = f"{FLOW_QUIET_REASON_PREFIX}{reason}"
-            self._set_session_status(
-                api,
-                context,
-                "healthy",
-                reason=flow_quiet_reason,
-            )
-            reason = flow_quiet_reason
-
-        api.record_checkpoint(context, alerts=alerts)
-        api.update_cursor(
-            context.session_name,
-            source_path=context.source_path,
-            last_offset=context.source_bytes,
-            snapshot_hash=context.snapshot_hash,
-            verdict=verdict,
-            reason=reason,
-            quiet_tick_count=quiet_tick_count,
-        )
-
-        # Use the structured classification engine for intervention decisions
-        if not mechanical_only:
-            try:
-                signals = self._context_to_signals(context, api)
-                health = _classify_session_health(signals)
-                # #1830: route through supervisor facade for pg/sqlite parity.
-                runtime = api.supervisor.get_session_runtime(context.session_name)
-                prev = runtime.recovery_attempts if runtime else 0
-                intervention = _select_intervention(health, signals, previous_interventions=prev)
-                # #249 — work-aware interventions. These dispatch before
-                # the generic worker-triage path so the policy-chosen
-                # action actually runs.
-                if intervention and intervention.action == "resume_ping":
-                    self._apply_resume_ping(api, context, signals, intervention)
-                elif intervention and intervention.action == "prompt_pm_task_next":
-                    self._apply_prompt_pm_task_next(api, context)
-                elif intervention and context.role == "worker":
-                    # Use Haiku to decide the right action for idle workers.
-                    # The LLM reads the snapshot and classifies: push forward,
-                    # nudge, do nothing, or escalate.
-                    self._triage_stalled_worker(api, context)
-                elif intervention and intervention.action == "escalate":
-                    self._escalate(api, context, intervention.reason)
-            except Exception:  # noqa: BLE001
-                pass
+            return True
+        api.clear_alert(context.session_name, "auth_broken")
+        return False
 
     def _handle_persona_drift(
         self, api, context: HeartbeatSessionContext

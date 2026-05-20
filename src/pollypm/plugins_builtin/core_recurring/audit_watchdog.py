@@ -2061,6 +2061,12 @@ def _create_operator_inbox_task(
                 initial_dedup_payload(payload, dedup_key)
                 if dedup_key else payload
             )
+            # #1915 fix — dedup row MUST stay live ("open") so the
+            # next tick's ``find_open_dedup_message`` can collapse onto
+            # it via ``bump_dedup_message``. Pre-fix this was
+            # ``state="closed"`` and the dedup query (which only scans
+            # ``state in ('open', 'staged')``) never matched, so every
+            # tick stacked a new notify row + chat task.
             message_id = store.enqueue_message(
                 type="notify",
                 tier="immediate",
@@ -2071,7 +2077,7 @@ def _create_operator_inbox_task(
                 scope=project_key,
                 labels=["notify", "watchdog"],
                 payload=seeded_payload,
-                state="closed",
+                state="open",
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
 
@@ -2266,6 +2272,12 @@ def _create_operator_tier4_inbox_task(
                 initial_dedup_payload(payload, dedup_key)
                 if dedup_key else payload
             )
+            # #1915 fix — dedup row MUST stay live ("open") so the
+            # next tick's ``find_open_dedup_message`` can collapse onto
+            # it via ``bump_dedup_message``. Pre-fix this was
+            # ``state="closed"`` and the dedup query (which only scans
+            # ``state in ('open', 'staged')``) never matched, so every
+            # tick stacked a new notify row + chat task.
             message_id = store.enqueue_message(
                 type="notify",
                 tier="immediate",
@@ -2276,7 +2288,7 @@ def _create_operator_tier4_inbox_task(
                 scope=project_key,
                 labels=["notify", "watchdog", "tier4"],
                 payload=seeded_payload,
-                state="closed",
+                state="open",
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
 

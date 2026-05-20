@@ -8744,7 +8744,7 @@ class PollyInboxApp(App[None]):
             task, labels=labels,
         )
         project_key = task.project
-        from pollypm.plugins_builtin.project_planning.proposals import (
+        from pollypm.project_planning_protocol import (
             accept_proposal as _accept_helper,
         )
         # #1101: unified resolver.
@@ -8823,11 +8823,9 @@ class PollyInboxApp(App[None]):
             self.reply_input.value = ""
             self.list_view.focus()
             return
-        from pollypm.plugins_builtin.project_planning.memory import (
-            record_proposal_rejection,
-        )
-        from pollypm.plugins_builtin.project_planning.proposals import (
+        from pollypm.project_planning_protocol import (
             memkey_from_labels,
+            record_proposal_rejection,
         )
         memkey = memkey_from_labels(labels) or ""
         project_key = task.project

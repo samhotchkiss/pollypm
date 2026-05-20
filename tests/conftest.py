@@ -377,7 +377,8 @@ def _pytest_provenance_tokens() -> tuple[str, ...]:
       vars at ``pytest_configure`` time (``pollypm-pytest-<pid>``).
     - The conventional pytest tmp marker (``pytest-of-<user>``).
     - The literal ``tmp_path`` token, which appears in tracebacks /
-      transcripts when a test path leaks into rendered output.
+      transcripts when a test path leaks into rendered output (#1955 —
+      the docstring claimed this was in the list, but it wasn't).
     """
     tokens: list[str] = []
     tokens.append(f"pollypm-pytest-{os.getpid()}")
@@ -388,7 +389,77 @@ def _pytest_provenance_tokens() -> tuple[str, ...]:
     # CI runners where USER may not be populated; still pytest-specific
     # enough that no production cockpit code would emit it.
     tokens.append("pytest-of-")
+    # #1955 — the original docstring claimed ``tmp_path`` was in this
+    # list but the implementation never included it. A test that
+    # rendered ``tmp_path`` into a cockpit artifact and dropped it in
+    # the real ~/.pollypm/ would slip past the token check.
+    tokens.append("tmp_path")
     return tuple(tokens)
+
+
+def _live_cockpit_running() -> bool:
+    """Return True iff a live PollyPM cockpit appears to be running.
+
+    Checks ``~/.pollypm/rail_daemon.pid`` for a PID that names a live
+    process. When the cockpit is up, the home-write guard can't safely
+    treat every post-test write as a leak — the rail daemon and
+    heartbeat continuously stage checkpoints / snapshots / state.db
+    journals into the same dirs. Without this check we'd flag real
+    operator artifacts and unlink them mid-flight (the #1938
+    regression). When NO cockpit is running, any new file under
+    ``~/.pollypm/`` written during the test is by definition test
+    induced — that's the #1955 surface the original token-only guard
+    was missing.
+
+    Best-effort: a missing pid file, an unreadable pid value, or a
+    process-table probe that fails are all treated as "no live cockpit"
+    so the guard falls back to the stricter timestamp-based check.
+    """
+    pollypm_home = _real_pollypm_home()
+    if pollypm_home is None:
+        return False
+    pid_path = pollypm_home / "rail_daemon.pid"
+    try:
+        pid_text = pid_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return False
+    try:
+        pid = int(pid_text.splitlines()[0])
+    except (ValueError, IndexError):
+        return False
+    if pid <= 0:
+        return False
+    # ``os.kill(pid, 0)`` is the portable liveness probe — ``OSError``
+    # with ``errno == ESRCH`` means the PID is dead, ``EPERM`` means
+    # alive-but-not-ours (still alive). Anything else is treated as
+    # "can't tell, assume no cockpit" so the guard stays strict.
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+
+
+def _file_written_during_test(path: Path, test_start: float) -> bool:
+    """Return True iff ``path`` was created/modified after ``test_start``.
+
+    Uses ``mtime`` because it's the field PollyPM writers actually
+    update on each rewrite. ``ctime`` would catch the inode change too
+    but is platform-dependent. A stat race that loses the file is
+    treated as "not during the test" — the snapshot diff already proved
+    the path is new since pre-test, so the worst case is we miss a
+    single leak we'd otherwise have caught by mtime, never a false
+    positive.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return False
+    return mtime >= test_start
 
 
 def _looks_test_induced(path: Path, tokens: tuple[str, ...]) -> bool:
@@ -444,8 +515,18 @@ def _pollypm_home_write_guard(request):
     a test writing pytest-fixture paths into the real cockpit; that
     shape is still caught because the writes carry pytest provenance
     tokens (pytest-of-<user>, pollypm-pytest-<pid>, ``tmp_path``).
-    Files lacking those markers are logged as warnings but NOT
-    unlinked and do NOT fail the test.
+
+    #1955 — the #1938 narrowing was too aggressive: a test that
+    writes a plain artifact (no pytest token in path or content) to
+    the real ~/.pollypm/ silently passed. When no live PollyPM
+    cockpit is running, ANY new file written under ~/.pollypm/ during
+    the test is by definition test induced — we fail those regardless
+    of token presence. When a live cockpit IS running, we still
+    require either a pytest provenance token OR mtime evidence that
+    falls outside what a background writer could plausibly have done
+    in the test window; in practice the simpler signal there is the
+    token, so we keep the original token-only fallback to avoid
+    flagging real operator artifacts.
     """
     if request.node.get_closest_marker("allows_home_writes") is not None:
         yield
@@ -454,6 +535,8 @@ def _pollypm_home_write_guard(request):
     if pollypm_home is None:
         yield
         return
+    test_start = time.time()
+    cockpit_live = _live_cockpit_running()
     before = _snapshot_guarded_dirs(pollypm_home)
     yield
     after = _snapshot_guarded_dirs(pollypm_home)
@@ -468,7 +551,17 @@ def _pollypm_home_write_guard(request):
     leaks: list[str] = []
     unattributed: list[str] = []
     for path in candidates:
-        if _looks_test_induced(path, tokens):
+        token_match = _looks_test_induced(path, tokens)
+        # #1955 — when NO live cockpit is running, any file written
+        # during the test window is test induced (there's no other
+        # writer that could have produced it). When a cockpit IS
+        # running, fall back to the token-only check so we don't
+        # delete real background-process artifacts.
+        if token_match:
+            leaks.append(str(path))
+        elif not cockpit_live and _file_written_during_test(
+            path, test_start,
+        ):
             leaks.append(str(path))
         else:
             unattributed.append(str(path))

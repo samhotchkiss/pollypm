@@ -326,8 +326,10 @@ async def stream_audit_events(
         producer_task.cancel()
         try:
             await producer_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+        except asyncio.CancelledError:
             pass
+        except Exception:  # noqa: BLE001
+            logger.debug("sse producer task raised on shutdown", exc_info=True)
 
     # If we never sent anything, emit one keep-alive so test clients
     # that drain bytes don't see an empty stream.

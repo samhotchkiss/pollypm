@@ -101,7 +101,10 @@ def _work_progress_sweep_one(
                         counters["skipped_active_turn"] += 1
                         continue
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug(
+                        "work.progress_sweep: is_turn_active probe failed for %s",
+                        target_name, exc_info=True,
+                    )
 
         try:
             resolver = getattr(work, "_resolve_project_path", None)
@@ -154,7 +157,10 @@ def _work_progress_sweep_one(
                             target_name, "state_drift", message,
                         )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "work.progress_sweep: state_drift audit emit failed for %s",
+                        task.task_id, exc_info=True,
+                    )
                 alert_type = f"state_drift:{task.task_id}"
                 try:
                     is_new = not _open_alert_exists(
@@ -186,7 +192,10 @@ def _work_progress_sweep_one(
                     if is_new:
                         counters["drift_alerted"] += 1
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "work.progress_sweep: drift alert upsert failed for %s",
+                        task.task_id, exc_info=True,
+                    )
 
             if is_worker_session_name(target_name):
                 try:
@@ -226,7 +235,10 @@ def _work_progress_sweep_one(
                         else str(last_ts_stamp)
                     )
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug(
+                    "work.progress_sweep: recent-event probe via msg_store failed for %s",
+                    target_name, exc_info=True,
+                )
         if recent_ts is None and state_store is not None:
             recent_events = getattr(state_store, "recent_events", None)
             if callable(recent_events):
@@ -243,7 +255,10 @@ def _work_progress_sweep_one(
                             )
                             break
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug(
+                        "work.progress_sweep: recent-event probe via state_store failed for %s",
+                        target_name, exc_info=True,
+                    )
         if recent_ts is not None:
             try:
                 last_ts = datetime.fromisoformat(recent_ts)
@@ -292,7 +307,11 @@ def _work_progress_sweep_one(
                         ),
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "work.progress_sweep: stuck_on_task alert upsert "
+                        "failed for %s/%s", target_name, event.task_id,
+                        exc_info=True,
+                    )
 
     return True
 
@@ -589,7 +608,11 @@ def _pane_text_classify_body(
                                     },
                                 )
                         except Exception:  # noqa: BLE001
-                            pass
+                            logger.debug(
+                                "pane_text_classify: pane.classify.match audit emit "
+                                "failed for %s/%s", session_name, rule_name,
+                                exc_info=True,
+                            )
                 except Exception:  # noqa: BLE001
                     logger.debug(
                         "pane_text_classify: upsert_alert failed "
@@ -622,7 +645,10 @@ def _pane_text_classify_body(
                             state_store.clear_alert(session_name, alert_type)
                         alerts_cleared += 1
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "pane_text_classify: clear_alert failed for %s/%s",
+                        session_name, alert_type, exc_info=True,
+                    )
 
     return {
         "outcome": "swept",
@@ -664,7 +690,10 @@ def _emit_pane_pattern_inbox_item(
                     if dedupe_label in labels:
                         return False
     except Exception:  # noqa: BLE001
-        pass
+        logger.debug(
+            "pane_text_classify: dedupe scan failed for %s",
+            dedupe_label, exc_info=True,
+        )
 
     title_map = {
         "context_full": (
@@ -761,7 +790,10 @@ def _emit_pane_pattern_inbox_item(
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "pane_text_classify: inbox_emitted audit append failed for %s/%s",
+                session_name, rule_name, exc_info=True,
+            )
     return True
 
 
@@ -859,7 +891,10 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                             (msg_store or store).clear_alert(session_key, alert_type)
                             alerts_cleared += 1
                         except Exception:  # noqa: BLE001
-                            pass
+                            logger.warning(
+                                "worktree.state_audit: clear_alert failed for %s/%s",
+                                session_key, alert_type, exc_info=True,
+                            )
                     continue
 
                 if state is WorktreeState.MERGE_CONFLICT:
@@ -946,7 +981,10 @@ def worktree_state_audit_handler(payload: dict[str, Any]) -> dict[str, Any]:
                                 (msg_store or store).clear_alert(session_key, alert_type)
                                 alerts_cleared += 1
                             except Exception:  # noqa: BLE001
-                                pass
+                                logger.warning(
+                                    "worktree.state_audit: clear_alert failed for %s/%s",
+                                    session_key, alert_type, exc_info=True,
+                                )
 
                 elif state is WorktreeState.ORPHAN_BRANCH:
                     age_days = float(classification.metadata.get("age_days", 0.0))
@@ -1027,7 +1065,10 @@ def _emit_inbox_task(
             if dedupe_label in labels:
                 return False
     except Exception:  # noqa: BLE001
-        pass
+        logger.debug(
+            "worktree.state_audit: inbox dedupe scan failed for %s",
+            dedupe_label, exc_info=True,
+        )
 
     try:
         work.create(

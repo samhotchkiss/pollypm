@@ -177,7 +177,10 @@ def notify(
         try:
             msg_store.clear_alert("task_assignment", _alert_type_for(event))
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "task_assignment_notify: clear_alert(task_assignment) failed for %s",
+                event.task_id, exc_info=True,
+            )
         # #921: also clear the sweep-level ``(worker-<project>, no_session)``
         # alert raised by ``_emit_no_session_alert``. That alert is
         # keyed by the candidate session name we *would* expect, not by
@@ -194,7 +197,10 @@ def notify(
                 try:
                     msg_store.clear_alert(candidate, "no_session")
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug(
+                        "task_assignment_notify: clear_alert(no_session) failed for %s",
+                        candidate, exc_info=True,
+                    )
 
     try:
         session_svc.send(target_name, message)
@@ -211,7 +217,10 @@ def notify(
                         delivery_status=failure_status,
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug(
+                        "task_assignment_notify: update_notification_status "
+                        "(failure) failed for %s", event.task_id, exc_info=True,
+                    )
             else:
                 try:
                     store.record_notification(
@@ -223,7 +232,10 @@ def notify(
                         execution_version=execution_version,
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.debug(
+                        "task_assignment_notify: record_notification "
+                        "(failure) failed for %s", event.task_id, exc_info=True,
+                    )
         return {
             "outcome": "send_failed",
             "task_id": event.task_id,
@@ -680,7 +692,10 @@ def _escalate_no_session_service(event: TaskAssignmentEvent, store: Any | None) 
             ),
         )
     except Exception:  # noqa: BLE001
-        pass
+        logger.debug(
+            "task_assignment_notify: no_session_service alert upsert failed",
+            exc_info=True,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -965,7 +980,10 @@ def _recover_dead_claims(
                     },
                 )
             except Exception:  # noqa: BLE001
-                pass
+                logger.warning(
+                    "auto_claim_sweep: worker_session_recovered audit emit "
+                    "failed for %s", task_id, exc_info=True,
+                )
 
 
 def _wire_session_manager(svc: Any, project_root: Path, services: Any) -> None:

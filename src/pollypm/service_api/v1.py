@@ -27,6 +27,7 @@ from dataclasses import asdict, is_dataclass
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import logging
 from pathlib import Path
 
 from pollypm.accounts import (
@@ -74,6 +75,9 @@ from pollypm.workers import (
     stop_worker_session,
     suggest_worker_prompt,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def _parse_task_window_name(name: str) -> tuple[str, int] | None:
@@ -389,6 +393,13 @@ class PollyPMService:
                 limit=200,
             )
         except Exception:  # noqa: BLE001
+            # Silent fallback used to mask the failure as
+            # "Unknown alert id"; log so an actual store outage is
+            # distinguishable from a stale-id from the caller.
+            logger.warning(
+                "resolve_alert: query_messages failed; treating as empty",
+                exc_info=True,
+            )
             rows = []
         target = next((row for row in rows if int(row.get("id", 0)) == alert_id), None)
         if target is None:
@@ -396,7 +407,13 @@ class PollyPMService:
         try:
             supervisor.msg_store.close_message(alert_id)
         except Exception:  # noqa: BLE001
-            pass
+            # The alert row stays open on a close-message failure, so the
+            # next resolve call retries. Surface the failure so a broken
+            # close path doesn't masquerade as success.
+            logger.warning(
+                "resolve_alert: close_message(%d) failed", alert_id,
+                exc_info=True,
+            )
         payload = target.get("payload") or {}
         subject = str(target.get("subject") or "")
         message_text = (

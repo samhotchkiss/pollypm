@@ -1116,6 +1116,11 @@ class Supervisor:
         try:
             launches = self.plan_launches()
         except Exception:  # noqa: BLE001
+            logger.warning(
+                "patch_missing_session_rows: plan_launches failed; "
+                "skipping reconciliation",
+                exc_info=True,
+            )
             return 0
 
         upserted = 0
@@ -1136,6 +1141,10 @@ class Supervisor:
             except Exception:  # noqa: BLE001
                 # Per-session failure is non-fatal — we want to patch as
                 # many rows as we can.
+                logger.debug(
+                    "patch_missing_session_rows: upsert failed for %s",
+                    launch.session.name, exc_info=True,
+                )
                 continue
         return upserted
 
@@ -1753,7 +1762,13 @@ class Supervisor:
         try:
             self.ensure_heartbeat_schedule()
         except Exception:  # noqa: BLE001
-            pass  # Schedule failure shouldn't discard a successful sweep
+            # Schedule failure shouldn't discard a successful sweep, but a
+            # silently dropped re-arm means the heartbeat could permanently
+            # stop — make sure the failure shows up in the log.
+            logger.warning(
+                "ensure_heartbeat_schedule failed; next sweep may not be re-armed",
+                exc_info=True,
+            )
 
         return alerts
 
@@ -2211,7 +2226,12 @@ class Supervisor:
                 payload={"session_name": session_name, "owner": owner},
             )
         except Exception:  # noqa: BLE001
-            pass  # Best-effort — lease still works without auto-release
+            # Best-effort — lease still works without auto-release, but a
+            # silent failure means the lease never auto-expires; surface it.
+            logger.warning(
+                "claim_lease: failed to schedule auto-release for %s (owner=%s)",
+                session_name, owner, exc_info=True,
+            )
 
     def release_lease(self, session_name: str, expected_owner: str | None = None) -> None:
         self._require_session(session_name)

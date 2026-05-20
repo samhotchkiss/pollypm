@@ -144,7 +144,12 @@ class CriticalErrorNotificationHandler(logging.Handler):
             if self._mark_first_delivery(notification.alert_type):
                 self._send_desktop(notification)
         except Exception:  # noqa: BLE001
-            pass
+            # Inside a logging.Handler — never re-log directly (would
+            # recurse through this handler). Defer to ``handleError``
+            # which honors ``logging.raiseExceptions`` and writes to
+            # stderr in debug mode rather than silently dropping the
+            # original critical error.
+            self.handleError(record)
         finally:
             self._emit_guard.active = False
 

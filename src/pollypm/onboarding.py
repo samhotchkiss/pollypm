@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import re
 import shlex
 import shutil
@@ -50,6 +51,8 @@ from pollypm.onboarding_ui import (  # noqa: F401  (re-exported)
     render_provider_choices as _render_provider_choices,
 )
 from pollypm.session_services import create_tmux_client
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from pollypm.tmux.client import TmuxClient
@@ -718,7 +721,10 @@ def add_selected_projects(config_path: Path, selected_paths: list[Path]) -> list
         try:
             commit_initial_scaffold(normalized)
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "onboarding: initial scaffold commit failed for %s",
+                normalized, exc_info=True,
+            )
         added.append(project)
     if added:
         write_config(config, path=config_path, force=True)

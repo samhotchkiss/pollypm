@@ -3277,13 +3277,20 @@ def check_scheduler_last_fired() -> CheckResult:
     (fresh installs); one whose last event is older than the gap is a
     warning.
     """
+    # Post-sqlite-ripout (refs #1971): route through the configured
+    # backend (pg) instead of opening a per-state.db SQLAlchemyStore
+    # directly. ``_primary_state_db()`` is still consulted as a
+    # presence probe so the doctor's "no workspace yet" skip path
+    # mirrors prior behaviour on a fresh install.
     db_path = _primary_state_db()
     if db_path is None:
         return _skip("scheduler-cadence check skipped (no state.db)")
 
     try:
-        from pollypm.store import SQLAlchemyStore
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
+        from pollypm.config import load_config
+        from pollypm.store import get_store
+
+        store = get_store(load_config())
     except Exception:  # noqa: BLE001
         return _skip("scheduler-cadence check skipped (cannot open store)")
 
@@ -3319,10 +3326,10 @@ def check_scheduler_last_fired() -> CheckResult:
             if existing is None or ts_val > existing:
                 latest_per_handler[handler_key] = ts_val
     finally:
-        try:
-            store.close()
-        except Exception:  # noqa: BLE001
-            pass
+        # ``store`` is the process-wide singleton from ``get_store`` —
+        # do NOT close it (closing breaks subsequent callers in the
+        # same process).
+        pass
 
     overdue: list[tuple[str, float]] = []
     never_seen: list[str] = []

@@ -695,33 +695,29 @@ def advisor_tick_handler(payload: dict[str, Any]) -> dict[str, Any]:
                     compute_project_monitor_summary,
                     record_project_monitor_summary,
                 )
-                from pollypm.store import SQLAlchemyStore
+                from pollypm.store import get_store
 
-                state_db = getattr(getattr(config, "project", None), "state_db", None)
-                if state_db is not None:
-                    store = SQLAlchemyStore(f"sqlite:///{Path(state_db)}")
-                    try:
-                        # #782: record a full monitor summary, not
-                        # just a stalled-tasks placeholder. The helper
-                        # walks the work service and fills
-                        # completions, stalls, blockers, and the
-                        # zero-completion flag so durable activity
-                        # rows carry the full picture.
-                        summary = compute_project_monitor_summary(
-                            work_service=work_service,
-                            project_key=project_key,
-                        )
-                        summary.automatic_next_actions = [
-                            "advisor review queued for stagnation classification"
-                            if entry.get("scheduled")
-                            else "advisor review considered but not queued"
-                        ]
-                        record_project_monitor_summary(
-                            store=store,
-                            summary=summary,
-                        )
-                    finally:
-                        store.close()
+                # Post-sqlite-ripout (refs #1971): pg-backed singleton.
+                # Do NOT close — process-wide.
+                store = get_store(config)
+                # #782: record a full monitor summary, not just a
+                # stalled-tasks placeholder. The helper walks the
+                # work service and fills completions, stalls,
+                # blockers, and the zero-completion flag so durable
+                # activity rows carry the full picture.
+                summary = compute_project_monitor_summary(
+                    work_service=work_service,
+                    project_key=project_key,
+                )
+                summary.automatic_next_actions = [
+                    "advisor review queued for stagnation classification"
+                    if entry.get("scheduled")
+                    else "advisor review considered but not queued"
+                ]
+                record_project_monitor_summary(
+                    store=store,
+                    summary=summary,
+                )
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "advisor: failed to record monitor summary for %s",

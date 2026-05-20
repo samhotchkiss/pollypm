@@ -145,12 +145,13 @@ STORAGE_CONTRACTS: Mapping[StorageConcept, ReadAPI] = {
         ),
     ),
     StorageConcept.ACTIVITY_EVENT: ReadAPI(
-        module="pollypm.store.sqlalchemy_store",
-        function="SQLAlchemyStore.query_messages",
+        module="pollypm.store.backends.pg_store",
+        function="PgStore.query_messages",
         description=(
             "Filters for `type='event'` produce the activity feed "
             "query. All cockpit, CLI, and plugin readers go through "
-            "this single method."
+            "this single method. Post-sqlite-ripout (refs #1971) "
+            "the pg backend is the only supported reader."
         ),
     ),
     StorageConcept.ALERT: ReadAPI(
@@ -162,18 +163,17 @@ STORAGE_CONTRACTS: Mapping[StorageConcept, ReadAPI] = {
         ),
     ),
     StorageConcept.TASK: ReadAPI(
-        module="pollypm.work.sqlite_service",
-        function="SQLiteWorkService.list_tasks",
+        module="pollypm.work.pg_service",
+        function="PgWorkService.list_tasks",
         description=(
-            "The work service's task list. Resolved to "
-            "<workspace_root>/.pollypm/state.db by "
-            "pollypm.work.db_resolver — project isolation is row-level "
-            "via the work_tasks.project column (#1004)."
+            "The work service's task list. Backed by the pg pool "
+            "(post-sqlite-ripout, refs #1971). Project isolation is "
+            "row-level via the work_tasks.project column."
         ),
     ),
     StorageConcept.EXECUTION: ReadAPI(
-        module="pollypm.work.sqlite_service",
-        function="SQLiteWorkService.get_execution",
+        module="pollypm.work.pg_service",
+        function="PgWorkService.get_execution",
         description=(
             "Flow node execution history. Recovery must NEVER delete "
             "rows (#806); transitions are append-only."

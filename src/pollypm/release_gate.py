@@ -243,9 +243,12 @@ def gate_signal_routing_emitters_migrated() -> GateResult:
         # ``register_routed_emitter(...)`` call at module load.
         # Without this side-effect import, the registry is empty
         # (no other consumer in the gate path imports them).
+        # Post-sqlite-ripout (refs #1971) the SQLiteWorkService emitter
+        # registration is gone; the pg service registers its own
+        # routed emitters on import.
         import pollypm.heartbeats.local  # noqa: F401
         import pollypm.supervisor_alerts  # noqa: F401
-        import pollypm.work.sqlite_service  # noqa: F401
+        import pollypm.work.pg_service  # noqa: F401
         from pollypm.signal_routing import (
             missing_routed_emitters,
             required_high_traffic_emitters,

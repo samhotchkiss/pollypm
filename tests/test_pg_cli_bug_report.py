@@ -25,11 +25,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from sqlalchemy import text
 from typer.testing import CliRunner
 
 from pollypm.cli import app as root_app
-from pollypm.store import SQLAlchemyStore
 
 
 runner = CliRunner()
@@ -163,9 +161,12 @@ def test_cli_gh_missing_exits_non_zero(monkeypatch):
 def test_cli_writes_no_inbox_row(_gh_available, tmp_path: Path):
     """The whole point of the command is to bypass the inbox.
 
-    Set up a fresh state.db, run ``pm bug-report``, then assert
-    ``messages`` is empty — the helper went out to GitHub (mocked)
-    and did not enqueue a notify row.
+    Run ``pm bug-report`` and assert that no state.db was opened /
+    touched as a side effect — the helper went out to GitHub (mocked)
+    and did not enqueue a notify row. Post-sqlite-ripout (refs #1971)
+    the messages table lives in pg; the contract this test locks is
+    simply that the bug-report path doesn't reach for any local
+    workspace state at all.
     """
     db_path = tmp_path / "state.db"
 
@@ -183,18 +184,8 @@ def test_cli_writes_no_inbox_row(_gh_available, tmp_path: Path):
         )
     assert result.exit_code == 0, result.output
 
-    # bug-report does not auto-create the state DB — verify by
-    # creating it manually and confirming no rows exist (the test's
-    # contract is "no inbox row was written").
-    if db_path.exists():
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
-        try:
-            with store.read_engine.connect() as conn:
-                rows = conn.execute(
-                    text("SELECT count(*) FROM messages")
-                ).scalar() or 0
-            assert rows == 0
-        finally:
-            store.close()
-    # If db_path was not created at all, that's also a pass — the
-    # helper never touched the inbox layer.
+    # bug-report does not auto-create a state DB — confirm the path
+    # was never written. (Pre-ripout this opened the sqlite file via
+    # SQLAlchemyStore to assert the messages table was empty; the
+    # absence-of-file check is the same contract on the new backend.)
+    assert not db_path.exists()

@@ -65,7 +65,7 @@ from pollypm.recovery.worker_turn_end import (
     send_standard_reprompt,
 )
 from pollypm.runtime_services import _RuntimeServices
-from pollypm.store import SQLAlchemyStore
+from pollypm.store.backends.pg_store import PgStore
 from pollypm.work import task_assignment as bus
 from pollypm.work.models import (
     Artifact,
@@ -385,64 +385,62 @@ class TestReconcileExpectedAdvancePure:
         assert result is None
 
     def test_plan_and_notify_routes_to_user_approval(
-        self, tmp_path: Path,
+        self, pg_schema_pool, tmp_path: Path,
     ) -> None:
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
-        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
-        try:
-            _record_plan_ready_notify(store, project="demo")
-            task = FakeTask(
-                project="demo", task_number=1,
-                flow_template_id="plan_project",
-                current_node_id="research",
-            )
-            result = reconcile_expected_advance(
-                task, tmp_path, work_service=None, state_store=store,
-            )
-            assert result is not None
-            assert result.advance_to_node == "user_approval"
-            assert "plan" in result.reason.lower()
-        finally:
-            store.close()
+        # Post-sqlite-ripout (refs #1971): the message store is pg now.
+        # ``pg_schema_pool`` bootstraps the per-test schema; ``PgStore``
+        # then resolves to that same pool via the process-wide
+        # singleton, so events recorded here are visible to
+        # ``reconcile_expected_advance``'s ``query_messages`` read.
+        store = PgStore(url="postgresql://test/ignored")
+        _record_plan_ready_notify(store, project="demo")
+        task = FakeTask(
+            project="demo", task_number=1,
+            flow_template_id="plan_project",
+            current_node_id="research",
+        )
+        result = reconcile_expected_advance(
+            task, tmp_path, work_service=None, state_store=store,
+        )
+        assert result is not None
+        assert result.advance_to_node == "user_approval"
+        assert "plan" in result.reason.lower()
 
     def test_plan_file_only_routes_to_synthesize(
-        self, tmp_path: Path,
+        self, pg_schema_pool, tmp_path: Path,
     ) -> None:
         _write_plan(tmp_path / "docs" / "plan" / "plan.md")
-        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
-        try:
-            task = FakeTask(
-                project="demo", task_number=1,
-                flow_template_id="plan_project",
-                current_node_id="research",
-            )
-            result = reconcile_expected_advance(
-                task, tmp_path, work_service=None, state_store=store,
-            )
-            assert result is not None
-            assert result.advance_to_node == "synthesize"
-        finally:
-            store.close()
+        store = PgStore(url="postgresql://test/ignored")
+        task = FakeTask(
+            project="demo", task_number=1,
+            flow_template_id="plan_project",
+            current_node_id="research",
+        )
+        result = reconcile_expected_advance(
+            task, tmp_path, work_service=None, state_store=store,
+        )
+        assert result is not None
+        assert result.advance_to_node == "synthesize"
 
-    def test_legacy_project_plan_path_accepted(self, tmp_path: Path) -> None:
+    def test_legacy_project_plan_path_accepted(
+        self, pg_schema_pool, tmp_path: Path,
+    ) -> None:
         """Tasks that wrote to docs/project-plan.md (pre-spec-revision
         architects) are honoured too."""
         _write_plan(tmp_path / "docs" / "project-plan.md")
-        store = SQLAlchemyStore(f"sqlite:///{tmp_path / 'state.db'}")
-        try:
-            _record_plan_ready_notify(store, project="demo")
-            task = FakeTask(
-                project="demo", task_number=1,
-                flow_template_id="plan_project",
-                current_node_id="research",
-            )
-            result = reconcile_expected_advance(
-                task, tmp_path, work_service=None, state_store=store,
-            )
-            assert result is not None
-            assert result.advance_to_node == "user_approval"
-        finally:
-            store.close()
+        store = PgStore(url="postgresql://test/ignored")
+        _record_plan_ready_notify(store, project="demo")
+        task = FakeTask(
+            project="demo", task_number=1,
+            flow_template_id="plan_project",
+            current_node_id="research",
+        )
+        result = reconcile_expected_advance(
+            task, tmp_path, work_service=None, state_store=store,
+        )
+        assert result is not None
+        assert result.advance_to_node == "user_approval"
 
 
 # ---------------------------------------------------------------------------

@@ -7,8 +7,9 @@ These tests verify the wiring of:
 * ``pg_state_store`` — yields a writeable :class:`StateStore` (placeholder
   until the state.py port lands).
 * ``seeded_pg_workspace`` — produces a non-empty workspace.
-* ``@pytest.mark.backend(...)`` — the dispatch fixture in
-  ``tests/conftest.py`` routes to the right backend.
+* ``@pytest.mark.backend("postgres")`` — the dispatch fixture in
+  ``tests/conftest.py`` routes to the pg backend. Post-sqlite-ripout
+  (refs #1971) ``postgres`` is the only valid value.
 * Schema-per-test isolation — two pg tests in the same session cannot
   see each other's rows.
 
@@ -123,13 +124,18 @@ def test_isolation_leg_b(pg_work_service):
 # ---------------------------------------------------------------------------
 # work_service dispatch marker
 # ---------------------------------------------------------------------------
+#
+# Post-sqlite-ripout (refs #1971) the dispatch fixture only resolves to
+# pg. The previous sqlite + ``both`` tests were removed alongside the
+# backend itself; the unsupported-marker test below pins the guard so a
+# stray ``@pytest.mark.backend("sqlite")`` regression fails loudly.
 
 
-def test_dispatch_default_is_sqlite(work_service):
-    """No marker → sqlite. The default stays this way until Slice K."""
-    from pollypm.work.sqlite_service import SQLiteWorkService
+def test_dispatch_default_routes_to_pg(work_service):
+    """No marker → pg. Pre-#1971 the default was sqlite."""
+    from pollypm.work.pg_service import PgWorkService
 
-    assert isinstance(work_service, SQLiteWorkService)
+    assert isinstance(work_service, PgWorkService)
 
 
 @pytest.mark.backend("postgres")
@@ -139,16 +145,26 @@ def test_dispatch_postgres_marker_routes_to_pg(work_service):
     assert isinstance(work_service, PgWorkService)
 
 
-@pytest.mark.backend("both")
-def test_dispatch_both_marker_runs_against_each_backend(work_service):
-    """``both`` parameterizes the test; this body runs once per backend.
+def test_dispatch_rejects_unsupported_marker() -> None:
+    """The removed sqlite backend must not silently resolve.
 
-    The assertion is intentionally weak — the point of this test is that
-    pytest collects two test items for this single source line, one
-    sqlite-backed and one pg-backed. Stronger per-backend assertions
-    belong in the parity suite.
+    Directly probes ``_resolve_backend_marker`` (imported from the
+    project conftest) with a synthetic request carrying a
+    ``backend("sqlite")`` marker. Locks the post-#1971 contract that
+    a stray sqlite marker raises ``pytest.UsageError`` rather than
+    silently routing through pg.
     """
-    from pollypm.work.pg_service import PgWorkService
-    from pollypm.work.sqlite_service import SQLiteWorkService
+    from tests.conftest import _resolve_backend_marker
 
-    assert isinstance(work_service, (SQLiteWorkService, PgWorkService))
+    class _FakeMarker:
+        args = ("sqlite",)
+
+    class _FakeNode:
+        def get_closest_marker(self, _name: str):
+            return _FakeMarker()
+
+    class _FakeRequest:
+        node = _FakeNode()
+
+    with pytest.raises(pytest.UsageError, match="sqlite"):
+        _resolve_backend_marker(_FakeRequest())

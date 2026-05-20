@@ -1,21 +1,14 @@
-"""PollyPM storage foundation — ``Store`` protocol and SQLAlchemy backend.
+"""PollyPM storage foundation — ``Store`` protocol and pg backend.
 
-This package is the structural replacement for the ad-hoc ``sqlite3.connect``
-callers scattered across the codebase. Every subsystem that needs persistent
-state will eventually route through the :class:`Store` protocol defined here.
+This package is the structural replacement for the ad-hoc
+``sqlite3.connect`` callers scattered across the codebase. Every
+subsystem that needs persistent state routes through the
+:class:`Store` protocol defined here.
 
-Issue #337 lands the foundation only:
-
-* :class:`Store` — the structural :class:`typing.Protocol` every caller targets.
-* :func:`make_engines` — the dual-pool engine factory (writer pool_size=1 for
-  serialized writes, reader pool_size=5 for WAL-concurrent reads).
-* :class:`SQLAlchemyStore` — a skeleton backend. Only ``transaction()`` is
-  functional; all other methods raise :class:`NotImplementedError` and land in
-  later issues (#338 schema, #340 callers).
-
-Downstream issues populate method bodies, define the metadata, and migrate
-callers off ``StateStore`` / direct ``sqlite3`` usage. Nothing in this module
-should reach into ``~/.pollypm/`` or open a connection at import time.
+Post-sqlite-ripout (refs #1971) the sqlite backend (the legacy
+``SQLAlchemyStore``) is gone — pg is the only supported backend.
+``make_engines`` / ``is_sqlite`` are kept for the few callers that
+still build their own engine pair for offline data migrations.
 """
 
 from __future__ import annotations
@@ -28,11 +21,9 @@ from pollypm.store.registry import (
     register_backend,
     unregister_backend,
 )
-from pollypm.store.sqlalchemy_store import SQLAlchemyStore
 from pollypm.store.title_contract import apply_title_contract
 
 __all__ = [
-    "SQLAlchemyStore",
     "Store",
     "apply_title_contract",
     "get_store",

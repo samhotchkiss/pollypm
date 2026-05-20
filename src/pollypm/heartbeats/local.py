@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.heartbeats.base import HeartbeatBackend, HeartbeatSessionContext
+from pollypm.persona_drift import detect_persona_drift
 from pollypm.recovery.base import (
     InterventionHistoryEntry,
     SessionHealth,
@@ -1199,7 +1200,6 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         Returns the list of alert types raised this tick (empty if no drift).
         """
         try:
-            from pollypm.supervisor import detect_persona_drift
             drifted_to = detect_persona_drift(context.role, context.pane_text or "")
         except Exception:  # noqa: BLE001
             drifted_to = None

@@ -94,11 +94,13 @@ def test_operator_fast_track_requires_explicit_authorization(pg_work_service):
 
 
 @pytest.mark.xfail(
-    reason="CLI --db flag is sqlite-specific; pg CLI path needs DSN-based test harness (#1737 K-cli-tests follow-up)",
+    reason=(
+        "pm task --db sqlite escape hatch removed (#1971 sqlite-ripout PR A); "
+        "pg CLI path still needs a DSN-based test harness (#1737 K-cli-tests)."
+    ),
     strict=False,
 )
 def test_cli_queue_readiness_warning_is_coaching_not_gate(tmp_path):
-    db_path = str(tmp_path / "state.db")
     create = runner.invoke(
         task_app,
         [
@@ -112,14 +114,12 @@ def test_cli_queue_readiness_warning_is_coaching_not_gate(tmp_path):
             "worker=worker",
             "--role",
             "reviewer=reviewer",
-            "--db",
-            db_path,
         ],
     )
     assert create.exit_code == 0, create.output
     assert "Readiness: Task is queueable but underspecified" in create.output
 
-    queue = runner.invoke(task_app, ["queue", "demo/1", "--db", db_path])
+    queue = runner.invoke(task_app, ["queue", "demo/1"])
     assert queue.exit_code == 0, queue.output
     assert "Queued demo/1" in queue.output
     assert "missing acceptance criteria" in queue.output

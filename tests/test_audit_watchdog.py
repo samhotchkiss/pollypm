@@ -3487,3 +3487,134 @@ def test_cadence_operator_dispatch_throttles_burst_by_root_cause(
     assert outcomes[0] == "dispatched"
     assert outcomes[1:] == ["throttled", "throttled", "throttled"], outcomes
     assert len(created) == 1
+
+
+# ---------------------------------------------------------------------------
+# PR #2020 review — dispatch_dedup_hash no-evidence fallback regression
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_dedup_hash_no_evidence_falls_back_to_subject() -> None:
+    """No ``evidence`` and no metadata dedup key → ``subject`` must distinguish.
+
+    The PR #2020 blocker (Codex review): production detectors that
+    don't populate ``evidence`` (``stuck_draft`` is the canonical
+    example — it only sets ``metadata``) collapsed to the same hash
+    just because they shared rule+project. Two unrelated draft tasks
+    ``demo/1`` and ``demo/2`` therefore over-deduped through the
+    throttle. The fallback path must include ``subject`` so distinct
+    findings get distinct hashes.
+    """
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    f1 = Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/1")
+    f2 = Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/2")
+
+    h1 = dispatch_dedup_hash(f1)
+    h2 = dispatch_dedup_hash(f2)
+    assert h1 != h2, (
+        "no-evidence findings must not collapse across subjects "
+        f"(got {h1} == {h2})"
+    )
+
+
+def test_dispatch_dedup_hash_same_subject_no_evidence_stable() -> None:
+    """Same rule+project+subject, no evidence → same hash (stable fallback)."""
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    f1 = Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/7")
+    f2 = Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/7",
+                 message="cosmetic copy varies")
+    assert dispatch_dedup_hash(f1) == dispatch_dedup_hash(f2)
+
+
+def test_dispatch_dedup_hash_evidence_collapses_across_subjects() -> None:
+    """With evidence populated, sibling subjects must still collapse.
+
+    Pins the #2015 contract: when a detector DOES populate ``evidence``,
+    the throttle should dedupe across different subjects (samblog/32-35
+    burst). The fallback only kicks in when evidence is empty.
+    """
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    common = {"queued_subjects": ["demo/21", "demo/26"]}
+    f1 = Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/1",
+                 evidence=common)
+    f2 = Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/2",
+                 evidence=common)
+    assert dispatch_dedup_hash(f1) == dispatch_dedup_hash(f2)
+
+
+def test_dispatch_dedup_hash_metadata_root_cause_key_collapses() -> None:
+    """When evidence is empty but metadata has ``root_cause_hash`` /
+    ``dedup_key``, collapse across subjects using that key instead.
+
+    Lets a detector opt into root-cause dedup without restructuring
+    its payload as ``evidence`` — used by callers that already
+    computed a stable hash upstream (tier-4 promotion tracker).
+    """
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    f1 = Finding(
+        rule=RULE_STUCK_DRAFT, project="demo", subject="demo/1",
+        metadata={"root_cause_hash": "abc123", "detected_via": "state"},
+    )
+    f2 = Finding(
+        rule=RULE_STUCK_DRAFT, project="demo", subject="demo/2",
+        metadata={"root_cause_hash": "abc123", "detected_via": "event"},
+    )
+    f3 = Finding(
+        rule=RULE_STUCK_DRAFT, project="demo", subject="demo/3",
+        metadata={"root_cause_hash": "different"},
+    )
+    assert dispatch_dedup_hash(f1) == dispatch_dedup_hash(f2)
+    assert dispatch_dedup_hash(f1) != dispatch_dedup_hash(f3)
+
+
+def test_dispatch_dedup_hash_real_stuck_draft_detector_distinguishes_subjects(
+    now: datetime,
+) -> None:
+    """Drive the actual ``_detect_stuck_drafts`` path and assert findings
+    for different tasks get different hashes.
+
+    Pre-fix Codex repro:
+
+        Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/1")
+        Finding(rule=RULE_STUCK_DRAFT, project="demo", subject="demo/2")
+        → both hash to d14d2be490dfea41 (collision).
+
+    The real detector only populates ``metadata`` (no ``evidence``),
+    so the fallback path is exercised. This is the "use the actual
+    detector, not hand-built findings" regression that Codex
+    specifically requested.
+    """
+    from pollypm.audit.watchdog import dispatch_dedup_hash
+
+    events = [
+        _make_event(
+            event=EVENT_TASK_CREATED, subject="demo/1",
+            metadata={"title": "first"},
+            ts=now - timedelta(minutes=20),
+        ),
+        _make_event(
+            event=EVENT_TASK_CREATED, subject="demo/2",
+            metadata={"title": "second"},
+            ts=now - timedelta(minutes=20),
+        ),
+    ]
+    findings = [
+        f for f in scan_events(events, now=now) if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert len(findings) == 2, findings
+    # Every real-detector finding sets metadata but NOT evidence.
+    for f in findings:
+        assert f.evidence == {}, (
+            "regression — _detect_stuck_drafts should not populate "
+            "evidence; the fallback test depends on this shape"
+        )
+        assert f.metadata, "_detect_stuck_drafts should populate metadata"
+
+    hashes = {dispatch_dedup_hash(f) for f in findings}
+    assert len(hashes) == len(findings), (
+        f"real-detector findings collapsed: {hashes}"
+    )

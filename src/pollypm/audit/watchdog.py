@@ -3036,15 +3036,38 @@ def dispatch_dedup_hash(finding: Finding) -> str:
     ``subject`` / ``message`` / ``recommendation`` (the latter two are
     cosmetic copy).
 
+    **Fallback for detectors without ``evidence`` (PR #2020 review).**
+    Most detector paths populate ``metadata`` but not ``evidence``
+    (``stuck_draft`` being the canonical case). Collapsing on
+    rule+project alone would over-dedupe genuinely different findings
+    that happen to share a rule. So:
+
+    1. If ``finding.evidence`` is non-empty, hash rule + project +
+       canonical evidence JSON (the intended #2015 behavior — collapse
+       sibling subjects whose bodies are identical).
+    2. Else if ``finding.metadata`` carries a stable root-cause key
+       (``root_cause_hash`` or ``dedup_key``), hash that instead. This
+       lets a detector opt into root-cause dedup without copying its
+       evidence shape — used by tier-4 callers that already computed
+       a stable hash upstream.
+    3. Else fall back to including ``subject`` in the hash — i.e.
+       legacy single-finding-per-subject behavior. With nothing
+       structured to compare, subject is the only signal that
+       distinguishes ``demo/1`` from ``demo/2``, and we must not
+       collapse them.
+
     Stable across:
         - Different ``subject`` (the whole point — same root cause
-          across sibling draft tasks).
+          across sibling draft tasks), **iff** ``evidence`` is
+          populated (path 1) or a metadata key is provided (path 2).
         - Different ``message`` / ``recommendation`` text.
         - Re-ordering of keys inside ``evidence``.
 
     Sensitive to:
         - Different ``rule`` or ``project``.
         - Any structural change to the ``evidence`` payload.
+        - ``subject`` when neither ``evidence`` nor a metadata
+          dedup key is present (fallback path 3).
 
     16-hex-char output matches :func:`root_cause_hash` for symmetry;
     collision resistance is fine for the cardinality the throttle sees
@@ -3055,17 +3078,43 @@ def dispatch_dedup_hash(finding: Finding) -> str:
     evidence_raw = getattr(finding, "evidence", None) or {}
     if not isinstance(evidence_raw, dict):
         evidence_raw = {}
-    try:
-        evidence_json = json.dumps(
-            evidence_raw,
-            sort_keys=True,
-            ensure_ascii=False,
-            default=str,
-            separators=(",", ":"),
-        )
-    except (TypeError, ValueError):
-        evidence_json = ""
-    canonical = "|".join([rule, project, evidence_json])
+    metadata_raw = getattr(finding, "metadata", None) or {}
+    if not isinstance(metadata_raw, dict):
+        metadata_raw = {}
+
+    # Path 1: structured evidence wins — collapse across sibling subjects.
+    if evidence_raw:
+        try:
+            evidence_json = json.dumps(
+                evidence_raw,
+                sort_keys=True,
+                ensure_ascii=False,
+                default=str,
+                separators=(",", ":"),
+            )
+        except (TypeError, ValueError):
+            evidence_json = ""
+        canonical = "|".join(["v1", rule, project, evidence_json])
+    else:
+        # Path 2: opt-in via a stable metadata key (root_cause_hash /
+        # dedup_key). Lets a detector dedupe across subjects without
+        # populating evidence.
+        meta_key = ""
+        for candidate in ("root_cause_hash", "dedup_key"):
+            value = metadata_raw.get(candidate)
+            if isinstance(value, str) and value:
+                meta_key = f"{candidate}={value}"
+                break
+        if meta_key:
+            canonical = "|".join(["meta", rule, project, meta_key])
+        else:
+            # Path 3: fallback. No structured body — subject is the
+            # only signal that distinguishes findings. Including it
+            # restores legacy single-finding-per-subject behavior and
+            # prevents the throttle from suppressing distinct
+            # watchdog dispatches (PR #2020 review).
+            subject = str(getattr(finding, "subject", "") or "")
+            canonical = "|".join(["subj", rule, project, subject])
     digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
     return digest[:16]
 

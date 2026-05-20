@@ -245,7 +245,7 @@ def _table_set(db_path: Path) -> set[str]:
 
 def _default_clone_path() -> Path:
     """Location of the dry-run clone (~/.pollypm/migration-check.db)."""
-    home = Path(os.environ.get("POLLYPM_HOME", str(Path.home() / ".pollypm")))
+    home = Path(os.environ.get("POLLYPM_HOME", str(GLOBAL_CONFIG_DIR)))
     return home / "migration-check.db"
 
 
@@ -572,7 +572,7 @@ def check_pending(db_path: Path | None = None) -> tuple[bool, str]:
     """
     if db_path is None:
         try:
-            from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+            from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR, load_config
         except ImportError:
             return (True, "skipped: config module unavailable")
         if not DEFAULT_CONFIG_PATH.is_file():

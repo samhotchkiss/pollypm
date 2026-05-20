@@ -1247,9 +1247,10 @@ class PollyCockpitApp(App[None]):
     def _rail_daemon_alive(self) -> bool:
         """True iff the headless rail daemon currently holds its PID file."""
         import os as _os
-        from pathlib import Path as _Path
 
-        pid_path = _Path.home() / ".pollypm" / "rail_daemon.pid"
+        from pollypm.projects import global_pollypm_dir
+
+        pid_path = global_pollypm_dir() / "rail_daemon.pid"
         if not pid_path.exists():
             return False
         try:
@@ -1313,7 +1314,8 @@ class PollyCockpitApp(App[None]):
             return
 
         try:
-            home = _Path.home() / ".pollypm"
+            from pollypm.projects import global_pollypm_dir
+            home = global_pollypm_dir()
             pid_path = home / "rail_daemon.pid"
             # Resolve the workspace state.db path via the supervisor
             # if we can; fall back to the conventional location so the
@@ -2288,7 +2290,9 @@ class PollyCockpitApp(App[None]):
         Cleanup lives in #720's post-upgrade summary flow — the flag
         sticks until the user dismisses the summary.
         """
-        return Path.home() / ".pollypm" / "post-upgrade.flag"
+        from pollypm.projects import global_pollypm_dir
+
+        return global_pollypm_dir() / "post-upgrade.flag"
 
     def _check_post_upgrade_flag(self) -> None:
         """Swap the pill to "restart to pick up new code" when the
@@ -9893,7 +9897,9 @@ def _dashboard_plan_path_from_worktrees(project_path: Path) -> Path | None:
     without waiting for the merge. Returns ``None`` when no worktree
     holds a plan file.
     """
-    worktrees_root = project_path / ".pollypm" / "worktrees"
+    from pollypm.projects import project_worktrees_dir
+
+    worktrees_root = project_worktrees_dir(project_path)
     if not worktrees_root.is_dir():
         return None
     candidates: list[tuple[float, Path]] = []
@@ -10228,7 +10234,9 @@ def _dashboard_plan_staleness(
 
     if project_path is None:
         return None
-    db_path = project_path / ".pollypm" / "state.db"
+    from pollypm.projects import project_state_db_path
+
+    db_path = project_state_db_path(project_path)
     if not db_path.exists():
         return None
     # Cache key: project + plan mtime + db mtime. If neither file has
@@ -11027,12 +11035,14 @@ def _dashboard_task_db_paths(config: object, project_path: Path) -> list[Path]:
         if candidate not in candidates and candidate.exists():
             candidates.append(candidate)
 
+    from pollypm.projects import project_state_db_path
+
     project_settings = getattr(config, "project", None)
     workspace_root = getattr(project_settings, "workspace_root", None)
     if workspace_root is not None:
-        _add(Path(workspace_root) / ".pollypm" / "state.db")
+        _add(project_state_db_path(Path(workspace_root)))
 
-    _add(project_path / ".pollypm" / "state.db")
+    _add(project_state_db_path(project_path))
 
     state_db = getattr(project_settings, "state_db", None)
     if state_db is not None:
@@ -11418,9 +11428,10 @@ def _classify_worker_activity(
     has_owned_task = False
     if project_path is not None:
         try:
+            from pollypm.projects import project_state_db_path
             from pollypm.work import create_work_service
 
-            db_path = project_path / ".pollypm" / "state.db"
+            db_path = project_state_db_path(project_path)
             if db_path.exists():
                 with create_work_service(
                     db_path=db_path,
@@ -12088,9 +12099,11 @@ def _dashboard_inbox_collect_messages(
     primary_source_key = (
         message_sources[0][0] if message_sources else project_key
     )
+    from pollypm.projects import project_state_db_path as _project_state_db_path
+
     primary_source_db = (
         message_sources[0][1] if message_sources
-        else project_path / ".pollypm" / "state.db"
+        else _project_state_db_path(project_path)
     )
 
     for row in rows:
@@ -12152,7 +12165,9 @@ def _dashboard_inbox(
     config_path: Path, project_key: str, project_path: Path,
 ) -> tuple[int, list[dict], list[dict]]:
     """Return project-scoped inbox items + actionable PM blocker notes."""
-    db_path = project_path / ".pollypm" / "state.db"
+    from pollypm.projects import project_state_db_path
+
+    db_path = project_state_db_path(project_path)
     if not db_path.exists():
         return 0, [], []
     # Content-addressed cache: an unchanged db_mtime means no inbox
@@ -12185,7 +12200,7 @@ def _dashboard_inbox(
     message_sources: list[tuple[str, Path]] = [(project_key, db_path)]
     workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
     if workspace_root is not None:
-        workspace_db = Path(workspace_root) / ".pollypm" / "state.db"
+        workspace_db = project_state_db_path(Path(workspace_root))
         if workspace_db.exists() and workspace_db.resolve() != db_path.resolve():
             message_sources.append(("__workspace__", workspace_db))
 
@@ -12690,7 +12705,9 @@ def _dashboard_activity(
     project = (config.projects or {}).get(project_key)
     db_mtime: float | None = None
     if project is not None and getattr(project, "path", None) is not None:
-        db_path = project.path / ".pollypm" / "state.db"
+        from pollypm.projects import project_state_db_path
+
+        db_path = project_state_db_path(project.path)
         try:
             db_mtime = db_path.stat().st_mtime
         except OSError:
@@ -16195,7 +16212,9 @@ class PollyProjectDashboardApp(App[None]):
             cfg = load_config(self.config_path)
         except Exception:  # noqa: BLE001
             cfg = None
-        db_path = data.project_path / ".pollypm" / "state.db"
+        from pollypm.projects import project_state_db_path
+
+        db_path = project_state_db_path(data.project_path)
         approved_task = None
         # Track the pre/post status so the toast can tell the user
         # whether their click actually moved the task or just left a

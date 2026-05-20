@@ -70,11 +70,11 @@ def _state_path() -> Path:
     if override:
         return Path(override).expanduser() / "pm_turn_state.json"
     try:
-        from pollypm.config import DEFAULT_CONFIG_PATH
+        from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR
 
         return Path(DEFAULT_CONFIG_PATH).parent / "pm_turn_state.json"
     except Exception:  # noqa: BLE001 — config errors never break detection
-        return Path.home() / ".pollypm" / "pm_turn_state.json"
+        return GLOBAL_CONFIG_DIR / "pm_turn_state.json"
 
 
 def is_pm_session(session_name: str) -> bool:

@@ -1220,7 +1220,11 @@ def _default_init_tmux_session(root: Path) -> str:
 
 
 def _build_example_config(root: Path, *, tmux_session: str = "pollypm") -> PollyPMConfig:
-    base_dir = root / ".pollypm"
+    # Lazy import to avoid a config <-> projects circular import; the
+    # resolver also collapses the doubled-pollypm-path case (#1972).
+    from pollypm.projects import project_pollypm_dir
+
+    base_dir = project_pollypm_dir(root)
     return PollyPMConfig(
         project=ProjectSettings(
             name="PollyPM",

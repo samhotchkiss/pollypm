@@ -1302,7 +1302,8 @@ class TmuxSessionService:
         # worker's cwd (workers run from their worktree, not project root).
         # See issue #263.
         display_path = prompt_path
-        instruct_path = self._config.project.root_dir / ".pollypm" / "docs" / "SYSTEM.md"
+        from pollypm.projects import project_docs_dir as _pdocs_dir
+        instruct_path = _pdocs_dir(self._config.project.root_dir) / "SYSTEM.md"
         # #1007: bootstrap framing — see the matching block in
         # :meth:`pollypm.supervisor.Supervisor._prepare_initial_input`
         # for the iteration history. tl;dr "Adopt … as operating

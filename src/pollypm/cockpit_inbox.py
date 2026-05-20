@@ -71,7 +71,7 @@ def _render_work_service_issues(
     """Render tasks from the work service for a project."""
     from pollypm.work import create_work_service
 
-    db_path = project.path / ".pollypm" / "state.db"
+    db_path = project_state_db_path(project.path)
     if not db_path.exists():
         raise FileNotFoundError(db_path)
 
@@ -1352,6 +1352,7 @@ _WORKER_ROSTER_CACHE: dict[int, tuple[float, tuple["WorkerRosterRow", ...]]] = {
 # the first tick can populate it — subsequent stale reads then surface
 # immediately while the background thread re-walks.
 import threading as _threading  # noqa: E402
+from pollypm.projects import project_state_db_path
 
 _WORKER_ROSTER_REFRESH_LOCK = _threading.Lock()
 _WORKER_ROSTER_REFRESH_INFLIGHT: set[int] = set()
@@ -1474,7 +1475,7 @@ def _gather_worker_roster_uncached(config) -> list[WorkerRosterRow]:
         )
         if project_path is None or not isinstance(project_path, Path):
             continue
-        db_path = project_path / ".pollypm" / "state.db"
+        db_path = project_state_db_path(project_path)
         if not db_path.exists():
             continue
         try:

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from subprocess import CalledProcessError as _CalledProcessError
+from pollypm.projects import project_worker_markers_dir, project_worktrees_dir
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +275,7 @@ class SessionManager:
         # Serialize concurrent provisions of the same task. The lock
         # lives in the worktree's parent directory so both the lock and
         # the worktree-add race on the same filesystem target.
-        worktree_parent = self._project_path / ".pollypm" / "worktrees"
+        worktree_parent = project_worktrees_dir(self._project_path)
         session_id = f"task-{task_slug}"
         lock_acquired = False
         try:
@@ -896,7 +897,8 @@ class SessionManager:
             # Codex's workspace-write sandbox otherwise allows that
             # worktree but rejects the parent project state directory
             # that ``pm task done`` must update (#1437).
-            project_state_dir = (self._project_path / ".pollypm").resolve()
+            from pollypm.projects import project_pollypm_dir as _project_pollypm_dir
+            project_state_dir = _project_pollypm_dir(self._project_path).resolve()
             session_args = [*session_args, "--add-dir", str(project_state_dir)]
 
         session = SessionConfig(
@@ -968,7 +970,7 @@ class SessionManager:
 
             # Use a fresh_launch_marker so SessionService.create() knows
             # to send the kickoff as initial input.
-            marker_dir = self._project_path / ".pollypm" / "worker-markers"
+            marker_dir = project_worker_markers_dir(self._project_path)
             marker_dir.mkdir(parents=True, exist_ok=True)
             marker_path = marker_dir / f"{window_name}.fresh"
             marker_create_status = "ok"
@@ -1389,7 +1391,7 @@ class SessionManager:
         )
 
         if self._session_service is not None:
-            marker_dir = self._project_path / ".pollypm" / "worker-markers"
+            marker_dir = project_worker_markers_dir(self._project_path)
             try:
                 marker_dir.mkdir(parents=True, exist_ok=True)
                 marker_path = marker_dir / f"{window_name}.fresh"
@@ -1603,7 +1605,7 @@ class SessionManager:
         # path, kept for back-compat with tasks created pre-#1737).
         task_slug = f"{project}-{int(task_number)}"
         worker_worktree = (
-            self._project_path / ".pollypm" / "worktrees" / task_slug
+            project_worktrees_dir(self._project_path) / task_slug
         )
         if worker_worktree.exists():
             session_cwd = worker_worktree
@@ -1644,10 +1646,9 @@ class SessionManager:
             and persona_prompt
             and account.home is not None
         ):
+            from pollypm.projects import project_system_prompts_dir
             target = (
-                account.home
-                / ".pollypm"
-                / "system-prompts"
+                project_system_prompts_dir(account.home)
                 / f"reviewer_{project}_{int(task_number)}.md"
             )
             try:
@@ -1827,7 +1828,7 @@ class SessionManager:
         a dangling directory that isn't a real worktree. All subprocess
         calls have timeouts so a hung git op can't wedge claim().
         """
-        worktree_path = project_path / ".pollypm" / "worktrees" / task_slug
+        worktree_path = project_worktrees_dir(project_path) / task_slug
         branch_name = f"task/{task_slug}"
 
         if worktree_path.exists():

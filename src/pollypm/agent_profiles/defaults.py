@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pollypm.agent_profiles.base import AgentProfile, AgentProfileContext
+from pollypm.projects import project_state_db_path
 
 _PROFILES_DIR = (
     Path(__file__).resolve().parents[1]
@@ -529,7 +530,7 @@ def _project_inbox_snapshot(project_key: str, project_root: Path) -> list[dict[s
     except Exception:  # noqa: BLE001
         return []
 
-    db_path = project_root / ".pollypm" / "state.db"
+    db_path = project_state_db_path(project_root)
     if not db_path.exists():
         return []
     try:
@@ -611,10 +612,15 @@ def _read_instruct_rules(project_root: Path) -> str:
             "</project-overrides>"
         )
     ]
-    system_path = project_root / ".pollypm" / "docs" / "SYSTEM.md"
+    from pollypm.projects import (
+        project_docs_dir,
+        project_instruction_file,
+    )
+
+    system_path = project_docs_dir(project_root) / "SYSTEM.md"
     if system_path.exists():
         parts.append(system_path.read_text(encoding="utf-8").strip())
-    instruct_path = project_root / ".pollypm" / "INSTRUCT.md"
+    instruct_path = project_instruction_file(project_root)
     if instruct_path.exists():
         parts.append(instruct_path.read_text(encoding="utf-8").strip())
     return "\n\n".join(parts)
@@ -622,7 +628,9 @@ def _read_instruct_rules(project_root: Path) -> str:
 
 def _reference_pointer(project_root: Path) -> str:
     """Short pointer to reference docs — look-up material, not behavioral rules."""
-    ref_dir = project_root / ".pollypm" / "docs" / "reference"
+    from pollypm.projects import project_docs_dir
+
+    ref_dir = project_docs_dir(project_root) / "reference"
     if not ref_dir.is_dir():
         return ""
     return (

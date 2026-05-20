@@ -32,9 +32,10 @@ from pathlib import Path
 from typing import Callable
 
 import pollypm
+from pollypm.config import GLOBAL_CONFIG_DIR
 
 
-_POST_UPGRADE_FLAG = Path.home() / ".pollypm" / "post-upgrade.flag"
+_POST_UPGRADE_FLAG = GLOBAL_CONFIG_DIR / "post-upgrade.flag"
 
 
 def _write_post_upgrade_flag(
@@ -394,7 +395,7 @@ def _perform_recycle(
     """
     log = step or (lambda _msg: None)
     try:
-        from pollypm.config import DEFAULT_CONFIG_PATH
+        from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR
         from pollypm.service_api import PollyPMService
     except Exception:  # noqa: BLE001
         log(f"recycle ({scope}): pollypm runtime imports failed")

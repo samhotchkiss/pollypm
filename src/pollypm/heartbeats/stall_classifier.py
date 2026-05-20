@@ -240,9 +240,10 @@ def has_pending_work_for_session(config, session_name: str) -> bool:
             pass
 
         try:
+            from pollypm.projects import project_state_db_path
             from pollypm.work import create_work_service
 
-            db_path = project_path / ".pollypm" / "state.db"
+            db_path = project_state_db_path(project_path)
             if db_path.exists():
                 with create_work_service(
                     db_path=db_path, project_path=project_path,

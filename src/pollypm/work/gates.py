@@ -12,6 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+from pollypm.projects import project_gates_dir, project_plugins_dir
 from pollypm.work.models import (
     ArtifactKind,
     GateResult,
@@ -216,12 +217,13 @@ class GateRegistry:
             self._load_gates_from_dir(plugin_gate_dir)
 
         # User-global: ~/.pollypm/gates/
-        user_dir = self._user_gates_dir or (Path.home() / ".pollypm" / "gates")
+        from pollypm.projects import global_pollypm_dir as _global_dir
+        user_dir = self._user_gates_dir or (_global_dir() / "gates")
         self._load_gates_from_dir(user_dir)
 
         # Project-local: <project>/.pollypm/gates/
         if self._project_path is not None:
-            proj_dir = self._project_path / ".pollypm" / "gates"
+            proj_dir = project_gates_dir(self._project_path)
             self._load_gates_from_dir(proj_dir)
 
     def _plugin_gate_dirs(self) -> list[Path]:
@@ -246,14 +248,15 @@ class GateRegistry:
                 if plugin_dir.is_dir() and (plugin_dir / "gates").is_dir():
                     dirs.append(plugin_dir / "gates")
 
-        user_plugin_root = Path.home() / ".pollypm" / "plugins"
+        from pollypm.projects import global_pollypm_dir as _global_dir
+        user_plugin_root = _global_dir() / "plugins"
         if user_plugin_root.is_dir():
             for plugin_dir in sorted(user_plugin_root.iterdir()):
                 if plugin_dir.is_dir() and (plugin_dir / "gates").is_dir():
                     dirs.append(plugin_dir / "gates")
 
         if self._project_path is not None:
-            proj_plugin_root = self._project_path / ".pollypm" / "plugins"
+            proj_plugin_root = project_plugins_dir(self._project_path)
             if proj_plugin_root.is_dir():
                 for plugin_dir in sorted(proj_plugin_root.iterdir()):
                     if plugin_dir.is_dir() and (plugin_dir / "gates").is_dir():

@@ -78,7 +78,9 @@ def build_backend_for_config(config_path: Path) -> FileMemoryBackend:
     config = load_config(resolved)
     workspace_root = getattr(config.project, "workspace_root", None)
     if workspace_root is not None:
-        workspace_state_db = Path(workspace_root) / ".pollypm" / "state.db"
+        from pollypm.projects import project_state_db_path
+
+        workspace_state_db = project_state_db_path(Path(workspace_root))
         if workspace_state_db.exists():
             return get_memory_backend(Path(workspace_root), "file")  # type: ignore[return-value]
     project_root = config.project.root_dir

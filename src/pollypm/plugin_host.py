@@ -47,6 +47,7 @@ from pollypm.plugin_api.v1 import (
 )
 from pollypm.plugin_trust import warn_third_party_extension_trust_once
 from pollypm.plugin_validate import validate_plugin
+from pollypm.projects import project_plugins_dir
 
 logger = logging.getLogger(__name__)
 
@@ -300,18 +301,24 @@ class ExtensionHost:
                 for user_path in declaration.user_paths:
                     paths.append((plugin_dir / user_path).resolve())
 
+        from pollypm.projects import (
+            global_pollypm_dir as _global_dir,
+            project_content_dir as _pcontent_dir,
+        )
+
         # 2) User-global content path.
-        user_home = Path.home()
+        global_content = _global_dir() / "content"
         if kind is not None:
-            paths.append(user_home / ".pollypm" / "content" / plugin_name / kind)
+            paths.append(global_content / plugin_name / kind)
         else:
-            paths.append(user_home / ".pollypm" / "content" / plugin_name)
+            paths.append(global_content / plugin_name)
 
         # 3) Project-local content path.
+        project_content = _pcontent_dir(self.root_dir)
         if kind is not None:
-            paths.append(self.root_dir / ".pollypm" / "content" / plugin_name / kind)
+            paths.append(project_content / plugin_name / kind)
         else:
-            paths.append(self.root_dir / ".pollypm" / "content" / plugin_name)
+            paths.append(project_content / plugin_name)
 
         return paths
 
@@ -831,9 +838,10 @@ class ExtensionHost:
         3. User-global: ``~/.pollypm/plugins/``
         4. Project-local: ``<project>/.pollypm/plugins/``
         """
+        from pollypm.projects import global_pollypm_dir as _global_dir
         builtins = Path(__file__).resolve().parent / "plugins_builtin"
-        user = Path.home() / ".pollypm" / "plugins"
-        project = self.root_dir / ".pollypm" / "plugins"
+        user = _global_dir() / "plugins"
+        project = project_plugins_dir(self.root_dir)
         return [
             ("builtin", builtins),
             ("user", user),

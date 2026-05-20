@@ -33,6 +33,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from pollypm.models import KnownProject
+from pollypm.projects import project_advisor_log_path, project_state_db_path
 
 
 logger = logging.getLogger(__name__)
@@ -296,7 +297,7 @@ def project_state_db_paths(project: KnownProject, config=None) -> list[Path]:
     candidates: list[Path] = []
     seen: set[Path] = set()
 
-    per_project = project.path / ".pollypm" / "state.db"
+    per_project = project_state_db_path(project.path)
     if per_project.exists():
         resolved = per_project.resolve()
         if resolved not in seen:
@@ -307,7 +308,7 @@ def project_state_db_paths(project: KnownProject, config=None) -> list[Path]:
     if config is not None:
         workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
     if workspace_root is not None:
-        ws_db = Path(workspace_root) / ".pollypm" / "state.db"
+        ws_db = project_state_db_path(Path(workspace_root))
         if ws_db.exists():
             resolved = ws_db.resolve()
             if resolved not in seen:
@@ -447,7 +448,7 @@ def _gather_advisor_insights(
 
     Missing file / corrupt lines / wrong type → ignored.
     """
-    log_path = project_root / ".pollypm" / "advisor-log.jsonl"
+    log_path = project_advisor_log_path(project_root)
     if not log_path.exists():
         return []
     out: list[AdvisorInsightSummary] = []

@@ -28,6 +28,7 @@ from pathlib import Path
 # core module so the cockpit UI can call it without importing from
 # ``plugins_builtin`` (#1363). Re-exported here so callers that already
 # import from ``project_planning.memory`` keep working unchanged.
+from pollypm.config import GLOBAL_CONFIG_DIR
 from pollypm.project_planning_protocol import (  # noqa: F401
     REJECTIONS_FILE,
     is_proposal_rejected,
@@ -35,7 +36,7 @@ from pollypm.project_planning_protocol import (  # noqa: F401
 )
 
 
-MEMORY_DIR = Path.home() / ".pollypm" / "memory"
+MEMORY_DIR = GLOBAL_CONFIG_DIR / "memory"
 MEMORY_FILE = MEMORY_DIR / "planner.jsonl"
 
 

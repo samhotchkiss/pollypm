@@ -28,6 +28,7 @@ from pollypm.plugin_api.v1 import (
     RailContext,
     RailRow,
 )
+from pollypm.projects import project_state_db_path
 
 logger = logging.getLogger(__name__)
 
@@ -299,14 +300,14 @@ def _classify_projects(ctx: RailContext) -> tuple[list[tuple[str, Any]], list[tu
             return 0.0
 
     def _project_activity(project_key: str, project: Any) -> tuple[bool, bool]:
-        db_path = project.path / ".pollypm" / "state.db"
+        db_path = project_state_db_path(project.path)
         git_dir = project.path / ".git"
         db_mtime = _path_mtime(db_path)
         workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
         if workspace_root is not None:
             db_mtime = max(
                 db_mtime,
-                _path_mtime(Path(workspace_root) / ".pollypm" / "state.db"),
+                _path_mtime(project_state_db_path(Path(workspace_root))),
             )
         git_mtime = _path_mtime(git_dir)
         cache = getattr(router, "_project_activity_cache", None)

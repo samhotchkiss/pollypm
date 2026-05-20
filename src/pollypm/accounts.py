@@ -12,7 +12,7 @@ from pathlib import Path
 import typer
 
 from pollypm.agent_profiles.defaults import heartbeat_prompt, polly_prompt
-from pollypm.config import load_config, write_config
+from pollypm.config import GLOBAL_CONFIG_DIR, load_config, write_config
 from pollypm.models import AccountConfig, PollyPMConfig, ProviderKind
 from pollypm.onboarding import (
     _decode_jwt_payload,
@@ -506,7 +506,7 @@ def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[st
 
     existing = [account for account in config.accounts.values() if account.provider is provider]
     next_index = len(existing) + 1
-    agent_homes = Path.home() / ".pollypm" / "agent_homes"
+    agent_homes = GLOBAL_CONFIG_DIR / "agent_homes"
     agent_homes.mkdir(parents=True, exist_ok=True)
     home = agent_homes / f"{provider.value}_{next_index}"
     _run_login_window(

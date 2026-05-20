@@ -61,6 +61,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Callable
+from pollypm.config import GLOBAL_CONFIG_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +111,7 @@ def build_plist_dict(
     we'd ask launchd to do, not whether plistlib can serialize a dict).
     """
     python = str(python_executable or sys.executable)
-    log = str(log_path or (Path.home() / ".pollypm" / "rail_daemon.log"))
+    log = str(log_path or (GLOBAL_CONFIG_DIR / "rail_daemon.log"))
     program_args = [
         python, "-m", "pollypm.rail_daemon",
         "--config", str(config_path),

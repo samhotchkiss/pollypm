@@ -51,7 +51,7 @@ class ReleaseCheck:
 
 
 def _cache_path() -> Path:
-    return Path.home() / ".pollypm" / "release-check.json"
+    return GLOBAL_CONFIG_DIR / "release-check.json"
 
 
 def _load_cached(path: Path, channel: str, ttl_seconds: int) -> ReleaseCheck | None:
@@ -248,7 +248,7 @@ def _resolve_channel(config_path: Path | None) -> str:
     raising — the update check is a nice-to-have signal, never a
     startup blocker.
     """
-    from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+    from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR, load_config
 
     path = config_path or DEFAULT_CONFIG_PATH
     if not path.exists():

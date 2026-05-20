@@ -6,7 +6,9 @@ from pollypm.task_backends.file import FileTaskBackend
 
 
 def _project_task_backend_settings(project_path: Path) -> tuple[str, str | None]:
-    config_path = project_path / ".pollypm" / "config" / "project.toml"
+    from pollypm.projects import project_config_dir
+
+    config_path = project_config_dir(project_path) / "project.toml"
     if not config_path.exists():
         return "file", None
     try:

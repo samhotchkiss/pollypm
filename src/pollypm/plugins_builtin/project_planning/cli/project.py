@@ -42,6 +42,7 @@ from pollypm.project_guides import (
     list_project_guides,
     render_project_guide_diff,
 )
+from pollypm.projects import project_state_db_path
 
 
 project_app = typer.Typer(
@@ -206,12 +207,12 @@ def _planner_db_path(
     Fall back to the project-local path only when no config is available,
     which keeps older isolated tests and recovery paths working.
     """
-    db_path = project_path / ".pollypm" / "state.db"
+    db_path = project_state_db_path(project_path)
     try:
         cfg = load_config(config_path) if config_path is not None else load_config()
         workspace_root = getattr(cfg.project, "workspace_root", None)
         if workspace_root is not None:
-            db_path = Path(workspace_root) / ".pollypm" / "state.db"
+            db_path = project_state_db_path(Path(workspace_root))
     except Exception:  # noqa: BLE001
         pass
     if create_parent:
@@ -243,7 +244,7 @@ def _has_work_tasks(
     if project_key:
         db_path = _planner_db_path(project_path, config_path=config_path)
     else:
-        db_path = project_path / ".pollypm" / "state.db"
+        db_path = project_state_db_path(project_path)
     if not db_path.exists():
         return False
     try:
@@ -722,7 +723,7 @@ def _workspace_db_path(config_path: Path) -> Path | None:
     workspace_root = getattr(config.project, "workspace_root", None)
     if workspace_root is None:
         return None
-    return Path(workspace_root) / ".pollypm" / "state.db"
+    return project_state_db_path(Path(workspace_root))
 
 
 def _count_project_state_rows(

@@ -19,6 +19,7 @@ from typing import Any
 import typer
 
 from pollypm.cli_help import help_with_examples
+from pollypm.config import GLOBAL_CONFIG_DIR
 
 plugins_app = typer.Typer(
     help=help_with_examples(
@@ -32,8 +33,8 @@ plugins_app = typer.Typer(
 )
 
 
-USER_PLUGINS_DIR = Path.home() / ".pollypm" / "plugins"
-USER_CONFIG_PATH = Path.home() / ".pollypm" / "pollypm.toml"
+USER_PLUGINS_DIR = GLOBAL_CONFIG_DIR / "plugins"
+USER_CONFIG_PATH = GLOBAL_CONFIG_DIR / "pollypm.toml"
 
 
 # ---------------------------------------------------------------------------

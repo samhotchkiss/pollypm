@@ -33,7 +33,7 @@ from textual.widgets import (
 )
 
 from pollypm.account_usage_sampler import load_cached_account_usage
-from pollypm.config import load_config, write_config
+from pollypm.config import GLOBAL_CONFIG_DIR, load_config, write_config
 from pollypm.cockpit_project_advisor_log import render_advisor_log_lines
 from pollypm.cockpit_settings_confirm import _SettingsConfirmModal
 from pollypm.cockpit_settings_history import (
@@ -50,6 +50,7 @@ from pollypm.models import ModelAssignment, ProviderKind
 from pollypm.role_routing import resolve_role_assignment
 from pollypm.service_api import PollyPMService
 from pollypm.work import create_work_service
+from pollypm.projects import project_project_guides_dir, project_state_db_path
 
 _PROJECT_ROLE_KEYS = ("architect", "worker", "reviewer")
 _ROLE_LABELS = {
@@ -147,7 +148,7 @@ _PROJECT_GUIDE_ROLES: tuple[str, ...] = ("architect", "worker", "reviewer")
 
 
 def _project_guides_dir(project_path: Path) -> Path:
-    return Path(project_path) / ".pollypm" / "project-guides"
+    return project_project_guides_dir(Path(project_path))
 
 
 def _project_guide_path(project_path: Path, role: str) -> Path:
@@ -613,7 +614,7 @@ class PollyProjectSettingsApp(App[None]):
         project_path = getattr(project, "path", None)
         if project is None or project_path is None:
             return "[dim]No project found.[/dim]"
-        db_path = project_path / ".pollypm" / "state.db"
+        db_path = project_state_db_path(project_path)
         if not db_path.exists():
             return "[dim]No project database yet.[/dim]"
         try:
@@ -804,7 +805,7 @@ class PollyProjectSettingsApp(App[None]):
         # Invalidate the cached release check so the next probe re-queries
         # against the new channel. The cache module from #714 doesn't
         # exist yet — unlink defensively.
-        cache_path = Path.home() / ".pollypm" / "release-check.json"
+        cache_path = GLOBAL_CONFIG_DIR / "release-check.json"
         try:
             cache_path.unlink(missing_ok=True)
         except OSError:
@@ -980,7 +981,7 @@ class PollyProjectSettingsApp(App[None]):
         header.update(f"[b]{self.project_key}[/b] [dim]advisor log[/dim]")
         try:
             config = load_config(self.config_path)
-            base_dir = Path(getattr(config.project, "base_dir", Path.home() / ".pollypm"))
+            base_dir = Path(getattr(config.project, "base_dir", GLOBAL_CONFIG_DIR))
         except Exception as exc:  # noqa: BLE001
             body.update(f"Advisor log unavailable: {exc}")
             return

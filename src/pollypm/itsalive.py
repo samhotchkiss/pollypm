@@ -10,6 +10,7 @@ from typing import Any
 from urllib import error, parse, request
 
 from pollypm.atomic_io import atomic_write_json
+from pollypm.config import GLOBAL_CONFIG_DIR
 from pollypm.messaging import (
     notify_deploy_complete,
     notify_deploy_expired,
@@ -26,7 +27,7 @@ GLOBAL_CONFIG_FILE = Path.home() / ".itsalive"
 # subdomains under the same email. Keyed by email so a single operator can
 # manage multiple verified accounts and a fresh project never re-prompts for
 # verification on a previously-verified email.
-OWNER_TOKENS_FILE = Path.home() / ".pollypm" / "itsalive_owner_tokens.json"
+OWNER_TOKENS_FILE = GLOBAL_CONFIG_DIR / "itsalive_owner_tokens.json"
 PENDING_DIR = ".pollypm/itsalive/pending"
 _IGNORE_NAMES = {".DS_Store", ".itsalive", "ITSALIVE.md", "CLAUDE.md"}
 _IGNORE_PARTS = {".git", "node_modules"}

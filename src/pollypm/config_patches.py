@@ -7,7 +7,13 @@ import shutil
 from pollypm.config import project_config_path
 from pollypm.doc_scaffold import scaffold_docs
 from pollypm.plugin_host import PLUGIN_MANIFEST
-from pollypm.projects import ensure_project_scaffold
+from pollypm.projects import (
+    ensure_project_scaffold,
+    project_config_dir,
+    project_magic_dir,
+    project_plugins_dir,
+    project_rules_dir,
+)
 from pollypm.rules import discover_magic, discover_rules
 
 
@@ -33,21 +39,21 @@ def detect_preference_patch(project_root: Path, text: str) -> PreferencePatch | 
         return PreferencePatch(
             kind="rule",
             target_name="build",
-            path=project_root / ".pollypm" / "rules" / "build.md",
+            path=project_rules_dir(project_root) / "build.md",
             offer_text="I can create a project-local override for the `build` rule in `.pollypm/rules/build.md` so the next session uses your preference.",
         )
     if any(token in lowered for token in ("magic", "capability")):
         return PreferencePatch(
             kind="magic",
             target_name="deploy-site",
-            path=project_root / ".pollypm" / "magic" / "deploy-site.md",
+            path=project_magic_dir(project_root) / "deploy-site.md",
             offer_text="I can create a project-local magic override in `.pollypm/magic/` so the next session uses that behavior.",
         )
     if any(token in lowered for token in ("plugin", "provider", "scheduler", "heartbeat backend")):
         return PreferencePatch(
             kind="plugin_selection",
             target_name="plugins",
-            path=project_root / ".pollypm" / "config" / "plugins.toml",
+            path=project_config_dir(project_root) / "plugins.toml",
             offer_text="I can write a project-local plugin selection override in `.pollypm/config/plugins.toml`.",
         )
     return PreferencePatch(
@@ -110,7 +116,7 @@ def _write_rule_override(project_root: Path, rule_name: str, preference: str) ->
     source = rules.get(rule_name)
     if source is None:
         raise ValueError(f"Unknown rule: {rule_name}")
-    target = project_root / ".pollypm" / "rules" / f"{rule_name}.md"
+    target = project_rules_dir(project_root) / f"{rule_name}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     body = source.content.rstrip() + "\n\n## Project Override\n" f"- User preference: {preference.strip()}\n"
     if "test" in preference.lower() and "commit" in preference.lower():
@@ -124,7 +130,7 @@ def _write_magic_override(project_root: Path, magic_name: str, preference: str) 
     source = magic.get(magic_name)
     if source is None:
         raise ValueError(f"Unknown magic: {magic_name}")
-    target = project_root / ".pollypm" / "magic" / f"{magic_name}.md"
+    target = project_magic_dir(project_root) / f"{magic_name}.md"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(
         source.content.rstrip()
@@ -136,7 +142,7 @@ def _write_magic_override(project_root: Path, magic_name: str, preference: str) 
 
 def write_plugin_override(project_root: Path, plugin_name: str, body: str) -> Path:
     ensure_project_scaffold(project_root)
-    plugin_dir = project_root / ".pollypm" / "plugins" / plugin_name
+    plugin_dir = project_plugins_dir(project_root) / plugin_name
     plugin_dir.mkdir(parents=True, exist_ok=True)
     (plugin_dir / PLUGIN_MANIFEST).write_text(
         "\n".join(
@@ -161,11 +167,11 @@ def write_plugin_override(project_root: Path, plugin_name: str, body: str) -> Pa
 
 def remove_project_override(project_root: Path, kind: str, target_name: str) -> None:
     candidates = {
-        ("rule", target_name): project_root / ".pollypm" / "rules" / f"{target_name}.md",
-        ("magic", target_name): project_root / ".pollypm" / "magic" / f"{target_name}.md",
+        ("rule", target_name): project_rules_dir(project_root) / f"{target_name}.md",
+        ("magic", target_name): project_magic_dir(project_root) / f"{target_name}.md",
         ("project_setting", target_name): project_config_path(project_root),
-        ("plugin_selection", target_name): project_root / ".pollypm" / "config" / "plugins.toml",
-        ("plugin", target_name): project_root / ".pollypm" / "plugins" / target_name,
+        ("plugin_selection", target_name): project_config_dir(project_root) / "plugins.toml",
+        ("plugin", target_name): project_plugins_dir(project_root) / target_name,
     }
     path = candidates.get((kind, target_name))
     if path is None:

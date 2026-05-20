@@ -302,10 +302,12 @@ def _collect_recent_tasks_by_account(
         path = getattr(project, "path", None)
         if path is None:
             continue
+        from pollypm.projects import project_state_db_path
+
         project_path = Path(path)
         if not project_path.exists():
             continue
-        db_path = project_path / ".pollypm" / "state.db"
+        db_path = project_state_db_path(project_path)
         if not db_path.exists():
             continue
         try:

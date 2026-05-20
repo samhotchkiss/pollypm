@@ -49,6 +49,7 @@ from pollypm.signal_routing import (
     route_signal,
 )
 from pollypm.work.models import ArtifactKind
+from pollypm.config import GLOBAL_CONFIG_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ class _HasExecutions(Protocol):
 
 
 def state_path() -> Path:
-    return Path.home() / ".pollypm" / _STATE_FILENAME
+    return GLOBAL_CONFIG_DIR / _STATE_FILENAME
 
 
 def load_state(path: Path | None = None) -> dict[str, Any]:

@@ -31,6 +31,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from pollypm.projects import (
+    project_control_prompts_dir as _project_control_prompts_dir,
+    project_project_guides_dir,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -107,7 +111,7 @@ def role_guide_path(project_path: Path, role: str) -> Path:
     # path so at least a consistent string is returned.
     if local is not None:
         return local
-    return project_path / ".pollypm" / "project-guides" / f"{normalized}.md"
+    return project_project_guides_dir(project_path) / f"{normalized}.md"
 
 
 def _built_in_operator_guide_path() -> Path:
@@ -212,7 +216,7 @@ def project_control_prompts_dir(project_path: Path) -> Path:
     self-contained per #763. Writers should call :func:`session_control_prompts_dir`
     to pick the right project for a given session name.
     """
-    return Path(project_path) / ".pollypm" / "control-prompts"
+    return _project_control_prompts_dir(Path(project_path))
 
 
 def session_control_prompts_dir(config, session_name: str) -> Path:

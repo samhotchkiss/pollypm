@@ -90,7 +90,13 @@ def default_audit_dir() -> Path:
 
         return Path(DEFAULT_CONFIG_PATH).parent / "audit"
     except Exception:  # noqa: BLE001
-        return Path.home() / ".pollypm" / "audit"
+        # noqa: pollypm-path-join — import-cycle fallback. This leaf module
+        # mirrors ``audit.log._central_root`` without importing it (cycle
+        # risk via state_cache → audit → state_cache). When the lazy
+        # ``pollypm.config`` import above fails, we cannot route through
+        # the typed helper (``pollypm.projects.global_pollypm_dir``)
+        # without re-introducing the cycle. The literal is intentional.
+        return Path.home() / ".pollypm" / "audit"  # noqa: pollypm-path-join
 
 
 def stub_refresh_fn(project_key: str) -> ProjectStateCacheEntry | None:

@@ -7,10 +7,11 @@ from pathlib import Path
 import tomllib
 
 from pollypm.models import ModelAssignment
+from pollypm.config import GLOBAL_CONFIG_DIR
 
 
 _log = logging.getLogger(__name__)
-_DEFAULT_OVERLAY_PATH = Path.home() / ".pollypm" / "model_registry.toml"
+_DEFAULT_OVERLAY_PATH = GLOBAL_CONFIG_DIR / "model_registry.toml"
 
 
 @dataclass(slots=True, frozen=True)

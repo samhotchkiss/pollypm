@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.capacity import CapacityState, probe_capacity
-from pollypm.config import PollyPMConfig, load_config
+from pollypm.config import GLOBAL_CONFIG_DIR, PollyPMConfig, load_config
 from pollypm.models import ProviderKind
 from pollypm.runtime_env import claude_config_dir
 
@@ -31,7 +31,7 @@ def _account_store(config: PollyPMConfig) -> None:
 
 
 HAIKU_MODEL = "claude-haiku-4-5-20251001"
-DEFAULT_CONFIG_PATH = Path.home() / ".pollypm" / "pollypm.toml"
+DEFAULT_CONFIG_PATH = GLOBAL_CONFIG_DIR / "pollypm.toml"
 
 
 def select_background_account(

@@ -435,7 +435,9 @@ def _read_pyproject_version() -> str | None:
 
 
 def _setup_tags_path() -> Path:
-    return Path.home() / ".pollypm" / "setup-tags.json"
+    from pollypm.projects import global_pollypm_dir
+
+    return global_pollypm_dir() / "setup-tags.json"
 
 
 def _tool_version(binary: str, *, timeout: float = 2.0) -> str | None:
@@ -822,7 +824,9 @@ def _workspace_state_db_path(config: PollyPMConfig | None = None) -> Path | None
         return None
     if workspace_root is None:
         return None
-    return Path(workspace_root) / ".pollypm" / "state.db"
+    from pollypm.projects import project_state_db_path
+
+    return project_state_db_path(Path(workspace_root))
 
 
 def _user_state_db_path() -> Path:
@@ -833,7 +837,9 @@ def _user_state_db_path() -> Path:
     lists, global memory dossiers) while the workspace DB holds the
     work_tasks / messages / sessions tables.
     """
-    return Path.home() / ".pollypm" / "state.db"
+    from pollypm.projects import global_pollypm_dir
+
+    return global_pollypm_dir() / "state.db"
 
 
 def _state_db_candidates() -> list[Path]:
@@ -893,10 +899,12 @@ def _state_db_candidates() -> list[Path]:
     # Legacy per-project DBs — if any survive the migration to #339
     # we still want migration / size checks to see them.
     if config is not None:
+        from pollypm.projects import project_state_db_path
+
         for project in (getattr(config, "projects", {}) or {}).values():
             if not getattr(project, "tracked", False):
                 continue
-            _add(project.path / ".pollypm" / "state.db")
+            _add(project_state_db_path(project.path))
     return out
 
 
@@ -1055,7 +1063,9 @@ def check_work_migrations() -> CheckResult:
 
 
 def _pollypm_home() -> Path:
-    return Path.home() / ".pollypm"
+    from pollypm.projects import global_pollypm_dir
+
+    return global_pollypm_dir()
 
 
 def check_rail_daemon_alive() -> CheckResult:
@@ -1199,8 +1209,9 @@ def check_db_layout_canonical() -> CheckResult:
             "legacy artifact)"
         )
     from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+    from pollypm.projects import global_pollypm_dir, project_state_db_path
 
-    user_db = Path.home() / ".pollypm" / "state.db"
+    user_db = global_pollypm_dir() / "state.db"
     workspace_db: Path | None = None
     strays: list[Path] = []
 
@@ -1212,7 +1223,7 @@ def check_db_layout_canonical() -> CheckResult:
         if config is not None:
             workspace_root = getattr(config.project, "workspace_root", None)
             if workspace_root is not None:
-                workspace_db = Path(workspace_root) / ".pollypm" / "state.db"
+                workspace_db = project_state_db_path(Path(workspace_root))
                 stray = Path(workspace_root) / _LEGACY_STATE_DIRNAME
                 if stray.exists():
                     strays.append(stray)
@@ -2429,7 +2440,9 @@ def _project_guides_module():
 
 
 def _project_guides_dir(project_path: Path) -> Path:
-    return Path(project_path) / ".pollypm" / "project-guides"
+    from pollypm.projects import project_project_guides_dir
+
+    return project_project_guides_dir(Path(project_path))
 
 
 def _project_guide_path(project_path: Path, role: str) -> Path:
@@ -2930,11 +2943,13 @@ def check_task_assignment_sweeper_dbs() -> CheckResult:
     missing: list[str] = []
     missing_paths: list[Path] = []
     found = 0
+    from pollypm.projects import project_state_db_path
+
     for key, project in projects.items():
         if not getattr(project, "tracked", False):
             continue
         tracked_total += 1
-        per_project_db = project.path / ".pollypm" / "state.db"
+        per_project_db = project_state_db_path(project.path)
         # Pattern A from the #1034 audit: a project is reachable when
         # *either* the workspace DB (post-#339 canonical) OR the legacy
         # per-project DB exists. Probing only the per-project file
@@ -3571,7 +3586,9 @@ def _logs_dir_candidates() -> list[Path]:
             out.append(config.project.logs_dir)
         except Exception:  # noqa: BLE001
             pass
-    out.append(Path.home() / ".pollypm" / "logs")
+    from pollypm.projects import global_pollypm_dir
+
+    out.append(global_pollypm_dir() / "logs")
     return [p for p in out if p.is_dir()]
 
 

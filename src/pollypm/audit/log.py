@@ -278,7 +278,7 @@ def _central_root() -> Path:
     # ``DEFAULT_CONFIG_PATH.parent`` (typically ``~/.pollypm``) so a
     # custom config home stays internally consistent.
     try:
-        from pollypm.config import DEFAULT_CONFIG_PATH
+        from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR
 
         return Path(DEFAULT_CONFIG_PATH).parent / "audit"
     except Exception:  # noqa: BLE001 — never fail audit on config errors
@@ -289,7 +289,7 @@ def _central_root() -> Path:
             "falling back to ~/.pollypm/audit",
             exc_info=True,
         )
-        return Path.home() / ".pollypm" / "audit"
+        return GLOBAL_CONFIG_DIR / "audit"
 
 
 def _safe_project_filename(project: str) -> str:

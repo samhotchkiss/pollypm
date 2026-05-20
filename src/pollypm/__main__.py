@@ -100,7 +100,7 @@ def _paint_inbox_loading_placeholder() -> None:
 
 
 def _default_config_path() -> Path:
-    return Path.home() / ".pollypm" / "pollypm.toml"
+    return GLOBAL_CONFIG_DIR / "pollypm.toml"
 
 
 def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> Exception | None:
@@ -131,7 +131,7 @@ def _paint_inbox_snapshot(config_path: Path, *, project: str | None) -> Exceptio
             load_inbox_action_preview,
             load_inbox_entries,
         )
-        from pollypm.config import load_config
+        from pollypm.config import GLOBAL_CONFIG_DIR, load_config
 
         config = load_config(config_path)
         try:

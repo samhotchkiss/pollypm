@@ -85,7 +85,7 @@ from pollypm.persona_drift import (  # noqa: F401  (re-exported)
     _ROLE_PERSONA_MARKER,
     detect_persona_drift,
 )
-from pollypm.projects import ensure_project_scaffold
+from pollypm.projects import ensure_project_scaffold, project_session_markers_dir
 from pollypm.projects import project_checkpoints_dir, project_transcripts_dir, project_worktrees_dir, release_session_lock
 from pollypm.providers.claude.resume import recorded_session_id as _recorded_claude_session_id
 from pollypm.providers.claude.resume import session_ids as _claude_session_ids
@@ -1058,7 +1058,7 @@ class Supervisor:
         # Also clear markers in account homes (e.g. ~/.pollypm/agent_homes/claude_1)
         for account in self.config.accounts.values():
             if account.home is not None:
-                markers_dir = account.home / ".pollypm" / "session-markers"
+                markers_dir = project_session_markers_dir(account.home)
                 if markers_dir.is_dir():
                     for marker in markers_dir.iterdir():
                         marker.unlink(missing_ok=True)
@@ -3058,12 +3058,13 @@ class Supervisor:
 
         project_settings = getattr(self.config, "project", None)
         workspace_root = getattr(project_settings, "workspace_root", None)
+        from pollypm.projects import project_state_db_path as _pstate_db
         if workspace_root is not None:
-            _add_candidate(_Path(workspace_root) / ".pollypm" / "state.db")
+            _add_candidate(_pstate_db(_Path(workspace_root)))
         if project is not None:
             project_path = getattr(project, "path", None)
             if project_path is not None:
-                _add_candidate(_Path(project_path) / ".pollypm" / "state.db")
+                _add_candidate(_pstate_db(_Path(project_path)))
         state_db = getattr(project_settings, "state_db", None)
         if state_db is not None:
             _add_candidate(state_db)
@@ -4783,7 +4784,8 @@ class Supervisor:
         # See issue #263.
         display_path = prompt_path
         # Point to both SYSTEM.md (PollyPM reference) and the control prompt (role)
-        instruct_path = self.config.project.root_dir / ".pollypm" / "docs" / "SYSTEM.md"
+        from pollypm.projects import project_docs_dir as _pdocs_dir
+        instruct_path = _pdocs_dir(self.config.project.root_dir) / "SYSTEM.md"
         # #1007: bootstrap framing has been a moving target for prompt-
         # injection defense. Iteration history:
         #

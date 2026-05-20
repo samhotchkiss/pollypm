@@ -1957,13 +1957,13 @@ def _precompute_plan_missing_projects(services: Any) -> dict[str, str | None]:
 
 def _open_workspace_project_work_service(project: Any, services: Any) -> Any | None:
     """Open the workspace-root DB with a project-specific runtime context."""
+    from pollypm.projects import project_state_db_path
+
     project_path = getattr(project, "path", None)
     if project_path is None:
         return None
-    db_path = (
+    db_path = project_state_db_path(
         Path(getattr(services, "project_root", Path.cwd()))
-        / ".pollypm"
-        / "state.db"
     )
     if not db_path.exists():
         return None

@@ -49,6 +49,8 @@ from pollypm.cockpit_content import (
     TextualCommandPane,
     resolve_cockpit_content,
 )
+from pollypm.cockpit_inbox import _register_worker_roster_rail_item
+from pollypm.cockpit_metrics_rail import _register_metrics_rail_item
 from pollypm.cockpit_window_manager import (
     CockpitWindowManager,
     CockpitWindowSpec,
@@ -1641,15 +1643,11 @@ class CockpitRouter:
         except Exception:  # noqa: BLE001
             core_enabled = True
         if core_enabled:
-            # Deferred imports: the worker roster + metrics registrations
-            # live in ``pollypm.cockpit`` alongside the gather helpers
-            # they call into. Importing them at module load time would
-            # create a cycle (cockpit imports cockpit_rail to re-export
-            # the router), so we resolve them per-tick instead.
-            from pollypm.cockpit import (
-                _register_metrics_rail_item,
-                _register_worker_roster_rail_item,
-            )
+            # #1367: imports moved to module top once the metrics-rail
+            # registration was hoisted to ``cockpit_metrics_rail`` and
+            # the worker-roster registration was sourced from its real
+            # home in ``cockpit_inbox`` — both break the historical
+            # cockpit <-> cockpit_rail cycle.
             _register_worker_roster_rail_item(registry, self)
             _register_metrics_rail_item(registry, self)
         return registry

@@ -386,16 +386,14 @@ class Supervisor:
             self._core_rail = core_rail
             self.store = core_rail.get_state_store()
         else:
-            # Deferred attribute access keeps the import gate clean while
             # state.py is still the source of truth for the legacy
             # domain tables Supervisor reads through ``self.store``
             # (cluster-A reads/writes are pg-routed by the
             # ``_upsert_session`` / ``_get_session_runtime`` / ... helpers
             # below).
-            from pollypm.storage import state as _state_mod
+            from pollypm.storage.state import StateStore
 
-            _cls = getattr(_state_mod, "StateStore")
-            self.store = _cls(config.project.state_db, readonly=readonly_state)
+            self.store = StateStore(config.project.state_db, readonly=readonly_state)
             # Lazy-import to avoid import cycles (core imports nothing from
             # supervisor, but keep the reference local to be safe).
             from pollypm.core import CoreRail as _CoreRail

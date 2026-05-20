@@ -108,13 +108,11 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 
 
 def _declared_state_migrations() -> list[tuple[int, str]]:
-    # Deferred attribute access keeps the import gate clean while
     # state.py is still the source of truth for the legacy migration
     # list (pg has its own schema_migrations registry).
-    from pollypm.storage import state as _state_mod
+    from pollypm.storage.state import StateStore
 
-    _cls = getattr(_state_mod, "StateStore")
-    return [(version, desc) for version, desc, _ in _cls._MIGRATIONS]
+    return [(version, desc) for version, desc, _ in StateStore._MIGRATIONS]
 
 
 def _declared_work_migrations() -> list[tuple[int, str]]:
@@ -316,11 +314,10 @@ def _apply_all(db_path: Path) -> None:
     into the unified ``schema_migrations`` audit table so operators have
     a single pane of glass.
     """
-    from pollypm.storage import state as _state_mod
+    from pollypm.storage.state import StateStore
     from pollypm.work import create_work_service
 
-    _cls = getattr(_state_mod, "StateStore")
-    with _cls(db_path) as _store:
+    with StateStore(db_path) as _store:
         pass
 
     with create_work_service(db_path=db_path) as _svc:

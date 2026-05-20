@@ -296,7 +296,7 @@ def _svc(db: str, project: str | None = None) -> "WorkService":
             storage_closet_name = "pollypm-storage-closet"
             try:
                 from pollypm.session_services.tmux import TmuxSessionService
-                from pollypm.storage import state as _state_mod
+                from pollypm.storage.state import StateStore
 
                 if config is None:
                     from pollypm.config import load_config
@@ -304,11 +304,7 @@ def _svc(db: str, project: str | None = None) -> "WorkService":
                 storage_closet_name = (
                     f"{config.project.tmux_session}-storage-closet"
                 )
-                # Deferred attribute access keeps the import gate clean
-                # while StateStore consumers still need a handle (see
-                # runtime_services for the same shim).
-                _cls = getattr(_state_mod, "StateStore")
-                store = _cls(config.project.state_db)
+                store = StateStore(config.project.state_db)
                 session_service = TmuxSessionService(config=config, store=store)
             except Exception:  # noqa: BLE001
                 pass

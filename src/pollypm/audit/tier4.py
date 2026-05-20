@@ -228,12 +228,10 @@ class Tier4PromotionTracker:
         # TODO(pg-callers-port): tier4_promotion_state uses raw
         # StateStore.execute(SQL) without a corresponding pg facade.
         # Migrating requires building a pg_tier4 facade (filed as
-        # pg-gap). For now this caller stays on StateStore via a
-        # deferred attribute lookup so the gate grep stays clean.
-        from pollypm.storage import state as _state_mod
+        # pg-gap). For now this caller stays on StateStore.
+        from pollypm.storage.state import StateStore
 
-        _cls = getattr(_state_mod, "StateStore")
-        return _cls(self._db_path)
+        return StateStore(self._db_path)
 
     def get(self, root_cause_hash: str) -> Tier4State | None:
         """Return the row for ``root_cause_hash`` or ``None`` if absent."""

@@ -131,6 +131,29 @@ def _render_work_service_issues(
     return "\n".join(lines)
 
 
+# #1634 perf — per-process TTL cache for ``pm_inbox_awaits_user_list``.
+# The function is the single source of truth for "what is waiting on
+# the user" and runs at minimum two pg queries (tasks + messages) plus
+# the plan-review approval filter on every call. Both the rail inbox
+# badge (via ``_count_inbox_tasks_for_label`` → ``_inbox_count`` in the
+# ``core_rail_items`` plugin) and the rail glyph categorization
+# (``_project_categorizations`` → ``project_state_map_from_config`` →
+# ``_waiting_items_by_project``) call into it on the same
+# ``build_items()`` worker tick — and each surface previously had its
+# own short-lived cache, so a fresh tick produced two independent
+# computations. Caching at the function itself collapses those two
+# calls into one and dampens navigation-burst churn.
+#
+# Cache key: ``id(config)`` — the cockpit router already invalidates
+# its config cache on mtime change, so a config reload yields a fresh
+# object identity and bypasses this cache automatically. TTL is set at
+# 1.0s to match the existing ``_INBOX_COUNT_CACHE`` wall-clock bucket
+# in :mod:`pollypm.plugins_builtin.core_rail_items.plugin`; freshly
+# completed work surfaces within ~1 rail tick (0.8s).
+_AWAITS_USER_TTL_SECONDS = 1.0
+_AWAITS_USER_CACHE: dict[int, tuple[float, tuple[object, ...]]] = {}
+
+
 def pm_inbox_awaits_user_list(config) -> list[object]:
     """Return every inbox entry across the config that ``awaits_user``.
 
@@ -146,6 +169,42 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     so a row visible in more than one DB counts once. The function is
     best-effort: a broken DB / missing source / failed store query
     degrades a single source rather than raising.
+
+    #1634 perf — results are memoised per ``config`` identity with a
+    short TTL (:data:`_AWAITS_USER_TTL_SECONDS`) so the rail badge and
+    the rail glyph categorization share a single computation per tick
+    instead of each running their own (~2 pg queries + the plan-review
+    filter). Callers receive a fresh ``list`` copy so mutation is safe.
+    """
+    import time as _time
+
+    cache_key = id(config)
+    now = _time.monotonic()
+    cached = _AWAITS_USER_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < _AWAITS_USER_TTL_SECONDS:
+        return list(cached[1])
+
+    result = _pm_inbox_awaits_user_list_uncached(config)
+    # Best-effort eviction so the cache doesn't grow across long-lived
+    # processes with config reloads (each reload yields a fresh
+    # ``id(config)``). Cheap because the dict is typically tiny — one
+    # entry per live config.
+    if len(_AWAITS_USER_CACHE) > 8:
+        for stale_key in [
+            k for k, (ts, _v) in _AWAITS_USER_CACHE.items()
+            if now - ts >= _AWAITS_USER_TTL_SECONDS
+        ]:
+            _AWAITS_USER_CACHE.pop(stale_key, None)
+    _AWAITS_USER_CACHE[cache_key] = (now, tuple(result))
+    return result
+
+
+def _pm_inbox_awaits_user_list_uncached(config) -> list[object]:
+    """Underlying implementation of :func:`pm_inbox_awaits_user_list`.
+
+    Separated from the public entry point so the cache wrapper stays
+    trivially readable. Tests that need to bypass the cache can call
+    this directly (or reach into :data:`_AWAITS_USER_CACHE`).
     """
     try:
         from pollypm.inbox import awaits_user

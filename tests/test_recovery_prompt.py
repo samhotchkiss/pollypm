@@ -264,6 +264,185 @@ class TestBuildFromCheckpoint:
 
 
 # ---------------------------------------------------------------------------
+# Live git state (#1974 — checkpoint emitting stale branch → architect
+# rejects the recovery prompt as prompt-injection)
+# ---------------------------------------------------------------------------
+
+
+class TestLiveGitStateFromSessionCwd:
+    """Architect / worker sessions live in per-session worktrees; the
+    git state shown in the recovery prompt must reflect the session's
+    actual ``cwd``, not the project root, or the agent rejects the
+    checkpoint."""
+
+    def test_session_cwd_branch_overrides_project_root(
+        self, tmp_path: Path,
+    ) -> None:
+        import subprocess
+
+        project_root = tmp_path / "repo"
+        project_root.mkdir()
+        # Initialise the project repo on ``main``.
+        subprocess.run(
+            ["git", "init", "-b", "main", str(project_root)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git",
+             "-c", "user.email=test@example.com",
+             "-c", "user.name=test",
+             "-C", str(project_root), "commit",
+             "--allow-empty", "-m", "init"],
+            check=True, capture_output=True,
+        )
+
+        # Session worktree on a different branch (this is what
+        # architect-<project> sessions look like in production:
+        # ``<project>/.pollypm/worktrees/<session>/`` checked out to
+        # ``fix/some-branch``).
+        worktree = tmp_path / "worktree"
+        subprocess.run(
+            ["git", "-C", str(project_root), "worktree", "add",
+             "-b", "fix/recovery-checkpoint-live-state",
+             str(worktree)],
+            check=True, capture_output=True,
+        )
+
+        config = PollyPMConfig(
+            project=ProjectSettings(
+                root_dir=project_root,
+                base_dir=project_root / ".pollypm",
+                logs_dir=project_root / ".pollypm/logs",
+                snapshots_dir=project_root / ".pollypm/snapshots",
+                state_db=project_root / ".pollypm/state.db",
+            ),
+            pollypm=PollyPMSettings(controller_account="claude_main"),
+            accounts={
+                "claude_main": AccountConfig(
+                    name="claude_main",
+                    provider=ProviderKind.CLAUDE,
+                    home=project_root / ".pollypm" / "homes" / "claude_main",
+                ),
+            },
+            sessions={
+                "architect_test": SessionConfig(
+                    name="architect_test",
+                    role="architect",
+                    provider=ProviderKind.CLAUDE,
+                    account="claude_main",
+                    cwd=worktree,
+                    project="test",
+                ),
+            },
+            projects={
+                "test": KnownProject(
+                    key="test",
+                    path=project_root,
+                    name="TestProject",
+                    kind=ProjectKind.FOLDER,
+                ),
+            },
+        )
+
+        checkpoint = CheckpointData(
+            checkpoint_id="ckpt-1974",
+            session_name="architect_test",
+            project="test",
+            objective="Test live git state",
+        )
+
+        prompt = _build_from_checkpoint(
+            config, checkpoint,
+            provider=ProviderKind.CLAUDE,
+            task_prompt="",
+            max_chars=DEFAULT_MAX_CHARS,
+            session_name="architect_test",
+        )
+
+        rendered = prompt.render()
+        # The worktree's branch must appear — that is the whole bug.
+        assert "Branch: fix/recovery-checkpoint-live-state" in rendered, (
+            "Recovery checkpoint must read live git state from the "
+            "session's cwd (the worktree), not the project root. See "
+            "issue #1974."
+        )
+        # And it must NOT say the main-repo branch, or the architect
+        # treats the mismatch as prompt-injection and refuses.
+        assert "Branch: main" not in rendered
+
+    def test_falls_back_to_project_root_without_session_cwd(
+        self, tmp_path: Path,
+    ) -> None:
+        """When no session_name is supplied (or the session has no
+        cwd configured), the existing behavior — reading from
+        project.path — is preserved."""
+        import subprocess
+
+        project_root = tmp_path / "repo"
+        project_root.mkdir()
+        subprocess.run(
+            ["git", "init", "-b", "main", str(project_root)],
+            check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git",
+             "-c", "user.email=test@example.com",
+             "-c", "user.name=test",
+             "-C", str(project_root), "commit",
+             "--allow-empty", "-m", "init"],
+            check=True, capture_output=True,
+        )
+
+        config = _config(tmp_path)
+        # Re-init under the same project root the helper made.
+        # Helper above already created ``repo``, so reuse it: rebuild
+        # config explicitly to point ``test`` at the git repo we just
+        # initialised.
+        config = PollyPMConfig(
+            project=ProjectSettings(
+                root_dir=project_root,
+                base_dir=project_root / ".pollypm",
+                logs_dir=project_root / ".pollypm/logs",
+                snapshots_dir=project_root / ".pollypm/snapshots",
+                state_db=project_root / ".pollypm/state.db",
+            ),
+            pollypm=PollyPMSettings(controller_account="claude_main"),
+            accounts={
+                "claude_main": AccountConfig(
+                    name="claude_main",
+                    provider=ProviderKind.CLAUDE,
+                    home=project_root / ".pollypm" / "homes" / "claude_main",
+                ),
+            },
+            sessions={},
+            projects={
+                "test": KnownProject(
+                    key="test",
+                    path=project_root,
+                    name="TestProject",
+                    kind=ProjectKind.FOLDER,
+                ),
+            },
+        )
+
+        checkpoint = CheckpointData(
+            checkpoint_id="ckpt-fallback",
+            session_name="missing",
+            project="test",
+            objective="Fallback path",
+        )
+        prompt = _build_from_checkpoint(
+            config, checkpoint,
+            provider=ProviderKind.CLAUDE,
+            task_prompt="",
+            max_chars=DEFAULT_MAX_CHARS,
+            # Intentionally omit session_name to exercise the fallback.
+        )
+        rendered = prompt.render()
+        assert "Branch: main" in rendered
+
+
+# ---------------------------------------------------------------------------
 # Truncation
 # ---------------------------------------------------------------------------
 

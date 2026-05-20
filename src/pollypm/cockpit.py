@@ -910,41 +910,11 @@ def _gather_metrics_snapshot(config) -> MetricsSnapshot:
     )
 
 
-def _register_metrics_rail_item(registry, router) -> None:
-    """Add the ``top.Metrics`` rail row if not already registered.
-
-    Kept next to the worker-roster registration so both observability
-    rows sit at the top of the rail. Safe to call repeatedly — the
-    registry dedupes on ``(plugin_name, section, label)``.
-    """
-    try:
-        from pollypm.plugin_api.v1 import RailItemRegistration, PanelSpec
-    except Exception:  # noqa: BLE001
-        return
-
-    def _state(_ctx) -> str:
-        return "watch"
-
-    def _handler(ctx):
-        try:
-            router.route_selected("metrics")
-        except Exception:  # noqa: BLE001
-            pass
-        return PanelSpec(widget=None, focus_hint="metrics")
-
-    reg = RailItemRegistration(
-        plugin_name="cockpit_metrics",
-        section="top",
-        index=28,  # after Workers (25), before Projects (30+)
-        label="Metrics",
-        handler=_handler,
-        key="metrics",
-        state_provider=_state,
-    )
-    try:
-        registry.add(reg)
-    except Exception:  # noqa: BLE001
-        pass
+# ``_register_metrics_rail_item`` moved to ``pollypm.cockpit_metrics_rail``
+# (#1367) so ``cockpit_rail`` can import it at module load time instead of
+# lazy-importing ``cockpit`` to break a cycle. Re-exported here for any
+# legacy callers / monkeypatch paths.
+from pollypm.cockpit_metrics_rail import _register_metrics_rail_item  # noqa: F401,E402
 
 
 def _render_metrics_panel(config_path: Path) -> str:

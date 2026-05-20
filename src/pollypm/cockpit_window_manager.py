@@ -516,9 +516,15 @@ class CockpitWindowManager:
         before = self._window_key_set(park.storage_session)
         # #1631 follow-up — route through the idempotent helper so a
         # live duplicate in the closet doesn't get a second window
-        # silently appended.  When the helper returns False, the
-        # storage window IS the persistent home; our right pane has
-        # been killed and we just clear mount state below.
+        # silently appended.
+        #
+        # #1955 — the helper now kills any pre-existing live orphan and
+        # break-panes the cockpit mount into storage (preserving the
+        # user's active conversation as the canonical window).  The
+        # ``broke is False`` branch now only covers the case where
+        # ``break-pane`` itself errored — we keep the action label
+        # ``park_failed_break_pane`` so a flaky tmux is still visible
+        # in the action log even though the manager can't recover.
         from pollypm.cockpit_storage_park import safe_break_pane_to_storage
         broke = safe_break_pane_to_storage(
             self.tmux,
@@ -531,7 +537,7 @@ class CockpitWindowManager:
             self._rename_created_window(park.storage_session, before, park.window_name, actions)
         else:
             actions.append(
-                f"park_skipped_live_duplicate:{park.storage_session}:{park.window_name}"
+                f"park_failed_break_pane:{park.storage_session}:{park.window_name}"
             )
         state = state.cleared_mount()
 

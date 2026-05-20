@@ -4291,6 +4291,19 @@ class CockpitRouter:
         # (both are live) and Sam saw a fresh Polly re-asking the same
         # 4 onboarding questions — the duplicate window held the
         # original conversation.
+        #
+        # #1955 — live-duplicate policy reversal. The original #1635
+        # logic refused break-pane when a live storage window already
+        # held the canonical name, trusting storage as the persistent
+        # home. For rail-navigation that's wrong: the user has been
+        # typing into ``right_pane_id`` (the cockpit mount), so the
+        # cockpit pane IS the user's active conversation and any
+        # pre-existing live storage window with the same name is a
+        # stale orphan. Killing the cockpit pane (the original
+        # behaviour) wiped Sam's live architect chat on every
+        # nav-and-back. Trust the cockpit pane: kill the orphan and
+        # break-pane the cockpit pane into storage so the next mount
+        # picks up the real conversation.
         existing_same_name = [
             w for w in storage_windows_before
             if getattr(w, "name", None) == window_name
@@ -4304,17 +4317,13 @@ class CockpitRouter:
             if not self._storage_window_is_live(w)
         ]
         if live_existing:
-            # A live duplicate already owns ``window_name`` in storage —
-            # the existing window IS the persistent home. Skip the
-            # break-pane entirely. The caller's subsequent
-            # ``respawn_pane`` on our right pane will discard the
-            # duplicate process we would otherwise have parked.
-            state.pop("mounted_session", None)
-            state.pop("mounted_identity", None)
-            self._write_state(state)
-            self._release_cockpit_lease(supervisor, mounted_session)
+            # #1955 — kill the orphan(s) so the user's actual conversation
+            # (which is right_pane_id, the cockpit's current mount) can
+            # claim the canonical name on break-pane below.  Emit a
+            # forensics event BEFORE the kill so the audit trail records
+            # which indices we removed.
             self._emit_cockpit_audit(
-                event_name="cockpit.park_skipped_existing",
+                event_name="cockpit.park_killed_orphan",
                 subject=mounted_session,
                 status="warn",
                 metadata={
@@ -4323,10 +4332,14 @@ class CockpitRouter:
                     "storage_session": storage_session,
                     "live_duplicate_indices": [w.index for w in live_existing],
                     "dead_duplicate_indices": [w.index for w in dead_existing],
-                    "reason": "live_existing_storage_window",
+                    "reason": "killed_orphan_to_preserve_active_mount",
                 },
             )
-            return
+            for window in live_existing:
+                try:
+                    self.tmux.kill_window(f"{storage_session}:{window.index}")
+                except Exception:  # noqa: BLE001
+                    continue
         # Re-occupy any stale (pane-dead) windows that already hold the
         # name so break-pane lands at the canonical name rather than
         # falling back to a tmux-generated suffix.
@@ -4363,6 +4376,7 @@ class CockpitRouter:
                 "storage_session": storage_session,
                 "storage_windows_after": sorted(w.name for w in after),
                 "reoccupied_dead_indices": [w.index for w in dead_existing],
+                "killed_live_orphan_indices": [w.index for w in live_existing],
             },
         )
 

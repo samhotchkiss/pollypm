@@ -1041,12 +1041,22 @@ def _start_foreground_core_rail_workers(plan) -> bool:
         if LaunchAction.START_RAIL_DAEMON in getattr(plan, "actions", ()):
             return False
     except Exception:  # noqa: BLE001
-        pass
+        # A silent failure here defaults to "run foreground workers",
+        # which can race a daemon launch. Surface so the race is debuggable.
+        logger.warning(
+            "_start_foreground_core_rail_workers: launch-plan probe failed; "
+            "defaulting to foreground workers",
+            exc_info=True,
+        )
     try:
         if _rail_daemon_live():
             return False
     except Exception:  # noqa: BLE001
-        pass
+        logger.warning(
+            "_start_foreground_core_rail_workers: rail-daemon-live probe "
+            "failed; defaulting to foreground workers",
+            exc_info=True,
+        )
     return True
 
 

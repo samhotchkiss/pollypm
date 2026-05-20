@@ -332,7 +332,10 @@ def sweep_all_sessions(config) -> dict[str, int]:
                 if snapshot_path.exists():
                     snapshot = snapshot_path.read_text()[-1500:]
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug(
+                    "session_intelligence: snapshot fetch failed for %s",
+                    session_name, exc_info=True,
+                )
 
             session_cfg = config.sessions.get(session_name)
             role = session_cfg.role if session_cfg else "worker"
@@ -355,7 +358,11 @@ def sweep_all_sessions(config) -> dict[str, int]:
                         sup.send_input(session_name, msg, owner="pollypm", force=True)
                         counts["actions_taken"] += 1
                     except Exception:  # noqa: BLE001
-                        pass
+                        logger.warning(
+                            "session_intelligence: send_input failed for %s "
+                            "(action=%s)", session_name, intel.action,
+                            exc_info=True,
+                        )
 
                 if intel.knowledge_entries:
                     stage_pending_knowledge(project_root, session_name, intel.knowledge_entries)

@@ -263,7 +263,9 @@ def _run_gc_maintenance(supervisor: Supervisor, payload: dict[str, Any]) -> None
                 target = f"{session_name}:{window.name}"
                 supervisor.tmux.set_pane_history_limit(target, 200)
     except Exception:  # noqa: BLE001
-        pass
+        logger.debug(
+            "gc_maintenance: scrollback trim failed", exc_info=True,
+        )
 
 
 @register_job("prune_state")

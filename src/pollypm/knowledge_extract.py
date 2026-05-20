@@ -5,12 +5,15 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 import json
+import logging
 import re
 from typing import Any
 
 from pollypm.llm_runner import HAIKU_MODEL, run_haiku, run_haiku_json
 from pollypm.memory_backends import get_memory_backend
 from pollypm.memory_extractors import CONFIDENCE_THRESHOLD, run_extractors
+
+logger = logging.getLogger(__name__)
 
 EXTRACTION_INTERVAL_SECONDS = 15 * 60
 SUMMARY_HEADER = "## Summary"
@@ -148,7 +151,10 @@ def store_snapshot_learnings(
         try:
             backend.compact(scope)
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "knowledge_extract: memory-backend compact failed for %s",
+                scope, exc_info=True,
+            )
     return count
 
 

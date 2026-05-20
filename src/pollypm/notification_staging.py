@@ -562,6 +562,9 @@ def _project_is_idle(svc, project: str) -> bool:
     try:
         tasks = svc.list_tasks(project=project)
     except Exception:  # noqa: BLE001
+        logger.debug(
+            "_project_is_idle: list_tasks failed for %s", project, exc_info=True,
+        )
         return False
     for t in tasks:
         meta = metadata_for(t.work_status)

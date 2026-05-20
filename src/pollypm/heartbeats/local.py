@@ -225,8 +225,12 @@ def _collect_work_service_signals(
                     ts = ts.replace(tzinfo=timezone.utc)
                 out["active_claim_task_id"] = claim_task_id
                 out["claim_age_seconds"] = int((now - ts).total_seconds())
-            except Exception:  # noqa: BLE001
-                pass
+            except (ValueError, TypeError):
+                # Malformed started_at — fall through without claim metadata.
+                logger.debug(
+                    "work-signal: bad started_at %r for %s",
+                    claim_started_at, claim_task_id,
+                )
 
         # Git commit timestamp on the claimed task's worktree.
         if worktree_path:
@@ -616,7 +620,11 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                         severity=_SignalSeverity.CRITICAL,
                     )
                 except Exception:  # noqa: BLE001
-                    pass
+                    logger.warning(
+                        "heartbeat: failed to emit heartbeat_error event for %s "
+                        "(original session error: %s)",
+                        context.session_name, exc, exc_info=True,
+                    )
         from pollypm.events.summaries import activity_summary
 
         open_alerts = api.open_alerts()
@@ -950,7 +958,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             elif intervention and intervention.action == "escalate":
                 self._escalate(api, context, intervention.reason)
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "heartbeat: intervention dispatch failed for %s",
+                context.session_name, exc_info=True,
+            )
 
     def _handle_pane_health_alerts(
         self,
@@ -1456,7 +1467,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     f"Stuck on {task_id}: {intervention.reason[:140]}",
                 )
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug(
+                    "resume_ping: stuck_on_task alert upsert failed for %s/%s",
+                    context.session_name, task_id, exc_info=True,
+                )
         except Exception:  # noqa: BLE001
             logger.debug(
                 "resume_ping apply failed for %s",
@@ -1537,7 +1551,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     },
                 )
             except Exception:  # noqa: BLE001
-                pass
+                logger.debug(
+                    "silent_worker_prompt audit emit failed for %s",
+                    context.session_name, exc_info=True,
+                )
         except Exception:  # noqa: BLE001
             logger.debug(
                 "prompt_pm_task_next apply failed for %s",
@@ -1578,7 +1595,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                     return
                 break
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "_escalate: dedupe scan failed for %s",
+                context.session_name, exc_info=True,
+            )
 
         try:
             _emit_routed_alert(
@@ -1614,7 +1634,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.warning(
+                "_escalate: stuck_session alert/audit emit failed for %s",
+                context.session_name, exc_info=True,
+            )
 
     def _context_to_signals(self, context: HeartbeatSessionContext, api) -> SessionSignals:
         """Bridge HeartbeatSessionContext to SessionSignals for the classification engine."""
@@ -1807,7 +1830,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             if most_recent_age is not None and most_recent_age < self._NUDGE_COOLDOWN_SECONDS:
                 return
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "nudge gate failed for %s — proceeding with nudge",
+                context.session_name, exc_info=True,
+            )
         # Context-aware nudge for the worker
         snippet = (context.pane_text or "").strip().splitlines()[-1][:80] if context.pane_text else ""
         if "permission" in snippet.lower() or "approve" in snippet.lower():
@@ -1838,7 +1864,10 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 },
             )
         except Exception:  # noqa: BLE001
-            pass
+            logger.debug(
+                "nudge audit emit failed for %s",
+                context.session_name, exc_info=True,
+            )
 
     def _has_pending_work(self, api, context: HeartbeatSessionContext) -> bool:
         """Check if a worker's project has ready/in-progress tasks.

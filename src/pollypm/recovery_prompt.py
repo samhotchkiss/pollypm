@@ -59,12 +59,24 @@ class RecoveryPrompt:
     session_name: str = ""
     is_fallback: bool = False
     recovery_mode_banner: str = ""
+    # #2012 — Lever 2 of the recovery cascade. When the session has a
+    # configured ``auth_token``, the rendered preamble is prepended
+    # with ``[PollyPM-Auth: <token>]\\n`` so the receiving agent can
+    # distinguish a legitimate RECOVERY MODE injection from a prompt-
+    # injection attack. Empty/missing tokens omit the marker (the
+    # preamble renders identically to pre-Lever-2 behaviour).
+    auth_token: str = ""
 
     def render(self) -> str:
         """Render the full recovery prompt as text."""
+        from pollypm.session_auth import format_auth_marker
+
         if self.provider == ProviderKind.CODEX:
-            return _render_codex(self.sections, self.recovery_mode_banner, self.is_fallback)
-        return _render_claude(self.sections, self.recovery_mode_banner, self.is_fallback)
+            body = _render_codex(self.sections, self.recovery_mode_banner, self.is_fallback)
+        else:
+            body = _render_claude(self.sections, self.recovery_mode_banner, self.is_fallback)
+        marker = format_auth_marker(self.auth_token)
+        return f"{marker}{body}" if marker else body
 
     @property
     def total_chars(self) -> int:
@@ -223,6 +235,7 @@ def _build_from_checkpoint(
         checkpoint_id=checkpoint.checkpoint_id,
         session_name=checkpoint.session_name,
         recovery_mode_banner=recovery_mode_banner,
+        auth_token=_session_auth_token(config, session_name),
     )
 
 
@@ -333,6 +346,7 @@ def _build_fallback_prompt(
         provider=provider,
         is_fallback=True,
         recovery_mode_banner=recovery_mode_banner,
+        auth_token=_session_auth_token(config, session_name),
     )
 
 
@@ -563,6 +577,24 @@ def _live_git_state(
         parts.append("- Working tree clean")
 
     return "\n".join(parts) if len(parts) > 1 else ""
+
+
+def _session_auth_token(
+    config: PollyPMConfig, session_name: str | None,
+) -> str:
+    """Return the session's ``auth_token`` for Lever 2 (#2012) signing.
+
+    Empty string when the session isn't in config or has no token yet
+    — see :func:`pollypm.session_auth.format_auth_marker` for how the
+    empty case degrades to the un-marked legacy preamble.
+    """
+    if not session_name:
+        return ""
+    sessions = getattr(config, "sessions", None) or {}
+    session = sessions.get(session_name)
+    if session is None:
+        return ""
+    return getattr(session, "auth_token", "") or ""
 
 
 def _session_git_root(

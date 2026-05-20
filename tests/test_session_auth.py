@@ -212,10 +212,15 @@ path = "demo"
         config.sessions["architect_demo"].auth_token
         == "cafebabe1234567890cafebabe1234567890cafebabe1234567890cafebabe12"
     )
-    # Legacy session (no auth_token key) parses to empty string.
-    assert config.sessions["heartbeat"].auth_token == ""
+    # Legacy session (no auth_token key in TOML) is migrated by
+    # load_config: ``ensure_session_auth_tokens`` mints a fresh 64-char
+    # hex token. The persistence write happens in-place, so the loaded
+    # config carries the minted token and the file on disk is updated.
+    heartbeat_token = config.sessions["heartbeat"].auth_token
+    assert len(heartbeat_token) == 64, heartbeat_token
+    assert all(c in "0123456789abcdef" for c in heartbeat_token)
 
-    # Round-trip through write_config.
+    # Round-trip through write_config — both explicit and migrated tokens persist.
     output_path = tmp_path / "out.toml"
     write_config(config, output_path, force=True)
     rendered = output_path.read_text()
@@ -230,9 +235,79 @@ path = "demo"
         reloaded.sessions["architect_demo"].auth_token
         == config.sessions["architect_demo"].auth_token
     )
-    # Legacy session still has no marker emitted.
+    # Migrated heartbeat token is now emitted in the rendered TOML and
+    # stable across the load → write → load cycle.
     heartbeat_block = rendered.split("[sessions.heartbeat]")[1].split("[", 1)[0]
-    assert "auth_token" not in heartbeat_block, heartbeat_block
+    assert f'auth_token = "{heartbeat_token}"' in heartbeat_block, heartbeat_block
+    assert reloaded.sessions["heartbeat"].auth_token == heartbeat_token
+
+
+def test_load_config_migrates_missing_auth_tokens_in_place(tmp_path: Path) -> None:
+    """Real regression for PR #2018 review (id 4502846140).
+
+    ``load_config`` MUST mint tokens for any session missing one AND
+    persist them to disk, so watchdog/recovery dispatch never emits an
+    unsigned brief for a legacy session. Starts from a config where
+    every session lacks an ``auth_token`` key; asserts (a) the loaded
+    config has 64-char hex tokens for every session, (b) the on-disk
+    TOML now contains those tokens, (c) a second load returns the same
+    tokens (stable, not re-minted).
+    """
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.architect_demo]
+role = "architect"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+project = "demo"
+
+[projects.demo]
+path = "demo"
+"""
+    )
+    (tmp_path / "demo").mkdir()
+
+    # No auth_token keys in the source TOML.
+    assert "auth_token" not in config_path.read_text()
+
+    # First load_config: mints + persists.
+    config = load_config(config_path)
+    heartbeat = config.sessions["heartbeat"].auth_token
+    architect = config.sessions["architect_demo"].auth_token
+    assert len(heartbeat) == 64 and len(architect) == 64
+    assert heartbeat != architect  # per-session uniqueness
+
+    # File on disk now carries the tokens.
+    persisted = config_path.read_text()
+    assert f'auth_token = "{heartbeat}"' in persisted
+    assert f'auth_token = "{architect}"' in persisted
+
+    # Second load returns identical tokens (stable, no re-mint).
+    # Bypass the in-process cache so we actually re-read from disk.
+    import pollypm.config as config_mod
+    config_mod._config_cache.clear()
+    reloaded = load_config(config_path)
+    assert reloaded.sessions["heartbeat"].auth_token == heartbeat
+    assert reloaded.sessions["architect_demo"].auth_token == architect
 
 
 # ---------------------------------------------------------------------------

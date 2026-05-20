@@ -1249,12 +1249,57 @@ def _enrich_finding_metadata(
     )
 
 
+def _architect_auth_token(
+    config_path: Path | None, project_key: str,
+) -> str:
+    """Return the auth_token of the architect session for ``project_key``.
+
+    #2012 — Lever 2 of the recovery cascade. Loads the active config
+    (lazily; expensive, so callers should already be on the dispatch
+    leg) and walks ``config.sessions`` looking for ``architect_<key>``
+    or its underscore-alias form. Returns the empty string when:
+
+    * config cannot be loaded (corrupt, missing, racing rewrite),
+    * no architect session is configured for the project,
+    * the session exists but has no token yet (pre-migration).
+
+    The empty-string fallback is load-bearing: ``format_unstick_brief``
+    treats it the same as "no marker, render legacy shape", so a
+    misconfigured project keeps receiving briefs (just unauthenticated)
+    rather than silently dropping its dispatch path. The
+    ``ensure_session_auth_tokens`` helper migrates legacy sessions in
+    on the next ``write_config`` so the empty path is transient.
+    """
+    if not project_key:
+        return ""
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+    except Exception:  # noqa: BLE001
+        return ""
+    cfg_path = config_path or DEFAULT_CONFIG_PATH
+    try:
+        cfg = load_config(cfg_path)
+    except Exception:  # noqa: BLE001
+        return ""
+    sessions = getattr(cfg, "sessions", None) or {}
+    alias = project_key.replace("-", "_")
+    for candidate in (f"architect_{project_key}", f"architect_{alias}"):
+        session = sessions.get(candidate)
+        if session is None:
+            continue
+        token = getattr(session, "auth_token", "") or ""
+        if token:
+            return token
+    return ""
+
+
 def _maybe_dispatch_to_architect(
     finding: Finding,
     *,
     project_path: Path | None,
     storage_closet_name: str | None,
     now: datetime,
+    config_path: Path | None = None,
 ) -> str:
     """Apply throttle + emit + send brief. Returns a status code.
 
@@ -1263,6 +1308,11 @@ def _maybe_dispatch_to_architect(
     * ``"throttled"`` — already dispatched within the throttle window.
     * ``"dispatched"`` — brief sent successfully.
     * ``"send_failed"`` — emit ran, send-keys failed.
+
+    #2012 — when the architect session has an ``auth_token`` set, the
+    brief is signed with ``[PollyPM-Auth: <token>]`` so the agent can
+    distinguish it from a prompt-injection attack. Missing tokens fall
+    back to the legacy unsigned brief shape.
     """
     if finding.rule not in _DISPATCHABLE_RULES:
         return "skipped"
@@ -1280,7 +1330,8 @@ def _maybe_dispatch_to_architect(
         dedup_hash=dedup_hash,
     ):
         return "throttled"
-    brief = format_unstick_brief(finding)
+    auth_token = _architect_auth_token(config_path, finding.project)
+    brief = format_unstick_brief(finding, auth_token=auth_token)
     # Emit the dispatch event BEFORE the send so the throttle window
     # is engaged even if the send fails — otherwise a tmux outage would
     # cause every cadence tick to re-emit and re-attempt.
@@ -3255,6 +3306,7 @@ def _route_one_finding(
         project_path=project_path,
         storage_closet_name=storage_closet_name,
         now=now,
+        config_path=config_path,
     )
     if outcome == "dispatched":
         counters["dispatches_sent"] += 1

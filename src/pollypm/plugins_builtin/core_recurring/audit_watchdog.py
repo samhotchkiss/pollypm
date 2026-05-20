@@ -1529,9 +1529,44 @@ def _self_heal_role_session_missing(
                 from pollypm.tmux.client import TmuxClient
 
                 tmux = TmuxClient()
+                # #1937 — the normal provision path receives the
+                # reviewer kickoff because the transition manager wires
+                # a ``session_service``. The self-heal previously
+                # constructed ``SessionManager`` bare, so
+                # ``provision_reviewer`` fell to the raw-tmux branch
+                # that sends ``reviewer_cmd`` only and never delivers
+                # ``initial_input=reviewer_kickoff``. Build the same
+                # ``TmuxSessionService`` the work CLI wires so the
+                # resurrected reviewer window is fed the task-specific
+                # kickoff. Best-effort: if the session-service factory
+                # fails for any reason we still spawn (falling back to
+                # raw tmux) rather than wedge the self-heal.
+                session_service = None
+                storage_closet_name = "pollypm-storage-closet"
+                try:
+                    from pollypm.session_services.tmux import (
+                        TmuxSessionService,
+                    )
+                    from pollypm.storage.state import StateStore
+
+                    storage_closet_name = (
+                        f"{cfg.project.tmux_session}-storage-closet"
+                    )
+                    store = StateStore(cfg.project.state_db)
+                    session_service = TmuxSessionService(
+                        config=cfg, store=store,
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.debug(
+                        "audit.watchdog: TmuxSessionService init failed "
+                        "for reviewer self-heal of %s; falling back to "
+                        "raw tmux", task_id, exc_info=True,
+                    )
                 mgr = SessionManager(
                     tmux, svc, project_path or cfg.project.root_dir,
                     config=cfg,
+                    session_service=session_service,
+                    storage_closet_name=storage_closet_name,
                 )
                 window = mgr.provision_reviewer(task_id)
         except Exception:  # noqa: BLE001

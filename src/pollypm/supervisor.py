@@ -189,19 +189,28 @@ _OWNER_PREFIXES = {
 # in the table for backwards-compat with any legacy callers, but the
 # recovery prompt is no longer injected into heartbeat panes (#1007 —
 # see the gate in :meth:`Supervisor.restart_session`).
+#
+# #1976: the persona name embedded in the preamble is a ``{persona_name}``
+# template token. ``_identity_preamble_for_role`` substitutes it with the
+# project's configured ``persona_name`` (samblog → "Sage") before
+# returning, falling back to the role default in :data:`_ROLE_DEFAULT_PERSONA`
+# when the project did not pick a custom name. The "Not X" parenthetical
+# at the end of each line keeps the role-default name as a contrast cue
+# (the agent has seen it in older transcripts), so the preamble still
+# reads naturally even after substitution.
 _ROLE_IDENTITY_PREAMBLE: dict[str, str] = {
     "operator-pm": (
-        "Quick reminder: in this session you're playing Polly, the "
+        "Quick reminder: in this session you're playing {persona_name}, the "
         "PollyPM operator — managing the project workspace from the "
         "cockpit's operator session. (Not Russell, not a project PM.)"
     ),
     "reviewer": (
-        "Quick reminder: in this session you're playing Russell, the "
+        "Quick reminder: in this session you're playing {persona_name}, the "
         "code reviewer — approve/reject decisions on completed work. "
         "(Not Polly, not a project PM.)"
     ),
     "architect": (
-        "Quick reminder: in this session you're playing Archie, the "
+        "Quick reminder: in this session you're playing {persona_name}, the "
         "architect — designing plans for the worker to implement. "
         "(Not the worker who executes them.)"
     ),
@@ -210,6 +219,21 @@ _ROLE_IDENTITY_PREAMBLE: dict[str, str] = {
         "supervisor — checking mechanical session health only, not "
         "owning task work."
     ),
+}
+
+
+# Role-default persona names used when the project did not configure a
+# custom ``persona_name``. Mirrors the role-registry defaults in
+# :mod:`pollypm.role_contract` and the per-role fallbacks used by
+# :func:`pollypm.plugins_builtin.project_planning.plugin.MarkdownPromptProfile.build_prompt`
+# (architect → "Archie") and
+# :func:`pollypm.work.session_manager._resolve_reviewer_persona_prompt`
+# (reviewer → "Russell"). Kept local so the preamble lookup stays a
+# pure-data helper without re-importing the role registry.
+_ROLE_DEFAULT_PERSONA: dict[str, str] = {
+    "operator-pm": "Polly",
+    "reviewer": "Russell",
+    "architect": "Archie",
 }
 
 
@@ -239,16 +263,47 @@ def _parse_supervisor_iso(value: object) -> datetime | None:
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
 
 
-def _identity_preamble_for_role(role: str | None) -> str:
+def _identity_preamble_for_role(
+    role: str | None,
+    *,
+    persona_name: str | None = None,
+) -> str:
     """Return an identity preamble for ``role`` (#869).
 
     Short string the supervisor prepends to the recovery prompt so a
     role-scoped agent does not slide into a different persona after
     reading the project-context section.
+
+    ``persona_name`` (#1976) overrides the role-default persona name
+    inside the preamble. Used by ``Supervisor.restart_session`` to thread
+    the project's configured ``KnownProject.persona_name`` (samblog →
+    "Sage") so the recovery preamble injected into the architect /
+    reviewer / operator-pm pane greets the agent with its real project
+    persona instead of leaking the role default ("Archie" / "Russell" /
+    "Polly"). Mirrors the precedence used by the architect system-prompt
+    builder (``MarkdownPromptProfile.build_prompt``) and the reviewer
+    persona prompt resolver (``_resolve_reviewer_persona_prompt``):
+    explicit project persona wins, role default backs it.
+
+    The ``heartbeat-supervisor`` preamble does not embed a persona name —
+    the heartbeat is a process role, not a chat persona — so substitution
+    is a no-op for it.
     """
     if not role:
         return ""
-    return _ROLE_IDENTITY_PREAMBLE.get(role, "")
+    template = _ROLE_IDENTITY_PREAMBLE.get(role, "")
+    if not template:
+        return ""
+    resolved = (
+        persona_name.strip()
+        if isinstance(persona_name, str) and persona_name.strip()
+        else _ROLE_DEFAULT_PERSONA.get(role, "")
+    )
+    if "{persona_name}" not in template:
+        # ``heartbeat-supervisor`` and any future role without an embedded
+        # persona — return the template as-is.
+        return template
+    return template.replace("{persona_name}", resolved)
 
 
 def _prefix_for_owner(owner: str, text: str) -> str:
@@ -3755,8 +3810,25 @@ class Supervisor:
                     provider=launch.session.provider,
                 )
                 rendered = recovery.render()
+                # #1976 — thread the project's configured ``persona_name``
+                # into the identity preamble so the architect / reviewer /
+                # operator-pm recovery message greets the agent with its
+                # project-scoped persona (samblog → "Sage") instead of
+                # leaking the role default ("Archie" / "Russell" / "Polly").
+                # Mirrors the precedence used by the architect system-prompt
+                # builder and the reviewer persona resolver: explicit
+                # project ``persona_name`` wins; role default backs it.
+                project_persona: str | None = None
+                project_key = launch.session.project
+                if project_key:
+                    project_cfg = self.config.projects.get(project_key)
+                    if project_cfg is not None:
+                        persona_raw = getattr(project_cfg, "persona_name", None)
+                        if isinstance(persona_raw, str) and persona_raw.strip():
+                            project_persona = persona_raw.strip()
                 identity_preamble = _identity_preamble_for_role(
                     launch.session.role,
+                    persona_name=project_persona,
                 )
                 if identity_preamble and rendered.strip():
                     rendered = f"{identity_preamble}\n\n{rendered}"

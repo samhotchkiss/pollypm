@@ -77,6 +77,88 @@ def task_status_probe(
         return False, None
 
 
+def bump_reap_count_and_demote(
+    *,
+    project_key: str,
+    task_number: int,
+    config: "PollyPMConfig | None" = None,
+) -> int | None:
+    """Atomically demote a reaped task back to ``queued`` and bump ``reap_count``.
+
+    Called by :func:`pollypm.work.worker_marker_reaper._classify_marker`
+    when a fresh-launch marker is reaped because the tmux window has
+    vanished while the task is still non-terminal (#1999). The single
+    UPDATE bumps ``reap_count`` and demotes the task in one round-trip,
+    returning the post-increment count so the caller can decide whether
+    to escalate (3rd+ reap → inbox notify).
+
+    The update is conservative: it only fires when the task is still in
+    a non-terminal status (``in_progress`` / ``review`` / ``queued`` /
+    ``rework``). If a competing actor already cancelled or completed the
+    task between marker classification and this call, the row guard
+    prevents us from clobbering the terminal state — we return ``None``
+    in that case and the reaper skips the escalation.
+
+    Returns
+    -------
+    int | None
+        The post-increment ``reap_count`` value (>= 1) when the demote
+        landed. ``None`` when the row could not be found, the row was
+        already terminal, or the pool / query failed.
+    """
+    try:
+        from pollypm.storage.pg_pool import get_rw_pool
+    except Exception:  # noqa: BLE001
+        logger.debug("bump_reap_count_and_demote: pg_pool import failed", exc_info=True)
+        return None
+    try:
+        rw_ctx = get_rw_pool(config).connection()
+    except Exception:  # noqa: BLE001
+        logger.debug("bump_reap_count_and_demote: get_rw_pool failed", exc_info=True)
+        return None
+
+    try:
+        with rw_ctx as conn, conn.cursor() as cur:
+            try:
+                cur.execute(
+                    "UPDATE work_tasks "
+                    "SET reap_count = reap_count + 1, "
+                    "    work_status = 'queued', "
+                    "    assignee = NULL, "
+                    "    updated_at = now() "
+                    "WHERE project = %s AND task_number = %s "
+                    "  AND work_status NOT IN ('done', 'cancelled', 'abandoned') "
+                    "RETURNING reap_count",
+                    (project_key, int(task_number)),
+                )
+                row = cur.fetchone()
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "bump_reap_count_and_demote: UPDATE failed for %s/%s",
+                    project_key, task_number, exc_info=True,
+                )
+                conn.rollback()
+                return None
+            if row is None:
+                # No row matched — either the task is gone or it's
+                # already terminal. Either way, no demote, no escalate.
+                conn.rollback()
+                return None
+            try:
+                count = int(row[0])
+            except (TypeError, ValueError):
+                conn.rollback()
+                return None
+            conn.commit()
+            return count
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "bump_reap_count_and_demote: connection failed for %s/%s",
+            project_key, task_number, exc_info=True,
+        )
+        return None
+
+
 def task_numbers_with_statuses(
     *,
     project_key: str,

@@ -58,9 +58,20 @@ from pollypm.work.task_state import (
     TERMINAL_TASK_STATUSES,
     parse_task_window_name,
 )
-from pollypm.storage.work_task_state import task_status_probe
+from pollypm.storage.work_task_state import (
+    bump_reap_count_and_demote,
+    task_status_probe,
+)
 
 logger = logging.getLogger(__name__)
+
+# Sam-approved policy threshold for #1999: silently demote on the first
+# two reaps of the same task; emit an inbox escalation on the 3rd+ reap.
+# The counter is persisted on ``work_tasks.reap_count`` so the threshold
+# survives cockpit restarts. We intentionally do NOT reset on terminal
+# transition — the field measures "how many interruptions has THIS task
+# endured", which is per-task history, not a windowed sliding count.
+REAP_ESCALATION_THRESHOLD = 3
 
 
 # Statuses that mean "this worker marker should be reaped".
@@ -122,6 +133,157 @@ def _emit_worker_session_reaped(decision: "ReapedMarker") -> None:
         )
 
 
+def _emit_repeat_reap_inbox_escalation(
+    *,
+    config: Any,
+    project_key: str,
+    task_project: str,
+    task_number: int,
+    reap_count: int,
+) -> None:
+    """Create an inbox notify task when ``reap_count`` crosses the threshold.
+
+    Sam-approved policy for #1999: silent on the first two reaps, escalate
+    on the third+. Each subsequent reap re-fires this — the inbox row is
+    a fresh signal that the systemic issue is still active. Dedupes via a
+    ``reap_repeat:<project>/<task>`` label so a single in-flight escalation
+    row doesn't get re-posted on every sweep.
+
+    Best-effort: any failure logs and returns. The demote already
+    landed; the operator-visible escalation is the secondary signal.
+    """
+    task_id = f"{task_project}/{task_number}"
+    title = (
+        f"Task {task_id} reaped {reap_count} times — "
+        "likely systemic issue"
+    )
+    dedupe_label = f"reap_repeat:{task_id}"
+    try:
+        from pollypm.work.factory import create_work_service
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worker_marker_reaper: create_work_service import failed",
+            exc_info=True,
+        )
+        return
+
+    try:
+        work = create_work_service(config=config, project_key=task_project)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worker_marker_reaper: create_work_service open failed for %s",
+            task_project, exc_info=True,
+        )
+        return
+
+    # Dedupe: if a prior escalation is still queued/in_progress with the
+    # same dedupe label, skip — the operator already has the signal.
+    try:
+        existing = []
+        for status in ("queued", "in_progress", "draft"):
+            try:
+                existing.extend(
+                    work.list_tasks(project=task_project, work_status=status)
+                )
+            except Exception:  # noqa: BLE001
+                continue
+        for existing_task in existing:
+            labels = getattr(existing_task, "labels", None) or ()
+            if dedupe_label in labels:
+                logger.debug(
+                    "worker_marker_reaper: escalation already open for %s",
+                    task_id,
+                )
+                return
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "worker_marker_reaper: dedupe scan failed for %s",
+            task_id, exc_info=True,
+        )
+
+    body = (
+        f"Task `{task_id}` has been reaped {reap_count} times by the "
+        f"worker marker reaper — the tmux window keeps vanishing while "
+        f"the task is still active.\n\n"
+        f"Likely systemic issue. Investigate or cancel "
+        f"(`pm task cancel {task_id}`)."
+    )
+    try:
+        work.create(
+            title=title,
+            description=body,
+            type="task",
+            project=task_project,
+            flow_template="chat",
+            labels=[
+                "notify",
+                "reap_escalation",
+                dedupe_label,
+            ],
+            roles={"requester": "worker_marker_reaper", "operator": "user"},
+            created_by="worker_marker_reaper",
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "worker_marker_reaper: escalation inbox-task create failed for %s",
+            task_id, exc_info=True,
+        )
+
+
+def _demote_and_maybe_escalate(
+    *,
+    config: Any,
+    decision: "ReapedMarker",
+) -> None:
+    """Bump ``reap_count``, demote the task, maybe post an inbox escalation.
+
+    The full #1999 recovery: when the reaper has decided to delete a
+    marker because the worker's tmux window has vanished but the task
+    is still non-terminal, this helper:
+
+    1. Atomically bumps ``work_tasks.reap_count`` and sets
+       ``work_status='queued'`` (and clears ``assignee``) so the next
+       claim cycle can re-spawn a worker — see
+       :func:`pollypm.storage.work_task_state.bump_reap_count_and_demote`.
+    2. If the post-increment count is at or beyond
+       :data:`REAP_ESCALATION_THRESHOLD`, posts a ``notify``-labeled
+       inbox task addressed to the user so the operator sees the loop.
+
+    Best-effort: any failure logs and returns; the marker unlink and
+    audit emit already happened upstream so the reaper still made
+    forward progress.
+    """
+    if not decision.window_missing_for_non_terminal:
+        return
+    if decision.task_project is None or decision.task_number is None:
+        return
+    new_count = bump_reap_count_and_demote(
+        project_key=decision.task_project,
+        task_number=decision.task_number,
+        config=config,
+    )
+    if new_count is None:
+        logger.debug(
+            "worker_marker_reaper: demote skipped (no row / terminal) "
+            "for %s/%s",
+            decision.task_project, decision.task_number,
+        )
+        return
+    logger.warning(
+        "worker_marker_reaper: demoted %s/%s back to queued "
+        "(reap_count=%d)",
+        decision.task_project, decision.task_number, new_count,
+    )
+    if new_count >= REAP_ESCALATION_THRESHOLD:
+        _emit_repeat_reap_inbox_escalation(
+            config=config,
+            project_key=decision.project_key,
+            task_project=decision.task_project,
+            task_number=decision.task_number,
+            reap_count=new_count,
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class ReapedMarker:
     """Record of a worker marker that was unlinked by the reaper.
@@ -130,12 +292,28 @@ class ReapedMarker:
     the project the marker lived under, the tmux window name encoded
     in the file stem, the on-disk path, and the reason the reaper
     decided to remove it.
+
+    ``task_project`` / ``task_number`` are populated when the window
+    name parses cleanly as ``task-<project>-<N>`` — the #1999 demote
+    path needs them to issue the ``reap_count`` UPDATE. Both are
+    ``None`` for non-task markers (e.g. future advisor markers) so the
+    demote helper can skip cleanly.
+
+    ``window_missing_for_non_terminal`` flags the specific case the
+    #1999 fix targets: the marker is being reaped because the worker's
+    tmux window has vanished but the task is still in a non-terminal
+    status. Only this branch triggers the demote-and-maybe-escalate
+    flow; the terminal-task and missing-row branches leave the task
+    untouched (it's already terminal / already gone).
     """
 
     project_key: str
     window_name: str
     marker_path: Path
     reason: str
+    task_project: str | None = None
+    task_number: int | None = None
+    window_missing_for_non_terminal: bool = False
 
 
 def _iter_worker_markers(project_path: Path) -> Iterable[Path]:
@@ -238,6 +416,8 @@ def _classify_marker(
             window_name=window_name,
             marker_path=marker,
             reason="orphan: no work_tasks row",
+            task_project=parsed_project,
+            task_number=task_number,
         )
 
     if status in WORKER_MARKER_REAPABLE_STATUSES:
@@ -246,6 +426,8 @@ def _classify_marker(
             window_name=window_name,
             marker_path=marker,
             reason=f"task in terminal status '{status}'",
+            task_project=parsed_project,
+            task_number=task_number,
         )
 
     if window_name not in live_window_names:
@@ -257,6 +439,9 @@ def _classify_marker(
                 f"tmux window missing for non-terminal task "
                 f"(status='{status}')"
             ),
+            task_project=parsed_project,
+            task_number=task_number,
+            window_missing_for_non_terminal=True,
         )
 
     return None
@@ -357,6 +542,20 @@ def reap_orphan_worker_markers(
                 f"in {decision.project_key}: {decision.reason}",
                 flush=True,
             )
+            # #1999 — when the marker was reaped because the worker's
+            # tmux window vanished while the task is still non-terminal,
+            # bump ``reap_count`` and demote the task back to ``queued``
+            # so the next claim cycle can re-spawn a worker. On the 3rd+
+            # reap of the same task we also post an inbox escalation so
+            # the operator sees the loop. The helper is a no-op for the
+            # other reap reasons (terminal task / missing row).
+            try:
+                _demote_and_maybe_escalate(config=config, decision=decision)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "worker_marker_reaper: demote/escalate failed for %s",
+                    decision.window_name, exc_info=True,
+                )
             reaped.append(decision)
     return reaped
 
@@ -404,6 +603,7 @@ def sweep_worker_markers(
 
 
 __all__ = [
+    "REAP_ESCALATION_THRESHOLD",
     "ReapedMarker",
     "WORKER_MARKER_REAPABLE_STATUSES",
     "reap_orphan_worker_markers",

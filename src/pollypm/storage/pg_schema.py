@@ -328,6 +328,7 @@ CREATE TABLE IF NOT EXISTS work_tasks (
     kind                    text NOT NULL DEFAULT 'legacy',
     roles                   jsonb NOT NULL DEFAULT '{}'::jsonb,
     external_refs           jsonb NOT NULL DEFAULT '{}'::jsonb,
+    reap_count              int NOT NULL DEFAULT 0,
     created_at              timestamptz NOT NULL,
     created_by              text NOT NULL,
     updated_at              timestamptz NOT NULL,
@@ -748,6 +749,32 @@ ALTER TABLE IF EXISTS tier4_promotion_state
 
 
 # --------------------------------------------------------------------- #
+# 0005 — work_tasks.reap_count counter for #1999.
+# --------------------------------------------------------------------- #
+#
+# #1999: ``worker_marker_reaper`` deletes a stale fresh-launch marker
+# whenever the tmux window has vanished for a non-terminal task, but it
+# never demoted the task back to ``queued`` or surfaced repeat reaps to
+# the operator. Sam-approved policy:
+#
+# * 1st + 2nd reap on the same task → demote silently
+# * 3rd+ reap on the same task → demote AND escalate to the inbox
+#
+# The counter must persist across cockpit restarts (Sam may restart
+# between reaps), so it lives as a column on ``work_tasks``. The
+# reaper UPDATE bumps + reads it atomically via RETURNING.
+#
+# Migration is idempotent: ``ADD COLUMN IF NOT EXISTS`` is a no-op when
+# the column is already present (fresh installs pick it up from
+# ``INITIAL_SCHEMA_DDL``; deployed installs gain it via this migration).
+
+_MIGRATION_0005_WORK_TASKS_REAP_COUNT = """
+ALTER TABLE IF EXISTS work_tasks
+    ADD COLUMN IF NOT EXISTS reap_count int NOT NULL DEFAULT 0;
+"""
+
+
+# --------------------------------------------------------------------- #
 # Migration list — forward-only, append-only.
 # --------------------------------------------------------------------- #
 
@@ -759,6 +786,7 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (2, "0002_alert_dedupe_tuple", _MIGRATION_0002_ALERT_DEDUPE),
     (3, "0003_account_columns_text", _MIGRATION_0003_ACCOUNT_COLUMNS_TEXT),
     (4, "0004_tier4_terminal_handoff", _MIGRATION_0004_TIER4_TERMINAL_HANDOFF),
+    (5, "0005_work_tasks_reap_count", _MIGRATION_0005_WORK_TASKS_REAP_COUNT),
 ]
 
 

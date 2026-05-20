@@ -38,6 +38,7 @@ from pollypm.cockpit_rail import (
     CockpitPresence,
     _alert_type_is_user_action_waiting,
 )
+from pollypm.cockpit_theme import Glyph, State
 
 
 class RailItem(ListItem):
@@ -118,7 +119,7 @@ class RailItem(ListItem):
 
         text = Text()
         if self.has_class("active-view"):
-            text.append("▌ ", style="#5b8aff")
+            text.append("▌ ", style=State.INFO)
         else:
             text.append("  ")
         indicator, indicator_style = self._indicator()
@@ -150,9 +151,9 @@ class RailItem(ListItem):
                 # #989 — Dim subtitle picks up severity tint so the
                 # subtitle reads as the same alert as the row badge.
                 subtitle_style = (
-                    "#f0c45a dim"
+                    f"{State.WAITING} dim"
                     if self.item.alert_severity == "warn"
-                    else "#ff5f6d dim"
+                    else f"{State.BLOCKED} dim"
                 )
                 for chunk in _wrap_alert_reason(
                     reason,
@@ -168,7 +169,7 @@ class RailItem(ListItem):
         # error (red) read as different states even when the row label
         # / state string are identical.
         alert_color = (
-            "#f0c45a" if self.item.alert_severity == "warn" else "#ff5f6d"
+            State.WAITING if self.item.alert_severity == "warn" else State.BLOCKED
         )
         if self.item.key.startswith("project:"):
             # #1390 — Approval-pending takes precedence over the rollup
@@ -179,9 +180,9 @@ class RailItem(ListItem):
                 getattr(self.item, "approvals_pending", 0) > 0
                 and self.item.state != "project-red"
             ):
-                return "▶", "#ff5f6d"
+                return Glyph.DECISION, State.BLOCKED
             if self.item.state == "project-red":
-                return "▲", alert_color
+                return Glyph.BLOCKED, alert_color
             # #1520 — A "Waiting on you:" alert family on the project's
             # sessions (plan_missing, worker_question, recovery_limit,
             # auth_broken, stuck_on_task:, no_session_for_assignment:,
@@ -196,17 +197,17 @@ class RailItem(ListItem):
             if _alert_type_is_user_action_waiting(
                 getattr(self.item, "alert_type", None)
             ):
-                return "◆", "#f0a030"
+                return Glyph.ATTENTION, State.ATTENTION
             if self.item.state == "project-yellow":
                 # #1092 — use ◆ to match the dashboard's "needs attention"
                 # diamond. ``•`` and the idle ``·`` are visually
                 # indistinguishable in many terminal fonts, so a project
                 # with held tasks read as idle in the rail.
-                return "◆", "#f0a030"
+                return Glyph.ATTENTION, State.ATTENTION
             if self.item.state == "project-green":
-                return "•", "#3ddc84"
+                return Glyph.LIVE, State.WORKING
             if self.item.state == "project-working":
-                return "•", "#f0c45a"
+                return Glyph.LIVE, State.WAITING
         if (
             presence is not None
             and self.item.session_name
@@ -219,45 +220,45 @@ class RailItem(ListItem):
             work_glyph, color = self._session_work_glyph(self.item.work_state)
             return f"{pulse}{work_glyph}", color
         if presence is not None and self.item.state in {"heartbeat", "watch"}:
-            return presence.heartbeat_frame(self.spinner_index), "#3ddc84"
+            return presence.heartbeat_frame(self.spinner_index), State.WORKING
         # Alerts (red triangle / amber for warn-tier — #989)
         if self.item.state.startswith("!"):
-            return "▲", alert_color
+            return Glyph.BLOCKED, alert_color
         # Separator
         if self.item.state == "separator":
-            return "", "#4a5568"
+            return "", State.IDLE
         # Top-level agents (Polly, Russell)
         if self.item.key in ("polly", "russell"):
             if self.item.state.endswith("working"):
-                return self.item.state.split(" ", 1)[0], "#3ddc84"  # green spinner
+                return self.item.state.split(" ", 1)[0], State.WORKING  # green spinner
             if self.item.state in {"ready", "idle"}:
-                return "•", "#5b8aff"  # blue dot
-            return "•", "#5b8aff"
+                return Glyph.LIVE, State.INFO  # blue dot
+            return Glyph.LIVE, State.INFO
         # Inbox
         if self.item.key == "inbox":
             label = self.item.label
             if "(" in label and not label.endswith("(0)"):
-                return "◆", "#f0c45a"  # yellow diamond
-            return "◇", "#4a5568"
+                return Glyph.ATTENTION, State.WAITING  # yellow diamond
+            return Glyph.WAITING, State.IDLE
         # Settings
         if self.item.key == "settings":
-            return "⚙", "#6b7a88"
+            return "⚙", State.MUTED
         # Sub-items
         if self.item.state == "sub":
-            return " ", "#4a5568"
+            return " ", State.IDLE
         # Projects keep their status marker quieter than global rows.
         # A full orange unread dot or animated working spinner makes
         # ordinary project rows compete with true alert/action rows in the
         # narrow rail.
         if self.item.key.startswith("project:"):
             if self.item.state == "unread":
-                return "•", "#f0a030"
+                return Glyph.LIVE, State.ATTENTION
             if "working" in self.item.state:
-                return "•", "#f0c45a"
-            return "○", "#4a5568"  # dim circle — idle
+                return Glyph.LIVE, State.WAITING
+            return Glyph.IDLE, State.IDLE  # dim circle — idle
         # Unread
         if self.item.state == "unread":
-            return "●", "#f0a030"  # orange dot
+            return "●", State.ATTENTION  # orange dot
         # Generic "<glyph> working" state — top-level rail rows
         # (e.g. Workers when any worker is currently turning) used
         # to fall through to the idle circle below, so a
@@ -266,28 +267,28 @@ class RailItem(ListItem):
         # state with the spinner / active diamond.
         if self.item.state.endswith("working"):
             if presence is not None:
-                return presence.working_frame(self.spinner_index), "#3ddc84"
-            return "◆", "#f0c45a"
-        return "○", "#4a5568"
+                return presence.working_frame(self.spinner_index), State.WORKING
+            return Glyph.ATTENTION, State.WAITING
+        return Glyph.IDLE, State.IDLE
 
     def _session_work_glyph(self, work_state: str) -> tuple[str, str]:
         presence = self.presence
         if work_state == "writing":
             if presence is not None:
                 if not presence.should_animate():
-                    return "…", "#3ddc84"
-                return presence.working_frame(self.spinner_index), "#3ddc84"
-            return "◆", "#3ddc84"
+                    return "…", State.WORKING
+                return presence.working_frame(self.spinner_index), State.WORKING
+            return Glyph.ATTENTION, State.WORKING
         if work_state == "reviewing":
-            return "✎", "#3ddc84"
+            return Glyph.REVIEWING, State.WORKING
         if work_state == "stuck":
             # #989 — Pick amber for warn-tier alerts so the user can
             # distinguish "answer the prompt" from "account repair".
-            color = "#f0c45a" if self.item.alert_severity == "warn" else "#ff5f6d"
-            return "⚠", color
+            color = State.WAITING if self.item.alert_severity == "warn" else State.BLOCKED
+            return Glyph.STUCK, color
         if work_state == "exited":
-            return "✕", "#4a5568"
-        return "·", "#4a5568"
+            return Glyph.EXITED, State.IDLE
+        return "·", State.IDLE
 
 
 __all__ = ["RailItem"]

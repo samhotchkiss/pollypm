@@ -288,6 +288,52 @@ def pg_job_queue(pg_schema_pool):
 
 
 @pytest.fixture()
+def pg_sweep_harness(pg_work_service, tmp_path):
+    """Long-lived ``(work_service, state_store, advance_clock)`` for sweep ticks.
+
+    Sweep / lifecycle tests historically simulated process restarts by
+    closing + reopening a :class:`SQLiteWorkService` against the same
+    DB path. That idiom doesn't translate to pg — one schema, one pool,
+    "reopen" is a no-op (#1788). This fixture replaces it with the
+    correct pg shape:
+
+    * One :class:`PgWorkService` lives for the whole test (no close
+      between ticks).
+    * A tmp-path ``StateStore`` (still sqlite — :class:`StateStore` has
+      no pg port yet; #342-followup) carries notification + alert
+      bookkeeping the same way it does in production.
+    * ``advance_clock`` is a no-op callable today. The sweep handlers
+      currently consult ``datetime.now(UTC)`` directly; tests that need
+      to age rows do so by backdating columns. The callable exists so
+      future ports of time-stepped tests have a stable seam.
+
+    Returns
+    -------
+    tuple[PgWorkService, StateStore, Callable[[int], None]]
+        ``(work_service, state_store, advance_clock)`` ready for repeated
+        sweep ticks. The ``StateStore`` is also usable as the
+        ``msg_store`` slot on ``_RuntimeServices`` because
+        :class:`StateStore` exposes the Store-shaped surface
+        (``upsert_alert`` / ``record_notification`` / etc.).
+    """
+    from pollypm.storage.state import StateStore
+
+    store = StateStore(tmp_path / "state.db")
+
+    def _advance_clock(_seconds: int) -> None:
+        """No-op clock stepper (placeholder for time-stepped ports)."""
+        return None
+
+    try:
+        yield pg_work_service, store, _advance_clock
+    finally:
+        try:
+            store.close()
+        except Exception:  # noqa: BLE001 - best-effort teardown
+            pass
+
+
+@pytest.fixture()
 def seeded_pg_workspace(pg_work_service):
     """A ``PgWorkService`` pre-seeded with one project + a few tasks.
 

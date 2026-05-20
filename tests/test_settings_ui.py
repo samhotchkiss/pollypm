@@ -431,21 +431,27 @@ def settings_env(tmp_path: Path, monkeypatch):
             updated_at="2026-04-21 09:30:00",
         ),
     }
-    monkeypatch.setattr("pollypm.cockpit_ui.load_config", lambda _p: fake_config)
-    monkeypatch.setattr("pollypm.cockpit_ui.load_cached_account_usage", lambda _p: cached_usage)
+    # ``_gather_settings_data`` lives in ``cockpit_settings_gather`` after the
+    # #1354 extraction; patch the names that the gather module looks up
+    # there rather than via the back-compat re-exports on ``cockpit_ui``.
+    monkeypatch.setattr("pollypm.cockpit_settings_gather.load_config", lambda _p: fake_config)
     monkeypatch.setattr(
-        "pollypm.cockpit_ui._collect_recent_tasks_by_account",
+        "pollypm.cockpit_settings_gather.load_cached_account_usage",
+        lambda _p: cached_usage,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_settings_gather._collect_recent_tasks_by_account",
         lambda _config, _statuses, max_per_account=3: recent_tasks,
     )
     monkeypatch.setattr(
-        "pollypm.cockpit_ui.collect_settings_projects",
+        "pollypm.cockpit_settings_gather.collect_settings_projects",
         _collect_project_rows,
     )
     monkeypatch.setattr(
         "pollypm.cockpit_settings_history.Path.home",
         lambda: tmp_path / "home",
     )
-    monkeypatch.setattr("pollypm.cockpit_ui.load_registry", _fake_role_registry)
+    monkeypatch.setattr("pollypm.cockpit_settings_gather.load_registry", _fake_role_registry)
     service = _FakeService(statuses, fake_config)
 
     from pollypm.cockpit_ui import PollySettingsPaneApp
@@ -855,12 +861,12 @@ def test_roles_section_persists_alias_and_custom_pair(tmp_path: Path, monkeypatc
     )
     write_config(config, config_path, force=True)
 
-    monkeypatch.setattr("pollypm.cockpit_ui.load_cached_account_usage", lambda _p: {})
+    monkeypatch.setattr("pollypm.cockpit_settings_gather.load_cached_account_usage", lambda _p: {})
     monkeypatch.setattr(
-        "pollypm.cockpit_ui._collect_recent_tasks_by_account",
+        "pollypm.cockpit_settings_gather._collect_recent_tasks_by_account",
         lambda _config, _statuses, max_per_account=3: {},
     )
-    monkeypatch.setattr("pollypm.cockpit_ui.load_registry", _fake_role_registry)
+    monkeypatch.setattr("pollypm.cockpit_settings_gather.load_registry", _fake_role_registry)
     monkeypatch.setattr(
         "pollypm.cockpit_settings_history.Path.home",
         lambda: tmp_path / "home",
@@ -1030,17 +1036,17 @@ def test_mount_perf_budget_for_20_projects_5_accounts(tmp_path: Path, monkeypatc
         f"acct_{i}": _FakeAccount(f"acct_{i}", ProviderKind.CLAUDE)
         for i in range(5)
     }
-    monkeypatch.setattr("pollypm.cockpit_ui.load_config", lambda _p: fake_config)
-    monkeypatch.setattr("pollypm.cockpit_ui.load_cached_account_usage", lambda _p: {})
+    monkeypatch.setattr("pollypm.cockpit_settings_gather.load_config", lambda _p: fake_config)
+    monkeypatch.setattr("pollypm.cockpit_settings_gather.load_cached_account_usage", lambda _p: {})
     monkeypatch.setattr(
-        "pollypm.cockpit_ui._collect_recent_tasks_by_account",
+        "pollypm.cockpit_settings_gather._collect_recent_tasks_by_account",
         lambda _config, _statuses, max_per_account=3: {},
     )
     monkeypatch.setattr(
-        "pollypm.cockpit_ui.collect_settings_projects",
+        "pollypm.cockpit_settings_gather.collect_settings_projects",
         _collect_project_rows,
     )
-    monkeypatch.setattr("pollypm.cockpit_ui.load_registry", _fake_role_registry)
+    monkeypatch.setattr("pollypm.cockpit_settings_gather.load_registry", _fake_role_registry)
     from pollypm.cockpit_ui import PollySettingsPaneApp
 
     app = PollySettingsPaneApp(config_path)

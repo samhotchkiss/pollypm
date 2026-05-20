@@ -318,6 +318,35 @@ def _prefix_for_owner(owner: str, text: str) -> str:
 _REVIEW_NUDGE_CACHE = _supervisor_alerts._REVIEW_NUDGE_CACHE
 
 
+# #1634 perf — per-process TTL cache for ``Supervisor.status()``.
+#
+# ``status()`` shells out to tmux (``list_all_windows`` — a real
+# subprocess) and fans out to the store for open alerts + leases on
+# every call. The rail's ``build_items()`` worker tick invokes it once
+# per render via ``cockpit_rail.CockpitRouter.build_items``; the
+# operator dashboard (``cockpit.py``) and the rail metrics surface
+# (``cockpit_metrics.py``) also call it on overlapping ticks. Within a
+# single ~1s rail tick those calls return materially the same snapshot
+# (tmux window list doesn't churn that fast and alerts/leases are
+# already eventually-consistent), so collapsing them onto a shared
+# result removes a redundant tmux subprocess + store roundtrip per
+# extra caller.
+#
+# Mirrors the same pattern PR #1907 used for
+# ``pm_inbox_awaits_user_list``: a tiny module-level dict keyed on the
+# supervisor instance identity, with a short TTL and best-effort
+# eviction of stale entries. ``id(supervisor)`` is stable for the
+# lifetime of a given ``Supervisor`` instance; processes that build a
+# fresh ``Supervisor`` (e.g. after a config reload) bypass this cache
+# automatically because the identity changes.
+#
+# Callers receive a fresh tuple of fresh ``list`` copies so any
+# downstream mutation (sorting, filtering, appending) cannot leak back
+# into the cached snapshot.
+_STATUS_TTL_SECONDS = 1.0
+_STATUS_CACHE: dict[int, tuple[float, tuple[list, list, list, list, list]]] = {}
+
+
 from pollypm.models import CONTROL_ROLES as _MODULE_CONTROL_ROLES
 
 
@@ -1517,6 +1546,45 @@ class Supervisor:
         )
 
     def status(self) -> tuple[list[SessionLaunchSpec], list[TmuxWindow], list[AlertRecord], list[LeaseRecord], list[str]]:
+        """Return the current supervisor snapshot.
+
+        #1634 perf — results are memoised per ``Supervisor`` instance
+        identity with a short TTL (:data:`_STATUS_TTL_SECONDS`) so the
+        multiple rail / cockpit surfaces that read status on the same
+        worker tick share a single computation instead of each running
+        their own ``plan_launches`` + tmux ``list_all_windows``
+        subprocess + store fanout. Callers receive fresh ``list``
+        copies so mutation is safe.
+        """
+        cache_key = id(self)
+        now = time.monotonic()
+        cached = _STATUS_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _STATUS_TTL_SECONDS:
+            launches, windows, alerts, leases, errors = cached[1]
+            return list(launches), list(windows), list(alerts), list(leases), list(errors)
+
+        result = self._status_uncached()
+        # Best-effort eviction so the cache doesn't grow across
+        # long-lived processes that build successive ``Supervisor``
+        # instances. Cheap because the dict is typically tiny — one
+        # entry per live supervisor.
+        if len(_STATUS_CACHE) > 8:
+            for stale_key in [
+                k for k, (ts, _v) in _STATUS_CACHE.items()
+                if now - ts >= _STATUS_TTL_SECONDS
+            ]:
+                _STATUS_CACHE.pop(stale_key, None)
+        _STATUS_CACHE[cache_key] = (now, result)
+        launches, windows, alerts, leases, errors = result
+        return list(launches), list(windows), list(alerts), list(leases), list(errors)
+
+    def _status_uncached(self) -> tuple[list[SessionLaunchSpec], list[TmuxWindow], list[AlertRecord], list[LeaseRecord], list[str]]:
+        """Underlying implementation of :meth:`status`.
+
+        Separated from the public entry point so the cache wrapper
+        stays trivially readable. Tests that need to bypass the cache
+        can call this directly (or clear :data:`_STATUS_CACHE`).
+        """
         launches = self.plan_launches()
         errors: list[str] = []
         windows: list[TmuxWindow] = []

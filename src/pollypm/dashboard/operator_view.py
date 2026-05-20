@@ -19,6 +19,7 @@ mount — 12 projects × ~5–350ms sqlite opens dominated the cold path.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -35,6 +36,38 @@ from pollypm.dashboard.categorization import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# #1634 #1945 perf — per-process TTL cache for ``_prefetch_project_state``.
+#
+# When the rail's 2s categorization TTL expires, the same rail
+# ``build_items()`` tick runs both ``_project_state_rollups`` (which
+# pulls bulk tasks via :func:`pollypm.cockpit_pg_aggregates.all_tasks_grouped`)
+# and ``_project_categorizations`` → :func:`project_state_map_from_config`,
+# which opens its own shared work-service and runs
+# ``svc.list_tasks()`` + ``svc.list_worker_sessions(active_only=True)``
+# against pg. Two broad task reads, milliseconds apart, before the
+# rail can render.
+#
+# Mirrors the same wedge PRs #1907 + #1928 used for
+# ``pm_inbox_awaits_user_list`` and ``Supervisor.status()``: a tiny
+# module-level dict keyed on ``id(config)`` with a short TTL. The
+# ``svc`` argument is intentionally excluded from the key because the
+# resolved backend (pg pool or sqlite handle) is uniquely determined
+# by ``config``; the work-service handle is just a thin shim and a
+# fresh one each call would otherwise defeat the cache. The cockpit
+# router invalidates its config cache on mtime change, so a reload
+# yields a fresh ``id(config)`` and bypasses this cache automatically.
+# Callers receive fresh dict + inner-list copies so downstream
+# mutation cannot leak into the cached snapshot.
+_PREFETCH_PROJECT_STATE_TTL_SECONDS = 1.0
+_PREFETCH_PROJECT_STATE_CACHE: dict[
+    int,
+    tuple[
+        float,
+        tuple[dict[str, tuple], dict[str, tuple]],
+    ],
+] = {}
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +186,53 @@ def _prefetch_project_state(config, svc) -> tuple[  # noqa: ANN001
     :func:`pollypm.work.project_aliases.project_storage_aliases` —
     replacing N ``list_tasks(project=<key>)`` calls and N
     ``list_worker_sessions(project=<key>)`` calls with two queries.
+
+    #1634 #1945 perf — results are memoised per ``id(config)`` with a
+    short TTL (:data:`_PREFETCH_PROJECT_STATE_TTL_SECONDS`) so the
+    rail glyph categorization shares its bulk task/session reads
+    across the multiple rail-build surfaces that hit
+    :func:`project_state_map_from_config` on overlapping ticks.
+    Callers receive fresh dict + inner-list copies so mutation is safe.
+    """
+    cache_key = id(config)
+    now = time.monotonic()
+    cached = _PREFETCH_PROJECT_STATE_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < _PREFETCH_PROJECT_STATE_TTL_SECONDS:
+        tasks_snap, workers_snap = cached[1]
+        return (
+            {key: list(rows) for key, rows in tasks_snap.items()},
+            {key: list(rows) for key, rows in workers_snap.items()},
+        )
+
+    result = _prefetch_project_state_uncached(svc)
+    # Best-effort eviction so the cache doesn't grow across long-lived
+    # processes with config reloads (each reload yields a fresh
+    # ``id(config)``).
+    if len(_PREFETCH_PROJECT_STATE_CACHE) > 8:
+        for stale_key in [
+            k for k, (ts, _v) in _PREFETCH_PROJECT_STATE_CACHE.items()
+            if now - ts >= _PREFETCH_PROJECT_STATE_TTL_SECONDS
+        ]:
+            _PREFETCH_PROJECT_STATE_CACHE.pop(stale_key, None)
+    tasks_by_alias, workers_by_alias = result
+    _PREFETCH_PROJECT_STATE_CACHE[cache_key] = (
+        now,
+        (
+            {key: tuple(rows) for key, rows in tasks_by_alias.items()},
+            {key: tuple(rows) for key, rows in workers_by_alias.items()},
+        ),
+    )
+    return result
+
+
+def _prefetch_project_state_uncached(svc) -> tuple[  # noqa: ANN001
+    "dict[str, list]", "dict[str, list]"
+]:
+    """Underlying implementation of :func:`_prefetch_project_state`.
+
+    Separated from the public entry point so the cache wrapper stays
+    trivially readable. Tests that need to bypass the cache can call
+    this directly (or clear :data:`_PREFETCH_PROJECT_STATE_CACHE`).
     """
     tasks_by_alias: dict[str, list] = {}
     workers_by_alias: dict[str, list] = {}

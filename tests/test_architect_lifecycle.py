@@ -35,16 +35,45 @@ def store(tmp_path: Path) -> StateStore:
 
 
 @pytest.fixture
-def claude_account() -> AccountConfig:
+def claude_account(tmp_path: Path) -> AccountConfig:
+    """A Claude account whose home points at a per-test tmp dir.
+
+    #1902 — was previously ``home=Path.home()`` which pointed at the
+    dev machine's real ``$HOME``. ``AccountConfig.home`` feeds into
+    ``ClaudeProvider.latest_session_id`` (read-only) and downstream
+    resume-token plumbing; both accept any path. Using ``tmp_path``
+    keeps the unit tests host-agnostic and stops them tugging on the
+    real ``~/.claude/`` cache. The host-probe test below
+    (``test_close_idle_architect_persists_token_when_session_exists``)
+    uses its own fixture that intentionally points at the dev home.
+    """
     return AccountConfig(
-        name="claude_test", provider=ProviderKind.CLAUDE, home=Path.home(),
+        name="claude_test", provider=ProviderKind.CLAUDE, home=tmp_path / "claude_home",
     )
 
 
 @pytest.fixture
-def codex_account() -> AccountConfig:
+def codex_account(tmp_path: Path) -> AccountConfig:
+    """A Codex account whose home points at a per-test tmp dir.
+
+    See ``claude_account`` for the rationale (#1902).
+    """
     return AccountConfig(
-        name="codex_test", provider=ProviderKind.CODEX, home=Path.home(),
+        name="codex_test", provider=ProviderKind.CODEX, home=tmp_path / "codex_home",
+    )
+
+
+@pytest.fixture
+def host_claude_account() -> AccountConfig:
+    """Read-only fixture that points at the real ``$HOME`` for host probes.
+
+    Only the two tests that deliberately scan the dev machine's
+    Claude transcript cache should use this — and both must skip
+    when no live session exists. The fixture name documents intent:
+    this is the host-coupled probe, not the unit-test sandbox.
+    """
+    return AccountConfig(
+        name="claude_test", provider=ProviderKind.CLAUDE, home=Path.home(),
     )
 
 
@@ -97,21 +126,25 @@ def test_should_close_architect_threshold_respected(store):
     )
 
 
-def test_close_idle_architect_persists_token_when_session_exists(store, claude_account):
+def test_close_idle_architect_persists_token_when_session_exists(store, host_claude_account):
     """Real session UUID lookup against the live test environment.
 
     This host-level check only runs when the local Claude transcript
     cache actually has a resumable session for the fixture path.
+    Uses ``host_claude_account`` (not ``claude_account``) because the
+    probe deliberately reads the dev machine's real Claude cache —
+    #1902 split the sandbox fixture from the host fixture so unit
+    tests stop touching real state.
     """
     killed: list[str] = []
     provider = ClaudeProvider()
     cwd = Path("/Users/sam/dev/pollypm")
-    if provider.latest_session_id(claude_account, cwd) is None:
+    if provider.latest_session_id(host_claude_account, cwd) is None:
         pytest.skip("no live Claude session available for architect token capture")
     captured = close_idle_architect(
         store=store,
         provider=provider,
-        account=claude_account,
+        account=host_claude_account,
         project_key="passgen",
         cwd=cwd,
         tmux_kill_window=killed.append,
@@ -239,8 +272,15 @@ def test_manager_architect_launch_cmd_routes_through_token(store, claude_account
     assert "warm-id" in argv
 
 
-def test_manager_latest_session_id_passes_through(claude_account):
-    sid = manager.latest_session_id(claude_account, Path("/Users/sam/dev/pollypm"))
+def test_manager_latest_session_id_passes_through(host_claude_account):
+    """Host-probe: the manager helper returns a UUID-or-None from the real cache.
+
+    Uses ``host_claude_account`` (real ``Path.home()``) because the
+    assertion's point is "the lookup against the dev machine's
+    Claude cache returns the right shape". See #1902 for why this
+    is split from the sandboxed ``claude_account`` fixture.
+    """
+    sid = manager.latest_session_id(host_claude_account, Path("/Users/sam/dev/pollypm"))
     # Test envs that have run claude here will have a session; tolerate
     # both outcomes — what matters is the function returns a string or None,
     # not that it raises.

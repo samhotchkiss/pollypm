@@ -4552,7 +4552,7 @@ def test_cockpit_router_parks_mounted_task_worker(monkeypatch, tmp_path: Path) -
 
 
 def test_cockpit_router_park_kills_orphan_when_live_duplicate_exists(monkeypatch, tmp_path: Path) -> None:
-    """#1955 — ``_park_mounted_session`` must kill any pre-existing live
+    """#1994 — ``_park_mounted_session`` must kill any pre-existing live
     same-named storage window (an ORPHAN, by construction) and then
     break-pane the cockpit mount into storage to preserve the user's
     active conversation.
@@ -4688,7 +4688,7 @@ def test_cockpit_router_park_kills_orphan_when_live_duplicate_exists(monkeypatch
     router._park_mounted_session(FakeSupervisor(), "pollypm:PollyPM")
 
     assert "break" in calls, (
-        "#1955 — break-pane MUST run so the user's active mount is "
+        "#1994 — break-pane MUST run so the user's active mount is "
         "preserved as the canonical pm-operator window in storage"
     )
     break_calls = calls["break"]
@@ -4721,7 +4721,7 @@ def test_cockpit_router_park_kills_orphan_when_live_duplicate_exists(monkeypatch
     )
     assert not any(
         e["event_name"] == "cockpit.park_skipped_existing" for e in audit_events
-    ), "park-skipped event must no longer fire — #1955"
+    ), "park-skipped event must no longer fire — #1994"
 
     # State is cleared so the next mount won't think we still own the
     # cockpit right pane.
@@ -4856,7 +4856,7 @@ def test_cockpit_router_park_reoccupies_dead_storage_window(monkeypatch, tmp_pat
 def test_rail_navigation_preserves_architect_session_across_nav_and_back(
     monkeypatch, tmp_path: Path
 ) -> None:
-    """#1955 — rail navigation must NOT wipe a live architect chat.
+    """#1994 — rail navigation must NOT wipe a live architect chat.
 
     Sam's verbatim repro on 2026-05-20::
 
@@ -4866,10 +4866,10 @@ def test_rail_navigation_preserves_architect_session_across_nav_and_back(
 
     Trigger: a stale ``architect-samblog`` orphan from a prior cockpit
     lifetime is sitting in the storage closet at the moment the user
-    clicks away.  Pre-#1955, ``_park_mounted_session`` saw the orphan,
+    clicks away.  Pre-#1994, ``_park_mounted_session`` saw the orphan,
     refused to break-pane, and trusted storage as the persistent home;
     the caller's ``respawn_pane`` then wiped the cockpit's actual
-    architect conversation.  Post-#1955, the helper kills the orphan
+    architect conversation.  Post-#1994, the helper kills the orphan
     and break-panes the cockpit mount into storage under the canonical
     name — the conversation is preserved and the next mount can find
     it again.
@@ -5044,7 +5044,7 @@ def test_rail_navigation_preserves_architect_session_across_nav_and_back(
         "killed_orphan_to_preserve_active_mount"
     )
     # 5. The old policy marker MUST NOT fire (it would mean the
-    #    helper followed the pre-#1955 wipe path).
+    #    helper followed the pre-#1994 wipe path).
     assert not any(
         e["event_name"] == "cockpit.park_skipped_existing"
         for e in audit_events

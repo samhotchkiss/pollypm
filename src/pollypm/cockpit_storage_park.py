@@ -30,7 +30,7 @@ The helper is intentionally tmux-shape agnostic: callers pass a
 ``tmux`` client plus a small audit-emit callback, and the helper does
 the rest.  Pure-function design makes testing without tmux trivial.
 
-Live-duplicate policy (#1955, 2026-05-20)
+Live-duplicate policy (#1994, 2026-05-20)
 -----------------------------------------
 The original helper, on finding a same-named LIVE window in storage,
 killed the caller's ``source_pane_id`` and refused the break-pane —
@@ -104,7 +104,7 @@ def safe_break_pane_to_storage(
         break-pane re-occupies the canonical name, then break.
       * No duplicates → break unconditionally.
 
-    Why the live-duplicate path changed (#1631 → #1955 fix):
+    Why the live-duplicate path changed (#1631 → #1994 fix):
     The original #1631 helper assumed the storage window held the
     user's conversation and skipped the break-pane (killing
     ``source_pane_id`` as collateral).  That was correct when the
@@ -117,7 +117,7 @@ def safe_break_pane_to_storage(
     _refusal`` memory — the cockpit pane is the source of truth at the
     moment of the park because the rail just unmounted from it.
 
-    The helper centralizes the #1631/#1635/#1955 logic so every
+    The helper centralizes the #1631/#1635/#1994 logic so every
     break-pane site in the cockpit gets the same handling.  See module
     docstring for the full list of historical bypass sites.
     """

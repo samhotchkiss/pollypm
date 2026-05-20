@@ -174,7 +174,7 @@ class FakeTmux:
         raise KeyError(target)
 
     def kill_window(self, target: str) -> None:
-        """#1955 — drop the matching window from its session.
+        """#1994 — drop the matching window from its session.
 
         Mirrors ``tmux kill-window -t <session>:<index>``.  The
         ``cockpit_storage_park.safe_break_pane_to_storage`` helper
@@ -650,7 +650,7 @@ def test_park_live_to_storage_breaks_right_and_replaces_static_content() -> None
 
 
 def test_park_live_to_storage_kills_orphan_when_live_duplicate_exists() -> None:
-    """#1955 — ``park_live_to_storage`` must kill a live storage orphan
+    """#1994 — ``park_live_to_storage`` must kill a live storage orphan
     and break-pane the cockpit mount under the canonical name to
     preserve the user's active conversation.
 
@@ -661,7 +661,7 @@ def test_park_live_to_storage_kills_orphan_when_live_duplicate_exists() -> None:
     conversation (they were typing into it); any pre-existing live
     storage window with the same name is a stale orphan.
 
-    Pre-#1955 behaviour: the helper refused to break-pane and killed
+    Pre-#1994 behaviour: the helper refused to break-pane and killed
     the cockpit's right pane (the user's chat), then the next mount
     surfaced the orphan as if it were the user's conversation.
 
@@ -720,7 +720,7 @@ def test_park_live_to_storage_kills_orphan_when_live_duplicate_exists() -> None:
     assert f"break_live:{right_id}->pollypm-storage-closet:architect-samblog" in result.actions
     assert not any(
         action.startswith("park_skipped_live_duplicate") for action in result.actions
-    ), "park-skipped action must no longer fire — #1955"
+    ), "park-skipped action must no longer fire — #1994"
     assert result.state.mounted_session is None
 
 

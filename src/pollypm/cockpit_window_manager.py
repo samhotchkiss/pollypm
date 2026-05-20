@@ -518,7 +518,7 @@ class CockpitWindowManager:
         # live duplicate in the closet doesn't get a second window
         # silently appended.
         #
-        # #1955 — the helper now kills any pre-existing live orphan and
+        # #1994 — the helper now kills any pre-existing live orphan and
         # break-panes the cockpit mount into storage (preserving the
         # user's active conversation as the canonical window).  The
         # ``broke is False`` branch now only covers the case where

@@ -15,7 +15,7 @@ These tests pin the contract of :func:`safe_break_pane_to_storage`:
   ORPHAN (the cockpit pane being parked is by construction the
   user's active mount).  The orphan is killed, ``break-pane`` runs,
   audit fires with ``cockpit.park_killed_orphan``, helper returns
-  ``True``.  See #1955 — the original "skip break-pane and kill the
+  ``True``.  See #1994 — the original "skip break-pane and kill the
   cockpit pane" policy wiped Sam's live architect chat on every
   rail-navigation and back.
 * Dead duplicates → killed before break-pane so the freshly-parked
@@ -131,7 +131,7 @@ def test_safe_break_unconditional_when_no_existing_window() -> None:
 def test_safe_break_kills_orphan_when_live_duplicate_exists() -> None:
     """Live duplicate → helper kills the orphan and breaks the pane.
 
-    #1955 — Sam's verbatim bug: ``I was talking with the Sam blog
+    #1994 — Sam's verbatim bug: ``I was talking with the Sam blog
     architect.  I click into a different area on the rail.  I click
     back to the Sam blog architect, and it's a new goddamn
     conversation.``  The cockpit pane (``%99`` here) is the user's
@@ -165,7 +165,7 @@ def test_safe_break_kills_orphan_when_live_duplicate_exists() -> None:
         ("%99", "pollypm-storage-closet", "architect-samblog")
     ]
     # The helper must NEVER kill the source pane in the live-duplicate
-    # branch — that was the #1955 regression surface.
+    # branch — that was the #1994 regression surface.
     assert tmux.kill_pane_calls == []
     # Storage closet still has exactly one architect-samblog window
     # (the freshly broken-in cockpit pane).
@@ -224,7 +224,7 @@ def test_safe_break_kills_all_live_orphans_when_two_duplicates_exist() -> None:
     finds exactly one ``architect-samblog`` window holding the
     user's actual conversation.
 
-    Pre-#1955 behaviour: refuse to break and kill ``%5099``,
+    Pre-#1994 behaviour: refuse to break and kill ``%5099``,
     wiping the user's live conversation.
     """
     tmux = _FakeTmux(
@@ -330,7 +330,7 @@ def test_safe_break_swallows_list_windows_errors() -> None:
 def test_safe_break_audit_callback_is_optional() -> None:
     """Helper must work without an audit callback (low-level callers).
 
-    With #1955's policy reversal, a missing audit callback still
+    With #1994's policy reversal, a missing audit callback still
     causes the orphan to be killed and break-pane to proceed; the
     audit emit is best-effort and silent without a callback.
     """
@@ -353,7 +353,7 @@ def test_safe_break_audit_callback_is_optional() -> None:
 
 
 def test_safe_break_preserves_active_mount_across_rail_navigation() -> None:
-    """#1955 regression: rail nav must NOT wipe the user's chat.
+    """#1994 regression: rail nav must NOT wipe the user's chat.
 
     Reproduces Sam's verbatim bug (2026-05-20):
 
@@ -398,7 +398,7 @@ def test_safe_break_preserves_active_mount_across_rail_navigation() -> None:
     # CRITICAL: the helper must NEVER kill the active mount in the
     # rail-navigation case — that's the conversation-wipe surface.
     assert tmux.kill_pane_calls == [], (
-        "safe_break_pane_to_storage killed the active mount — #1955 "
+        "safe_break_pane_to_storage killed the active mount — #1994 "
         "regression"
     )
     # Exactly one architect-samblog window remains in storage and it

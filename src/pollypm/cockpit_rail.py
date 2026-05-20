@@ -4292,7 +4292,7 @@ class CockpitRouter:
         # 4 onboarding questions — the duplicate window held the
         # original conversation.
         #
-        # #1955 — live-duplicate policy reversal. The original #1635
+        # #1994 — live-duplicate policy reversal. The original #1635
         # logic refused break-pane when a live storage window already
         # held the canonical name, trusting storage as the persistent
         # home. For rail-navigation that's wrong: the user has been
@@ -4317,7 +4317,7 @@ class CockpitRouter:
             if not self._storage_window_is_live(w)
         ]
         if live_existing:
-            # #1955 — kill the orphan(s) so the user's actual conversation
+            # #1994 — kill the orphan(s) so the user's actual conversation
             # (which is right_pane_id, the cockpit's current mount) can
             # claim the canonical name on break-pane below.  Emit a
             # forensics event BEFORE the kill so the audit trail records

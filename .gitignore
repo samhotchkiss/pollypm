@@ -6,6 +6,19 @@ __pycache__/
 *.pyc
 src/*.egg-info/
 
+# #2009: `python -m build` (or any wheel build via
+# ``setuptools.build_meta``) drops a snapshot of ``src/pollypm/``
+# into ``build/lib/pollypm/``. If that directory survives a code
+# change, the next ``uv tool install --force --reinstall .`` can
+# pick the stale snapshot up instead of the current ``src/`` tree
+# and silently ship pre-edit code (the "build/ shadows src/"
+# regression trap). Keep ``build/`` out of git so it's obvious that
+# wiping it between dev installs is safe — and so a stray local
+# build artifact never gets committed.
+build/
+dist/
+*.egg-info/
+
 .pollypm/
 .claude/worktrees/
 reports/

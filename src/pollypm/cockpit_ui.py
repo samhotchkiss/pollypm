@@ -6308,7 +6308,12 @@ class PollyInboxApp(App[None]):
         )
         self._render_list(select_first=select_first)
 
-    def _render_list(self, *, select_first: bool = False) -> None:
+    def _render_list(
+        self,
+        *,
+        select_first: bool = False,
+        defer_detail_hydration: bool = False,
+    ) -> None:
         previous_row_key = self._selected_row_key
         previous_task_id = self._selected_task_id
         self.list_view.clear()
@@ -6395,12 +6400,57 @@ class PollyInboxApp(App[None]):
             row_ref = visible_rows[restore_index]
             self._selected_task_id = row_ref.task_id
             self._selected_row_key = row_ref.key
-            self._render_detail(row_ref.task_id)
+            if defer_detail_hydration:
+                # #1959 perf — paint the list first; defer the synchronous
+                # task/replies/context fetch onto the next event-loop tick
+                # so the inbox list appears immediately and detail
+                # hydrates asynchronously.
+                self._schedule_deferred_detail_hydration(row_ref.task_id)
+            else:
+                self._render_detail(row_ref.task_id)
         elif restore_index is not None and 0 <= restore_index < len(visible_rows):
             row_ref = visible_rows[restore_index]
             self._selected_task_id = row_ref.task_id
             self._selected_row_key = row_ref.key
         self._update_status(total=total, shown=len(visible))
+
+    def _schedule_deferred_detail_hydration(self, task_id: str) -> None:
+        """Defer ``_render_detail`` onto the next event-loop tick.
+
+        #1959 perf — the inbox initial-load completion callback runs on
+        the UI thread; calling ``_render_detail`` synchronously inside
+        that callback blocks first-paint on a work-service open + task
+        + replies + context fetch. Showing a "Loading…" placeholder and
+        scheduling the hydration via ``set_timer(0)`` lets the list
+        paint immediately; the timer fires in the next event-loop tick
+        and runs the same code path against the same task_id. If the
+        user has navigated away by then we skip hydration.
+        """
+        try:
+            self.detail.update("[dim]Loading detail…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+
+        def _hydrate() -> None:
+            # Cancellable / stale-result guard: only hydrate if the user
+            # is still on this row (no navigation away during the gap).
+            if self._selected_task_id != task_id:
+                return
+            try:
+                self._render_detail(task_id)
+            except Exception:  # noqa: BLE001
+                pass
+
+        try:
+            self.set_timer(0, _hydrate)
+        except Exception:  # noqa: BLE001
+            # Defensive: if the timer can't be scheduled (shutdown), fall
+            # back to the synchronous path so the user isn't stranded on
+            # the placeholder.
+            try:
+                self._render_detail(task_id)
+            except Exception:  # noqa: BLE001
+                pass
 
     def _update_status(self, *, total: int, shown: int) -> None:
         """Render the bottom counter strip — folds in active filters.
@@ -6525,7 +6575,10 @@ class PollyInboxApp(App[None]):
             tasks, unread, replies_by_task,
         )
         try:
-            self._render_list(select_first=True)
+            # #1959 perf — paint the list now and hydrate the first
+            # row's detail on the next event-loop tick so the click
+            # doesn't block on a synchronous task/replies/context fetch.
+            self._render_list(select_first=True, defer_detail_hydration=True)
         except Exception:  # noqa: BLE001
             pass
 

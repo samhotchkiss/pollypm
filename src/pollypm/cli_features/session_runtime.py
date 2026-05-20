@@ -71,6 +71,42 @@ def _notify_user_prompt_fallback_note_enabled() -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_notify_store(db: str):
+    """Return the configured-backend ``Store`` for ``pm notify`` writes.
+
+    Mirrors :func:`pollypm.work.cli._svc` backend dispatch (#1369,
+    #1737) and the inbox-CLI helper added for #1790. When ``--db`` is
+    the canonical workspace default, route through
+    :func:`pollypm.store.get_store` so ``[storage].backend = "postgres"``
+    actually writes to the pg pool. When ``--db`` is overridden (the
+    test / CI escape hatch) pin to sqlite at the supplied path.
+
+    The returned ``Store`` is a process-wide singleton — do NOT
+    ``close()`` it.
+
+    Issue #1755 / #1790: ``pm notify`` constructing
+    ``SQLAlchemyStore("sqlite:///<state>")`` directly silently wrote
+    to the empty sqlite shadow whenever the configured backend was
+    postgres, so live pg readers never saw the alert and the
+    immediate-priority inbox task fan-out hit a non-existent row.
+    """
+    from pollypm.work.db_resolver import (
+        WORKSPACE_DEFAULT_DB_PATH,
+        resolve_work_db_path,
+    )
+
+    if db != WORKSPACE_DEFAULT_DB_PATH:
+        from pollypm.store import get_store_by_url
+
+        db_path = resolve_work_db_path(db, project=None)
+        return get_store_by_url(f"sqlite:///{db_path}")
+
+    from pollypm.config import load_config
+    from pollypm.store import get_store
+
+    return get_store(load_config())
+
+
 # ``<project>/<N>`` matches the canonical task id form. When ``pm send``
 # receives an argument matching this shape we translate it to the
 # per-task worker window name (#924) so the user does not have to know
@@ -801,7 +837,8 @@ def _validate_user_prompt_payload(user_prompt_json: str) -> dict[str, object] | 
 
 def _create_notify_inbox_task(
     *,
-    db_path: Path,
+    db: str,
+    store,
     message_id: object,
     subject: str,
     body: str,
@@ -820,14 +857,38 @@ def _create_notify_inbox_task(
     dashboard can cross-link them, and returns the ``task_id``. Errors
     are surfaced via ``typer.echo`` + ``typer.Exit(1)`` to match the
     original inline behavior.
-    """
-    from pollypm.store import SQLAlchemyStore
-    from pollypm.work import create_work_service
 
-    svc = create_work_service(
-        db_path=db_path,
-        project_path=db_path.parent.parent,
+    Backend-aware (#1790): the messages-store ``store`` is the
+    process-wide singleton resolved by :func:`_resolve_notify_store`,
+    and the work-service is built through
+    :func:`pollypm.work.create_work_service` with the active
+    :class:`PollyPMConfig` so ``[storage].backend = "postgres"`` lands
+    on the pg pool. ``--db`` non-default values force sqlite dispatch
+    via ``db_path`` (mirrors :func:`pollypm.work.cli._svc`).
+    """
+    from pollypm.work import create_work_service
+    from pollypm.work.db_resolver import (
+        WORKSPACE_DEFAULT_DB_PATH,
+        resolve_work_db_path,
     )
+
+    config_obj = None
+    if db == WORKSPACE_DEFAULT_DB_PATH:
+        try:
+            from pollypm.config import load_config
+
+            config_obj = load_config()
+        except Exception:  # noqa: BLE001
+            config_obj = None
+
+    if config_obj is not None:
+        svc = create_work_service(config=config_obj, project_key=project)
+    else:
+        db_path = resolve_work_db_path(db, project=None)
+        svc = create_work_service(
+            db_path=db_path,
+            project_path=db_path.parent.parent,
+        )
     try:
         task_labels = [
             *label_list,
@@ -850,14 +911,12 @@ def _create_notify_inbox_task(
             kind=notify_kind,
         )
         inbox_task_id = task.task_id
-        store = SQLAlchemyStore(f"sqlite:///{db_path}")
-        try:
-            store.update_message(
-                message_id,
-                payload={**payload, "task_id": inbox_task_id},
-            )
-        finally:
-            store.close()
+        # ``store`` is the process-wide messages singleton from
+        # :func:`_resolve_notify_store`; do NOT close it.
+        store.update_message(
+            message_id,
+            payload={**payload, "task_id": inbox_task_id},
+        )
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Failed to create inbox task: {exc}", err=True)
         raise typer.Exit(code=1) from exc
@@ -1105,11 +1164,8 @@ def notify(
             err=True,
         )
 
-    from pollypm.store import SQLAlchemyStore
-    from pollypm.work.cli import _resolve_db_path
-
-    db_path = _resolve_db_path(db, project=project)
-    store = SQLAlchemyStore(f"sqlite:///{db_path}")
+    # Backend-aware Store dispatch (#1790). Singleton — do NOT close.
+    store = _resolve_notify_store(db)
     tier_state = {
         "immediate": "open",
         "digest": "staged",
@@ -1192,13 +1248,14 @@ def notify(
     except Exception as exc:  # noqa: BLE001
         typer.echo(f"Failed to enqueue notify message: {exc}", err=True)
         raise typer.Exit(code=1) from exc
-    finally:
-        store.close()
+    # ``store`` is the process-wide singleton from
+    # :func:`_resolve_notify_store` (#1790); do NOT close it.
 
     inbox_task_id: str | None = None
     if resolved_priority == "immediate":
         inbox_task_id = _create_notify_inbox_task(
-            db_path=db_path,
+            db=db,
+            store=store,
             message_id=message_id,
             subject=subject,
             body=body,

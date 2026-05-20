@@ -1348,7 +1348,12 @@ class SessionManager:
             return window_name
 
         try:
-            reviewer_cmd, _provider, _account = self._reviewer_launch_bundle(
+            (
+                reviewer_cmd,
+                reviewer_provider,
+                reviewer_account,
+                reviewer_cwd,
+            ) = self._reviewer_launch_bundle(
                 window_name=window_name,
                 project=project,
                 task_number=task_number,
@@ -1366,21 +1371,73 @@ class SessionManager:
             )
             return None
 
-        try:
-            if not self._tmux.has_session(session_name):
-                self._tmux.create_session(
-                    session_name, window_name, reviewer_cmd,
+        # #1910 — the reviewer needs a task-specific kickoff or it
+        # launches in the right cwd but sits idle waiting for input.
+        # Build the kickoff message (mirrors the worker's prompt-file
+        # convention from _provision_locked) and route through the
+        # SessionService when configured so the kickoff is delivered as
+        # initial input after the stabilize window. Falls back to the
+        # legacy raw-tmux path for test harnesses that wire a bare
+        # SessionManager without a SessionService.
+        reviewer_kickoff = (
+            f"Review task {task_id}. Inspect the diff between the task "
+            f"branch and main, read the worker's "
+            f".pollypm-task-prompt.md, and decide. If the work meets the "
+            f"bar, approve with `pm task approve {task_id}`. If it "
+            f"needs changes, reject with "
+            f"`pm task reject {task_id} --reason '<why>'`."
+        )
+
+        if self._session_service is not None:
+            marker_dir = self._project_path / ".pollypm" / "worker-markers"
+            try:
+                marker_dir.mkdir(parents=True, exist_ok=True)
+                marker_path = marker_dir / f"{window_name}.fresh"
+                marker_path.write_text(_now())
+            except OSError as marker_exc:
+                logger.warning(
+                    "provision_reviewer: could not write fresh-launch "
+                    "marker for %s: %s (kickoff may not be delivered)",
+                    task_id, marker_exc,
                 )
-            else:
-                self._tmux.create_window(
-                    session_name, window_name, reviewer_cmd, detached=True,
+                marker_path = None
+            try:
+                self._session_service.create(
+                    name=window_name,
+                    provider=reviewer_provider,
+                    account=reviewer_account,
+                    cwd=reviewer_cwd,
+                    command=reviewer_cmd,
+                    window_name=window_name,
+                    tmux_session=session_name,
+                    stabilize=True,
+                    initial_input=reviewer_kickoff,
+                    fresh_launch_marker=marker_path,
+                    session_role="reviewer",
                 )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "provision_reviewer: tmux spawn failed for %s: %s",
-                task_id, exc,
-            )
-            return None
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "provision_reviewer: session-service spawn failed for "
+                    "%s: %s", task_id, exc,
+                )
+                return None
+        else:
+            try:
+                if not self._tmux.has_session(session_name):
+                    self._tmux.create_session(
+                        session_name, window_name, reviewer_cmd,
+                    )
+                else:
+                    self._tmux.create_window(
+                        session_name, window_name, reviewer_cmd,
+                        detached=True,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "provision_reviewer: tmux spawn failed for %s: %s",
+                    task_id, exc,
+                )
+                return None
 
         # Best-effort forensic event so operators can grep the audit
         # log for spawn cadence. Mirrors the worker provision audit
@@ -1451,15 +1508,21 @@ class SessionManager:
         window_name: str,
         project: str,
         task_number: int,
-    ) -> tuple[str, str, str]:
+    ) -> tuple[str, str, str, Path]:
         """Build the launch command for a per-task reviewer window.
 
-        Returns ``(command, provider_name, account_name)``. Routes
+        Returns ``(command, provider_name, account_name, cwd)``. Routes
         through the configured provider/runtime adapter pair so the
         reviewer obeys the same account, runtime, and permissions
         policy as the worker. Materialises the reviewer persona prompt
         to disk and appends ``--append-system-prompt-file`` for Claude
         launches (mirrors #1870/#1873 architect persona injection).
+
+        ``cwd`` is the resolved working directory — the worker's task
+        worktree when present, otherwise the project root (#1886). The
+        caller passes this back into ``SessionService.create`` so the
+        reviewer kickoff (#1910) lands in the same directory the
+        launch command targets.
         """
         from pollypm.models import ProviderKind, SessionConfig
         from pollypm.onboarding import default_session_args
@@ -1615,7 +1678,7 @@ class SessionManager:
                 )
 
         command = runtime.wrap_command(launch, account, config.project)
-        return command, account.provider.value, account_name
+        return command, account.provider.value, account_name, session_cwd
 
     # ------------------------------------------------------------------
     # Rejection

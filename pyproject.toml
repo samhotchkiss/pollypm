@@ -36,8 +36,16 @@ dev = [
 pm = "pollypm.cli:app"
 pollypm = "pollypm.cli:app"
 
+# #1956: sqlite is intentionally NOT entry-pointed any more. The
+# pg cutover (#1737) made postgres the production backend; leaving
+# ``sqlite`` registered here let a misconfigured ``[storage].backend
+# = "sqlite"`` silently open an empty sqlite shadow alongside the
+# real pg state. ``get_store(config)`` now raises
+# ``StoreBackendNotFound`` for ``backend == "sqlite"`` unless a
+# caller has explicitly opted back in via
+# :func:`pollypm.store.registry.register_backend` (tests, legacy
+# ``--db <path>`` escape hatches). See ``store/registry.py``.
 [project.entry-points."pollypm.store_backend"]
-sqlite = "pollypm.store.sqlalchemy_store:SQLAlchemyStore"
 postgres = "pollypm.store.backends.pg_store:PgStore"
 
 # Phase B (#397) — both providers extracted into their own packages.

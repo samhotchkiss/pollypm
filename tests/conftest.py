@@ -115,6 +115,28 @@ def pytest_configure(config):
         "(use only when a test explicitly monkeypatches Path.home / "
         "GLOBAL_CONFIG_DIR to a sandbox).",
     )
+    # #1956 — sqlite was removed from the ``pollypm.store_backend``
+    # entry-point group in ``pyproject.toml`` so a stock prod install
+    # cannot silently pick it up from ``[storage].backend = "sqlite"``.
+    # The test suite still relies on sqlite via
+    # ``@pytest.mark.backend("sqlite")``, the legacy ``--db <path>``
+    # CLI escape paths, and direct ``get_store_by_url`` calls in
+    # ``tests/test_cli_inbox_backend_aware.py`` /
+    # ``tests/test_cli_notify_backend_aware.py``. Register the
+    # backend in-process for the whole pytest run so those paths
+    # keep resolving. ``quiet=True`` suppresses the production
+    # warn-log under pytest.
+    try:
+        from pollypm.store import SQLAlchemyStore
+        from pollypm.store.registry import register_backend
+
+        register_backend("sqlite", SQLAlchemyStore, quiet=True)
+    except Exception:  # noqa: BLE001
+        # The store package may not be importable in the very early
+        # phase of some sub-suite runs (e.g. tooling-only tests with
+        # mocked sys.modules). Tests that actually need sqlite will
+        # re-register from their own fixtures.
+        pass
 
 
 @pytest.fixture(autouse=True)

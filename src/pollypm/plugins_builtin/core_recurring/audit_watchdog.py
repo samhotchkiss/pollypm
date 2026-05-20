@@ -2061,6 +2061,12 @@ def _create_operator_inbox_task(
                 initial_dedup_payload(payload, dedup_key)
                 if dedup_key else payload
             )
+            # #1915 fix — dedup row MUST stay live ("open") so the
+            # next tick's ``find_open_dedup_message`` can collapse onto
+            # it via ``bump_dedup_message``. Pre-fix this was
+            # ``state="closed"`` and the dedup query (which only scans
+            # ``state in ('open', 'staged')``) never matched, so every
+            # tick stacked a new notify row + chat task.
             message_id = store.enqueue_message(
                 type="notify",
                 tier="immediate",
@@ -2071,7 +2077,7 @@ def _create_operator_inbox_task(
                 scope=project_key,
                 labels=["notify", "watchdog"],
                 payload=seeded_payload,
-                state="closed",
+                state="open",
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
 
@@ -2266,6 +2272,12 @@ def _create_operator_tier4_inbox_task(
                 initial_dedup_payload(payload, dedup_key)
                 if dedup_key else payload
             )
+            # #1915 fix — dedup row MUST stay live ("open") so the
+            # next tick's ``find_open_dedup_message`` can collapse onto
+            # it via ``bump_dedup_message``. Pre-fix this was
+            # ``state="closed"`` and the dedup query (which only scans
+            # ``state in ('open', 'staged')``) never matched, so every
+            # tick stacked a new notify row + chat task.
             message_id = store.enqueue_message(
                 type="notify",
                 tier="immediate",
@@ -2276,7 +2288,7 @@ def _create_operator_tier4_inbox_task(
                 scope=project_key,
                 labels=["notify", "watchdog", "tier4"],
                 payload=seeded_payload,
-                state="closed",
+                state="open",
                 kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
             )
 
@@ -2461,6 +2473,7 @@ def _dispatch_to_operator_tier4(
     promotion_path: str,
     justification: str = "",
     tracker: Any | None = None,
+    config_path: Path | None = None,
 ) -> str:
     """Tier-4 dispatch: route a finding to broader-authority Polly.
 
@@ -2478,6 +2491,12 @@ def _dispatch_to_operator_tier4(
     self-promote CLI) decides whether to call this; it does not gate
     on ``_OPERATOR_DISPATCHABLE_RULES`` because tier-4 dispatch is
     promotion-driven, not rule-driven.
+
+    ``config_path`` (#1914 fix) — mirrors the tier-3 fix from #1546.
+    Alternate-config heartbeat runs need the inbox write to land on
+    the same backend the projector reads from; pre-fix tier-4 always
+    resolved against ``DEFAULT_CONFIG_PATH`` so cards could land in
+    the wrong workspace/backend on pg cutover or test setups.
     """
     from pollypm.audit.tier4 import root_cause_hash
 
@@ -2524,6 +2543,7 @@ def _dispatch_to_operator_tier4(
             subject=subject_text,
             body=body,
             dedup_key=dedup_key,
+            config_path=config_path,
         )
     except Exception:  # noqa: BLE001
         logger.warning(
@@ -3202,12 +3222,18 @@ def _scan_one_project(
             if tracker is not None:
                 try:
                     if tracker.should_auto_promote(finding, now=now):
+                        # #1914 fix — thread ``config_path`` so
+                        # alternate-config heartbeat runs route the
+                        # tier-4 inbox write to the same backend the
+                        # tier-3 fix already covers. Pre-fix tier-4
+                        # always resolved ``DEFAULT_CONFIG_PATH``.
                         outcome = _dispatch_to_operator_tier4(
                             finding,
                             project_path=project_path,
                             now=now,
                             promotion_path="watchdog",
                             tracker=tracker,
+                            config_path=config_path,
                         )
                         if outcome == "dispatched":
                             counters["tier4_dispatches_sent"] += 1

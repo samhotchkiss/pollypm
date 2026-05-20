@@ -4,6 +4,15 @@ Design document for issue [#1664](https://github.com/samhotchkiss/pollypm/issues
 Status: **proposed** (design only; implementation deferred to post-RC).
 Authors: Sam, with research from the 2026-05-18 rail-perf review on [#1634](https://github.com/samhotchkiss/pollypm/issues/1634).
 
+> **Note (2026-05-19, pre-PR-1):** This doc was written 2026-05-18, before
+> the postgres cutover (#1737) completed. Where the prose says "sqlite open"
+> or "60-100 sqlite opens per refresh," read it as **per-project postgres
+> queries from the hot path**. The architecture (audit-log tail →
+> in-process snapshot → lock-free reads) is unchanged; only the label on
+> the bottleneck changed. The §2.1 hot-path table still names the right
+> call sites — they now open a pg connection / run a per-project query
+> instead of opening sqlite.
+
 This document describes a concrete design that an implementor can pick up
 post-v1-RC. It does **not** ship the cache. It is the resolution to the design
 ticket; the implementation lands as a separate sequence of PRs (see §6).
@@ -13,18 +22,19 @@ ticket; the implementation lands as a separate sequence of PRs (see §6).
 ## 1. Problem statement
 
 The 2026-05-18 perf review on the rail-perf meta (#1634) traced the user-felt
-cold-load and stuttery rail to **per-project sqlite-open fanout from multiple
+cold-load and stuttery rail to **per-project query fanout from multiple
 surfaces with no shared cache**. Concretely, a single rail rebuild on a
-12-project workspace performs ~60-100 sqlite opens. Prior wedges
-(#1605, #1608, #1630) moved that work off the main thread but did not reduce
-wall-clock cost; ~50% of asyncio-task time is still parked on the RLock
-that hands worker-thread results back to the UI.
+12-project workspace performs ~60-100 per-project work-service queries
+(historically sqlite opens; post-#1737 postgres queries against the shared
+state DB). Prior wedges (#1605, #1608, #1630) moved that work off the main
+thread but did not reduce wall-clock cost; ~50% of asyncio-task time is
+still parked on the RLock that hands worker-thread results back to the UI.
 
 The review proposed three architectural moves prioritized A → C → B. **Move A**
 is the smallest-scope, biggest user-felt win:
 
 > In-process project-state cache with epoch-driven invalidation. ~2 days.
-> Kills 60-100 sqlite opens per refresh.
+> Kills 60-100 per-project DB queries per refresh.
 
 This doc is the design artifact for Move A. The output of #1664 is **this
 document**; the implementation work is tracked separately as the PR sequence
@@ -32,14 +42,14 @@ in §6.
 
 ### Measured baseline (cited from the perf review)
 
-| Surface | Cold load | Steady refresh | Sqlite opens / refresh |
+| Surface | Cold load | Steady refresh | Per-project queries / refresh |
 |---|---|---|---|
 | Operator dashboard, 12 projects | ~12s under load, 1-2s quiet | ~600ms | 30-50 |
 | Rail rebuild, 12 projects | ~800ms | ~250-400ms | 30-50 (overlap w/ dashboard) |
 | `pm_inbox_awaits_user_list` | n/a | called per rail tick | 24 (= 2 × N projects) |
 
 Acceptance targets (also in §8): dashboard cold mount <300ms median quiet,
-<2s under load; rail rebuild reads zero sqlite directly.
+<2s under load; rail rebuild issues zero per-project DB queries directly.
 
 ---
 
@@ -78,7 +88,7 @@ The seven hottest paths, by file:line. These are the ones Move A optimizes.
   `src/pollypm/cockpit_project_settings.py` — out of the rail / dashboard
   hot path.
 
-### 2.3 Why per-project opens are the bottleneck (and why a cache helps)
+### 2.3 Why per-project queries are the bottleneck (and why a cache helps)
 
 Each surface independently re-derives:
 
@@ -91,10 +101,10 @@ Each surface independently re-derives:
 4. **Live worker state** — sessions + latest heartbeat.
 5. **Task status counts** — needed for rail glyphs.
 
-Today these are recomputed from sqlite per render, per surface, with no
-sharing. The 2s TTL cache in `cockpit_rail.py:1806` is the only existing
-mitigation, and it has the staleness pathology you'd expect: a freshly
-completed task hangs around as "WORKING" until the TTL falls off.
+Today these are recomputed from the work store per render, per surface,
+with no sharing. The 2s TTL cache in `cockpit_rail.py:1806` is the only
+existing mitigation, and it has the staleness pathology you'd expect: a
+freshly completed task hangs around as "WORKING" until the TTL falls off.
 
 A single in-process cache, populated by a refresher thread driven by the
 audit log, eliminates the fan-out and the TTL staleness at the same time.
@@ -322,15 +332,15 @@ The §2.1 hot-path table, but with the new behavior column:
 
 | # | File:line | Today | New |
 |---|---|---|---|
-| 1 | `src/pollypm/cockpit_inbox.py:130-265` `pm_inbox_awaits_user_list` | opens `create_work_service` + `SQLAlchemyStore` per project | `cache.snapshot()` → concat `entry.awaits_user_items` |
+| 1 | `src/pollypm/cockpit_inbox.py:130-265` `pm_inbox_awaits_user_list` | opens `create_work_service` + work store per project | `cache.snapshot()` → concat `entry.awaits_user_items` |
 | 2 | `src/pollypm/cockpit_inbox.py:268-295` `_count_inbox_tasks_for_label` | wraps #1 | `sum(e.awaits_user_count for e in cache.snapshot().values())` |
 | 3 | `src/pollypm/cockpit_inbox.py:298-…` `pm_inbox_filtered_list` | same fan-out as #1 with `kind_filter` | optional — see Open Question §9.2 |
 | 4 | `src/pollypm/dashboard/operator_view.py:189-201` `load_operator_view[_from_config]` | `_parallel_scan_rows` opens 1-2 svc per project | iterates `cache.snapshot()` |
 | 5 | `src/pollypm/dashboard/operator_view.py:359-400` `project_state_map_from_config` | parallel fan-out, every rail tick | `{key: e.state for key, e in cache.snapshot().items()}` |
 | 6 | `src/pollypm/cockpit_rail.py:1806-1855` `_project_categorizations` | calls #5 behind a 2s TTL | direct `cache.snapshot()`; **TTL cache removed** |
 | 7 | `src/pollypm/cockpit_rail.py:1857-1880` `_project_state_rollups` | calls #8 per project | iterates `cache.snapshot()`, reads `rail_state` / `approvals_pending` |
-| 8 | `src/pollypm/cockpit_rail.py:1882-2049` `_project_tasks_for_rollup` | up to 3 DB opens per project | becomes an internal helper of the cache refresher; no longer called from hot path |
-| 9 | `src/pollypm/cockpit_rail.py:1474-1490, 2200-2220` `latest_heartbeat()` per project | one sqlite query × N | `entry.latest_heartbeat_by_session[session]` |
+| 8 | `src/pollypm/cockpit_rail.py:1882-2049` `_project_tasks_for_rollup` | up to 3 per-project queries | becomes an internal helper of the cache refresher; no longer called from hot path |
+| 9 | `src/pollypm/cockpit_rail.py:1474-1490, 2200-2220` `latest_heartbeat()` per project | one per-project query × N | `entry.latest_heartbeat_by_session[session]` |
 
 Specifically, this collapses the following query fan-outs into ONE per
 project per refresh:

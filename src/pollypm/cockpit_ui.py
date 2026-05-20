@@ -7236,64 +7236,61 @@ class PollyInboxApp(App[None]):
         except Exception:  # noqa: BLE001
             pass
 
-    def _render_detail(self, task_id: str, *, prefer_cache: bool = False) -> None:
-        item = self._item_for_id(task_id)
-        if item is None:
-            self.detail.update("[red]Inbox item is no longer available.[/red]")
-            self._clear_rollup_items()
-            self._set_reply_mode_for_task()
-            return
-        if not is_task_inbox_entry(item):
-            self._render_message_detail(item)
-            return
-        self._set_reply_mode_for_task()
-        if prefer_cache:
-            task = item
-            replies = list(self._replies_by_task.get(task_id, ()))
-            rollup_items_raw = []
-            hydrate_from_cache = True
-        else:
-            hydrate_from_cache = False
-            # #1101: route through the unified ``_resolve_inbox_svc`` helper so
-            # the project-key-mismatch fallback is consistent with the action
-            # handlers (archive / approve / discuss / reply). Workspace-scoped
-            # tasks still short-circuit to the message renderer per #855.
-            project_key = task_id.split("/", 1)[0] if "/" in task_id else None
-            is_workspace = (
-                project_key is None
-                or project_key in {"inbox", "workspace", "[workspace]"}
-                or self._project_key_is_unknown(project_key)
-            )
-            svc = self._resolve_inbox_svc(item, task_id)
-            if svc is None:
-                if is_workspace:
-                    self._render_message_detail(item)
-                    return
-                self.detail.update(
-                    "[#f0c45a]This task lives in a project that is not "
-                    "currently registered with PollyPM. Add the project from "
-                    "the project picker to load its details here.[/#f0c45a]"
-                )
-                self._clear_rollup_items()
-                return
-            try:
-                task = svc.get(task_id)
-                replies = svc.list_replies(task_id)
-                rollup_items_raw = (
-                    svc.get_context(task_id, entry_type="rollup_item")
-                    if _task_is_rollup(task) else []
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.detail.update(f"[red]Error loading task: {exc}[/red]")
-                self._clear_rollup_items()
-                svc.close()
-                return
-            finally:
-                try:
-                    svc.close()
-                except Exception:  # noqa: BLE001
-                    pass
+    def _detail_fetch_task_data(
+        self, task_id: str, item, *, prefer_cache: bool,
+    ) -> tuple[object | None, list, list]:
+        """Resolve the task + replies + rollup payload for ``_render_detail``.
 
+        Returns ``(task, replies, rollup_items_raw)``. When the lookup
+        fails (workspace fallback, unregistered project, exception),
+        the caller-side handling already updated ``self.detail`` and
+        the return is ``(None, [], [])``.
+        """
+        if prefer_cache:
+            return item, list(self._replies_by_task.get(task_id, ())), []
+        # #1101: route through the unified ``_resolve_inbox_svc`` helper so
+        # the project-key-mismatch fallback is consistent with the action
+        # handlers (archive / approve / discuss / reply). Workspace-scoped
+        # tasks still short-circuit to the message renderer per #855.
+        project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+        is_workspace = (
+            project_key is None
+            or project_key in {"inbox", "workspace", "[workspace]"}
+            or self._project_key_is_unknown(project_key)
+        )
+        svc = self._resolve_inbox_svc(item, task_id)
+        if svc is None:
+            if is_workspace:
+                self._render_message_detail(item)
+                return None, [], []
+            self.detail.update(
+                "[#f0c45a]This task lives in a project that is not "
+                "currently registered with PollyPM. Add the project from "
+                "the project picker to load its details here.[/#f0c45a]"
+            )
+            self._clear_rollup_items()
+            return None, [], []
+        try:
+            task = svc.get(task_id)
+            replies = svc.list_replies(task_id)
+            rollup_items_raw = (
+                svc.get_context(task_id, entry_type="rollup_item")
+                if _task_is_rollup(task) else []
+            )
+            return task, replies, rollup_items_raw
+        except Exception as exc:  # noqa: BLE001
+            self.detail.update(f"[red]Error loading task: {exc}[/red]")
+            self._clear_rollup_items()
+            svc.close()
+            return None, [], []
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _detail_build_sections(self, task) -> list[str]:
+        """Build the section list (header + meta + triage + body)."""
         from pollypm.tz import format_relative
 
         updated_iso = (
@@ -7364,23 +7361,31 @@ class PollyInboxApp(App[None]):
                 sections.append(_md_to_rich(_escape_body(body)))
         else:
             sections.append(_md_to_rich(_escape_body(body)))
+        return sections
 
-        if replies:
+    def _detail_append_thread(self, sections: list[str], replies: list) -> None:
+        from pollypm.tz import format_relative
+        if not replies:
+            return
+        sections.append("")
+        sections.append(f"[dim]\u2500\u2500 thread ({len(replies)}) \u2500\u2500[/dim]")
+        for entry in replies:
+            e_iso = (
+                entry.timestamp.isoformat()
+                if hasattr(entry.timestamp, "isoformat") else str(entry.timestamp)
+            )
+            age = format_relative(e_iso)
+            who = entry.actor or "user"
             sections.append("")
-            sections.append(f"[dim]\u2500\u2500 thread ({len(replies)}) \u2500\u2500[/dim]")
-            for entry in replies:
-                e_iso = (
-                    entry.timestamp.isoformat()
-                    if hasattr(entry.timestamp, "isoformat") else str(entry.timestamp)
-                )
-                age = format_relative(e_iso)
-                who = entry.actor or "user"
-                sections.append("")
-                sections.append(
-                    f"[b #5b8aff]{_escape(who)}[/b #5b8aff]  [dim]{_escape(age)}[/dim]"
-                )
-                sections.append(_md_to_rich(_escape_body(entry.text)))
+            sections.append(
+                f"[b #5b8aff]{_escape(who)}[/b #5b8aff]  [dim]{_escape(age)}[/dim]"
+            )
+            sections.append(_md_to_rich(_escape_body(entry.text)))
 
+    def _detail_apply_label_hints(
+        self, task, task_id: str, item, replies: list,
+    ) -> None:
+        """Update the hint bar + state caches based on label-driven affordances."""
         # Improvement-proposal detection (#275). Proposal items carry a
         # ``proposal`` label; when present, swap the hint bar for the
         # accept/reject keybindings. The body itself already embeds the
@@ -7439,6 +7444,28 @@ class PollyInboxApp(App[None]):
         else:
             self._proposal_specs.pop(task_id, None)
             self._restore_default_hint()
+
+    def _render_detail(self, task_id: str, *, prefer_cache: bool = False) -> None:
+        item = self._item_for_id(task_id)
+        if item is None:
+            self.detail.update("[red]Inbox item is no longer available.[/red]")
+            self._clear_rollup_items()
+            self._set_reply_mode_for_task()
+            return
+        if not is_task_inbox_entry(item):
+            self._render_message_detail(item)
+            return
+        self._set_reply_mode_for_task()
+        hydrate_from_cache = prefer_cache
+        task, replies, rollup_items_raw = self._detail_fetch_task_data(
+            task_id, item, prefer_cache=prefer_cache,
+        )
+        if task is None:
+            return
+
+        sections = self._detail_build_sections(task)
+        self._detail_append_thread(sections, replies)
+        self._detail_apply_label_hints(task, task_id, item, replies)
 
         # #761 — when the inbox item references a task in review state
         # (plan_review, review_ready, etc.), pull in the review artifact
@@ -9389,6 +9416,189 @@ class PollyInboxApp(App[None]):
         self.reply_input.disabled = False
         self.reply_input.focus()
 
+    def _deny_plan_cancel_and_successor(
+        self,
+        *,
+        plan_svc,
+        plan_task_id: str,
+        project_key: str,
+        actor_name: str,
+        clean_reason: str,
+    ) -> tuple[object | None, object | None]:
+        """Cancel the plan task and create the successor.
+
+        Returns ``(cancelled_task, new_task)``. Either may be None when
+        the operation aborted; the caller already surfaced an error
+        toast via ``self.notify``.
+        """
+        cancelled_task = None
+        new_task = None
+        try:
+            cancelled_task = plan_svc.cancel(
+                plan_task_id, actor_name, clean_reason,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Cancel failed: {exc}", severity="error", timeout=3.0,
+            )
+            return None, None
+        # 2. Create the successor plan_project task. Mirror the
+        #    shape used by ``_plan_project_task`` (CLI helper) so
+        #    the architect's assignment sweep finds real work.
+        try:
+            new_task = plan_svc.create(
+                title=f"Replan {project_key or 'project'}",
+                description=(
+                    "Replan triggered by user denial of "
+                    f"{plan_task_id}.\n\n"
+                    "Address these concerns from the user:\n"
+                    f"{clean_reason}"
+                ),
+                type="task",
+                project=cancelled_task.project,
+                flow_template="plan_project",
+                roles={"architect": cancelled_task.roles.get(
+                    "architect", "architect",
+                )} if cancelled_task.roles else {"architect": "architect"},
+                priority="high",
+                created_by=actor_name,
+                predecessor_task_id=plan_task_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.notify(
+                f"Replan create failed: {exc}",
+                severity="error", timeout=3.0,
+            )
+            return cancelled_task, None
+        # 2a. Best-effort auto-queue so the architect's assignment
+        #     sweep finds the task (mirrors ``_plan_project_task``).
+        try:
+            plan_svc.queue(new_task.task_id, actor="planner")
+        except Exception:  # noqa: BLE001
+            pass
+        # 2b. Stamp the denial reason on the new plan task as a
+        #     ``plan_review_denied`` context entry. Architect reads
+        #     this directly — no tmux scraping required.
+        try:
+            plan_svc.add_context(
+                new_task.task_id,
+                actor=actor_name,
+                text=(
+                    f"Denial reason for {plan_task_id}:\n{clean_reason}"
+                ),
+                entry_type="plan_review_denied",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return cancelled_task, new_task
+
+    def _deny_plan_archive_inbox(
+        self,
+        *,
+        item,
+        task_id: str,
+        plan_task_id: str,
+        new_task,
+        actor_name: str,
+        clean_reason: str,
+    ) -> None:
+        """Archive the inbox plan_review row and stamp the deny on it."""
+        inbox_svc = self._resolve_inbox_svc(item, task_id)
+        if inbox_svc is None:
+            return
+        try:
+            inbox_svc.add_context(
+                task_id,
+                actor=actor_name,
+                text=(
+                    f"Plan denied \u2192 cancelled {plan_task_id}, "
+                    f"created successor {new_task.task_id}: "
+                    f"{clean_reason[:200]}"
+                ),
+                entry_type="plan_review_denied",
+            )
+            inbox_svc.archive_task(task_id, actor=actor_name)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                inbox_svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _deny_plan_clear_local_state(self, task_id: str) -> None:
+        """Drop the inbox row + clean caches after a deny."""
+        self._tasks = [t for t in self._tasks if t.task_id != task_id]
+        self._unread_ids.discard(task_id)
+        self._session_read_ids.discard(task_id)
+        self._replies_by_task.pop(task_id, None)
+        self._thread_expanded_task_ids.discard(task_id)
+        self._plan_review_meta.pop(task_id, None)
+        self._plan_review_round_trip.pop(task_id, None)
+        if self._selected_task_id == task_id:
+            self._selected_task_id = None
+            self._selected_row_key = None
+        self.reply_input.value = ""
+        self.reply_input.placeholder = (
+            "Reply \u2026 (Enter to send, Esc back to list)"
+        )
+        self.list_view.focus()
+        self._render_list(select_first=bool(self._tasks))
+        self._restore_default_hint()
+
+    def _deny_plan_dispatch_pm(
+        self,
+        *,
+        project_key: str,
+        cancelled_task,
+        plan_task_id: str,
+        new_task,
+        clean_reason: str,
+        actor_name: str,
+    ) -> None:
+        """Open the project's PM chat with the denial primer."""
+        try:
+            cockpit_key, pm_label = _resolve_pm_target(
+                self.config_path,
+                project_key or cancelled_task.project,
+            )
+            # Try to resolve the canonical plan path so the primer can
+            # quote it for the PM persona. Best-effort — the architect
+            # already has the denial reason on the successor task even
+            # if the plan file lookup fails.
+            plan_path = ""
+            try:
+                config = load_config(self.config_path)
+                project = config.projects.get(
+                    project_key or cancelled_task.project,
+                )
+                if project is not None:
+                    for candidate in _PLAN_FILE_CANDIDATES:
+                        p = project.path / candidate
+                        if p.is_file():
+                            plan_path = str(p)
+                            break
+            except Exception:  # noqa: BLE001
+                plan_path = ""
+            primer = _build_plan_review_denial_primer(
+                project_key=project_key or cancelled_task.project,
+                cancelled_plan_task_id=plan_task_id,
+                successor_plan_task_id=new_task.task_id,
+                denial_reason=clean_reason,
+                reviewer_name="Polly" if actor_name == "polly" else "Sam",
+                plan_path=plan_path,
+            )
+            self.run_worker(
+                lambda: self._dispatch_to_pm_sync(
+                    cockpit_key, primer, pm_label,
+                ),
+                thread=True,
+                exclusive=True,
+                group="jump_to_pm",
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
     def _finish_deny_plan_review(self, task_id: str, reason: str) -> None:
         """Cancel the plan_task with ``reason`` and seed a successor.
 
@@ -9449,96 +9659,33 @@ class PollyInboxApp(App[None]):
             self.reply_input.value = ""
             self.list_view.focus()
             return
-        cancelled_task = None
-        new_task = None
         try:
-            try:
-                cancelled_task = plan_svc.cancel(
-                    plan_task_id, actor_name, clean_reason,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.notify(
-                    f"Cancel failed: {exc}", severity="error", timeout=3.0,
-                )
-                return
-            # 2. Create the successor plan_project task. Mirror the
-            #    shape used by ``_plan_project_task`` (CLI helper) so
-            #    the architect's assignment sweep finds real work.
-            try:
-                new_task = plan_svc.create(
-                    title=f"Replan {project_key or 'project'}",
-                    description=(
-                        "Replan triggered by user denial of "
-                        f"{plan_task_id}.\n\n"
-                        "Address these concerns from the user:\n"
-                        f"{clean_reason}"
-                    ),
-                    type="task",
-                    project=cancelled_task.project,
-                    flow_template="plan_project",
-                    roles={"architect": cancelled_task.roles.get(
-                        "architect", "architect",
-                    )} if cancelled_task.roles else {"architect": "architect"},
-                    priority="high",
-                    created_by=actor_name,
-                    predecessor_task_id=plan_task_id,
-                )
-            except Exception as exc:  # noqa: BLE001
-                self.notify(
-                    f"Replan create failed: {exc}",
-                    severity="error", timeout=3.0,
-                )
-                return
-            # 2a. Best-effort auto-queue so the architect's assignment
-            #     sweep finds the task (mirrors ``_plan_project_task``).
-            try:
-                plan_svc.queue(new_task.task_id, actor="planner")
-            except Exception:  # noqa: BLE001
-                pass
-            # 2b. Stamp the denial reason on the new plan task as a
-            #     ``plan_review_denied`` context entry. Architect reads
-            #     this directly — no tmux scraping required.
-            try:
-                plan_svc.add_context(
-                    new_task.task_id,
-                    actor=actor_name,
-                    text=(
-                        f"Denial reason for {plan_task_id}:\n{clean_reason}"
-                    ),
-                    entry_type="plan_review_denied",
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            cancelled_task, new_task = self._deny_plan_cancel_and_successor(
+                plan_svc=plan_svc,
+                plan_task_id=plan_task_id,
+                project_key=project_key,
+                actor_name=actor_name,
+                clean_reason=clean_reason,
+            )
         finally:
             try:
                 plan_svc.close()
             except Exception:  # noqa: BLE001
                 pass
+        if cancelled_task is None or new_task is None:
+            return
 
         # 3. Archive the inbox plan_review row + record the deny on
         #    the inbox task itself for audit. Uses a fresh svc since we
         #    already closed the plan-task one.
-        inbox_svc = self._resolve_inbox_svc(item, task_id)
-        if inbox_svc is not None:
-            try:
-                inbox_svc.add_context(
-                    task_id,
-                    actor=actor_name,
-                    text=(
-                        f"Plan denied → cancelled {plan_task_id}, "
-                        f"created successor {new_task.task_id}: "
-                        f"{clean_reason[:200]}"
-                    ),
-                    entry_type="plan_review_denied",
-                )
-                inbox_svc.archive_task(task_id, actor=actor_name)
-            except Exception:  # noqa: BLE001
-                pass
-            finally:
-                try:
-                    inbox_svc.close()
-                except Exception:  # noqa: BLE001
-                    pass
+        self._deny_plan_archive_inbox(
+            item=item,
+            task_id=task_id,
+            plan_task_id=plan_task_id,
+            new_task=new_task,
+            actor_name=actor_name,
+            clean_reason=clean_reason,
+        )
 
         self._emit_event(
             task_id,
@@ -9550,76 +9697,27 @@ class PollyInboxApp(App[None]):
         )
         self.notify(
             (
-                f"Denied {plan_task_id} — replan queued as "
+                f"Denied {plan_task_id} \u2014 replan queued as "
                 f"{new_task.task_id}."
             ),
             severity="information", timeout=4.0,
         )
 
         # 4. Drop the row locally + clean caches.
-        self._tasks = [t for t in self._tasks if t.task_id != task_id]
-        self._unread_ids.discard(task_id)
-        self._session_read_ids.discard(task_id)
-        self._replies_by_task.pop(task_id, None)
-        self._thread_expanded_task_ids.discard(task_id)
-        self._plan_review_meta.pop(task_id, None)
-        self._plan_review_round_trip.pop(task_id, None)
-        if self._selected_task_id == task_id:
-            self._selected_task_id = None
-            self._selected_row_key = None
-        self.reply_input.value = ""
-        self.reply_input.placeholder = (
-            "Reply … (Enter to send, Esc back to list)"
-        )
-        self.list_view.focus()
-        self._render_list(select_first=bool(self._tasks))
-        self._restore_default_hint()
+        self._deny_plan_clear_local_state(task_id)
 
         # 5. Open the project's PM chat thread with the denial primer
         #    so the conversation continues there. Best-effort: the deny
         #    has already landed in the work service even if tmux/PM
         #    routing fails.
-        try:
-            cockpit_key, pm_label = _resolve_pm_target(
-                self.config_path,
-                project_key or cancelled_task.project,
-            )
-            # Try to resolve the canonical plan path so the primer can
-            # quote it for the PM persona. Best-effort — the architect
-            # already has the denial reason on the successor task even
-            # if the plan file lookup fails.
-            plan_path = ""
-            try:
-                config = load_config(self.config_path)
-                project = config.projects.get(
-                    project_key or cancelled_task.project,
-                )
-                if project is not None:
-                    for candidate in _PLAN_FILE_CANDIDATES:
-                        p = project.path / candidate
-                        if p.is_file():
-                            plan_path = str(p)
-                            break
-            except Exception:  # noqa: BLE001
-                plan_path = ""
-            primer = _build_plan_review_denial_primer(
-                project_key=project_key or cancelled_task.project,
-                cancelled_plan_task_id=plan_task_id,
-                successor_plan_task_id=new_task.task_id,
-                denial_reason=clean_reason,
-                reviewer_name="Polly" if actor_name == "polly" else "Sam",
-                plan_path=plan_path,
-            )
-            self.run_worker(
-                lambda: self._dispatch_to_pm_sync(
-                    cockpit_key, primer, pm_label,
-                ),
-                thread=True,
-                exclusive=True,
-                group="jump_to_pm",
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        self._deny_plan_dispatch_pm(
+            project_key=project_key,
+            cancelled_task=cancelled_task,
+            plan_task_id=plan_task_id,
+            new_task=new_task,
+            clean_reason=clean_reason,
+            actor_name=actor_name,
+        )
 
     # ------------------------------------------------------------------
     # Event emission
@@ -11243,6 +11341,168 @@ def _classify_worker_activity(
     return "idle"
 
 
+def _collect_project_sessions(
+    _config, _alias_set: set, _CONTROL_ROLES,
+) -> list:
+    """Enumerate project sessions, skipping disabled and control-plane roles."""
+    project_sessions: list = []
+    if _config is None:
+        return project_sessions
+    for session in (_config.sessions or {}).values():
+        if not getattr(session, "enabled", True):
+            continue
+        if getattr(session, "project", None) not in _alias_set:
+            continue
+        if getattr(session, "role", "") in _CONTROL_ROLES:
+            continue
+        project_sessions.append(session)
+    return project_sessions
+
+
+def _collect_alive_sessions(
+    supervisor, project_sessions: list, alive_cutoff,
+) -> list:
+    """Return ``[(session, hb_created_at), ...]`` for sessions with fresh heartbeats."""
+    from datetime import UTC, datetime
+
+    alive_sessions: list[tuple[object, str]] = []
+    for sess in project_sessions:
+        try:
+            hb = supervisor.store.latest_heartbeat(sess.name)
+        except Exception:  # noqa: BLE001
+            continue
+        if hb is None:
+            continue
+        try:
+            dt = datetime.fromisoformat(hb.created_at)
+        except (ValueError, TypeError):
+            continue
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        if dt > alive_cutoff and not getattr(hb, "pane_dead", False):
+            alive_sessions.append((sess, hb.created_at))
+    return alive_sessions
+
+
+def _collect_project_alerts(
+    supervisor,
+    *,
+    project_sessions: list,
+    _alias_set: set,
+    action_items: list[dict] | None,
+) -> tuple[list, int, list[str]]:
+    """Return ``(all_open_alerts, actionable_count, alert_types)`` for the project."""
+    try:
+        from pollypm.cockpit_alerts import is_operational_alert
+
+        project_session_names = {
+            s.name for s in project_sessions
+        }
+        # #920 — include the plan_gate session for every project alias
+        # so alert counts stay correct under hyphen/underscore swaps.
+        for _alias in _alias_set:
+            project_session_names.add(f"plan_gate-{_alias}")
+        open_alerts_fn = getattr(supervisor, "open_alerts", None)
+        if callable(open_alerts_fn):
+            open_alerts = list(open_alerts_fn())
+        else:
+            open_alerts = list(supervisor.store.open_alerts())
+        covered_task_ids = {
+            str(item.get("primary_ref"))
+            for item in (action_items or [])
+            if item.get("primary_ref")
+        }
+        actionable_alerts = [
+            a for a in open_alerts
+            if getattr(a, "session_name", None) in project_session_names
+            and not is_operational_alert(getattr(a, "alert_type", ""))
+            and not _stuck_alert_covers_action(
+                getattr(a, "alert_type", ""), covered_task_ids,
+            )
+        ]
+        alert_count = len(actionable_alerts)
+        # #1512 — surface the de-duplicated alert_type list so the
+        # banner can render specific copy per family instead of the
+        # generic "Polly needs to inspect a project issue" fallback.
+        # Preserve first-seen order so the most-recent alert (last in
+        # the list) doesn't always win on ties.
+        seen_types: set[str] = set()
+        alert_types: list[str] = []
+        for a in actionable_alerts:
+            t = str(getattr(a, "alert_type", "") or "")
+            if not t or t in seen_types:
+                continue
+            seen_types.add(t)
+            alert_types.append(t)
+        return open_alerts, alert_count, alert_types
+    except Exception:  # noqa: BLE001
+        return [], 0, []
+
+
+def _select_lead_worker(
+    supervisor,
+    *,
+    alive_sessions: list,
+    open_alerts: list,
+    _alias_set: set,
+    _project_path: Path | None,
+    _config,
+) -> dict | None:
+    """Pick the most-progressing alive session as the dashboard's lead worker."""
+    permission_prompt_sessions: set[str] = set()
+    try:
+        for a in open_alerts:
+            if getattr(a, "alert_type", "") == "pane:permission_prompt":
+                name = getattr(a, "session_name", None)
+                if name:
+                    permission_prompt_sessions.add(str(name))
+    except Exception:  # noqa: BLE001
+        permission_prompt_sessions = set()
+
+    _ACTIVITY_RANK = {"working": 0, "awaiting_user": 1, "idle": 2}
+    candidates: list[dict] = []
+    for sess, hb_created_at in alive_sessions:
+        session_name = sess.name
+        role = getattr(sess, "role", "worker")
+        has_perm_alert = session_name in permission_prompt_sessions
+        try:
+            activity = _classify_worker_activity(
+                supervisor,
+                session_name,
+                role,
+                _alias_set,
+                _project_path,
+                has_perm_alert,
+                config=_config,
+            )
+        except Exception:  # noqa: BLE001
+            activity = "idle"
+        candidates.append({
+            "session_name": session_name,
+            "role": role,
+            "last_heartbeat": hb_created_at,
+            "activity": activity,
+        })
+
+    if not candidates:
+        return None
+    # Stable sort: first by descending heartbeat (newest wins
+    # ties), then by activity rank ascending (working before
+    # awaiting_user before idle). Python's sort is stable, so
+    # the heartbeat order is preserved within each activity
+    # bucket after the second sort.
+    candidates.sort(
+        key=lambda info: str(info.get("last_heartbeat") or ""),
+        reverse=True,
+    )
+    candidates.sort(
+        key=lambda info: _ACTIVITY_RANK.get(
+            info.get("activity", "idle"), 2,
+        ),
+    )
+    return candidates[0]
+
+
 def _dashboard_active_worker(
     config_path: Path,
     project_key: str,
@@ -11277,9 +11537,6 @@ def _dashboard_active_worker(
     """
     from datetime import UTC, datetime, timedelta
 
-    worker_info: dict | None = None
-    alert_count = 0
-    alert_types: list[str] = []
     try:
         from pollypm.service_api import PollyPMService
         supervisor = PollyPMService(config_path).load_supervisor()
@@ -11309,31 +11566,12 @@ def _dashboard_active_worker(
         # instead of calling ``supervisor.plan_launches()``. The full
         # launch plan resolves provider profiles, scans the rules
         # catalog, writes session manifests, and builds wrapped tmux
-        # commands — none of which the dashboard reads. cProfile on
-        # the pollypm drilldown showed ``plan_launches`` consumed
-        # ~380ms of the 510ms ``_dashboard_active_worker`` budget, all
-        # to populate fields we discard. We only need ``name``,
-        # ``role``, ``project``, and ``enabled`` — every one is a
-        # plain attribute on ``SessionConfig`` that ``effective_session``
-        # never modifies for the routing path. Per-session account
-        # overrides reshape provider/account, but the dashboard's
-        # downstream callers (heartbeat lookup, alert filter, activity
-        # classifier) key off the session ``name`` only, so the
-        # untransformed config session is sufficient.
-        project_sessions: list = []
-        if _config is not None:
-            for session in (_config.sessions or {}).values():
-                if not getattr(session, "enabled", True):
-                    continue
-                if getattr(session, "project", None) not in _alias_set:
-                    continue
-                if getattr(session, "role", "") in _CONTROL_ROLES:
-                    continue
-                project_sessions.append(session)
+        # commands — none of which the dashboard reads.
+        project_sessions = _collect_project_sessions(
+            _config, _alias_set, _CONTROL_ROLES,
+        )
         # Resolve the project's on-disk path so the activity classifier
-        # can open its work-service DB and check task ownership. The
-        # config form keyed by ``project_key`` is canonical; aliases
-        # are only used for matching session.project.
+        # can open its work-service DB and check task ownership.
         _project_path: Path | None = None
         try:
             if _config is not None:
@@ -11348,132 +11586,26 @@ def _dashboard_active_worker(
         # alive heartbeat, which could pin an idle architect to the
         # "Current activity" panel while a worker was the genuinely
         # progressing agent on a different task.
-        alive_sessions: list[tuple[object, str]] = []
-        for sess in project_sessions:
-            try:
-                hb = supervisor.store.latest_heartbeat(sess.name)
-            except Exception:  # noqa: BLE001
-                continue
-            if hb is None:
-                continue
-            try:
-                dt = datetime.fromisoformat(hb.created_at)
-            except (ValueError, TypeError):
-                continue
-            if dt.tzinfo is None:
-                dt = dt.replace(tzinfo=UTC)
-            if dt > alive_cutoff and not getattr(hb, "pane_dead", False):
-                alive_sessions.append((sess, hb.created_at))
+        alive_sessions = _collect_alive_sessions(
+            supervisor, project_sessions, alive_cutoff,
+        )
         # Actionable alerts for this project's sessions.
-        open_alerts: list = []
-        try:
-            from pollypm.cockpit_alerts import is_operational_alert
-
-            project_session_names = {
-                s.name for s in project_sessions
-            }
-            # #920 — include the plan_gate session for every project alias
-            # so alert counts stay correct under hyphen/underscore swaps.
-            for _alias in _alias_set:
-                project_session_names.add(f"plan_gate-{_alias}")
-            open_alerts_fn = getattr(supervisor, "open_alerts", None)
-            if callable(open_alerts_fn):
-                open_alerts = list(open_alerts_fn())
-            else:
-                open_alerts = list(supervisor.store.open_alerts())
-            covered_task_ids = {
-                str(item.get("primary_ref"))
-                for item in (action_items or [])
-                if item.get("primary_ref")
-            }
-            actionable_alerts = [
-                a for a in open_alerts
-                if getattr(a, "session_name", None) in project_session_names
-                and not is_operational_alert(getattr(a, "alert_type", ""))
-                and not _stuck_alert_covers_action(
-                    getattr(a, "alert_type", ""), covered_task_ids,
-                )
-            ]
-            alert_count = len(actionable_alerts)
-            # #1512 — surface the de-duplicated alert_type list so the
-            # banner can render specific copy per family instead of the
-            # generic "Polly needs to inspect a project issue" fallback.
-            # Preserve first-seen order so the most-recent alert (last in
-            # the list) doesn't always win on ties.
-            seen_types: set[str] = set()
-            alert_types = []
-            for a in actionable_alerts:
-                t = str(getattr(a, "alert_type", "") or "")
-                if not t or t in seen_types:
-                    continue
-                seen_types.add(t)
-                alert_types.append(t)
-        except Exception:  # noqa: BLE001
-            alert_count = 0
-            alert_types = []
-        # #990 — classify the worker's actual activity. Heartbeat-alive
-        # alone is not enough to claim "in action"; the dashboard must
-        # also see either a claimed task with pane movement or, for an
-        # architect, pane movement on its own. An alive but quiet
-        # session is reported as ``idle`` so the banner / now-section
-        # / pill don't overclaim.
-        # #1025 — classify EVERY alive session and pick the one with
-        # the most-progressing activity (working > awaiting_user >
-        # idle), tiebroken by heartbeat recency. Without this, a
-        # project with multiple agents (architect + worker) reads
-        # whichever heartbeat happened to come first as the lead, and
-        # an idle architect routinely upstaged a busy worker.
-        permission_prompt_sessions: set[str] = set()
-        try:
-            for a in open_alerts:
-                if getattr(a, "alert_type", "") == "pane:permission_prompt":
-                    name = getattr(a, "session_name", None)
-                    if name:
-                        permission_prompt_sessions.add(str(name))
-        except Exception:  # noqa: BLE001
-            permission_prompt_sessions = set()
-
-        _ACTIVITY_RANK = {"working": 0, "awaiting_user": 1, "idle": 2}
-        candidates: list[dict] = []
-        for sess, hb_created_at in alive_sessions:
-            session_name = sess.name
-            role = getattr(sess, "role", "worker")
-            has_perm_alert = session_name in permission_prompt_sessions
-            try:
-                activity = _classify_worker_activity(
-                    supervisor,
-                    session_name,
-                    role,
-                    _alias_set,
-                    _project_path,
-                    has_perm_alert,
-                    config=_config,
-                )
-            except Exception:  # noqa: BLE001
-                activity = "idle"
-            candidates.append({
-                "session_name": session_name,
-                "role": role,
-                "last_heartbeat": hb_created_at,
-                "activity": activity,
-            })
-
-        if candidates:
-            # Stable sort: first by descending heartbeat (newest wins
-            # ties), then by activity rank ascending (working before
-            # awaiting_user before idle). Python's sort is stable, so
-            # the heartbeat order is preserved within each activity
-            # bucket after the second sort.
-            candidates.sort(
-                key=lambda info: str(info.get("last_heartbeat") or ""),
-                reverse=True,
-            )
-            candidates.sort(
-                key=lambda info: _ACTIVITY_RANK.get(
-                    info.get("activity", "idle"), 2,
-                ),
-            )
-            worker_info = candidates[0]
+        open_alerts, alert_count, alert_types = _collect_project_alerts(
+            supervisor,
+            project_sessions=project_sessions,
+            _alias_set=_alias_set,
+            action_items=action_items,
+        )
+        # #990 / #1025 — classify each alive session and pick the
+        # most-progressing one.
+        worker_info = _select_lead_worker(
+            supervisor,
+            alive_sessions=alive_sessions,
+            open_alerts=open_alerts,
+            _alias_set=_alias_set,
+            _project_path=_project_path,
+            _config=_config,
+        )
     finally:
         try:
             supervisor.store.close()
@@ -11679,112 +11811,69 @@ def _dashboard_inbox_finalize(
     return (_action_count(items, action_items), top, action_items)
 
 
-def _dashboard_inbox(
-    config_path: Path, project_key: str, project_path: Path,
-) -> tuple[int, list[dict], list[dict]]:
-    """Return project-scoped inbox items + actionable PM blocker notes."""
+def _dashboard_inbox_sort_value(value: object) -> float:
+    """Coerce an ISO timestamp / datetime to a float epoch for sorting."""
     from datetime import datetime
-
-    db_path = project_path / ".pollypm" / "state.db"
-    if not db_path.exists():
-        return 0, [], []
-    # Content-addressed cache: an unchanged db_mtime means no inbox
-    # writes since the last call, so the answer is unchanged. The
-    # lone ``stat()`` is essentially free compared to the two DB
-    # opens + queries inside this function.
+    if not value:
+        return 0.0
     try:
-        db_mtime: float | None = db_path.stat().st_mtime
-    except OSError:
-        db_mtime = None
-    cache_key = (project_key, db_mtime)
-    cached = _DASHBOARD_INBOX_CACHE.get(cache_key)
-    if cached is not None:
-        _DASHBOARD_INBOX_CACHE.move_to_end(cache_key)
-        return cached
-    try:
-        from pollypm.store import SQLAlchemyStore
-        from pollypm.work import create_work_service
-        from pollypm.work.inbox_view import inbox_tasks
-        from pollypm.cockpit_inbox_sources import _row_is_dev_channel
+        if hasattr(value, "timestamp"):
+            return float(value.timestamp())
+        return float(datetime.fromisoformat(str(value)).timestamp())
     except Exception:  # noqa: BLE001
-        return 0, [], []
-    try:
-        config = load_config(config_path)
-    except Exception:  # noqa: BLE001
-        return 0, [], []
+        return 0.0
 
-    def _sort_value(value: object) -> float:
-        if not value:
-            return 0.0
+
+def _dashboard_inbox_labels_from_row(row: dict) -> list[str]:
+    """Coerce the ``labels`` cell of a messages row into a list[str]."""
+    raw = row.get("labels") or []
+    if isinstance(raw, list):
+        return [str(label) for label in raw if str(label).strip()]
+    if isinstance(raw, str):
         try:
-            if hasattr(value, "timestamp"):
-                return float(value.timestamp())
-            return float(datetime.fromisoformat(str(value)).timestamp())
+            loaded = json.loads(raw)
         except Exception:  # noqa: BLE001
-            return 0.0
+            loaded = []
+        if isinstance(loaded, list):
+            return [str(label) for label in loaded if str(label).strip()]
+    return []
 
-    def _plain_text(value: object | None) -> str:
-        text = str(value or "").strip()
-        if not text:
-            return ""
-        text = _re.sub(r"[*_`#>\[\]]+", "", text)
-        text = " ".join(part.strip() for part in text.splitlines() if part.strip())
-        return _re.sub(r"^\([a-zA-Z]\)\s+", "", text)
 
-    def _labels_from_row(row: dict[str, object]) -> list[str]:
-        raw = row.get("labels") or []
-        if isinstance(raw, list):
-            return [str(label) for label in raw if str(label).strip()]
-        if isinstance(raw, str):
-            try:
-                loaded = json.loads(raw)
-            except Exception:  # noqa: BLE001
-                loaded = []
-            if isinstance(loaded, list):
-                return [str(label) for label in loaded if str(label).strip()]
-        return []
-
-    def _message_body(value: object | None) -> str:
-        text = str(value or "")
-        # Some PM handoff notes arrive through shell-escaped paths and
-        # persist literal "\n" sequences. Normalize before extracting
-        # blocker paragraphs and numbered action steps.
-        return text.replace("\\n", "\n")
-
-    def _message_projects(row: dict[str, object]) -> set[str]:
-        projects: set[str] = set()
-        known_projects = set(getattr(config, "projects", {}).keys())
-        payload = row.get("payload") or {}
-        if isinstance(payload, dict):
-            for key in ("project", "task_project"):
-                value = payload.get(key)
-                if isinstance(value, str) and value in known_projects:
-                    projects.add(value)
-        scope = row.get("scope")
-        if isinstance(scope, str) and scope in known_projects:
-            projects.add(scope)
-        text = "\n".join(
-            str(part or "") for part in (row.get("subject"), row.get("body"))
-        )
-        for match in _PROJECT_TASK_REF_RE.finditer(text):
-            project = match.group("project")
-            if project in known_projects:
-                projects.add(project)
-        return projects
-
-    def _trim(text: str, *, limit: int = 220) -> str:
-        text = text.strip()
-        if len(text) <= limit:
-            return text
-        return text[: limit - 1].rstrip() + "…"
-
-    # Body-parsing helpers (#1356 wedge): the inner ``_summary_from_body``
-    # / ``_steps_from_body`` / ``_requirement_step`` closures were
-    # already module-level ``_dashboard_*`` helpers; the per-message
-    # builder now calls those directly via
-    # ``_dashboard_inbox_build_message_item``.
-
+def _dashboard_inbox_message_projects(row: dict, config) -> set[str]:
+    """Return the set of registered projects referenced by a messages row."""
+    projects: set[str] = set()
     known_projects = set(getattr(config, "projects", {}).keys())
+    payload = row.get("payload") or {}
+    if isinstance(payload, dict):
+        for key in ("project", "task_project"):
+            value = payload.get(key)
+            if isinstance(value, str) and value in known_projects:
+                projects.add(value)
+    scope = row.get("scope")
+    if isinstance(scope, str) and scope in known_projects:
+        projects.add(scope)
+    text = "\n".join(
+        str(part or "") for part in (row.get("subject"), row.get("body"))
+    )
+    for match in _PROJECT_TASK_REF_RE.finditer(text):
+        project = match.group("project")
+        if project in known_projects:
+            projects.add(project)
+    return projects
+
+
+def _dashboard_inbox_collect_tasks(
+    *,
+    db_path: Path,
+    project_path: Path,
+    config,
+    project_key: str,
+    known_projects: set,
+) -> list[dict]:
+    """Open the work service and return the task-shaped inbox items."""
+    from pollypm.work import create_work_service
+    from pollypm.work.inbox_view import inbox_tasks
+
     items: list[dict] = []
     try:
         with create_work_service(
@@ -11816,7 +11905,7 @@ def _dashboard_inbox(
                         "task_id": entry.task_id,
                         "title": getattr(entry, "title", "") or "(untitled)",
                         "updated_at": updated_at,
-                        "sort_value": _sort_value(updated_at),
+                        "sort_value": _dashboard_inbox_sort_value(updated_at),
                         "triage_label": getattr(entry, "triage_label", ""),
                         "triage_rank": int(getattr(entry, "triage_rank", 2) or 2),
                         "needs_action": bool(getattr(entry, "needs_action", False)),
@@ -11827,15 +11916,23 @@ def _dashboard_inbox(
                     }
                 )
     except Exception:  # noqa: BLE001
-        return 0, [], []
+        return []
+    return items
 
-    message_sources: list[tuple[str, Path]] = [(project_key, db_path)]
-    workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
-    if workspace_root is not None:
-        workspace_db = Path(workspace_root) / ".pollypm" / "state.db"
-        if workspace_db.exists() and workspace_db.resolve() != db_path.resolve():
-            message_sources.append(("__workspace__", workspace_db))
 
+def _dashboard_inbox_collect_messages(
+    *,
+    message_sources: list,
+    config,
+    project_key: str,
+    project_path: Path,
+    known_projects: set,
+) -> list[dict]:
+    """Open each message-source DB and append message-shaped inbox items."""
+    from pollypm.store import SQLAlchemyStore
+    from pollypm.cockpit_inbox_sources import _row_is_dev_channel
+
+    items: list[dict] = []
     seen_messages: set[tuple[str, object]] = set()
     for source_key, source_db in message_sources:
         try:
@@ -11862,14 +11959,14 @@ def _dashboard_inbox(
                 payload = row.get("payload") or {}
                 if not isinstance(payload, dict):
                     payload = {}
-                labels = _labels_from_row(row)
+                labels = _dashboard_inbox_labels_from_row(row)
                 is_blocker_summary = (
                     payload.get("event_type") == "project_blocker_summary"
                     or row.get("subject") == "project.blocker_summary"
                 )
                 if row.get("type") == "event" and not is_blocker_summary:
                     continue
-                if project_key not in _message_projects(row):
+                if project_key not in _dashboard_inbox_message_projects(row, config):
                     continue
                 if is_blocker_summary:
                     raw_updated_at = (
@@ -11882,10 +11979,14 @@ def _dashboard_inbox(
                             row,
                             payload,
                             project_key,
-                            sort_value=_sort_value(raw_updated_at),
+                            sort_value=_dashboard_inbox_sort_value(raw_updated_at),
                         )
                     )
                     continue
+                # Some PM handoff notes arrive through shell-escaped paths and
+                # persist literal "\n" sequences. Normalize before extracting
+                # blocker paragraphs and numbered action steps.
+                message_body = str(row.get("body") or "").replace("\\n", "\n")
                 items.append(
                     _dashboard_inbox_build_message_item(
                         row=row,
@@ -11896,8 +11997,8 @@ def _dashboard_inbox(
                         project_key=project_key,
                         project_path=project_path,
                         known_projects=known_projects,
-                        message_body=_message_body(row.get("body")),
-                        sort_value=_sort_value,
+                        message_body=message_body,
+                        sort_value=_dashboard_inbox_sort_value,
                     )
                 )
         finally:
@@ -11905,10 +12006,64 @@ def _dashboard_inbox(
                 store.close()
             except Exception:  # noqa: BLE001
                 pass
+    return items
+
+
+def _dashboard_inbox(
+    config_path: Path, project_key: str, project_path: Path,
+) -> tuple[int, list[dict], list[dict]]:
+    """Return project-scoped inbox items + actionable PM blocker notes."""
+    db_path = project_path / ".pollypm" / "state.db"
+    if not db_path.exists():
+        return 0, [], []
+    # Content-addressed cache: an unchanged db_mtime means no inbox
+    # writes since the last call, so the answer is unchanged. The
+    # lone ``stat()`` is essentially free compared to the two DB
+    # opens + queries inside this function.
+    try:
+        db_mtime: float | None = db_path.stat().st_mtime
+    except OSError:
+        db_mtime = None
+    cache_key = (project_key, db_mtime)
+    cached = _DASHBOARD_INBOX_CACHE.get(cache_key)
+    if cached is not None:
+        _DASHBOARD_INBOX_CACHE.move_to_end(cache_key)
+        return cached
+    try:
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001
+        return 0, [], []
+
+    known_projects = set(getattr(config, "projects", {}).keys())
+    items: list[dict] = _dashboard_inbox_collect_tasks(
+        db_path=db_path,
+        project_path=project_path,
+        config=config,
+        project_key=project_key,
+        known_projects=known_projects,
+    )
+
+    message_sources: list[tuple[str, Path]] = [(project_key, db_path)]
+    workspace_root = getattr(getattr(config, "project", None), "workspace_root", None)
+    if workspace_root is not None:
+        workspace_db = Path(workspace_root) / ".pollypm" / "state.db"
+        if workspace_db.exists() and workspace_db.resolve() != db_path.resolve():
+            message_sources.append(("__workspace__", workspace_db))
+
+    items.extend(
+        _dashboard_inbox_collect_messages(
+            message_sources=message_sources,
+            config=config,
+            project_key=project_key,
+            project_path=project_path,
+            known_projects=known_projects,
+        )
+    )
 
     result = _dashboard_inbox_finalize(items)
     _dashboard_cache_set(_DASHBOARD_INBOX_CACHE, cache_key, result)
     return result
+
 
 
 def _format_blocked_dep(
@@ -14644,172 +14799,178 @@ class PollyProjectDashboardApp(App[None]):
             f"architect.[/]"
         )
 
-    def _render_now_body(self, data: ProjectDashboardData) -> str:
-        w = data.active_worker
-        if w:
-            sess_raw = w.get("session_name") or ""
-            role_raw = w.get("role") or "worker"
-            activity = str(w.get("activity") or "working")
-            in_flight = data.task_buckets.get("in_progress", [])
-            # #1541 \u2014 when the project is calm (idle worker, no in-flight
-            # task, no action card), prefer the configured PM persona
-            # over the raw role / session key. The topbar already names
-            # the PM (``PM: Archie``); the Current activity panel must
-            # not re-introduce ``architect`` or ``architect_bikepath``
-            # one line below. Other activity branches (working /
-            # awaiting_user / in-flight task surfaced) keep the
-            # role-based identity so the operator still sees which
-            # session is doing the work.
-            pm_persona = (
-                getattr(data, "pm_persona", None)
-                or getattr(data, "persona_name", None)
-                or ""
+    def _render_now_body_active_worker(
+        self, data: ProjectDashboardData, w: dict,
+    ) -> str:
+        """Render the Now panel body when ``data.active_worker`` is set."""
+        sess_raw = w.get("session_name") or ""
+        role_raw = w.get("role") or "worker"
+        activity = str(w.get("activity") or "working")
+        in_flight = data.task_buckets.get("in_progress", [])
+        # #1541 \u2014 when the project is calm (idle worker, no in-flight
+        # task, no action card), prefer the configured PM persona
+        # over the raw role / session key. The topbar already names
+        # the PM (``PM: Archie``); the Current activity panel must
+        # not re-introduce ``architect`` or ``architect_bikepath``
+        # one line below. Other activity branches (working /
+        # awaiting_user / in-flight task surfaced) keep the
+        # role-based identity so the operator still sees which
+        # session is doing the work.
+        pm_persona = (
+            getattr(data, "pm_persona", None)
+            or getattr(data, "persona_name", None)
+            or ""
+        )
+        pm_persona = pm_persona.strip() if isinstance(pm_persona, str) else ""
+        calm_state = (
+            activity == "idle"
+            and not in_flight
+            and not data.action_items
+        )
+        if calm_state and pm_persona:
+            identity_markup = f"[b]{_escape(pm_persona)}[/b]"
+        # Collapse "<role>_<project_key>" sessions on their own
+        # project's dashboard down to just the role \u2014 both the
+        # role name and the project context are already implicit
+        # (we're on that project's dashboard), so rendering
+        # ``architect_polly_remote  architect`` repeats info the
+        # operator already has. Leave any session_name with extra
+        # information (task-N, workerN, ad-hoc names) unchanged.
+        elif sess_raw in {role_raw, f"{role_raw}_{self.project_key}"}:
+            identity_markup = f"[b]{_escape(role_raw)}[/b]"
+        else:
+            identity_markup = (
+                f"[b]{_escape(sess_raw)}[/b]  "
+                f"[dim]{_escape(role_raw)}[/dim]"
             )
-            pm_persona = pm_persona.strip() if isinstance(pm_persona, str) else ""
-            calm_state = (
+        hb = w.get("last_heartbeat") or ""
+        age = _format_relative_age(hb) if hb else ""
+        age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+        # #990 \u2014 colour the dot by activity, not just "alive". A
+        # green \u25cf for a session that self-reports "standing by"
+        # is the false-positive the issue called out. Yellow \u25c6
+        # marks "alive but not progressing" \u2014 same shape the
+        # pipeline uses for in-flight-but-needs-attention rows.
+        if activity == "working":
+            dot_markup = "[#3ddc84]\u25cf[/#3ddc84]"
+            state_tail = ""
+        elif activity == "awaiting_user":
+            dot_markup = "[#f0c45a]\u25c6[/#f0c45a]"
+            state_tail = "  [dim]waiting on input[/dim]"
+        else:  # idle
+            dot_markup = "[#6b7a88]\u25cb[/#6b7a88]"
+            state_tail = "  [dim]standing by[/dim]"
+        lines = [
+            f"{dot_markup} {identity_markup}{age_part}{state_tail}",
+        ]
+        # Surface the top-most in-flight task as context.
+        if in_flight:
+            t = in_flight[0]
+            num = t.get("task_number")
+            num_part = f"#{num} " if num is not None else ""
+            title = _escape(t.get("title") or "")
+            node = t.get("current_node_id")
+            node_part = (
+                f"  [dim]@ {_escape(str(node))}[/dim]" if node else ""
+            )
+            # #1025 — when the active session is idle but a task is
+            # in-flight, the task is being progressed by its
+            # assignee, NOT the idle session. Naming the assignee
+            # avoids implying the idle agent is responsible for
+            # the in-flight task (the bikepath repro was an idle
+            # architect pinned to a worker's task).
+            assignee_raw = str(t.get("assignee") or "").strip()
+            if (
                 activity == "idle"
-                and not in_flight
-                and not data.action_items
-            )
-            if calm_state and pm_persona:
-                identity_markup = f"[b]{_escape(pm_persona)}[/b]"
-            # Collapse "<role>_<project_key>" sessions on their own
-            # project's dashboard down to just the role \u2014 both the
-            # role name and the project context are already implicit
-            # (we're on that project's dashboard), so rendering
-            # ``architect_polly_remote  architect`` repeats info the
-            # operator already has. Leave any session_name with extra
-            # information (task-N, workerN, ad-hoc names) unchanged.
-            elif sess_raw in {role_raw, f"{role_raw}_{self.project_key}"}:
-                identity_markup = f"[b]{_escape(role_raw)}[/b]"
+                and assignee_raw
+                and assignee_raw != sess_raw
+                and assignee_raw != role_raw
+            ):
+                assignee_tail = (
+                    f"  [dim]· {_escape(assignee_raw)} is on it[/dim]"
+                )
             else:
-                identity_markup = (
-                    f"[b]{_escape(sess_raw)}[/b]  "
-                    f"[dim]{_escape(role_raw)}[/dim]"
-                )
-            hb = w.get("last_heartbeat") or ""
-            age = _format_relative_age(hb) if hb else ""
-            age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
-            # #990 \u2014 colour the dot by activity, not just "alive". A
-            # green \u25cf for a session that self-reports "standing by"
-            # is the false-positive the issue called out. Yellow \u25c6
-            # marks "alive but not progressing" \u2014 same shape the
-            # pipeline uses for in-flight-but-needs-attention rows.
-            if activity == "working":
-                dot_markup = "[#3ddc84]\u25cf[/#3ddc84]"
-                state_tail = ""
-            elif activity == "awaiting_user":
-                dot_markup = "[#f0c45a]\u25c6[/#f0c45a]"
-                state_tail = "  [dim]waiting on input[/dim]"
-            else:  # idle
-                dot_markup = "[#6b7a88]\u25cb[/#6b7a88]"
-                state_tail = "  [dim]standing by[/dim]"
-            lines = [
-                f"{dot_markup} {identity_markup}{age_part}{state_tail}",
-            ]
-            # Surface the top-most in-flight task as context.
-            if in_flight:
-                t = in_flight[0]
-                num = t.get("task_number")
-                num_part = f"#{num} " if num is not None else ""
-                title = _escape(t.get("title") or "")
-                node = t.get("current_node_id")
-                node_part = (
-                    f"  [dim]@ {_escape(str(node))}[/dim]" if node else ""
-                )
-                # #1025 — when the active session is idle but a task is
-                # in-flight, the task is being progressed by its
-                # assignee, NOT the idle session. Naming the assignee
-                # avoids implying the idle agent is responsible for
-                # the in-flight task (the bikepath repro was an idle
-                # architect pinned to a worker's task).
-                assignee_raw = str(t.get("assignee") or "").strip()
-                if (
-                    activity == "idle"
-                    and assignee_raw
-                    and assignee_raw != sess_raw
-                    and assignee_raw != role_raw
-                ):
-                    assignee_tail = (
-                        f"  [dim]· {_escape(assignee_raw)} is on it[/dim]"
-                    )
-                else:
-                    assignee_tail = ""
+                assignee_tail = ""
+            lines.append(
+                f"  {num_part}{title}{node_part}{assignee_tail}"
+            )
+        elif data.action_items:
+            # No task in flight but the user has decisions waiting:
+            # the operator-facing reality is "I have something to do
+            # here." Saying just "<architect> active" while the
+            # banner reads "Waiting on you" hides that fact in the
+            # very section meant to explain what's happening now.
+            # Don't restate the full prompt \u2014 it's already in the
+            # Action Needed card right above; point there instead.
+            lines.append(
+                "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
+                "response \u2014 see [b]Action Needed[/b] above."
+            )
+        elif activity == "idle":
+            # No task, no action card, but the session is alive
+            # and standing by. #990: bikepath's architect was
+            # exactly here \u2014 heartbeat-alive, "Re-anchored as Bea
+            # \u2026 standing by." The dashboard had no way to show
+            # this, so it implied work was happening. Spell out
+            # the actual state instead.
+            #
+            # #1541 \u2014 drop the syslog-style "The session is alive
+            # but not progressing work" phrasing in favour of a
+            # warmer, PM-named note that invites a next step.
+            # The topbar already names the PM; this line echoes
+            # the same identity so the operator sees one voice,
+            # not "Archie" up top and "the session" below.
+            if pm_persona:
                 lines.append(
-                    f"  {num_part}{title}{node_part}{assignee_tail}"
+                    f"  [dim]{_escape(pm_persona)} is ready when "
+                    "you want to pick something up \u2014 press [b]c[/b] "
+                    "to chat or [b]p[/b] to plan.[/dim]"
                 )
-            elif data.action_items:
-                # No task in flight but the user has decisions waiting:
-                # the operator-facing reality is "I have something to do
-                # here." Saying just "<architect> active" while the
-                # banner reads "Waiting on you" hides that fact in the
-                # very section meant to explain what's happening now.
-                # Don't restate the full prompt \u2014 it's already in the
-                # Action Needed card right above; point there instead.
+            else:
                 lines.append(
-                    "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
-                    "response \u2014 see [b]Action Needed[/b] above."
+                    "  [dim]Ready when you want to pick something "
+                    "up \u2014 press [b]c[/b] to chat or [b]p[/b] to "
+                    "plan.[/dim]"
                 )
-            elif activity == "idle":
-                # No task, no action card, but the session is alive
-                # and standing by. #990: bikepath's architect was
-                # exactly here \u2014 heartbeat-alive, "Re-anchored as Bea
-                # \u2026 standing by." The dashboard had no way to show
-                # this, so it implied work was happening. Spell out
-                # the actual state instead.
-                #
-                # #1541 \u2014 drop the syslog-style "The session is alive
-                # but not progressing work" phrasing in favour of a
-                # warmer, PM-named note that invites a next step.
-                # The topbar already names the PM; this line echoes
-                # the same identity so the operator sees one voice,
-                # not "Archie" up top and "the session" below.
-                if pm_persona:
-                    lines.append(
-                        f"  [dim]{_escape(pm_persona)} is ready when "
-                        "you want to pick something up \u2014 press [b]c[/b] "
-                        "to chat or [b]p[/b] to plan.[/dim]"
-                    )
-                else:
-                    lines.append(
-                        "  [dim]Ready when you want to pick something "
-                        "up \u2014 press [b]c[/b] to chat or [b]p[/b] to "
-                        "plan.[/dim]"
-                    )
-            elif activity == "awaiting_user":
+        elif activity == "awaiting_user":
+            lines.append(
+                "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
+                "response \u2014 a permission prompt is open."
+            )
+        elif activity == "working":
+            # #1545 \u2014 architect / worker is heartbeat-alive and the
+            # pane is moving, but no task is claimed in_progress in
+            # the work-service DB (architects rarely own tasks;
+            # workers can work ahead of a queued claim). Without a
+            # context line the panel reads as just "\u25cf architect 30s"
+            # which feels empty \u2014 coffeeboardnm hit exactly this
+            # while ``architect_coffeeboardnm`` had been building
+            # for 8 minutes. Surface the most recent activity-feed
+            # entry so the operator sees what the session is doing
+            # right now; fall back to a plain "working ahead" note
+            # if the feed is empty.
+            entries = getattr(data, "activity_entries", None) or []
+            latest = entries[0] if entries else None
+            summary = ""
+            if latest:
+                summary = self._sanitize_activity_summary(
+                    str(latest.get("summary") or "").strip(),
+                )
+            if summary:
                 lines.append(
-                    "  [#f0c45a]\u25c6[/#f0c45a] Waiting on your "
-                    "response \u2014 a permission prompt is open."
+                    f"  [dim]\u21b3 {_escape(summary)}[/dim]",
                 )
-            elif activity == "working":
-                # #1545 \u2014 architect / worker is heartbeat-alive and the
-                # pane is moving, but no task is claimed in_progress in
-                # the work-service DB (architects rarely own tasks;
-                # workers can work ahead of a queued claim). Without a
-                # context line the panel reads as just "\u25cf architect 30s"
-                # which feels empty \u2014 coffeeboardnm hit exactly this
-                # while ``architect_coffeeboardnm`` had been building
-                # for 8 minutes. Surface the most recent activity-feed
-                # entry so the operator sees what the session is doing
-                # right now; fall back to a plain "working ahead" note
-                # if the feed is empty.
-                entries = getattr(data, "activity_entries", None) or []
-                latest = entries[0] if entries else None
-                summary = ""
-                if latest:
-                    summary = self._sanitize_activity_summary(
-                        str(latest.get("summary") or "").strip(),
-                    )
-                if summary:
-                    lines.append(
-                        f"  [dim]\u21b3 {_escape(summary)}[/dim]",
-                    )
-                else:
-                    lines.append(
-                        "  [dim]Working ahead \u2014 no claimed task "
-                        "yet.[/dim]",
-                    )
-            return "\n".join(lines)
+            else:
+                lines.append(
+                    "  [dim]Working ahead \u2014 no claimed task "
+                    "yet.[/dim]",
+                )
+        return "\n".join(lines)
+
+    def _render_now_body_no_worker(
+        self, data: ProjectDashboardData,
+    ) -> str:
+        """Render the Now panel body when ``data.active_worker`` is None."""
         if data.action_items:
             item = data.action_items[0]
             prompt = _escape(
@@ -14875,9 +15036,168 @@ class PollyProjectDashboardApp(App[None]):
             )
             return (
                 "[#f0c45a]◆[/#f0c45a] Plan's ready for your review.\n"
-                f"  [dim]↳ {_escape(title)}[/dim]"
+                f"  [dim]\u21b3 {_escape(title)}[/dim]"
             )
         return "[dim]Idle. No tasks in flight and no user action needed.[/dim]"
+
+    def _render_now_body(self, data: ProjectDashboardData) -> str:
+        w = data.active_worker
+        if w:
+            return self._render_now_body_active_worker(data, w)
+        return self._render_now_body_no_worker(data)
+
+    def _render_pipeline_task_row(
+        self,
+        out: list[str],
+        t: dict,
+        status: str,
+        title_map: dict[str, str],
+    ) -> None:
+        """Append the per-task lines (title + status-specific decorations)."""
+        num = t.get("task_number")
+        num_part = f"[dim]#{num}[/dim] " if num is not None else ""
+        title = _escape(t.get("title") or "")
+        age = _format_relative_age(t.get("updated_at") or "")
+        age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
+        out.append(f"  {num_part}{title}{age_part}")
+        # For blocked tasks, name the dependencies the task is
+        # waiting on. Without this the operator sees a list of
+        # blocked titles with no signal about *why* — they have
+        # to drill into each task to find the upstream work.
+        if status == "blocked":
+            blocked_by = [
+                str(ref) for ref in (t.get("blocked_by") or []) if ref
+            ]
+            if blocked_by:
+                joined = ", ".join(
+                    _format_blocked_dep(
+                        ref, title_map,
+                        current_project=self.project_key,
+                    )
+                    for ref in blocked_by[:3]
+                )
+                if len(blocked_by) > 3:
+                    joined += f" (+{len(blocked_by) - 3} more)"
+                out.append(f"      [dim]waiting on: {joined}[/dim]")
+        # Symmetric surface for on_hold tasks: print the hold
+        # reason recorded with ``pm task hold --reason``. Without
+        # this the operator sees "Paused" with no signal about
+        # *why* the work is parked or what would unparked it.
+        if status == "on_hold":
+            reason = _clean_hold_reason(
+                str(t.get("hold_reason") or ""),
+                title_map,
+                self_task_id=str(t.get("task_id") or "") or None,
+            )
+            if reason:
+                out.append(f"      [dim]paused: {_escape(reason)}[/dim]")
+        # Recovery affordance (#1016): every stuck task now also
+        # gets a "what should I do?" line. The dispatch table in
+        # ``recovery_actions`` parses the reason; the dashboard
+        # renders the title + the first non-comment CLI step
+        # so the operator can act without drilling into detail
+        # view first. The full block lives in the task detail
+        # surface (``cockpit_tasks._render_overview``).
+        if status in {"on_hold", "blocked"}:
+            self._render_pipeline_recovery_hint(out, t, status)
+        # In-progress rows tell the operator which worker is
+        # carrying the task and which node they're at right now.
+        # Without this signal, the dashboard says "1 in
+        # progress" but doesn't tell Sam who to message if he
+        # has a question — the assignee is already on the
+        # bucket dict, just unsurfaced.
+        if status == "in_progress":
+            assignee = str(t.get("assignee") or "").strip()
+            node_id = str(t.get("current_node_id") or "").strip()
+            if assignee:
+                node_part = f" @ {_escape(node_id)}" if node_id else ""
+                out.append(
+                    f"      [dim]{_escape(assignee)}{node_part}[/dim]"
+                )
+        # Review rows tell the operator who has the ball:
+        # auto-reviewer (Russell etc.) or a user-approval
+        # node that needs Sam's call. Without this, the user
+        # sees "1 task in review" and can't tell whether to
+        # wait or act.
+        if status == "review":
+            node_id = str(t.get("current_node_id") or "").lower()
+            is_user_review = any(
+                marker in node_id for marker in ("human", "user")
+            )
+            if is_user_review:
+                out.append(
+                    "      [#f0c45a]ready for your approval[/]"
+                )
+            else:
+                assignee = str(t.get("assignee") or "").strip()
+                node_part = f" @ {_escape(node_id)}" if node_id else ""
+                if assignee:
+                    out.append(
+                        f"      [dim]reviewing: "
+                        f"{_escape(assignee)}{node_part}[/dim]"
+                    )
+                elif node_id:
+                    out.append(f"      [dim]@ {_escape(node_id)}[/dim]")
+
+    def _render_pipeline_recovery_hint(
+        self, out: list[str], t: dict, status: str,
+    ) -> None:
+        """Emit the green ``recovery:`` line for stuck (on_hold / blocked) tasks."""
+        raw_reason = (
+            str(t.get("hold_reason") or "")
+            if status == "on_hold"
+            else "blocked: waiting on " + (
+                (t.get("blocked_by") or [""])[0]
+                if isinstance(t.get("blocked_by"), list)
+                and t.get("blocked_by")
+                else ""
+            )
+        )
+        recovery_proxy = {
+            "task_id": str(t.get("task_id") or ""),
+            "project": (
+                str(t.get("task_id") or "").split("/", 1)[0]
+                if "/" in str(t.get("task_id") or "")
+                else ""
+            ),
+            "task_number": t.get("task_number"),
+            "work_status": status,
+            "reason": raw_reason,
+        }
+        try:
+            from pollypm.recovery_actions import (
+                recovery_action_for,
+            )
+            action = recovery_action_for(recovery_proxy)
+        except Exception:  # noqa: BLE001
+            action = None
+        if action is None:
+            return
+        first_step = next(
+            (
+                step for step in action.cli_steps
+                if step and not step.startswith("#")
+            ),
+            "",
+        )
+        kb = (
+            f" \u00b7 press {action.keybinding}"
+            if action.keybinding else ""
+        )
+        if first_step:
+            out.append(
+                "      [#7fbf6a]\u2192 recovery: "
+                f"{_escape(action.detail)}[/]"
+            )
+            out.append(
+                f"        [dim]$ {_escape(first_step)}"
+                f"{kb}[/dim]"
+            )
+        else:
+            out.append(
+                "      [#7fbf6a]\u2192 recovery: "
+                f"{_escape(action.detail)}{kb}[/]"
+            )
 
     def _render_pipeline_body(self, data: ProjectDashboardData) -> str:
         if not data.exists_on_disk:
@@ -14939,143 +15259,7 @@ class PollyProjectDashboardApp(App[None]):
             header = status.replace("_", " ").title()
             out.append(f"[dim]{header}[/dim]")
             for t in items:
-                num = t.get("task_number")
-                num_part = f"[dim]#{num}[/dim] " if num is not None else ""
-                title = _escape(t.get("title") or "")
-                age = _format_relative_age(t.get("updated_at") or "")
-                age_part = f"  [dim]{_escape(age)}[/dim]" if age else ""
-                out.append(f"  {num_part}{title}{age_part}")
-                # For blocked tasks, name the dependencies the task is
-                # waiting on. Without this the operator sees a list of
-                # blocked titles with no signal about *why* — they have
-                # to drill into each task to find the upstream work.
-                if status == "blocked":
-                    blocked_by = [
-                        str(ref) for ref in (t.get("blocked_by") or []) if ref
-                    ]
-                    if blocked_by:
-                        joined = ", ".join(
-                            _format_blocked_dep(
-                                ref, title_map,
-                                current_project=self.project_key,
-                            )
-                            for ref in blocked_by[:3]
-                        )
-                        if len(blocked_by) > 3:
-                            joined += f" (+{len(blocked_by) - 3} more)"
-                        out.append(f"      [dim]waiting on: {joined}[/dim]")
-                # Symmetric surface for on_hold tasks: print the hold
-                # reason recorded with ``pm task hold --reason``. Without
-                # this the operator sees "Paused" with no signal about
-                # *why* the work is parked or what would unparked it.
-                if status == "on_hold":
-                    reason = _clean_hold_reason(
-                        str(t.get("hold_reason") or ""),
-                        title_map,
-                        self_task_id=str(t.get("task_id") or "") or None,
-                    )
-                    if reason:
-                        out.append(f"      [dim]paused: {_escape(reason)}[/dim]")
-                # Recovery affordance (#1016): every stuck task now also
-                # gets a "what should I do?" line. The dispatch table in
-                # ``recovery_actions`` parses the reason; the dashboard
-                # renders the title + the first non-comment CLI step
-                # so the operator can act without drilling into detail
-                # view first. The full block lives in the task detail
-                # surface (``cockpit_tasks._render_overview``).
-                if status in {"on_hold", "blocked"}:
-                    raw_reason = (
-                        str(t.get("hold_reason") or "")
-                        if status == "on_hold"
-                        else "blocked: waiting on " + (
-                            (t.get("blocked_by") or [""])[0]
-                            if isinstance(t.get("blocked_by"), list)
-                            and t.get("blocked_by")
-                            else ""
-                        )
-                    )
-                    recovery_proxy = {
-                        "task_id": str(t.get("task_id") or ""),
-                        "project": (
-                            str(t.get("task_id") or "").split("/", 1)[0]
-                            if "/" in str(t.get("task_id") or "")
-                            else ""
-                        ),
-                        "task_number": t.get("task_number"),
-                        "work_status": status,
-                        "reason": raw_reason,
-                    }
-                    try:
-                        from pollypm.recovery_actions import (
-                            recovery_action_for,
-                        )
-                        action = recovery_action_for(recovery_proxy)
-                    except Exception:  # noqa: BLE001
-                        action = None
-                    if action is not None:
-                        first_step = next(
-                            (
-                                step for step in action.cli_steps
-                                if step and not step.startswith("#")
-                            ),
-                            "",
-                        )
-                        kb = (
-                            f" · press {action.keybinding}"
-                            if action.keybinding else ""
-                        )
-                        if first_step:
-                            out.append(
-                                "      [#7fbf6a]→ recovery: "
-                                f"{_escape(action.detail)}[/]"
-                            )
-                            out.append(
-                                f"        [dim]$ {_escape(first_step)}"
-                                f"{kb}[/dim]"
-                            )
-                        else:
-                            out.append(
-                                "      [#7fbf6a]→ recovery: "
-                                f"{_escape(action.detail)}{kb}[/]"
-                            )
-                # In-progress rows tell the operator which worker is
-                # carrying the task and which node they're at right now.
-                # Without this signal, the dashboard says "1 in
-                # progress" but doesn't tell Sam who to message if he
-                # has a question — the assignee is already on the
-                # bucket dict, just unsurfaced.
-                if status == "in_progress":
-                    assignee = str(t.get("assignee") or "").strip()
-                    node_id = str(t.get("current_node_id") or "").strip()
-                    if assignee:
-                        node_part = f" @ {_escape(node_id)}" if node_id else ""
-                        out.append(
-                            f"      [dim]{_escape(assignee)}{node_part}[/dim]"
-                        )
-                # Review rows tell the operator who has the ball:
-                # auto-reviewer (Russell etc.) or a user-approval
-                # node that needs Sam's call. Without this, the user
-                # sees "1 task in review" and can't tell whether to
-                # wait or act.
-                if status == "review":
-                    node_id = str(t.get("current_node_id") or "").lower()
-                    is_user_review = any(
-                        marker in node_id for marker in ("human", "user")
-                    )
-                    if is_user_review:
-                        out.append(
-                            "      [#f0c45a]ready for your approval[/]"
-                        )
-                    else:
-                        assignee = str(t.get("assignee") or "").strip()
-                        node_part = f" @ {_escape(node_id)}" if node_id else ""
-                        if assignee:
-                            out.append(
-                                f"      [dim]reviewing: "
-                                f"{_escape(assignee)}{node_part}[/dim]"
-                            )
-                        elif node_id:
-                            out.append(f"      [dim]@ {_escape(node_id)}[/dim]")
+                self._render_pipeline_task_row(out, t, status, title_map)
             out.append("")
         # Drop trailing blank for tidy spacing
         while out and out[-1] == "":

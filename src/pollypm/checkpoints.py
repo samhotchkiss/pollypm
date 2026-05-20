@@ -643,32 +643,53 @@ def record_checkpoint(
 ) -> None:
     """Record a checkpoint row and refresh the session_runtime stamp.
 
-    ``store`` and ``config`` are retained for caller compatibility but
-    are no longer used — writes go through the pg facades.
+    Routes writes through the pg facades when the active backend is
+    Postgres; otherwise writes through the injected ``store`` (StateStore).
     """
-    del store  # unused on pg backend
-    del config  # unused on pg backend
-    from pollypm.storage.pg_checkpoints import record_checkpoint as _pg_record_checkpoint
-    from pollypm.storage.pg_sessions import (
-        get_session_runtime as _pg_get_session_runtime,
-        upsert_session_runtime as _pg_upsert_session_runtime,
-    )
+    from pollypm.storage._backend_dispatch import is_pg_backend
 
-    _pg_record_checkpoint(
-        session_name=launch.session.name,
-        project_key=project_key,
-        level=level,
-        json_path=str(artifact.json_path),
-        summary_path=str(artifact.summary_path),
-        snapshot_path=str(snapshot_path),
-        summary_text=artifact.summary_text,
-    )
-    current = _pg_get_session_runtime(launch.session.name)
-    _pg_upsert_session_runtime(
-        session_name=launch.session.name,
-        status=current.status if current is not None else "healthy",
-        last_checkpoint_path=str(artifact.summary_path),
-    )
+    if is_pg_backend(config):
+        from pollypm.storage.pg_checkpoints import record_checkpoint as _pg_record_checkpoint
+        from pollypm.storage.pg_sessions import (
+            get_session_runtime as _pg_get_session_runtime,
+            upsert_session_runtime as _pg_upsert_session_runtime,
+        )
+
+        _pg_record_checkpoint(
+            session_name=launch.session.name,
+            project_key=project_key,
+            level=level,
+            json_path=str(artifact.json_path),
+            summary_path=str(artifact.summary_path),
+            snapshot_path=str(snapshot_path),
+            summary_text=artifact.summary_text,
+        )
+        current = _pg_get_session_runtime(launch.session.name)
+        _pg_upsert_session_runtime(
+            session_name=launch.session.name,
+            status=current.status if current is not None else "healthy",
+            last_checkpoint_path=str(artifact.summary_path),
+        )
+    else:
+        if store is None:
+            raise ValueError(
+                "record_checkpoint requires a StateStore on the sqlite backend"
+            )
+        store.record_checkpoint(  # type: ignore[attr-defined]
+            session_name=launch.session.name,
+            project_key=project_key,
+            level=level,
+            json_path=str(artifact.json_path),
+            summary_path=str(artifact.summary_path),
+            snapshot_path=str(snapshot_path),
+            summary_text=artifact.summary_text,
+        )
+        current = store.get_session_runtime(launch.session.name)  # type: ignore[attr-defined]
+        store.upsert_session_runtime(  # type: ignore[attr-defined]
+            session_name=launch.session.name,
+            status=current.status if current is not None else "healthy",
+            last_checkpoint_path=str(artifact.summary_path),
+        )
     try:
         memory_backend = get_memory_backend(launch.session.cwd, memory_backend_name)
         memory_backend.write_entry(

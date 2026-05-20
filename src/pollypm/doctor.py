@@ -625,9 +625,9 @@ def _latest_state_migration_version() -> int | None:
     try:
         # The migrations live on the class; avoid instantiating (that opens
         # a real DB). Walk the class var directly.
-        from pollypm.storage import state as _state_mod
+        from pollypm.storage.state import StateStore
 
-        migrations = getattr(_state_mod.StateStore, "_MIGRATIONS", None)
+        migrations = getattr(StateStore, "_MIGRATIONS", None)
         if not migrations:
             return None
         return max(v for v, _, _ in migrations)
@@ -2832,13 +2832,10 @@ def _initialize_project_state_db(db_path: Path) -> tuple[bool, str]:
     the corresponding doctor check is rewired to the pg world.
     """
     # Deferred import: only sqlite installs reach this code path.
-    from pollypm.storage import state as _state_mod
+    from pollypm.storage.state import StateStore
 
-    _cls = getattr(_state_mod, "StateStore", None)
-    if _cls is None:
-        return (False, "StateStore unavailable")
     try:
-        store = _cls(db_path)
+        store = StateStore(db_path)
         try:
             pass
         finally:
@@ -3364,13 +3361,10 @@ def check_state_db_size() -> CheckResult:
         # ``incremental_vacuum`` is meaningless on pg. Deferred import
         # keeps the legacy path callable for sqlite installs until the
         # check itself is rewired.
-        from pollypm.storage import state as _state_mod
+        from pollypm.storage.state import StateStore
 
-        _cls = getattr(_state_mod, "StateStore", None)
-        if _cls is None:
-            return (False, "StateStore unavailable")
         try:
-            store = _cls(biggest)
+            store = StateStore(biggest)
             try:
                 reclaimed = store.incremental_vacuum()
             finally:

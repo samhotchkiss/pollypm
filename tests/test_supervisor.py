@@ -33,6 +33,7 @@ from pollypm.supervisor import (
     _extract_claude_model_name,
     _extract_codex_model_name,
     _extract_token_metrics,
+    _identity_preamble_for_role,
 )
 from pollypm.tmux.client import TmuxPane, TmuxWindow
 
@@ -2517,3 +2518,140 @@ def test_restart_session_skips_recovery_prompt_for_heartbeat(
     runtime = supervisor.store.get_session_runtime("heartbeat")
     assert runtime is not None
     assert runtime.status == "healthy"
+
+
+def test_identity_preamble_threads_project_persona_for_architect() -> None:
+    """#1976 — when the project configures a custom ``persona_name``
+    (samblog → "Sage") the architect recovery preamble must greet the
+    agent with that name instead of the role default "Archie".
+
+    Pre-fix: ``_identity_preamble_for_role("architect")`` returned a
+    hardcoded "Quick reminder: in this session you're playing Archie,
+    the architect …" message and ``Supervisor.restart_session`` sent it
+    verbatim into the architect pane on every recovery. The cockpit
+    sidebar correctly read "Sage" from ``KnownProject.persona_name``
+    but the architect itself, anchored by the recovery preamble, kept
+    self-identifying as Archie ("Hi — Archie, settled in"). The fix
+    threads ``persona_name`` through ``_identity_preamble_for_role``.
+
+    The "Not <other>" parenthetical at the end of each line keeps the
+    role default mentioned as a contrast cue (the assertion below
+    deliberately tolerates that — only the leading identity claim has
+    to flip from Archie to the configured persona).
+    """
+    preamble = _identity_preamble_for_role("architect", persona_name="Sage")
+    assert "you're playing Sage, the architect" in preamble
+    assert "you're playing Archie, the architect" not in preamble
+
+
+def test_identity_preamble_falls_back_to_role_default_for_architect() -> None:
+    """Projects that never picked a ``persona_name`` keep the historical
+    role default ("Archie") so the fallback path mirrors the precedence
+    used by ``MarkdownPromptProfile.build_prompt`` (architect system
+    prompt builder) and ``_resolve_reviewer_persona_prompt``: explicit
+    project persona wins, role default backs it.
+    """
+    preamble = _identity_preamble_for_role("architect", persona_name=None)
+    assert "you're playing Archie, the architect" in preamble
+    # Blank persona override must NOT leak ``{persona_name}`` into the message.
+    blank = _identity_preamble_for_role("architect", persona_name="   ")
+    assert "{persona_name}" not in blank
+    assert "you're playing Archie, the architect" in blank
+
+
+def test_identity_preamble_threads_persona_for_reviewer_and_operator() -> None:
+    """The same leak existed for the reviewer ("Russell") and
+    operator-pm ("Polly") preambles — both are now persona-aware so a
+    project that renamed its reviewer/operator persona stays consistent
+    across the system prompt, sidebar label, and recovery preamble.
+    """
+    reviewer = _identity_preamble_for_role("reviewer", persona_name="Rook")
+    assert "you're playing Rook, the code reviewer" in reviewer
+    assert "you're playing Russell, the code reviewer" not in reviewer
+
+    operator = _identity_preamble_for_role("operator-pm", persona_name="Ruby")
+    assert "you're playing Ruby, the PollyPM operator" in operator
+    assert "you're playing Polly, the PollyPM operator" not in operator
+
+
+def test_identity_preamble_for_heartbeat_is_persona_agnostic() -> None:
+    """``heartbeat-supervisor`` is a process role, not a chat persona —
+    its preamble does not embed a name and the persona override is a
+    no-op. Guards against an over-eager template substitution wiping
+    out the heartbeat string.
+    """
+    preamble = _identity_preamble_for_role(
+        "heartbeat-supervisor", persona_name="Sage",
+    )
+    assert "Heartbeat supervisor" in preamble
+    assert "{persona_name}" not in preamble
+
+
+def test_restart_session_recovery_preamble_uses_project_persona(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#1976 end-to-end — ``Supervisor.restart_session`` on an architect
+    session whose project sets ``persona_name = "Sage"`` must inject a
+    recovery prompt whose identity preamble greets the agent as Sage,
+    not Archie. The send_keys payload is the load-bearing surface —
+    pre-fix this carried "playing Archie" into samblog's architect pane
+    despite the project-guide and system prompt already reading "Sage".
+    """
+    config = _config(tmp_path)
+    # Add an architect session and rebrand the project's persona.
+    config.sessions["architect"] = SessionConfig(
+        name="architect",
+        role="architect",
+        provider=ProviderKind.CLAUDE,
+        account="claude_controller",
+        cwd=tmp_path,
+        project="pollypm",
+        window_name="pm-architect",
+    )
+    config.projects["pollypm"] = KnownProject(
+        key="pollypm",
+        path=tmp_path,
+        name="PollyPM",
+        kind=ProjectKind.FOLDER,
+        persona_name="Sage",
+    )
+    supervisor = Supervisor(config)
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux, "has_session", lambda _name: False,
+    )
+    monkeypatch.setattr(
+        supervisor, "launch_session", lambda _name: None,
+    )
+    sent: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "send_keys",
+        lambda target, text, **kw: sent.append((target, text)),
+    )
+    # Bypass the (launch, target) window match guard so the test isn't
+    # gated on a real tmux topology — we only care about the rendered
+    # preamble that would be sent into the pane.
+    monkeypatch.setattr(
+        supervisor, "_target_window_matches_launch",
+        lambda _launch, _target: True,
+    )
+    monkeypatch.setattr(
+        supervisor, "_pane_already_bootstrapped_as_other_role",
+        lambda _role, _target: False,
+    )
+    monkeypatch.setattr(
+        supervisor, "_resolve_send_target",
+        lambda _launch: "pm-control:pm-architect",
+    )
+
+    supervisor.restart_session(
+        "architect", "claude_controller", failure_type="pane_dead",
+    )
+
+    assert sent, "restart_session must inject a recovery prompt for architect"
+    payload = sent[0][1]
+    assert "you're playing Sage, the architect" in payload, (
+        f"recovery preamble leaked the role default; got:\n{payload[:400]}"
+    )
+    assert "you're playing Archie, the architect" not in payload

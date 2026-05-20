@@ -2494,6 +2494,20 @@ def _git_last_change_ref(path: Path | None) -> str | None:
 
 @lru_cache(maxsize=None)
 def _built_in_guide_body(role: str) -> str:
+    # Delegate to the writer's source-of-truth so the doctor's drift
+    # detector and ``init_project_guide`` agree by construction. The
+    # previous bespoke implementation read ``worker_prompt()`` for the
+    # worker role while the writer reads ``docs/worker-guide.md`` —
+    # producing two different digests for the same role and wedging
+    # drift detection on the fallback path.
+    project_guides = _project_guides_module()
+    if project_guides is not None:
+        getter = getattr(project_guides, "built_in_guide_text", None)
+        if callable(getter):
+            try:
+                return getter(role)
+            except Exception:  # noqa: BLE001
+                pass
     if role == "architect":
         source = _guide_source_path(role)
         if source is None:

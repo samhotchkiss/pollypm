@@ -109,10 +109,15 @@ def project_guide_drift_info(
     if not target.exists():
         return None
     guide = _read_project_guide_path(target)
-    upstream_body = built_in_guide_text(normalized).strip()
+    # Hash the raw built-in text — exactly what ``init_project_guide``
+    # passes when it records ``forked_from``. Stripping here previously
+    # produced a different sha256 from the writer, wedging drift
+    # detection in packaged installs (where the git-sha fallback path
+    # is unavailable). See ``fix/guide-drift-source-mismatch``.
+    raw_upstream = built_in_guide_text(normalized)
     current_ref = built_in_guide_fork_ref(
         normalized,
-        content=upstream_body,
+        content=raw_upstream,
         source_path=built_in_guide_source_path(normalized),
     )
     return ProjectGuideDriftInfo(
@@ -122,7 +127,7 @@ def project_guide_drift_info(
         current_ref=current_ref,
         drifted=(guide.forked_from != current_ref),
         body=guide.body,
-        upstream_body=upstream_body,
+        upstream_body=raw_upstream.strip(),
     )
 
 

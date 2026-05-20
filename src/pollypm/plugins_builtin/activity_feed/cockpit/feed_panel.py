@@ -252,14 +252,12 @@ def _try_import_textual():  # pragma: no cover - import guard
         )
 
 
-def _build_widget_classes():
-    """Construct the Textual widget + app lazily.
+def _build_activity_feed_panel(Widget, Static, ComposeResult):
+    """Construct the ``ActivityFeedPanel`` Widget class.
 
-    Keeps plugin import cheap; only materialises Textual dependencies
-    when someone actually launches the cockpit pane.
+    Constructed inside a function so the Textual imports stay lazy
+    (they only happen the first time the cockpit pane is launched).
     """
-    App, ComposeResult, Binding, Widget, Static = _try_import_textual()
-
     class ActivityFeedPanel(Widget):
         """Reverse-chronological feed of FeedEntry rows.
 
@@ -422,6 +420,15 @@ def _build_widget_classes():
             # Escape brackets so Rich doesn't try to parse JSON braces.
             return "[dim]" + _rich_escape(text) + "[/]"
 
+    return ActivityFeedPanel
+
+
+def _build_activity_feed_app(App, ComposeResult, Binding, PanelCls):
+    """Construct the ``ActivityFeedApp`` App class.
+
+    ``PanelCls`` is the class returned by ``_build_activity_feed_panel``;
+    it's threaded through so the App can instantiate its panel widget.
+    """
     class ActivityFeedApp(App):
         TITLE = "PollyPM"
         SUB_TITLE = "Activity"
@@ -447,13 +454,13 @@ def _build_widget_classes():
         def __init__(self, config_path: Path, *, limit: int = 50) -> None:
             super().__init__()
             self.config_path = config_path
-            self._panel: ActivityFeedPanel | None = None
+            self._panel: PanelCls | None = None
             self._limit = limit
             self._last_epoch = 0.0
 
         def compose(self) -> ComposeResult:  # pragma: no cover - Textual harness
             projector = self._load_projector()
-            self._panel = ActivityFeedPanel(projector, limit=self._limit)
+            self._panel = PanelCls(projector, limit=self._limit)
             yield self._panel
 
         def _load_projector(self) -> EventProjector | None:
@@ -532,8 +539,19 @@ def _build_widget_classes():
                 return
             self._panel._selected_index = max(0, self._panel._selected_index - 1)
 
-    return ActivityFeedPanel, ActivityFeedApp
+    return ActivityFeedApp
 
+
+def _build_widget_classes():
+    """Construct the Textual widget + app lazily.
+
+    Keeps plugin import cheap; only materialises Textual dependencies
+    when someone actually launches the cockpit pane.
+    """
+    App, ComposeResult, Binding, Widget, Static = _try_import_textual()
+    PanelCls = _build_activity_feed_panel(Widget, Static, ComposeResult)
+    AppCls = _build_activity_feed_app(App, ComposeResult, Binding, PanelCls)
+    return PanelCls, AppCls
 
 def _rich_escape(text: str) -> str:
     """Escape ``[`` / ``]`` in user content so Rich markup doesn't mis-

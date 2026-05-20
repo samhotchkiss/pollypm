@@ -85,6 +85,21 @@ def _looks_like_stale_base(reason: str) -> bool:
     return any(hint in detail for hint in _STALE_BASE_REASON_HINTS)
 
 
+def _is_cap_exceeded_error(exc: BaseException) -> bool:
+    """Return True when ``exc`` is a ``WorkerCapExceededError`` (#1906).
+
+    Walks the exception class hierarchy by qualified name so the
+    transition manager doesn't have to import
+    ``pollypm.work.session_manager`` at module-load time (the
+    session-manager module imports transition helpers in some test
+    paths, so a top-level import would risk circularity).
+    """
+    for cls in type(exc).__mro__:
+        if cls.__name__ == "WorkerCapExceededError":
+            return True
+    return False
+
+
 @dataclass(slots=True)
 class _PMRepairCallSiteOutcome:
     """Internal wrapper that the reject() call site consumes (#1026)."""
@@ -643,6 +658,24 @@ class WorkTransitionManager:
                         actor,
                         exc,
                     )
+                    # #1906 — the atomic cap reserve can still lose the
+                    # race after the claim transition has already
+                    # committed (two queued tasks both pass the pre-check,
+                    # one wins the atomic reserve, the other commits its
+                    # task transition and then raises WorkerCapExceededError
+                    # from the reserve). Without this rollback the loser
+                    # is left ``in_progress`` with no worker, no tmux
+                    # window, and no worktree — auto-claim won't naturally
+                    # re-pick it because it's no longer ``queued``.
+                    #
+                    # The session manager already released its placeholder
+                    # cap slot via _release_cap_slot_on_failure, so all
+                    # that's left is reverting the work_tasks row + the
+                    # active node execution so the next tick re-claims.
+                    if _is_cap_exceeded_error(exc):
+                        self._rollback_claim_to_queued(
+                            task, node_id, actor, exc,
+                        )
 
         result = self._finish(
             task_id,
@@ -650,6 +683,76 @@ class WorkTransitionManager:
             after_sync=_after_sync,
         )
         return result
+
+    def _rollback_claim_to_queued(
+        self,
+        task: Task,
+        node_id: str,
+        actor: str,
+        exc: BaseException,
+    ) -> None:
+        """Revert an in_progress claim back to queued (#1906).
+
+        Called when post-commit ``provision_worker`` fails with a
+        cap-exceeded error. Drops the active node execution row that
+        the claim mutate inserted and stamps the task back to
+        ``queued`` so the next auto-claim tick can re-pick it.
+
+        Best-effort: any DB error is logged and swallowed because the
+        provision exception in ``last_provision_error`` is the primary
+        operator signal. Without the rollback the task is silently
+        wedged; with a failed rollback the operator still sees the
+        provision error and can run ``pm task release`` manually.
+        """
+        now = _now()
+        try:
+            self._commit(
+                lambda: (
+                    self.service._conn.execute(
+                        "UPDATE work_tasks SET work_status = ?, "
+                        "updated_at = ? "
+                        "WHERE project = ? AND task_number = ?",
+                        (
+                            WorkStatus.QUEUED.value,
+                            now,
+                            task.project,
+                            task.task_number,
+                        ),
+                    ),
+                    self.service._conn.execute(
+                        "UPDATE work_node_executions SET status = ?, "
+                        "ended_at = ? "
+                        "WHERE task_project = ? AND task_number = ? "
+                        "AND node_id = ? AND status = ?",
+                        (
+                            ExecutionStatus.ABANDONED.value,
+                            now,
+                            task.project,
+                            task.task_number,
+                            node_id,
+                            ExecutionStatus.ACTIVE.value,
+                        ),
+                    ),
+                    self.service._record_transition(
+                        task.project,
+                        task.task_number,
+                        WorkStatus.IN_PROGRESS.value,
+                        WorkStatus.QUEUED.value,
+                        actor,
+                    ),
+                )
+            )
+            logger.warning(
+                "claim rollback: %s/%d returned to queued after "
+                "post-commit provision failure (%s)",
+                task.project, task.task_number, exc,
+            )
+        except Exception as rollback_exc:  # noqa: BLE001
+            logger.warning(
+                "claim rollback failed for %s/%d: %s (task remains "
+                "in_progress; operator must release manually)",
+                task.project, task.task_number, rollback_exc,
+            )
 
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:
         task = self.service.get(task_id)

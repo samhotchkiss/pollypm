@@ -64,17 +64,28 @@ from pollypm.storage.doctor_state_probes import (
 __path__ = [str(Path(__file__).resolve().with_name("doctor"))]
 
 
-def _pg_mode_active() -> bool:
+def _pg_mode_active(config: "PollyPMConfig | None" = None) -> bool:
     """Return True when the resolved storage backend is Postgres.
 
     Cheap probe used to short-circuit sqlite-flavored checks during
     the pg cutover (#1810). Failure to resolve the backend returns
     ``False`` — the legacy sqlite path stays the default.
+
+    #1905: forward the same resolved config the migration probes use
+    (``_doctor_config_or_none``) so an alt-config probe — or a test
+    that monkeypatches the loader to ``None`` to force the sqlite
+    path — isn't silently diverted to the host's default pg pool.
     """
     try:
         from pollypm.storage._backend_dispatch import is_pg_backend
 
-        return is_pg_backend()
+        if config is None:
+            config = _doctor_config_or_none()
+            if config is None:
+                # No resolvable config in scope — stay on the sqlite
+                # path so alt-config / test seams keep working.
+                return False
+        return is_pg_backend(config)
     except Exception:  # noqa: BLE001 — defensive
         return False
 
@@ -658,13 +669,21 @@ def _latest_pg_migration_version() -> int | None:
         return None
 
 
-def _applied_pg_schema_version() -> int | None:
-    """``MAX(version)`` from pg's ``schema_migrations`` table, or ``None``."""
+def _applied_pg_schema_version(
+    config: "PollyPMConfig | None" = None,
+) -> int | None:
+    """``MAX(version)`` from pg's ``schema_migrations`` table, or ``None``.
+
+    #1905: accepts the resolved doctor config so alt-config probes
+    (and tests that pin the config seam) read the same pg pool the
+    rest of the doctor check is reasoning about — not the host default.
+    """
     try:
         from pollypm.storage.doctor_state_probes import applied_schema_version_ro
     except Exception:  # noqa: BLE001
         return None
-    config = _doctor_config_or_none()
+    if config is None:
+        config = _doctor_config_or_none()
     if config is None:
         return None
     # The pg branch ignores ``db_path``; pass a dummy path so the
@@ -672,12 +691,19 @@ def _applied_pg_schema_version() -> int | None:
     return applied_schema_version_ro(Path("/dev/null"), "schema_migrations", config=config)
 
 
-def _pg_state_migrations_probe() -> CheckResult:
-    """pg-mode counterpart to :func:`check_state_migrations`."""
+def _pg_state_migrations_probe(
+    config: "PollyPMConfig | None" = None,
+) -> CheckResult:
+    """pg-mode counterpart to :func:`check_state_migrations`.
+
+    #1905: ``config`` flows in from the caller so the probe inspects
+    the same backend the caller already decided was pg — instead of
+    silently re-resolving against the host default.
+    """
     latest = _latest_pg_migration_version()
     if latest is None:
         return _skip("state migration check skipped (pg migrations list empty)")
-    applied = _applied_pg_schema_version()
+    applied = _applied_pg_schema_version(config=config)
     if applied is None:
         return _skip(
             "state migration check skipped (pg schema_migrations unreadable)"
@@ -706,16 +732,21 @@ def _pg_state_migrations_probe() -> CheckResult:
     )
 
 
-def _pg_work_migrations_probe() -> CheckResult:
+def _pg_work_migrations_probe(
+    config: "PollyPMConfig | None" = None,
+) -> CheckResult:
     """In pg-mode the work schema is folded into ``schema_migrations``.
 
     Returns OK when the pg schema is at-head; a separate ``work``
     migration table doesn't exist on the pg backend (#1737).
+
+    #1905: takes the caller's resolved config so the pg pool lookup
+    matches the mode decision (no silent fallback to the host default).
     """
     latest = _latest_pg_migration_version()
     if latest is None:
         return _skip("work migration check skipped (pg migrations list empty)")
-    applied = _applied_pg_schema_version()
+    applied = _applied_pg_schema_version(config=config)
     if applied is None:
         return _skip(
             "work migration check skipped (pg schema_migrations unreadable)"
@@ -929,8 +960,12 @@ def check_state_migrations() -> CheckResult:
     # the storage facade instead of walking stale sqlite files. A
     # successful pg probe with the matching latest version returns OK;
     # anything else falls back to a benign skip with operator guidance.
-    if _pg_mode_active():
-        return _pg_state_migrations_probe()
+    # #1905 — resolve the doctor config once and thread it through both
+    # the mode decision and the probe so alt-config probes / test stubs
+    # aren't silently diverted to the host default pg pool.
+    config = _doctor_config_or_none()
+    if _pg_mode_active(config):
+        return _pg_state_migrations_probe(config=config)
     latest = _latest_state_migration_version()
     if latest is None:
         return _skip("state migration check skipped (no migrations defined)")
@@ -972,8 +1007,10 @@ def check_work_migrations() -> CheckResult:
     # #1810 — in pg-mode the work-schema lives in pg, not in the
     # legacy ``work_schema_version`` sqlite table. Skip the sqlite walk
     # and route to the pg probe.
-    if _pg_mode_active():
-        return _pg_work_migrations_probe()
+    # #1905 — same config-threading rationale as check_state_migrations.
+    config = _doctor_config_or_none()
+    if _pg_mode_active(config):
+        return _pg_work_migrations_probe(config=config)
     latest = _latest_work_migration_version()
     if latest is None:
         return _skip("work migration check skipped (no migrations defined)")
@@ -1691,7 +1728,7 @@ def check_doubled_pollypm_path() -> CheckResult:
     # all) but report it as a tiny, informational warn.
     if file_count == 0:
         return _fail(
-            f"empty ~/.pollypm/.pollypm/ directory (artifact)",
+            "empty ~/.pollypm/.pollypm/ directory (artifact)",
             why=(
                 "An empty doubled-path directory is a leftover scaffold "
                 "from a pre-fix config render. Removing it keeps grep / "

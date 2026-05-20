@@ -81,9 +81,9 @@ def _format_activity_relative(timestamp: str) -> str:
     if not timestamp:
         return "\u2014"
     try:
-        from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
-            format_relative_time,
-        )
+        # #1363: pulled from the shared protocol module so this file no
+        # longer depends on ``plugins_builtin`` for plain-text formatting.
+        from pollypm.activity_feed_protocol import format_relative_time
 
         return format_relative_time(timestamp)
     except Exception:  # noqa: BLE001
@@ -754,9 +754,9 @@ class PollyActivityFeedApp(App[None]):
             self.detail.display = False
             return
         try:
-            from pollypm.plugins_builtin.activity_feed.cockpit.feed_panel import (
-                render_entry_detail,
-            )
+            # #1363: shared renderer lives in the core protocol module so
+            # this surface no longer reaches into ``plugins_builtin``.
+            from pollypm.activity_feed_protocol import render_entry_detail
 
             text = render_entry_detail(entry)
         except Exception:  # noqa: BLE001

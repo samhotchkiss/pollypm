@@ -28,9 +28,18 @@ import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Iterable
 
 from pollypm.inbox.kind import InboxItemKind
+
+# Helpers consumed by core (``cockpit_ui``) now live in the shared
+# protocol module so disabling this plugin doesn't break the inbox's
+# Accept/Reject keybindings (#1363). Re-exported here so existing
+# callers keep working unchanged.
+from pollypm.project_planning_protocol import (  # noqa: F401
+    accept_proposal,
+    memkey_from_labels,
+)
 
 
 # Severity values accepted on a proposal. Kept deliberately short so the
@@ -151,14 +160,6 @@ def is_proposal_task(task) -> bool:
     return PROPOSAL_LABEL in labels
 
 
-def memkey_from_labels(labels: Iterable[str]) -> str | None:
-    """Pull the ``memkey:<hash>`` label off a task, if present."""
-    for label in labels or []:
-        if isinstance(label, str) and label.startswith("memkey:"):
-            return label.split(":", 1)[1]
-    return None
-
-
 def severity_from_labels(labels: Iterable[str]) -> str | None:
     for label in labels or []:
         if isinstance(label, str) and label.startswith("severity:"):
@@ -238,45 +239,7 @@ def filter_rejected(
 # ---------------------------------------------------------------------------
 # Accept helper — used by the cockpit UI
 # ---------------------------------------------------------------------------
-
-
-def accept_proposal(
-    service,
-    *,
-    task_id: str,
-    proposal_spec: dict[str, Any],
-    project_key: str,
-    actor: str = "user",
-):
-    """Create a follow-on work_tasks row for an accepted proposal.
-
-    Returns the newly-created :class:`Task`. The caller is expected to
-    archive the inbox row and record a ``proposal_accepted`` context
-    entry on it separately.
-    """
-    spec = proposal_spec or {}
-    title = (spec.get("title") or "").strip() or "Proposal follow-up"
-    description = (spec.get("description") or "").strip()
-    acceptance_criteria = spec.get("acceptance_criteria") or None
-    # The user-review flow has reviewer as ``actor_type: human``, so no
-    # ``reviewer=`` role assignment is needed. Previously this used the
-    # ``standard`` flow with ``reviewer=user`` — that's the savethenovel
-    # bug shape (``user`` is not an autonomous agent that can claim a
-    # role-typed review node). The user-review flow is the structurally
-    # correct way to express "worker implements, human reviews".
-    task = service.create(
-        title=title,
-        description=description,
-        type="task",
-        project=project_key,
-        flow_template="user-review",
-        roles={"worker": "worker", "requester": "user"},
-        priority="normal",
-        created_by=actor,
-        acceptance_criteria=acceptance_criteria,
-        labels=["from_proposal", f"project:{project_key}"],
-    )
-    # Context entry on the ORIGINATING inbox task is the caller's job
-    # (``task_id`` above) — that way they can use their own service
-    # handle and keep transaction boundaries obvious.
-    return task
+#
+# Implementation moved to :mod:`pollypm.project_planning_protocol` (#1363)
+# so the cockpit can call it without importing from ``plugins_builtin``.
+# Re-exported at the top of this module for back-compat.

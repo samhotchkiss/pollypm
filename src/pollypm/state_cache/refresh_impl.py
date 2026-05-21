@@ -66,7 +66,39 @@ def build_refresh_fn(
     invokes per project. It loads the config fresh on every call so
     a config reload during a long-running cockpit picks up the new
     paths automatically.
+
+    PR #2026 review: the closure also memoises a single ``store``
+    (StateStore) across refresh calls and reuses it for the
+    heartbeat-prefetch path. Without this, every per-project refresh
+    would build a fresh ``Supervisor(load_config(DEFAULT_CONFIG_PATH))``
+    inside :func:`_heartbeats_for_sessions` — heavy supervisor/store
+    setup on the cache's hot path, AND wrong-config when the cockpit
+    was launched against a non-default config. The cached store is
+    keyed by ``id(config)``: a config reload (new instance) drops the
+    old store and lazily opens a new one against the active config.
     """
+
+    # Cached (id(config), store) tuple. ``id(config)`` flips when the
+    # provider returns a freshly-loaded config object, so a reload
+    # transparently invalidates this slot without an explicit hook.
+    cached_store: dict[str, Any] = {"config_id": None, "store": None}
+
+    def _store_for(config: Any) -> Any | None:
+        """Return a StateStore for ``config``, reused across refreshes."""
+
+        try:
+            current_id = id(config)
+        except Exception:  # noqa: BLE001
+            return None
+        if (
+            cached_store["store"] is not None
+            and cached_store["config_id"] == current_id
+        ):
+            return cached_store["store"]
+        store = _open_store(config)
+        cached_store["config_id"] = current_id
+        cached_store["store"] = store
+        return store
 
     def _refresh(project_key: str) -> ProjectStateCacheEntry | None:
         try:
@@ -79,13 +111,51 @@ def build_refresh_fn(
                 exc_info=True,
             )
             return empty_entry(project_key)
-        return compute_entry_for_project(project_key, config)
+        store = _store_for(config)
+        return compute_entry_for_project(project_key, config, store=store)
 
     return _refresh
 
 
+def _open_store(config: Any) -> Any | None:
+    """Open a :class:`StateStore` against ``config`` for heartbeat reads.
+
+    PR #2026 review: replaces the per-project
+    ``Supervisor(load_config(DEFAULT_CONFIG_PATH))`` init inside
+    :func:`_heartbeats_for_sessions`. We don't need the full
+    Supervisor — only ``store.latest_heartbeat(session_name)`` —
+    so we open the StateStore directly against the injected config's
+    ``state_db`` path. Read-only because the refresher never writes.
+    Failures degrade silently to ``None``; the heartbeat prefetch
+    then returns ``{}`` and the rail's direct fall-through covers
+    the gap.
+    """
+
+    try:
+        from pollypm.storage.state import StateStore
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "state_cache: StateStore import failed; "
+            "heartbeat prefetch disabled",
+            exc_info=True,
+        )
+        return None
+    try:
+        state_db = getattr(getattr(config, "project", None), "state_db", None)
+        if not state_db:
+            return None
+        return StateStore(state_db, readonly=True)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "state_cache: StateStore open failed; "
+            "heartbeat prefetch disabled",
+            exc_info=True,
+        )
+        return None
+
+
 def compute_entry_for_project(
-    project_key: str, config: Any,
+    project_key: str, config: Any, *, store: Any | None = None,
 ) -> ProjectStateCacheEntry:
     """Recompute the entry for ``project_key`` against ``config``.
 
@@ -118,7 +188,15 @@ def compute_entry_for_project(
     # so cockpit_rail can short-circuit its per-project ``latest_heartbeat()``
     # calls. Best-effort: failures degrade silently to an empty mapping
     # (the rail's fall-through path re-fetches direct).
-    latest_heartbeat_by_session = _heartbeats_for_sessions(live_workers)
+    # PR #2026 review: ``store`` is threaded from ``build_refresh_fn`` so
+    # we reuse a single StateStore across the refresh pass instead of
+    # building ``Supervisor(load_config(DEFAULT_CONFIG_PATH))`` per
+    # project. When called without a store (tests, ad-hoc callers) we
+    # skip the heartbeat prefetch entirely — the rail's direct fall-through
+    # covers the gap.
+    latest_heartbeat_by_session = _heartbeats_for_sessions(
+        live_workers, store=store,
+    )
 
     entry = ProjectStateCacheEntry(
         project_key=project_key,
@@ -344,6 +422,8 @@ def _categorize_and_rollup(
 
 def _heartbeats_for_sessions(
     live_workers: list[Any],
+    *,
+    store: Any | None = None,
 ) -> dict[str, Any]:
     """Return ``{session_name: HeartbeatRecord}`` for ``live_workers``.
 
@@ -355,37 +435,24 @@ def _heartbeats_for_sessions(
 
     The mapping is keyed by ``session.name`` (matching the rail's
     ``_session_name_for_item`` resolution path) — NOT by task identity.
+
+    PR #2026 review: ``store`` is passed in from
+    :func:`build_refresh_fn`, which memoises it across the entire
+    refresh pass and rebuilds only when the active config changes
+    (keyed by ``id(config)``). Previously this function built a
+    ``Supervisor(load_config(DEFAULT_CONFIG_PATH))`` per project,
+    which (a) reintroduced heavy supervisor/store setup on the very
+    hot path the cache exists to flatten, and (b) ignored the
+    injected config — a cockpit launched against a non-default config
+    would read heartbeats from the wrong workspace. With ``store=None``
+    we skip the prefetch and let the rail's direct fall-through
+    handle it (correct behaviour, just no perf win for that pass).
     """
 
-    if not live_workers:
-        return {}
-    try:
-        from pollypm.supervisor import Supervisor
-        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "state_cache: supervisor import failed; "
-            "skipping heartbeat prefetch",
-            exc_info=True,
-        )
-        return {}
-
-    try:
-        # Re-load the config; the cache refresher is the only consumer
-        # here, so the extra load is bounded to one per refresh-pass.
-        config = load_config(DEFAULT_CONFIG_PATH)
-        supervisor = Supervisor(config)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "state_cache: Supervisor init failed during heartbeat prefetch",
-            exc_info=True,
-        )
+    if not live_workers or store is None:
         return {}
 
     out: dict[str, Any] = {}
-    store = getattr(supervisor, "store", None)
-    if store is None:
-        return {}
     for session in live_workers:
         # Look up the session_name from the worker record. The session
         # naming convention is ``worker_<project>/<task_number>``; the

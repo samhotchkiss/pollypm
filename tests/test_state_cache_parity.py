@@ -649,12 +649,16 @@ class TestCountInboxTasksForLabelParity:
     def test_partial_cache_falls_through_to_direct(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Cache missing a tracked project → fall through.
+        """Cache missing a tracked project → fall through to direct sweep.
 
-        Otherwise we'd under-count any project that hasn't been
-        refreshed yet. (The fast-path in
-        :func:`pm_inbox_awaits_user_list` already does this; the
-        count helper inherits the same gate via the public wrapper.)
+        PR #2026 review: summing only the cached projects would
+        silently under-count any tracked project that hasn't been
+        refreshed yet (e.g. during the boot-time gap before the
+        initial-full-refresh completes). The gate is
+        ``known_projects.issubset(snapshot.keys())`` —
+        when ``False`` we MUST fall through so the direct sweep
+        covers the missing project, and the rail badge keeps showing
+        every awaits-user item.
         """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
@@ -668,16 +672,33 @@ class TestCountInboxTasksForLabelParity:
             ),
         }
         _seed_cache(monkeypatch, entries)
-        # The cache-routed count helper returns 1 (alpha only) — fine,
-        # because the next call into pm_inbox_awaits_user_list would
-        # fall through to the direct sweep. The contract is the same
-        # as PR 2: a partial cache still serves the cached values for
-        # the projects it knows about. We verify only that the count
-        # equals what the cache holds for known projects.
+
+        # Direct path returns BOTH projects' items (1 in alpha, 1 in
+        # beta). If the fast-path under-counts (the pre-fix bug) the
+        # helper would return 1 — alpha only — because beta isn't in
+        # the snapshot. With the issubset() gate the helper MUST fall
+        # through to the direct sweep and return 2.
+        direct_items = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+            _inbox_item(project="beta", source="task", ident="beta/2"),
+        ]
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(direct_items)
+
+        monkeypatch.setattr(
+            cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
+        )
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         counted = cockpit_inbox._count_inbox_tasks_for_label(config)
-        # alpha contributes 1; beta is missing → not summed via cache.
-        assert counted == 1
+        # Both projects counted because the fall-through ran the
+        # direct sweep — beta was NOT silently dropped.
+        assert counted == 2
+        # And the direct sweep was actually invoked (proof of
+        # fall-through, not the fast-path quietly returning 1).
+        assert direct_called["n"] >= 1
 
 
 # ── Move A PR 3 parity — load_operator_view_from_config cache route ─

@@ -258,6 +258,13 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
         return None
 
     known_projects = set(getattr(config, "projects", {}).keys())
+    # Partial-cache guard (PR #2026 review): any tracked project missing
+    # from the snapshot would be silently dropped from ``cached_items``,
+    # causing the rail badge + count helper that falls through here to
+    # under-report. Fall through to the direct sweep so the missing
+    # project's items are included.
+    if not known_projects.issubset(snapshot.keys()):
+        return None
     cached_items: list[object] = []
     for project_key, entry in snapshot.items():
         if project_key not in known_projects:
@@ -424,9 +431,10 @@ def _count_inbox_tasks_for_label(config) -> int:
     ``entry.awaits_user_count`` across the snapshot directly. The
     snapshot read is O(N projects) and skips the workspace-wide pg
     sweep entirely. Falls through to ``len(pm_inbox_awaits_user_list)``
-    on cold / partial cache so the three-surfaces-one-predicate
-    invariant still holds (the public helper itself routes through
-    the same cache when populated).
+    on cold OR partial cache (any tracked project missing from the
+    snapshot) so the three-surfaces-one-predicate invariant still
+    holds (the public helper itself routes through the same cache
+    when populated).
     """
     cached = _maybe_cache_count_awaits_user(config)
     if cached is not None:
@@ -441,6 +449,14 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     cold cache, or any unexpected failure → ``None`` so the caller
     falls back to the direct path. Skips the workspace-wide sweep
     when the cache is authoritative for every tracked project.
+
+    Partial-cache fall-through (PR #2026 review): if any tracked
+    project in ``config.projects`` is missing from the cache snapshot
+    we MUST return ``None`` so the caller runs the direct sweep.
+    Summing only the projects that happen to be cached would
+    under-count any tracked project that hasn't been refreshed yet —
+    the rail badge would silently drop work that's still waiting on
+    the user.
     """
 
     try:
@@ -457,6 +473,11 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     if not snapshot:
         return None
     known_projects = set(getattr(config, "projects", {}).keys())
+    # Partial-cache guard: a tracked project not yet refreshed into the
+    # cache would be silently omitted from the sum. Fall through to the
+    # direct path so the badge stays correct during the boot-time gap.
+    if not known_projects.issubset(snapshot.keys()):
+        return None
     total = 0
     for project_key, entry in snapshot.items():
         if project_key not in known_projects:

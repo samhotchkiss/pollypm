@@ -37,31 +37,50 @@ def _isolate_singletons():
     reset_for_test()
 
 
-def test_flag_default_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flag_default_is_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Move A PR 4 (#1664, design §6.4): default is now ON.
+
+    With no env var set, the cache is enabled. The env var stays as a
+    kill-switch — :func:`is_enabled` returns False only when it's
+    explicitly disabled (``0`` / ``false`` / ``no`` / ``off``).
+    """
     monkeypatch.delenv(ENV_FLAG, raising=False)
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
-@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
-def test_truthy_values_enable_flag(
+@pytest.mark.parametrize(
+    "value", ["1", "true", "TRUE", "yes", "on", "", "  ", "garbage"]
+)
+def test_non_falsy_values_keep_cache_enabled(
     monkeypatch: pytest.MonkeyPatch, value: str,
 ) -> None:
+    """PR 4: only the explicit kill-switch values disable.
+
+    Empty string + whitespace + unknown values all leave the cache
+    enabled because the default is now ON.
+    """
     monkeypatch.setenv(ENV_FLAG, value)
     assert is_enabled() is True
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "  "])
-def test_falsy_values_disable_flag(
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off"])
+def test_kill_switch_values_disable_flag(
     monkeypatch: pytest.MonkeyPatch, value: str,
 ) -> None:
+    """PR 4: ``POLLYPM_STATE_CACHE=0`` (and siblings) still disables.
+
+    Kept for one release per design §6.4 so an emergency rollback is
+    a process restart with the env var set.
+    """
     monkeypatch.setenv(ENV_FLAG, value)
     assert is_enabled() is False
 
 
-def test_get_cache_returns_shim_when_off(
+def test_get_cache_returns_shim_when_killswitch_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(ENV_FLAG, raising=False)
+    """With ``POLLYPM_STATE_CACHE=0`` the shim cache is returned."""
+    monkeypatch.setenv(ENV_FLAG, "0")
     cache = get_cache()
     assert cache.get("alpha") is None
     assert cache.snapshot() == {}
@@ -72,6 +91,22 @@ def test_get_cache_returns_shim_when_off(
     cache.invalidate(None)
     # No refresher gets created in shim mode.
     assert get_refresher() is None
+
+
+def test_get_cache_returns_real_cache_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 4 default: with no env var set, the real cache + refresher come up."""
+    monkeypatch.delenv(ENV_FLAG, raising=False)
+    cache = get_cache()
+    try:
+        assert isinstance(cache, ProjectStateCache)
+        # Refresher came up alongside the cache.
+        refresher = get_refresher()
+        assert refresher is not None
+        assert refresher.running
+    finally:
+        reset_for_test()
 
 
 def test_get_cache_returns_real_cache_when_on(
@@ -101,7 +136,8 @@ def test_get_cache_is_idempotent_singleton(
 def test_shim_singleton_is_stable_across_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(ENV_FLAG, raising=False)
+    """The shim is shared when the kill-switch is set."""
+    monkeypatch.setenv(ENV_FLAG, "0")
     a = get_cache()
     b = get_cache()
     assert a is b
@@ -204,6 +240,74 @@ def test_singleton_wires_project_keys_provider_for_initial_refresh(
         assert set(snapshot.keys()) == {"alpha", "beta", "gamma"}
     finally:
         reset_for_test()
+
+
+# ── Move A PR 4 — divergence sampler is no-op when cache authoritative ──
+
+
+class TestPr4DivergenceSamplerNoop:
+    """PR 4 (#1664, design §6.4): sampler is silent when flag default applies.
+
+    The parity-debugging window is over — the cache is authoritative
+    when the kill-switch is not set. The sampler MUST NOT pay the
+    cost of running the direct path alongside the cache.
+    """
+
+    def test_sampler_is_silent_by_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No env var → cache is authoritative → sampler returns False."""
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        monkeypatch.delenv(ENV_FLAG, raising=False)
+        counter = DivergenceCounter(rate=1)
+        # Even at rate=1, the sampler stays silent because the cache
+        # is the default-on authoritative source.
+        for _ in range(50):
+            assert counter.should_sample() is False
+
+    def test_sampler_is_silent_when_flag_explicitly_on(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``POLLYPM_STATE_CACHE=1`` → cache authoritative → no samples."""
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        monkeypatch.setenv(ENV_FLAG, "1")
+        counter = DivergenceCounter(rate=1)
+        for _ in range(50):
+            assert counter.should_sample() is False
+
+    def test_sampler_runs_when_killswitch_set(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Kill-switch set → operator debugging cache vs direct.
+
+        The sampler still runs at its 1-in-N cadence so an operator
+        who flipped the kill-switch can see parity warnings if their
+        suspicion was right. (In practice this also means the
+        kill-switch's "fall back to direct" branch keeps emitting the
+        same divergence telemetry shape PR 2 introduced.)
+        """
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        monkeypatch.setenv(ENV_FLAG, "0")
+        counter = DivergenceCounter(rate=3)
+        # 1, 2 → no; 3 → yes; 4, 5 → no; 6 → yes.
+        results = [counter.should_sample() for _ in range(6)]
+        assert results == [False, False, True, False, False, True]
+
+    def test_always_override_ignores_killswitch(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``always=True`` is the test-only escape hatch for parity tests."""
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        # Even with the cache authoritative (default), always=True
+        # makes the sampler fire at every Nth call.
+        monkeypatch.delenv(ENV_FLAG, raising=False)
+        counter = DivergenceCounter(rate=2, always=True)
+        results = [counter.should_sample() for _ in range(4)]
+        assert results == [False, True, False, True]
 
 
 def test_singleton_provider_degrades_gracefully_on_config_failure(

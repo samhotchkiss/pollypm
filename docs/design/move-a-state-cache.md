@@ -9,8 +9,17 @@ The shipped Move A behavior diverges from the original design in three places. T
 - `_maybe_cache_route_awaits_user` / `_maybe_cache_count_awaits_user` decline when the workspace-root inbox has any open message (via `has_workspace_root_open_messages` probe). Workspace-root inbox isn't yet represented in cache entries. Tracked in [#2051](https://github.com/samhotchkiss/pollypm/issues/2051).
 
 Design document for issue [#1664](https://github.com/samhotchkiss/pollypm/issues/1664).
-Status: **proposed** (design only; implementation deferred to post-RC).
+Status: **implemented** (2026-05-20) — PR 1 #2000, PR 2 #2016, PR 3 #2026, PR 4 #2027.
 Authors: Sam, with research from the 2026-05-18 rail-perf review on [#1634](https://github.com/samhotchkiss/pollypm/issues/1634).
+
+> **Implementation note (2026-05-20):** The four-PR rollout from §6
+> landed over the 2026-05-19 → 2026-05-20 window. `POLLYPM_STATE_CACHE`
+> now defaults **ON**; the env var stays as a kill-switch
+> (`POLLYPM_STATE_CACHE=0` falls back to direct paths for one release).
+> The 2s `_project_categorizations` TTL was removed (§9.5). The
+> divergence sampler from PR 2 is silent when the cache is
+> authoritative (kill-switch not set) — the parity-debugging window
+> closed with PR 4.
 
 > **Note (2026-05-19, pre-PR-1):** This doc was written 2026-05-18, before
 > the postgres cutover (#1737) completed. Where the prose says "sqlite open"
@@ -420,10 +429,14 @@ Effort: ~0.5d.
 
 Effort: ~0.5d.
 
-- `POLLYPM_STATE_CACHE` default flips to **on**.
-- Leave the env var as a kill-switch for one release.
+- `POLLYPM_STATE_CACHE` default flips to **on**. ✅ Shipped #2027.
+- Leave the env var as a kill-switch for one release. ✅ Kept.
 - After two weeks of green production telemetry, remove the shim path and
-  the direct-DB fallbacks in the routed call sites.
+  the direct-DB fallbacks in the routed call sites. ⏳ Deferred — tracked
+  as a follow-up after 14-day production observation.
+- Divergence sampler from PR 2 is no-op when cache is authoritative
+  (kill-switch not set). The sampler only emits parity warnings if an
+  operator explicitly flips the kill-switch. ✅ Shipped #2027.
 
 ### 6.5 Rollback
 

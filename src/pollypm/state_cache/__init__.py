@@ -76,18 +76,32 @@ __all__ = [
 
 
 def _flag_truthy(raw: str | None) -> bool:
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _flag_falsy(raw: str | None) -> bool:
     if raw is None:
         return False
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
+    return raw.strip().lower() in {"0", "false", "no", "off"}
 
 
 def is_enabled() -> bool:
     """Return True iff the cache is enabled by env at call time.
 
-    Default OFF. PR 4 will flip this default after telemetry.
+    Move A PR 4 (#1664, design §6.4): default is now **ON**. The env
+    var stays as a kill-switch — ``POLLYPM_STATE_CACHE=0`` (or any
+    other falsy spelling: ``false`` / ``no`` / ``off``) still
+    disables for one release. PR 1-3 callers all preserve a
+    flag-off fall-through, so an emergency rollback is a process
+    restart with the kill-switch set.
+
+    Unset / empty / unknown values → enabled.
     """
 
-    return _flag_truthy(os.environ.get(ENV_FLAG))
+    raw = os.environ.get(ENV_FLAG)
+    if _flag_falsy(raw):
+        return False
+    return True
 
 
 # ── shim — used when the flag is off ───────────────────────────────

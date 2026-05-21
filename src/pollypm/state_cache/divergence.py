@@ -52,20 +52,45 @@ class DivergenceCounter:
     call after construction does NOT sample (we want the sample to
     land mid-cycle, not on cold start when the cache is empty by
     construction and a divergence would be expected).
+
+    Move A PR 4 (#1664, design §6.4): the parity-debugging window is
+    over once the flag default flips to ON — the cache is now the
+    authoritative source. :meth:`should_sample` returns False
+    whenever the kill-switch is NOT set (i.e. cache is the default),
+    so routed call sites stop paying the cost of running the direct
+    path alongside the cache. Tests pin the always-sample path by
+    constructing a counter with ``always=True`` or by setting the
+    kill-switch env var.
     """
 
-    __slots__ = ("_rate", "_counter", "_lock")
+    __slots__ = ("_rate", "_counter", "_lock", "_always")
 
-    def __init__(self, rate: int = DIVERGENCE_SAMPLE_RATE) -> None:
+    def __init__(
+        self, rate: int = DIVERGENCE_SAMPLE_RATE, *, always: bool = False,
+    ) -> None:
         if rate < 1:
             raise ValueError(f"sample rate must be >= 1, got {rate!r}")
         self._rate = rate
         self._counter = 0
         self._lock = threading.Lock()
+        # Test override: when set, ``should_sample`` ignores the
+        # PR 4 "no-op when cache authoritative" suppression and
+        # samples every Nth call as before. Production code never
+        # passes this — only PR 2's parity tests do.
+        self._always = always
 
     def should_sample(self) -> bool:
-        """Return True every Nth call. Thread-safe."""
+        """Return True every Nth call. Thread-safe.
 
+        Move A PR 4: returns False whenever the cache is
+        authoritative (kill-switch not set). Pass ``always=True`` at
+        construction to force the legacy always-sample behavior for
+        tests.
+        """
+
+        if not self._always and not _kill_switch_set():
+            # Cache is authoritative — skip the parity sample.
+            return False
         with self._lock:
             self._counter += 1
             # Sample the Nth call (not the 1st) so cold-start traffic
@@ -77,6 +102,28 @@ class DivergenceCounter:
 
         with self._lock:
             self._counter = 0
+
+
+def _kill_switch_set() -> bool:
+    """Return True iff ``POLLYPM_STATE_CACHE`` is set to a falsy value.
+
+    Move A PR 4: the cache default flipped to ON, so the divergence
+    sampler is silent EXCEPT when the operator has explicitly set
+    the kill-switch. That's the only condition under which we still
+    care about parity telemetry — the operator is presumably
+    debugging a cache vs direct mismatch, and we want both paths to
+    run + compare while they triage.
+
+    Defined locally (no import from ``pollypm.state_cache``) to
+    avoid the leaf-module circular import.
+    """
+
+    import os
+
+    raw = os.environ.get("POLLYPM_STATE_CACHE")
+    if raw is None:
+        return False
+    return raw.strip().lower() in {"0", "false", "no", "off"}
 
 
 # ── comparison helpers ─────────────────────────────────────────────

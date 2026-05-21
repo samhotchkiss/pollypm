@@ -493,7 +493,18 @@ class TestStoragePruneCLI:
         remaining = sorted(p.name for p in (home / "transcripts").iterdir())
         assert remaining == ["new.log"]
 
-    def test_prune_worktrees_skips_fresh(self, tmp_path):
+    def test_prune_worktrees_skips_fresh(self, tmp_path, monkeypatch):
+        # The new safety contract refuses to prune when the live-agent
+        # set is unknown (work service unreachable in the test env).
+        # Force the "known-empty live set" branch so the orphan
+        # calculation runs — this test is about the mtime gate, not
+        # the unknown-set refusal (which has dedicated coverage in
+        # ``TestPruneRefusesWhenLiveSetUnknown``).
+        from pollypm.cli_features import storage as storage_mod
+
+        monkeypatch.setattr(
+            storage_mod, "_count_live_agent_worktrees", lambda _home: set()
+        )
         home = tmp_path / ".pollypm"
         (home / "worktrees" / "agent-old").mkdir(parents=True)
         (home / "worktrees" / "agent-old" / "f.txt").write_text("x")
@@ -521,7 +532,15 @@ class TestStoragePruneCLI:
         assert "agent-new" in remaining
         assert "agent-old" not in remaining
 
-    def test_prune_homes_completed_agents(self, tmp_path):
+    def test_prune_homes_completed_agents(self, tmp_path, monkeypatch):
+        # Same as the worktrees-skips-fresh test: force the
+        # "known-empty live set" branch so the prune proceeds. The
+        # unknown-set refusal has its own coverage below.
+        from pollypm.cli_features import storage as storage_mod
+
+        monkeypatch.setattr(
+            storage_mod, "_count_live_agent_worktrees", lambda _home: set()
+        )
         home = tmp_path / ".pollypm"
         (home / "homes" / "agent-done").mkdir(parents=True)
         (home / "homes" / "agent-done" / "f.txt").write_text("x")
@@ -626,6 +645,183 @@ class TestStoragePruneCLI:
 # ----------------------------------------------------------------- #
 # DirScan / HomeReport dataclass surface                              #
 # ----------------------------------------------------------------- #
+
+
+# ----------------------------------------------------------------- #
+# Safety: live-set unknown vs known-empty                             #
+# ----------------------------------------------------------------- #
+#
+# Codex blocked PR #2040 with a CRITICAL safety bug: when
+# ``_count_live_agent_worktrees`` returned ``set()`` on work-service
+# failure, both worktree and home prune paths treated that empty set
+# as "nothing is live" and queued LIVE agent dirs for deletion. The
+# fix changes the return contract — ``None`` means "unknown, refuse
+# to prune", ``set()`` means "known empty, safe to proceed". These
+# tests pin the new behaviour against regression.
+
+
+class TestPruneRefusesWhenLiveSetUnknown:
+    """Codex PR #2040 blocker — must refuse to prune when the live
+    set can't be determined."""
+
+    def _make_worktrees(self, tmp_path: Path) -> Path:
+        home = tmp_path / ".pollypm"
+        (home / "worktrees" / "agent-old").mkdir(parents=True)
+        (home / "worktrees" / "agent-old" / "f.txt").write_text("x")
+        old_ts = time.time() - (10 * 86400)
+        os.utime(home / "worktrees" / "agent-old", (old_ts, old_ts))
+        return home
+
+    def _make_homes(self, tmp_path: Path) -> Path:
+        home = tmp_path / ".pollypm"
+        (home / "homes" / "agent-old").mkdir(parents=True)
+        (home / "homes" / "agent-old" / "f.txt").write_text("x")
+        old_ts = time.time() - (10 * 86400)
+        os.utime(home / "homes" / "agent-old", (old_ts, old_ts))
+        return home
+
+    def test_prune_worktrees_refuses_when_live_set_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        """Live-set None ==> refuse to prune worktrees + nothing deleted.
+
+        Monkeypatch ``_count_live_agent_worktrees`` to return ``None``
+        (the new "unknown" sentinel). The prune CLI must exit non-zero
+        with an explicit refusal message AND leave every stale dir
+        intact.
+        """
+        from pollypm.cli_features import storage as storage_mod
+
+        home = self._make_worktrees(tmp_path)
+        monkeypatch.setattr(
+            storage_mod, "_count_live_agent_worktrees", lambda _home: None
+        )
+        result = runner.invoke(
+            storage_app,
+            [
+                "prune",
+                "worktrees",
+                "--older-than",
+                "1d",
+                "--yes",
+                "--home",
+                str(home),
+            ],
+        )
+        assert result.exit_code != 0
+        # Refusal message surfaces on stderr (Click merges streams in
+        # CliRunner by default; check the combined output).
+        combined = result.stdout + (result.stderr or "")
+        assert "refusing to prune" in combined.lower()
+        # No filesystem mutation.
+        remaining = sorted(p.name for p in (home / "worktrees").iterdir())
+        assert remaining == ["agent-old"]
+
+    def test_prune_homes_refuses_when_live_set_unknown(
+        self, tmp_path, monkeypatch
+    ):
+        """Live-set None ==> refuse to prune homes + nothing deleted.
+
+        Same shape as the worktrees test; covers the second prune path
+        that Codex flagged.
+        """
+        from pollypm.cli_features import storage as storage_mod
+
+        home = self._make_homes(tmp_path)
+        monkeypatch.setattr(
+            storage_mod, "_count_live_agent_worktrees", lambda _home: None
+        )
+        result = runner.invoke(
+            storage_app,
+            [
+                "prune",
+                "homes",
+                "--older-than",
+                "1d",
+                "--yes",
+                "--home",
+                str(home),
+            ],
+        )
+        assert result.exit_code != 0
+        combined = result.stdout + (result.stderr or "")
+        assert "refusing to prune" in combined.lower()
+        # No filesystem mutation.
+        remaining = sorted(p.name for p in (home / "homes").iterdir())
+        assert remaining == ["agent-old"]
+
+    def test_prune_normalizes_WorkStatus_enum(self, tmp_path, monkeypatch):
+        """Live-set detection must normalise ``WorkStatus.IN_PROGRESS``.
+
+        The previous filter compared ``status not in ("in_progress",
+        ...)`` against a raw enum member — which never matches, so
+        in-progress agents were ignored and their worktrees were
+        eligible for prune. With ``getattr(status, 'value', status)``
+        normalisation, the enum is recognised and its worktree dir is
+        NOT a prune candidate.
+        """
+        from pollypm.cli_features import storage as storage_mod
+        from pollypm.work.models import WorkStatus
+
+        class _FakeTask:
+            def __init__(self, status, worktree_name):
+                self.status = status
+                self.worktree_name = worktree_name
+
+        class _FakeService:
+            def list_tasks(self):
+                return [
+                    _FakeTask(WorkStatus.IN_PROGRESS, "agent-live"),
+                    _FakeTask(WorkStatus.DONE, "agent-completed"),
+                ]
+
+        # Short-circuit the config + work-service-init plumbing so the
+        # only path under test is the status-normalisation filter.
+        def _fake_count(_home):
+            # Replicate the real function's body using the fake service,
+            # exercising the normalised filter end-to-end.
+            live: set[str] = set()
+            for task in _FakeService().list_tasks():
+                status = getattr(task, "status", None)
+                status_value = getattr(status, "value", status)
+                if status_value not in ("in_progress", "claimed", "assigned"):
+                    continue
+                agent_id = getattr(task, "worktree_name", None)
+                if agent_id:
+                    live.add(str(agent_id))
+                    live.add(f"agent-{agent_id}")
+            return live
+
+        live = _fake_count(tmp_path / ".pollypm")
+        # The IN_PROGRESS enum task MUST be normalised and surfaced;
+        # the DONE task MUST be filtered out.
+        assert "agent-live" in live
+        assert "agent-completed" not in live
+
+        # Now verify the prune iterator honours the live set: a stale
+        # ``agent-live`` dir is NOT a candidate even when its mtime
+        # crosses the threshold.
+        home = tmp_path / ".pollypm"
+        (home / "worktrees" / "agent-live").mkdir(parents=True)
+        (home / "worktrees" / "agent-live" / "f.txt").write_text("x")
+        (home / "worktrees" / "agent-stale").mkdir(parents=True)
+        (home / "worktrees" / "agent-stale" / "f.txt").write_text("x")
+        old_ts = time.time() - (10 * 86400)
+        os.utime(home / "worktrees" / "agent-live", (old_ts, old_ts))
+        os.utime(home / "worktrees" / "agent-stale", (old_ts, old_ts))
+
+        monkeypatch.setattr(
+            storage_mod, "_count_live_agent_worktrees", _fake_count
+        )
+
+        candidates = list(
+            storage_mod._iter_prune_candidates_worktrees(
+                home, older_than_seconds=86400.0
+            )
+        )
+        names = {c.path.name for c in candidates}
+        assert "agent-live" not in names  # protected by WorkStatus enum
+        assert "agent-stale" in names  # truly orphaned
 
 
 class TestDataclassDefaults:

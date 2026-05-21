@@ -1080,31 +1080,46 @@ def _scan_config_files(root: Path) -> tuple[int, int, float | None]:
     return (count, total, newest)
 
 
-def _count_live_agent_worktrees(home: Path) -> set[str]:
+def _count_live_agent_worktrees(home: Path) -> set[str] | None:
     """Return the set of worktree dir names that have a live agent task.
 
     Best-effort: reads ``~/.pollypm/worktrees/`` and matches each
-    directory name against in-progress work-service tasks. When the
-    work service can't be reached (no config, no pg, etc.) we return
-    an empty set and the caller treats EVERY stale worktree as
-    potentially orphaned — the safer default for a visibility tool.
+    directory name against in-progress work-service tasks.
 
-    Returns dir basenames (not full paths) so the orphan check is a
-    cheap set membership test.
+    Return contract (issue: Codex blocker on PR #2040 — distinguishing
+    "live set unknown" from "known empty live set" is a SAFETY
+    requirement, because the prune paths must REFUSE to delete when the
+    live set is unknown):
+
+    * ``None`` — live-agent detection FAILED (config missing, work
+      service module unimportable, listing raised, etc.). Callers that
+      delete dirs (``_iter_prune_candidates_worktrees`` /
+      ``_iter_prune_candidates_homes``) MUST refuse to prune in this
+      case — otherwise an unreachable work service would cause every
+      stale ``agent-*`` dir to be treated as orphaned and deleted.
+    * ``set()`` — work service reachable but reports no in-progress
+      agent tasks. Safe to proceed with orphan calculation: any stale
+      dir really is orphaned.
+    * ``{agent_id, ...}`` — populated live set. Standard orphan
+      calculation applies.
+
+    The visibility-only callers (``scan_pollypm_home`` /
+    ``_count_orphan_worktrees``) MAY treat ``None`` as ``set()`` since
+    they only render advisory NOTES, never mutate the filesystem.
     """
     try:
         from pollypm.config import resolve_config_path, load_config
         from pollypm.work.service_factory import get_default_work_service
-    except Exception:  # noqa: BLE001 — module missing == treat as no live agents
-        return set()
+    except Exception:  # noqa: BLE001 — module missing == live set unknown
+        return None
     try:
         cfg_path = resolve_config_path(DEFAULT_CONFIG_PATH)
         if not cfg_path.exists():
-            return set()
+            return None
         cfg = load_config(cfg_path)
         service = get_default_work_service(cfg)
-    except Exception:  # noqa: BLE001
-        return set()
+    except Exception:  # noqa: BLE001 — service-init failure == unknown
+        return None
 
     live: set[str] = set()
     try:
@@ -1114,10 +1129,16 @@ def _count_live_agent_worktrees(home: Path) -> set[str]:
         # agent task may be tagged ``agent-<id>`` or just ``<id>``.
         list_tasks = getattr(service, "list_tasks", None)
         if list_tasks is None:
-            return set()
+            return None
         for task in list_tasks():
             status = getattr(task, "status", None)
-            if status not in ("in_progress", "claimed", "assigned"):
+            # Normalize ``WorkStatus`` enum -> its ``.value`` string so
+            # active tasks represented as ``WorkStatus.IN_PROGRESS``
+            # are recognised; without this they'd fall through the
+            # filter and their worktrees would be eligible for prune
+            # (Codex PR #2040 blocker).
+            status_value = getattr(status, "value", status)
+            if status_value not in ("in_progress", "claimed", "assigned"):
                 continue
             agent_id = (
                 getattr(task, "worktree_name", None)
@@ -1127,8 +1148,8 @@ def _count_live_agent_worktrees(home: Path) -> set[str]:
             if agent_id:
                 live.add(str(agent_id))
                 live.add(f"agent-{agent_id}")
-    except Exception:  # noqa: BLE001 — fall back to "nothing known live"
-        return set()
+    except Exception:  # noqa: BLE001 — listing failed == unknown
+        return None
     return live
 
 
@@ -1215,7 +1236,12 @@ def scan_pollypm_home(home: Path | None = None) -> HomeReport:
     if not home.is_dir():
         return report
 
-    live_names = _count_live_agent_worktrees(home)
+    # Visibility-only path: treat "unknown" (None) as "no known live"
+    # for the orphan-NOTES badge. The report never deletes; rendering
+    # NOTES against an empty live set just over-flags rather than
+    # under-flags, which is the safe direction here. The prune paths
+    # below have a separate refuse-on-unknown gate.
+    live_names = _count_live_agent_worktrees(home) or set()
     stale_seconds = _ORPHAN_WORKTREE_STALE_DAYS * 86400.0
 
     for name in _HOME_SUBDIRS:
@@ -1586,6 +1612,20 @@ def _iter_prune_candidates_transcripts(
             continue
 
 
+class _LiveSetUnknownError(RuntimeError):
+    """Raised when prune is asked to enumerate worktree/home candidates
+    but ``_count_live_agent_worktrees`` returned ``None`` (live-agent
+    detection failed).
+
+    The CLI surface (``storage_prune``) catches this and exits non-zero
+    with a clear "refusing to prune" message. The point is to never let
+    "I don't know what's live" silently degrade to "nothing is live" —
+    the latter would treat every stale ``agent-*`` dir as orphaned and
+    delete LIVE agents' work on a machine whose work service is briefly
+    unreachable (Codex PR #2040 blocker).
+    """
+
+
 def _iter_prune_candidates_worktrees(
     home: Path, *, older_than_seconds: float
 ) -> Iterable[_PruneCandidate]:
@@ -1600,8 +1640,19 @@ def _iter_prune_candidates_worktrees(
        call site: ``--older-than 1d`` matches the standard orphan
        definition, but the operator can pass ``--older-than 7d``
        for a more conservative sweep).
+
+    REFUSES TO ENUMERATE (raises ``_LiveSetUnknownError``) when
+    ``_count_live_agent_worktrees`` returns ``None`` — see that
+    function's docstring for the safety contract. An empty *known*
+    live set is fine (the work service is reachable, just no active
+    agents); an *unknown* live set must not be silently treated the
+    same way.
     """
     live_names = _count_live_agent_worktrees(home)
+    if live_names is None:
+        raise _LiveSetUnknownError(
+            "live-agent detection failed — refusing to prune worktrees"
+        )
     for path in _iter_orphan_worktree_paths(
         home,
         live_names=live_names,
@@ -1621,12 +1672,21 @@ def _iter_prune_candidates_homes(
 
     Same orphan-detection plumbing as worktrees: a ``homes/agent-<id>``
     dir is prune-eligible only if no in-progress task references it
-    AND it has been idle longer than ``older_than_seconds``. The
-    work-service lookup gracefully degrades to "no known live agents"
-    when the service is unreachable, which means a misconfigured
-    machine gets nothing pruned (the safer default).
+    AND it has been idle longer than ``older_than_seconds``.
+
+    REFUSES TO ENUMERATE (raises ``_LiveSetUnknownError``) when the
+    live-agent set is unknown (work service unreachable, config
+    missing, listing raised). This matches the docstring's original
+    promise that "an unreachable service gets nothing pruned" — the
+    previous implementation contradicted that by returning ``set()``
+    on failure, which the orphan filter then treated as "no agents
+    are live" and queued every ``homes/agent-*`` dir for deletion.
     """
     live_names = _count_live_agent_worktrees(home)
+    if live_names is None:
+        raise _LiveSetUnknownError(
+            "live-agent detection failed — refusing to prune homes"
+        )
     # The homes dir name varies: ``homes/`` (current) and ``agent_homes/``
     # (legacy alias used by some plugins). Prune the modern one only —
     # the legacy alias would conflate with operator state if cleaned
@@ -1844,9 +1904,24 @@ def storage_prune(
         raise typer.Exit(code=0)
 
     iterator = _PRUNE_TARGETS[target]
-    candidates: list[_PruneCandidate] = list(
-        iterator(home_path, older_than_seconds=older_than_seconds)
-    )
+    try:
+        candidates: list[_PruneCandidate] = list(
+            iterator(home_path, older_than_seconds=older_than_seconds)
+        )
+    except _LiveSetUnknownError as exc:
+        # Live-agent detection failed (work service unreachable / config
+        # missing / listing raised). REFUSE to prune rather than let the
+        # caller silently treat an unknown live set as an empty one —
+        # the latter would delete LIVE agent directories. Codex PR
+        # #2040 blocker.
+        typer.echo(
+            f"{exc}.\n"
+            "Fix: run `pm doctor` to diagnose the work service "
+            "connection, confirm Postgres is reachable and "
+            "pollypm.toml is loadable, then re-run.",
+            err=True,
+        )
+        raise typer.Exit(code=3) from exc
 
     total_bytes = sum(c.bytes for c in candidates)
     total_count = len(candidates)

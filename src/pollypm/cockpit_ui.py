@@ -13311,13 +13311,22 @@ def _dashboard_css_with_palette(raw_css: str) -> str:
     dashboard CSS block so a palette tweak in ``cockpit_theme`` propagates
     here without a manual edit.
 
-    The dashboard CSS predates ``cockpit_theme`` and contains ~25 raw hex
-    literals. Five of them are the canonical semantic colors used across
-    the cockpit (rail, inbox, activity, footer status); the rest are
-    dashboard-specific surface tints (action-bar attention/critical fill,
-    section backgrounds, scrollbar slate) with no current ``State.*``
-    equivalent. We route only the canonical five through ``State.*`` —
-    the remaining hexes stay literal until a future audit promotes them.
+    The dashboard CSS predates ``cockpit_theme`` and contained ~25 raw hex
+    literals before promotion landed in two waves:
+
+    1. The five cockpit-wide canonical colors (info blue, muted gray,
+       neutral gray, body bright, heading) shared with rail / inbox /
+       activity / footer — landed in PR #2022.
+    2. The three dashboard surface tints (WARN amber, DANGER red, SUCCESS
+       green), each a triple of (text, background, border) used by the
+       action-bar and the celebratory plan-review CTA — landed here as
+       follow-up to PR #2022 once ``cockpit_theme.State`` grew the matching
+       ``SURFACE_*`` semantic constants.
+
+    What stays literal: pure dashboard chrome that has no analog elsewhere
+    in the cockpit (screen background, section borders, scrollbar slate,
+    plan-scroll backdrop). Promoting those would require inventing
+    single-use constants with no other consumer.
 
     Using ``str.replace`` (rather than an f-string CSS) keeps the source
     CSS readable: Textual CSS uses ``{ ... }`` rule blocks everywhere,
@@ -13326,11 +13335,22 @@ def _dashboard_css_with_palette(raw_css: str) -> str:
     ``State.*`` literal), so this is a source-level rename, not a redesign.
     """
     palette = (
+        # Canonical cockpit-wide colors (PR #2022).
         ("#5b8aff", _State.INFO),
         ("#6b7a88", _State.MUTED),
         ("#97a6b2", _State.NEUTRAL),
         ("#d6dee5", _State.BODY_BRIGHT),
         ("#eef2f4", _State.HEADING),
+        # Dashboard surface tints — WARN / DANGER / SUCCESS triples.
+        ("#f7d67a", _State.SURFACE_WARN),
+        ("#3a2c08", _State.SURFACE_WARN_BG),
+        ("#7a5a14", _State.SURFACE_WARN_BORDER),
+        ("#ffd7d9", _State.SURFACE_DANGER),
+        ("#3a1719", _State.SURFACE_DANGER_BG),
+        ("#8d3137", _State.SURFACE_DANGER_BORDER),
+        ("#b6f0c0", _State.SURFACE_SUCCESS),
+        ("#1a2e1c", _State.SURFACE_SUCCESS_BG),
+        ("#2c5b32", _State.SURFACE_SUCCESS_BORDER),
     )
     result = raw_css
     for old, new in palette:
@@ -13352,10 +13372,11 @@ class PollyProjectDashboardApp(App[None]):
 
     # Dashboard CSS — routed through ``cockpit_theme.State`` so the five
     # canonical semantic colors (info blue, muted gray, neutral gray, body
-    # bright, heading) stay in lockstep with the rail/inbox/activity/footer
-    # palette. See ``_dashboard_css_with_palette`` above for the substitution
-    # contract and rationale for staying with ``str.replace`` instead of an
-    # f-string.
+    # bright, heading) AND the three dashboard surface tints (WARN amber,
+    # DANGER red, SUCCESS green — each a text/background/border triple)
+    # stay in lockstep with the rest of the cockpit. See
+    # ``_dashboard_css_with_palette`` above for the substitution contract
+    # and rationale for staying with ``str.replace`` instead of an f-string.
     CSS = _dashboard_css_with_palette("""
     Screen {
         background: #0f1317;

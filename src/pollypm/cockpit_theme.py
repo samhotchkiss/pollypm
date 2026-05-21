@@ -131,6 +131,36 @@ class State:
     ATTENTION_BRIGHT = "#ffb454"
     NEUTRAL = "#97a6b2"
 
+    # Dashboard surface tints — used by the per-project dashboard's
+    # action-bar (attention/critical fills) and the celebratory plan-
+    # review CTA. Each "surface" is a triple of (text, background,
+    # border) tuned to read as a single tinted card without yelling
+    # over the rail/inbox palette. Promoted from raw hex literals in
+    # the dashboard CSS (#1988 follow-up) so a tint tweak in one place
+    # propagates everywhere a surface uses it.
+    #
+    # WARN (amber) — "Action Needed" action-bar + drafts/empty-state
+    # affordance. Sits one notch warmer than ``WAITING`` (foreground
+    # text vs. card fill) so the surface reads as a banner, not a row.
+    SURFACE_WARN = "#f7d67a"
+    SURFACE_WARN_BG = "#3a2c08"
+    SURFACE_WARN_BORDER = "#7a5a14"
+
+    # DANGER (red/pink) — critical action-bar variant (stuck/blocked
+    # alerts). Mirrors ``BLOCKED`` for rail glyphs but tinted softer
+    # so a full-width card doesn't bleed when stacked above body text.
+    SURFACE_DANGER = "#ffd7d9"
+    SURFACE_DANGER_BG = "#3a1719"
+    SURFACE_DANGER_BORDER = "#8d3137"
+
+    # SUCCESS (green) — celebratory plan-review CTA (#1531). Sits
+    # under the "Plan's ready" banner so the pair reads as a single
+    # affordance; the green hue distinguishes "ship-it" from the amber
+    # "decide" tone of the WARN surface.
+    SURFACE_SUCCESS = "#b6f0c0"
+    SURFACE_SUCCESS_BG = "#1a2e1c"
+    SURFACE_SUCCESS_BORDER = "#2c5b32"
+
 
 class Glyph:
     """Semantic glyph vocabulary.

@@ -188,6 +188,7 @@ from pollypm.cockpit_rail import (
     CockpitRouter,
     _alert_type_is_user_action_waiting,
 )
+from pollypm.cockpit_theme import State as _State
 
 
 import re as _re
@@ -13305,6 +13306,38 @@ def _alert_banner_copy(
     )
 
 
+def _dashboard_css_with_palette(raw_css: str) -> str:
+    """Substitute canonical ``cockpit_theme.State.*`` hex values into the
+    dashboard CSS block so a palette tweak in ``cockpit_theme`` propagates
+    here without a manual edit.
+
+    The dashboard CSS predates ``cockpit_theme`` and contains ~25 raw hex
+    literals. Five of them are the canonical semantic colors used across
+    the cockpit (rail, inbox, activity, footer status); the rest are
+    dashboard-specific surface tints (action-bar attention/critical fill,
+    section backgrounds, scrollbar slate) with no current ``State.*``
+    equivalent. We route only the canonical five through ``State.*`` —
+    the remaining hexes stay literal until a future audit promotes them.
+
+    Using ``str.replace`` (rather than an f-string CSS) keeps the source
+    CSS readable: Textual CSS uses ``{ ... }`` rule blocks everywhere,
+    which would force escaping every brace in an f-string. The substitution
+    is byte-identical today (each replaced hex matches the corresponding
+    ``State.*`` literal), so this is a source-level rename, not a redesign.
+    """
+    palette = (
+        ("#5b8aff", _State.INFO),
+        ("#6b7a88", _State.MUTED),
+        ("#97a6b2", _State.NEUTRAL),
+        ("#d6dee5", _State.BODY_BRIGHT),
+        ("#eef2f4", _State.HEADING),
+    )
+    result = raw_css
+    for old, new in palette:
+        result = result.replace(old, new)
+    return result
+
+
 class PollyProjectDashboardApp(App[None]):
     """Information-dense per-project dashboard — replaces the legacy
     text dump rendered when the user selects a project in the rail.
@@ -13317,7 +13350,13 @@ class PollyProjectDashboardApp(App[None]):
     SUB_TITLE = "Project"
     REFRESH_INTERVAL_SECONDS = 10
 
-    CSS = """
+    # Dashboard CSS — routed through ``cockpit_theme.State`` so the five
+    # canonical semantic colors (info blue, muted gray, neutral gray, body
+    # bright, heading) stay in lockstep with the rail/inbox/activity/footer
+    # palette. See ``_dashboard_css_with_palette`` above for the substitution
+    # contract and rationale for staying with ``str.replace`` instead of an
+    # f-string.
+    CSS = _dashboard_css_with_palette("""
     Screen {
         background: #0f1317;
         color: #eef2f4;
@@ -13508,7 +13547,7 @@ class PollyProjectDashboardApp(App[None]):
         color: #3e4c5a;
         background: #0c0f12;
     }
-    """
+    """)
 
     BINDINGS = [
         Binding("c", "chat_pm", "Chat PM"),

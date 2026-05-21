@@ -264,6 +264,17 @@ def doctor(
         "--fix-dry-run",
         help="Show what --fix WOULD do, without mutating anything.",
     ),
+    verbose: bool = typer.Option(
+        False,
+        "--verbose",
+        "-v",
+        help="Show the full Why/Fix block for every failing check (no clustering).",
+    ),
+    alert_type: str | None = typer.Option(
+        None,
+        "--alert-type",
+        help="Drill into a single check by name — restricts output to that check and renders full detail.",
+    ),
 ) -> None:
     from pollypm.doctor import (
         apply_fixes,
@@ -322,7 +333,7 @@ def doctor(
         if banner:
             typer.echo(banner)
             typer.echo("")
-        typer.echo(render_human(report))
+        typer.echo(render_human(report, verbose=verbose, alert_type=alert_type))
         typer.echo("")
         typer.echo(release_channel_line())
         typer.echo(setup_tag_line())
@@ -1332,6 +1343,11 @@ def register_maintenance_commands(app: typer.Typer) -> None:
                 ("pm doctor", "show the full health checklist"),
                 ("pm doctor --fix", "apply safe automatic repairs"),
                 ("pm doctor --json", "emit the report as machine-readable JSON"),
+                ("pm doctor --verbose", "show full Why/Fix detail (skip clustering)"),
+                (
+                    "pm doctor --alert-type project-guide-drift",
+                    "drill into one cluster by check name",
+                ),
             ],
         )
     )(doctor)

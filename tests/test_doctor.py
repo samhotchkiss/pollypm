@@ -919,6 +919,170 @@ def test_render_json_is_parseable() -> None:
     assert payload["checks"][0]["data"] == {"foo": 1}
 
 
+# --------------------------------------------------------------------- #
+# Cluster-output rendering (refs #1988)
+# --------------------------------------------------------------------- #
+#
+# A long doctor run can pile up dozens of structurally-identical
+# warnings — e.g. project-guide-drift across 12 projects with several
+# roles each. The Failures: block then dwarfs the checklist itself.
+# These tests lock the clustering contract:
+# - cluster ≥ CLUSTER_THRESHOLD → compact summary
+# - cluster < CLUSTER_THRESHOLD → unchanged verbose Why/Fix
+# - --verbose suppresses clustering even past threshold
+# - --alert-type filters and drills into one cluster (verbose)
+# - --json output is never clustered (programmatic consumers depend
+#   on the full per-row payload)
+
+
+def _make_drift_check(stale_count: int, project_count: int) -> tuple[doctor.Check, list[dict]]:
+    """Build a project-guide-drift-shaped failing check with N sub-alerts."""
+    stale = [
+        {
+            "project": f"proj{i // 2}",
+            "role": "architect" if i % 2 == 0 else "worker",
+            "path": f"/tmp/proj{i // 2}/{i}.md",
+        }
+        for i in range(stale_count)
+    ]
+
+    def _run() -> doctor.CheckResult:
+        return doctor._fail(
+            f"{stale_count} stale across {project_count} projects",
+            why="upstream prompt drifted",
+            fix="Refresh each stale guide\nRecheck: pm doctor",
+            severity="warning",
+            data={"count": stale_count, "projects": project_count, "stale": stale},
+        )
+
+    return doctor.Check("project-guide-drift", _run, "guides", severity="warning"), stale
+
+
+def test_render_human_clusters_when_alerts_at_or_above_threshold() -> None:
+    """≥3 sub-alerts collapse into the compact cluster summary."""
+    check, _ = _make_drift_check(stale_count=4, project_count=2)
+    report = doctor.run_checks([check])
+    text = doctor.render_human(report)
+    # Cluster headline: count + project count + alert_type (= check.name)
+    assert "project-guide-drift: 4 alerts across 2 projects" in text
+    # Exactly CLUSTER_SAMPLE_SIZE=3 subjects in the sample
+    assert "Sample subjects: proj0:architect, proj0:worker, proj1:architect" in text
+    # "+N more" overflow tag is the literal remainder, not "..."-only
+    assert "(+1 more)" in text
+    # Pointer hints
+    assert "pm doctor --verbose" in text
+    # Verbose Why/Fix detail SUPPRESSED in clustered mode (the whole point)
+    assert "Why: upstream prompt drifted" not in text
+    assert "Refresh each stale guide" not in text
+
+
+def test_render_human_does_not_cluster_below_threshold() -> None:
+    """<3 sub-alerts fall through to the existing per-row Why/Fix format."""
+    check, _ = _make_drift_check(stale_count=2, project_count=1)
+    report = doctor.run_checks([check])
+    text = doctor.render_human(report)
+    # No cluster summary
+    assert "Sample subjects:" not in text
+    assert "alerts across" not in text
+    # Verbose detail rendered as before
+    assert "Why: upstream prompt drifted" in text
+    assert "Refresh each stale guide" in text
+
+
+def test_render_human_verbose_suppresses_clustering() -> None:
+    """--verbose bypasses clustering even at large sub-alert counts."""
+    check, _ = _make_drift_check(stale_count=10, project_count=10)
+    report = doctor.run_checks([check])
+    text = doctor.render_human(report, verbose=True)
+    assert "Sample subjects:" not in text
+    assert "alerts across" not in text
+    assert "Why: upstream prompt drifted" in text
+    assert "Refresh each stale guide" in text
+
+
+def test_render_human_alert_type_filters_and_drills_in() -> None:
+    """--alert-type restricts to the named check AND renders full detail."""
+    drift_check, _ = _make_drift_check(stale_count=5, project_count=5)
+
+    def _other() -> doctor.CheckResult:
+        return doctor._fail("system broken", why="other-why", fix="other-fix")
+
+    report = doctor.run_checks([
+        drift_check,
+        doctor.Check("other-check", _other, "system"),
+    ])
+    text = doctor.render_human(report, alert_type="project-guide-drift")
+    # Filtered: other-check is gone
+    assert "other-check" not in text
+    assert "other-why" not in text
+    # Drilled-in: verbose detail for the targeted cluster
+    assert "project-guide-drift" in text
+    assert "Why: upstream prompt drifted" in text
+    # Not the cluster summary — the operator asked to see the detail
+    assert "Sample subjects:" not in text
+
+
+def test_render_human_cluster_summary_uses_n3_samples_plus_overflow() -> None:
+    """Sample line has exactly 3 subjects and '(+N more)' for the remainder."""
+    check, _ = _make_drift_check(stale_count=24, project_count=12)
+    report = doctor.run_checks([check])
+    text = doctor.render_human(report)
+    assert "project-guide-drift: 24 alerts across 12 projects" in text
+    # Three subjects, then the +21 overflow.
+    assert (
+        "Sample subjects: proj0:architect, proj0:worker, proj1:architect ... (+21 more)"
+        in text
+    )
+
+
+def test_render_human_cluster_exactly_at_threshold_has_no_overflow() -> None:
+    """Edge case: count == sample size → no '+0 more' noise."""
+    check, _ = _make_drift_check(stale_count=3, project_count=3)
+    report = doctor.run_checks([check])
+    text = doctor.render_human(report)
+    assert "project-guide-drift: 3 alerts across 3 projects" in text
+    assert "Sample subjects: proj0:architect, proj0:worker, proj1:architect" in text
+    assert "+0 more" not in text
+    assert "(+" not in text  # no overflow tag at all
+
+
+def test_render_json_never_clusters() -> None:
+    """--json output preserves the full per-row payload regardless of cluster size."""
+    check, stale = _make_drift_check(stale_count=24, project_count=12)
+    report = doctor.run_checks([check])
+    payload = json.loads(doctor.render_json(report))
+    assert len(payload["checks"]) == 1
+    rendered = payload["checks"][0]
+    # The full why/fix blob and the full sub-alert list MUST be present —
+    # programmatic consumers (cockpit, alert daemons) rely on this.
+    assert rendered["why"] == "upstream prompt drifted"
+    assert "Refresh each stale guide" in rendered["fix"]
+    assert rendered["data"]["count"] == 24
+    assert len(rendered["data"]["stale"]) == 24
+    # The "alerts across" cluster headline is a render_human concern —
+    # JSON must not leak it into the status field.
+    assert "alerts across" not in rendered["status"]
+
+
+def test_render_human_cluster_extracts_subject_from_scalar_items() -> None:
+    """Scalar sub-alert lists (e.g. data['missing'] = ['/a', '/b', '/c']) cluster too."""
+    def _missing() -> doctor.CheckResult:
+        return doctor._fail(
+            "3 missing parents",
+            why="why",
+            fix="fix",
+            severity="warning",
+            data={"missing": ["/p/state-a.db", "/p/state-b.db", "/p/state-c.db", "/p/state-d.db"]},
+        )
+
+    report = doctor.run_checks([doctor.Check("state-parents", _missing, "filesystem", severity="warning")])
+    text = doctor.render_human(report)
+    assert "state-parents: 4 alerts" in text
+    # Scalars stringify directly
+    assert "Sample subjects: /p/state-a.db, /p/state-b.db, /p/state-c.db" in text
+    assert "(+1 more)" in text
+
+
 def test_apply_fixes_invokes_fix_fn(tmp_path: Path) -> None:
     called = {"ok": False}
 

@@ -1876,7 +1876,15 @@ class TestParallelWorkerCap:
 
 
 class TestRoleSessionMissingCapAware:
-    """#1737 — cap-back-pressure suppresses queued worker_role findings."""
+    """#1737 — cap-back-pressure suppresses queued worker_role findings.
+
+    #2023 — the carve-out was extended: queued worker-role tasks are
+    now suppressed regardless of back-pressure state (the matching
+    self-heal is a structural no-op for worker; per-task workers are
+    provisioned by the auto-claim sweep on ``pm task claim``). The
+    not-at-cap test was inverted to reflect the new behaviour;
+    ``in_progress`` workers still fire and are unaffected.
+    """
 
     def test_queued_worker_at_cap_emits_no_finding(self) -> None:
         from pollypm.audit.watchdog import (
@@ -1909,7 +1917,15 @@ class TestRoleSessionMissingCapAware:
         )
         assert not any(f.rule == RULE_ROLE_SESSION_MISSING for f in findings)
 
-    def test_queued_worker_not_at_cap_still_fires(self) -> None:
+    def test_queued_worker_not_at_cap_no_longer_fires(self) -> None:
+        """#2023 — pre-fix this test asserted a queued worker task
+        with back_pressure=False fires the finding. That was the
+        every-cycle noise source (456/24h on pollypm with 0 spawns):
+        the matching self-heal is a structural no-op for worker, so
+        the finding had nowhere to go. The carve-out now suppresses
+        queued+worker regardless of cap state; the auto-claim sweep
+        is the recovery path.
+        """
         from pollypm.audit.watchdog import (
             RULE_ROLE_SESSION_MISSING,
             scan_events,
@@ -1923,7 +1939,8 @@ class TestRoleSessionMissingCapAware:
                 self.roles = roles
                 self.assignee = None
 
-        # Same shape but back_pressure False → legacy detector behaviour.
+        # Same shape but back_pressure False — pre-#2023 this fired;
+        # post-#2023 it is suppressed alongside the at-cap case.
         tasks = [_T("samblog", 9, "queued", {"worker": "worker"})]
         findings = scan_events(
             [],
@@ -1933,8 +1950,7 @@ class TestRoleSessionMissingCapAware:
             project="samblog",
             worker_cap_back_pressure={"samblog": False},
         )
-        matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
-        assert len(matched) == 1
+        assert not any(f.rule == RULE_ROLE_SESSION_MISSING for f in findings)
 
     def test_in_progress_worker_finding_unaffected_by_back_pressure(self) -> None:
         """Back-pressure only suppresses queued; in_progress still fires

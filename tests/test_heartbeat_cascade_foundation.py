@@ -639,26 +639,119 @@ def test_queue_without_motion_disabled_when_probe_flag_off(
 
 def test_role_session_missing_fires_for_queued_task(now: datetime) -> None:
     """The pre-#1546 filter only fired for in_progress / review; the
-    coffeeboardnm cancel-loop happened because queued advisor tasks
-    fell off the radar. Widened to include ``queued``."""
+    coffeeboardnm cancel-loop happened because queued non-worker tasks
+    (e.g. advisor) fell off the radar. Widened to include ``queued``.
+
+    #2023 — queued *worker*-role tasks are explicitly carved out (the
+    self-heal is a structural no-op for worker; auto-claim sweep is
+    the recovery path). This test therefore exercises the #1546
+    queued widening using an *architect* role, which still has a real
+    long-running ``architect-<project>`` lane the healer can spawn.
+    """
     task = _StubTask(
         project="demo",
         task_number=42,
         work_status_str="queued",
         executions=[],
-        roles={"worker": "claude:advisor"},
+        roles={"architect": "claude:architect"},
     )
     findings = scan_events(
         [],
         now=now,
         open_tasks=[task],
-        storage_window_names=["architect-demo"],
+        storage_window_names=["worker-demo"],
         project="demo",
     )
     matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
     assert len(matched) == 1
     assert matched[0].subject == "demo/42"
     assert matched[0].tier == TIER_1
+
+
+def test_role_session_missing_silent_for_queued_worker_role(
+    now: datetime,
+) -> None:
+    """#2023 — queued worker-role tasks must NOT fire
+    ``role_session_missing`` even when no ``worker-<project>`` window
+    exists.
+
+    Bug: detector fired every cycle (~5.5min) while the matching
+    self-heal was a structural no-op (per-task workers spawn on
+    ``pm task claim``, not via the deprecated ``worker-<project>``
+    long-running lane). On pollypm that produced 456 findings / 24h
+    with 0 spawns — pure escalation noise. The carve-out skips
+    queued+worker entirely so the auto-claim sweep is the sole
+    recovery path for that state.
+    """
+    task = _StubTask(
+        project="pollypm",
+        task_number=36,
+        work_status_str="queued",
+        executions=[],
+        roles={"worker": "claude:worker"},
+    )
+    findings = scan_events(
+        [],
+        now=now,
+        open_tasks=[task],
+        # No ``worker-pollypm`` window — exactly the bug condition.
+        storage_window_names=["architect-pollypm"],
+        project="pollypm",
+    )
+    assert not any(f.rule == RULE_ROLE_SESSION_MISSING for f in findings)
+
+
+def test_role_session_missing_silent_for_queued_worker_assignee_fallback(
+    now: datetime,
+) -> None:
+    """#2023 — same carve-out applies when the role is resolved via
+    the ``assignee`` fallback (defaults to ``worker``). That is the
+    common production shape on tasks without an explicit ``roles``
+    dict, and was a contributor to the 456-per-24h finding count."""
+    task = _StubTask(
+        project="pollypm",
+        task_number=109,
+        work_status_str="queued",
+        executions=[],
+        roles=None,
+        assignee="alice",
+    )
+    findings = scan_events(
+        [],
+        now=now,
+        open_tasks=[task],
+        storage_window_names=[],
+        project="pollypm",
+    )
+    assert not any(f.rule == RULE_ROLE_SESSION_MISSING for f in findings)
+
+
+def test_role_session_missing_still_fires_for_in_progress_worker(
+    now: datetime,
+) -> None:
+    """#2023 — the carve-out is queued-only. ``in_progress`` worker
+    tasks legitimately require a live ``worker-<project>`` window
+    (the worker claimed the task, opened a window, then the window
+    died). That escalation IS actionable for the architect; do not
+    suppress it."""
+    task = _StubTask(
+        project="pollypm",
+        task_number=37,
+        work_status_str="in_progress",
+        executions=[],
+        roles={"worker": "claude:worker"},
+    )
+    findings = scan_events(
+        [],
+        now=now,
+        open_tasks=[task],
+        storage_window_names=["architect-pollypm"],
+        project="pollypm",
+    )
+    matched = [f for f in findings if f.rule == RULE_ROLE_SESSION_MISSING]
+    assert len(matched) == 1
+    assert matched[0].metadata["role"] == "worker"
+    assert matched[0].metadata["status"] == "in_progress"
 
 
 def test_role_session_missing_fires_for_queued_advisor_task(

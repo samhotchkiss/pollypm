@@ -1254,7 +1254,14 @@ def _emit_inbox_task(
 ) -> bool:
     """Create a user-routed inbox task on the chat flow."""
     try:
-        existing = work.list_tasks(project=project, work_status="queued")
+        # Inbox tasks land on the ``chat`` flow which starts in
+        # ``draft`` status pending user promotion — so the dedupe scan
+        # MUST include ``draft`` alongside ``queued`` and ``in_progress``,
+        # otherwise every recurring sweep re-creates the same task and
+        # the project accumulates stuck_draft churn (one orphan branch
+        # observed producing 30 dupes in 10h, all draft). #2021
+        existing = work.list_tasks(project=project, work_status="draft")
+        existing += work.list_tasks(project=project, work_status="queued")
         existing += work.list_tasks(project=project, work_status="in_progress")
         for task in existing:
             labels = getattr(task, "labels", None) or ()

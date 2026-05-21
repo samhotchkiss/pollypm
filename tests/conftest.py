@@ -258,52 +258,182 @@ def _real_pollypm_home() -> Path | None:
     return candidate if candidate.is_dir() else None
 
 
-# Cap the per-subdir scan so a pre-existing 281K-file scaffold leak
-# (the doubled-path family from #1810, now fixed but possibly still
-# on long-lived dev machines) doesn't make every test pay an
-# O(scaffold) walk cost. When a subdir exceeds the cap, the guard
-# falls back to the entry-set of its immediate children, which is
-# still enough to catch a NEW top-level write (the #1902 shape
-# was a fresh ``operator/`` checkpoint dir appearing).
-_GUARD_SNAPSHOT_FILE_CAP = 5000
+# Subdirs that are append-only on a busy dev machine and routinely
+# grow into the hundreds of thousands of entries (the user's
+# ``~/.pollypm/snapshots/`` carried ~1.4M files at the time of #2035).
+# Even an ``os.scandir`` + ``stat`` per top-level child cost ~35s warm
+# on that tree, which still blew the per-test budget. For these dirs
+# we use a directory-mtime sentinel: the parent dir's mtime bumps when
+# a top-level child is added/removed, so an unchanged mtime proves
+# nothing was added during the test without enumerating ANY children.
+# When the sentinel DOES change, we fall back to a shallow scandir to
+# identify the specific new entry.
+_GUARD_SHALLOW_ONLY: frozenset[str] = frozenset({
+    "snapshots",
+    "transcripts",
+    "homes",
+    "agent_homes",
+    "worktrees",
+})
+
+# Safety cap across the recursive scan of a single subdir. The cap
+# exists purely so a corrupted-tree symlink loop or a bug-introduced
+# explosion of nested dirs can't make the guard itself hang. 200k
+# tuples comfortably covers every non-append-only guarded subdir on a
+# healthy dev machine.
+_GUARD_SNAPSHOT_ENTRY_CAP = 200_000
 
 
-def _snapshot_guarded_dirs(pollypm_home: Path) -> dict[str, set[Path]]:
-    """Return ``{subdir: {paths under that subdir}}`` for the guarded set.
+# ``_GuardEntry`` shapes a single snapshot row.
+# - For shallow-sentinel dirs: ``("__sentinel__", "s", mtime_ns, inode)``
+#   — one tuple per dir, no enumeration cost on the hot path.
+# - For recursive dirs (and shallow dirs whose sentinel changed):
+#   ``(rel_path, "d"|"f", mtime_ns, size)`` — one tuple per entry.
+# All fields are primitives so the frozenset hash is fast and diff
+# is pure set arithmetic.
+_GuardEntry = tuple[str, str, int, int]
 
-    Each value is the recursive set of file paths under the subdir at
-    snapshot time, capped at ``_GUARD_SNAPSHOT_FILE_CAP``. Comparison
-    post-test uses set difference so the guard surfaces NEW files
-    specifically (rather than counting or mtime-windowing, which is
-    racy under parallel pytest workers).
+
+def _shallow_sentinel(root: Path) -> _GuardEntry | None:
+    """Return a one-tuple summary of ``root`` (no enumeration).
+
+    Stats only the directory itself: ``(mtime_ns, inode)``. Adding /
+    removing a top-level child bumps ``mtime_ns``. Returning ``None``
+    means the dir vanished mid-stat — caller treats that as the
+    empty-snapshot fallback (matches the previous OSError handling).
     """
-    snapshot: dict[str, set[Path]] = {}
+    try:
+        st = os.stat(root, follow_symlinks=False)
+    except OSError:
+        return None
+    # ``st_mtime_ns`` gives nanosecond resolution on macOS / Linux,
+    # which is enough to disambiguate two writes inside the same test.
+    return ("__sentinel__", "s", st.st_mtime_ns, st.st_ino)
+
+
+def _snapshot_guarded_dirs(
+    pollypm_home: Path,
+) -> dict[str, frozenset[_GuardEntry]]:
+    """Return ``{subdir: frozenset of metadata tuples}`` for the guarded set.
+
+    #2035 — the original implementation snapshotted recursive ``Path``
+    sets using ``rglob('*')`` + ``is_file()``. On a long-lived dev
+    machine (the user's ``~/.pollypm/snapshots/`` had 1.4M files), the
+    per-entry stat cost made every pytest invocation hang for minutes,
+    twice (pre + post snapshot per test). Even a shallow ``os.scandir``
+    of that dir cost ~35s warm because each ``stat`` is a syscall and
+    the cost is O(top-level children).
+
+    The new shape:
+
+    - Each value is a ``frozenset`` of metadata tuples.
+    - Subdirs in ``_GUARD_SHALLOW_ONLY`` (append-only operator state
+      like ``snapshots/``, ``transcripts/``, ``homes/``) record a
+      one-tuple sentinel: ``(mtime_ns, inode)`` of the dir itself.
+      The kernel bumps the dir's mtime when a child is added/removed,
+      so the sentinel detects the #1902 leak shape (fresh top-level
+      child appearing) without enumerating ANY children.
+    - Other subdirs (``artifacts/``, ``checkpoints/``, ``dossier/``)
+      recurse depth-first via ``os.scandir`` (one stat per entry,
+      no ``Path.is_file()`` double-stat). Capped at
+      ``_GUARD_SNAPSHOT_ENTRY_CAP``.
+    - ``stat`` / ``scandir`` failures (permissions, races, ENOENT
+      mid-walk) are swallowed per entry; the snapshot continues. A
+      whole-dir ``OSError`` falls back to an empty frozenset —
+      conservative, matches the previous behaviour.
+    """
+    snapshot: dict[str, frozenset[_GuardEntry]] = {}
     for name in _POLLYPM_HOME_GUARDED_DIRS:
         root = pollypm_home / name
         if not root.is_dir():
-            snapshot[name] = set()
+            snapshot[name] = frozenset()
             continue
+        if name in _GUARD_SHALLOW_ONLY:
+            sentinel = _shallow_sentinel(root)
+            snapshot[name] = (
+                frozenset((sentinel,)) if sentinel is not None
+                else frozenset()
+            )
+            continue
+        entries: list[_GuardEntry] = []
         try:
-            entries: set[Path] = set()
-            for path in root.rglob("*"):
-                if not path.is_file():
+            # Iterative DFS with os.scandir so we never pay the
+            # ``Path.is_file()`` double-stat per entry the original
+            # impl did.
+            stack: list[str] = [str(root)]
+            root_str = str(root)
+            done = False
+            while stack and not done:
+                current = stack.pop()
+                try:
+                    it = os.scandir(current)
+                except OSError:
                     continue
-                entries.add(path)
-                if len(entries) >= _GUARD_SNAPSHOT_FILE_CAP:
-                    # Bail out — the dir is too big for a fine-grained
-                    # diff. Switch to the shallow entry-set of the
-                    # subdir's top-level children so the diff still
-                    # catches new session/checkpoint dirs.
-                    entries = {p for p in root.iterdir()}
-                    break
-            snapshot[name] = entries
+                with it:
+                    for de in it:
+                        try:
+                            is_dir = de.is_dir(follow_symlinks=False)
+                            st = de.stat(follow_symlinks=False)
+                        except OSError:
+                            continue
+                        rel = os.path.relpath(de.path, root_str)
+                        entries.append((
+                            rel,
+                            "d" if is_dir else "f",
+                            int(st.st_mtime),
+                            st.st_size,
+                        ))
+                        if len(entries) >= _GUARD_SNAPSHOT_ENTRY_CAP:
+                            done = True
+                            break
+                        if is_dir:
+                            stack.append(de.path)
         except OSError:
-            # Walk failures (permissions, races) shouldn't break the
-            # test run — fall back to an empty set so the post-diff
-            # records every file as "new" only if the dir later
-            # becomes readable. This is conservative.
-            snapshot[name] = set()
+            # Whole-dir walk failure (e.g. root vanished between is_dir
+            # check and scandir). Treat as nothing-to-guard rather than
+            # blowing up the test run.
+            snapshot[name] = frozenset()
+            continue
+        snapshot[name] = frozenset(entries)
     return snapshot
+
+
+def _shallow_diff_after_sentinel_change(
+    root: Path,
+) -> list[str]:
+    """Enumerate top-level children of ``root`` for leak attribution.
+
+    Only called when a SHALLOW_ONLY dir's sentinel changed — at that
+    point we know a top-level entry was added/removed/touched, so the
+    O(top-level-children) cost is unavoidable. Returns relative names
+    so the caller can rebuild absolute Paths.
+    """
+    names: list[str] = []
+    try:
+        with os.scandir(root) as it:
+            for de in it:
+                names.append(de.name)
+                if len(names) >= _GUARD_SNAPSHOT_ENTRY_CAP:
+                    break
+    except OSError:
+        return []
+    return names
+
+
+def _resolve_guard_entry(
+    pollypm_home: Path,
+    subdir: str,
+    entry: _GuardEntry,
+) -> Path:
+    """Reconstruct an absolute ``Path`` from a snapshot diff tuple.
+
+    The snapshot stores ``(rel_path, kind, mtime, size)``. The downstream
+    leak-attribution helpers (``_looks_test_induced``,
+    ``_file_written_during_test``) take a ``Path``; this rebuilds it from
+    the subdir root + relative path captured at snapshot time.
+    """
+    rel_path = entry[0]
+    return pollypm_home / subdir / rel_path
 
 
 def _pytest_provenance_tokens() -> tuple[str, ...]:
@@ -484,11 +614,47 @@ def _pollypm_home_write_guard(request):
     before = _snapshot_guarded_dirs(pollypm_home)
     yield
     after = _snapshot_guarded_dirs(pollypm_home)
+    # #2035 — snapshot values are now ``frozenset[tuple]`` (metadata
+    # tuples), not ``set[Path]``. For SHALLOW_ONLY dirs the value is a
+    # single ``("__sentinel__", "s", mtime_ns, inode)`` tuple; if the
+    # sentinel diff is non-empty, the dir's mtime changed during the
+    # test and we enumerate its top-level children to find the new
+    # entry. For recursive dirs the diff is a set of per-entry tuples.
     candidates: list[Path] = []
     for subdir, before_set in before.items():
-        new_files = after.get(subdir, set()) - before_set
-        for path in sorted(new_files):
-            candidates.append(path)
+        new_entries = after.get(subdir, frozenset()) - before_set
+        if not new_entries:
+            continue
+        if subdir in _GUARD_SHALLOW_ONLY:
+            # Sentinel changed → a top-level child was added/removed
+            # OR the dir itself was touched during the test.
+            #
+            # If a live cockpit is running it constantly bumps these
+            # dirs (writing snapshots/transcripts/homes/...), so the
+            # sentinel will ALWAYS diff and any enumeration we do
+            # here is wasted work that would just be logged as
+            # unattributed. Skip the O(top-level-children) re-enum in
+            # that case — it'd cost ~35s on a 200k-child snapshots/
+            # dir and wouldn't change the leak verdict.
+            if cockpit_live:
+                continue
+            # Cockpit NOT live → enumerate top-level children and let
+            # ``_file_written_during_test`` filter to those whose
+            # mtime falls inside the test window. The "before" set
+            # isn't recoverable from the sentinel, so we treat ALL
+            # current top-level children as candidates and rely on
+            # the downstream mtime / token attribution to reject
+            # pre-existing entries.
+            child_names = _shallow_diff_after_sentinel_change(
+                pollypm_home / subdir,
+            )
+            for child_name in sorted(child_names):
+                candidates.append(pollypm_home / subdir / child_name)
+            continue
+        for entry in sorted(new_entries):
+            candidates.append(
+                _resolve_guard_entry(pollypm_home, subdir, entry),
+            )
     if not candidates:
         return
     tokens = _pytest_provenance_tokens()

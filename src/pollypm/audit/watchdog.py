@@ -1426,12 +1426,28 @@ def _detect_role_session_missing(
     ``max_parallel_workers``) and no finding is emitted. The cadence
     handler computes the flag from live worker-session counts +
     project cap before invoking ``scan_events``.
+
+    #2023 — the #1737 carve-out was subsumed: ALL queued worker-role
+    findings are now suppressed (not just the at-cap subset) because
+    the matching self-heal is a structural no-op (per-task workers
+    spawn on ``pm task claim`` via the auto-claim sweep, not via a
+    long-running ``worker-<project>`` lane). Pre-fix this detector
+    fired ~456x/24h on pollypm with 0 corresponding spawns — pure
+    escalation noise. The ``worker_cap_back_pressure`` parameter is
+    retained on the signature so the cadence handler doesn't churn,
+    but is no longer consulted; see the comment near the carve-out
+    below for the full reasoning.
     """
     findings: list[Finding] = []
     if not open_tasks or storage_window_names is None:
         return findings
     window_set = {str(name).strip() for name in storage_window_names if name}
-    back_pressure = worker_cap_back_pressure or {}
+    # #2023 — ``worker_cap_back_pressure`` is no longer consulted; the
+    # at-cap suppression from #1737 was subsumed by the broader
+    # worker+queued carve-out further down. Discard the kwarg so the
+    # local doesn't trigger an unused-variable lint while we keep the
+    # public signature stable for the cadence handler caller.
+    del worker_cap_back_pressure
 
     for task in open_tasks:
         status = getattr(task, "work_status", None)
@@ -1485,18 +1501,27 @@ def _detect_role_session_missing(
                 role_used = "worker"
         if role_used is None:
             continue
-        # #1737 — queued worker-role tasks for a project at the
-        # ``max_parallel_workers`` ceiling are not a missing-session
-        # condition; they are normal back-pressure. The auto-claim
-        # sweep + per-task spawn-on-claim already gate fresh workers
-        # against the cap, so suppress the tier-1 finding here to
-        # avoid a noisy false-positive loop. ``in_progress`` workers
-        # already have a session, so no special-case needed there.
-        if (
-            role_used == "worker"
-            and status_value == "queued"
-            and back_pressure.get(task_project)
-        ):
+        # #2023 — queued worker-role tasks have NO addressable self-heal
+        # by construction. ``worker-<project>`` is a deprecated
+        # long-running lane (see
+        # ``_self_heal_role_session_missing``: the worker branch is a
+        # structural no-op to avoid leaking the retired per-project
+        # worker). Per-task workers are spun up by the auto-claim
+        # sweep on ``pm task claim`` — that path, not the
+        # role-session-missing detector, is the recovery for a queued
+        # worker task with no live window. Firing the finding every
+        # tick (~5.5min) just burns escalation budget on an
+        # unactionable item: 456 findings / 24h on pollypm pre-fix,
+        # 0 spawns.
+        #
+        # The #1737 carve-out only suppressed the at-cap case; #2023
+        # extends suppression to ALL queued+worker findings because
+        # the self-heal cannot structurally help in either state.
+        # ``in_progress`` workers are NOT suppressed — those
+        # genuinely require a live session (the worker claimed the
+        # task, opened a window, then the window died) and the
+        # architect escalation IS actionable there.
+        if role_used == "worker" and status_value == "queued":
             continue
         # #1737 — reviewers are per-task ephemeral
         # (``reviewer-<project>-<N>``) so the watchdog must check the

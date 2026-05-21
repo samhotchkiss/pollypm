@@ -527,3 +527,98 @@ class TestHandler:
         key = ("worker-demo-9", "worktree_state:demo/9:dirty_stale")
         assert fake_store.alerts[key]["status"] == "cleared"
         assert result["alerts_cleared"] >= 1
+
+    def test_merge_conflict_dedupe_skips_existing_draft_inbox_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Regression for #2021: inbox tasks land in ``draft`` state under
+        the ``chat`` flow template. The dedupe scan must include ``draft``
+        or every sweep re-emits a duplicate (we saw ~30 dupes per orphan
+        over 10h on coffeeboardnm before the fix).
+
+        We seed a prior-sweep task carrying the dedupe label in
+        ``draft`` state, re-run the merge-conflict sweep, and assert no
+        new inbox task is created.
+        """
+        repo = _make_repo(tmp_path / "repo")
+        wt = _add_worktree(repo, "conflict-dupe")
+        (wt / "file.txt").write_text("left\n")
+        _run("git", "-C", str(wt), "add", "file.txt")
+        _run("git", "-C", str(wt), "commit", "-m", "L")
+        (repo / "file.txt").write_text("right\n")
+        _run("git", "-C", str(repo), "add", "file.txt")
+        _run("git", "-C", str(repo), "commit", "-m", "R")
+        merge = _run("git", "-C", str(wt), "merge", "main", check=False)
+        assert merge.returncode != 0
+
+        sessions = [
+            _FakeSession(
+                task_project="demo", task_number=42,
+                agent_name="worker-demo-42", worktree_path=str(wt),
+            ),
+        ]
+
+        # Capture the calls so we can verify the handler actually queried
+        # ``draft`` (otherwise this test would still pass by accident if
+        # the dedupe scan were removed entirely).
+        @dataclass
+        class _StubTask:
+            labels: tuple
+            work_status: str
+
+        dedupe_label = "worktree_audit:demo/42:merge_conflict"
+        prior_draft = _StubTask(
+            labels=("audit:worktree_state", dedupe_label),
+            work_status="draft",
+        )
+        statuses_queried: list[str] = []
+
+        from pollypm.plugins_builtin.core_recurring import plugin as plugin_module
+        from pollypm.plugins_builtin.core_recurring import sweeps as sweeps_module
+
+        fake_store = _FakeStore()
+        fake_work = _FakeWork(sessions)
+
+        def _list_tasks(**kwargs: Any):
+            status = kwargs.get("work_status")
+            statuses_queried.append(status)
+            if status == "draft":
+                return [prior_draft]
+            return []
+
+        fake_work.list_tasks = _list_tasks  # type: ignore[method-assign]
+
+        @dataclass
+        class _FakeProject:
+            root_dir: Path
+
+        @dataclass
+        class _FakeConfig:
+            project: _FakeProject
+
+        cfg = _FakeConfig(project=_FakeProject(root_dir=repo))
+        monkeypatch.setattr(
+            sweeps_module, "_load_config_and_store",
+            _fake_load_cm(cfg, fake_store),
+        )
+        monkeypatch.setattr(
+            sweeps_module, "_open_msg_store", lambda _config: fake_store,
+        )
+        monkeypatch.setattr(
+            sweeps_module, "_close_msg_store", lambda _store: None,
+        )
+        import pollypm.work as work_mod
+
+        monkeypatch.setattr(
+            work_mod, "create_work_service",
+            lambda *a, **kw: fake_work,
+        )
+
+        result = plugin_module.worktree_state_audit_handler({})
+        # Alert still raised (alerts are deduped by msg_store, not this scan).
+        assert result["classified"].get("merge_conflict") == 1
+        # But NO new inbox task — the draft was found.
+        assert result["inbox_emitted"] == 0
+        assert fake_work.created == []
+        # And the handler did query draft (this is what #2021 was missing).
+        assert "draft" in statuses_queried

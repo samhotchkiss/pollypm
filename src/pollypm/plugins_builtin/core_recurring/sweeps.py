@@ -1254,7 +1254,11 @@ def _emit_inbox_task(
 ) -> bool:
     """Create a user-routed inbox task on the chat flow."""
     try:
-        existing = work.list_tasks(project=project, work_status="queued")
+        # #2021: include ``draft`` so we don't re-emit on every sweep — inbox
+        # tasks land via ``flow_template="chat"`` which starts in draft, not
+        # queued. Without this we churn ~30 dupes per orphan over 10h.
+        existing = work.list_tasks(project=project, work_status="draft")
+        existing += work.list_tasks(project=project, work_status="queued")
         existing += work.list_tasks(project=project, work_status="in_progress")
         for task in existing:
             labels = getattr(task, "labels", None) or ()

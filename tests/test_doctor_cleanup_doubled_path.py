@@ -60,7 +60,7 @@ def test_cleanup_refuses_when_real_config_subdirs_present(
     # Plant the suspicious child. For ``state.db`` etc. (files) we
     # touch a file; for ``audit``/``agent_homes``/``plugins`` we mkdir.
     child = doubled / anomaly
-    if anomaly.endswith(".db") or anomaly.endswith(".toml") or "-" in anomaly:
+    if anomaly.endswith(".db") or "-" in anomaly:
         child.write_text("real data")
     else:
         child.mkdir()
@@ -149,6 +149,42 @@ def test_cleanup_moves_doubled_tree_to_timestamped_backup(
     # Contents survived the move.
     assert (expected_backup / "stray.toml").exists()
     assert (expected_backup / "logs" / "old.log").exists()
+
+
+def test_cleanup_moves_doubled_path_pollypm_toml(tmp_path: Path) -> None:
+    """A ``pollypm.toml`` under the doubled path is a legacy artifact, not live state.
+
+    Pre-#1972 bad config renders wrote ``pollypm.toml`` under
+    ``~/.pollypm/.pollypm/`` — the *real* config TOML lives one level up
+    at ``~/.pollypm/pollypm.toml``. The doubled-path copy is dead and
+    must be moved to the ``.bak-*`` sibling as part of cleanup, NOT
+    block it. Regression test for the Codex review on PR #2030 (the
+    set previously included ``pollypm.toml`` which made ``pm doctor
+    --fix`` refuse to clean a common legacy artifact shape).
+    """
+    home = tmp_path / "home" / ".pollypm"
+    doubled = home / ".pollypm"
+    doubled.mkdir(parents=True)
+    # The exact legacy artifact shape: ~/.pollypm/.pollypm/pollypm.toml
+    legacy_toml = doubled / "pollypm.toml"
+    legacy_toml.write_text("legacy = true\n")
+    (doubled / "stray.log").write_text("noise\n")
+
+    now = datetime(2026, 5, 21, 9, 0, 0)
+    plan = cleanup_doubled_path(doubled, now=now)
+
+    # No refusal — the TOML must NOT block cleanup.
+    assert plan.refused_reason is None, plan.refused_reason
+    assert plan.moved is True
+    # Doubled tree gone; backup sibling exists with the TOML inside.
+    assert not doubled.exists()
+    expected_backup = home / ".pollypm.bak-20260521-090000"
+    assert plan.backup_path == expected_backup
+    assert expected_backup.exists()
+    assert (expected_backup / "pollypm.toml").exists()
+    assert (
+        (expected_backup / "pollypm.toml").read_text() == "legacy = true\n"
+    )
 
 
 def test_cleanup_emits_audit_event_on_success(

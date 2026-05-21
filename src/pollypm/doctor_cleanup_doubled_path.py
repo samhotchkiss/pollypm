@@ -54,7 +54,6 @@ ANOMALOUS_DIRECT_CHILDREN: frozenset[str] = frozenset(
         "state.db",
         "state.db-wal",
         "state.db-shm",
-        "pollypm.toml",
     }
 )
 

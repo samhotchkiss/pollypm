@@ -36,11 +36,17 @@ Contract
 
 from __future__ import annotations
 
+import json
+import os
 import platform
+import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
+from typing import Iterable
 
 import typer
 
@@ -51,6 +57,7 @@ from pollypm.config import DEFAULT_CONFIG_PATH, load_config, resolve_config_path
 __all__ = [
     "bootstrap_pg",
     "register_storage_commands",
+    "scan_pollypm_home",
     "storage_app",
 ]
 
@@ -573,11 +580,15 @@ def bootstrap_pg(
 
 storage_app = typer.Typer(
     help=help_with_examples(
-        "Storage backend tooling (sqlite ↔ postgres migration).",
+        "Storage backend tooling (migration + ~/.pollypm/ disk usage).",
         [
             (
-                "pm storage migrate-to-pg",
-                "preview the sqlite → postgres data migration (dry-run)",
+                "pm storage report",
+                "show ~/.pollypm/ disk usage by subdir (bytes, files, mtime)",
+            ),
+            (
+                "pm storage prune snapshots --older-than 14d --dry-run",
+                "preview snapshot pruning without deleting anything",
             ),
             (
                 "pm storage migrate-to-pg --commit --yes",
@@ -807,5 +818,1118 @@ def migrate_to_pg(
     if run.preflight_error:
         raise typer.Exit(code=3)
     if not run.succeeded:
+        raise typer.Exit(code=1)
+    raise typer.Exit(code=0)
+
+
+# --------------------------------------------------------------------- #
+# ``pm storage report`` + ``pm storage prune`` — disk-bloat visibility. #
+# --------------------------------------------------------------------- #
+#
+# Why this exists
+# ---------------
+#
+# PR #2037 caught ``~/.pollypm/snapshots/`` silently growing past 1.4M
+# files (~38 GB) — large enough to wedge the autouse pytest snapshot
+# fixture for minutes per test. There was no surface that would have
+# told the operator *which* subtree under ``~/.pollypm/`` was the one
+# growing unbounded; ``du -sh ~/.pollypm/*`` walks every inode and
+# itself takes long enough on snapshots/ that nobody runs it
+# preventatively.
+#
+# ``pm storage report`` is that surface. It scans every top-level
+# subdir of ``~/.pollypm/`` and prints a tabular summary: file count,
+# byte total, oldest/newest mtime, and a NOTES column that flags
+# unbounded growth / orphaned worktrees / etc. ``pm storage prune``
+# is the matching cleanup: targeted, age-gated, dry-run by default,
+# requires ``--yes`` to actually delete (no interactive prompt so the
+# command works via tmux send-keys).
+#
+# Scan strategy
+# -------------
+#
+# ``os.scandir`` is used everywhere — ``Path.rglob`` is ~4x slower at
+# this volume because every iteration round-trips through ``PosixPath``
+# construction. Two dir classes mirror the split that PR #2037 added
+# to ``tests/conftest.py::_snapshot_guarded_dirs``:
+#
+# - ``_SHALLOW_ONLY_DIRS`` (e.g. ``snapshots/``) — recurse but stop
+#   when we exceed ``_SCAN_FILE_CAP``; flag NOTES with the cap-hit
+#   warning. These dirs are known to grow unbounded; the report
+#   should still load fast even when they're already broken.
+# - All other dirs — recursive, no cap. Even ``transcripts/`` at
+#   100k files completes in well under a second with ``os.scandir``.
+#
+# The cap protects ``pm storage report`` against the exact failure
+# mode it's meant to surface — a developer machine where
+# ``snapshots/`` already has 1.4M files shouldn't have to wait 30s
+# for the report that tells them that.
+
+
+# ``~/.pollypm/`` subdirs we expect to find on a healthy install.
+# The order here is the natural reading order of the report
+# (snapshots first because it's the unbounded one); the actual
+# render-time sort is configurable via ``--sort``.
+_HOME_SUBDIRS: tuple[str, ...] = (
+    "snapshots",
+    "transcripts",
+    "homes",
+    "agent_homes",
+    "worktrees",
+    "audit",
+    "artifacts",
+    "checkpoints",
+    "dossier",
+    "logs",
+)
+
+# Subdirs where recursion is capped because production has been
+# observed to grow them without bound. Cap-hit fires a NOTES flag.
+_SHALLOW_ONLY_DIRS: frozenset[str] = frozenset({"snapshots"})
+
+# How many entries we'll walk in a capped subdir before bailing.
+# 50k is large enough to give exact counts on a healthy install
+# (snapshots/ holds ~few-thousand files on a normal week) while
+# short enough to bound the report at ~1s even when the dir is
+# already broken. The number is intentionally NOT user-tunable —
+# this is a visibility tool, not a forensics tool; if the operator
+# needs an exact count of a 1M-file dir they can use ``find | wc``.
+_SCAN_FILE_CAP: int = 50_000
+
+# How many days of stillness make an unattended worktree dir an
+# orphan candidate. Picked deliberately conservative: a live agent
+# is expected to touch its worktree at least once per heartbeat
+# (default 30s), so 1 day is ~2880 heartbeats of silence — well
+# past any "agent is doing slow work" plateau.
+_ORPHAN_WORKTREE_STALE_DAYS: int = 1
+
+
+@dataclass(slots=True)
+class DirScan:
+    """One row of the storage report — totals for a single subdir.
+
+    Attributes
+    ----------
+    name :
+        Subdir name relative to ``~/.pollypm/`` (e.g. ``"snapshots"``).
+    files :
+        Total file count. When ``cap_hit`` is True this is the cap
+        value, not the true count.
+    bytes :
+        Sum of ``stat().st_size`` over every file walked.
+    oldest_mtime / newest_mtime :
+        Earliest / latest mtime seen (epoch seconds). ``None`` when
+        the dir is empty or unreadable.
+    cap_hit :
+        True when the scan stopped at ``_SCAN_FILE_CAP`` rather than
+        completing — the report flags this in NOTES so the operator
+        knows the count is a lower bound.
+    note :
+        Free-form NOTES column text (unbounded-growth flag, orphan
+        count for worktrees, rotation flag for audit, etc.).
+    """
+
+    name: str
+    files: int = 0
+    bytes: int = 0
+    oldest_mtime: float | None = None
+    newest_mtime: float | None = None
+    cap_hit: bool = False
+    note: str = ""
+
+
+@dataclass(slots=True)
+class HomeReport:
+    """Whole-home summary returned by ``scan_pollypm_home``.
+
+    Holds the per-subdir rows plus aggregate totals so the renderer
+    doesn't have to walk the list twice. ``config_files_*`` counts
+    top-level ``*.toml`` / ``*.json`` / ``*.pid`` artifacts directly
+    under ``~/.pollypm/`` (separated from subdirs so they don't
+    distort sorting).
+    """
+
+    home: Path
+    rows: list[DirScan] = field(default_factory=list)
+    config_files: int = 0
+    config_bytes: int = 0
+    config_newest_mtime: float | None = None
+
+    @property
+    def total_files(self) -> int:
+        return self.config_files + sum(row.files for row in self.rows)
+
+    @property
+    def total_bytes(self) -> int:
+        return self.config_bytes + sum(row.bytes for row in self.rows)
+
+
+def _format_bytes(n: int) -> str:
+    """Render ``n`` bytes as the largest unit that keeps the integer < 1024.
+
+    Output uses GB/MB/KB (not GiB/MiB) because the report is for
+    operator scanning, not for binary precision. Negative inputs
+    (shouldn't happen — defensive) round-trip as ``"0 B"``.
+    """
+    if n <= 0:
+        return "0 B"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024:
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} PB"
+
+
+def _format_mtime(ts: float | None) -> str:
+    """Render ``ts`` (epoch seconds) as ``YYYY-MM-DD``; dash when None."""
+    if ts is None or ts <= 0:
+        return "-"
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d")
+
+
+def _scan_subdir(
+    root: Path,
+    name: str,
+    *,
+    cap: int | None,
+) -> DirScan:
+    """Walk ``root/name`` with ``os.scandir`` and return a ``DirScan``.
+
+    When ``cap`` is set and we exceed it, ``cap_hit=True`` is recorded
+    and the walk stops early — the caller treats those counts as a
+    lower bound. A missing / unreadable subdir returns an empty
+    ``DirScan`` rather than raising; the report should still render
+    even when one subtree has wedged permissions.
+
+    Uses ``os.scandir`` because it returns file metadata (``stat``,
+    ``is_file``) from the directory entry without an extra syscall —
+    ``Path.rglob`` round-trips through ``PosixPath`` construction and
+    is measurably slower at the file counts we care about. We also
+    catch ``OSError`` per-entry so one bad symlink doesn't abort the
+    whole subdir scan (#1810's doubled-path scaffold leaves a few
+    broken links on long-lived dev machines).
+    """
+    scan = DirScan(name=name)
+    target = root / name
+    if not target.is_dir():
+        return scan
+
+    stack: list[str] = [str(target)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        # Don't follow symlinks — they'd let an
+                        # attacker / misconfigured plugin send the
+                        # scan out of ~/.pollypm/. ``follow_symlinks
+                        # =False`` on ``is_dir`` avoids that.
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    scan.files += 1
+                    scan.bytes += st.st_size
+                    mtime = st.st_mtime
+                    if scan.oldest_mtime is None or mtime < scan.oldest_mtime:
+                        scan.oldest_mtime = mtime
+                    if scan.newest_mtime is None or mtime > scan.newest_mtime:
+                        scan.newest_mtime = mtime
+                    if cap is not None and scan.files >= cap:
+                        scan.cap_hit = True
+                        return scan
+        except OSError:
+            continue
+    return scan
+
+
+def _scan_config_files(root: Path) -> tuple[int, int, float | None]:
+    """Return ``(count, bytes, newest_mtime)`` for top-level config artifacts.
+
+    Counts every file directly under ``~/.pollypm/`` (NOT in a
+    subdir): pollypm.toml, state.db / state.db-wal / -shm,
+    rail_daemon.pid, errors.log, etc. Separated from the subdir scan
+    so the report can summarise "config files" as its own row
+    without distorting the sort-by-bytes ordering.
+    """
+    count = 0
+    total = 0
+    newest: float | None = None
+    if not root.is_dir():
+        return (0, 0, None)
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                try:
+                    if not entry.is_file(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                count += 1
+                total += st.st_size
+                if newest is None or st.st_mtime > newest:
+                    newest = st.st_mtime
+    except OSError:
+        return (0, 0, None)
+    return (count, total, newest)
+
+
+def _count_live_agent_worktrees(home: Path) -> set[str]:
+    """Return the set of worktree dir names that have a live agent task.
+
+    Best-effort: reads ``~/.pollypm/worktrees/`` and matches each
+    directory name against in-progress work-service tasks. When the
+    work service can't be reached (no config, no pg, etc.) we return
+    an empty set and the caller treats EVERY stale worktree as
+    potentially orphaned — the safer default for a visibility tool.
+
+    Returns dir basenames (not full paths) so the orphan check is a
+    cheap set membership test.
+    """
+    try:
+        from pollypm.config import resolve_config_path, load_config
+        from pollypm.work.service_factory import get_default_work_service
+    except Exception:  # noqa: BLE001 — module missing == treat as no live agents
+        return set()
+    try:
+        cfg_path = resolve_config_path(DEFAULT_CONFIG_PATH)
+        if not cfg_path.exists():
+            return set()
+        cfg = load_config(cfg_path)
+        service = get_default_work_service(cfg)
+    except Exception:  # noqa: BLE001
+        return set()
+
+    live: set[str] = set()
+    try:
+        # The work service exposes tasks via ``list_tasks`` /
+        # ``get_active_tasks`` depending on backend; we try the
+        # broader one and fall back. Names are best-effort: an
+        # agent task may be tagged ``agent-<id>`` or just ``<id>``.
+        list_tasks = getattr(service, "list_tasks", None)
+        if list_tasks is None:
+            return set()
+        for task in list_tasks():
+            status = getattr(task, "status", None)
+            if status not in ("in_progress", "claimed", "assigned"):
+                continue
+            agent_id = (
+                getattr(task, "worktree_name", None)
+                or getattr(task, "agent_id", None)
+                or getattr(task, "id", None)
+            )
+            if agent_id:
+                live.add(str(agent_id))
+                live.add(f"agent-{agent_id}")
+    except Exception:  # noqa: BLE001 — fall back to "nothing known live"
+        return set()
+    return live
+
+
+def _count_orphan_worktrees(
+    home: Path,
+    *,
+    live_names: set[str],
+    stale_after_seconds: float,
+) -> int:
+    """Return the count of worktree subdirs with no matching live agent.
+
+    Orphan definition: dir whose mtime is older than
+    ``stale_after_seconds`` AND whose basename is not in
+    ``live_names``. The mtime check protects against flagging a
+    just-spawned worktree before the agent has registered itself.
+    """
+    target = home / "worktrees"
+    if not target.is_dir():
+        return 0
+    now = time.time()
+    orphans = 0
+    try:
+        with os.scandir(target) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if entry.name in live_names:
+                    continue
+                if now - st.st_mtime < stale_after_seconds:
+                    continue
+                orphans += 1
+    except OSError:
+        return 0
+    return orphans
+
+
+def _iter_orphan_worktree_paths(
+    home: Path,
+    *,
+    live_names: set[str],
+    stale_after_seconds: float,
+) -> Iterable[Path]:
+    """Yield orphan worktree paths (same definition as ``_count_orphan_worktrees``).
+
+    Split out from the counter so prune can iterate without a second
+    scandir pass — counter wraps this for backwards-compat.
+    """
+    target = home / "worktrees"
+    if not target.is_dir():
+        return
+    now = time.time()
+    try:
+        with os.scandir(target) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if entry.name in live_names:
+                    continue
+                if now - st.st_mtime < stale_after_seconds:
+                    continue
+                yield Path(entry.path)
+    except OSError:
+        return
+
+
+def scan_pollypm_home(home: Path | None = None) -> HomeReport:
+    """Scan ``home`` (default ``~/.pollypm``) and return a ``HomeReport``.
+
+    Public-ish entry point — exposed in ``__all__`` so tests can call
+    it directly with a synthesized ``tmp_path`` and assert on the
+    structured result without going through the Typer surface.
+    """
+    if home is None:
+        home = Path.home() / ".pollypm"
+    report = HomeReport(home=home)
+    if not home.is_dir():
+        return report
+
+    live_names = _count_live_agent_worktrees(home)
+    stale_seconds = _ORPHAN_WORKTREE_STALE_DAYS * 86400.0
+
+    for name in _HOME_SUBDIRS:
+        cap = _SCAN_FILE_CAP if name in _SHALLOW_ONLY_DIRS else None
+        row = _scan_subdir(home, name, cap=cap)
+        # NOTES heuristics. Order matters: cap-hit dominates because
+        # any other note would understate the situation.
+        notes: list[str] = []
+        if row.cap_hit:
+            notes.append(
+                f"⚠ unbounded growth (>{_SCAN_FILE_CAP:,} files; scan capped)"
+            )
+        if name == "worktrees" and row.files > 0:
+            orphans = _count_orphan_worktrees(
+                home,
+                live_names=live_names,
+                stale_after_seconds=stale_seconds,
+            )
+            if orphans > 0:
+                notes.append(f"{orphans} orphaned (no live agent)")
+        if name == "audit" and row.files > 0:
+            # Rotation lands a ``.jsonl`` plus ``.gz`` siblings. If
+            # we see any ``.gz`` in the tree, rotation is active.
+            if _has_gz_descendant(home / name):
+                notes.append("rotation active")
+        row.note = " · ".join(notes)
+        report.rows.append(row)
+
+    cfg_count, cfg_bytes, cfg_newest = _scan_config_files(home)
+    report.config_files = cfg_count
+    report.config_bytes = cfg_bytes
+    report.config_newest_mtime = cfg_newest
+
+    return report
+
+
+def _has_gz_descendant(root: Path) -> bool:
+    """Best-effort scandir check: True if any ``.gz`` file lives under ``root``.
+
+    Cheap walk with an early-exit on the first hit. Used to flag
+    audit rotation in NOTES without a full second scan of the audit
+    tree (which is small anyway, but the early-exit keeps the cost
+    predictable on every dir size).
+    """
+    stack: list[str] = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            if entry.name.endswith(".gz"):
+                                return True
+                            continue
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return False
+
+
+def _sort_rows(rows: list[DirScan], *, key: str) -> list[DirScan]:
+    """Stable-sort rows by the requested key (descending).
+
+    ``files`` and ``bytes`` are obvious; ``mtime`` uses the newer of
+    oldest/newest (newest_mtime), with None sorted last. Unknown
+    keys raise — the Typer surface validates before calling us.
+    """
+    if key == "files":
+        return sorted(rows, key=lambda r: r.files, reverse=True)
+    if key == "bytes":
+        return sorted(rows, key=lambda r: r.bytes, reverse=True)
+    if key == "mtime":
+        return sorted(
+            rows,
+            key=lambda r: r.newest_mtime if r.newest_mtime is not None else 0.0,
+            reverse=True,
+        )
+    raise ValueError(f"unknown sort key: {key!r}")
+
+
+def _render_report_text(report: HomeReport, *, sort_key: str) -> str:
+    """Render the human-facing ``pm storage report`` table.
+
+    The header line mirrors the spec's preamble (``total: <bytes>,
+    <files> files``). Columns: DIR, FILES, BYTES, OLDEST, NEWEST,
+    NOTES. Widths are dynamic so a very long NOTES doesn't break
+    the table — we right-pad fixed-width columns and leave NOTES
+    free-form at the end.
+    """
+    lines: list[str] = []
+    total_bytes = report.total_bytes
+    total_files = report.total_files
+    lines.append(
+        f"{report.home}/  total: {_format_bytes(total_bytes)}, "
+        f"{total_files:,} files"
+    )
+    lines.append("")
+
+    rows = _sort_rows(list(report.rows), key=sort_key)
+
+    header = ("DIR", "FILES", "BYTES", "OLDEST", "NEWEST", "NOTES")
+    formatted: list[tuple[str, ...]] = [header]
+    for row in rows:
+        if row.files == 0 and row.bytes == 0 and not row.note:
+            # Skip absent / empty subdirs — keeps the report short
+            # on fresh installs where most subdirs don't exist yet.
+            continue
+        files_str = f"{row.files:,}" + ("+" if row.cap_hit else "")
+        formatted.append(
+            (
+                f"{row.name}/",
+                files_str,
+                _format_bytes(row.bytes),
+                _format_mtime(row.oldest_mtime),
+                _format_mtime(row.newest_mtime),
+                row.note,
+            )
+        )
+    if report.config_files > 0:
+        formatted.append(
+            (
+                "config files",
+                f"{report.config_files:,}",
+                _format_bytes(report.config_bytes),
+                "-",
+                _format_mtime(report.config_newest_mtime),
+                "",
+            )
+        )
+
+    # Compute per-column widths from the rendered cells. Last
+    # column (NOTES) stays free-form — no padding.
+    widths = [0] * len(header)
+    for row in formatted:
+        for i, cell in enumerate(row):
+            if i == len(header) - 1:
+                continue
+            widths[i] = max(widths[i], len(cell))
+
+    for i, row in enumerate(formatted):
+        parts = []
+        for j, cell in enumerate(row):
+            if j == len(header) - 1:
+                parts.append(cell)
+            else:
+                parts.append(cell.ljust(widths[j]))
+        lines.append("  ".join(parts).rstrip())
+        if i == 0:
+            # Separator under header.
+            sep_parts = []
+            for j in range(len(header)):
+                if j == len(header) - 1:
+                    sep_parts.append("-----")
+                else:
+                    sep_parts.append("-" * widths[j])
+            lines.append("  ".join(sep_parts).rstrip())
+
+    return "\n".join(lines) + "\n"
+
+
+def _render_report_json(report: HomeReport, *, sort_key: str) -> str:
+    """Render the report as a JSON document.
+
+    Schema:
+
+    ```
+    {
+      "home": "/home/user/.pollypm",
+      "total_files": 1498221,
+      "total_bytes": 44230000000,
+      "subdirs": [
+        {"name": "snapshots", "files": 1395189, "bytes": ...,
+         "oldest_mtime": "...", "newest_mtime": "...",
+         "cap_hit": true, "note": "..."},
+        ...
+      ],
+      "config_files": {"files": 12, "bytes": 122880,
+                       "newest_mtime": "..."}
+    }
+    ```
+
+    ``mtime`` fields are emitted as ISO-8601 UTC for portability;
+    epoch ints stay machine-friendly but ISO is what every caller
+    actually wants when they pipe this into jq.
+    """
+    def _iso(ts: float | None) -> str | None:
+        if ts is None or ts <= 0:
+            return None
+        return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+            "%Y-%m-%dT%H:%M:%SZ"
+        )
+
+    rows = _sort_rows(list(report.rows), key=sort_key)
+    payload = {
+        "home": str(report.home),
+        "total_files": report.total_files,
+        "total_bytes": report.total_bytes,
+        "subdirs": [
+            {
+                "name": row.name,
+                "files": row.files,
+                "bytes": row.bytes,
+                "oldest_mtime": _iso(row.oldest_mtime),
+                "newest_mtime": _iso(row.newest_mtime),
+                "cap_hit": row.cap_hit,
+                "note": row.note,
+            }
+            for row in rows
+        ],
+        "config_files": {
+            "files": report.config_files,
+            "bytes": report.config_bytes,
+            "newest_mtime": _iso(report.config_newest_mtime),
+        },
+    }
+    return json.dumps(payload, indent=2, sort_keys=False) + "\n"
+
+
+_OLDER_THAN_RE = re.compile(r"^\s*(\d+)\s*([dwhm])\s*$", re.IGNORECASE)
+
+
+def _parse_older_than(spec: str) -> float:
+    """Parse a ``--older-than`` spec (``7d``, ``4w``, ``24h``, ``30m``).
+
+    Returns the threshold in seconds. Raises ``typer.BadParameter`` on
+    malformed input; the caller propagates that so the Typer error
+    surface stays consistent with the rest of the CLI.
+    """
+    match = _OLDER_THAN_RE.match(spec or "")
+    if not match:
+        raise typer.BadParameter(
+            f"Could not parse --older-than={spec!r}. "
+            "Expected a number with a unit suffix: "
+            "7d (days), 4w (weeks), 24h (hours), 30m (minutes)."
+        )
+    n = int(match.group(1))
+    unit = match.group(2).lower()
+    multiplier = {"m": 60.0, "h": 3600.0, "d": 86400.0, "w": 604800.0}[unit]
+    if n <= 0:
+        raise typer.BadParameter(
+            f"--older-than must be positive (got {spec!r})."
+        )
+    return n * multiplier
+
+
+@dataclass(slots=True)
+class _PruneCandidate:
+    """One filesystem entry the pruner has selected for deletion.
+
+    ``path`` is the absolute path; ``bytes`` is the recursive size
+    (so dry-run totals are accurate); ``is_dir`` chooses between
+    ``unlink`` and ``rmtree`` on commit.
+    """
+
+    path: Path
+    bytes: int
+    is_dir: bool
+
+
+def _dir_size(path: Path) -> int:
+    """Recursively sum file sizes under ``path``. Best-effort.
+
+    Used to populate ``_PruneCandidate.bytes`` so dry-run totals
+    match what the actual ``rmtree`` will reclaim. ``OSError`` is
+    swallowed per-entry — a dir with unreadable children still
+    reports a (lower-bound) size.
+    """
+    total = 0
+    stack: list[str] = [str(path)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if entry.is_file(follow_symlinks=False):
+                            total += entry.stat(follow_symlinks=False).st_size
+                    except OSError:
+                        continue
+        except OSError:
+            continue
+    return total
+
+
+def _iter_prune_candidates_snapshots(
+    home: Path, *, older_than_seconds: float
+) -> Iterable[_PruneCandidate]:
+    """Yield snapshot files older than the threshold.
+
+    Snapshots are flat-file artifacts (one file per snapshot), so
+    we walk via scandir and emit per-file candidates. mtime is the
+    snapshot's own write time — exactly what we want for "older
+    than 14 days".
+    """
+    root = home / "snapshots"
+    if not root.is_dir():
+        return
+    cutoff = time.time() - older_than_seconds
+    stack: list[str] = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if st.st_mtime <= cutoff:
+                        yield _PruneCandidate(
+                            path=Path(entry.path),
+                            bytes=st.st_size,
+                            is_dir=False,
+                        )
+        except OSError:
+            continue
+
+
+def _iter_prune_candidates_transcripts(
+    home: Path, *, older_than_seconds: float
+) -> Iterable[_PruneCandidate]:
+    """Yield transcript files older than the threshold.
+
+    Same shape as snapshots — flat-file scan. Transcripts are
+    append-only artifacts that live in per-session subdirs; we
+    walk recursively and emit per-file candidates so a recent
+    session keeps its in-flight transcript even when older ones
+    in the same dir get pruned.
+    """
+    root = home / "transcripts"
+    if not root.is_dir():
+        return
+    cutoff = time.time() - older_than_seconds
+    stack: list[str] = [str(root)]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)
+                            continue
+                        if not entry.is_file(follow_symlinks=False):
+                            continue
+                        st = entry.stat(follow_symlinks=False)
+                    except OSError:
+                        continue
+                    if st.st_mtime <= cutoff:
+                        yield _PruneCandidate(
+                            path=Path(entry.path),
+                            bytes=st.st_size,
+                            is_dir=False,
+                        )
+        except OSError:
+            continue
+
+
+def _iter_prune_candidates_worktrees(
+    home: Path, *, older_than_seconds: float
+) -> Iterable[_PruneCandidate]:
+    """Yield orphan worktree DIRS older than the threshold.
+
+    Worktrees are pruned at the dir level (not per file) because
+    a worktree is the atomic unit — half-deleting one is worse
+    than leaving it. We layer two safety checks:
+
+    1. The dir's basename is NOT in the live-agent set (orphan-only).
+    2. The dir's mtime is older than ``older_than_seconds`` (typical
+       call site: ``--older-than 1d`` matches the standard orphan
+       definition, but the operator can pass ``--older-than 7d``
+       for a more conservative sweep).
+    """
+    live_names = _count_live_agent_worktrees(home)
+    for path in _iter_orphan_worktree_paths(
+        home,
+        live_names=live_names,
+        stale_after_seconds=older_than_seconds,
+    ):
+        yield _PruneCandidate(
+            path=path,
+            bytes=_dir_size(path),
+            is_dir=True,
+        )
+
+
+def _iter_prune_candidates_homes(
+    home: Path, *, older_than_seconds: float
+) -> Iterable[_PruneCandidate]:
+    """Yield agent home subdirs whose agent task has completed AND mtime > threshold.
+
+    Same orphan-detection plumbing as worktrees: a ``homes/agent-<id>``
+    dir is prune-eligible only if no in-progress task references it
+    AND it has been idle longer than ``older_than_seconds``. The
+    work-service lookup gracefully degrades to "no known live agents"
+    when the service is unreachable, which means a misconfigured
+    machine gets nothing pruned (the safer default).
+    """
+    live_names = _count_live_agent_worktrees(home)
+    # The homes dir name varies: ``homes/`` (current) and ``agent_homes/``
+    # (legacy alias used by some plugins). Prune the modern one only —
+    # the legacy alias would conflate with operator state if cleaned
+    # without explicit operator intent.
+    root = home / "homes"
+    if not root.is_dir():
+        return
+    cutoff = time.time() - older_than_seconds
+    try:
+        with os.scandir(root) as it:
+            for entry in it:
+                try:
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                if entry.name in live_names:
+                    continue
+                if st.st_mtime > cutoff:
+                    continue
+                yield _PruneCandidate(
+                    path=Path(entry.path),
+                    bytes=_dir_size(Path(entry.path)),
+                    is_dir=True,
+                )
+    except OSError:
+        return
+
+
+_PRUNE_TARGETS: dict[str, callable] = {  # type: ignore[type-arg]
+    "snapshots": _iter_prune_candidates_snapshots,
+    "transcripts": _iter_prune_candidates_transcripts,
+    "worktrees": _iter_prune_candidates_worktrees,
+    "homes": _iter_prune_candidates_homes,
+}
+
+
+_REPORT_HELP = help_with_examples(
+    (
+        "Show disk usage of ``~/.pollypm/`` broken down by subdir.\n\n"
+        "Surfaces the silent-growth subtrees that ``du -sh`` is too "
+        "slow to enumerate. Flags unbounded growth, orphan worktrees, "
+        "and audit rotation in the NOTES column."
+    ),
+    [
+        ("pm storage report", "tabular report sorted by bytes (default)"),
+        (
+            "pm storage report --sort=files",
+            "re-sort by file count instead of bytes",
+        ),
+        ("pm storage report --json", "machine-readable output for scripts"),
+    ],
+    trailing=(
+        "Scans use os.scandir for speed. ``snapshots/`` is "
+        "capped at 50k files to keep the report fast on already-"
+        "broken installs; the cap-hit shows as ``50,000+`` and "
+        "flags ``unbounded growth`` in NOTES."
+    ),
+)
+
+
+@storage_app.command("report", help=_REPORT_HELP)
+def storage_report(
+    sort: str = typer.Option(
+        "bytes",
+        "--sort",
+        help="Sort by bytes (default), files, or mtime.",
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit JSON instead of the human-readable table.",
+    ),
+    home: Path = typer.Option(
+        None,
+        "--home",
+        help=(
+            "Override the ``~/.pollypm/`` location. Mostly for tests; "
+            "production should use the default."
+        ),
+    ),
+) -> None:
+    """``pm storage report`` entry point — see module docstring for design."""
+    if sort not in ("bytes", "files", "mtime"):
+        raise typer.BadParameter(
+            f"--sort must be one of: bytes, files, mtime (got {sort!r})."
+        )
+    target = home if home is not None else Path.home() / ".pollypm"
+    if not target.is_dir():
+        typer.echo(
+            f"{target}/ does not exist yet. Run `pm up` once to "
+            "create the workspace, then re-run `pm storage report`."
+        )
+        raise typer.Exit(code=0)
+
+    report = scan_pollypm_home(target)
+    if json_output:
+        typer.echo(_render_report_json(report, sort_key=sort), nl=False)
+    else:
+        typer.echo(_render_report_text(report, sort_key=sort), nl=False)
+    raise typer.Exit(code=0)
+
+
+_PRUNE_HELP = help_with_examples(
+    (
+        "Delete old artifacts under ``~/.pollypm/<target>/``.\n\n"
+        "DEFAULT IS DRY-RUN. ``--yes`` actually deletes (no interactive "
+        "prompt — works under tmux send-keys). Targets: snapshots, "
+        "transcripts, worktrees (orphans only), homes (completed-agent only)."
+    ),
+    [
+        (
+            "pm storage prune snapshots --older-than 14d --dry-run",
+            "preview the prune (no deletion)",
+        ),
+        (
+            "pm storage prune snapshots --older-than 14d --yes",
+            "delete snapshots older than 14 days",
+        ),
+        (
+            "pm storage prune worktrees --older-than 7d --yes",
+            "delete orphan worktrees stale > 7 days",
+        ),
+    ],
+    trailing=(
+        "Safety: prune NEVER touches files newer than --older-than, "
+        "NEVER touches worktrees / homes whose agent is still in-"
+        "progress, and ALWAYS requires --yes (or --dry-run). "
+        "Without either flag the command refuses to run."
+    ),
+)
+
+
+@storage_app.command("prune", help=_PRUNE_HELP)
+def storage_prune(
+    target: str = typer.Argument(
+        ...,
+        help="Subdir to prune: snapshots, transcripts, worktrees, homes.",
+    ),
+    older_than: str = typer.Option(
+        ...,
+        "--older-than",
+        help="Age threshold, e.g. 7d, 4w, 24h, 30m. Required.",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Show what would be deleted; never modify the filesystem.",
+    ),
+    yes: bool = typer.Option(
+        False,
+        "--yes",
+        "-y",
+        help=(
+            "Confirm destructive deletion. Required (alongside the absence "
+            "of --dry-run) to actually delete. There is no interactive "
+            "prompt so the command works via tmux send-keys."
+        ),
+    ),
+    json_output: bool = typer.Option(
+        False,
+        "--json",
+        help="Emit JSON instead of the human-readable summary.",
+    ),
+    sample: int = typer.Option(
+        5,
+        "--sample",
+        help="Number of sample paths to show in the dry-run summary.",
+    ),
+    home: Path = typer.Option(
+        None,
+        "--home",
+        help="Override ``~/.pollypm/`` (tests only).",
+    ),
+) -> None:
+    """``pm storage prune`` entry point.
+
+    Refuses to run when neither ``--dry-run`` nor ``--yes`` is set so
+    a typo can't accidentally delete: the operator must opt in to
+    EITHER a preview or a destructive action.
+    """
+    if target not in _PRUNE_TARGETS:
+        raise typer.BadParameter(
+            f"Unknown prune target {target!r}. "
+            f"Valid: {', '.join(sorted(_PRUNE_TARGETS))}."
+        )
+    if not dry_run and not yes:
+        typer.echo(
+            "Refusing to run without --dry-run or --yes. "
+            "Pass --dry-run to preview, or --yes to actually delete.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    if dry_run and yes:
+        # Not a fatal error — surface the conflict and prefer the
+        # safer interpretation (dry-run wins).
+        typer.echo(
+            "Note: both --dry-run and --yes passed; --dry-run takes "
+            "precedence (nothing will be deleted).",
+            err=True,
+        )
+
+    try:
+        older_than_seconds = _parse_older_than(older_than)
+    except typer.BadParameter:
+        raise
+
+    home_path = home if home is not None else Path.home() / ".pollypm"
+    if not home_path.is_dir():
+        typer.echo(
+            f"{home_path}/ does not exist. Nothing to prune.",
+            err=True,
+        )
+        raise typer.Exit(code=0)
+
+    iterator = _PRUNE_TARGETS[target]
+    candidates: list[_PruneCandidate] = list(
+        iterator(home_path, older_than_seconds=older_than_seconds)
+    )
+
+    total_bytes = sum(c.bytes for c in candidates)
+    total_count = len(candidates)
+    sample_paths = [str(c.path) for c in candidates[: max(sample, 0)]]
+
+    if json_output:
+        payload = {
+            "target": target,
+            "older_than": older_than,
+            "older_than_seconds": older_than_seconds,
+            "dry_run": dry_run or not yes,
+            "candidate_count": total_count,
+            "candidate_bytes": total_bytes,
+            "sample_paths": sample_paths,
+            "deleted_count": 0,
+            "deleted_bytes": 0,
+        }
+    else:
+        typer.echo(
+            f"Prune target: {target}/ (older than {older_than}) — "
+            f"{total_count:,} candidate(s), {_format_bytes(total_bytes)}"
+        )
+        if sample_paths:
+            typer.echo("Sample paths:")
+            for p in sample_paths:
+                typer.echo(f"  - {p}")
+            if total_count > len(sample_paths):
+                typer.echo(
+                    f"  ... and {total_count - len(sample_paths):,} more"
+                )
+
+    if dry_run or not yes:
+        if json_output:
+            typer.echo(json.dumps(payload, indent=2) + "\n", nl=False)
+        else:
+            typer.echo("(dry-run — no files were deleted)")
+        raise typer.Exit(code=0)
+
+    # Destructive path. Each candidate is unlinked/rmtree'd
+    # independently — a single bad path (vanished mid-scan, EACCES,
+    # etc.) shouldn't abort the whole prune.
+    deleted_count = 0
+    deleted_bytes = 0
+    failures: list[tuple[str, str]] = []
+    for cand in candidates:
+        try:
+            if cand.is_dir:
+                shutil.rmtree(cand.path)
+            else:
+                cand.path.unlink()
+        except FileNotFoundError:
+            # Already gone — count as success since the end state
+            # matches what the operator asked for.
+            deleted_count += 1
+            deleted_bytes += cand.bytes
+            continue
+        except OSError as exc:
+            failures.append((str(cand.path), str(exc)))
+            continue
+        deleted_count += 1
+        deleted_bytes += cand.bytes
+
+    if json_output:
+        payload["deleted_count"] = deleted_count
+        payload["deleted_bytes"] = deleted_bytes
+        payload["dry_run"] = False
+        payload["failures"] = [
+            {"path": path, "error": msg} for path, msg in failures
+        ]
+        typer.echo(json.dumps(payload, indent=2) + "\n", nl=False)
+    else:
+        typer.echo(
+            f"Deleted {deleted_count:,} of {total_count:,} candidate(s), "
+            f"reclaimed {_format_bytes(deleted_bytes)}."
+        )
+        if failures:
+            typer.echo(f"{len(failures)} failure(s):", err=True)
+            for path, msg in failures[:5]:
+                typer.echo(f"  - {path}: {msg}", err=True)
+            if len(failures) > 5:
+                typer.echo(
+                    f"  ... and {len(failures) - 5:,} more", err=True
+                )
+    if failures:
         raise typer.Exit(code=1)
     raise typer.Exit(code=0)

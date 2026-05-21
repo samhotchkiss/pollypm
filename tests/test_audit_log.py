@@ -569,6 +569,164 @@ def test_rotation_disabled_via_env(
     assert len(lines) == 20
 
 
+def test_read_events_walks_gz_archives_after_rotation(
+    tmp_path: Path,
+) -> None:
+    """Regression for the #2032 codex blocker: ``read_events()`` must
+    walk rotated ``.gz`` archives so events that landed in the
+    rotated chunk remain visible to consumers like the watchdog
+    dedupe window.
+
+    Without rotation-aware reads, a rotation between escalation
+    dispatches would hide the prior ``watchdog.escalation_dispatched``
+    row and allow a duplicate dispatch.
+
+    Test shape:
+
+    1. Seed a ``audit.jsonl.<ts>.gz`` archive with a
+       ``watchdog.escalation_dispatched`` event.
+    2. Leave the live ``audit.jsonl`` either empty or with
+       unrelated events only.
+    3. Call ``read_events(event="watchdog.escalation_dispatched",
+       since=<old_iso>)``.
+    4. Assert the archived event is returned.
+    """
+    import gzip as _gz
+
+    project_root = tmp_path / "gzread"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    # Seed an archived rotation: a single .gz file holding the
+    # historical watchdog.escalation_dispatched event.
+    archived_event = {
+        "schema": SCHEMA_VERSION,
+        "ts": "2026-05-19T12:00:00+00:00",
+        "project": "gzread",
+        "event": "watchdog.escalation_dispatched",
+        "subject": "gzread/finding-A",
+        "actor": "watchdog",
+        "status": "ok",
+        "metadata": {
+            "finding_type": "stuck_draft",
+            "root_cause_hash": "abc123",
+        },
+    }
+    gz_archive = audit_path.with_suffix(audit_path.suffix + ".1234567890.gz")
+    with _gz.open(gz_archive, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(archived_event) + "\n")
+
+    # Live file: empty (touch only). The post-rotation append in
+    # production lands the next event here; for this regression the
+    # rotated chunk is what matters.
+    audit_path.touch()
+
+    # Query as the watchdog would: filter on the dedupe event +
+    # an old since-cutoff that should clearly include the archived
+    # event.
+    events = read_events(
+        "gzread",
+        project_path=project_root,
+        event="watchdog.escalation_dispatched",
+        since="2026-05-01T00:00:00+00:00",
+    )
+
+    subjects = [e.subject for e in events]
+    assert "gzread/finding-A" in subjects, (
+        "read_events must walk .gz archives — the rotated "
+        "watchdog.escalation_dispatched row went missing, which "
+        "would allow duplicate dispatches in production"
+    )
+    archived_match = next(
+        (e for e in events if e.subject == "gzread/finding-A"), None
+    )
+    assert archived_match is not None
+    assert archived_match.metadata.get("root_cause_hash") == "abc123"
+
+
+def test_read_events_chains_live_and_gz_in_chronological_order(
+    tmp_path: Path,
+) -> None:
+    """When events exist across BOTH a .gz archive and the live file,
+    ``read_events()`` must return them in chronological order so
+    downstream consumers (heartbeat, briefings, doctor) see a
+    coherent timeline."""
+    import gzip as _gz
+
+    project_root = tmp_path / "chain"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    # Older event in an archive.
+    old_event = {
+        "schema": SCHEMA_VERSION,
+        "ts": "2026-05-01T00:00:00+00:00",
+        "project": "chain",
+        "event": "task.created",
+        "subject": "chain/old",
+        "actor": "test",
+        "status": "ok",
+        "metadata": {},
+    }
+    gz_archive = audit_path.with_suffix(audit_path.suffix + ".1700000000.gz")
+    with _gz.open(gz_archive, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(old_event) + "\n")
+
+    # Newer event in the live file (after rotation).
+    new_event = {
+        "schema": SCHEMA_VERSION,
+        "ts": "2026-05-20T00:00:00+00:00",
+        "project": "chain",
+        "event": "task.created",
+        "subject": "chain/new",
+        "actor": "test",
+        "status": "ok",
+        "metadata": {},
+    }
+    audit_path.write_text(json.dumps(new_event) + "\n", encoding="utf-8")
+
+    events = read_events("chain", project_path=project_root)
+    subjects = [e.subject for e in events]
+    assert subjects == ["chain/old", "chain/new"], (
+        f"events should be chronological across .gz + live, got {subjects}"
+    )
+
+
+def test_read_events_walks_gz_archives_for_central_tail(
+    tmp_path: Path,
+) -> None:
+    """The rotation walker must apply to the central-tail fallback
+    too (no project_path), so the workspace-level audit grep / SSE
+    consumers also see rotated history."""
+    import gzip as _gz
+
+    central = central_log_path("centralgz")
+    central.parent.mkdir(parents=True, exist_ok=True)
+
+    archived_event = {
+        "schema": SCHEMA_VERSION,
+        "ts": "2026-05-10T00:00:00+00:00",
+        "project": "centralgz",
+        "event": "watchdog.escalation_dispatched",
+        "subject": "centralgz/finding-Z",
+        "actor": "watchdog",
+        "status": "ok",
+        "metadata": {"root_cause_hash": "deadbeef"},
+    }
+    gz_archive = central.with_suffix(central.suffix + ".1700000001.gz")
+    with _gz.open(gz_archive, "wt", encoding="utf-8") as fh:
+        fh.write(json.dumps(archived_event) + "\n")
+    # Live central tail: empty.
+    central.touch()
+
+    events = read_events(
+        "centralgz",
+        event="watchdog.escalation_dispatched",
+        since="2026-05-01T00:00:00+00:00",
+    )
+    assert [e.subject for e in events] == ["centralgz/finding-Z"]
+
+
 # ---------------------------------------------------------------------------
 # Sqlite-integration tests REMOVED for Slice K (#1737).
 #

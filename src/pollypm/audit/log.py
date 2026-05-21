@@ -778,27 +778,99 @@ def _iter_log_lines(path: Path) -> Iterable[dict[str, Any]]:
     mid-write) can leave a truncated final line. Skip those rather
     than crashing the reader — the heartbeat must keep working
     even when the log has a junk tail.
+
+    Routes ``.gz`` archives through :func:`gzip.open` in text mode so
+    callers walking a rotation chain (live ``.jsonl`` + ``.gz``
+    siblings) get the same line-iteration shape regardless of file
+    format. See :func:`_walk_log_chain` for the chain producer.
     """
     if not path.exists():
         return
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    obj = json.loads(stripped)
-                except json.JSONDecodeError:
-                    # Truncated / corrupt line — skip silently. We
-                    # do not log here because a single bad tail line
-                    # would otherwise spam the error log on every
-                    # heartbeat tick.
-                    continue
-                if isinstance(obj, dict):
-                    yield obj
+        if path.suffix == ".gz":
+            fh = gzip.open(path, "rt", encoding="utf-8")
+        else:
+            fh = open(path, "r", encoding="utf-8")
     except OSError as exc:
         logger.warning("audit.read: open failed for %s: %s", path, exc)
+        return
+    try:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                # Truncated / corrupt line — skip silently. We
+                # do not log here because a single bad tail line
+                # would otherwise spam the error log on every
+                # heartbeat tick.
+                continue
+            if isinstance(obj, dict):
+                yield obj
+    except OSError as exc:
+        logger.warning("audit.read: read failed for %s: %s", path, exc)
+    finally:
+        try:
+            fh.close()
+        except Exception:  # noqa: BLE001 — close-time errors are noise
+            pass
+
+
+def _archive_sort_key(path: Path) -> tuple[float, str]:
+    """Sort key for ``audit.jsonl.<ts>[.bump].gz`` archives.
+
+    We want newest-first iteration. Use mtime as primary because the
+    rotation timestamp is embedded in the filename but tests + edge
+    cases can leave clock-skew; fall back to filename for stable
+    ordering within the same mtime second.
+
+    Mirrors the helper in ``pollypm.cli_features.audit`` (PR #2036).
+    Duplicated rather than imported because that module pulls in
+    typer and would create an import cycle from this stdlib-only
+    audit primitive.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (mtime, path.name)
+
+
+def _walk_log_chain(live: Path) -> Iterable[Path]:
+    """Yield ``live`` first, then ``live.<ts>[.bump].gz`` archives newest-first.
+
+    Yields only paths that exist. Used by :func:`read_events` so
+    rotation never hides events from consumers (#2032 codex blocker):
+    once ``_maybe_rotate`` moves ``audit.jsonl`` into ``audit.jsonl.<ts>.gz``
+    the rotated chunk must remain visible to the watchdog dedupe
+    window, SSE, morning briefing, and doctor checks — otherwise a
+    rotation would silently allow duplicate escalation dispatches.
+
+    Mirrors the helper in ``pollypm.cli_features.audit`` (PR #2036).
+    """
+    if live.exists():
+        yield live
+    parent = live.parent
+    if not parent.exists():
+        return
+    prefix = live.name + "."
+    archives: list[Path] = []
+    try:
+        for sibling in parent.iterdir():
+            if not sibling.is_file():
+                continue
+            if not sibling.name.startswith(prefix):
+                continue
+            if not sibling.name.endswith(".gz"):
+                continue
+            archives.append(sibling)
+    except OSError:
+        return
+    archives.sort(key=_archive_sort_key, reverse=True)
+    for archive in archives:
+        yield archive
 
 
 def read_events(
@@ -814,10 +886,20 @@ def read_events(
     Source preference:
 
     1. If ``project_path`` is provided AND the per-project log
-       exists, read from there. This is the source of truth and
-       carries events from before any central-tail rotation.
+       exists, read from there + walk its rotated ``.gz`` siblings.
+       This is the source of truth and carries events from before
+       any central-tail rotation.
     2. Otherwise read from the central tail at
-       ``~/.pollypm/audit/<project>.jsonl``.
+       ``~/.pollypm/audit/<project>.jsonl`` + its rotated ``.gz``
+       siblings.
+
+    Rotation visibility (#2032 codex blocker): each source above is a
+    *chain* — live ``.jsonl`` first, then ``.gz`` archives newest-
+    first. Once a rotation moves recent events into a ``.gz``, those
+    rows must still satisfy ``read_events(..., since=..., event=...)``
+    queries. The watchdog dedupe window depends on this: if the prior
+    ``watchdog.escalation_dispatched`` row disappears after rotation
+    the next tick would dispatch a duplicate.
 
     Filters apply in order:
 
@@ -832,15 +914,22 @@ def read_events(
     chatty project lands in the low thousands per day — so loading
     fully into memory is fine.
     """
-    paths_to_try: list[Path] = []
     per_project = project_log_path(project_path)
     if per_project is not None and per_project.exists():
-        paths_to_try.append(per_project)
+        live = per_project
     else:
-        paths_to_try.append(central_log_path(project))
+        live = central_log_path(project)
 
-    events: list[AuditEvent] = []
-    for path in paths_to_try:
+    # ``_walk_log_chain`` yields live first then archives newest-first.
+    # Each file is a chronological run of records (older-first within
+    # the file), so the cross-file order is:
+    #   live (oldest→newest in live), then archive_N (newest archive),
+    #   then archive_N-1, ... archive_1 (oldest archive).
+    # We collect per-file then reverse the inter-file order so the
+    # final list is globally chronological (oldest→newest).
+    per_file: list[list[AuditEvent]] = []
+    for path in _walk_log_chain(live):
+        bucket: list[AuditEvent] = []
         for obj in _iter_log_lines(path):
             if event is not None and obj.get("event") != event:
                 continue
@@ -854,10 +943,21 @@ def read_events(
             # mutation hooks).
             if obj.get("project") and obj.get("project") != project:
                 continue
-            events.append(AuditEvent.from_dict(obj))
-        # Once we've found a real source, don't fall through.
-        if events:
-            break
+            bucket.append(AuditEvent.from_dict(obj))
+        per_file.append(bucket)
+
+    # Inter-file order from walker: [live, newest_gz, ..., oldest_gz].
+    # Chronological (oldest→newest) is the reverse: [oldest_gz, ...,
+    # newest_gz, live]. Within each file, records are already in
+    # write-order (oldest→newest).
+    events: list[AuditEvent] = []
+    for bucket in reversed(per_file):
+        events.extend(bucket)
+
+    # Re-sort by ts to defend against clock-skew between rotations
+    # (the walker uses mtime which is approximate, but ts is the
+    # actual write time). ISO-8601 UTC sorts lexicographically.
+    events.sort(key=lambda e: e.ts)
 
     if limit is not None and limit >= 0:
         return events[-limit:]

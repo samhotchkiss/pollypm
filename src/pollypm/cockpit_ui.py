@@ -58,6 +58,7 @@ from textual.widgets import (
 )
 
 from pollypm.approval_notifications import notify_task_approved
+from pollypm.cockpit_footer_status import render_footer_status
 from pollypm.cockpit_formatting import format_relative_age as _format_relative_age
 from pollypm.cockpit_markup import _escape, _escape_body
 from pollypm.model_registry import load_registry
@@ -2386,26 +2387,135 @@ class PollyCockpitApp(App[None]):
         return "⚠ Heartbeat offline · open Settings"
 
     def _update_hint(self) -> None:
-        # Keep this hint short enough to fit a 30-col rail without
-        # wrapping. Anything beyond j/k/\u21b5/?/q is discoverable via the
-        # ``?`` overlay (#790). Width budget is roughly 28 chars after
-        # the leading pad applied by Textual.
+        # Unified footer status bar (#1988 / #2014). Replaces the
+        # ad-hoc ``j/k \u21b5open \u00b7 ? help \u00b7 q quit`` / heartbeat-offline
+        # string-build with a single call into
+        # :func:`pollypm.cockpit_footer_status.render_footer_status` so
+        # the cockpit footer, rail badge, and ticker share one format.
+        #
+        # The route-status hint (``_route_status_hint``) still wins \u2014
+        # it's a transient per-route override (e.g. "Press n to launch")
+        # that the unified status bar isn't meant to displace.
+        #
+        # Backstop: ``render_footer_status`` is a pure formatter, but
+        # any failure to *resolve its inputs* (supervisor load, inbox
+        # fanout, pg fallback) would otherwise blank the footer. Wrap
+        # the new path in a try/except and fall through to the legacy
+        # inline builder so the footer NEVER crashes the cockpit.
         route_status_hint = getattr(self, "_route_status_hint", None)
         if route_status_hint:
             self.hint.update(route_status_hint)
             return
+        try:
+            hint_text = self._compose_unified_footer_status()
+        except Exception:  # noqa: BLE001
+            # Fall back to the pre-#1988 inline builder. Logged at WARN
+            # so the cockpit operator sees the degradation in pm logs
+            # without it surfacing as an alert dialog.
+            logger.warning(
+                "render_footer_status failed; falling back to legacy hint",
+                exc_info=True,
+            )
+            hint_text = self._compose_legacy_footer_hint()
+        self.hint.update(hint_text)
+
+    def _compose_unified_footer_status(self) -> str:
+        """Build the footer text via :func:`render_footer_status`.
+
+        Resolves the four inputs (project_count, agent_count,
+        inbox_count, alert) from the live supervisor + inbox helpers,
+        then hands them to the leaf formatter shipped in #2014. The
+        ``width`` budget reads from the ``hint`` widget's current
+        rendered size and falls back to 80 cols if Textual hasn't
+        sized the widget yet (typical on first paint).
+        """
+        supervisor = self.router._load_supervisor()
+        config = supervisor.config
+
+        # project_count: every configured project (tracked + paused).
+        # The footer is a workspace-wide signal \u2014 filtering to tracked
+        # would hide projects the operator just paused, contradicting
+        # the "Tracked-Filter Asymmetry" memo for the rail badge.
+        projects = getattr(config, "projects", {}) or {}
+        project_count = len(projects)
+
+        # agent_count: every configured session row, since "agents" in
+        # the audit copy maps to the session table the supervisor
+        # launches. Live-only counts would jitter as workers restart.
+        sessions = getattr(config, "sessions", {}) or {}
+        agent_count = len(sessions)
+
+        # inbox_count: re-use the shared ``pm_inbox_awaits_user_list``
+        # so the footer can never disagree with the rail badge / ``pm
+        # inbox --awaits-user`` (#1571).
+        from pollypm.cockpit_inbox import pm_inbox_awaits_user_list
+        inbox_items = pm_inbox_awaits_user_list(config) or []
+        inbox_count = len(inbox_items)
+
+        # alert: the only footer-class alert today is the
+        # heartbeat-offline warning. Reuse the existing detection +
+        # formatter so the new path and the legacy path stay aligned.
+        alert = self._resolve_heartbeat_footer_alert(supervisor)
+
+        try:
+            width = int(getattr(self.hint, "size", None).width)  # type: ignore[union-attr]
+        except (AttributeError, TypeError, ValueError):
+            width = 80
+        if width <= 0:
+            width = 80
+
+        return render_footer_status(
+            project_count=project_count,
+            agent_count=agent_count,
+            inbox_count=inbox_count,
+            alert=alert,
+            width=width,
+        )
+
+    def _resolve_heartbeat_footer_alert(self, supervisor) -> str | None:
+        """Return the heartbeat-offline alert string, or None if fresh.
+
+        Mirrors the legacy ``_update_hint`` heartbeat-staleness probe
+        (pg-aware read, naive-UTC normalization, ``_HEARTBEAT_STALE_SECONDS``
+        threshold, ``_format_heartbeat_offline_hint`` for the string).
+        Any failure returns ``None`` so the footer just hides the
+        alert chunk rather than poisoning the whole bar.
+        """
+        try:
+            from pollypm.storage._backend_dispatch import is_pg_backend
+            if is_pg_backend(supervisor.config):
+                from pollypm.storage.pg_heartbeats import (
+                    last_heartbeat_at as _pg_last_heartbeat_at,
+                )
+                last_hb = _pg_last_heartbeat_at(config=supervisor.config)
+            else:
+                last_hb = supervisor.store.last_heartbeat_at()
+            if not last_hb:
+                return None
+            from datetime import UTC, datetime
+            parsed = datetime.fromisoformat(last_hb.replace(" ", "T"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=UTC)
+            elapsed = (datetime.now(UTC) - parsed).total_seconds()
+            if elapsed > self._HEARTBEAT_STALE_SECONDS:
+                return self._format_heartbeat_offline_hint(elapsed)
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
+    def _compose_legacy_footer_hint(self) -> str:
+        """Pre-#1988 inline footer builder, retained as the backstop.
+
+        Called from ``_update_hint`` only when the unified path raises;
+        keeps the cockpit footer alive through any future regression in
+        ``render_footer_status`` or its input-resolution helpers.
+        """
         if self._right_pane_has_live_session():
             hint_text = "Tab detail \u00b7 j/k \u00b7 ? help"
         else:
             hint_text = "j/k \u21b5open \u00b7 ? help \u00b7 q quit"
         try:
             supervisor = self.router._load_supervisor()
-            # Backend-aware read: on the pg backend the unified ``messages``
-            # table lives in Postgres, but ``supervisor.store`` is still the
-            # SQLite ``StateStore`` (kept for legacy domain reads). Reading
-            # the sqlite copy yields a stale row from before the pg cutover
-            # and the rail then renders a false-positive "Heartbeat offline
-            # (Nm)" warning. Route through the pg facade when configured.
             from pollypm.storage._backend_dispatch import is_pg_backend
             if is_pg_backend(supervisor.config):
                 from pollypm.storage.pg_heartbeats import (
@@ -2416,11 +2526,6 @@ class PollyCockpitApp(App[None]):
                 last_hb = supervisor.store.last_heartbeat_at()
             if last_hb:
                 from datetime import UTC, datetime
-                # Unified ``messages`` table stores SQLite's default
-                # ``CURRENT_TIMESTAMP`` which is naive-UTC
-                # (``YYYY-MM-DD HH:MM:SS``, no ``+00:00``). Force UTC
-                # so ``datetime.now(UTC) - parsed`` doesn't raise
-                # ``can't subtract offset-naive and offset-aware``.
                 parsed = datetime.fromisoformat(last_hb.replace(" ", "T"))
                 if parsed.tzinfo is None:
                     parsed = parsed.replace(tzinfo=UTC)
@@ -2429,7 +2534,7 @@ class PollyCockpitApp(App[None]):
                     hint_text = self._format_heartbeat_offline_hint(elapsed)
         except Exception:  # noqa: BLE001
             pass
-        self.hint.update(hint_text)
+        return hint_text
 
     def _sync_selected_from_nav(self) -> None:
         """Update selected_key from the current ListView cursor position."""

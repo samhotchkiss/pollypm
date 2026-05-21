@@ -1735,6 +1735,26 @@ def check_doubled_pollypm_path() -> CheckResult:
         }
     )
 
+    # The ``--fix`` handler MOVES (never deletes) the doubled tree to
+    # a timestamped sibling. Helper carries the safety guards (refuses
+    # if direct children look like a real config root; refuses on
+    # symlink target; never follows symlinks) so the rule is testable
+    # in isolation. See :mod:`pollypm.doctor_cleanup_doubled_path`.
+    def _fix() -> tuple[bool, str]:
+        from pollypm.doctor_cleanup_doubled_path import (
+            cleanup_doubled_path,
+            emit_cleanup_audit_event,
+            format_summary,
+        )
+
+        plan = cleanup_doubled_path(doubled)
+        if plan.refused_reason is not None:
+            return (False, plan.refused_reason)
+        if not plan.moved:
+            return (False, format_summary(plan))
+        emit_cleanup_audit_event(plan)
+        return (True, format_summary(plan))
+
     # Empty-directory case — still flag (the path should not exist at
     # all) but report it as a tiny, informational warn.
     if file_count == 0:
@@ -1748,9 +1768,12 @@ def check_doubled_pollypm_path() -> CheckResult:
             fix=(
                 f"Remove the empty directory —\n"
                 f"  rmdir {doubled}\n"
+                "Or run:  pm doctor --fix   # moves it to a .bak sibling\n"
                 "Recheck: pm doctor"
             ),
             severity="warning",
+            fixable=True,
+            fix_fn=_fix,
             data=data,
         )
 
@@ -1775,11 +1798,14 @@ def check_doubled_pollypm_path() -> CheckResult:
             f"Move the artifact to a backup location once you have "
             f"confirmed nothing under it is needed —\n"
             f"  mv {doubled} {doubled}.bak-$(date +%Y%m%d)\n"
+            "Or run:  pm doctor --fix   # MOVES (never deletes) to .bak-<ts>\n"
             "Or remove it outright:\n"
             f"  rm -rf {doubled}\n"
             "Recheck: pm doctor"
         ),
         severity="warning",
+        fixable=True,
+        fix_fn=_fix,
         data=data,
     )
 

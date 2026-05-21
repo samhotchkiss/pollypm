@@ -286,15 +286,33 @@ class _FakeWork:
     """Minimal work-service stand-in — only the methods the handler
     uses (``list_worker_sessions`` + ``create`` + ``list_tasks``)."""
 
-    def __init__(self, sessions: list[_FakeSession]) -> None:
+    def __init__(
+        self,
+        sessions: list[_FakeSession],
+        *,
+        existing_tasks: list[Any] | None = None,
+    ) -> None:
         self._sessions = list(sessions)
         self.created: list[dict[str, Any]] = []
+        # Stand-in for ``work.list_tasks`` results — keyed by status so
+        # the dedupe scan can lookup draft / queued / in_progress rows.
+        self._tasks_by_status: dict[str, list[Any]] = {}
+        for task in (existing_tasks or []):
+            status = getattr(task, "work_status", "draft")
+            self._tasks_by_status.setdefault(status, []).append(task)
 
     def list_worker_sessions(self, *, active_only: bool = True):  # noqa: ARG002
         return list(self._sessions)
 
-    def list_tasks(self, **_kwargs: Any):
-        return []
+    def list_tasks(self, **kwargs: Any):
+        status = kwargs.get("work_status")
+        if status is None:
+            # Return everything when caller doesn't filter.
+            out: list[Any] = []
+            for rows in self._tasks_by_status.values():
+                out.extend(rows)
+            return out
+        return list(self._tasks_by_status.get(status, ()))
 
     def create(self, **kwargs: Any):
         self.created.append(kwargs)
@@ -310,6 +328,7 @@ def _invoke_handler_with_fakes(
     *,
     sessions: list[_FakeSession],
     project_root: Path,
+    existing_tasks: list[Any] | None = None,
 ) -> tuple[dict[str, Any], _FakeStore, _FakeWork]:
     """Run the handler with the work-service factory + ``_load_config_and_store``
     swapped for fakes. Returns (result, store, work) so assertions can
@@ -318,7 +337,7 @@ def _invoke_handler_with_fakes(
     from pollypm.plugins_builtin.core_recurring import sweeps as sweeps_module
 
     fake_store = _FakeStore()
-    fake_work = _FakeWork(sessions)
+    fake_work = _FakeWork(sessions, existing_tasks=existing_tasks)
 
     @dataclass
     class _FakeProject:
@@ -457,6 +476,56 @@ class TestHandler:
         assert result["classified"].get("lock_file") == 1
         key = ("worker-demo-3", "worktree_state:demo/3:lock_file")
         assert store.alerts[key]["severity"] == "error"
+
+    def test_merge_conflict_dedupes_against_draft_inbox_task(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A prior sweep's inbox task that's still in ``draft`` (waiting
+        for user promotion) must dedupe the next sweep's emit.
+
+        Regression #2021: ``_emit_inbox_task`` only scanned ``queued`` +
+        ``in_progress``, so chat-flow inbox tasks (which start in
+        ``draft``) were re-created every sweep, producing one duplicate
+        per cycle. Observed in production: 5 orphan worktrees → 150
+        duplicate draft tasks in 10h (30 dupes each)."""
+        repo = _make_repo(tmp_path / "repo")
+        wt = _add_worktree(repo, "conflict_dupe")
+        (wt / "file.txt").write_text("left\n")
+        _run("git", "-C", str(wt), "add", "file.txt")
+        _run("git", "-C", str(wt), "commit", "-m", "L")
+        (repo / "file.txt").write_text("right\n")
+        _run("git", "-C", str(repo), "add", "file.txt")
+        _run("git", "-C", str(repo), "commit", "-m", "R")
+        merge = _run("git", "-C", str(wt), "merge", "main", check=False)
+        assert merge.returncode != 0
+
+        sessions = [
+            _FakeSession(
+                task_project="demo", task_number=11,
+                agent_name="worker-demo-11", worktree_path=str(wt),
+            ),
+        ]
+
+        # Seed the work-service with a prior-sweep draft task carrying
+        # the dedupe label. The handler must NOT create a duplicate.
+        @dataclass
+        class _StubTask:
+            labels: tuple[str, ...]
+            work_status: str = "draft"
+
+        prior_draft = _StubTask(labels=(
+            "audit:worktree_state",
+            "worktree_audit:demo/11:merge_conflict",
+        ))
+        result, _store, work = _invoke_handler_with_fakes(
+            monkeypatch, sessions=sessions, project_root=repo,
+            existing_tasks=[prior_draft],
+        )
+        assert result["classified"].get("merge_conflict") == 1
+        # Alert still raised (idempotent upsert), but no new inbox row.
+        assert result["alerts_raised"] >= 1
+        assert result["inbox_emitted"] == 0
+        assert work.created == []
 
     def test_clean_after_dirty_clears_existing_alert(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,

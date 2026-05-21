@@ -1,4 +1,4 @@
-"""Tests for the rail's project-state categorization TTL cache (#1642).
+"""Tests for the rail's project-state categorization (#1642 → Move A PR 3).
 
 Pre-#1642, ``CockpitRouter._project_categorizations`` called through to
 ``project_state_map_from_config`` on every rail-refresh tick. That
@@ -6,14 +6,24 @@ function opens every project DB + walks every inbox source, so a
 navigation burst could stack a multi-second sweep inside the
 ``rail_refresh`` worker and contend with route workers + pane loaders.
 
-The fix wraps the call in a short-TTL cache keyed on the config
-identity. These tests pin two invariants:
+The original #1642 fix wrapped the call in a short-TTL cache keyed on
+the config identity. Move A PR 3 (docs/design/move-a-state-cache.md
+§9.5) **removes** that TTL: the in-process state cache's
+``global_version()`` short-circuit + the per-call TTL inside
+:func:`project_state_map_from_config` (``_PREFETCH_PROJECT_STATE_TTL_SECONDS``)
+already collapse navigation-burst refreshes into a single compute. Two
+cache layers were worse than one — a freshly completed task hung
+around as WORKING for up to 2s with no invalidation path.
 
-* Within the TTL, repeated calls collapse to a single underlying sweep
-  (no DB re-scans on every tick).
-* The cache is invalidated when ``_clear_rail_caches`` runs — which is
-  the same chokepoint ``_load_config`` already routes config-mtime
-  reloads through.
+These tests pin the post-removal invariants:
+
+* The rail's :meth:`_project_categorizations` is now a thin wrapper
+  around :func:`project_state_map_from_config`; every call delegates
+  to the underlying helper, no router-side memoisation.
+* Updates to the underlying state are visible on the next call (no
+  waiting on a TTL to elapse).
+* The router-side TTL attributes are gone — verified by introspection
+  so a future "let's add caching back" PR breaks a test loud and clear.
 """
 
 from __future__ import annotations
@@ -36,12 +46,17 @@ def _router(tmp_path: Path) -> CockpitRouter:
     return CockpitRouter(config_path)
 
 
-def test_project_categorizations_caches_within_ttl(monkeypatch, tmp_path: Path) -> None:
-    """Repeated calls within the TTL must not re-scan project DBs.
+def test_project_categorizations_does_not_cache_within_ttl(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """Move A PR 3 (§9.5): the rail-side TTL is GONE.
 
-    Counts the number of times ``project_state_map_from_config`` is
-    invoked; on a 0.8s-tick cockpit, 10 calls landing inside the cache
-    window must collapse to exactly one underlying sweep.
+    Every call delegates to ``project_state_map_from_config`` so the
+    rail picks up state changes immediately. ``project_state_map_from_config``
+    itself has a 1s ``_PREFETCH_PROJECT_STATE_TTL_SECONDS`` cache plus
+    (when the env flag is on) the state-cache fast path; both yield the
+    same "skip wasted work when nothing changed" win without trapping
+    stale data behind a rail-side timer.
     """
     router = _router(tmp_path)
     config = object()
@@ -61,27 +76,26 @@ def test_project_categorizations_caches_within_ttl(monkeypatch, tmp_path: Path) 
     for _ in range(9):
         router._project_categorizations(config)
 
-    assert len(calls) == 1, (
-        "rail re-scanned project DBs within TTL — expected cached result"
-    )
+    # No router-side caching — every call delegates fresh.
+    assert len(calls) == 10
     assert first == {"alpha": "working", "beta": "idle"}
 
 
-def test_project_categorizations_invalidates_on_cache_clear(
+def test_project_categorizations_updates_visible_immediately(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    """``_clear_rail_caches`` (called by ``_load_config`` on mtime change)
-    must drop the categorization cache so a reloaded config doesn't keep
-    painting stale glyphs."""
+    """A change to the underlying state is visible on the next call.
+
+    Regression test for the TTL pathology: freshly-completed work
+    hanging around as WORKING for up to 2s. Now the rail picks up
+    state transitions on the next tick.
+    """
     router = _router(tmp_path)
     config = object()
 
     state = {"map": {"alpha": ProjectState.WORKING}}
-    calls = 0
 
     def _fake_map(cfg):  # noqa: ANN001, ANN202
-        nonlocal calls
-        calls += 1
         return state["map"]
 
     monkeypatch.setattr(
@@ -89,51 +103,28 @@ def test_project_categorizations_invalidates_on_cache_clear(
         _fake_map,
     )
 
-    router._project_categorizations(config)
-    assert calls == 1
-    router._clear_rail_caches()
-    state["map"] = {"alpha": ProjectState.WAITING}
-    result = router._project_categorizations(config)
-    assert calls == 2
-    assert result == {"alpha": "waiting"}
+    first = router._project_categorizations(config)
+    assert first == {"alpha": "working"}
+
+    # Simulate the task completing — the rail's next call MUST see the
+    # new state, with no waiting on a TTL to elapse.
+    state["map"] = {"alpha": ProjectState.IDLE}
+    second = router._project_categorizations(config)
+    assert second == {"alpha": "idle"}
 
 
-def test_project_categorizations_returns_independent_dict(
+def test_project_categorizations_handles_failure_without_raising(
     monkeypatch, tmp_path: Path,
 ) -> None:
-    """Callers must not be able to mutate the cached map.
+    """A raising sweep is contained — caller gets ``{}`` instead of a crash.
 
-    The rail glues the result onto ``CockpitItem`` rendering; if a
-    caller pops keys (e.g. while walking project rows) the cached map
-    must stay intact for the next tick.
+    The router stays best-effort: a broken underlying helper degrades
+    to an empty map rather than propagating into the rail render path.
     """
     router = _router(tmp_path)
     config = object()
 
-    monkeypatch.setattr(
-        "pollypm.dashboard.operator_view.project_state_map_from_config",
-        lambda _cfg: {"alpha": ProjectState.WORKING},
-    )
-
-    first = router._project_categorizations(config)
-    first["alpha"] = "MUTATED"
-    second = router._project_categorizations(config)
-    assert second["alpha"] == "working"
-
-
-def test_project_categorizations_caches_empty_on_failure(
-    monkeypatch, tmp_path: Path,
-) -> None:
-    """A raising sweep must still be cached as ``{}`` so the rail
-    doesn't re-trigger the (expensive, failing) scan every tick."""
-    router = _router(tmp_path)
-    config = object()
-
-    calls = 0
-
     def _boom(_cfg):  # noqa: ANN001, ANN202
-        nonlocal calls
-        calls += 1
         raise RuntimeError("DB unavailable")
 
     monkeypatch.setattr(
@@ -144,4 +135,17 @@ def test_project_categorizations_caches_empty_on_failure(
     result_a = router._project_categorizations(config)
     result_b = router._project_categorizations(config)
     assert result_a == {} == result_b
-    assert calls == 1
+
+
+def test_router_no_longer_holds_categorization_cache_state(
+    tmp_path: Path,
+) -> None:
+    """The router-side TTL attributes are GONE (Move A PR 3, §9.5).
+
+    A future "let's add caching back" PR will break this test.
+    """
+    router = _router(tmp_path)
+    assert not hasattr(router, "_project_categorizations_cache")
+    assert not hasattr(router, "_project_categorizations_cache_key")
+    assert not hasattr(router, "_project_categorizations_cached_at")
+    assert not hasattr(CockpitRouter, "_PROJECT_CATEGORIZATIONS_TTL_SECONDS")

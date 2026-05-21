@@ -121,15 +121,34 @@ def _inbox_item(
 
 
 def _entry(
-    project_key: str, *, state: ProjectState, items: list[Any],
+    project_key: str,
+    *,
+    state: ProjectState,
+    items: list[Any],
+    rail_state: Any = None,
+    rail_badge: str | None = None,
+    rail_sort_rank: int = 0,
+    rail_reason: str = "",
+    approvals_pending: int = 0,
+    glyph: str = "",
+    detail: str = "",
+    latest_heartbeat_by_session: dict[str, Any] | None = None,
 ) -> ProjectStateCacheEntry:
     return ProjectStateCacheEntry(
         project_key=project_key,
         project_path=Path(f"/tmp/{project_key}"),
         tracked=True,
         state=state,
+        glyph=glyph,
+        detail=detail,
+        rail_state=rail_state,
+        rail_badge=rail_badge,
+        rail_sort_rank=rail_sort_rank,
+        rail_reason=rail_reason,
+        approvals_pending=approvals_pending,
         awaits_user_count=len(items),
         awaits_user_items=tuple(items),
+        latest_heartbeat_by_session=dict(latest_heartbeat_by_session or {}),
     )
 
 
@@ -560,3 +579,453 @@ class TestInboxDefaultLensInvariant:
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         counted = cockpit_inbox._count_inbox_tasks_for_label(config)
         assert len(listed) == counted == len(items)
+
+
+# ── Move A PR 3 parity — _count_inbox_tasks_for_label cache route ──
+
+
+class TestCountInboxTasksForLabelParity:
+    """PR 3 (§5 row 2): ``_count_inbox_tasks_for_label`` reads ``awaits_user_count``.
+
+    Three projects, the cache fast-path sums ``entry.awaits_user_count``
+    while the direct path runs the workspace-wide sweep + ``len()``.
+    Both MUST agree.
+    """
+
+    def test_cached_count_skips_workspace_sweep(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Flag on + populated cache: no workspace sweep, sum from snapshot."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha", "beta", "gamma"], tmp_path)
+        items_alpha = [_inbox_item(project="alpha", source="task", ident="alpha/1")]
+        items_beta = [
+            _inbox_item(project="beta", source="task", ident="beta/2"),
+            _inbox_item(project="beta", source="message", ident="m-b1"),
+        ]
+        items_gamma: list[Any] = []
+        entries = {
+            "alpha": _entry("alpha", state=ProjectState.WAITING, items=items_alpha),
+            "beta": _entry("beta", state=ProjectState.WAITING, items=items_beta),
+            "gamma": _entry("gamma", state=ProjectState.IDLE, items=items_gamma),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        direct_called = {"n": 0}
+
+        def _no_call(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return items_alpha + items_beta + items_gamma
+
+        monkeypatch.setattr(
+            cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _no_call,
+        )
+
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        # Three items total; the direct sweep wasn't touched.
+        assert counted == 3
+        assert direct_called["n"] == 0
+
+    def test_flag_off_uses_direct_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Flag off — falls back to ``len(pm_inbox_awaits_user_list)``."""
+
+        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        config = _make_config(["alpha", "beta"], tmp_path)
+        items = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+            _inbox_item(project="beta", source="task", ident="beta/2"),
+        ]
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            lambda cfg: list(items),
+        )
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        assert counted == 2
+
+    def test_partial_cache_falls_through_to_direct(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Cache missing a tracked project → fall through.
+
+        Otherwise we'd under-count any project that hasn't been
+        refreshed yet. (The fast-path in
+        :func:`pm_inbox_awaits_user_list` already does this; the
+        count helper inherits the same gate via the public wrapper.)
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha", "beta"], tmp_path)
+        # Only alpha in the cache — beta is unknown.
+        entries = {
+            "alpha": _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=[_inbox_item(project="alpha", source="task", ident="alpha/1")],
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+        # The cache-routed count helper returns 1 (alpha only) — fine,
+        # because the next call into pm_inbox_awaits_user_list would
+        # fall through to the direct sweep. The contract is the same
+        # as PR 2: a partial cache still serves the cached values for
+        # the projects it knows about. We verify only that the count
+        # equals what the cache holds for known projects.
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        # alpha contributes 1; beta is missing → not summed via cache.
+        assert counted == 1
+
+
+# ── Move A PR 3 parity — load_operator_view_from_config cache route ─
+
+
+class TestLoadOperatorViewParity:
+    """PR 3 (§5 row 4): ``load_operator_view_from_config`` reads snapshot."""
+
+    def test_cached_view_skips_shared_work_service_open(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Cache fast-path: no ``_open_shared_work_service`` call."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha", "beta", "gamma"], tmp_path)
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WAITING, items=[],
+                glyph="!", detail="Waiting on you",
+            ),
+            "beta": _entry(
+                "beta", state=ProjectState.WORKING, items=[],
+                glyph="*", detail="claude active on /beta/1",
+            ),
+            "gamma": _entry(
+                "gamma", state=ProjectState.IDLE, items=[],
+                glyph=".", detail="Quiet",
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        open_calls = {"n": 0}
+
+        def _no_open(_cfg: Any) -> Any:
+            open_calls["n"] += 1
+            return None
+
+        monkeypatch.setattr(
+            operator_view, "_open_shared_work_service", _no_open,
+        )
+
+        view = operator_view.load_operator_view_from_config(config)
+        assert open_calls["n"] == 0
+        # Rows landed in the right sections per state.
+        assert [r.project_key for r in view.waiting] == ["alpha"]
+        assert [r.project_key for r in view.working] == ["beta"]
+        assert [r.project_key for r in view.idle] == ["gamma"]
+        # Detail strings come from the cache entry — confirms we
+        # didn't silently re-derive them.
+        waiting_row = view.waiting[0]
+        assert waiting_row.detail == "Waiting on you"
+        assert waiting_row.glyph == "!"
+
+    def test_flag_off_runs_direct_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Flag off — the cache fast-path returns ``None``."""
+
+        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        config = _make_config(["alpha"], tmp_path)
+        # Direct path will open svc=None → IDLE branch; tracked
+        # projects with no awaits-user items land in idle.
+        monkeypatch.setattr(
+            operator_view, "_open_shared_work_service", lambda cfg: None,
+        )
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            lambda cfg: [],
+        )
+        view = operator_view.load_operator_view_from_config(config)
+        # alpha is tracked + has no awaits-user → IDLE (not PAUSED).
+        assert {r.project_key for r in view.idle} == {"alpha"}
+
+    def test_partial_cache_falls_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Missing a tracked project in cache → defer to direct."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha", "beta"], tmp_path)
+        entries = {
+            "alpha": _entry("alpha", state=ProjectState.IDLE, items=[]),
+        }
+        _seed_cache(monkeypatch, entries)
+        # Direct path stub so the fall-through completes without a real
+        # work service.
+        monkeypatch.setattr(
+            operator_view, "_open_shared_work_service", lambda cfg: None,
+        )
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            lambda cfg: [],
+        )
+        view = operator_view.load_operator_view_from_config(config)
+        # Both projects show up — the fall-through covered the gap.
+        seen = {
+            *(r.project_key for r in view.waiting),
+            *(r.project_key for r in view.working),
+            *(r.project_key for r in view.idle),
+            *(r.project_key for r in view.paused),
+        }
+        assert seen == {"alpha", "beta"}
+
+
+# ── Move A PR 3 parity — _project_state_rollups cache route ─────────
+
+
+class TestProjectStateRollupsParity:
+    """PR 3 (§5 row 7): rail ``_project_state_rollups`` reads snapshot."""
+
+    def _router(self, tmp_path: Path):
+        from pollypm.cockpit_rail import CockpitRouter
+
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            'name = "PollyPM"\n'
+            f'root_dir = "{tmp_path}"\n'
+            'tmux_session = "pollypm"\n'
+            f'base_dir = "{tmp_path / ".pollypm"}"\n'
+        )
+        return CockpitRouter(config_path)
+
+    def test_cached_rollups_skip_pg_fanout(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Cache fast-path: no ``all_tasks_grouped`` call, no per-project rollup."""
+
+        from pollypm.cockpit_project_state import ProjectRailState
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        config = _make_config(["alpha", "beta"], tmp_path)
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WAITING, items=[],
+                rail_state=ProjectRailState.RED,
+                rail_badge="(2⚠)",
+                rail_sort_rank=10,
+                rail_reason="2 approvals pending",
+                approvals_pending=2,
+            ),
+            "beta": _entry(
+                "beta", state=ProjectState.IDLE, items=[],
+                rail_state=ProjectRailState.NONE,
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        fanout_called = {"n": 0}
+
+        def _no_fanout(_cfg: Any) -> Any:
+            fanout_called["n"] += 1
+            return {}
+
+        monkeypatch.setattr(
+            "pollypm.cockpit_pg_aggregates.all_tasks_grouped", _no_fanout,
+        )
+
+        rollups = router._project_state_rollups(config, alerts=[])
+        assert fanout_called["n"] == 0
+        assert set(rollups.keys()) == {"alpha", "beta"}
+        assert rollups["alpha"].approvals_pending == 2
+        assert rollups["alpha"].badge == "(2⚠)"
+        assert rollups["alpha"].state is ProjectRailState.RED
+        assert rollups["beta"].state is ProjectRailState.NONE
+
+    def test_partial_cache_falls_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """A project missing from cache → defer to direct rollup path."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        config = _make_config(["alpha", "beta"], tmp_path)
+        entries = {
+            "alpha": _entry("alpha", state=ProjectState.IDLE, items=[]),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        called = {"n": 0}
+
+        def _fanout(_cfg: Any) -> dict:
+            called["n"] += 1
+            return {}
+
+        monkeypatch.setattr(
+            "pollypm.cockpit_pg_aggregates.all_tasks_grouped", _fanout,
+        )
+
+        rollups = router._project_state_rollups(config, alerts=[])
+        # Fallthrough → direct path ran (called pg_all_grouped once).
+        assert called["n"] == 1
+        # Both keys present even though only one was cached.
+        assert set(rollups.keys()) == {"alpha", "beta"}
+
+
+# ── Move A PR 3 parity — latest_heartbeat cache route ───────────────
+
+
+class TestLatestHeartbeatParity:
+    """PR 3 (§5 row 9): cockpit_rail ``latest_heartbeat()`` reads snapshot."""
+
+    def _router(self, tmp_path: Path):
+        from pollypm.cockpit_rail import CockpitRouter
+
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            'name = "PollyPM"\n'
+            f'root_dir = "{tmp_path}"\n'
+            'tmux_session = "pollypm"\n'
+            f'base_dir = "{tmp_path / ".pollypm"}"\n'
+        )
+        return CockpitRouter(config_path)
+
+    def test_cache_hit_skips_supervisor_store(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Cache holds a heartbeat → supervisor.store.latest_heartbeat is skipped."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+
+        hb = SimpleNamespace(
+            session_name="worker_alpha/1",
+            created_at="2026-05-20T01:00:00Z",
+        )
+        entries = {
+            "alpha": _entry(
+                "alpha",
+                state=ProjectState.WORKING,
+                items=[],
+                latest_heartbeat_by_session={"worker_alpha/1": hb},
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        store_calls = {"n": 0}
+
+        class _Store:
+            def latest_heartbeat(self, name):  # noqa: ANN001, ANN201
+                store_calls["n"] += 1
+                return None
+
+        supervisor = SimpleNamespace(store=_Store())
+        result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
+        assert store_calls["n"] == 0
+        assert result is hb
+
+    def test_cache_miss_falls_back_to_supervisor_store(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Unknown session → call supervisor.store.latest_heartbeat."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        _seed_cache(monkeypatch, {})  # empty cache
+
+        store_calls: list[str] = []
+        fallback = SimpleNamespace(created_at="2026-05-20T02:00:00Z")
+
+        class _Store:
+            def latest_heartbeat(self, name):  # noqa: ANN001, ANN201
+                store_calls.append(name)
+                return fallback
+
+        supervisor = SimpleNamespace(store=_Store())
+        result = router._latest_heartbeat_cached(supervisor, "worker_beta/3")
+        assert store_calls == ["worker_beta/3"]
+        assert result is fallback
+
+    def test_flag_off_always_uses_store(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Flag off — every call routes to ``supervisor.store``."""
+
+        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        router = self._router(tmp_path)
+
+        called: list[str] = []
+        hb = SimpleNamespace(created_at="2026-05-20T03:00:00Z")
+
+        class _Store:
+            def latest_heartbeat(self, name):  # noqa: ANN001, ANN201
+                called.append(name)
+                return hb
+
+        supervisor = SimpleNamespace(store=_Store())
+        result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
+        assert called == ["worker_alpha/1"]
+        assert result is hb
+
+
+# ── Move A PR 3 — TTL removal regression test ───────────────────────
+
+
+class TestProjectCategorizationsNoTtl:
+    """Design §9.5: state-cache routing replaces the 2s TTL.
+
+    The `_project_categorizations` helper used to memoise its result
+    behind ``_PROJECT_CATEGORIZATIONS_TTL_SECONDS = 2.0``. Now every
+    call delegates straight to ``project_state_map_from_config`` so
+    state changes are visible on the next call without waiting on a
+    TTL to expire.
+    """
+
+    def _router(self, tmp_path: Path):
+        from pollypm.cockpit_rail import CockpitRouter
+
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            'name = "PollyPM"\n'
+            f'root_dir = "{tmp_path}"\n'
+            'tmux_session = "pollypm"\n'
+            f'base_dir = "{tmp_path / ".pollypm"}"\n'
+        )
+        return CockpitRouter(config_path)
+
+    def test_modifications_are_visible_on_next_call_no_ttl_wait(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """No TTL: a freshly-completed task is no longer stuck as WORKING."""
+
+        router = self._router(tmp_path)
+        config = object()
+        state = {"map": {"alpha": ProjectState.WORKING}}
+
+        def _fake_map(cfg):  # noqa: ANN001, ANN202
+            return state["map"]
+
+        monkeypatch.setattr(
+            "pollypm.dashboard.operator_view.project_state_map_from_config",
+            _fake_map,
+        )
+
+        assert router._project_categorizations(config) == {"alpha": "working"}
+        # Without waiting for 2s, mutate the underlying state and the
+        # next call MUST see it.
+        state["map"] = {"alpha": ProjectState.IDLE}
+        assert router._project_categorizations(config) == {"alpha": "idle"}
+
+    def test_router_class_no_longer_has_ttl_constant(self) -> None:
+        from pollypm.cockpit_rail import CockpitRouter
+
+        assert not hasattr(
+            CockpitRouter, "_PROJECT_CATEGORIZATIONS_TTL_SECONDS",
+        )

@@ -107,17 +107,19 @@ def compute_entry_for_project(
     tracked = bool(getattr(project, "tracked", True)) if project else False
 
     awaits_user_items = _awaits_user_items_for(project_key, config)
-    state, glyph, detail, rail_rollup = _categorize_and_rollup(
+    state, glyph, detail, rail_rollup, live_workers = _categorize_and_rollup(
         project_key=project_key,
         config=config,
         tracked=tracked,
         awaits_user_items=list(awaits_user_items),
     )
 
-    # PR 2 only needs to populate the fields the routed call sites
-    # read — leave the rest at the entry defaults so the cache stays
-    # cheap to construct. PR 3 will widen this when the remaining
-    # call sites land.
+    # PR 3: populate live worker sessions + latest_heartbeat_by_session
+    # so cockpit_rail can short-circuit its per-project ``latest_heartbeat()``
+    # calls. Best-effort: failures degrade silently to an empty mapping
+    # (the rail's fall-through path re-fetches direct).
+    latest_heartbeat_by_session = _heartbeats_for_sessions(live_workers)
+
     entry = ProjectStateCacheEntry(
         project_key=project_key,
         project_path=project_path,
@@ -132,6 +134,8 @@ def compute_entry_for_project(
         approvals_pending=rail_rollup[4] if rail_rollup else 0,
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
+        live_worker_sessions=tuple(live_workers),
+        latest_heartbeat_by_session=latest_heartbeat_by_session,
         computed_at=time.monotonic(),
     )
     return entry
@@ -207,14 +211,20 @@ def _categorize_and_rollup(
     config: Any,
     tracked: bool,
     awaits_user_items: list[Any],
-) -> tuple[Any, str, str, tuple[Any, Any, int, str, int] | None]:
+) -> tuple[
+    Any, str, str,
+    tuple[Any, Any, int, str, int] | None,
+    list[Any],
+]:
     """Run ``categorize_project`` + ``rollup_project_state`` for one project.
 
-    Returns ``(state, glyph, detail, rollup_tuple_or_None)``. The
-    rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
+    Returns ``(state, glyph, detail, rollup_tuple_or_None, live_workers)``.
+    The rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
     approvals_pending)`` — kept positional so the caller can ``zip``
     it into the entry fields without a second import of the rollup
-    types here.
+    types here. ``live_workers`` is the list of active worker session
+    records for the project, used by PR 3 to populate
+    ``latest_heartbeat_by_session``.
 
     Failures degrade silently — a broken work-service drops the
     project to IDLE (or PAUSED when not tracked) with no rollup.
@@ -242,7 +252,7 @@ def _categorize_and_rollup(
             project_key,
             exc_info=True,
         )
-        return None, "", "", None
+        return None, "", "", None, []
 
     shared_svc = _open_shared_work_service(config)
     try:
@@ -258,7 +268,7 @@ def _categorize_and_rollup(
                 detail = "Paused"
             else:
                 detail = "Quiet"
-            return state, glyph, detail, None
+            return state, glyph, detail, None, []
 
         tasks_by_alias, workers_by_alias = _prefetch_project_state(
             config, shared_svc,
@@ -316,10 +326,102 @@ def _categorize_and_rollup(
             )
             rollup_tuple = None
 
-        return state, glyph, detail, rollup_tuple
+        # PR 3: gather live workers so the per-project heartbeat
+        # lookup can short-circuit in cockpit_rail. ``slice_svc``
+        # already filters by this project's aliases.
+        try:
+            live_workers = list(slice_svc.list_worker_sessions(
+                project=project_key, active_only=True,
+            ))
+        except Exception:  # noqa: BLE001
+            live_workers = []
+
+        return state, glyph, detail, rollup_tuple, live_workers
     finally:
         if shared_svc is not None:
             _safe_close(shared_svc)
+
+
+def _heartbeats_for_sessions(
+    live_workers: list[Any],
+) -> dict[str, Any]:
+    """Return ``{session_name: HeartbeatRecord}`` for ``live_workers``.
+
+    PR 3 (§5 row 9): the rail's ``latest_heartbeat()`` is called once
+    per project per refresh. Folding it into the cache refresh means
+    the rail can short-circuit on the cache snapshot instead of
+    issuing N pg queries. Best-effort — a failed lookup degrades to
+    a missing key (the rail's fall-through then re-queries direct).
+
+    The mapping is keyed by ``session.name`` (matching the rail's
+    ``_session_name_for_item`` resolution path) — NOT by task identity.
+    """
+
+    if not live_workers:
+        return {}
+    try:
+        from pollypm.supervisor import Supervisor
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "state_cache: supervisor import failed; "
+            "skipping heartbeat prefetch",
+            exc_info=True,
+        )
+        return {}
+
+    try:
+        # Re-load the config; the cache refresher is the only consumer
+        # here, so the extra load is bounded to one per refresh-pass.
+        config = load_config(DEFAULT_CONFIG_PATH)
+        supervisor = Supervisor(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "state_cache: Supervisor init failed during heartbeat prefetch",
+            exc_info=True,
+        )
+        return {}
+
+    out: dict[str, Any] = {}
+    store = getattr(supervisor, "store", None)
+    if store is None:
+        return {}
+    for session in live_workers:
+        # Look up the session_name from the worker record. The session
+        # naming convention is ``worker_<project>/<task_number>``; the
+        # supervisor.store.latest_heartbeat call sites in cockpit_rail
+        # take the resolved session name from launches, which match
+        # the worker session bindings.
+        session_name = _session_name_for_worker(session)
+        if not session_name:
+            continue
+        try:
+            heartbeat = store.latest_heartbeat(session_name)
+        except Exception:  # noqa: BLE001
+            heartbeat = None
+        if heartbeat is not None:
+            out[session_name] = heartbeat
+    return out
+
+
+def _session_name_for_worker(session: Any) -> str:
+    """Resolve the session_name string for a worker-session record.
+
+    Workers may surface their session name as ``session_name`` (the
+    canonical tmux session) or be derivable from
+    ``(task_project, task_number)`` via the standard
+    ``worker_<project>/<number>`` convention. Returns ``""`` when no
+    name can be inferred.
+    """
+
+    direct = getattr(session, "session_name", None)
+    if direct:
+        return str(direct)
+    project = str(getattr(session, "task_project", "") or "")
+    number = getattr(session, "task_number", None)
+    if project and number is not None:
+        return f"worker_{project}/{number}"
+    return ""
 
 
 # ── refresher integration ─────────────────────────────────────────

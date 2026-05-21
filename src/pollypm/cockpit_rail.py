@@ -814,14 +814,14 @@ class CockpitRouter:
     _COCKPIT_WINDOW = "PollyPM"
     _LEFT_PANE_WIDTH = 30  # default; actual value persisted in cockpit state.
     _STATE_WRITE_DEBOUNCE_SECONDS = 0.25
-    # #1642 — TTL for the project-state categorization sweep. Pre-#1642
-    # every rail refresh re-opened every project DB + every inbox source
-    # to recompute glyphs; with 0.8s ticks + state-mtime debouncing, a
-    # navigation burst could stack ~5-10 sweeps inside ``rail_refresh``.
-    # Picked at ~1 tick so a freshly-completed task still surfaces on
-    # the next refresh; callers that need stronger freshness clear via
-    # ``_clear_rail_caches`` (which the supervisor reload already does).
-    _PROJECT_CATEGORIZATIONS_TTL_SECONDS = 2.0
+    # Move A PR 3 (#1664, design §9.5): the rail-side categorization
+    # TTL (``_PROJECT_CATEGORIZATIONS_TTL_SECONDS = 2.0``) was removed.
+    # Reason: the in-process state cache's ``global_version()``
+    # short-circuit + the per-call TTL inside
+    # ``project_state_map_from_config`` already collapse navigation-burst
+    # refreshes to a single compute. Two cache layers were worse than
+    # one — a freshly-completed task hung around as WORKING for up to
+    # 2s with no invalidation path.
     _SUPERVISOR_FREE_STATIC_KEYS = frozenset(
         {"dashboard", "inbox", "workers", "metrics", "activity", "settings", "operator"},
     )
@@ -849,20 +849,9 @@ class CockpitRouter:
         # value: (db_mtime, git_mtime, is_active, has_working_task)
         # Skips re-opening SQLite on every 0.8s cockpit tick when nothing changed.
         self._project_activity_cache: dict[str, tuple[float, float, bool, bool]] = {}
-        # #1642 — short-TTL cache for the operator-state categorization that
-        # the rail glyph draws. ``project_state_map_from_config`` opens every
-        # project DB + walks every inbox source; running that on every
-        # rail-refresh tick (or every burst of state-bumps) stacks a
-        # multi-second sweep into the ``rail_refresh`` worker and contends
-        # with route workers / pane loaders. The cache key is
-        # ``(config_identity, dirty_marker)`` so a config reload (which
-        # ``_load_config`` already routes through ``_clear_rail_caches``)
-        # always misses; within a config lifetime entries expire after
-        # ``_PROJECT_CATEGORIZATIONS_TTL_SECONDS`` so freshly-completed work
-        # still surfaces within ~1 tick.
-        self._project_categorizations_cache_key: int | None = None
-        self._project_categorizations_cache: dict[str, str] | None = None
-        self._project_categorizations_cached_at: float = 0.0
+        # Move A PR 3 (#1664, design §9.5): the rail-side TTL cache for
+        # ``_project_categorizations`` was removed. See the class-level
+        # comment + the helper's docstring for rationale.
         # #1961 perf — per-window-target ``list_panes`` cache so static
         # rail click bursts don't each shell out to the same tmux
         # subprocess. value: (cached_at_monotonic, panes_or_None).
@@ -900,11 +889,8 @@ class CockpitRouter:
         self._collapsed_sections_cache = None
         self._grouped_rail_cache_key = None
         self._grouped_rail_cache = None
-        # #1642 — also drop the project-state categorization cache so a
-        # supervisor / config reload doesn't keep painting stale glyphs.
-        self._project_categorizations_cache_key = None
-        self._project_categorizations_cache = None
-        self._project_categorizations_cached_at = 0.0
+        # Move A PR 3 (#1664, design §9.5): the project-categorization
+        # TTL cache was removed; no rail-side state to clear here.
 
     def _config_identity(self, config: object) -> int:
         return id(config)
@@ -1513,10 +1499,9 @@ class CockpitRouter:
                 item.work_state = self._work_state_for_item_state(
                     item.state, launch.session.role,
                 )
-                try:
-                    heartbeat = supervisor.store.latest_heartbeat(session_name)
-                except Exception:  # noqa: BLE001
-                    heartbeat = None
+                heartbeat = self._latest_heartbeat_cached(
+                    supervisor, session_name,
+                )
                 item.heartbeat_at = getattr(heartbeat, "created_at", None)
         # #989 — Surface the top actionable alert's severity + message
         # on the item so the renderer can pick the right palette
@@ -1542,6 +1527,61 @@ class CockpitRouter:
             return None
         project_key = item.key.split(":", 1)[1]
         return project_session_map.get(project_key)
+
+    def _latest_heartbeat_cached(
+        self,
+        supervisor: object,
+        session_name: str,
+    ) -> object | None:
+        """Return the latest heartbeat for ``session_name``.
+
+        Move A PR 3 (#1664, design §5 row 9): with the cache flag on
+        AND the per-project entry populated, the heartbeat is read
+        from ``entry.latest_heartbeat_by_session[session_name]`` —
+        no per-project pg query. Falls through to
+        ``supervisor.store.latest_heartbeat`` on cold cache, missing
+        session, or any unexpected failure (e.g. the cache lagging
+        a brand-new session).
+        """
+
+        cached = self._maybe_cache_heartbeat(session_name)
+        if cached is not None:
+            return cached
+        store = getattr(supervisor, "store", None)
+        if store is None:
+            return None
+        try:
+            return store.latest_heartbeat(session_name)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _maybe_cache_heartbeat(self, session_name: str) -> object | None:
+        """Cache fast-path for :meth:`_latest_heartbeat_cached`.
+
+        Returns ``None`` whenever a cache miss should defer to the
+        direct path — flag off, cold cache, unknown session, any
+        unexpected failure.
+        """
+
+        try:
+            from pollypm.state_cache import get_cache, is_enabled
+        except Exception:  # noqa: BLE001
+            return None
+        if not is_enabled():
+            return None
+        try:
+            cache = get_cache()
+            snapshot = cache.snapshot()
+        except Exception:  # noqa: BLE001
+            return None
+        if not snapshot:
+            return None
+        for entry in snapshot.values():
+            mapping = getattr(entry, "latest_heartbeat_by_session", None) or {}
+            heartbeat = mapping.get(session_name)
+            if heartbeat is not None:
+                return heartbeat
+        return None
 
     # ── #989 — alert metadata attachment ────────────────────────────────
     #
@@ -1914,34 +1954,16 @@ class CockpitRouter:
         to the tracked / paused IDLE classification rather than
         raising, mirroring the rest of the rail render path.
 
-        #1642 — Cached with a short TTL keyed on the config identity
-        (which already rolls forward on every config-file mtime change
-        via ``_load_config`` → ``_clear_rail_caches``). The underlying
-        ``project_state_map_from_config`` opens every project DB and
-        every inbox source on each call; running it on every 0.8s
-        rail-refresh tick stacked a multi-second sweep into the
-        ``rail_refresh`` worker and contended with route workers + pane
-        loaders. The TTL collapses navigation-burst refreshes into a
-        single sweep while keeping glyph staleness bounded.
-
-        Slice H decision (#1737): the TTL cache STAYS under both
-        backends. Under sqlite it remains the only thing keeping the
-        per-project fanout off the hot tick. Under pg the underlying
-        sweep collapses to one or two pool checkouts — strictly
-        cheaper, but redundant work across navigation-burst refreshes
-        is still wasted work, and the cache costs ~nothing to keep.
-        Slice K may revisit this when the sqlite path is gone.
+        Move A PR 3 (#1664, design §9.5): the prior 2s TTL cache
+        (``_PROJECT_CATEGORIZATIONS_TTL_SECONDS``) is **removed**. The
+        in-process state cache's ``global_version()`` short-circuit
+        plus the per-call TTL inside
+        :func:`project_state_map_from_config` (``_PREFETCH_PROJECT_STATE_TTL_SECONDS``)
+        already collapse navigation-burst refreshes into a single
+        compute. Two cache layers were worse than one — a freshly
+        completed task hung around as WORKING for up to 2s with no
+        invalidation path.
         """
-        cache_key = self._config_identity(config)
-        now = time.monotonic()
-        cached = self._project_categorizations_cache
-        if (
-            cached is not None
-            and self._project_categorizations_cache_key == cache_key
-            and now - self._project_categorizations_cached_at
-            < self._PROJECT_CATEGORIZATIONS_TTL_SECONDS
-        ):
-            return dict(cached)
         try:
             from pollypm.dashboard.operator_view import (
                 project_state_map_from_config,
@@ -1949,24 +1971,28 @@ class CockpitRouter:
 
             states = project_state_map_from_config(config)
         except Exception:  # noqa: BLE001
-            # Best-effort: cache the empty result too so a hard failure
-            # doesn't re-trigger the (expensive, failing) sweep on every
-            # tick until the TTL elapses.
-            self._project_categorizations_cache_key = cache_key
-            self._project_categorizations_cache = {}
-            self._project_categorizations_cached_at = now
             return {}
-        result = {key: state.value for key, state in states.items()}
-        self._project_categorizations_cache_key = cache_key
-        self._project_categorizations_cache = result
-        self._project_categorizations_cached_at = now
-        return dict(result)
+        return {key: state.value for key, state in states.items()}
 
     def _project_state_rollups(
         self,
         config: object,
         alerts: list[object],
     ) -> dict[str, ProjectStateRollup]:
+        """Return ``{project_key: ProjectStateRollup}`` for every project.
+
+        Move A PR 3 (#1664, design §5 row 7): when ``POLLYPM_STATE_CACHE=1``
+        AND the cache has every tracked project populated, this reads
+        the pre-computed ``rail_state`` / ``rail_badge`` / ``rail_sort_rank``
+        / ``rail_reason`` / ``approvals_pending`` fields directly from
+        ``cache.snapshot()`` — no per-project ``_project_tasks_for_rollup``
+        call, no bulk pg query. Falls through to the direct path on
+        cold / partial cache.
+        """
+        cached_rollups = self._maybe_cache_route_rollups(config, alerts)
+        if cached_rollups is not None:
+            return cached_rollups
+
         projects = getattr(config, "projects", {}) or {}
         rollups: dict[str, ProjectStateRollup] = {}
 
@@ -1995,6 +2021,74 @@ class CockpitRouter:
                 ),
             )
             rollups[str(project_key)] = rollup
+        return rollups
+
+    def _maybe_cache_route_rollups(
+        self,
+        config: object,
+        alerts: list[object],
+    ) -> dict[str, ProjectStateRollup] | None:
+        """Cache fast-path for :meth:`_project_state_rollups`.
+
+        Returns ``None`` when the env flag is off, the cache is cold,
+        or the cache is missing any tracked project. The fall-through
+        path then runs the direct per-project rollup compute.
+
+        When the cache is authoritative, the alert-derived
+        ``actionable_task_alert_ids`` is folded into a fresh
+        :class:`ProjectStateRollup` per project — the cache's
+        ``rail_*`` fields don't depend on alerts (the refresher
+        doesn't have them), so we re-derive ``actionable_key`` from
+        the live alert list while keeping the cached rail_state /
+        badge / rank / reason / approvals_pending.
+        """
+
+        try:
+            from pollypm.state_cache import get_cache, is_enabled
+        except Exception:  # noqa: BLE001
+            return None
+        if not is_enabled():
+            return None
+        try:
+            cache = get_cache()
+            snapshot = cache.snapshot()
+        except Exception:  # noqa: BLE001
+            return None
+        if not snapshot:
+            return None
+
+        projects = getattr(config, "projects", {}) or {}
+        known_keys = [str(key) for key in projects.keys()]
+        snapshot_keys = set(snapshot.keys())
+        if not all(key in snapshot_keys for key in known_keys):
+            return None
+
+        rollups: dict[str, ProjectStateRollup] = {}
+        for project_key in known_keys:
+            entry = snapshot[project_key]
+            rail_state = getattr(entry, "rail_state", None)
+            if rail_state is None:
+                # Refresher hasn't filled in rail fields yet — defer.
+                return None
+            # Re-derive actionable_key from live alerts (the cache
+            # entry doesn't carry alert state).
+            actionable_ids = actionable_alert_task_ids(
+                alerts, project_key=project_key,
+            )
+            actionable_key = (
+                next(iter(sorted(actionable_ids)), None)
+                if actionable_ids else None
+            )
+            rollups[project_key] = ProjectStateRollup(
+                state=rail_state,
+                badge=getattr(entry, "rail_badge", None),
+                sort_rank=int(getattr(entry, "rail_sort_rank", 0) or 0),
+                actionable_key=actionable_key,
+                reason=str(getattr(entry, "rail_reason", "") or ""),
+                approvals_pending=int(
+                    getattr(entry, "approvals_pending", 0) or 0
+                ),
+            )
         return rollups
 
     def _project_tasks_for_rollup(
@@ -2193,10 +2287,9 @@ class CockpitRouter:
             except Exception:  # noqa: BLE001
                 supervisor = None
             if supervisor is not None:
-                try:
-                    heartbeat = supervisor.store.latest_heartbeat(session_name)
-                except Exception:  # noqa: BLE001
-                    heartbeat = None
+                heartbeat = self._latest_heartbeat_cached(
+                    supervisor, session_name,
+                )
             working = self._is_pane_working(
                 window,
                 launch.session.provider,

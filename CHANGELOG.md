@@ -72,6 +72,34 @@ Added, Changed, and Removed.
   `ProjectStateCache.invalidate(None)` only iterates known entries.
   PR #2016 review blocker.
 
+### Changed
+- State-cache routing (Move A PR 3, refs #1664) extends the
+  `POLLYPM_STATE_CACHE=1` fast path to the remaining 5 hot-path call
+  sites from `docs/design/move-a-state-cache.md` §5. With the flag
+  on and the per-project cache populated:
+  `cockpit_inbox._count_inbox_tasks_for_label` sums
+  `entry.awaits_user_count` instead of running the workspace sweep;
+  `dashboard.operator_view.load_operator_view_from_config` builds
+  the view from the snapshot instead of opening the shared work
+  service; `cockpit_rail._project_state_rollups` reads pre-computed
+  `rail_state` / `rail_badge` / `approvals_pending` fields;
+  `cockpit_rail._project_tasks_for_rollup` is folded into the
+  refresher (no longer called from `build_items` when cache is
+  authoritative); and `cockpit_rail`'s two `latest_heartbeat()`
+  per-project sites read from `entry.latest_heartbeat_by_session`.
+  Each call site keeps a flag-off fall-through, so behaviour is
+  unchanged until PR 4 flips the default. Flag still defaults OFF.
+
+### Removed
+- Rail-side 2s TTL on `CockpitRouter._project_categorizations`
+  (`_PROJECT_CATEGORIZATIONS_TTL_SECONDS = 2.0`). Per
+  `docs/design/move-a-state-cache.md` §9.5, the state cache's
+  `global_version()` short-circuit plus the per-call TTL inside
+  `project_state_map_from_config` already collapse navigation-burst
+  refreshes — two cache layers were worse than one. The TTL
+  pathology (freshly completed task stuck as WORKING for up to 2s)
+  is gone with this change.
+
 ## [1.0.0] - 2026-04-20
 
 ### Added

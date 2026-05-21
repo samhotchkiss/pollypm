@@ -418,8 +418,51 @@ def _count_inbox_tasks_for_label(config) -> int:
     The function name is kept for backward compatibility with existing
     callers; the return value is now an item count, not just a task
     count.
+
+    Move A PR 3 (#1664): when ``POLLYPM_STATE_CACHE=1`` AND the cache
+    has every tracked project populated, this sums
+    ``entry.awaits_user_count`` across the snapshot directly. The
+    snapshot read is O(N projects) and skips the workspace-wide pg
+    sweep entirely. Falls through to ``len(pm_inbox_awaits_user_list)``
+    on cold / partial cache so the three-surfaces-one-predicate
+    invariant still holds (the public helper itself routes through
+    the same cache when populated).
     """
+    cached = _maybe_cache_count_awaits_user(config)
+    if cached is not None:
+        return cached
     return len(pm_inbox_awaits_user_list(config))
+
+
+def _maybe_cache_count_awaits_user(config) -> int | None:
+    """Return the cache-routed count, or ``None`` to fall through.
+
+    Same gating as :func:`_maybe_cache_route_awaits_user`: flag off,
+    cold cache, or any unexpected failure → ``None`` so the caller
+    falls back to the direct path. Skips the workspace-wide sweep
+    when the cache is authoritative for every tracked project.
+    """
+
+    try:
+        from pollypm.state_cache import get_cache, is_enabled
+    except Exception:  # noqa: BLE001
+        return None
+    if not is_enabled():
+        return None
+    try:
+        cache = get_cache()
+        snapshot = cache.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    if not snapshot:
+        return None
+    known_projects = set(getattr(config, "projects", {}).keys())
+    total = 0
+    for project_key, entry in snapshot.items():
+        if project_key not in known_projects:
+            continue
+        total += int(getattr(entry, "awaits_user_count", 0) or 0)
+    return total
 
 
 def pm_inbox_filtered_list(

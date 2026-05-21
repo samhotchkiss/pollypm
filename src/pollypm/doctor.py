@@ -2810,6 +2810,62 @@ def check_visual_explainer_skill() -> CheckResult:
     )
 
 
+def _refresh_drifted_project_guides(
+    pairs: list[tuple[str, Path, str]],
+) -> tuple[bool, str]:
+    """Bulk-refresh each ``(project_key, project_path, role)`` drift pair.
+
+    Invokes the same code path as ``pm project init-guide --force`` for
+    every entry. Each call is independent — one failure does not abort
+    the batch — and the result is summarised as ``Refreshed N guides
+    across M projects; failed for K (list)``.
+
+    Idempotent: when called a second time, the underlying drift list
+    will be empty, so the caller passes no pairs and this helper
+    short-circuits.
+    """
+    if not pairs:
+        return (True, "no drifted project guides to refresh")
+
+    # Deferred import: keeps ``project_guides`` out of the doctor
+    # module's import-time graph (it pulls in ``projects`` + agent
+    # profiles) and lets the test suite monkeypatch the module before
+    # the fix runs.
+    try:
+        from pollypm import project_guides as _pg_module
+    except Exception as exc:  # noqa: BLE001
+        return (False, f"project_guides import failed: {exc}")
+
+    init_fn = getattr(_pg_module, "init_project_guide", None)
+    if not callable(init_fn):
+        return (False, "project_guides.init_project_guide unavailable")
+
+    refreshed: list[tuple[str, str]] = []
+    failed: list[tuple[str, str, str]] = []
+    for project_key, project_path, role in pairs:
+        try:
+            init_fn(Path(project_path), role, force=True)
+        except Exception as exc:  # noqa: BLE001
+            # Each pair is independent — record and keep going so a
+            # single broken project doesn't strand the rest.
+            failed.append((project_key, role, str(exc)))
+            continue
+        refreshed.append((project_key, role))
+
+    project_count = len({key for key, _ in refreshed})
+    guide_word = "guide" if len(refreshed) == 1 else "guides"
+    project_word = "project" if project_count == 1 else "projects"
+    summary = (
+        f"Refreshed {len(refreshed)} {guide_word} across "
+        f"{project_count} {project_word}"
+    )
+    if failed:
+        failed_label = ", ".join(f"{key}:{role}" for key, role, _ in failed)
+        summary += f"; failed for {len(failed)} ({failed_label})"
+        return (False, summary)
+    return (True, summary)
+
+
 def check_project_local_guide_drift() -> CheckResult:
     """Warn when a project-local role guide has drifted from upstream."""
     _path, config = _safe_load_config()
@@ -2820,6 +2876,10 @@ def check_project_local_guide_drift() -> CheckResult:
         return _skip("project-guide drift check skipped (no projects)")
 
     stale: list[dict[str, object]] = []
+    # Parallel list of (project_key, project_path, role) tuples — kept
+    # alongside ``stale`` so the --fix closure has the absolute path it
+    # needs without re-resolving the config a second time.
+    fix_pairs: list[tuple[str, Path, str]] = []
     for project_key, project in projects.items():
         project_path = getattr(project, "path", None)
         if project_path is None:
@@ -2836,6 +2896,7 @@ def check_project_local_guide_drift() -> CheckResult:
                     "current_ref": str(_drift_value(info, "current_ref") or ""),
                 }
             )
+            fix_pairs.append((project_key, Path(project_path), role))
 
     if not stale:
         return _ok(
@@ -2862,11 +2923,23 @@ def check_project_local_guide_drift() -> CheckResult:
         )
     if len(stale) > 4:
         fix_lines.append(f"  ... and {len(stale) - 4} more")
+    fix_lines.append("Or run:  pm doctor --fix   # bulk-refreshes every drifted guide")
     fix_lines.append("Review local edits before overwriting if needed.")
     fix_lines.append("Recheck: pm doctor")
     n_stale = len(stale)
     guide_word = "guide" if n_stale == 1 else "guides"
     project_word = "project" if projects_with_drift == 1 else "projects"
+
+    # Snapshot the pairs into the closure so a subsequent reload of
+    # config between check + --fix doesn't shift the targets out from
+    # under us. The fix is idempotent — re-running clears drift, so the
+    # second invocation enters the ``no stale`` branch and the fix never
+    # registers.
+    pairs_snapshot = list(fix_pairs)
+
+    def _fix() -> tuple[bool, str]:
+        return _refresh_drifted_project_guides(pairs_snapshot)
+
     return _fail(
         f"{n_stale} stale project-local {guide_word} across "
         f"{projects_with_drift} {project_word}: {sample}",
@@ -2877,6 +2950,8 @@ def check_project_local_guide_drift() -> CheckResult:
         ),
         fix="\n".join(fix_lines),
         severity="warning",
+        fixable=True,
+        fix_fn=_fix,
         data={
             "count": len(stale),
             "projects": projects_with_drift,

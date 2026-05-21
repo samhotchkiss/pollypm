@@ -110,25 +110,15 @@ def _classify_status(
 def _latest_heartbeat(config, session_name: str):
     """Return the most-recent heartbeat record for ``session_name``.
 
-    Backend-aware (#1737 / #1811): postgres installs read through the
-    pg facade; sqlite installs fall back to the legacy ``StateStore``.
-    Returns ``None`` when no heartbeat row exists OR the read fails —
-    a read failure must not crash a read-only CLI summary.
+    Postgres-only: reads through :mod:`pollypm.storage.pg_heartbeats`.
+    Returns ``None`` when no heartbeat row exists OR the lookup fails —
+    a read failure must not crash a read-only CLI summary, and the
+    caller treats ``None`` as ``unknown`` status downstream.
     """
-    from pollypm.storage._backend_dispatch import is_pg_backend
-
     try:
-        if is_pg_backend(config):
-            from pollypm.storage.pg_heartbeats import latest_heartbeat as _pg
+        from pollypm.storage.pg_heartbeats import latest_heartbeat as _pg
 
-            return _pg(session_name, config=config)
-        from pollypm.store import get_store
-
-        store = get_store(config)
-        getter = getattr(store, "latest_heartbeat", None)
-        if getter is None:
-            return None
-        return getter(session_name)
+        return _pg(session_name, config=config)
     except Exception:  # noqa: BLE001 — never crash a read-only summary
         logger.debug("latest_heartbeat lookup failed", exc_info=True)
         return None

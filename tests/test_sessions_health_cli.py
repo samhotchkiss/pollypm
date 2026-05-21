@@ -174,6 +174,50 @@ class TestBuildRow:
 
 
 # ---------------------------------------------------------------------------
+# latest_heartbeat — pg-only, degrades to None on failure
+# ---------------------------------------------------------------------------
+
+
+class TestLatestHeartbeatPgOnly:
+    def test_pg_lookup_failure_degrades_to_unknown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # When the pg heartbeat facade raises (pool unavailable, schema
+        # missing, etc.) the CLI must NOT crash — _latest_heartbeat
+        # returns None and the row downstream classifies as "unknown".
+        def _boom(*_args, **_kwargs):
+            raise RuntimeError("pg pool unavailable")
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _boom
+        )
+
+        config = _make_config(sessions={})
+        assert mod._latest_heartbeat(config, "worker_demo") is None
+
+        # End-to-end: a failing pg lookup surfaces as ``unknown`` in the
+        # CLI output without raising.
+        sessions = {
+            "worker_demo": _make_session(
+                "worker_demo", window="worker-demo", auth_token="t" * 16
+            )
+        }
+        config_with_session = _make_config(sessions=sessions)
+        monkeypatch.setattr(
+            "pollypm.config.load_config", lambda _path=None: config_with_session
+        )
+        monkeypatch.setattr(
+            mod, "_list_windows", lambda _name: {"worker-demo": _fake_window()}
+        )
+
+        result = runner.invoke(_build_cli_app(), ["sessions", "--json"])
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip().splitlines()[0])
+        assert payload["status"] == "unknown"
+        assert payload["last_heartbeat_iso"] is None
+
+
+# ---------------------------------------------------------------------------
 # end-to-end CLI
 # ---------------------------------------------------------------------------
 

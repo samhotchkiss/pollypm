@@ -253,6 +253,51 @@ class PlannerSettings:
 
 
 @dataclass(slots=True)
+class AuditSettings:
+    """Per-project ``audit.jsonl`` rotation + retention configuration
+    from the ``[audit]`` TOML section.
+
+    The forensic audit log (``<project>/.pollypm/audit.jsonl`` plus the
+    central-tail mirror at ``~/.pollypm/audit/<project>.jsonl``) is
+    append-only and grows unbounded by default. A noisy project can
+    accumulate thousands of ``stuck_draft`` events per day; without
+    rotation, this fills disks and slows down readers that scan the
+    full file. The audit writer (see :mod:`pollypm.audit.log`) consults
+    these knobs *before each append*; if the live file is over the size
+    threshold it is gzipped to a timestamped sibling and the next
+    append starts at offset 0 in a fresh empty file.
+
+    ``rotate_size_mb`` — threshold in megabytes above which the live
+    ``audit.jsonl`` is rotated. Files at or below this size are left
+    alone. Default 50 MB — large enough that real incident debugging
+    still has plenty of scrollback in the live file, small enough that
+    a runaway ``stuck_draft`` loop (5550 events / day on coffeeboardnm)
+    can't fill a disk before rotation kicks in.
+
+    ``retention_count`` — number of gzipped rotations to keep per
+    audit file. Older ``audit.jsonl.<ts>.gz`` siblings beyond this
+    count are deleted oldest-first. Default 4: at 50 MB live + 4 x
+    ~10 MB gzipped rotations, the ceiling per project is ~90 MB,
+    well-bounded for a workstation tool while keeping enough history
+    to reconstruct a multi-day incident timeline.
+
+    ``disable_rotation`` — operator escape hatch. When ``True`` the
+    rotation check short-circuits and the live file grows forever.
+    Useful when an incident investigation needs a continuous file
+    that won't be archived mid-debug. Default ``False``.
+
+    Rotation is best-effort and isolated from the append: if rotation
+    fails (disk full, perms) we log + skip rotation and the append
+    still happens. The audit log is load-bearing for the watchdog;
+    housekeeping must never break audit writes.
+    """
+
+    rotate_size_mb: int = 50
+    retention_count: int = 4
+    disable_rotation: bool = False
+
+
+@dataclass(slots=True)
 class EventsRetentionSettings:
     """Tiered retention windows for the ``events`` table.
 
@@ -378,6 +423,7 @@ class PollyPMConfig:
     rail: RailSettings = field(default_factory=RailSettings)
     planner: PlannerSettings = field(default_factory=PlannerSettings)
     logging: LoggingSettings = field(default_factory=LoggingSettings)
+    audit: AuditSettings = field(default_factory=AuditSettings)
     events: EventsRetentionSettings = field(
         default_factory=EventsRetentionSettings,
     )

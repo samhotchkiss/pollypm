@@ -306,6 +306,270 @@ def test_emit_with_empty_project_only_writes_per_project(tmp_path: Path) -> None
 
 
 # ---------------------------------------------------------------------------
+# Rotation + retention (#2023)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def _tiny_rotation(monkeypatch: pytest.MonkeyPatch):
+    """Pin a tiny rotation threshold so tests fire rotation without
+    building 50 MB of audit data. Yields a helper that lets a test
+    tune the retention count too.
+    """
+    import pollypm.audit.log as log_mod
+
+    monkeypatch.setattr(log_mod, "_test_rotate_size_bytes", 512)
+    monkeypatch.setattr(log_mod, "_test_retention_count", 4)
+    # Ensure no env-var override leaks across tests.
+    monkeypatch.delenv(log_mod._DISABLE_ENV, raising=False)
+    return log_mod
+
+
+def _gz_archives(audit_path: Path) -> list[Path]:
+    prefix = audit_path.name + "."
+    return sorted(
+        sibling
+        for sibling in audit_path.parent.iterdir()
+        if sibling.name.startswith(prefix) and sibling.name.endswith(".gz")
+    )
+
+
+def test_rotation_fires_when_size_exceeds_threshold(
+    tmp_path: Path, _tiny_rotation
+) -> None:
+    """Write past the threshold; the live file should be empty (or
+    contain only the post-rotation line) and a single .gz archive
+    should exist with the pre-rotation events."""
+    project_root = tmp_path / "rotproj"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    # Write enough events to push us past the 512-byte threshold but
+    # leave the file small enough that we can inspect every line.
+    for i in range(20):
+        emit(
+            event="task.created",
+            project="rotproj",
+            subject=f"rotproj/{i}",
+            metadata={"i": i, "padding": "x" * 64},
+            project_path=project_root,
+        )
+
+    archives = _gz_archives(audit_path)
+    assert len(archives) >= 1, (
+        f"expected at least one .gz rotation, found {archives}"
+    )
+    # The live file must still exist and (because the last append
+    # fired after the most recent rotation) hold at most the events
+    # written since the last rotation — strictly smaller than the
+    # original 20-event payload.
+    assert audit_path.exists()
+    live_lines = [
+        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+    ]
+    assert len(live_lines) < 20
+
+
+def test_rotation_archives_contain_pre_rotation_events(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gzipped archive must hold a readable JSONL chunk of the
+    events written before the rotation fired.
+
+    Uses a generous retention so events written before rotation are
+    not also lost to over-aggressive pruning — the unit under test
+    is gz contents, not retention prune logic (covered separately).
+    """
+    import pollypm.audit.log as log_mod
+
+    # Big retention so multi-rotation runs don't lose history to
+    # prune; that path is exercised in
+    # ``test_rotation_retention_prunes_old_archives``.
+    monkeypatch.setattr(log_mod, "_test_rotate_size_bytes", 2048)
+    monkeypatch.setattr(log_mod, "_test_retention_count", 50)
+    monkeypatch.delenv(log_mod._DISABLE_ENV, raising=False)
+
+    project_root = tmp_path / "gzproj"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    for i in range(40):
+        emit(
+            event="task.created",
+            project="gzproj",
+            subject=f"gzproj/{i}",
+            metadata={"i": i, "padding": "y" * 64},
+            project_path=project_root,
+        )
+
+    archives = _gz_archives(audit_path)
+    assert archives, "expected at least one .gz archive"
+    import gzip as _gz
+
+    archived_subjects: list[str] = []
+    for gz_path in archives:
+        with _gz.open(gz_path, "rt", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                record = json.loads(stripped)
+                archived_subjects.append(record["subject"])
+                assert record["event"] == "task.created"
+                assert record["project"] == "gzproj"
+
+    # Plus whatever is in the live file currently.
+    live_subjects = [
+        json.loads(l)["subject"]
+        for l in audit_path.read_text(encoding="utf-8").splitlines()
+        if l.strip()
+    ]
+    # With retention=50 no archive can have been pruned, so every
+    # subject we emitted must appear somewhere (archives + live).
+    all_subjects = set(archived_subjects) | set(live_subjects)
+    expected = {f"gzproj/{i}" for i in range(40)}
+    assert expected.issubset(all_subjects), (
+        f"missing subjects after rotation: {expected - all_subjects}"
+    )
+
+
+def test_rotation_retention_prunes_old_archives(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When N rotations have already happened, the next rotation must
+    delete the oldest archive so we hold steady at N total."""
+    import pollypm.audit.log as log_mod
+
+    monkeypatch.setattr(log_mod, "_test_rotate_size_bytes", 256)
+    monkeypatch.setattr(log_mod, "_test_retention_count", 2)
+    monkeypatch.delenv(log_mod._DISABLE_ENV, raising=False)
+
+    project_root = tmp_path / "retproj"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    # Hammer enough events to trigger multiple rotations. Sleep
+    # between batches so each archive picks up a distinct mtime and
+    # the prune sort can order them deterministically.
+    import time as _time
+
+    for batch in range(5):
+        for i in range(10):
+            emit(
+                event="task.created",
+                project="retproj",
+                subject=f"retproj/b{batch}-{i}",
+                metadata={"padding": "z" * 64},
+                project_path=project_root,
+            )
+        _time.sleep(0.02)
+
+    archives = _gz_archives(audit_path)
+    assert len(archives) <= 2, (
+        f"retention=2 should cap archives at 2, got {len(archives)}: {archives}"
+    )
+    # The live file must still be writable (and contain the latest
+    # append — proving the audit pipeline never broke).
+    emit(
+        event="task.created",
+        project="retproj",
+        subject="retproj/final",
+        project_path=project_root,
+    )
+    final_lines = [
+        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+    ]
+    assert any(
+        json.loads(l)["subject"] == "retproj/final" for l in final_lines
+    ), "post-rotation append must still land in the live file"
+
+
+def test_rotation_failure_does_not_break_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If rotation raises (read-only dir, disk full, etc.), the
+    append must still happen — the audit log is load-bearing for
+    the watchdog and housekeeping must never lose writes."""
+    import pollypm.audit.log as log_mod
+
+    monkeypatch.setattr(log_mod, "_test_rotate_size_bytes", 256)
+    monkeypatch.setattr(log_mod, "_test_retention_count", 4)
+    monkeypatch.delenv(log_mod._DISABLE_ENV, raising=False)
+
+    project_root = tmp_path / "failproj"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    # Prime the audit log past the threshold so the next emit would
+    # normally trigger a rotation.
+    for i in range(20):
+        emit(
+            event="task.created",
+            project="failproj",
+            subject=f"failproj/{i}",
+            metadata={"padding": "p" * 64},
+            project_path=project_root,
+        )
+
+    # Force every subsequent rename in the rotation path to fail.
+    def _boom_rename(*_args, **_kwargs):
+        raise OSError("simulated rotation failure")
+
+    monkeypatch.setattr(log_mod.os, "rename", _boom_rename)
+
+    # The append MUST still succeed.
+    emit(
+        event="task.created",
+        project="failproj",
+        subject="failproj/after-failure",
+        project_path=project_root,
+    )
+
+    lines = [
+        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+    ]
+    subjects = [json.loads(l)["subject"] for l in lines]
+    assert "failproj/after-failure" in subjects, (
+        "audit append must succeed even when rotation fails"
+    )
+
+
+def test_rotation_disabled_via_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The env-var escape hatch short-circuits rotation entirely so
+    incident debuggers can pin a continuous file mid-investigation."""
+    import pollypm.audit.log as log_mod
+
+    monkeypatch.setattr(log_mod, "_test_rotate_size_bytes", 256)
+    monkeypatch.setattr(log_mod, "_test_retention_count", 4)
+    monkeypatch.setenv(log_mod._DISABLE_ENV, "1")
+
+    project_root = tmp_path / "noproj"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    for i in range(20):
+        emit(
+            event="task.created",
+            project="noproj",
+            subject=f"noproj/{i}",
+            metadata={"padding": "q" * 64},
+            project_path=project_root,
+        )
+
+    archives = _gz_archives(audit_path)
+    assert archives == [], (
+        f"rotation disabled should produce zero archives, got {archives}"
+    )
+    # All 20 lines should be in the live file because nothing rotated.
+    lines = [
+        l for l in audit_path.read_text(encoding="utf-8").splitlines() if l.strip()
+    ]
+    assert len(lines) == 20
+
+
+# ---------------------------------------------------------------------------
 # Sqlite-integration tests REMOVED for Slice K (#1737).
 #
 # The eight test_workservice_* tests that lived here exercised the

@@ -249,6 +249,170 @@ def test_project_local_guide_drift_warns_when_stale(
     assert "proj-b:worker" in result.status
 
 
+def test_project_local_guide_drift_fix_refreshes_stale_guides(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """``--fix`` must invoke ``init_project_guide`` for each drifted pair.
+
+    Seeds two stale guides across two projects (one project has two
+    stale roles), runs the fix handler, and asserts the on-disk guide
+    bodies are refreshed with the current built-in text. Also asserts
+    the summary line uses the documented format and that the handler
+    is marked ``fixable=True`` with a non-None ``fix_fn``.
+    """
+    from pollypm import project_guides
+
+    # Two projects: proj-a has architect + worker drift, proj-b has
+    # worker drift only. Three (project, role) pairs total.
+    proj_a = tmp_path / "proj-a"
+    proj_b = tmp_path / "proj-b"
+    for path in (proj_a, proj_b):
+        (path / ".pollypm" / "project-guides").mkdir(parents=True)
+    # Seed stale on-disk content for each pair — the writer overwrites
+    # this file when init_project_guide(..., force=True) runs.
+    stale_marker = "STALE BODY THAT MUST BE REPLACED\n"
+    seeded_paths: dict[tuple[str, str], Path] = {}
+    for project_key, project_path, role in (
+        ("proj-a", proj_a, "architect"),
+        ("proj-a", proj_a, "worker"),
+        ("proj-b", proj_b, "worker"),
+    ):
+        guide_path = project_path / ".pollypm" / "project-guides" / f"{role}.md"
+        guide_path.write_text(stale_marker, encoding="utf-8")
+        seeded_paths[(project_key, role)] = guide_path
+
+    fake_a = type("P", (), {"path": proj_a, "name": "Project A"})
+    fake_b = type("P", (), {"path": proj_b, "name": "Project B"})
+    fake_config = type("C", (), {"projects": {"proj-a": fake_a, "proj-b": fake_b}})
+
+    monkeypatch.setattr(
+        doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config),
+    )
+
+    def _fake_drift_list(project_path: Path) -> list[dict[str, object]]:
+        # Mirror the on-disk seeded pairs per project.
+        if Path(project_path) == proj_a:
+            return [
+                {"role": "architect", "path": seeded_paths[("proj-a", "architect")],
+                 "forked_from": "deadbeef", "current_ref": "cafebabe", "drifted": True},
+                {"role": "worker", "path": seeded_paths[("proj-a", "worker")],
+                 "forked_from": "deadbeef", "current_ref": "cafebabe", "drifted": True},
+            ]
+        if Path(project_path) == proj_b:
+            return [
+                {"role": "worker", "path": seeded_paths[("proj-b", "worker")],
+                 "forked_from": "deadbeef", "current_ref": "cafebabe", "drifted": True},
+            ]
+        return []
+
+    monkeypatch.setattr(doctor, "_list_drifted_project_guides", _fake_drift_list)
+
+    # Stub the writer's built-in text so we don't depend on the
+    # packaged guide content; the assertion is "the file body changed
+    # to the upstream text we stubbed."
+    refreshed_marker = "REFRESHED BUILT-IN GUIDE BODY\n"
+    monkeypatch.setattr(
+        project_guides, "built_in_guide_text", lambda _role: refreshed_marker,
+    )
+    monkeypatch.setattr(
+        project_guides, "built_in_guide_source_path", lambda _role: None,
+    )
+    monkeypatch.setattr(
+        project_guides, "_git_sha_for_path", lambda _path: None,
+    )
+
+    result = doctor.check_project_local_guide_drift()
+    assert not result.passed
+    assert result.fixable is True
+    assert result.fix_fn is not None
+
+    success, message = result.fix_fn()
+    assert success is True, message
+    assert message == "Refreshed 3 guides across 2 projects"
+
+    # Every seeded stale file must now contain the refreshed body.
+    for guide_path in seeded_paths.values():
+        body = guide_path.read_text(encoding="utf-8")
+        assert refreshed_marker.strip() in body, (
+            f"{guide_path} not refreshed: still contains stale marker"
+        )
+        assert "STALE BODY" not in body
+
+    # Idempotence: with drift cleared, the next check returns OK and
+    # registers no fix handler. Simulate by emptying the drift list.
+    monkeypatch.setattr(
+        doctor, "_list_drifted_project_guides", lambda _path: [],
+    )
+    second = doctor.check_project_local_guide_drift()
+    assert second.passed is True
+    assert second.fix_fn is None
+
+
+def test_project_local_guide_drift_fix_continues_past_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """One failing ``init_project_guide`` call must not abort the batch.
+
+    Stubs ``init_project_guide`` to raise for ``proj-a:worker`` while
+    succeeding for the other two pairs. The summary should report the
+    refreshed pairs AND surface the failed pair by name, with
+    ``success=False`` so callers know follow-up is required.
+    """
+    from pollypm import project_guides
+
+    proj_a = tmp_path / "proj-a"
+    proj_b = tmp_path / "proj-b"
+    for path in (proj_a, proj_b):
+        (path / ".pollypm" / "project-guides").mkdir(parents=True)
+
+    fake_a = type("P", (), {"path": proj_a, "name": "A"})
+    fake_b = type("P", (), {"path": proj_b, "name": "B"})
+    fake_config = type("C", (), {"projects": {"proj-a": fake_a, "proj-b": fake_b}})
+
+    monkeypatch.setattr(
+        doctor, "_safe_load_config", lambda: (Path("/tmp/x"), fake_config),
+    )
+    monkeypatch.setattr(
+        doctor,
+        "_list_drifted_project_guides",
+        lambda project_path: (
+            [
+                {"role": "architect", "path": project_path / "x", "forked_from": "a",
+                 "current_ref": "b", "drifted": True},
+                {"role": "worker", "path": project_path / "y", "forked_from": "a",
+                 "current_ref": "b", "drifted": True},
+            ]
+            if Path(project_path) == proj_a
+            else [
+                {"role": "worker", "path": project_path / "z", "forked_from": "a",
+                 "current_ref": "b", "drifted": True},
+            ]
+        ),
+    )
+
+    invocations: list[tuple[Path, str]] = []
+
+    def _fake_init(project_path: Path, role: str, *, force: bool = False):
+        invocations.append((Path(project_path), role))
+        if Path(project_path) == proj_a and role == "worker":
+            raise RuntimeError("simulated write failure")
+        return object()
+
+    monkeypatch.setattr(project_guides, "init_project_guide", _fake_init)
+
+    result = doctor.check_project_local_guide_drift()
+    assert result.fixable and result.fix_fn is not None
+    success, message = result.fix_fn()
+
+    # The handler attempted every pair — failure on one does not abort
+    # the others.
+    assert len(invocations) == 3
+    assert success is False
+    assert "Refreshed 2 guides across 2 projects" in message
+    assert "failed for 1" in message
+    assert "proj-a:worker" in message
+
+
 # ---------------------------------------------------------------------------
 # Scheduler checks
 # ---------------------------------------------------------------------------

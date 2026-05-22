@@ -15,10 +15,11 @@ Also covers:
 
 - Codex-shape event handling (assistant_message, tool_call, tool_result)
 - Stale-archive detection (spec §4.7)
-- ``include_thinking`` flag
 - Malformed JSON line skip
 - ``resolve_transcript_path`` cwd matching + most-recent fallback
 - Subagent linking via task-notification block
+- Session-index fingerprint matching (cwd + account + provider) with
+  explicit ``None`` on unresolved surfaces (Codex review #2044)
 """
 
 from __future__ import annotations
@@ -39,6 +40,8 @@ from pollypm.web_api.chat.transcripts import (
     _extract_text_from_blocks,
     _format_tool_use_summary,
     _looks_like_subagent_result,
+    build_session_index,
+    lookup_transcript_path,
 )
 
 
@@ -684,25 +687,32 @@ def test_stale_threshold_default_matches_spec() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_transcript_picks_most_recent_when_no_cwd_match(
+def test_resolve_transcript_returns_none_when_no_cwd_match(
     tmp_path: Path,
 ) -> None:
+    # Codex review #2044 — explicit unresolved instead of falling back
+    # to "freshest events.jsonl under the project root". Without a cwd
+    # match we MUST return None so the API never cross-attaches a
+    # different surface's transcript.
     project_root = tmp_path / "proj"
     transcripts = project_root / ".pollypm" / "transcripts"
     older = transcripts / "session-old"
     newer = transcripts / "session-new"
     older.mkdir(parents=True)
     newer.mkdir(parents=True)
-    (older / "events.jsonl").write_text(
-        json.dumps(_claude_event("user_turn", text="x")) + "\n",
-    )
+    old_event = _claude_event("user_turn", text="x")
+    old_event["cwd"] = str(tmp_path / "elsewhere-a")
+    (older / "events.jsonl").write_text(json.dumps(old_event) + "\n")
     time.sleep(0.05)  # Filesystem mtime resolution.
-    (newer / "events.jsonl").write_text(
-        json.dumps(_claude_event("user_turn", text="y")) + "\n",
-    )
-    resolved = resolve_transcript_path(project_root)
-    assert resolved is not None
-    assert resolved.parent.name == "session-new"
+    new_event = _claude_event("user_turn", text="y")
+    new_event["cwd"] = str(tmp_path / "elsewhere-b")
+    (newer / "events.jsonl").write_text(json.dumps(new_event) + "\n")
+    # No cwd supplied → cannot fingerprint → None.
+    assert resolve_transcript_path(project_root) is None
+    # cwd supplied but no match → still None (no freshest fallback).
+    assert resolve_transcript_path(
+        project_root, cwd=str(tmp_path / "nowhere"),
+    ) is None
 
 
 def test_resolve_transcript_prefers_cwd_match(tmp_path: Path) -> None:
@@ -753,33 +763,84 @@ def test_resolve_transcript_skips_tasks_subdir(tmp_path: Path) -> None:
     transcripts = project_root / ".pollypm" / "transcripts"
     tasks_dir = transcripts / "tasks"
     tasks_dir.mkdir(parents=True)
-    (tasks_dir / "events.jsonl").write_text(
-        json.dumps(_claude_event("user_turn", text="x")) + "\n",
-    )
-    assert resolve_transcript_path(project_root) is None
+    tasks_event = _claude_event("user_turn", text="x")
+    tasks_event["cwd"] = str(tmp_path / "anywhere")
+    (tasks_dir / "events.jsonl").write_text(json.dumps(tasks_event) + "\n")
+    # Even with a matching cwd, the tasks/ subdir must be ignored.
+    assert resolve_transcript_path(
+        project_root, cwd=str(tmp_path / "anywhere"),
+    ) is None
 
 
-def test_resolve_transcript_session_hint_wins(tmp_path: Path) -> None:
+def test_resolve_transcript_filters_by_account_name(tmp_path: Path) -> None:
+    # Two surfaces sharing the same cwd MUST be disambiguated by their
+    # account_name fingerprint. Without this filter the older sibling
+    # would cross-attach to the newer surface's transcript.
     project_root = tmp_path / "proj"
     transcripts = project_root / ".pollypm" / "transcripts"
-    hint_dir = transcripts / "my-session-hint"
-    other_dir = transcripts / "other"
-    hint_dir.mkdir(parents=True)
-    other_dir.mkdir(parents=True)
-    (hint_dir / "events.jsonl").write_text(
-        json.dumps(_claude_event("user_turn", text="x")) + "\n",
+    shared_cwd = str(tmp_path / "shared")
+    Path(shared_cwd).mkdir()
+    main_event = _claude_event("user_turn", text="ops")
+    main_event["account_name"] = "claude_main"
+    main_event["cwd"] = shared_cwd
+    (transcripts / "session-main").mkdir(parents=True)
+    (transcripts / "session-main" / "events.jsonl").write_text(
+        json.dumps(main_event) + "\n",
     )
     time.sleep(0.05)
-    (other_dir / "events.jsonl").write_text(
-        json.dumps(_claude_event("user_turn", text="y")) + "\n",
+    alt_event = _claude_event("user_turn", text="arch")
+    alt_event["account_name"] = "claude_alt"
+    alt_event["cwd"] = shared_cwd
+    (transcripts / "session-alt").mkdir(parents=True)
+    (transcripts / "session-alt" / "events.jsonl").write_text(
+        json.dumps(alt_event) + "\n",
     )
-    # Without hint, ``other`` is most recent → wins.
-    assert resolve_transcript_path(project_root).parent.name == "other"
-    # With hint, ``my-session-hint`` wins even though older.
-    resolved = resolve_transcript_path(
-        project_root, session_hint="my-session-hint",
+    main_resolved = resolve_transcript_path(
+        project_root, cwd=shared_cwd, account_name="claude_main",
     )
-    assert resolved.parent.name == "my-session-hint"
+    assert main_resolved is not None
+    assert main_resolved.parent.name == "session-main"
+    alt_resolved = resolve_transcript_path(
+        project_root, cwd=shared_cwd, account_name="claude_alt",
+    )
+    assert alt_resolved is not None
+    assert alt_resolved.parent.name == "session-alt"
+
+
+def test_build_session_index_skips_unreadable_events(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj"
+    transcripts = project_root / ".pollypm" / "transcripts"
+    transcripts.mkdir(parents=True)
+    # Empty events.jsonl — no fingerprint, must be skipped.
+    (transcripts / "session-empty").mkdir()
+    (transcripts / "session-empty" / "events.jsonl").write_text("")
+    # Malformed first line — must be skipped.
+    (transcripts / "session-bad").mkdir()
+    (transcripts / "session-bad" / "events.jsonl").write_text("garbage\n")
+    # Well-formed line — kept.
+    (transcripts / "session-ok").mkdir()
+    good = _claude_event("user_turn", text="ok")
+    good["cwd"] = str(tmp_path / "cwd-ok")
+    (transcripts / "session-ok" / "events.jsonl").write_text(
+        json.dumps(good) + "\n",
+    )
+    index = build_session_index(transcripts)
+    assert {entry.session_id for entry in index} == {"session-ok"}
+
+
+def test_lookup_returns_none_without_cwd(tmp_path: Path) -> None:
+    project_root = tmp_path / "proj"
+    transcripts = project_root / ".pollypm" / "transcripts"
+    transcripts.mkdir(parents=True)
+    (transcripts / "session-a").mkdir()
+    event = _claude_event("user_turn", text="hi")
+    event["cwd"] = str(tmp_path / "x")
+    (transcripts / "session-a" / "events.jsonl").write_text(
+        json.dumps(event) + "\n",
+    )
+    index = build_session_index(transcripts)
+    assert lookup_transcript_path(index, cwd=None) is None
+    assert lookup_transcript_path(index, cwd="") is None
 
 
 # ---------------------------------------------------------------------------

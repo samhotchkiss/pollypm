@@ -540,6 +540,107 @@ def test_surface_transcript_path_none_when_archive_missing(tmp_path: Path) -> No
     assert surfaces[0].transcript_path is None
 
 
+def test_two_surfaces_sharing_cwd_resolve_to_correct_transcripts(
+    tmp_path: Path,
+) -> None:
+    """Codex review #2044 — blocker 1 regression test.
+
+    Operator + architect both run with ``cwd = project_root``. Without
+    the account-based fingerprint disambiguator, the prior freshest-mtime
+    fallback would cross-attach: both surfaces would resolve to whichever
+    transcript was written last. With the fingerprint lookup, each
+    surface resolves to its OWN transcript exactly.
+    """
+    project_root = tmp_path / "repo"
+    project_root.mkdir(exist_ok=True)
+    accounts = {
+        "claude_main": AccountConfig(
+            name="claude_main",
+            provider=ProviderKind.CLAUDE,
+            home=project_root / ".pollypm/homes/claude_main",
+        ),
+        "claude_alt": AccountConfig(
+            name="claude_alt",
+            provider=ProviderKind.CLAUDE,
+            home=project_root / ".pollypm/homes/claude_alt",
+        ),
+    }
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="pollypm",
+            root_dir=project_root,
+            base_dir=project_root / ".pollypm",
+            logs_dir=project_root / ".pollypm/logs",
+            snapshots_dir=project_root / ".pollypm/snapshots",
+            state_db=project_root / ".pollypm/state.db",
+            tmux_session="storage-closet",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts=accounts,
+        sessions={
+            "operator": _session(
+                "operator", role="operator-pm",
+                account="claude_main", cwd=project_root,
+            ),
+            "architect_pollypm": _session(
+                "architect_pollypm", role="architect", project="pollypm",
+                account="claude_alt", cwd=project_root,
+            ),
+        },
+        projects={
+            "pollypm": KnownProject(
+                key="pollypm", path=project_root, persona_name="Archie",
+                kind=ProjectKind.GIT,
+            ),
+        },
+    )
+    transcripts = project_root / ".pollypm" / "transcripts"
+    # Plant operator transcript first (older mtime).
+    op_dir = transcripts / "session-op-uuid"
+    op_dir.mkdir(parents=True)
+    op_event = {
+        "timestamp": "2026-05-21T20:00:00Z",
+        "event_type": "user_turn",
+        "session_id": "session-op-uuid",
+        "account_name": "claude_main",
+        "provider": "claude",
+        "project_key": "pollypm",
+        "source_path": "/tmp/raw-op",
+        "source_offset": 0,
+        "cwd": str(project_root),
+        "payload": {"text": "from operator"},
+    }
+    (op_dir / "events.jsonl").write_text(json.dumps(op_event) + "\n")
+    import time as _time
+    _time.sleep(0.05)
+    # Architect's transcript is the freshest — if the old "freshest mtime"
+    # fallback were still in place, the operator surface would
+    # cross-attach to this one.
+    arch_dir = transcripts / "session-arch-uuid"
+    arch_dir.mkdir(parents=True)
+    arch_event = {
+        "timestamp": "2026-05-21T21:00:00Z",
+        "event_type": "user_turn",
+        "session_id": "session-arch-uuid",
+        "account_name": "claude_alt",
+        "provider": "claude",
+        "project_key": "pollypm",
+        "source_path": "/tmp/raw-arch",
+        "source_offset": 0,
+        "cwd": str(project_root),
+        "payload": {"text": "from architect"},
+    }
+    (arch_dir / "events.jsonl").write_text(json.dumps(arch_event) + "\n")
+
+    surfaces = enumerate_chat_surfaces(config)
+    by_name = {s.session_name: s for s in surfaces}
+    assert by_name["operator"].transcript_path == op_dir / "events.jsonl"
+    assert by_name["architect_pollypm"].transcript_path == arch_dir / "events.jsonl"
+    # Symmetric assertion: neither surface attached to the other's
+    # transcript, even though both shared the same cwd.
+    assert by_name["operator"].transcript_path != by_name["architect_pollypm"].transcript_path
+
+
 # ---------------------------------------------------------------------------
 # auth_token_present surfacing
 # ---------------------------------------------------------------------------

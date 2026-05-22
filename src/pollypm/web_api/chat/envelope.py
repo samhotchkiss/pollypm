@@ -28,12 +28,19 @@ class MessageRole(StrEnum):
 
 
 class MessageType(StrEnum):
-    """Envelope discriminator per spec §3."""
+    """Envelope discriminator per spec §3.
+
+    NOTE: ``thinking`` is intentionally absent. The transcript ingestor
+    does not currently preserve provider thinking blocks, so adding the
+    discriminator before the upstream support exists would let callers
+    branch on a type that's never emitted. Tracking the follow-up arc
+    (preserve thinking in TranscriptIngestor + add the envelope type)
+    as a separate GitHub issue.
+    """
 
     TEXT = "text"
     TOOL_USE = "tool_use"
     TOOL_RESULT = "tool_result"
-    THINKING = "thinking"
     ASK_USER = "ask_user"
     FILE = "file"
     SUBAGENT_SPAWN = "subagent_spawn"

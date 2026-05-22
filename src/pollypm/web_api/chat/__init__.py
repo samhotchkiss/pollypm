@@ -3,9 +3,10 @@
 P1 ships the read-side primitives the chat endpoints (P2) compose:
 
 - :mod:`envelope` — the uniform :class:`MessageEnvelope` dataclass and
-  the eight type discriminators (``text``, ``tool_use``, ``tool_result``,
-  ``thinking``, ``ask_user``, ``file``, ``subagent_spawn``,
-  ``subagent_result``, ``system_event``) per spec §3.
+  the type discriminators (``text``, ``tool_use``, ``tool_result``,
+  ``ask_user``, ``file``, ``subagent_spawn``, ``subagent_result``,
+  ``system_event``) per spec §3. ``thinking`` is deferred — the
+  ingestor doesn't preserve provider thinking blocks yet.
 - :mod:`registry` — enumerates every live chat surface (operator,
   architect, advisor, worker) into :class:`ChatSurface` dataclasses,
   resolving the tmux window + transcript path for each.

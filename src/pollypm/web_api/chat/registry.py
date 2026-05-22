@@ -26,8 +26,12 @@ from pathlib import Path
 from typing import Any
 
 from pollypm.models import PollyPMConfig, SessionConfig
+from pollypm.projects import project_transcripts_dir
 from pollypm.work.session_manager import task_window_name
-from pollypm.web_api.chat.transcripts import resolve_transcript_path
+from pollypm.web_api.chat.transcripts import (
+    build_session_index,
+    lookup_transcript_path,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -177,28 +181,64 @@ def enumerate_chat_surfaces(
     and lets clients render a stable sidebar.
     """
     tmux_state_cache = _build_tmux_state_cache(config, tmux_client)
+    # Build the session-index ONCE per request — keyed by project root.
+    # Codex review blocker #2: previously each surface re-scanned the
+    # transcripts root inside ``resolve_transcript_path``. We now scan
+    # each project's root at most once via :func:`_build_session_index`
+    # and look up per surface (#2044).
+    session_index_cache: dict[Path, list] = {}
     surfaces: list[ChatSurface] = []
     surfaces.extend(enumerate_config_surfaces(
-        config, tmux_state_cache=tmux_state_cache,
+        config,
+        tmux_state_cache=tmux_state_cache,
+        session_index_cache=session_index_cache,
     ))
     if work_service is not None:
         surfaces.extend(enumerate_worker_surfaces(
-            config, work_service, tmux_state_cache=tmux_state_cache,
+            config, work_service,
+            tmux_state_cache=tmux_state_cache,
+            session_index_cache=session_index_cache,
         ))
     surfaces.sort(key=_surface_sort_key)
     return surfaces
+
+
+def _build_session_index(
+    project_root: Path,
+    cache: dict[Path, list] | None = None,
+) -> list:
+    """Return (and memoize) the session index for ``project_root``.
+
+    Keyed by the resolved transcripts root so multiple surfaces in the
+    same project share one scan, even when called via the two distinct
+    enumerate-*-surfaces helpers in the same request. The cache is
+    request-scoped (passed in by :func:`enumerate_chat_surfaces`); no
+    module-level state.
+    """
+    transcripts_root = project_transcripts_dir(project_root)
+    if cache is not None and transcripts_root in cache:
+        return cache[transcripts_root]
+    index = build_session_index(transcripts_root)
+    if cache is not None:
+        cache[transcripts_root] = index
+    return index
 
 
 def enumerate_config_surfaces(
     config: PollyPMConfig,
     *,
     tmux_state_cache: dict[str, TmuxWindowState] | None = None,
+    session_index_cache: dict[Path, list] | None = None,
 ) -> list[ChatSurface]:
     """Enumerate operator/architect/advisor surfaces from ``config.sessions``.
 
     Workers are NOT included (they live in the work-service, not the
     config). Disabled sessions are also skipped — they aren't running
     so they can't be chatted with.
+
+    ``session_index_cache`` memoizes the per-project session-index scan
+    so the same project's transcripts root is read at most once per
+    request even when multiple surfaces share it.
     """
     surfaces: list[ChatSurface] = []
     for session_name, session in (config.sessions or {}).items():
@@ -211,10 +251,12 @@ def enumerate_config_surfaces(
         project_root = _project_root_for_key(config, project_key)
         persona = _persona_for_session(config, session, surface_type)
         cwd = session.cwd if isinstance(session.cwd, Path) else Path(session.cwd or ".")
-        transcript_path = resolve_transcript_path(
-            project_root,
+        index = _build_session_index(project_root, session_index_cache)
+        transcript_path = lookup_transcript_path(
+            index,
             cwd=str(cwd),
-            session_hint=session_name,
+            account_name=session.account,
+            provider=str(session.provider),
         )
         window_name = session.window_name or session_name
         if tmux_state_cache and window_name in tmux_state_cache:
@@ -244,11 +286,16 @@ def enumerate_worker_surfaces(
     work_service: Any,
     *,
     tmux_state_cache: dict[str, TmuxWindowState] | None = None,
+    session_index_cache: dict[Path, list] | None = None,
 ) -> list[ChatSurface]:
     """Enumerate per-task worker surfaces from the work-service.
 
     Reads active :class:`WorkerSessionRecord`s and computes the
     canonical ``task-{project}-{N}`` session_name for each.
+
+    ``session_index_cache`` memoizes the per-project session-index scan
+    so multiple workers (and any config surface) under the same project
+    share one filesystem walk.
     """
     list_fn = getattr(work_service, "list_worker_sessions", None)
     if not callable(list_fn):
@@ -276,12 +323,14 @@ def enumerate_worker_surfaces(
             Path(record.worktree_path) if record.worktree_path else None
         )
         cwd_for_lookup = str(worktree_path) if worktree_path else None
-        transcript_path = resolve_transcript_path(
-            project_root,
-            cwd=cwd_for_lookup,
-            session_hint=session_name,
-        )
         provider_value = getattr(record, "provider", "") or ""
+        index = _build_session_index(project_root, session_index_cache)
+        transcript_path = lookup_transcript_path(
+            index,
+            cwd=cwd_for_lookup,
+            account_name=None,  # WorkerSessionRecord doesn't carry account
+            provider=provider_value or None,
+        )
         window_name = session_name
         if tmux_state_cache and window_name in tmux_state_cache:
             window_state = tmux_state_cache[window_name]

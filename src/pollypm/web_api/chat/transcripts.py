@@ -34,9 +34,11 @@ the following non-trivial mappings:
   ``subagent_result``.
 - Claude ``AskUserQuestion`` tool calls become ``ask_user`` envelopes.
 - Claude ``SendUserFile`` tool calls become ``file`` envelopes.
-- ``thinking`` blocks (when surfaced by the provider) only flow when
-  ``include_thinking=True``.
 - Compaction / session-start markers become ``system_event``.
+
+The ingestor does NOT currently preserve provider ``thinking`` blocks,
+so the P1 envelope contract does not surface them. Tracking that work
+as a follow-up arc (see GitHub issue linked in the P1 PR description).
 
 The parser is pure: takes a file path + flags, returns a list of
 envelopes. The P2 router layers pagination / filtering on top.
@@ -48,6 +50,7 @@ import hashlib
 import json
 import logging
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -84,41 +87,51 @@ _CODEX_PAYLOAD_KINDS = {
 }
 
 
-def resolve_transcript_path(
-    project_root: Path,
-    cwd: str | None = None,
-    *,
-    session_hint: str | None = None,
-) -> Path | None:
-    """Find the most recent ``events.jsonl`` for a surface.
+# A "session-index" entry: one record per ingested ``events.jsonl``
+# under a project's transcripts root. The registry builds the index
+# ONCE per request (via :func:`build_session_index`) and then matches
+# each surface by its fingerprint (cwd + account + provider) via
+# :func:`lookup_transcript_path` — no per-surface filesystem fan-out.
+#
+# Codex review blocker (#2044): the prior implementation fell back to
+# "freshest mtime under the project" when cwd matching had ties, which
+# could cross-attach the operator's transcript to the architect (or
+# vice-versa) whenever two surfaces shared a cwd. The fingerprint-based
+# index returns ``None`` for ambiguous surfaces instead of guessing.
+@dataclass(frozen=True, slots=True)
+class _SessionIndexEntry:
+    path: Path
+    session_id: str
+    cwd: str
+    account_name: str
+    provider: str
+    mtime: float
 
-    The ingestor names subdirectories by the provider-internal session
-    UUID (Claude ``sessionId`` / Codex ``session_meta.id``), not by the
-    tmux session name. We resolve the right subdir by walking the
-    project's transcripts root and preferring:
 
-    1. A subdir whose tail event's ``cwd`` matches ``cwd``, OR
-    2. The most-recently-modified ``events.jsonl`` under the root.
+def build_session_index(transcripts_root: Path) -> list[_SessionIndexEntry]:
+    """Walk a project's transcripts root and index every ``events.jsonl``.
 
-    Returns ``None`` when no events file exists yet (e.g. brand-new
-    session that hasn't streamed its first turn). Per spec §4.8 this is
-    not an error — callers surface ``messages: []`` to the client.
+    Reads the first well-formed event from each ``<session_id>/events.jsonl``
+    to extract ``(session_id, cwd, account_name, provider)`` — the
+    fingerprint we match a :class:`pollypm.models.SessionConfig` against.
+
+    Skips the ``tasks/`` subdirectory (raw-provider JSONLs archived by
+    :meth:`SessionManager._archive_jsonl`) and any malformed/empty files.
+
+    Cheaper than the prior tail-read because the first event of any
+    normalized ``events.jsonl`` already carries the full ``_event_base``
+    metadata (see :func:`pollypm.transcript_ingest._event_base`).
     """
-    root = project_transcripts_dir(project_root)
-    if not root.exists():
-        return None
-    candidates: list[tuple[float, Path, str | None]] = []
-    for child in root.iterdir():
+    if not transcripts_root.exists():
+        return []
+    entries: list[_SessionIndexEntry] = []
+    for child in transcripts_root.iterdir():
         if not child.is_dir():
             continue
         if child.name in {"tasks", ".ingestion-state.lock"}:
             # ``tasks/`` holds per-task raw-provider-JSONL archives
             # written by SessionManager._archive_jsonl; not normalized.
             continue
-        if session_hint and child.name == session_hint:
-            events_path = child / "events.jsonl"
-            if events_path.exists():
-                return events_path
         events_path = child / "events.jsonl"
         if not events_path.exists():
             continue
@@ -126,58 +139,133 @@ def resolve_transcript_path(
             mtime = events_path.stat().st_mtime
         except OSError:
             continue
-        candidates.append((mtime, events_path, _tail_cwd(events_path)))
-    if not candidates:
-        return None
-    if cwd:
-        normalized = str(Path(cwd).resolve())
-        matching = [
-            (mtime, path)
-            for mtime, path, tail_cwd in candidates
-            if tail_cwd and str(Path(tail_cwd).resolve()) == normalized
-        ]
-        if matching:
-            matching.sort(reverse=True)
-            return matching[0][1]
-    candidates.sort(key=lambda item: item[0], reverse=True)
-    return candidates[0][1]
+        fingerprint = _read_first_event_fingerprint(events_path)
+        if fingerprint is None:
+            # Empty / malformed — skip so we never serve an
+            # unidentifiable transcript to the wrong surface.
+            continue
+        session_id, cwd, account_name, provider = fingerprint
+        # Prefer the directory name as the canonical session_id (the
+        # ingestor names dirs by session_id), but fall back to the event's
+        # session_id if the dir name diverges.
+        entries.append(_SessionIndexEntry(
+            path=events_path,
+            session_id=child.name or session_id,
+            cwd=cwd,
+            account_name=account_name,
+            provider=provider,
+            mtime=mtime,
+        ))
+    return entries
 
 
-def _tail_cwd(events_path: Path) -> str | None:
-    """Best-effort: return the ``cwd`` from the last well-formed event.
+def lookup_transcript_path(
+    index: list[_SessionIndexEntry],
+    *,
+    cwd: str | None,
+    account_name: str | None = None,
+    provider: str | None = None,
+) -> Path | None:
+    """Resolve a single surface's events.jsonl path from the index.
 
-    Used by :func:`resolve_transcript_path` to pick the right subdir
-    when multiple Claude sessions have streamed into the same project.
-    Reads only the tail of the file (~16 KB) so we don't choke on
-    multi-MB transcripts.
+    Matching is fingerprint-based, NOT "freshest under the project":
+
+    1. ``cwd`` must match the surface's cwd (resolved). Required.
+    2. When ``account_name`` is given, entries with a different
+       ``account_name`` are filtered out.
+    3. When ``provider`` is given, entries with a different
+       ``provider`` are filtered out.
+    4. If multiple entries remain (e.g. a restarted session left two
+       events.jsonl with the same fingerprint), the most-recent mtime
+       wins — same fingerprint means same surface identity, so this
+       can never cross-attach to a different surface.
+    5. No matches → ``None`` (spec §4.8 — surface ``messages: []``).
+       Cross-surface fallback is explicitly forbidden.
     """
+    if not index or not cwd:
+        return None
     try:
-        size = events_path.stat().st_size
-    except OSError:
-        return None
-    if size == 0:
-        return None
-    read_size = min(size, 16 * 1024)
-    try:
-        with events_path.open("rb") as handle:
-            handle.seek(size - read_size)
-            tail = handle.read().decode("utf-8", errors="ignore")
-    except OSError:
-        return None
-    last_cwd: str | None = None
-    for line in tail.splitlines():
-        line = line.strip()
-        if not line:
+        normalized = str(Path(cwd).resolve())
+    except (OSError, RuntimeError):
+        normalized = str(cwd)
+    matches: list[_SessionIndexEntry] = []
+    for entry in index:
+        if not entry.cwd:
             continue
         try:
-            obj = json.loads(line)
-        except json.JSONDecodeError:
+            entry_cwd = str(Path(entry.cwd).resolve())
+        except (OSError, RuntimeError):
+            entry_cwd = entry.cwd
+        if entry_cwd != normalized:
             continue
-        if isinstance(obj, dict):
-            cwd = obj.get("cwd")
-            if isinstance(cwd, str) and cwd:
-                last_cwd = cwd
-    return last_cwd
+        if account_name and entry.account_name and entry.account_name != account_name:
+            continue
+        if provider and entry.provider and entry.provider != provider:
+            continue
+        matches.append(entry)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item.mtime, reverse=True)
+    return matches[0].path
+
+
+def resolve_transcript_path(
+    project_root: Path,
+    cwd: str | None = None,
+    *,
+    account_name: str | None = None,
+    provider: str | None = None,
+) -> Path | None:
+    """One-shot fingerprint resolver for a single surface.
+
+    Builds the index for ``project_root`` then looks up by fingerprint.
+    Callers iterating multiple surfaces should use
+    :func:`build_session_index` + :func:`lookup_transcript_path` to
+    amortize the scan; this helper exists for one-off resolution and to
+    keep the public surface ergonomic.
+
+    Returns ``None`` when no transcript matches the fingerprint — never
+    falls back to another surface's archive.
+    """
+    root = project_transcripts_dir(project_root)
+    index = build_session_index(root)
+    return lookup_transcript_path(
+        index, cwd=cwd, account_name=account_name, provider=provider,
+    )
+
+
+def _read_first_event_fingerprint(
+    events_path: Path,
+) -> tuple[str, str, str, str] | None:
+    """Return ``(session_id, cwd, account_name, provider)`` from line 1.
+
+    The ingestor writes ``_event_base`` dicts that always carry these
+    four fields, so we only need to read one well-formed line. Returns
+    ``None`` when the file is empty or contains nothing decodable.
+    """
+    try:
+        with events_path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for _ in range(8):  # Tolerate a handful of leading blanks.
+                line = handle.readline()
+                if not line:
+                    return None
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                session_id = str(obj.get("session_id") or "")
+                cwd = str(obj.get("cwd") or "")
+                account_name = str(obj.get("account_name") or "")
+                provider = str(obj.get("provider") or "")
+                return (session_id, cwd, account_name, provider)
+    except OSError:
+        return None
+    return None
 
 
 def is_archive_stale(
@@ -205,13 +293,9 @@ def is_archive_stale(
 def parse_events_jsonl(
     events_path: Path,
     *,
-    include_thinking: bool = False,
     actor_fallback: str = "agent",
 ) -> list[MessageEnvelope]:
     """Parse an ``events.jsonl`` archive into envelopes.
-
-    ``include_thinking`` — when ``False`` (default), ``thinking``
-    blocks are dropped per spec §3.4.
 
     ``actor_fallback`` — used when the event doesn't carry a clear
     actor name. The registry layer passes the surface's persona name
@@ -221,6 +305,10 @@ def parse_events_jsonl(
     Malformed lines are skipped with a debug log; the parser never
     raises on bad JSON because partially-flushed archives are normal
     (the ingestor appends line-by-line, the API may read mid-flush).
+
+    NOTE: provider ``thinking`` blocks are not surfaced — the
+    transcript ingestor does not currently preserve them. Tracking the
+    follow-up work as a separate arc (linked from the P1 PR).
     """
     envelopes: list[MessageEnvelope] = []
     if not events_path.exists():
@@ -252,7 +340,6 @@ def parse_events_jsonl(
                     event,
                     offset=start_offset,
                     source_key=source_key,
-                    include_thinking=include_thinking,
                     actor_fallback=actor_fallback,
                 )
                 envelopes.extend(converted)
@@ -270,7 +357,6 @@ def _event_to_envelopes(
     *,
     offset: int,
     source_key: str,
-    include_thinking: bool,
     actor_fallback: str,
 ) -> list[MessageEnvelope]:
     """Translate one ingestor event into 0+ envelopes.
@@ -792,7 +878,9 @@ def _extract_task_notification(content: Any) -> dict[str, Any] | None:
 
 __all__ = [
     "STALE_THRESHOLD_SECONDS",
+    "build_session_index",
     "is_archive_stale",
+    "lookup_transcript_path",
     "parse_events_jsonl",
     "resolve_transcript_path",
 ]

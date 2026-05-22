@@ -31,6 +31,7 @@ from pollypm.web_api.errors import (
     handle_unhandled_exception,
     handle_validation_error,
 )
+from pollypm.web_api.routes import chat_messages as chat_messages_routes
 from pollypm.web_api.routes import events as events_routes
 from pollypm.web_api.routes import health as health_routes
 from pollypm.web_api.routes import inbox as inbox_routes
@@ -112,6 +113,15 @@ def create_app(
     app.include_router(tasks_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(inbox_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(events_routes.router, prefix=API_V1_PREFIX, dependencies=sse_auth_deps)
+    # P2 of the chat-endpoints spec — GET /api/v1/chat/sessions and
+    # GET /api/v1/chat/{session_name}/messages. Sits under the same
+    # ``/chat`` prefix the P3 send endpoint will share so all
+    # chat-surface verbs are co-located in the routing table.
+    app.include_router(
+        chat_messages_routes.router,
+        prefix=f"{API_V1_PREFIX}/chat",
+        dependencies=auth_deps,
+    )
 
     # ``security: bearerAuth`` declared at the document level so
     # generated clients carry the correct Auth scheme.

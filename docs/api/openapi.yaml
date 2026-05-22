@@ -47,6 +47,11 @@ tags:
     description: Inbox items and threads.
   - name: Events
     description: Realtime audit-log stream.
+  - name: Chat
+    description: |
+      Chat-surface discovery and message history. The discovery endpoint
+      enumerates operator/architect/advisor/worker surfaces; the messages
+      endpoint paginates each surface's envelope stream.
 
 paths:
   /health:
@@ -274,6 +279,131 @@ paths:
           $ref: "#/components/responses/NotFound"
         "422":
           $ref: "#/components/responses/ValidationError"
+
+  /chat/sessions:
+    get:
+      tags: [Chat]
+      operationId: listChatSessions
+      summary: Discover every chat surface (operator/architect/advisor/worker)
+      description: |
+        Lists every registered chat surface — the operator session, each
+        architect/advisor persona configured for a project, and any
+        per-task worker sessions known to the work service. Surfaces
+        always carry their tmux window state so the cockpit can decide
+        whether to subscribe to live capture or pull from the JSONL
+        archive. Workers are best-effort: a transient work-service
+        outage degrades to "configured surfaces only" rather than 500.
+      responses:
+        "200":
+          description: List of chat surfaces.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatSessionsResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /chat/{session_name}/messages:
+    parameters:
+      - $ref: "#/components/parameters/ChatSessionName"
+    get:
+      tags: [Chat]
+      operationId: getChatMessages
+      summary: Paginated message history for one chat surface
+      description: |
+        Returns the envelope stream for a single chat surface, sourced
+        from the normalized `events.jsonl` archive with optional tmux
+        capture fallback. `source=auto` (the default) prefers the
+        archive and falls back to live capture when the archive is
+        stale (>60s) or missing; `source=jsonl` forces archive reads
+        and 404s when the archive isn't on disk; `source=capture` is
+        strict — missing windows / unavailable tmux / capture failures
+        all 503 with a typed error code instead of returning an empty
+        page.
+      parameters:
+        - in: query
+          name: since
+          schema: { type: string, format: date-time }
+          description: ISO-8601 lower bound on message timestamp.
+        - in: query
+          name: since_id
+          schema: { type: string }
+          description: |
+            Return messages strictly after this id in the requested
+            direction. Use the `next_cursor` field from the previous
+            response. The cursor is applied AFTER sort+direction so
+            pagination is stable for both `asc` and `desc`.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+          description: Max envelopes per page (capped at 500).
+        - in: query
+          name: direction
+          schema:
+            type: string
+            enum: [asc, desc]
+            default: desc
+          description: Ordering — `desc` (newest first, default) or `asc`.
+        - in: query
+          name: include_subagents
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: |
+            DEFERRED (#2052). The runtime accepts this parameter for
+            forward-compat with the v3 inliner, but currently returns
+            `422 validation_error` when set to `true`. The v3
+            implementation called `parse_events_jsonl` on the raw
+            Claude task-notification `metadata.output_file`, which is
+            a different JSONL shape than the normalized archive the
+            parser consumes; re-implementation is tracked in #2052.
+            Pass `false` (or omit) until the resolver lands.
+        - in: query
+          name: source
+          schema:
+            type: string
+            enum: [auto, jsonl, capture]
+            default: auto
+          description: |
+            Transcript source. `auto` = JSONL with capture fallback
+            when stale, `jsonl` = force archive (404 if absent),
+            `capture` = force tmux capture (503 on any failure).
+      responses:
+        "200":
+          description: Page of envelopes for this surface.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatMessagesResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: |
+            Unknown session (`session_unknown`) or archive missing
+            when `source=jsonl` is explicit (`archive_missing`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: |
+            Capture path failure when `source=capture` is explicit:
+            `window_missing` (tmux window not running),
+            `capture_unavailable` (tmux client not installed),
+            `capture_failed` (capture call raised). Also emitted when
+            a per-task worker lookup races a work-service outage
+            (`service_unavailable`) — distinct from the 404
+            `session_unknown` that fires when the surface genuinely
+            isn't registered.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /projects/{key}/tasks:
     parameters:
@@ -636,6 +766,15 @@ components:
       required: true
       schema: { type: string }
       description: Inbox item identifier.
+    ChatSessionName:
+      in: path
+      name: session_name
+      required: true
+      schema: { type: string }
+      description: |
+        Chat surface identifier from `GET /chat/sessions` — e.g.
+        `operator`, `architect_<project>`, `advisor_<project>`,
+        `task-<project>-<n>`.
     IdempotencyKey:
       in: header
       name: Idempotency-Key
@@ -890,6 +1029,174 @@ components:
         status:
           type: string
           enum: [accepted]
+
+    # ---- Chat GET endpoints (P2 — discovery + history) --------------
+    ChatSurfaceType:
+      type: string
+      enum: [operator, architect, advisor, worker]
+      description: Persona category for a chat surface.
+
+    ChatSurfaceWindow:
+      type: object
+      required: [tmux_session, window_name, present, pane_dead]
+      properties:
+        tmux_session: { type: string }
+        window_name: { type: string }
+        present:
+          type: boolean
+          description: True when the tmux window is currently running.
+        pane_id: { type: string }
+        pane_dead:
+          type: boolean
+          description: True when the pane is registered but its process exited.
+
+    ChatSurfaceTranscript:
+      type: object
+      properties:
+        source:
+          type: string
+          nullable: true
+          enum: [jsonl, null]
+          description: |
+            `jsonl` when an `events.jsonl` archive exists for this
+            surface; `null` for brand-new surfaces that haven't been
+            written to yet (spec §4.8). The discovery endpoint never
+            probes tmux — capture availability is decided by the
+            history endpoint.
+        path:
+          type: string
+          nullable: true
+          description: Filesystem path to the archive when `source=jsonl`.
+
+    ChatSurface:
+      type: object
+      required: [session_name, surface_type, window, transcript,
+                 provider, auth_token_present]
+      properties:
+        session_name: { type: string }
+        surface_type:
+          $ref: "#/components/schemas/ChatSurfaceType"
+        persona:
+          type: string
+          nullable: true
+        project:
+          type: string
+          nullable: true
+        task_id:
+          type: integer
+          nullable: true
+          description: Per-task worker surfaces only.
+        window:
+          $ref: "#/components/schemas/ChatSurfaceWindow"
+        transcript:
+          $ref: "#/components/schemas/ChatSurfaceTranscript"
+        cwd:
+          type: string
+          nullable: true
+        provider: { type: string }
+        auth_token_present: { type: boolean }
+        worktree_path:
+          type: string
+          nullable: true
+
+    ChatSessionsResponse:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatSurface"
+
+    ChatMessageRole:
+      type: string
+      enum: [user, assistant, system, tool]
+
+    ChatMessageType:
+      type: string
+      description: |
+        Envelope discriminator per spec §3. Mirrors the runtime
+        `MessageType` enum at `src/pollypm/web_api/chat/envelope.py:30-48`
+        — `tests/web_api/test_openapi_conformance.py::test_chat_message_type_enum_matches_runtime`
+        asserts set equality so future drift trips CI.
+
+        `thinking` is reserved — the transcript ingestor does not
+        currently preserve thinking blocks, so the API never emits
+        them. The `include_thinking` query param + `thinking` enum
+        value will return once the ingestor learns to round-trip them
+        (follow-up #2048).
+      enum:
+        - text
+        - tool_use
+        - tool_result
+        - ask_user
+        - file
+        - subagent_spawn
+        - subagent_result
+        - system_event
+
+    ChatMessageEnvelope:
+      type: object
+      required: [id, ts, role, actor, type, text, metadata]
+      properties:
+        id:
+          type: string
+          description: Stable per-archive envelope id (used as cursor).
+        ts:
+          type: string
+          description: ISO-8601 timestamp.
+        role:
+          $ref: "#/components/schemas/ChatMessageRole"
+        actor:
+          type: string
+          description: Persona / actor name (falls back to `agent` / `worker`).
+        type:
+          $ref: "#/components/schemas/ChatMessageType"
+        text: { type: string }
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Type-dependent payload. `subagent_result` envelopes carry
+            `output_file` and `summary`. `subagent_transcript` inlining
+            is deferred — see #2052.
+
+    ChatMessagesResponse:
+      type: object
+      required: [session_name, surface_type, messages, has_more]
+      properties:
+        session_name: { type: string }
+        surface_type:
+          $ref: "#/components/schemas/ChatSurfaceType"
+        persona:
+          type: string
+          nullable: true
+        transcript_source:
+          type: string
+          nullable: true
+          enum: [jsonl, capture, null]
+          description: |
+            Which source the envelopes came from for this request —
+            `jsonl` (archive), `capture` (live tmux), or `null` (no
+            archive yet and capture unavailable).
+        transcript_path:
+          type: string
+          nullable: true
+          description: Archive path when `transcript_source=jsonl`.
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/ChatMessageEnvelope"
+        has_more:
+          type: boolean
+          description: True when more pages exist after `next_cursor`.
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Pass back as `since_id` to fetch the next page. Applied
+            in the same order as the previous response so `asc` and
+            `desc` pagination both walk without duplicates.
 
     # ---- Tasks ------------------------------------------------------
     TaskStatus:

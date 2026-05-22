@@ -294,6 +294,7 @@ def parse_events_jsonl(
     events_path: Path,
     *,
     actor_fallback: str = "agent",
+    strict: bool = False,
 ) -> list[MessageEnvelope]:
     """Parse an ``events.jsonl`` archive into envelopes.
 
@@ -305,6 +306,18 @@ def parse_events_jsonl(
     Malformed lines are skipped with a debug log; the parser never
     raises on bad JSON because partially-flushed archives are normal
     (the ingestor appends line-by-line, the API may read mid-flush).
+
+    ``strict=False`` (default) preserves the historical fail-soft
+    posture: ``OSError`` (unreadable archive, permission denied,
+    transient I/O fault) is logged and the parser returns whatever
+    envelopes were accumulated before the failure. This is what
+    ``source=auto`` needs so it can fall back to tmux capture.
+
+    ``strict=True`` propagates ``OSError`` so explicit ``source=jsonl``
+    callers can map an unreadable archive to a typed 503
+    ``archive_unreadable`` instead of silently returning ``200`` with
+    an empty list (round-5 blocker 2). The chat-messages route catches
+    the propagated ``OSError`` and translates it.
 
     NOTE: provider ``thinking`` blocks are not surfaced — the
     transcript ingestor does not currently preserve them. Tracking the
@@ -344,6 +357,10 @@ def parse_events_jsonl(
                 )
                 envelopes.extend(converted)
     except OSError as exc:
+        if strict:
+            # Let the route translate this into a typed 503
+            # ``archive_unreadable`` (round-5 blocker 2).
+            raise
         logger.warning(
             "chat.transcripts: read failed for %s: %s",
             events_path, exc,

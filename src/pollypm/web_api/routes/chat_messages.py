@@ -1,0 +1,902 @@
+"""GET chat-history endpoints (Phase 1 — P2 of the chat-endpoints spec).
+
+Implements:
+
+- ``GET /api/v1/chat/sessions`` — discover every chat surface.
+- ``GET /api/v1/chat/{session_name}/messages`` — paginated history
+  for one surface, with optional inline-subagent expansion + tmux
+  capture fallback.
+
+Per ``~/Desktop/pollypm-chat-endpoints-spec.md`` §2.1 / §2.2 / §3 / §4.
+The router is a thin adapter over :mod:`pollypm.web_api.chat`:
+
+- :func:`pollypm.web_api.chat.enumerate_chat_surfaces` powers the
+  discovery endpoint.
+- :func:`pollypm.web_api.chat.parse_events_jsonl` powers the JSONL
+  branch of the history endpoint.
+- :func:`pollypm.web_api.chat.capture_envelopes` is the tmux
+  capture fallback driven by ``?source=capture`` or by ``?source=auto``
+  when the archive is stale (>60 s, per spec §4.7).
+
+The router never imports the work-service directly when the request
+doesn't need worker surfaces; per-task workers are opted into by
+opening a read-only work-service handle (matches the pattern used by
+:mod:`pollypm.web_api.service`).
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Annotated, Any, Literal
+
+from fastapi import APIRouter, Query
+from pydantic import BaseModel, Field
+
+from pollypm.tmux.client import TmuxClient
+from pollypm.web_api.chat import (
+    STALE_THRESHOLD_SECONDS,
+    ChatSurface,
+    MessageEnvelope,
+    SurfaceType,
+    capture_envelopes,
+    enumerate_chat_surfaces,
+    is_archive_stale,
+    parse_events_jsonl,
+)
+from pollypm.web_api.errors import APIError, service_unavailable
+from pollypm.web_api.routes._deps import ConfigDep
+from pollypm.work.task_state import parse_task_window_name
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter(tags=["Chat"])
+
+
+# ---------------------------------------------------------------------------
+# Limits + defaults (kept module-level so tests can patch)
+# ---------------------------------------------------------------------------
+
+
+# Spec §2.2: ``limit`` default 100, cap 500.
+DEFAULT_MESSAGE_LIMIT = 100
+MAX_MESSAGE_LIMIT = 500
+
+
+SourceMode = Literal["auto", "jsonl", "capture"]
+Direction = Literal["asc", "desc"]
+
+
+def _is_worker_session(session_name: str) -> bool:
+    """Return True iff ``session_name`` matches the worker naming pattern.
+
+    Delegates to the canonical
+    :func:`pollypm.work.task_state.parse_task_window_name` so the
+    chat-messages router stays in sync with the launcher / recovery
+    sweep / worker-marker reaper. The canonical parser accepts
+    ``task-<project>-<N>`` (with arbitrary characters in the project
+    slug as long as the trailing ``-N`` digits exist) and returns
+    ``None`` for everything else.
+    """
+    return parse_task_window_name(session_name) is not None
+
+
+class _WorkerFacadeUnavailable(Exception):
+    """Raised by ``_build_work_service_stub`` when the facade can't be opened.
+
+    Distinct from "facade returned no records" (which collapses to
+    ``None``). Lets ``_find_surface`` translate a transient pg-pool
+    outage into a typed 503 ``service_unavailable`` instead of a
+    misleading 404 ``session_unknown`` (blocker 3).
+    """
+
+
+# ---------------------------------------------------------------------------
+# Response models
+# ---------------------------------------------------------------------------
+
+
+class ChatSurfaceWindow(BaseModel):
+    """tmux window state for one surface (spec §2.1)."""
+
+    tmux_session: str
+    window_name: str
+    present: bool = False
+    pane_id: str | None = None
+    pane_dead: bool = False
+
+
+class ChatSurfaceTranscript(BaseModel):
+    """Transcript locator for one surface (spec §2.1).
+
+    ``source`` is ``"jsonl"`` when an ``events.jsonl`` archive exists
+    on disk; ``null`` when there's no archive yet (brand-new surface
+    per spec §4.8). The discovery endpoint never probes tmux for the
+    capture fallback — that decision belongs to the history endpoint.
+    """
+
+    source: str | None = None
+    path: str | None = None
+
+
+class ChatSurfaceResponse(BaseModel):
+    """One entry in the ``GET /sessions`` response (spec §2.1)."""
+
+    session_name: str
+    surface_type: str
+    persona: str | None = None
+    project: str | None = None
+    task_id: int | None = None
+    window: ChatSurfaceWindow
+    transcript: ChatSurfaceTranscript
+    cwd: str | None = None
+    provider: str = ""
+    auth_token_present: bool = False
+    worktree_path: str | None = None
+
+
+class ChatSessionsResponse(BaseModel):
+    """``GET /api/v1/chat/sessions`` envelope."""
+
+    sessions: list[ChatSurfaceResponse]
+
+
+class ChatMessageEnvelope(BaseModel):
+    """Wire form of :class:`MessageEnvelope` (spec §3).
+
+    The dataclass version is kept for internal callers; this Pydantic
+    model exists so the OpenAPI document carries the right schema and
+    FastAPI handles the JSON serialization uniformly.
+    """
+
+    id: str
+    ts: str
+    role: str
+    actor: str
+    type: str
+    text: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ChatMessagesResponse(BaseModel):
+    """``GET /api/v1/chat/{session_name}/messages`` envelope (spec §2.2)."""
+
+    session_name: str
+    surface_type: str
+    persona: str | None = None
+    transcript_source: str | None = None
+    transcript_path: str | None = None
+    messages: list[ChatMessageEnvelope]
+    has_more: bool = False
+    next_cursor: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Typed errors (spec §2.3 codes reused for symmetry with chat_send)
+# ---------------------------------------------------------------------------
+
+
+def _session_unknown(session_name: str) -> APIError:
+    return APIError(
+        status_code=404,
+        code="session_unknown",
+        message=f"No chat surface registered for session: {session_name!r}",
+        hint=(
+            "Use GET /api/v1/chat/sessions to discover registered surfaces, "
+            "or check config.sessions / work-service for per-task workers."
+        ),
+    )
+
+
+def _window_missing(target: str) -> APIError:
+    return APIError(
+        status_code=503,
+        code="window_missing",
+        message=f"Window not present in tmux: {target}",
+        hint=(
+            "The session is configured but its tmux window is not running. "
+            "Re-run `pm up` or check `pm sessions`."
+        ),
+    )
+
+
+def _archive_missing(session_name: str) -> APIError:
+    return APIError(
+        status_code=404,
+        code="archive_missing",
+        message=(
+            f"No events.jsonl archive on disk for session {session_name!r} "
+            "(source=jsonl was requested)."
+        ),
+        hint="Drop ?source=jsonl to fall back to tmux capture, or wait for the ingestor to flush.",
+    )
+
+
+def _archive_unreadable(session_name: str, detail: str) -> APIError:
+    """Spec §2.3 — explicit ``source=jsonl`` against an unreadable archive.
+
+    Returned as 503 (not 4xx): the archive exists on disk but the
+    process can't read it (permissions, transient I/O fault, mounted
+    volume gone). That's a server-side condition the caller can retry,
+    not a request-shape error (round-5 blocker 2).
+    """
+    return APIError(
+        status_code=503,
+        code="archive_unreadable",
+        message=(
+            f"events.jsonl archive for session {session_name!r} is "
+            f"present but cannot be read: {detail}"
+        ),
+        hint=(
+            "Check filesystem permissions on the archive, or drop "
+            "?source=jsonl to fall back to tmux capture."
+        ),
+    )
+
+
+def _capture_unavailable(session_name: str) -> APIError:
+    return APIError(
+        status_code=503,
+        code="capture_unavailable",
+        message=(
+            f"tmux client unavailable; cannot satisfy source=capture for "
+            f"session {session_name!r}."
+        ),
+        hint="Install tmux or drop ?source=capture to fall back to the JSONL archive.",
+    )
+
+
+def _capture_failed(session_name: str, detail: str) -> APIError:
+    return APIError(
+        status_code=503,
+        code="capture_failed",
+        message=(
+            f"tmux capture failed for session {session_name!r}: {detail}"
+        ),
+        hint="Retry shortly; check tmux server health with `pm sessions`.",
+    )
+
+
+def _invalid_query(field: str, message: str) -> APIError:
+    return APIError(
+        status_code=400,
+        code="invalid_request",
+        message=f"Invalid {field}: {message}",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _build_work_service_stub(config: Any) -> Any | None:
+    """Return a duck-typed stub the registry can call for workers (fail-soft).
+
+    The chat registry only needs ``list_worker_sessions(active_only=...)``
+    on the work-service. Rather than reach into a private context
+    manager, we call the public
+    :func:`pollypm.web_api.service.list_active_worker_sessions` facade
+    once and hand the registry a tiny adapter that re-emits those
+    records. Returns ``None`` when the facade yields no records — the
+    registry then skips worker enumeration entirely.
+
+    This (non-strict) variant is used by discovery: any unexpected
+    import/runtime error collapses to ``None`` so the response still
+    returns configured surfaces and never 500s. For the strict-mode
+    worker lookup path (where pg outages must surface as 503 instead
+    of 404), use :func:`_build_work_service_stub_strict` — it bypasses
+    the public facade so transient facade failures aren't swallowed
+    into an empty list (round-5 blocker).
+    """
+    try:
+        from pollypm.web_api.service import list_active_worker_sessions
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        records = list_active_worker_sessions(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "chat_messages: list_active_worker_sessions failed; "
+            "skipping worker surfaces",
+            exc_info=True,
+        )
+        return None
+    if not records:
+        return None
+    return _WorkerSessionStub(records)
+
+
+def _build_work_service_stub_strict(config: Any) -> Any | None:
+    """Strict variant: surfaces facade outages instead of swallowing them.
+
+    Consumes the public
+    :func:`pollypm.web_api.service.list_active_worker_sessions_strict`
+    facade — the fail-soft sibling :func:`list_active_worker_sessions`
+    collapses pg-pool outages to ``[]`` (fail-open posture for
+    discovery), but explicit per-session worker lookups need to tell
+    "no workers right now" apart from "the work-service can't be
+    opened" so the route can map the outage to a typed 503
+    ``service_unavailable`` instead of a misleading 404
+    ``session_unknown`` (round-6 blocker — moves the previously-inline
+    ``_open_work_service_readonly`` call behind the public service
+    boundary so the route layer doesn't reach into private helpers).
+
+    Facade errors propagate as :class:`_WorkerFacadeUnavailable`. An
+    empty result list still collapses to ``None`` (matches the
+    non-strict contract: the registry skips worker enumeration when
+    the stub is ``None``).
+    """
+    try:
+        from pollypm.web_api.service import (
+            WorkServiceFacadeUnavailable,
+            list_active_worker_sessions_strict,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _WorkerFacadeUnavailable(
+            "list_active_worker_sessions_strict import failed"
+        ) from exc
+    try:
+        records = list_active_worker_sessions_strict(config)
+    except WorkServiceFacadeUnavailable as exc:
+        raise _WorkerFacadeUnavailable(str(exc)) from exc
+    if not records:
+        return None
+    return _WorkerSessionStub(records)
+
+
+class _WorkerSessionStub:
+    """Minimal stand-in exposing ``list_worker_sessions`` for the registry.
+
+    ``enumerate_worker_surfaces`` in
+    :mod:`pollypm.web_api.chat.registry` only calls
+    ``list_worker_sessions(active_only=True)`` on the work-service it
+    receives, so we expose exactly that method and ignore the
+    ``active_only`` flag (the public facade always filters to active
+    records).
+    """
+
+    def __init__(self, records: list[Any]) -> None:
+        self._records = list(records)
+
+    def list_worker_sessions(
+        self, *, active_only: bool = True,  # noqa: ARG002 — registry-API compat
+    ) -> list[Any]:
+        return list(self._records)
+
+
+def _build_tmux_client() -> TmuxClient | None:
+    """Construct a :class:`TmuxClient` for window-presence probing.
+
+    Returns ``None`` if tmux isn't installed (or the client init
+    raises) — the registry treats a missing client as "presence
+    unknown" and returns surfaces with ``window.present=false``.
+    """
+    try:
+        return TmuxClient()
+    except Exception:  # noqa: BLE001
+        logger.debug("chat_messages: TmuxClient init failed; presence unknown", exc_info=True)
+        return None
+
+
+def _find_surface(
+    config: Any,
+    session_name: str,
+    *,
+    include_workers: bool | None = None,
+) -> ChatSurface:
+    """Resolve ``session_name`` to a :class:`ChatSurface` or raise.
+
+    Hot-path optimization (blocker 3): when ``session_name`` doesn't
+    match the worker pattern (``task-{project}-{N}``), we skip the
+    work-service open entirely — operator/architect/advisor surfaces
+    are always discoverable from ``config`` alone, so probing pg for
+    every lookup is pure overhead and turns a pg-pool outage into a
+    misleading 404 ``session_unknown``.
+
+    Callers may pin the behavior explicitly via ``include_workers``;
+    when unset (default) the helper infers from the session name.
+
+    For genuine worker lookups, the facade is opened in strict mode:
+    if pg is unreachable we raise 503 ``service_unavailable`` instead
+    of falling through to 404 ``session_unknown``, which would tell
+    the client to give up rather than retry.
+    """
+    if include_workers is None:
+        include_workers = _is_worker_session(session_name)
+    tmux_client = _build_tmux_client()
+    work_service: Any | None = None
+    if include_workers:
+        try:
+            work_service = _build_work_service_stub_strict(config)
+        except _WorkerFacadeUnavailable as exc:
+            raise service_unavailable(
+                f"work-service unavailable; cannot resolve worker session "
+                f"{session_name!r}",
+                hint=(
+                    "The per-task worker registry depends on the work-service. "
+                    "Retry shortly; check `pm sessions` / pg pool health."
+                ),
+            ) from exc
+    surfaces = enumerate_chat_surfaces(
+        config,
+        work_service=work_service,
+        tmux_client=tmux_client,
+    )
+    for surface in surfaces:
+        if surface.session_name == session_name:
+            return surface
+    raise _session_unknown(session_name)
+
+
+def _parse_since(since: str | None) -> datetime | None:
+    """Parse the ``?since`` ISO-8601 timestamp or raise 400.
+
+    Accepts both ``...Z`` and ``...+00:00`` suffix shapes (the
+    transcript writer normalises to ``Z`` but clients may roundtrip
+    through ``datetime.isoformat`` which emits ``+00:00``).
+    """
+    if not since:
+        return None
+    try:
+        candidate = since.replace("Z", "+00:00") if since.endswith("Z") else since
+        return datetime.fromisoformat(candidate)
+    except (TypeError, ValueError) as exc:
+        raise _invalid_query("since", f"not an ISO-8601 timestamp: {since!r}") from exc
+
+
+def _parse_envelope_ts(ts: str) -> datetime | None:
+    """Lenient ISO-8601 parse for envelope timestamps. ``None`` on failure.
+
+    Always returns a timezone-aware ``datetime`` when parse succeeds:
+    naive timestamps are coerced to UTC. This lets callers mix the
+    parsed value with the ``datetime.min.replace(tzinfo=timezone.utc)``
+    sort sentinel without ``TypeError: can't compare offset-naive and
+    offset-aware datetimes`` (blocker 2).
+    """
+    if not ts:
+        return None
+    try:
+        candidate = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
+        parsed = datetime.fromisoformat(candidate)
+    except (TypeError, ValueError):
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+# Sentinel used when sorting envelopes whose ``ts`` is missing /
+# unparseable. Timezone-aware so it compares against parsed tz-aware
+# timestamps without ``TypeError`` (blocker 2). Unparseable rows sort
+# to the head of an ascending sort (matching the prior behavior with
+# naive ``datetime.min``) but stay in the page — they just surface
+# with ``ts=""`` in the response.
+_TS_SORT_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
+
+
+def _envelope_to_wire(envelope: MessageEnvelope) -> ChatMessageEnvelope:
+    """Coerce a dataclass envelope to its Pydantic wire shape."""
+    return ChatMessageEnvelope(
+        id=envelope.id,
+        ts=envelope.ts,
+        role=str(envelope.role),
+        actor=envelope.actor,
+        type=str(envelope.type),
+        text=envelope.text,
+        metadata=envelope.metadata,
+    )
+
+
+def _surface_to_wire(surface: ChatSurface) -> ChatSurfaceResponse:
+    data = surface.to_dict()
+    return ChatSurfaceResponse(
+        session_name=data["session_name"],
+        surface_type=data["surface_type"],
+        persona=data.get("persona"),
+        project=data.get("project"),
+        task_id=data.get("task_id"),
+        window=ChatSurfaceWindow(**data["window"]),
+        transcript=ChatSurfaceTranscript(**data["transcript"]),
+        cwd=data.get("cwd"),
+        provider=data.get("provider", ""),
+        auth_token_present=bool(data.get("auth_token_present", False)),
+        worktree_path=data.get("worktree_path"),
+    )
+
+
+def _load_envelopes(
+    surface: ChatSurface,
+    *,
+    source: SourceMode,
+) -> tuple[list[MessageEnvelope], str | None, Path | None]:
+    """Return ``(envelopes, transcript_source, transcript_path)``.
+
+    ``transcript_source`` is one of ``"jsonl"`` / ``"capture"`` /
+    ``None`` (no transcript yet, spec §4.8).
+
+    NOTE: thinking-block filtering is no longer plumbed through this
+    helper. The authoritative ``parse_events_jsonl`` on main does not
+    surface thinking envelopes (transcript ingestor does not preserve
+    them), so there's nothing to gate. The ``include_thinking`` query
+    param is parked until the ingestor + parser learn how to round-trip
+    thinking blocks (follow-up #2048).
+    """
+    archive = surface.transcript_path
+    actor_fallback = surface.persona or "agent"
+
+    if source == "jsonl":
+        if archive is None or not archive.exists():
+            raise _archive_missing(surface.session_name)
+        try:
+            envelopes = parse_events_jsonl(
+                archive,
+                actor_fallback=actor_fallback,
+                strict=True,
+            )
+        except OSError as exc:
+            # The archive exists but we can't read it (permissions,
+            # transient I/O fault, etc). Explicit ``source=jsonl``
+            # callers asked for the archive specifically — return a
+            # typed 503 instead of silently swallowing to ``[]`` and
+            # responding ``200 messages=[]`` (round-5 blocker 2).
+            raise _archive_unreadable(surface.session_name, str(exc)) from exc
+        return envelopes, "jsonl", archive
+
+    if source == "capture":
+        # Explicit capture: surface errors instead of returning 200 +
+        # empty (spec §4.7 / blocker 5). Missing window → 503
+        # window_missing, no tmux client → 503 capture_unavailable,
+        # raise → 503 capture_failed.
+        envelopes = _capture_for_surface(
+            surface,
+            actor_fallback=actor_fallback,
+            strict=True,
+        )
+        return envelopes, "capture", None
+
+    # source == "auto" — prefer JSONL, fall back to capture when the
+    # archive is missing or stale (spec §4.7).
+    if archive is not None and not is_archive_stale(archive):
+        envelopes = parse_events_jsonl(
+            archive,
+            actor_fallback=actor_fallback,
+        )
+        if envelopes:
+            return envelopes, "jsonl", archive
+        # Empty result on a fresh (non-stale) archive could be a
+        # legitimately empty transcript OR an unreadable archive whose
+        # ``OSError`` the fail-soft parser swallowed (round-6 blocker 5
+        # — ``source=auto`` previously returned an empty 200 in that
+        # case, with no signal to retry). Re-parse with ``strict=True``
+        # to see if the file is actually unreadable; if so, fall
+        # through to capture (auto's job). If strict re-parse also
+        # returns empty, the archive is genuinely empty and we return
+        # the empty page.
+        try:
+            strict_envelopes = parse_events_jsonl(
+                archive,
+                actor_fallback=actor_fallback,
+                strict=True,
+            )
+        except OSError:
+            logger.debug(
+                "chat_messages: auto-mode jsonl unreadable for %s; "
+                "falling back to capture",
+                surface.session_name,
+                exc_info=True,
+            )
+        else:
+            return strict_envelopes, "jsonl", archive
+
+    # Stale or missing archive (or unreadable archive in the auto
+    # branch above) — try capture, fall back to whatever JSONL we have
+    # (better stale data than no data, per spec §4.8 which prefers
+    # empty over erroring).
+    captured = _capture_for_surface(surface, actor_fallback=actor_fallback)
+    if captured:
+        return captured, "capture", None
+    if archive is not None and archive.exists():
+        envelopes = parse_events_jsonl(
+            archive,
+            actor_fallback=actor_fallback,
+        )
+        return envelopes, "jsonl", archive
+    return [], None, None
+
+
+def _capture_for_surface(
+    surface: ChatSurface,
+    *,
+    actor_fallback: str,
+    strict: bool = False,
+) -> list[MessageEnvelope]:
+    """Capture the surface's tmux pane into envelopes.
+
+    ``strict=False`` (used by ``source=auto``) keeps the fail-soft
+    behavior: every failure mode collapses to ``[]`` so ``auto`` can
+    fall back to the JSONL archive (spec §4.7 / §4.8).
+
+    ``strict=True`` (used by explicit ``source=capture``) raises a
+    typed :class:`APIError` for each failure mode so the caller gets
+    an actionable 503 instead of an empty 200 (blocker 5):
+
+    - missing tmux window → ``window_missing``
+    - no tmux client / not installed → ``capture_unavailable``
+    - capture call raises → ``capture_failed``
+    """
+    if not surface.window.present:
+        if strict:
+            target = f"{surface.window.tmux_session}:{surface.window.window_name}"
+            raise _window_missing(target)
+        return []
+    tmux_client = _build_tmux_client()
+    if tmux_client is None:
+        if strict:
+            raise _capture_unavailable(surface.session_name)
+        return []
+    target = f"{surface.window.tmux_session}:{surface.window.window_name}"
+    try:
+        return capture_envelopes(
+            tmux_client,
+            session_name=surface.session_name,
+            target=target,
+            actor_fallback=actor_fallback,
+            strict=strict,
+        )
+    except APIError:
+        # Already a typed error — propagate without wrapping.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "chat_messages: capture failed for %s", surface.session_name,
+            exc_info=True,
+        )
+        if strict:
+            raise _capture_failed(surface.session_name, str(exc)) from exc
+        return []
+
+
+def _apply_filters_and_paginate(
+    envelopes: list[MessageEnvelope],
+    *,
+    since: datetime | None,
+    since_id: str | None,
+    direction: Direction,
+    limit: int,
+) -> tuple[list[ChatMessageEnvelope], bool, str | None]:
+    """Apply spec §2.2 query semantics and return ``(rows, has_more, cursor)``.
+
+    Filtering order (cursor MUST be applied after sort, because
+    ``next_cursor`` is the LAST id in the page in the requested
+    direction — applying ``since_id`` in source order would slice the
+    wrong half for ``direction=desc``, duplicating page 1 on page 2):
+
+    1. Drop ``thinking`` envelopes — the authoritative parser does not
+       surface them today (transcript ingestor does not preserve
+       thinking blocks); this defensive filter keeps capture-mode
+       output consistent if a future capture path ever emits one.
+       ``include_thinking`` is parked until follow-up #2048 wires the
+       full thinking round-trip.
+    2. ``since`` lower-bound on envelope ``ts``.
+    3. Sort by timestamp + position. JSONL ordering is already
+       chronological; we re-sort defensively so the response is
+       deterministic even when the parser returns shuffled rows.
+    4. Reverse for ``direction=desc``.
+    5. ``since_id`` cursor walk — strictly after the matching id in
+       the ordered sequence (the cursor itself is excluded from the
+       slice, matching the ``next_cursor`` semantics of the inbox
+       endpoint).
+    6. Slice to ``limit`` and compute ``has_more`` / ``next_cursor``.
+
+    NOTE: ``include_subagents`` is deferred to #2052 — the v3
+    implementation called ``parse_events_jsonl`` on
+    ``metadata.output_file``, but that field is the raw Claude
+    task-notification subagent JSONL (different shape than the
+    normalized archive). The path-traversal allowlist and inliner
+    were removed alongside the query param.
+    """
+    # Normalize the lower bound to tz-aware UTC so the comparison with
+    # parsed timestamps (always tz-aware after _parse_envelope_ts) never
+    # mixes naive + aware values (blocker 2).
+    since_aware: datetime | None = None
+    if since is not None:
+        since_aware = (
+            since if since.tzinfo is not None
+            else since.replace(tzinfo=timezone.utc)
+        )
+
+    filtered: list[MessageEnvelope] = []
+    for envelope in envelopes:
+        if str(envelope.type) == "thinking":
+            continue
+        if since_aware is not None:
+            ts = _parse_envelope_ts(envelope.ts)
+            if ts is None:
+                # Drop rows we can't compare — they'd otherwise sort
+                # to a non-deterministic position relative to ``since``.
+                continue
+            if ts < since_aware:
+                continue
+        filtered.append(envelope)
+
+    # Stable sort by (ts, original position). Original position is
+    # preserved because Python's sort is stable, but we've already
+    # filtered so we capture indices first. Unparseable / missing ``ts``
+    # values fall back to a tz-aware sentinel so mixed-shape rows don't
+    # raise ``TypeError`` from a naive/aware comparison (blocker 2).
+    indexed = list(enumerate(filtered))
+    indexed.sort(key=lambda item: (
+        _parse_envelope_ts(item[1].ts) or _TS_SORT_FLOOR,
+        item[0],
+    ))
+    ordered = [envelope for _, envelope in indexed]
+    if direction == "desc":
+        ordered.reverse()
+
+    # Apply cursor AFTER ordering so ``next_cursor`` (the last id of
+    # the previous page in the same direction) advances to the next
+    # slice instead of slicing source-order and re-emitting page 1.
+    if since_id is not None:
+        cursor_index = -1
+        for idx, envelope in enumerate(ordered):
+            if envelope.id == since_id:
+                cursor_index = idx
+                break
+        if cursor_index >= 0:
+            ordered = ordered[cursor_index + 1 :]
+
+    has_more = len(ordered) > limit
+    page = ordered[:limit]
+
+    next_cursor: str | None = None
+    if has_more and page:
+        next_cursor = page[-1].id
+
+    return [_envelope_to_wire(env) for env in page], has_more, next_cursor
+
+
+# NOTE: ``_inline_subagent`` / ``_allowed_transcript_roots`` /
+# ``_is_within`` were removed in PR #2045 round-4. The v3 implementation
+# called ``parse_events_jsonl`` on ``metadata.output_file``, but that
+# field is the raw Claude task-notification subagent JSONL — a totally
+# different shape than the normalized archive ``parse_events_jsonl``
+# consumes. Re-implementation tracked in #2052.
+
+
+# ---------------------------------------------------------------------------
+# Endpoints
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/sessions",
+    response_model=ChatSessionsResponse,
+    summary="Discover every chat surface (operator/architect/advisor/worker)",
+    operation_id="listChatSessions",
+)
+def list_chat_sessions_endpoint(config: ConfigDep) -> ChatSessionsResponse:
+    """GET /api/v1/chat/sessions — return every configured chat surface.
+
+    Workers are best-effort: when the work-service can't be opened
+    (fresh workspace, pg pool down) the response still lists the
+    configured surfaces and skips workers silently. The discovery
+    endpoint never 500s — the cockpit / frontend depend on it for
+    sidebar bootstrap.
+    """
+    tmux_client = _build_tmux_client()
+    work_service = _build_work_service_stub(config)
+    surfaces = enumerate_chat_surfaces(
+        config,
+        work_service=work_service,
+        tmux_client=tmux_client,
+    )
+    return ChatSessionsResponse(
+        sessions=[_surface_to_wire(surface) for surface in surfaces],
+    )
+
+
+@router.get(
+    "/{session_name}/messages",
+    response_model=ChatMessagesResponse,
+    summary="Paginated message history for one chat surface",
+    operation_id="getChatMessages",
+)
+def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec §2.2
+    session_name: str,
+    config: ConfigDep,
+    since: Annotated[str | None, Query(
+        description="ISO-8601 lower bound on message timestamp.",
+    )] = None,
+    since_id: Annotated[str | None, Query(
+        description="Return messages strictly after this message id (cursor).",
+    )] = None,
+    limit: Annotated[int, Query(
+        ge=1, le=MAX_MESSAGE_LIMIT,
+        description=(
+            f"Max messages, capped at {MAX_MESSAGE_LIMIT}. "
+            f"Defaults to {DEFAULT_MESSAGE_LIMIT}."
+        ),
+    )] = DEFAULT_MESSAGE_LIMIT,
+    direction: Annotated[Direction, Query(
+        description="Ordering: 'desc' (newest first, default) or 'asc'.",
+    )] = "desc",
+    source: Annotated[SourceMode, Query(
+        description=(
+            "Transcript source: 'auto' (jsonl with capture fallback when "
+            f">{int(STALE_THRESHOLD_SECONDS)}s stale), 'jsonl' (force "
+            "JSONL, 404 if absent), 'capture' (force tmux capture)."
+        ),
+    )] = "auto",
+    include_subagents: Annotated[bool, Query(
+        description=(
+            "DEFERRED (#2052): the v3 inliner called the normalized "
+            "events.jsonl parser on metadata.output_file, but that "
+            "field is the raw Claude subagent JSONL (different shape). "
+            "Passing include_subagents=true returns 422 until the "
+            "task-notification.output-file → normalized child archive "
+            "resolver lands."
+        ),
+    )] = False,
+) -> ChatMessagesResponse:
+    """GET /api/v1/chat/{session_name}/messages per spec §2.2."""
+    if include_subagents:
+        # Reject the deferred param explicitly so callers learn it's
+        # gone rather than silently getting un-inlined results.
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=(
+                "include_subagents is not currently supported; the "
+                "task-notification.output-file -> normalized archive "
+                "resolver is deferred."
+            ),
+            hint="Track re-implementation in #2052.",
+        )
+    surface = _find_surface(config, session_name)
+    since_dt = _parse_since(since)
+
+    envelopes, transcript_source, transcript_path = _load_envelopes(
+        surface, source=source,
+    )
+
+    rows, has_more, next_cursor = _apply_filters_and_paginate(
+        envelopes,
+        since=since_dt,
+        since_id=since_id,
+        direction=direction,
+        limit=limit,
+    )
+
+    return ChatMessagesResponse(
+        session_name=surface.session_name,
+        surface_type=str(surface.surface_type),
+        persona=surface.persona,
+        transcript_source=transcript_source,
+        transcript_path=str(transcript_path) if transcript_path else None,
+        messages=rows,
+        has_more=has_more,
+        next_cursor=next_cursor,
+    )
+
+
+# Silence the unused-import lint for SurfaceType — we re-export so the
+# spec's "discovery endpoint returns 4 surface types" contract is
+# discoverable from the router module too.
+_ = SurfaceType
+
+
+__all__ = [
+    "ChatMessageEnvelope",
+    "ChatMessagesResponse",
+    "ChatSessionsResponse",
+    "ChatSurfaceResponse",
+    "ChatSurfaceTranscript",
+    "ChatSurfaceWindow",
+    "DEFAULT_MESSAGE_LIMIT",
+    "MAX_MESSAGE_LIMIT",
+    "get_chat_messages_endpoint",
+    "list_chat_sessions_endpoint",
+    "router",
+]

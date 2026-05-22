@@ -281,6 +281,26 @@ Every 4xx and 5xx response body is:
 Validation errors carry an extra `details` field shaped like
 `[{"field": "reason", "message": "must be non-empty"}]`.
 
+### Chat-send specific codes
+
+`POST /api/v1/chat/{session_name}/send` adds the following typed
+codes on top of the standard set above:
+
+| HTTP | Code | When |
+|------|------|------|
+| 400 | `answer_to_missing` | `answer_to` does not match any transcript message id in the tail |
+| 400 | `selections_no_question` | `answer_to` references a message that isn't an `ask_user` envelope |
+| 400 | `selections_invalid` | One or more `selections` entries don't match an option label on the referenced ask_user |
+| 404 | `session_unknown` | `session_name` isn't in `config.sessions` and (for `task-{project}-{N}`) has no active worker-session row |
+| 409 | `unsafe_mid_tool` | Agent's latest assistant response has an unmatched `tool_use_id`, or the resolver couldn't fingerprint a transcript to this surface while other transcripts exist in the project |
+| 409 | `unsafe_mid_stream` | pg heartbeat for `session_name` is < 2 s old |
+| 409 | `pane_dead` | Target pane is `pane_dead=1` in tmux |
+| 409 | `pane_invalid` | Requested `pane` index is < 0, not present on the window, or the `list-panes` probe failed |
+| 503 | `window_missing` | The session is registered but its tmux window is not running |
+
+`safety=force` bypasses every 409 above. `safety=loose` keeps the
+mid-tool gate but allows mid-stream sends with a response header.
+
 ---
 
 ## 7. Resource model
@@ -386,6 +406,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | GET    | `/api/v1/projects/{key}` | Project drilldown — state, recent activity, top tasks, pending plan review |
 | POST   | `/api/v1/projects/{key}/plan` | Kick off `pm project plan` (initial or replan) |
 | POST   | `/api/v1/projects/{key}/chat` | Send a chat message to the project's PM persona |
+| POST   | `/api/v1/chat/{session_name}/send` | Send a message to a chat surface (operator/architect/advisor/worker) via tmux |
 | GET    | `/api/v1/projects/{key}/tasks` | Task list (`?status=&limit=&cursor=`) |
 | GET    | `/api/v1/projects/{key}/plan` | Structured plan body (`?version=N` matches the active version only — see §7) |
 | GET    | `/api/v1/tasks/{project}/{n}` | Task detail — status, node, executions, transitions |
@@ -399,9 +420,56 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | GET    | `/api/v1/events` | SSE stream of audit-log events (`?since=&project=&event=`) |
 | GET    | `/api/v1/chat/sessions` | Discover every chat surface (operator/architect/advisor/worker) |
 | GET    | `/api/v1/chat/{session_name}/messages` | Paginated message history for one chat surface (`?since=&since_id=&limit=&direction=&source=`) — `include_subagents` deferred (#2052) |
+| POST   | `/api/v1/chat/{session_name}/send` | Push a message into a chat surface via tmux (P3) |
 
-That's 19 endpoints in v1. The OpenAPI document is the authoritative
-list; if anything here drifts, the YAML wins.
+The OpenAPI document is the authoritative list; if anything here
+drifts, the YAML wins.
+
+### Chat-send (`POST /api/v1/chat/{session_name}/send`)
+
+Pushes text into the CLI agent backing `session_name` via tmux
+`send-keys`. Resolves surfaces through the shared P1 chat registry
+(`enumerate_chat_surfaces`): operator / architect / advisor sessions
+come from `config.sessions`; per-task workers
+(`task-{project}-{N}`) are validated against the work-service's
+active `list_worker_sessions()` rows — an authenticated caller
+cannot address a stale or unrelated tmux window by guessing names.
+
+Request body fields:
+
+| Field         | Type                                          | Required? | Notes |
+|---------------|-----------------------------------------------|-----------|-------|
+| `text`        | string                                        | when `selections` is empty | Free-text body. |
+| `press_enter` | bool (default true)                           | no        | Submit by pressing Enter after the text lands. |
+| `answer_to`   | string                                        | no        | Message id of an `ask_user` envelope this send answers. |
+| `selections`  | string[]                                      | no        | AskUserQuestion option labels (must match exactly). |
+| `notes`       | string                                        | no        | Appended after selections when answering an ask_user. |
+| `safety`      | enum `strict` (default) / `loose` / `force`   | no        | See safety gates below. |
+| `pane`        | integer ≥ 0                                   | no        | 0-based pane index; defaults to the active pane. |
+
+Response shape: `{ ok, message_id, session_name, window_target,
+characters_sent, method, press_enter_at? }`. `method` is
+`paste_buffer` for bodies > 100 chars and `send_keys` otherwise.
+
+#### Safety gates (`safety` enum)
+
+- `strict` (default) — both gates enforced; fails closed with
+  `409 unsafe_mid_tool` when the resolver cannot fingerprint a
+  transcript to the requested surface and other transcripts exist
+  in the project.
+- `loose` — keeps the mid-tool gate; allows mid-stream sends but
+  sets `X-PollyPM-Warning: agent-may-be-streaming` on the response.
+- `force` — bypasses both gates and the missing-fingerprint
+  fail-closed.
+
+#### Response header
+
+`X-PollyPM-Warning: agent-may-be-streaming` — set on a 200 response
+when `safety=loose` allowed a send while the pg heartbeat indicated
+the agent was streaming (< 2 s old). Absent on strict sends.
+
+Error codes for this endpoint are documented in §6 under the
+"Chat-send specific codes" table.
 
 ---
 

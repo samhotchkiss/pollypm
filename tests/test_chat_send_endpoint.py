@@ -54,21 +54,39 @@ class FakeWindow:
     pane_id: str = "%0"
 
 
+@dataclass
+class FakePane:
+    """Subset of :class:`pollypm.tmux.client.TmuxPane` the router reads."""
+
+    pane_index: int
+    pane_dead: bool = False
+
+
 class FakeTmuxClient:
     """In-memory stand-in for :class:`pollypm.tmux.client.TmuxClient`.
 
     Captures send_keys calls so tests can assert on the target / text /
-    press_enter triple. Configurable per-instance windows + send_keys
-    side effects make the negative paths (window missing, pane dead)
-    trivial to assert without monkeypatching subprocess.
+    press_enter triple. Configurable per-instance windows / panes +
+    send_keys side effects make the negative paths (window missing,
+    pane dead, pane invalid) trivial to assert without monkeypatching
+    subprocess.
     """
 
     windows_by_session: dict[str, list[FakeWindow]] = {}
+    panes_by_target: dict[str, list[FakePane]] = {}
     send_side_effect: Exception | None = None
     send_calls: list[tuple[str, str, bool]] = []
+    list_panes_side_effect: Exception | None = None
 
     def list_windows(self, session: str) -> list[FakeWindow]:
         return list(self.windows_by_session.get(session, []))
+
+    def list_panes(self, target: str) -> list[FakePane]:
+        if self.list_panes_side_effect is not None:
+            raise self.list_panes_side_effect
+        # Tests register panes by either window target ("session:window")
+        # or session, depending on the call shape; check both.
+        return list(self.panes_by_target.get(target, []))
 
     def send_keys(self, target: str, text: str, press_enter: bool = True) -> None:
         if self.send_side_effect is not None:
@@ -79,9 +97,24 @@ class FakeTmuxClient:
 @pytest.fixture(autouse=True)
 def _reset_fake_tmux():
     FakeTmuxClient.windows_by_session = {}
+    FakeTmuxClient.panes_by_target = {}
     FakeTmuxClient.send_side_effect = None
     FakeTmuxClient.send_calls = []
+    FakeTmuxClient.list_panes_side_effect = None
     yield
+
+
+@pytest.fixture(autouse=True)
+def _default_no_workers(monkeypatch: pytest.MonkeyPatch):
+    """Default: no per-task workers registered.
+
+    Tests that need worker validation override this via
+    :func:`_patch_worker_sessions`. Keeps the router off the real
+    work-service factory (pg) during unit tests.
+    """
+    monkeypatch.setattr(
+        chat_send_routes, "_list_worker_sessions", lambda config: [],
+    )
 
 
 @pytest.fixture
@@ -210,14 +243,69 @@ def _write_events_jsonl(
     project_root: Path,
     session_id: str,
     events: list[dict[str, Any]],
+    *,
+    cwd: Path | str | None = None,
+    provider: str = "claude",
+    account_name: str = "codex_primary",
 ) -> Path:
+    """Write a synthetic events.jsonl with the ``_event_base`` envelope.
+
+    The chat-send safety gates use P1's :func:`resolve_transcript_path`
+    which fingerprints transcripts by ``(cwd, account, provider)``
+    from the FIRST line of each ``events.jsonl``. We stamp those
+    fields on every event so the resolver returns an "exact" match
+    (and the strict-mode fail-closed gate stays quiet on legitimate
+    sends).
+    """
     transcripts = project_root / ".pollypm" / "transcripts" / session_id
     transcripts.mkdir(parents=True, exist_ok=True)
     path = transcripts / "events.jsonl"
     with path.open("w", encoding="utf-8") as fh:
         for event in events:
-            fh.write(json.dumps(event) + "\n")
+            payload = dict(event)
+            payload.setdefault("session_id", session_id)
+            payload.setdefault("provider", provider)
+            payload.setdefault("account_name", account_name)
+            if cwd is not None and "cwd" not in payload:
+                payload["cwd"] = str(cwd)
+            fh.write(json.dumps(payload) + "\n")
     return path
+
+
+@dataclass
+class FakeWorkerSessionRecord:
+    """Minimal :class:`WorkerSessionRecord` subset the registry reads."""
+
+    task_project: str
+    task_number: int
+    agent_name: str = "worker"
+    pane_id: str | None = None
+    worktree_path: str | None = None
+    branch_name: str | None = None
+    started_at: str = "2026-05-21T00:00:00Z"
+    ended_at: str | None = None
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    archive_path: str | None = None
+    provider: str | None = "claude"
+    provider_home: str | None = None
+
+
+def _patch_worker_sessions(
+    monkeypatch: pytest.MonkeyPatch,
+    records: list[FakeWorkerSessionRecord],
+) -> None:
+    """Make :func:`chat_send._list_worker_sessions` return ``records``.
+
+    Avoids spinning up pg / the work-service in the router-level tests
+    — the gate we actually care about is whether the resolver accepts
+    a session_name only when the active worker-session row exists.
+    """
+    monkeypatch.setattr(
+        chat_send_routes,
+        "_list_worker_sessions",
+        lambda config: list(records),
+    )
 
 
 def _set_storage_closet_windows(
@@ -322,6 +410,10 @@ def test_happy_path_per_task_worker(
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["task-myproj-42"])
     _patch_heartbeat_age(monkeypatch, None)
+    _patch_worker_sessions(
+        monkeypatch,
+        [FakeWorkerSessionRecord(task_project="myproj", task_number=42)],
+    )
     response = client.post(
         "/api/v1/chat/task-myproj-42/send",
         json={"text": "ping worker"},
@@ -332,6 +424,64 @@ def test_happy_path_per_task_worker(
     assert body["window_target"] == (
         "pollypm-test-storage-closet:task-myproj-42"
     )
+
+
+def test_unregistered_worker_session_returns_404(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review block 2 — `task-{project}-{id}` is not enough.
+
+    Even when a tmux window with the canonical name exists, the
+    router must refuse the send unless the work-service has an active
+    worker-session row for that exact ``(project, task_number)``. A
+    stale window or a guessed name otherwise lets an authenticated
+    caller poke an unrelated session.
+    """
+    _set_storage_closet_windows(patched_tmux, ["task-myproj-42"])
+    _patch_heartbeat_age(monkeypatch, None)
+    # Default fixture leaves _list_worker_sessions returning [].
+    response = client.post(
+        "/api/v1/chat/task-myproj-42/send",
+        json={"text": "ping worker"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 404
+    body = response.json()
+    assert body["error"]["code"] == "session_unknown"
+
+
+def test_ended_worker_session_returns_404(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only *active* worker sessions accept sends.
+
+    A row with ``ended_at`` set is the post-teardown state — sending
+    into the storage-closet window at that point is racing with
+    cleanup. Strict 404 so the operator notices.
+    """
+    _set_storage_closet_windows(patched_tmux, ["task-myproj-42"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _patch_worker_sessions(
+        monkeypatch,
+        [FakeWorkerSessionRecord(
+            task_project="myproj",
+            task_number=42,
+            ended_at="2026-05-21T00:00:00Z",
+        )],
+    )
+    response = client.post(
+        "/api/v1/chat/task-myproj-42/send",
+        json={"text": "ping worker"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "session_unknown"
 
 
 # ---------------------------------------------------------------------------
@@ -450,10 +600,14 @@ def test_unsafe_mid_tool_returns_409(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
-    _write_events_jsonl(project_root, "session-open", _assistant_with_open_tool())
+    _write_events_jsonl(
+        project_root, "session-open", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"text": "hello"},
@@ -470,10 +624,14 @@ def test_closed_tool_allows_send(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
-    _write_events_jsonl(project_root, "session-closed", _assistant_with_closed_tool())
+    _write_events_jsonl(
+        project_root, "session-closed", _assistant_with_closed_tool(),
+        cwd=workspace_root,
+    )
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"text": "hello"},
@@ -488,10 +646,14 @@ def test_safety_force_bypasses_mid_tool(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, 0.5)  # also fresh heartbeat
-    _write_events_jsonl(project_root, "session-open", _assistant_with_open_tool())
+    _write_events_jsonl(
+        project_root, "session-open", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"text": "hello", "safety": "force"},
@@ -506,10 +668,14 @@ def test_safety_loose_still_enforces_mid_tool(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
-    _write_events_jsonl(project_root, "session-open", _assistant_with_open_tool())
+    _write_events_jsonl(
+        project_root, "session-open", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"text": "hello", "safety": "loose"},
@@ -650,6 +816,7 @@ def test_answer_to_selections_happy_path(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
@@ -662,7 +829,7 @@ def test_answer_to_selections_happy_path(
             "event_type": "tool_result",
             "payload": {"type": "tool_result", "tool_use_id": "msg_q1"},
         },
-    ])
+    ], cwd=workspace_root)
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"answer_to": "msg_q1", "selections": ["alpha"]},
@@ -680,6 +847,7 @@ def test_answer_to_with_notes_appends_freeform(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
@@ -687,7 +855,7 @@ def test_answer_to_with_notes_appends_freeform(
         {"event_type": "assistant_turn", "payload": {"text": "Pick"}},
         _ask_user_event(message_id="msg_q2"),
         {"event_type": "tool_result", "payload": {"type": "tool_result", "tool_use_id": "msg_q2"}},
-    ])
+    ], cwd=workspace_root)
     response = client.post(
         "/api/v1/chat/operator/send",
         json={
@@ -709,6 +877,7 @@ def test_answer_to_multiselect_newline_joined(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
@@ -716,7 +885,7 @@ def test_answer_to_multiselect_newline_joined(
         {"event_type": "assistant_turn", "payload": {"text": "Pick many"}},
         _ask_user_event(message_id="msg_q3", multi=True),
         {"event_type": "tool_result", "payload": {"type": "tool_result", "tool_use_id": "msg_q3"}},
-    ])
+    ], cwd=workspace_root)
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"answer_to": "msg_q3", "selections": ["alpha", "bravo"]},
@@ -732,11 +901,17 @@ def test_answer_to_missing_returns_400(
     auth_headers: dict[str, str],
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
-    project_root: Path,  # noqa: ARG001
+    project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
-    # No events.jsonl written at all.
+    # Write a transcript so the strict-mode mapping is exact; the
+    # specific answer_to id is missing from the tail, which is the
+    # 400 path we want to hit (not the "no transcript at all" path).
+    _write_events_jsonl(project_root, "session-q", [
+        {"event_type": "assistant_turn", "payload": {"text": "hi"}},
+    ], cwd=workspace_root)
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"answer_to": "msg_ghost", "selections": ["alpha"]},
@@ -753,13 +928,14 @@ def test_answer_to_not_ask_user_returns_400(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
     _write_events_jsonl(project_root, "session-q", [
         {"event_type": "assistant_turn", "payload": {"text": "hi"}, "uuid": "msg_text"},
         # No AskUserQuestion — answer_to references a plain text message.
-    ])
+    ], cwd=workspace_root)
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"answer_to": "msg_text", "selections": ["alpha"]},
@@ -776,6 +952,7 @@ def test_selections_invalid_returns_400(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
@@ -783,7 +960,7 @@ def test_selections_invalid_returns_400(
         {"event_type": "assistant_turn", "payload": {"text": "pick"}},
         _ask_user_event(message_id="msg_q1", options=["alpha", "bravo"]),
         {"event_type": "tool_result", "payload": {"type": "tool_result", "tool_use_id": "msg_q1"}},
-    ])
+    ], cwd=workspace_root)
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"answer_to": "msg_q1", "selections": ["delta"]},
@@ -800,6 +977,7 @@ def test_answer_to_freeform_text_allowed(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
     project_root: Path,
+    workspace_root: Path,
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
@@ -807,7 +985,7 @@ def test_answer_to_freeform_text_allowed(
         {"event_type": "assistant_turn", "payload": {"text": "pick"}},
         _ask_user_event(message_id="msg_q1", options=["alpha", "bravo"]),
         {"event_type": "tool_result", "payload": {"type": "tool_result", "tool_use_id": "msg_q1"}},
-    ])
+    ], cwd=workspace_root)
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"answer_to": "msg_q1", "text": "neither, give me dayjs"},
@@ -852,12 +1030,21 @@ def test_pane_index_targets_split_pane(
 ) -> None:
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
+    # Codex #2043 review block 5 — pane targets now go through
+    # list_panes for existence + liveness validation. Seed two live
+    # panes so the requested ``pane=1`` resolves.
+    patched_tmux.panes_by_target = {
+        "pollypm-test-storage-closet:pm-operator": [
+            FakePane(pane_index=0),
+            FakePane(pane_index=1),
+        ],
+    }
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"text": "split pane", "pane": 1},
         headers=auth_headers,
     )
-    assert response.status_code == 200
+    assert response.status_code == 200, response.json()
     body = response.json()
     assert body["window_target"] == (
         "pollypm-test-storage-closet:pm-operator.1"
@@ -882,6 +1069,94 @@ def test_pane_zero_targets_default_pane(
     # pane=0 stays on the default window-level target (matches the
     # existing send_keys behaviour).
     assert body["window_target"] == "pollypm-test-storage-closet:pm-operator"
+
+
+def test_negative_pane_returns_409_invalid(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review block 5 — pane >= 0 must hold."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi", "pane": -1},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "pane_invalid"
+
+
+def test_nonexistent_pane_returns_409_invalid(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An in-range pane index that isn't actually on the window 409s."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.panes_by_target = {
+        "pollypm-test-storage-closet:pm-operator": [FakePane(pane_index=0)],
+    }
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi", "pane": 7},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "pane_invalid"
+
+
+def test_dead_split_pane_returns_409_pane_dead(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live window with a dead split pane 409s on that pane."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.panes_by_target = {
+        "pollypm-test-storage-closet:pm-operator": [
+            FakePane(pane_index=0),
+            FakePane(pane_index=1, pane_dead=True),
+        ],
+    }
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi", "pane": 1},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "pane_dead"
+
+
+def test_list_panes_failure_returns_409_invalid(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A list_panes failure short-circuits to a typed 409.
+
+    Without this gate the subprocess error would surface as a 500;
+    the operator can't tell whether it's safe to retry. Returning
+    pane_invalid pushes the operator to pick a known-good pane.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.list_panes_side_effect = RuntimeError("no such target")
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi", "pane": 2},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409
+    assert response.json()["error"]["code"] == "pane_invalid"
 
 
 def test_no_text_no_answer_to_returns_400(
@@ -929,8 +1204,9 @@ def test_unknown_task_session_404s(
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # ``task-<garbage>`` doesn't parse to (project, int) so the
-    # resolver raises 404 even though the prefix is suggestive.
+    # A name that doesn't appear in config.sessions AND has no
+    # matching active worker-session record returns 404 — this is
+    # the post-Codex-#2043 enforcement: registry-only resolution.
     _set_storage_closet_windows(patched_tmux, ["task-myproj-42"])
     _patch_heartbeat_age(monkeypatch, None)
     response = client.post(
@@ -958,7 +1234,8 @@ def test_open_tool_ids_helper_returns_unmatched(tmp_path: Path) -> None:
     assert open_ids == {"toolu_b"}
 
 
-def test_open_tool_ids_helper_empty_when_no_assistant() -> None:
+def test_open_tool_ids_helper_empty_when_only_user_turn() -> None:
+    """A user_turn alone is not "mid-tool" — empty open-id set."""
     events = [{"event_type": "user_turn", "payload": {"text": "hi"}}]
     assert chat_send_routes._last_assistant_open_tool_ids(events) == set()
 
@@ -974,14 +1251,71 @@ def test_open_tool_ids_helper_resets_per_assistant_turn() -> None:
     assert chat_send_routes._last_assistant_open_tool_ids(events) == set()
 
 
-def test_parse_task_session_name_canonical() -> None:
-    assert chat_send_routes._parse_task_session_name("task-myproj-42") == ("myproj", 42)
+def test_open_tool_ids_helper_tool_only_assistant_no_assistant_turn() -> None:
+    """Codex #2043 review block 4 — mandatory regression.
+
+    The :class:`TranscriptIngestor` only emits ``assistant_turn`` when
+    the assistant message carries text. A tool-only assistant response
+    (Claude returning a single ``tool_use`` block with no preface text)
+    produces a ``tool_call`` event in the JSONL stream WITHOUT a
+    preceding ``assistant_turn`` anchor.
+
+    The pre-fix ``_last_assistant_open_tool_ids`` walked back for the
+    most-recent ``assistant_turn`` and returned an empty set when it
+    didn't find one, making the mid-tool gate fail open and let the
+    operator type into a window whose Claude is still waiting on a
+    Bash tool to come back.
+
+    The fix anchors on the ``user_turn`` boundary instead so the
+    tool-only assistant span is still caught.
+    """
+    events = [
+        {"event_type": "user_turn", "payload": {"text": "go ahead"}},
+        # Claude responded with ONLY a tool_use — no text → no
+        # assistant_turn ever emitted.
+        {"event_type": "tool_call", "payload": {"id": "toolu_silent"}},
+    ]
+    open_ids = chat_send_routes._last_assistant_open_tool_ids(events)
+    assert open_ids == {"toolu_silent"}, (
+        "tool-only assistant turn must still trip the mid-tool gate"
+    )
 
 
-def test_parse_task_session_name_rejects_garbage() -> None:
-    assert chat_send_routes._parse_task_session_name("operator") is None
-    assert chat_send_routes._parse_task_session_name("task-only") is None
-    assert chat_send_routes._parse_task_session_name("task-foo-bar") is None
+def test_open_tool_ids_helper_tool_only_assistant_end_to_end_409(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """End-to-end mandate for Codex #2043 review block 4.
+
+    Synthesize an events.jsonl whose ONLY assistant artifact is a raw
+    ``tool_call`` — no preceding ``assistant_turn``. Assert the
+    chat-send strict-mode gate returns 409 ``unsafe_mid_tool``.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(project_root, "session-tool-only", [
+        {"event_type": "user_turn", "payload": {"text": "do thing"}},
+        {
+            "event_type": "tool_call",
+            "payload": {
+                "type": "tool_use",
+                "id": "toolu_silent",
+                "name": "Bash",
+                "input": {"command": "true"},
+            },
+        },
+    ], cwd=workspace_root)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "ping"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409, response.json()
+    assert response.json()["error"]["code"] == "unsafe_mid_tool"
 
 
 def test_build_answer_text_selections_only() -> None:

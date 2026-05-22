@@ -31,6 +31,16 @@ dev = [
   "ruff>=0.15.12",
   "testcontainers[postgres]>=4.8.0",
 ]
+# #2043 review: a fresh ``uv run --with pytest`` collection of the
+# Web API tests crashed because ``fastapi.testclient`` imports
+# ``httpx`` and httpx wasn't a guaranteed test-time dep. The
+# ``test`` extra mirrors the ``dev`` set down to the bits a CI
+# matrix actually needs so reviewers can use
+# ``uv run --extra test pytest`` and stay green.
+test = [
+  "httpx>=0.27.0",
+  "pytest>=8.4.0",
+]
 
 [project.scripts]
 pm = "pollypm.cli:app"

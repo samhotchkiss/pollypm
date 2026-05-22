@@ -33,6 +33,7 @@ from pollypm.web_api.errors import (
 )
 from pollypm.web_api.routes import chat_messages as chat_messages_routes
 from pollypm.web_api.routes import chat_send as chat_send_routes
+from pollypm.web_api.routes import config as config_routes
 from pollypm.web_api.routes import dashboard as dashboard_routes
 from pollypm.web_api.routes import events as events_routes
 from pollypm.web_api.routes import health as health_routes
@@ -120,6 +121,9 @@ def create_app(
     app.include_router(tasks_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(inbox_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(dashboard_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
+    # Phase 2 surface §13 — read-only config endpoints. Mutation is
+    # deferred to Phase 3 per the spec; config edits stay TOML-first.
+    app.include_router(config_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(events_routes.router, prefix=API_V1_PREFIX, dependencies=sse_auth_deps)
     # P2 of the chat-endpoints spec — GET /api/v1/chat/sessions and
     # GET /api/v1/chat/{session_name}/messages. Sits under the same

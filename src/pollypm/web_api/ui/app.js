@@ -4,6 +4,12 @@
 // the on-disk token, so every request just needs ``credentials:
 // 'include'`` to ride that cookie. We never read or display the token
 // in the browser.
+//
+// Cookie issuance is gated on the server side (see app.py _ui_index)
+// to one of: loopback client, Tailscale CGNAT peer, or valid bearer
+// header. LAN devices get the HTML but no cookie; the first /api/
+// call returns 401 and ``setAuthGate`` below surfaces a banner that
+// tells the operator how to recover.
 
 (function () {
   "use strict";
@@ -48,6 +54,29 @@
     if (lbl) lbl.textContent = label;
   }
 
+  // Show the auth-gate banner once when the SPA hits a 401. This
+  // happens when /ui/ was reached from a host that isn't loopback /
+  // Tailscale and didn't supply a valid bearer header, so the server
+  // declined to set the pollypm-session cookie. Surfacing the recovery
+  // path inline (rather than leaving the rails frozen on "loading…")
+  // makes the constraint visible at the moment it bites.
+  let authGateShown = false;
+  function showAuthGate() {
+    if (authGateShown) return;
+    authGateShown = true;
+    const banner = document.createElement("div");
+    banner.className = "error-banner auth-gate-banner";
+    banner.textContent =
+      "This UI requires Tailscale or local (loopback) access. " +
+      "Visit http://127.0.0.1:<port>/ui/ from the host running " +
+      "`pm serve`, or open http://<tailscale-ip>:<port>/ui/ from " +
+      "a tailnet device. To bootstrap manually, run " +
+      "`pm api regen-token` and send the value in an " +
+      "`Authorization: Bearer …` header.";
+    const layout = document.getElementById("layout") || document.body;
+    layout.parentNode.insertBefore(banner, layout);
+  }
+
   // ----- fetch wrapper ----------------------------------------------------
 
   async function apiFetch(path, opts) {
@@ -64,7 +93,8 @@
       throw err;
     }
     if (resp.status === 401) {
-      setStatus("error", "auth (reload /ui/)");
+      setStatus("error", "auth required");
+      showAuthGate();
       throw new Error("unauthorized");
     }
     if (!resp.ok) {

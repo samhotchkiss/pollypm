@@ -73,14 +73,18 @@ def detect_tailscale_ip() -> str | None:
 _SERVE_HELP = help_with_examples(
     "Run the PollyPM Web API server (FastAPI) as a peer to the cockpit.",
     [
-        ("pm serve", "bind to 127.0.0.1:8765 (default)"),
-        ("pm serve --port 9000", "bind to 127.0.0.1:9000"),
+        ("pm serve", "auto-detect Tailscale, else bind 127.0.0.1:8765"),
+        ("pm serve --port 9000", "same as above on port 9000"),
         (
             "pm serve --tailscale",
-            "auto-detect Tailscale IP + bind alongside loopback for the web UI",
+            "no-op (kept for back-compat) — auto-detection is on by default",
         ),
     ],
     trailing=(
+        "By default ``pm serve`` tries ``tailscale ip -4``. If it "
+        "returns an IPv4 the server binds that interface only; "
+        "otherwise it falls back to 127.0.0.1. LAN access is "
+        "intentionally unsupported in v0 (use Tailscale). "
         "First run prints the bearer token to stderr; rotate via "
         "`pm api regen-token`. The server reads / writes the same "
         "state.db and audit.jsonl as the cockpit, so it works with "
@@ -146,28 +150,34 @@ def register_web_api_commands(app: typer.Typer) -> None:
     @app.command(name="serve", help=_SERVE_HELP)
     def serve_command(
         port: int = typer.Option(8765, "--port", "-p", help="TCP port to bind."),
-        host: str = typer.Option(
-            "127.0.0.1",
+        host: str | None = typer.Option(
+            None,
             "--host",
-            help="Bind address. Defaults to 127.0.0.1 (loopback).",
+            help=(
+                "Override the bind address. Default: auto-detected "
+                "Tailscale IPv4, else 127.0.0.1. Passing this flag "
+                "skips Tailscale detection entirely."
+            ),
         ),
         allow_remote: bool = typer.Option(
             False,
             "--allow-remote",
             help=(
-                "Permit binding to a non-loopback address. The operator is "
-                "responsible for terminating TLS upstream (see spec §3)."
+                "Permit binding to a non-loopback / non-tailnet address. "
+                "Only meaningful with an explicit --host override; the "
+                "operator is responsible for terminating TLS upstream "
+                "(see spec §3)."
             ),
         ),
         tailscale: bool = typer.Option(
             False,
             "--tailscale",
             help=(
-                "Auto-detect the local Tailscale IPv4 via `tailscale ip -4` "
-                "and bind it alongside 127.0.0.1. Tailscale's network identity "
-                "acts as auth (see web_api/auth.py is_tailscale_ip). Falls "
-                "back to localhost with a warning if the tailscale binary "
-                "is missing."
+                "No-op kept for backwards compatibility. Tailscale "
+                "auto-detection runs unconditionally by default; the "
+                "server binds to the detected tailnet IPv4 only, or "
+                "falls back to 127.0.0.1 if Tailscale isn't installed "
+                "or hasn't returned an address."
             ),
         ),
         config_path: Path = typer.Option(
@@ -184,41 +194,63 @@ def register_web_api_commands(app: typer.Typer) -> None:
     ) -> None:
         from pollypm.web_api import create_app, ensure_token
 
-        # ``--tailscale`` is a sugar wrapper that auto-detects the
-        # tailnet IP and binds 0.0.0.0 (so both loopback + tailnet
-        # work). We treat it as an explicit opt-in to non-loopback
-        # binding, so it implies --allow-remote.
+        # Bind selection (spec doc decision a-default):
+        #
+        # - If the operator passed --host, honor it and skip detection
+        #   entirely. They know what they're doing.
+        # - Otherwise auto-detect Tailscale unconditionally and bind
+        #   the detected tailnet IPv4 ONLY. The kernel routing table
+        #   then enforces that packets must arrive on the tailscale0
+        #   interface to reach the listening socket — spoofed source
+        #   IPs from any other interface are dropped before the app
+        #   sees them.
+        # - If Tailscale isn't installed / hasn't logged in / hasn't
+        #   returned an IPv4, fall back to 127.0.0.1 (loopback only).
+        #   LAN access is intentionally unsupported in v0.
+        # - The --tailscale flag is now a no-op (the behaviour it
+        #   used to gate is the default). Warn if it was passed
+        #   without a detected IP so the operator understands why
+        #   they don't see a tailnet bind.
+        bind_mode: str
         tailscale_ip: str | None = None
-        if tailscale:
-            tailscale_ip = detect_tailscale_ip()
-            if tailscale_ip is None:
+        if host is not None:
+            # Explicit operator override — skip detection. Carry through
+            # the existing --allow-remote gate so accidental 0.0.0.0
+            # binds still trip the safety check.
+            bind_mode = "explicit"
+            if not allow_remote and host not in {"127.0.0.1", "localhost", "::1"}:
                 typer.echo(
-                    "Warning: --tailscale passed but `tailscale ip -4` "
-                    "did not return an address (binary missing, not "
-                    "logged in, or no IPv4 yet). Falling back to "
-                    f"localhost-only bind on {host}.",
+                    f"Error: refusing to bind {host}; pass --allow-remote to "
+                    f"enable non-loopback binds (spec §3).",
+                    err=True,
+                )
+                raise typer.Exit(code=2)
+        else:
+            tailscale_ip = detect_tailscale_ip()
+            if tailscale_ip is not None:
+                host = tailscale_ip
+                bind_mode = "tailscale"
+                typer.echo(
+                    f"[pm serve] bound {tailscale_ip}:{port} (tailscale "
+                    f"mode; UI at http://{tailscale_ip}:{port}/ui/)",
                     err=True,
                 )
             else:
-                # Bind 0.0.0.0 so both 127.0.0.1 and the tailnet IP
-                # accept connections without juggling two uvicorn
-                # processes. Auth still gates non-tailnet/non-loopback
-                # traffic at the middleware layer.
-                host = "0.0.0.0"
-                allow_remote = True
+                host = "127.0.0.1"
+                bind_mode = "loopback"
                 typer.echo(
-                    f"[pm serve] --tailscale: tailnet IP {tailscale_ip}; "
-                    f"binding {host}:{port} (UI: http://{tailscale_ip}:{port}/ui/).",
+                    f"[pm serve] bound 127.0.0.1:{port} (loopback only — "
+                    f"install/start Tailscale for network access)",
                     err=True,
                 )
 
-        if not allow_remote and host not in {"127.0.0.1", "localhost", "::1"}:
+        if tailscale and tailscale_ip is None and bind_mode != "tailscale":
             typer.echo(
-                f"Error: refusing to bind {host}; pass --allow-remote to enable "
-                f"non-loopback binds (spec §3).",
+                "Warning: --tailscale passed but `tailscale ip -4` "
+                "returned no IP (binary missing, not logged in, or no "
+                "IPv4 yet). Falling back to loopback-only.",
                 err=True,
             )
-            raise typer.Exit(code=2)
 
         config = load_config(config_path)
         token, generated = ensure_token(token_path)

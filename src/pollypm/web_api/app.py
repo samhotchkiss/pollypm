@@ -21,7 +21,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI, Response
+from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
@@ -30,6 +30,8 @@ from fastapi.staticfiles import StaticFiles
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.web_api.auth import (
     SESSION_COOKIE_NAME,
+    _extract_token,
+    is_tailscale_ip,
     make_bearer_auth_dependency,
     make_sse_auth_dependency,
 )
@@ -505,14 +507,49 @@ def _mount_web_ui(app: FastAPI, *, token_path: Path | None) -> None:
         return Response(status_code=307, headers={"Location": "/ui/"})
 
     @app.get("/ui/", include_in_schema=False)
-    def _ui_index() -> Response:
+    def _ui_index(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
         # Load the token at request time (not app-build time) so a
         # ``pm api regen-token`` rotation flows into the cookie on the
         # next page load without an app restart.
         resolved_token_path = token_path or DEFAULT_TOKEN_PATH
         token_value = load_token(resolved_token_path)
         response = FileResponse(index_path, media_type="text/html")
-        if token_value:
+
+        # Cookie issuance is credential issuance — gate it behind a
+        # proven local-operator path so a LAN device (or anyone who
+        # can reach this port from a network we don't trust) can't
+        # GET /ui/ and walk away with the bearer token via
+        # Set-Cookie. Three acceptable signals:
+        #
+        # 1. Authorization: Bearer <token> matches the on-disk token
+        #    (operator pasted it via curl / scripted boot).
+        # 2. Loopback client (127.0.0.1, ::1) — local operator on
+        #    the Mac itself.
+        # 3. Tailscale CGNAT peer — operator hitting /ui/ from a
+        #    tailnet device. Defense-in-depth on top of the
+        #    bind-to-interface enforcement in ``pm serve`` (see
+        #    cli_features/web_api.py).
+        #
+        # Everything else (LAN device, public-facing deploy by
+        # accident, spoofed source IP through a misconfigured proxy)
+        # gets the HTML but NO cookie. The SPA surfaces a 401 on its
+        # first /api/ call so the operator knows to access via
+        # loopback or tailnet. See spec doc:
+        # docs/pollypm-web-ui-2065-security-spec.md (decision d-ii).
+        client_host = request.client.host if request.client else None
+        is_loopback = client_host in ("127.0.0.1", "::1")
+        is_tailnet = is_tailscale_ip(client_host)
+        bearer_token = _extract_token(authorization)
+        valid_bearer = False
+        if bearer_token is not None and token_value is not None:
+            from secrets import compare_digest
+
+            valid_bearer = compare_digest(bearer_token, token_value)
+
+        if token_value and (is_loopback or is_tailnet or valid_bearer):
             # ``HttpOnly`` so JS can't read the token; ``SameSite=Lax``
             # so cross-tab navigation still carries it; ``Secure=False``
             # because the v0 deploy is loopback/Tailscale HTTP. When
@@ -527,9 +564,11 @@ def _mount_web_ui(app: FastAPI, *, token_path: Path | None) -> None:
                 path="/",
                 max_age=60 * 60 * 24 * 7,  # 7 days
             )
-        # If the token file doesn't exist yet, we still serve the HTML
-        # — the SPA will surface a 401 the first time it hits /api/
-        # and the operator will know to run `pm api regen-token`.
+        # If the token file doesn't exist yet, or the caller isn't on
+        # a trusted path, we still serve the HTML — the SPA will
+        # surface a 401 the first time it hits /api/ and the operator
+        # will know to access from loopback / Tailscale (or to run
+        # `pm api regen-token`).
         return response
 
     # Static assets served raw. ``html=False`` keeps StaticFiles from

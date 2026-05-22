@@ -337,3 +337,84 @@ section#message-pane {
   color: var(--blocked);
   font-size: 12.5px;
 }
+
+.auth-gate-banner {
+  margin: 12px 16px;
+  border-color: var(--attention);
+  background: rgba(240, 160, 48, 0.10);
+  color: var(--attention);
+  line-height: 1.5;
+}
+
+/* Mobile / tablet — collapse the three-column grid into a single
+ * stacked column so 360–768px viewports (phones in portrait, small
+ * tablets) don't horizontally overflow. The cockpit-tinted message
+ * pane keeps the most vertical space; the rails become full-width
+ * scrollable sections above (surfaces) and below (dashboard) the
+ * conversation. Sam's intent is Tailscale-from-phone first, so this
+ * is the primary read surface and the rails are reference panels.
+ */
+@media (max-width: 768px) {
+  #layout {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto 1fr auto;
+    height: calc(100vh - var(--topbar-h));
+  }
+  aside#surface-rail {
+    border-right: none;
+    border-bottom: 1px solid var(--border-line);
+    max-height: 30vh;
+  }
+  aside#dashboard-rail {
+    border-left: none;
+    border-top: 1px solid var(--border-line);
+    max-height: 28vh;
+  }
+  .rail-title {
+    padding: 10px 14px 6px;
+  }
+  .pane-header {
+    padding: 10px 14px;
+  }
+  .message-list {
+    padding: 10px 14px;
+  }
+  .send-form {
+    padding: 10px 14px;
+  }
+  .dashboard-rollups {
+    /* Lay rollup cards out horizontally so the rail stays short on
+     * a narrow phone viewport. */
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    padding: 8px 12px 12px;
+  }
+  .rollup-card {
+    margin: 0;
+    min-width: 110px;
+    flex: 1 1 auto;
+  }
+  #topbar {
+    padding: 0 12px;
+  }
+  .brand-tag {
+    /* Free up a little horizontal room — the brand mark + name are
+     * enough on a phone. */
+    display: none;
+  }
+}
+
+/* Very narrow phones — keep dot indicators visible but tighten
+ * paddings further so the input still fits the row. */
+@media (max-width: 380px) {
+  .surface-list li {
+    padding: 6px 8px;
+  }
+  .message {
+    padding: 6px 8px;
+  }
+  .send-button {
+    padding: 8px 12px;
+  }
+}

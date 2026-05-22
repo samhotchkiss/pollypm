@@ -54,6 +54,19 @@ def is_tailscale_ip(host: str | None) -> bool:
     Anything non-IP (hostnames, ``None``, malformed values) returns
     ``False`` so we never accidentally trust a string that looks
     plausible but isn't actually a tailnet address.
+
+    .. note::
+       This is a **sanity filter, not the primary trust boundary**. The
+       100.64.0.0/10 range is RFC 6598 shared address space; Tailscale
+       uses it but so does CGNAT-enabled ISP infrastructure. The real
+       tailnet-trust enforcement is the OS-level interface binding done
+       by ``pm serve`` (see ``cli_features/web_api.py``): uvicorn binds
+       to the detected Tailscale IPv4 only, so packets arriving on any
+       other interface are dropped by the kernel before reaching this
+       check. This helper exists for defense-in-depth: if a future
+       deploy widens the bind by accident (or the operator runs the
+       server behind a reverse proxy that doesn't preserve the peer
+       address), the CGNAT filter still keeps random LAN devices out.
     """
     if not host:
         return False
@@ -209,6 +222,7 @@ def make_sse_auth_dependency(token_path: Path | None = None):
 
 __all__ = [
     "SESSION_COOKIE_NAME",
+    "_extract_token",
     "is_tailscale_ip",
     "make_bearer_auth_dependency",
     "make_sse_auth_dependency",

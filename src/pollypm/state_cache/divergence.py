@@ -1,24 +1,22 @@
-"""Cache-vs-direct divergence sampler.
+"""Cache-vs-direct divergence sampler (historical / no-op).
 
-Per ``docs/design/move-a-state-cache.md`` §6.2 (last bullet) + §7
-(cache-mismatch risk row), each routed call site samples 1-in-N
-calls and runs BOTH the cached path and the direct (uncached) path,
-then compares the results. A mismatch logs a WARN line so the
-divergence shows up in telemetry — the cache is held to a strict
-"never silently drift from the source of truth" bar.
+Move A PR 4 (#1664, design §6.4) flipped ``POLLYPM_STATE_CACHE`` to
+ON by default and made the cache authoritative. As of PR
+[#2029](https://github.com/samhotchkiss/pollypm/issues/2029) this
+module is kept for historical reference and possible future
+re-enablement, but does NOTHING in production:
 
-The sample-rate constant lives here so the §6.2 PR 4 telemetry gate
-("0 WARN lines for 24h") has exactly one tuning knob. The default
-N=50 matches the design's "1-in-50 sampled call" recommendation —
-enough samples to catch sustained drift inside a single refresh
-cycle (~250ms tail tick × 50 = ~12.5s coverage window) without
-doubling the per-tick cost.
+* :meth:`DivergenceCounter.should_sample` returns ``False``
+  unconditionally — the in-process 1-in-N parity sampler has been
+  removed. Routed call sites guard on ``is_enabled()`` and return
+  early when the kill-switch is set, so the legacy "sample when
+  kill-switch is set" branch was unreachable anyway.
+* The ``compare_*`` helpers + :func:`log_divergence` are still
+  exported because tests use them to verify bulk parity between the
+  cached and direct facades; production never calls them.
 
-This module deliberately holds no state about which call site fired:
-each routed helper owns its own ``_should_sample()`` counter so a
-quiet site doesn't piggyback on a busy site's samples. The sampler
-returns a deterministic bool from a thread-safe counter so the test
-suite can inject mismatches at known intervals without flakiness.
+Parity is now verified by the test suite (bulk equivalence checks on
+fixture-backed configs), not by runtime sampling.
 """
 
 from __future__ import annotations
@@ -45,22 +43,25 @@ DIVERGENCE_SAMPLE_RATE = 50
 
 
 class DivergenceCounter:
-    """Thread-safe 1-in-N sampler used by each routed call site.
+    """Deterministic no-op sampler (PR #2029).
 
-    A fresh counter per call site keeps the sampling independent —
-    a quiet helper doesn't borrow samples from a busy one. The first
-    call after construction does NOT sample (we want the sample to
-    land mid-cycle, not on cold start when the cache is empty by
-    construction and a divergence would be expected).
+    Originally a thread-safe 1-in-N sampler that ran the direct path
+    alongside the cache for parity telemetry. PR #2029 removed the
+    sampling branch entirely:
 
-    Move A PR 4 (#1664, design §6.4): the parity-debugging window is
-    over once the flag default flips to ON — the cache is now the
-    authoritative source. :meth:`should_sample` returns False
-    whenever the kill-switch is NOT set (i.e. cache is the default),
-    so routed call sites stop paying the cost of running the direct
-    path alongside the cache. Tests pin the always-sample path by
-    constructing a counter with ``always=True`` or by setting the
-    kill-switch env var.
+    * Routed call sites (cockpit_inbox, operator_view, cockpit_rail,
+      state_map) short-circuit via ``is_enabled()`` when the
+      kill-switch is set, so the "sample when kill-switch is set"
+      branch could never fire in production.
+    * Bulk parity is verified by the test suite, not by in-process
+      sampling.
+
+    The class is preserved (and still constructable with ``rate=`` /
+    ``always=``) so existing route-site sentinels and tests that
+    instantiate it don't need to change. :meth:`should_sample` is
+    deterministic-off in production. ``always=True`` is the test
+    escape hatch that restores legacy 1-in-N behavior for parity
+    tests that need to drive the comparison helpers.
     """
 
     __slots__ = ("_rate", "_counter", "_lock", "_always")
@@ -73,23 +74,21 @@ class DivergenceCounter:
         self._rate = rate
         self._counter = 0
         self._lock = threading.Lock()
-        # Test override: when set, ``should_sample`` ignores the
-        # PR 4 "no-op when cache authoritative" suppression and
-        # samples every Nth call as before. Production code never
-        # passes this — only PR 2's parity tests do.
+        # Test-only escape hatch: when True, restores the legacy
+        # every-Nth-call sampling so parity tests can still drive the
+        # comparison helpers. Production code never sets this.
         self._always = always
 
     def should_sample(self) -> bool:
-        """Return True every Nth call. Thread-safe.
+        """Return False in production; legacy Nth-call when ``always=True``.
 
-        Move A PR 4: returns False whenever the cache is
-        authoritative (kill-switch not set). Pass ``always=True`` at
-        construction to force the legacy always-sample behavior for
-        tests.
+        PR #2029: deterministic-off in production. The kill-switch
+        branch was removed because routed call sites already return
+        early when the kill-switch is set, making that branch
+        unreachable.
         """
 
-        if not self._always and not _kill_switch_set():
-            # Cache is authoritative — skip the parity sample.
+        if not self._always:
             return False
         with self._lock:
             self._counter += 1
@@ -102,28 +101,6 @@ class DivergenceCounter:
 
         with self._lock:
             self._counter = 0
-
-
-def _kill_switch_set() -> bool:
-    """Return True iff ``POLLYPM_STATE_CACHE`` is set to a falsy value.
-
-    Move A PR 4: the cache default flipped to ON, so the divergence
-    sampler is silent EXCEPT when the operator has explicitly set
-    the kill-switch. That's the only condition under which we still
-    care about parity telemetry — the operator is presumably
-    debugging a cache vs direct mismatch, and we want both paths to
-    run + compare while they triage.
-
-    Defined locally (no import from ``pollypm.state_cache``) to
-    avoid the leaf-module circular import.
-    """
-
-    import os
-
-    raw = os.environ.get("POLLYPM_STATE_CACHE")
-    if raw is None:
-        return False
-    return raw.strip().lower() in {"0", "false", "no", "off"}
 
 
 # ── comparison helpers ─────────────────────────────────────────────

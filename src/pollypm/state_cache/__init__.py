@@ -3,22 +3,32 @@
 See ``docs/design/move-a-state-cache.md`` for the design (issue
 [#1664](https://github.com/samhotchkiss/pollypm/issues/1664)).
 
-This package ships the infra slice — entry dataclass, cache class,
+This package ships the entry dataclass, cache class,
 audit-log-driven refresher, and the env-flag-gated module-level
-accessor. **No call sites are wired up in this PR.** PR 2 routes
-the two hottest call sites (``pm_inbox_awaits_user_list`` and
-``project_state_map_from_config``); PR 3 the remainder; PR 4 flips
-the default.
+accessor. As of PR
+[#2029](https://github.com/samhotchkiss/pollypm/issues/2029) the
+cache is **authoritative when on** and five call sites are wired:
+``cockpit_inbox`` list + count, ``dashboard.operator_view`` rollup,
+``cockpit_rail`` rollups, and ``project_state_map_from_config``.
 
-Until then:
+Current contract:
 
-* :envvar:`POLLYPM_STATE_CACHE` defaults **off**. :func:`get_cache`
-  returns a no-op shim whose ``snapshot()`` is ``{}`` and ``get()``
-  is ``None``. Importing this module is side-effect-free.
-* When the flag is on at import time, the real cache + refresher
-  start up automatically. Future call sites that opt in will get
-  populated entries; until they exist, the refresher is exercised
-  only by tests.
+* :envvar:`POLLYPM_STATE_CACHE` defaults **ON** (PR 4 flip). Set
+  it to a falsy value (``0`` / ``false`` / ``no`` / ``off``) as a
+  kill-switch to fall through to the direct facade — emergency
+  rollback is a process restart with the env var set.
+* When the flag is on, :func:`get_cache` returns the real cache;
+  the refresher starts on the first :func:`get_cache` call (import
+  itself is still side-effect-free).
+* When the kill-switch is set, :func:`get_cache` returns a no-op
+  shim whose ``snapshot()`` is ``{}`` and ``get()`` is ``None``,
+  and routed call sites short-circuit via :func:`is_enabled` to
+  the direct path before touching the cache.
+* The cache is authoritative when on; there is no in-process
+  divergence sampling. Parity between the cached and direct
+  facades is enforced by the test suite (bulk equivalence checks),
+  not by runtime sampling. See ``divergence.py`` for the
+  historical helpers retained for those tests.
 """
 
 from __future__ import annotations

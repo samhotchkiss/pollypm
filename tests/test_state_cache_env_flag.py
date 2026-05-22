@@ -242,27 +242,27 @@ def test_singleton_wires_project_keys_provider_for_initial_refresh(
         reset_for_test()
 
 
-# ── Move A PR 4 — divergence sampler is no-op when cache authoritative ──
+# ── PR #2029 — divergence sampler is deterministic-off in production ──
 
 
-class TestPr4DivergenceSamplerNoop:
-    """PR 4 (#1664, design §6.4): sampler is silent when flag default applies.
+class TestDivergenceSamplerNoop:
+    """PR #2029: the in-process sampler is deterministic-off.
 
-    The parity-debugging window is over — the cache is authoritative
-    when the kill-switch is not set. The sampler MUST NOT pay the
-    cost of running the direct path alongside the cache.
+    The legacy "sample when kill-switch is set" branch was
+    unreachable (routed call sites guard on ``is_enabled()`` and
+    return early before touching the sampler), so it was removed.
+    The class is preserved so existing route-site sentinels keep
+    working; ``always=True`` remains as the test escape hatch.
     """
 
     def test_sampler_is_silent_by_default(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """No env var → cache is authoritative → sampler returns False."""
+        """No env var → cache authoritative → sampler returns False."""
         from pollypm.state_cache.divergence import DivergenceCounter
 
         monkeypatch.delenv(ENV_FLAG, raising=False)
         counter = DivergenceCounter(rate=1)
-        # Even at rate=1, the sampler stays silent because the cache
-        # is the default-on authoritative source.
         for _ in range(50):
             assert counter.should_sample() is False
 
@@ -277,33 +277,29 @@ class TestPr4DivergenceSamplerNoop:
         for _ in range(50):
             assert counter.should_sample() is False
 
-    def test_sampler_runs_when_killswitch_set(
+    def test_sampler_is_silent_when_killswitch_set(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """Kill-switch set → operator debugging cache vs direct.
+        """Kill-switch set → routes short-circuit before the sampler.
 
-        The sampler still runs at its 1-in-N cadence so an operator
-        who flipped the kill-switch can see parity warnings if their
-        suspicion was right. (In practice this also means the
-        kill-switch's "fall back to direct" branch keeps emitting the
-        same divergence telemetry shape PR 2 introduced.)
+        PR #2029 removed the kill-switch sampling branch entirely.
+        Routed call sites return early via ``is_enabled()`` when the
+        kill-switch is set, so the sampler is never reached in
+        production. Verify it stays silent here too.
         """
         from pollypm.state_cache.divergence import DivergenceCounter
 
         monkeypatch.setenv(ENV_FLAG, "0")
         counter = DivergenceCounter(rate=3)
-        # 1, 2 → no; 3 → yes; 4, 5 → no; 6 → yes.
-        results = [counter.should_sample() for _ in range(6)]
-        assert results == [False, False, True, False, False, True]
+        for _ in range(10):
+            assert counter.should_sample() is False
 
-    def test_always_override_ignores_killswitch(
+    def test_always_override_drives_legacy_cadence(
         self, monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """``always=True`` is the test-only escape hatch for parity tests."""
         from pollypm.state_cache.divergence import DivergenceCounter
 
-        # Even with the cache authoritative (default), always=True
-        # makes the sampler fire at every Nth call.
         monkeypatch.delenv(ENV_FLAG, raising=False)
         counter = DivergenceCounter(rate=2, always=True)
         results = [counter.should_sample() for _ in range(4)]

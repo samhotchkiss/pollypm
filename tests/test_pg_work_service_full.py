@@ -97,6 +97,122 @@ def test_update_missing_task_raises(pg_service):
         pg_service.update("nope/999", title="x")
 
 
+# ---------------------------------------------------------------------------
+# #2064 — assignee + external_refs pg roundtrips
+#
+# PR #2064 broadened ``_UPDATE_ALLOWED_COLUMNS`` to include ``assignee``
+# (backs ``POST /reassign`` + PATCH) and ``external_refs`` (backs PATCH
+# ``metadata``). The route-level tests use a fake work-service so the
+# pg column write + JSONB encode/decode + downstream query surfaces
+# (``my_tasks``, ``_row_to_task``) were not exercised. These tests pin
+# the pg roundtrip end-to-end.
+# ---------------------------------------------------------------------------
+
+
+def test_update_assignee_roundtrips(pg_service):
+    """Setting ``assignee`` via update() persists + ``my_tasks`` sees it.
+
+    ``my_tasks`` filters on ``current_node_id IS NOT NULL AND
+    assignee = ?`` — i.e. tasks that have been claimed onto a flow
+    node. We claim with the original actor, then reassign via
+    ``update`` (the PATCH path), and assert the new owner sees it.
+    """
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    # ``alice`` is the ``worker`` role on _make_draft's default roles
+    # dict, so the claim node-resolution advances cleanly.
+    pg_service.claim(task.task_id, actor="alice")
+    # Original claimer sees the task.
+    assert {t.task_id for t in pg_service.my_tasks("alice")} == {
+        task.task_id
+    }
+    # New assignee sees nothing yet.
+    assert pg_service.my_tasks("alice-reassigned") == []
+    # PATCH-style reassign (column write, no lifecycle transition).
+    updated = pg_service.update(task.task_id, assignee="alice-reassigned")
+    assert updated.assignee == "alice-reassigned"
+    # Re-read from a fresh get() so we know the column survived a
+    # round-trip, not just an in-memory hand-off.
+    refetched = pg_service.get(task.task_id)
+    assert refetched.assignee == "alice-reassigned"
+    # ``my_tasks`` now resolves the task to the new owner.
+    rows = pg_service.my_tasks("alice-reassigned")
+    assert {t.task_id for t in rows} == {task.task_id}
+    # Old owner no longer sees it.
+    assert pg_service.my_tasks("alice") == []
+
+
+def test_update_assignee_bumps_updated_at(pg_service):
+    """``updated_at`` must advance when ``update()`` writes assignee."""
+    task = _make_draft(pg_service)
+    before = task.updated_at
+    # Tiny sleep so the per-second resolution timestamps actually
+    # differ — _now_iso() resolution depends on the pg column type
+    # but our timestamps are isoformat strings with microseconds.
+    import time as _time
+
+    _time.sleep(0.01)
+    updated = pg_service.update(task.task_id, assignee="bob")
+    assert updated.assignee == "bob"
+    assert updated.updated_at != before
+
+
+def test_update_external_refs_roundtrips_jsonb(pg_service):
+    """``external_refs`` is JSONB on disk — verify dict survives encode/decode."""
+    task = _make_draft(pg_service)
+    payload = {
+        "jira": "JIRA-1234",
+        "slack_thread": "C0123ABC",
+        "github_issue": "5678",
+    }
+    updated = pg_service.update(task.task_id, external_refs=payload)
+    assert updated.external_refs == payload
+    # Re-read to prove the JSONB column decodes back to the exact map.
+    refetched = pg_service.get(task.task_id)
+    assert refetched.external_refs == payload
+    # Replace-semantics (spec §5.4): a second write replaces, not merges.
+    replaced = pg_service.update(
+        task.task_id, external_refs={"only_key": "X-1"}
+    )
+    assert replaced.external_refs == {"only_key": "X-1"}
+    refetched_again = pg_service.get(task.task_id)
+    assert refetched_again.external_refs == {"only_key": "X-1"}
+
+
+def test_update_external_refs_empty_dict_clears(pg_service):
+    """Empty dict clears the column (spec §5.4 lists/maps replace)."""
+    task = _make_draft(pg_service)
+    pg_service.update(task.task_id, external_refs={"jira": "X-1"})
+    cleared = pg_service.update(task.task_id, external_refs={})
+    assert cleared.external_refs == {}
+    refetched = pg_service.get(task.task_id)
+    assert refetched.external_refs == {}
+
+
+def test_update_combined_assignee_and_external_refs_single_call(pg_service):
+    """Combining columns in one update() call — single transaction.
+
+    PATCH atomicity (#2064 round-1) depends on this: labels +
+    external_refs must land in one ``svc.update(...)`` invocation so
+    the underlying UPDATE statement commits both columns together.
+    """
+    task = _make_draft(pg_service)
+    updated = pg_service.update(
+        task.task_id,
+        assignee="atomic-worker",
+        external_refs={"jira": "X-99"},
+        labels=["urgent", "rc"],
+    )
+    assert updated.assignee == "atomic-worker"
+    assert updated.external_refs == {"jira": "X-99"}
+    assert sorted(updated.labels) == ["rc", "urgent"]
+    # Re-read to confirm all three persisted.
+    refetched = pg_service.get(task.task_id)
+    assert refetched.assignee == "atomic-worker"
+    assert refetched.external_refs == {"jira": "X-99"}
+    assert sorted(refetched.labels) == ["rc", "urgent"]
+
+
 def test_increment_plan_version_bumps_counter(pg_service):
     task = _make_draft(pg_service)
     assert task.plan_version == 1

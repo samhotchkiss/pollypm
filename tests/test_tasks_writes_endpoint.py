@@ -580,6 +580,85 @@ def test_patch_multiple_fields_one_request(
     assert body["task"]["external_refs"] == {"ref": "ABC-1"}
 
 
+def test_patch_atomic_rollback_on_partial_failure(
+    client, auth_headers, task_store
+) -> None:
+    """Multi-field PATCH whose status transition fails MUST NOT mutate labels.
+
+    Regression for #2064 round-1 Codex P0: PATCH with labels + an
+    illegal status transition used to commit the labels first, then
+    409 on the status write — leaving labels mutated. The fix
+    preflights the transition against the in-memory task BEFORE any
+    write, so a 409 leaves labels (and external_refs) untouched.
+
+    Reproduction matches the Codex repro:
+        labels=['new'] + status='queued' on an in_progress task.
+
+    ``svc.queue`` only accepts ``draft``, so this transition is
+    refused. The labels write must NOT happen.
+    """
+    seeded = _seed(
+        task_store,
+        n=14,
+        work_status=WorkStatus.IN_PROGRESS,
+        labels=["original"],
+        external_refs={"keep": "me"},
+    )
+    response = client.patch(
+        "/api/v1/tasks/myproj/14",
+        headers=auth_headers,
+        json={
+            "labels": ["new"],
+            "metadata": {"jira": "X-1"},
+            "status": "queued",
+        },
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "invalid_state"
+    # Labels + metadata MUST be unchanged in the store.
+    assert seeded.labels == ["original"], (
+        "labels were mutated despite the status transition failing; "
+        "PATCH is not atomic (#2064 regression)."
+    )
+    assert seeded.external_refs == {"keep": "me"}, (
+        "external_refs were mutated despite the status transition "
+        "failing; PATCH is not atomic (#2064 regression)."
+    )
+    # The work_status must also be unchanged (we never called queue).
+    assert seeded.work_status == WorkStatus.IN_PROGRESS
+
+
+def test_patch_unsupported_status_does_not_mutate_other_fields(
+    client, auth_headers, task_store
+) -> None:
+    """Unsupported PATCH status target (422) MUST NOT mutate labels.
+
+    Companion to ``test_patch_atomic_rollback_on_partial_failure``:
+    even before reaching the work-service, an unsupported status
+    (e.g. ``in_progress``) returns 422. Labels/metadata must not be
+    pre-written speculatively.
+    """
+    seeded = _seed(
+        task_store,
+        n=15,
+        work_status=WorkStatus.QUEUED,
+        labels=["keep"],
+        external_refs={"x": "1"},
+    )
+    response = client.patch(
+        "/api/v1/tasks/myproj/15",
+        headers=auth_headers,
+        json={
+            "labels": ["clobber"],
+            "metadata": {"y": "2"},
+            "status": "review",
+        },
+    )
+    assert response.status_code == 422, response.text
+    assert seeded.labels == ["keep"]
+    assert seeded.external_refs == {"x": "1"}
+
+
 def test_patch_nonexistent_task_returns_404(client, auth_headers) -> None:
     response = client.patch(
         "/api/v1/tasks/myproj/9999",

@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
 from pollypm.web_api.errors import APIError, not_found
 from pollypm.web_api.models import (
@@ -170,11 +170,6 @@ def queue_task_endpoint(
     project: str,
     n: int,
     config: ConfigDep,
-    # ``Idempotency-Key`` is accepted in Phase 2 per the issue scope
-    # ("OPTIONAL in Phase 2 — actual replay-cache persistence ships in
-    # Phase 3"). We don't dedupe yet; declaring the header keeps the
-    # OpenAPI contract honest and lets clients send it from day one.
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> ActionResult:
     # The work-service knows how to look up the task; we still
     # short-circuit on an unregistered project so the 404 message is
@@ -190,9 +185,13 @@ def queue_task_endpoint(
 #
 # Each handler short-circuits on an unregistered project so the 404
 # message is project-specific (consistent with the GET / queue
-# handlers). The ``If-Match`` header is accepted but not yet
-# enforced — spec §2.6 / cross-cutting Q11 leaves enforcement to a
-# follow-up; default is last-writer-wins per §5.6.
+# handlers). ``Idempotency-Key`` and ``If-Match`` are intentionally
+# NOT declared on these handlers — no replay cache or version-token
+# enforcement exists yet (mirrors #2060 round-1 decision for the
+# inbox writes). Advertising them but discarding them would lie to
+# clients: a lost-response retry would 409 instead of replaying, and
+# concurrent edits would race silently. The headers will reappear
+# once a real replay store + ``If-Match`` enforcement ships.
 # ---------------------------------------------------------------------------
 
 
@@ -213,12 +212,7 @@ def claim_task_endpoint(
     n: int,
     body: TaskClaimRequest,
     config: ConfigDep,
-    idempotency_key: Annotated[
-        str | None, Header(alias="Idempotency-Key")
-    ] = None,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> TaskActionResult:
-    del idempotency_key, if_match  # Phase 2 plumbing only
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
     task = claim_task(config, project, n, actor=body.actor)
@@ -243,12 +237,7 @@ def cancel_task_endpoint(
     n: int,
     config: ConfigDep,
     body: TaskCancelRequest | None = None,
-    idempotency_key: Annotated[
-        str | None, Header(alias="Idempotency-Key")
-    ] = None,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> TaskActionResult:
-    del idempotency_key, if_match
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
     reason = body.reason if body is not None else None
@@ -274,12 +263,7 @@ def reassign_task_endpoint(
     n: int,
     body: TaskReassignRequest,
     config: ConfigDep,
-    idempotency_key: Annotated[
-        str | None, Header(alias="Idempotency-Key")
-    ] = None,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> TaskActionResult:
-    del idempotency_key, if_match
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
     task = reassign_task(config, project, n, actor=body.actor)
@@ -307,12 +291,7 @@ def patch_task_endpoint(
     n: int,
     body: TaskPatchRequest,
     config: ConfigDep,
-    idempotency_key: Annotated[
-        str | None, Header(alias="Idempotency-Key")
-    ] = None,
-    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
 ) -> TaskActionResult:
-    del idempotency_key, if_match
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
     task = patch_task(

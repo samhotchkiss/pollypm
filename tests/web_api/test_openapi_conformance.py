@@ -187,6 +187,71 @@ def test_static_yaml_does_not_advertise_idempotency_on_inbox_writes() -> None:
         )
 
 
+def test_static_yaml_does_not_advertise_idempotency_or_ifmatch_on_tasks() -> None:
+    """Static contract must match the implementation: no Idempotency-Key
+    or If-Match on task-state-mutation paths.
+
+    #2064 round-1 stripped both headers from the FastAPI handlers for
+    /queue, /claim, /cancel, /reassign, and PATCH /tasks/{p}/{n}
+    (mirrors #2060 round-1) because no replay cache or version-token
+    enforcement exists. Generated clients reading the static YAML
+    must see the same contract — otherwise they'd send headers the
+    server silently discards (Idempotency-Key) or thinks it honors
+    (If-Match concurrency).
+    """
+    contract = _load_contract()
+    paths = contract.get("paths", {})
+
+    # POST /tasks/{p}/{n}/{claim,cancel,reassign,queue}
+    task_post_paths = [
+        "/tasks/{project}/{n}/queue",
+        "/tasks/{project}/{n}/claim",
+        "/tasks/{project}/{n}/cancel",
+        "/tasks/{project}/{n}/reassign",
+    ]
+    for path in task_post_paths:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        params = post.get("parameters", []) or []
+        refs = [
+            p.get("$ref", "") for p in params if isinstance(p, dict)
+        ]
+        assert not any(
+            "IdempotencyKey" in ref for ref in refs
+        ), (
+            f"{path} static contract still advertises Idempotency-Key "
+            "but the handler does not implement it (#2064). Strip the "
+            "$ref or wire a real replay cache first."
+        )
+        # Inline If-Match (no shared component for it today).
+        for param in params:
+            if isinstance(param, dict) and param.get("name") == "If-Match":
+                raise AssertionError(
+                    f"{path} static contract still advertises If-Match "
+                    "but the handler does not enforce it (#2064). Strip "
+                    "the parameter or wire real version-token enforcement."
+                )
+
+    # PATCH /tasks/{project}/{n} lives on the GET path too — check the
+    # patch op specifically.
+    patch_op = paths.get("/tasks/{project}/{n}", {}).get("patch", {})
+    patch_params = patch_op.get("parameters", []) or []
+    patch_refs = [
+        p.get("$ref", "") for p in patch_params if isinstance(p, dict)
+    ]
+    assert not any("IdempotencyKey" in ref for ref in patch_refs), (
+        "PATCH /tasks/{project}/{n} static contract still advertises "
+        "Idempotency-Key but the handler does not implement it (#2064)."
+    )
+    for param in patch_params:
+        if isinstance(param, dict) and param.get("name") == "If-Match":
+            raise AssertionError(
+                "PATCH /tasks/{project}/{n} static contract still "
+                "advertises If-Match but the handler does not enforce "
+                "it (#2064)."
+            )
+
+
 def test_static_yaml_declares_503_on_inbox_write_paths() -> None:
     """Static contract must declare 503 on every inbox-write path.
 

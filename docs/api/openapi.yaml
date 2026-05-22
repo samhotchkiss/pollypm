@@ -898,9 +898,12 @@ paths:
         `svc.cancel`); other statuses raise `422 validation_error`
         with a hint pointing to the dedicated transition endpoint.
         `metadata` is stored as the task's `external_refs` map.
-        `If-Match` is accepted but not yet enforced.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+        Labels + metadata land in a single atomic `svc.update(...)`
+        call; an illegal `status` transition is rejected up front so
+        labels/metadata are NOT half-committed. `Idempotency-Key` and
+        `If-Match` are intentionally NOT accepted — no replay cache
+        or version-token enforcement exists yet (#2064 round-1,
+        mirrors #2060).
       requestBody:
         required: true
         content:
@@ -932,8 +935,9 @@ paths:
       tags: [Tasks]
       operationId: queueTask
       summary: Queue a draft task for execution
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+      description: |
+        `Idempotency-Key` is intentionally NOT accepted — no replay
+        cache exists yet (#2064 round-1, mirrors #2060).
       responses:
         "200":
           description: Task transitioned `draft` → `queued`.
@@ -959,10 +963,9 @@ paths:
       description: |
         Sets the task's `assignee` and advances the flow to the start
         (or current) node. Refuses non-queued tasks with `409
-        invalid_state`. `If-Match` is accepted but not yet enforced
-        (cross-cutting Q11); default = last-writer-wins.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+        invalid_state`. `Idempotency-Key` and `If-Match` are
+        intentionally NOT accepted — no replay cache or version-token
+        enforcement exists yet (#2064 round-1, mirrors #2060).
       requestBody:
         required: true
         content:
@@ -998,9 +1001,9 @@ paths:
         Moves any non-terminal task to `cancelled` and emits the
         cancel-cascade (dependents get an `_on_cancelled` breadcrumb).
         Cancelling a terminal (done/cancelled) task returns `409
-        invalid_state`.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+        invalid_state`. `Idempotency-Key` and `If-Match` are
+        intentionally NOT accepted — no replay cache or version-token
+        enforcement exists yet (#2064 round-1, mirrors #2060).
       requestBody:
         required: false
         content:
@@ -1033,9 +1036,10 @@ paths:
         Sets the `assignee` column to the new actor without firing a
         state-machine transition. The task's `work_status` is
         unchanged. Spec §5.3 leaves `null ⇒ unassign` open; this
-        endpoint requires a non-empty `actor`.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+        endpoint requires a non-empty `actor`. `Idempotency-Key` and
+        `If-Match` are intentionally NOT accepted — no replay cache
+        or version-token enforcement exists yet (#2064 round-1,
+        mirrors #2060).
       requestBody:
         required: true
         content:

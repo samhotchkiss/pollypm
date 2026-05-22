@@ -1483,6 +1483,49 @@ _PATCH_STATUS_TO_METHOD: dict[str, str] = {
 }
 
 
+def _preflight_status_transition(
+    current_status: str, target_status: str
+) -> None:
+    """Reject illegal PATCH ``status`` transitions BEFORE any writes.
+
+    The PATCH atomicity contract (#2064 round-1): all-or-nothing across
+    labels + metadata + status. The status lifecycle methods (``queue``,
+    ``cancel``) each commit their own row update, so we MUST gate them
+    in memory before touching any other column — otherwise a 409 from
+    the status transition would leave the earlier ``svc.update(labels=...)``
+    already committed.
+
+    Raises ``APIError(409, invalid_state)`` if the transition would be
+    rejected by the lifecycle method. Only validates the rules that
+    ``svc.queue`` / ``svc.cancel`` themselves enforce — the actual
+    side-effects still run inside the work-service and may surface
+    additional gate failures we can't preflight (claim-cascade etc.),
+    but those don't apply to queue/cancel which are pure status flips.
+    """
+    if target_status == "queued":
+        # ``svc.queue`` only accepts ``draft`` (single transition).
+        if current_status != "draft":
+            raise APIError(
+                status_code=409,
+                code="invalid_state",
+                message=(
+                    f"Cannot queue task in {current_status!r} state. "
+                    "Only draft tasks can be queued."
+                ),
+            )
+    elif target_status == "cancelled":
+        # ``svc.cancel`` refuses terminal states.
+        if current_status in {"done", "cancelled"}:
+            raise APIError(
+                status_code=409,
+                code="invalid_state",
+                message=(
+                    f"Cannot cancel task in terminal state "
+                    f"{current_status!r}."
+                ),
+            )
+
+
 def patch_task(
     config: PollyPMConfig,
     project_key: str,
@@ -1495,14 +1538,16 @@ def patch_task(
 ) -> APITaskDetail:
     """Selective edits — labels / status / metadata.
 
-    Each provided field is applied in turn against the same
-    work-service handle. ``status`` is mapped to the matching
-    lifecycle method (``queue``, ``cancel``) when supported; everything
-    else (in_progress / review / on_hold / etc.) returns 422 with a
-    hint to the dedicated transition endpoint. ``metadata`` is stored
-    as ``external_refs`` (the existing free-form per-task key/value
-    surface). All edits within one call land in the same response
-    snapshot.
+    Applies provided fields atomically: labels + metadata land in a
+    single ``svc.update(...)`` call (one DB transaction), and the
+    ``status`` transition is preflighted in memory before any writes
+    so a 409 from the lifecycle method doesn't leave labels/metadata
+    half-committed. ``status`` is mapped to the matching lifecycle
+    method (``queue``, ``cancel``) when supported; everything else
+    (in_progress / review / on_hold / etc.) returns 422 with a hint
+    to the dedicated transition endpoint. ``metadata`` is stored as
+    ``external_refs`` (the existing free-form per-task key/value
+    surface).
     """
     from pollypm.work.factory import create_work_service
     from pollypm.work.service_support import (
@@ -1529,6 +1574,21 @@ def patch_task(
                 "Valid statuses: " + ", ".join(sorted(valid_statuses))
             ),
         )
+    # Reject unsupported PATCH status targets BEFORE opening a writer.
+    if status is not None and status not in _PATCH_STATUS_TO_METHOD:
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=(
+                f"PATCH cannot set status={status!r}; this state "
+                "is only reachable via a flow transition."
+            ),
+            hint=(
+                "Use the dedicated endpoint (e.g. /claim, "
+                "/approve-plan) or POST a context-aware "
+                "transition instead of PATCH."
+            ),
+        )
 
     try:
         with create_work_service(
@@ -1536,62 +1596,54 @@ def patch_task(
         ) as svc:
             # Confirm task exists up-front so empty-PATCH still 404s.
             try:
-                svc.get(task_id)
+                current = svc.get(task_id)
             except _BACKING_STORE_ERRORS:
                 raise
             except Exception as exc:  # noqa: BLE001
                 raise not_found(f"Task not found: {task_id}") from exc
 
-            # Labels: replace-set semantics (spec §5.4 PATCH ``labels``
-            # field is a list; lists replace, not merge — same as
-            # ``relationships``).
-            if labels is not None:
-                try:
-                    svc.update(task_id, labels=labels)
-                except TaskNotFoundError as exc:
-                    raise not_found(f"Task not found: {task_id}") from exc
-                except WorkValidationError as exc:
-                    raise APIError(
-                        status_code=422,
-                        code="validation_error",
-                        message=str(exc) or "labels update failed validation.",
-                    ) from exc
-
-            # Metadata: stored as ``external_refs`` (jsonb). The
-            # work-service column is JSON-encoded; we replace the
-            # whole map per the documented PATCH semantics.
-            if metadata is not None:
-                try:
-                    svc.update(task_id, external_refs=metadata)
-                except TaskNotFoundError as exc:
-                    raise not_found(f"Task not found: {task_id}") from exc
-                except WorkValidationError as exc:
-                    raise APIError(
-                        status_code=422,
-                        code="validation_error",
-                        message=str(exc) or "metadata update failed validation.",
-                    ) from exc
-
-            # Status: route to the matching lifecycle method. Spec §5.4
-            # leaves transitions un-fully-enumerated; the conservative
-            # path is to refuse unsupported statuses so callers don't
-            # get a misleading 200 with an unchanged status field.
+            # Atomicity gate (#2064 round-1): preflight the status
+            # transition against the in-memory task BEFORE any writes
+            # so a 409 doesn't leave labels/metadata half-committed.
             if status is not None:
-                method_name = _PATCH_STATUS_TO_METHOD.get(status)
-                if method_name is None:
+                current_status = (
+                    current.work_status.value
+                    if hasattr(current.work_status, "value")
+                    else str(current.work_status)
+                )
+                _preflight_status_transition(current_status, status)
+
+            # Labels + metadata land in ONE ``svc.update(...)`` call so
+            # they share a single DB transaction. ``PgWorkService.update``
+            # already batches set-clauses into a single UPDATE; combining
+            # the calls here prevents the labels-commit-then-metadata-
+            # fails partial-write window.
+            combined_fields: dict[str, object] = {}
+            if labels is not None:
+                combined_fields["labels"] = labels
+            if metadata is not None:
+                combined_fields["external_refs"] = metadata
+            if combined_fields:
+                try:
+                    svc.update(task_id, **combined_fields)
+                except TaskNotFoundError as exc:
+                    raise not_found(f"Task not found: {task_id}") from exc
+                except WorkValidationError as exc:
                     raise APIError(
                         status_code=422,
                         code="validation_error",
                         message=(
-                            f"PATCH cannot set status={status!r}; this state "
-                            "is only reachable via a flow transition."
+                            str(exc)
+                            or "labels/metadata update failed validation."
                         ),
-                        hint=(
-                            "Use the dedicated endpoint (e.g. /claim, "
-                            "/approve-plan) or POST a context-aware "
-                            "transition instead of PATCH."
-                        ),
-                    )
+                    ) from exc
+
+            # Status: lifecycle method (queue/cancel). Preflighted above,
+            # but the work-service may still raise (e.g. row vanished
+            # between get + write, or a future gate the preflight
+            # doesn't know about); keep the translation in place.
+            if status is not None:
+                method_name = _PATCH_STATUS_TO_METHOD[status]
                 try:
                     if method_name == "queue":
                         svc.queue(task_id, actor)

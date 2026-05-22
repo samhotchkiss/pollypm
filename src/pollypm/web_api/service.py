@@ -1301,8 +1301,21 @@ def claim_task(
     queued-and-unblocked check, sets ``assignee``, advances to the
     flow's start node, and writes the transition row. We translate
     work-service exceptions into the API's typed error envelope.
+
+    Routes through :func:`create_work_service_with_session` (the
+    same facade ``pm task claim`` uses) so the SessionManager is
+    wired BEFORE ``svc.claim`` fires — the API surface therefore
+    provisions the per-task worker session, applies the parallel-
+    cap check, and surfaces ``last_provision_error`` exactly like
+    the CLI (#2064 round-9 blocker #2). The earlier head called
+    ``create_work_service`` directly with no SessionManager wiring;
+    a successful API claim would mark the task ``in_progress`` with
+    no worker lane and no error feedback, silently breaking the
+    operator workflow.
     """
-    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_factory import (
+        create_work_service_with_session,
+    )
     from pollypm.work.service_support import (
         InvalidTransitionError,
         TaskNotFoundError,
@@ -1314,8 +1327,10 @@ def claim_task(
 
     task_id = f"{project_key}/{task_number}"
     try:
-        with create_work_service(
-            config=config, project_key=project_key, project_path=project.path
+        with create_work_service_with_session(
+            config=config,
+            project_key=project_key,
+            project_path=project.path,
         ) as svc:
             try:
                 svc.claim(task_id, actor)
@@ -1422,6 +1437,7 @@ def reassign_task(
     """
     from pollypm.work.factory import create_work_service
     from pollypm.work.service_support import (
+        InvalidTransitionError,
         TaskNotFoundError,
         ValidationError as WorkValidationError,
     )
@@ -1445,6 +1461,25 @@ def reassign_task(
                 )
             except TaskNotFoundError as exc:
                 raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                # #2064 round-9 blocker #4: reassign now refuses
+                # terminal / draft tasks (live-worker-swap invariant).
+                # The work-service raises ``InvalidTransitionError``
+                # from inside the row-lock select; surface as 409 so
+                # the contract matches the ``/claim`` / ``/cancel``
+                # transition endpoints.
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc)
+                    or f"Task {task_id} cannot be reassigned in its "
+                    f"current state.",
+                    hint=(
+                        "Reassign is a live-worker handoff; it refuses "
+                        "draft (queue + claim first) and terminal "
+                        "(done / cancelled) tasks."
+                    ),
+                ) from exc
             except WorkValidationError as exc:
                 raise APIError(
                     status_code=422,

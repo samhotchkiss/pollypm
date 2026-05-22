@@ -279,6 +279,89 @@ def test_reassign_task_missing_task_raises(pg_service):
         )
 
 
+def test_reassign_task_rejects_draft(pg_service):
+    """#2064 round-9 blocker #4: reassign refuses draft (no live worker)."""
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(pg_service)
+    # Sanity: still in draft state.
+    assert pg_service.get(task.task_id).work_status.value == "draft"
+
+    with pytest.raises(InvalidTransitionError) as excinfo:
+        pg_service.reassign_task(
+            task.task_id, new_assignee="nora", actor="api"
+        )
+    assert "draft" in str(excinfo.value).lower()
+    # No breadcrumb should have been recorded; reassign refused
+    # BEFORE the INSERT.
+    entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert entries == [], (
+        f"reassign on draft must NOT record a breadcrumb; got "
+        f"{entries!r}"
+    )
+
+
+def test_reassign_task_rejects_cancelled(pg_service):
+    """#2064 round-9 blocker #4: reassign refuses cancelled (terminal)."""
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(
+        pg_service, roles={"worker": "pete", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="pete")
+    pg_service.cancel(task.task_id, actor="user", reason="not needed")
+    assert pg_service.get(task.task_id).work_status.value == "cancelled"
+
+    with pytest.raises(InvalidTransitionError) as excinfo:
+        pg_service.reassign_task(
+            task.task_id, new_assignee="nora", actor="api"
+        )
+    assert "cancelled" in str(excinfo.value).lower()
+    # No reassignment breadcrumb (cancel itself records a
+    # transition row but not a reassignment context entry).
+    entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert entries == []
+
+
+def test_reassign_task_rejects_done(pg_service):
+    """#2064 round-9 blocker #4: reassign refuses done (terminal)."""
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(
+        pg_service, roles={"worker": "pete", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="pete")
+    # Force the row into ``done`` directly via the column writer —
+    # going through the full flow machinery would require a
+    # configured review-approve chain. The state-check inside
+    # reassign_task runs under FOR UPDATE on ``work_status``, so the
+    # storage path is exercised either way.
+    with pg_service._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_tasks SET work_status = 'done' "
+            "WHERE project = %s AND task_number = %s",
+            (task.project, task.task_number),
+        )
+        conn.commit()
+    assert pg_service.get(task.task_id).work_status.value == "done"
+
+    with pytest.raises(InvalidTransitionError) as excinfo:
+        pg_service.reassign_task(
+            task.task_id, new_assignee="nora", actor="api"
+        )
+    assert "done" in str(excinfo.value).lower()
+    entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert entries == []
+
+
 def test_concurrent_reassign_serializes_breadcrumbs(pg_service):
     """Spec §P-9 + concurrency safety (#2064 round-4 blocker #2).
 
@@ -474,12 +557,24 @@ def test_concurrent_claim_serializes_one_winner_one_loser(pg_service):
     ``InvalidTransitionError`` (mapped to 409 by the route).
 
     Like the reassign test, the scheduler doesn't reliably produce
-    the interleaving in CI, so we force it deterministically by
-    interposing on the first thread's ``commit()``: thread 1 takes
-    the row lock then waits inside ``commit`` until thread 2 has
-    had a chance to attempt its own claim. With FOR UPDATE, thread
-    2's SELECT blocks until thread 1 commits; without it, thread 2
-    races past the validation and corrupts state.
+    the interleaving in CI, so we force it deterministically.
+    Round-8 used a commit-hook on every connection, but ``claim()``
+    opens TWO connections per call (the pre-transaction
+    ``self.get(task_id)`` read AND the write transaction), and the
+    pool may recycle a wrapped connection for t2. That produced a
+    flake where t1's pre-tx ``get()`` returned its connection to the
+    pool, t2 raced through its own ``claim()`` first, committed, and
+    t1 — entering its write transaction — saw ``in_progress`` and
+    raised ``InvalidTransitionError`` instead of being the winner.
+
+    Round-9 fix: checkpoint specifically on the ``SELECT ... FOR
+    UPDATE`` statement INSIDE t1's write transaction, gated by a
+    thread-local flag so the hook fires for t1 only. The cursor
+    wrapper inspects each ``execute`` and, after the FOR UPDATE
+    returns (row lock held), signals t1_acquired_lock and waits for
+    t2 to attempt its own claim. With FOR UPDATE, t2's SELECT blocks
+    on t1's lock until t1 commits; without it, t2 races past
+    validation and corrupts state.
 
     Regression target: this test fails on the prior head (both
     threads succeed, second assignee overwrites first). It passes
@@ -502,70 +597,119 @@ def test_concurrent_claim_serializes_one_winner_one_loser(pg_service):
     results: dict[str, object] = {}
     errors: dict[str, BaseException] = {}
 
+    # Thread-local guard: the connection wrapper is installed on the
+    # pool (process-wide) but the FOR-UPDATE checkpoint must only
+    # fire for t1's claim call. Without this, t2's own
+    # ``self._pool.connection()`` calls would also see the wrapper
+    # and trip the hook.
+    tls = threading.local()
+    original_connection = pg_service._pool.connection
+
+    class _CheckpointingCursor:
+        def __init__(self, real_cursor):
+            self._real = real_cursor
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self._real.__exit__(*a)
+
+        def execute(self, sql, params=None, *args, **kwargs):
+            # Run the statement first so the row lock is actually
+            # held by Postgres before we release t2.
+            if params is None:
+                result = self._real.execute(sql, *args, **kwargs)
+            else:
+                result = self._real.execute(sql, params, *args, **kwargs)
+            if (
+                getattr(tls, "is_t1", False)
+                and "FOR UPDATE" in (sql or "")
+                and not t1_acquired_lock.is_set()
+            ):
+                # t1 has the row lock now. Let t2 attempt its claim;
+                # with FOR UPDATE its SELECT blocks on our lock
+                # until t1 commits. Bounded wait so the test fails
+                # loudly rather than deadlocking.
+                t1_acquired_lock.set()
+                t2_started.wait(timeout=3)
+            return result
+
+    class _ConnProxy:
+        """Proxy wrapping a real psycopg connection.
+
+        Replaces ``cursor()`` with a checkpoint-aware factory without
+        mutating the underlying connection object (the pool recycles
+        the same psycopg connection across borrows; mutating it
+        would poison later tests). All other attribute access falls
+        through to the real connection via ``__getattr__`` so
+        ``commit``/``rollback``/``autocommit`` work as usual.
+        """
+
+        def __init__(self, real_conn):
+            object.__setattr__(self, "_real", real_conn)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._real, name, value)
+
+        def cursor(self, *args, **kwargs):
+            return _CheckpointingCursor(self._real.cursor(*args, **kwargs))
+
+    class _CheckpointingConn:
+        def __init__(self, real_cm):
+            self._real_cm = real_cm
+
+        def __enter__(self):
+            real_conn = self._real_cm.__enter__()
+            return _ConnProxy(real_conn)
+
+        def __exit__(self, *a):
+            return self._real_cm.__exit__(*a)
+
+    def _wrapping_connection():
+        return _CheckpointingConn(original_connection())
+
+    pg_service._pool.connection = _wrapping_connection
+
     def _t1_claim() -> None:
-        # ``claim()`` calls ``self._pool.connection()`` twice — once
-        # via the pre-transaction ``self.get(task_id)`` read (which
-        # doesn't commit) and once for the write transaction
-        # (which does). We need the delay only on the WRITE-tx
-        # commit, so wrap every connection during this thread's
-        # claim and let the wrapper's commit-hook fire only when
-        # something actually calls commit.
-        original_connection = pg_service._pool.connection
-
-        class _DelayingConn:
-            def __init__(self, real_cm):
-                self._real_cm = real_cm
-                self._real_conn = None
-
-            def __enter__(self):
-                self._real_conn = self._real_cm.__enter__()
-                original_commit = self._real_conn.commit
-
-                def _delayed_commit():
-                    # Row lock is held (FOR UPDATE) and the
-                    # UPDATE/transition/execution writes have
-                    # fired. Let t2 attempt its own claim
-                    # before we commit — with FOR UPDATE its
-                    # SELECT blocks on our lock until commit.
-                    t1_acquired_lock.set()
-                    t2_started.wait(timeout=3)
-                    return original_commit()
-
-                self._real_conn.commit = _delayed_commit
-                return self._real_conn
-
-            def __exit__(self, *a):
-                return self._real_cm.__exit__(*a)
-
-        def _wrapping_connection():
-            return _DelayingConn(original_connection())
-
+        tls.is_t1 = True
         try:
-            pg_service._pool.connection = _wrapping_connection
             results["t1"] = pg_service.claim(task.task_id, actor="winner")
         except BaseException as exc:  # noqa: BLE001
             errors["t1"] = exc
             t1_acquired_lock.set()
             t2_started.set()
         finally:
-            pg_service._pool.connection = original_connection
+            tls.is_t1 = False
 
     def _t2_claim() -> None:
         try:
             assert t1_acquired_lock.wait(timeout=5), (
-                "t1 never reached the pre-commit checkpoint"
+                "t1 never reached the FOR UPDATE checkpoint"
             )
             t2_started.set()
             results["t2"] = pg_service.claim(task.task_id, actor="loser")
         except BaseException as exc:  # noqa: BLE001
             errors["t2"] = exc
 
-    t1 = threading.Thread(target=_t1_claim)
-    t2 = threading.Thread(target=_t2_claim)
-    t1.start()
-    t2.start()
-    t1.join(timeout=15)
-    t2.join(timeout=15)
+    try:
+        t1 = threading.Thread(target=_t1_claim)
+        t2 = threading.Thread(target=_t2_claim)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+    finally:
+        # Restore the pool's connection factory so later tests see
+        # the unwrapped object even if a thread raised.
+        pg_service._pool.connection = original_connection
     assert not t1.is_alive() and not t2.is_alive(), (
         "thread deadlocked — claim() FOR UPDATE may have a "
         "starvation bug"

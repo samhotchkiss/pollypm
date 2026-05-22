@@ -944,6 +944,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /tasks/{project}/{n}/queue:
     parameters:
@@ -969,6 +971,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /tasks/{project}/{n}/claim:
     parameters:
@@ -1006,6 +1010,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /tasks/{project}/{n}/cancel:
     parameters:
@@ -1041,6 +1047,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /tasks/{project}/{n}/reassign:
     parameters:
@@ -1061,11 +1069,22 @@ paths:
         The task's `work_status` is unchanged (no state-machine
         transition fires). Spec §5.3 leaves `null ⇒ unassign` open;
         this endpoint requires a non-empty `actor`. The breadcrumb is
-        attributed to `"api"` (the HTTP layer is the operator). Use
-        this endpoint to change a task's assignee. PATCH
-        /tasks/{p}/{n} does NOT accept the assignee field — for
-        low-level updates without a handoff breadcrumb, use the work
-        service directly via the CLI.
+        attributed to `"api"` (the HTTP layer is the operator).
+
+        This is the ONLY operator surface for changing `assignee`
+        (#2064 round-9 blocker #5). PATCH `/tasks/{p}/{n}` does not accept the assignee field
+        — the `TaskPatchRequest` schema is
+        `additionalProperties: false`, so unknown keys including
+        `assignee` are rejected with `422 validation_error` at
+        request validation. `pm task update` does not advertise
+        `--assignee` either. There is no breadcrumb-less assignee
+        update path on either surface — every assignee change
+        records a `reassignment` context entry so the new owner
+        can recover via `pm task get`.
+
+        Refuses non-live tasks (`draft`, `done`, `cancelled`) with
+        `409 invalid_state` — reassign is a mid-flight worker swap
+        (spec §P-9), not a generic owner-relabel.
 
         `Idempotency-Key` and `If-Match` are intentionally NOT
         accepted — no replay cache or version-token enforcement
@@ -1092,8 +1111,12 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /inbox:
     get:

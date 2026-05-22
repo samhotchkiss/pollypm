@@ -164,6 +164,11 @@ def get_task_endpoint(project: str, n: int, config: ConfigDep) -> TaskDetail:
         "401": {"description": "Missing or invalid bearer token."},
         "404": {"description": "Project or task not found."},
         "409": {"description": "Task is not in a queueable state."},
+        # #2064 round-9 blocker #3: the service helper catches
+        # ``_BACKING_STORE_ERRORS`` and raises ``service_unavailable``;
+        # advertise that here so generated clients branch on the same
+        # 503 envelope they'll see on a real pg outage.
+        "503": {"description": "Backing store unavailable."},
     },
 )
 def queue_task_endpoint(
@@ -205,6 +210,7 @@ def queue_task_endpoint(
         "404": {"description": "Project or task not found."},
         "409": {"description": "Task is not in a claimable state."},
         "422": {"description": "Claim gate failure."},
+        "503": {"description": "Backing store unavailable."},
     },
 )
 def claim_task_endpoint(
@@ -230,6 +236,7 @@ def claim_task_endpoint(
         "401": {"description": "Missing or invalid bearer token."},
         "404": {"description": "Project or task not found."},
         "409": {"description": "Task is already in a terminal state."},
+        "503": {"description": "Backing store unavailable."},
     },
 )
 def cancel_task_endpoint(
@@ -255,7 +262,17 @@ def cancel_task_endpoint(
     responses={
         "401": {"description": "Missing or invalid bearer token."},
         "404": {"description": "Project or task not found."},
+        # #2064 round-9 blocker #4: reassign now refuses
+        # terminal / draft tasks (live-worker-swap invariant) with
+        # a 409 invalid_state, matching ``/claim`` and ``/cancel``.
+        "409": {
+            "description": (
+                "Task is in a state that does not permit a worker swap "
+                "(draft / done / cancelled)."
+            ),
+        },
         "422": {"description": "Assignee value rejected."},
+        "503": {"description": "Backing store unavailable."},
     },
 )
 def reassign_task_endpoint(
@@ -290,6 +307,7 @@ def reassign_task_endpoint(
         "404": {"description": "Project or task not found."},
         "409": {"description": "Status transition refused by the state machine."},
         "422": {"description": "Body validation / unsupported status."},
+        "503": {"description": "Backing store unavailable."},
     },
 )
 def patch_task_endpoint(

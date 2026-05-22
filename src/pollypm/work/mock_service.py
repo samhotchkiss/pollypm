@@ -398,6 +398,24 @@ class MockWorkService:
         task = self._tasks.get(task_id)
         if task is None:
             raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        # #2064 round-9 blocker #4: live-worker-swap invariant. Mirror
+        # the pg backend's check so swap-backend tests can rely on
+        # the same contract — reassign refuses ``draft`` (no worker
+        # yet) and terminal ``done`` / ``cancelled`` tasks. The pg
+        # backend enforces this under the same FOR UPDATE row lock
+        # that orders the assignee write; the in-memory mock doesn't
+        # need a lock but the surface must agree.
+        if task.work_status in {
+            WorkStatus.DRAFT,
+            WorkStatus.DONE,
+            WorkStatus.CANCELLED,
+        }:
+            raise InvalidTransitionError(
+                f"Cannot reassign task in '{task.work_status.value}' "
+                f"state. Reassign is a mid-flight worker swap "
+                f"(spec §P-9); it refuses draft (queue + claim first) "
+                f"and terminal (done / cancelled) tasks."
+            )
         old_assignee = task.assignee
         task.assignee = new_assignee
         task.updated_at = _now()

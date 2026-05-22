@@ -290,6 +290,124 @@ def test_static_yaml_declares_503_on_inbox_write_paths() -> None:
         )
 
 
+def test_static_yaml_declares_503_on_task_write_paths() -> None:
+    """Static contract must declare 503 on every task-write path.
+
+    Round 9 of #2064 — mirror of the inbox-write 503 conformance
+    test above. The FastAPI handlers in
+    ``src/pollypm/web_api/routes/tasks.py`` catch
+    ``_BACKING_STORE_ERRORS`` (psycopg.OperationalError /
+    psycopg_pool.PoolTimeout) and raise ``service_unavailable``
+    (503), but ``docs/api/openapi.yaml`` was missing the 503 entry
+    on ``/queue``, ``/claim``, ``/cancel``, ``/reassign``, and
+    PATCH ``/tasks/{project}/{n}``. Generated clients would not
+    know to handle a real pg outage with the same typed-error
+    envelope they see from the live server.
+
+    Pin coverage so future drift trips CI.
+    """
+    contract = _load_contract()
+    task_write_paths_post = [
+        "/tasks/{project}/{n}/queue",
+        "/tasks/{project}/{n}/claim",
+        "/tasks/{project}/{n}/cancel",
+        "/tasks/{project}/{n}/reassign",
+    ]
+    paths = contract.get("paths", {})
+    for path in task_write_paths_post:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        responses = post.get("responses", {}) or {}
+        assert "503" in responses, (
+            f"{path} POST missing 503 response in static contract "
+            "(#2064 round-9). The FastAPI handler maps backing-store "
+            "errors to a 503 with the service_unavailable envelope; "
+            "the YAML must say so too."
+        )
+    patch_responses = (
+        paths.get("/tasks/{project}/{n}", {})
+        .get("patch", {})
+        .get("responses", {})
+        or {}
+    )
+    assert "503" in patch_responses, (
+        "PATCH /tasks/{project}/{n} missing 503 response in static "
+        "contract (#2064 round-9). The FastAPI handler maps "
+        "backing-store errors to a 503 with the service_unavailable "
+        "envelope; the YAML must say so too."
+    )
+
+
+def test_task_write_endpoints_document_503() -> None:
+    """Implementation-side conformance for task-write 503 coverage.
+
+    Mirrors :func:`test_static_yaml_declares_503_on_inbox_write_paths`
+    on the auto-generated FastAPI OpenAPI document. Every task-write
+    route's ``responses=`` map must include 503 so generated clients
+    branch on the same typed envelope they see at runtime
+    (#2064 round-9 blocker #3).
+    """
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+    )
+    from pollypm.models import ProviderKind, RuntimeKind
+    from pollypm.web_api import create_app
+
+    base = Path(__file__).resolve().parent
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="P", root_dir=base, tmux_session="t",
+            workspace_root=base, base_dir=base / ".pollypm",
+            logs_dir=base / ".pollypm/logs",
+            snapshots_dir=base / ".pollypm/snapshots",
+            state_db=base / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={"codex_primary": AccountConfig(
+            name="codex_primary", provider=ProviderKind.CODEX,
+            email="codex@example.com", runtime=RuntimeKind.LOCAL,
+            home=base / ".pollypm/homes/codex_primary",
+        )},
+        sessions={},
+        projects={},
+        memory=MemorySettings(backend="file"),
+    )
+    app = create_app(config=config, token_path=base / "tmp-token")
+    raw = app.openapi()
+    paths = raw["paths"]
+
+    post_paths = [
+        "/api/v1/tasks/{project}/{n}/queue",
+        "/api/v1/tasks/{project}/{n}/claim",
+        "/api/v1/tasks/{project}/{n}/cancel",
+        "/api/v1/tasks/{project}/{n}/reassign",
+    ]
+    for path in post_paths:
+        responses = paths[path]["post"]["responses"]
+        assert "503" in responses, (
+            f"Implementation OpenAPI for POST {path} is missing a 503 "
+            "response — keep the route's ``responses=`` map in sync "
+            "with the static contract (#2064 round-9)."
+        )
+    patch_responses = paths["/api/v1/tasks/{project}/{n}"]["patch"]["responses"]
+    assert "503" in patch_responses, (
+        "Implementation OpenAPI for PATCH /api/v1/tasks/{project}/{n} "
+        "is missing a 503 response (#2064 round-9)."
+    )
+
+
 def test_inbox_archive_reason_documented_as_post_transition() -> None:
     """Pin the reason-note ordering contract.
 

@@ -196,7 +196,7 @@ def _project_from_task_id(task_id: str) -> str | None:
 def _svc(project: str | None = None) -> "WorkService":
     import atexit
 
-    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_factory import create_work_service_with_session
     from pollypm.work.sync import SyncManager
     from pollypm.work.sync_file import FileSyncAdapter
 
@@ -261,53 +261,19 @@ def _svc(project: str | None = None) -> "WorkService":
     sync = SyncManager()
     sync.register(FileSyncAdapter(issues_root=project_root / "issues"))
 
-    # Route through the factory so ``[storage] backend`` is honoured
-    # (#1369, #1737). The legacy ``--db`` flag was removed in the
-    # sqlite-ripout (refs #1971); pg is the only supported backend.
-    svc = create_work_service(
+    # Route through the shared facade so the Web API ``POST
+    # /tasks/{p}/{n}/claim`` handler and the CLI share one wiring
+    # path for the per-task SessionManager (#2064 round-9 blocker
+    # #2). The helper internally calls ``create_work_service`` then
+    # ``attach_session_manager``; both surfaces now provision worker
+    # sessions, apply the parallel-cap check, and surface
+    # ``last_provision_error`` identically.
+    svc = create_work_service_with_session(
         config=config_obj,
         project_path=project_root,
         project_key=project,
         sync_manager=sync,
     )
-
-    # Wire up the session manager for per-task worker lifecycle
-    try:
-        from pollypm.session_services import create_tmux_client
-        from pollypm.work.session_manager import SessionManager
-        if project_root.exists() and (project_root / ".git").exists():
-            # Try to route through the configured SessionService so per-task
-            # workers pick up stabilization, initial_input handling, and
-            # storage-closet naming from config. Fall back to a raw
-            # TmuxClient if config/plugin resolution fails.
-            config = config_obj
-            session_service = None
-            storage_closet_name = "pollypm-storage-closet"
-            try:
-                from pollypm.session_services.tmux import TmuxSessionService
-                from pollypm.storage.state import StateStore
-
-                if config is None:
-                    from pollypm.config import load_config
-                    config = load_config()
-                storage_closet_name = (
-                    f"{config.project.tmux_session}-storage-closet"
-                )
-                store = StateStore(config.project.state_db)
-                session_service = TmuxSessionService(config=config, store=store)
-            except Exception:  # noqa: BLE001
-                pass
-            session_mgr = SessionManager(
-                tmux_client=create_tmux_client(),
-                work_service=svc,
-                project_path=project_root,
-                config=config,
-                session_service=session_service,
-                storage_closet_name=storage_closet_name,
-            )
-            svc.set_session_manager(session_mgr)
-    except Exception:  # noqa: BLE001
-        pass  # SessionManager is optional — CLI still works without it
 
     atexit.register(svc.close)
     return svc

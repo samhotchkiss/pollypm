@@ -235,6 +235,23 @@ def _json_loads(raw: Any, default: Any) -> Any:
     return default
 
 
+# #2064 round-9 blocker #4: states a task can be in and still receive a
+# mid-flight reassign. Defined as the inverse of the "no live worker"
+# set (``draft``/``done``/``cancelled``); everything else — including
+# ``blocked`` / ``on_hold`` / ``rework`` — is a live lane with a
+# recoverable worker context. Keep this list in sync with
+# :class:`pollypm.work.models.WorkStatus`; the assignment is asserted
+# in ``tests/test_pg_work_service_full.py``.
+_REASSIGN_ALLOWED_STATUSES: frozenset[str] = frozenset({
+    WorkStatus.QUEUED.value,
+    WorkStatus.IN_PROGRESS.value,
+    WorkStatus.REWORK.value,
+    WorkStatus.BLOCKED.value,
+    WorkStatus.ON_HOLD.value,
+    WorkStatus.REVIEW.value,
+})
+
+
 class PgWorkService:
     """Postgres-backed work-service implementation (Slice A skeleton).
 
@@ -1342,12 +1359,17 @@ class PgWorkService:
         "acceptance_criteria": "acceptance_criteria",
         "constraints": "constraints",
         "relevant_files": "relevant_files",
-        # ``assignee`` is admitted so the API ``POST /reassign`` (issue
-        # #1548 spec §5.3) and PATCH variants have a single writer. The
-        # column is plain text — no JSON encoding — so it doesn't join
-        # ``_UPDATE_JSON_COLUMNS``. ``svc.claim`` is still the canonical
-        # path for the queued→in_progress transition; ``update`` only
-        # touches the column without firing a state-machine transition.
+        # ``assignee`` is admitted at the column-schema level for
+        # backend symmetry with the legacy SQLite store, but no
+        # operator surface targets this path post-#2064 round-9. The
+        # PATCH body (``TaskPatchRequest``) refuses ``assignee`` via
+        # ``extra='forbid'``, ``POST /reassign`` routes through
+        # :meth:`reassign_task`, and ``pm task update`` does not
+        # expose ``--assignee``. The single operator path for
+        # changing assignee is :meth:`reassign_task`, which writes
+        # the column AND appends a breadcrumb in one transaction
+        # (spec §P-9). The column is plain text — no JSON encoding —
+        # so it doesn't join ``_UPDATE_JSON_COLUMNS``.
         "assignee": "assignee",
         # ``external_refs`` carries the API's free-form ``metadata``
         # surface (spec §5.4 PATCH ``metadata?: {...}``). Stored as
@@ -1365,13 +1387,18 @@ class PgWorkService:
         ``work_status`` and ``flow_template`` changes — those go through
         the lifecycle methods.
 
-        Note on ``assignee``: this method writes the column but does
-        **not** record the context-log breadcrumb the work-service spec
-        (§P-9) requires for a mid-flight worker swap. PATCH callers that
-        merely correct an assignee field may continue to use this path;
-        callers that represent a real handoff (``POST /tasks/{p}/{n}/
-        reassign``) MUST call :meth:`reassign_task` instead so the new
-        owner can recover context from ``pm task get``.
+        Note on ``assignee``: this method still accepts the column for
+        backend symmetry, but post-#2064 round-9 no operator surface
+        exposes a breadcrumb-less assignee write. ``PATCH /tasks/
+        {p}/{n}`` rejects the ``assignee`` field at request-validation
+        (``TaskPatchRequest`` is ``extra='forbid'``), ``POST /tasks/
+        {p}/{n}/reassign`` routes through :meth:`reassign_task`, and
+        ``pm task update`` does not advertise ``--assignee``. Callers
+        that need to change ``assignee`` must call
+        :meth:`reassign_task` — it writes the column AND appends the
+        ``reassignment`` context-log breadcrumb in a single
+        transaction so the new owner can recover context via
+        ``pm task get`` (spec §P-9).
         """
         if "work_status" in fields:
             raise ValidationError(
@@ -1469,8 +1496,19 @@ class PgWorkService:
                 # waits on the first transaction's UPDATE; when it
                 # unblocks it reads the freshly-committed assignee,
                 # so the breadcrumb chain stays coherent.
+                #
+                # #2064 round-9 blocker #4: also fetch ``work_status``
+                # so we can enforce the live-worker-swap invariant
+                # (spec §P-9 / web-api-spec §5.3 "mid-flight"). Without
+                # this check, reassign happily appends a breadcrumb to
+                # ``draft`` / ``done`` / ``cancelled`` tasks even
+                # though there is no worker to hand off to. Checking
+                # under the same row lock means a task that flipped to
+                # terminal between the request and the lock
+                # acquisition raises ``InvalidTransitionError`` (→ 409)
+                # instead of recording a stray breadcrumb.
                 cur.execute(
-                    "SELECT assignee FROM work_tasks "
+                    "SELECT assignee, work_status FROM work_tasks "
                     "WHERE project = %s AND task_number = %s "
                     "FOR UPDATE",
                     (project, task_number),
@@ -1478,7 +1516,22 @@ class PgWorkService:
                 row = cur.fetchone()
                 if row is None:
                     raise TaskNotFoundError(f"Task '{task_id}' not found.")
-                old_assignee = row[0]
+                old_assignee, locked_status = row[0], row[1]
+                if locked_status not in _REASSIGN_ALLOWED_STATUSES:
+                    raise InvalidTransitionError(
+                        f"Cannot reassign task in '{locked_status}' "
+                        f"state.\n"
+                        f"\n"
+                        f"Why: reassign is a mid-flight worker swap "
+                        f"(work-service spec §P-9). It refuses "
+                        f"`draft` (no worker yet — queue + claim "
+                        f"first) and terminal `done` / `cancelled` "
+                        f"tasks (no worker lane left).\n"
+                        f"\n"
+                        f"Fix: pick a different task with "
+                        f"`pm task next`, or queue + claim this one "
+                        f"if it is still draft."
+                    )
                 # Column write — same SQL shape as update(assignee=...)
                 # but inline so the context-log INSERT lands in the
                 # same transaction.

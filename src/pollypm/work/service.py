@@ -147,13 +147,20 @@ class WorkService(Protocol):
         ``work_status`` or ``flow_template`` directly — use lifecycle
         methods instead.
 
-        ``assignee`` is accepted so PATCH callers can correct an
-        operator-bookkeeping field, but this method does **not** record
-        the handoff context the work-service spec requires for
-        mid-flight reassignment (§P-9). For a live worker swap call
-        :meth:`reassign_task` instead — it is atomic and leaves a
-        breadcrumb in the context log so the new owner can recover
-        context via ``pm task get``.
+        ``assignee`` is accepted by the column schema for symmetry
+        with the legacy SQLite backend, but **no operator surface
+        exposes a breadcrumb-less assignee write** (#2064 round-9
+        blocker #5). The CLI ``pm task update`` does not advertise an
+        ``--assignee`` flag, the API ``PATCH /tasks/{p}/{n}`` body
+        (``TaskPatchRequest``) refuses the ``assignee`` key with
+        ``extra='forbid'``, and ``POST /tasks/{p}/{n}/reassign`` now
+        routes exclusively through :meth:`reassign_task`. The single
+        operator path for changing ``assignee`` is therefore
+        :meth:`reassign_task`, which writes the column AND appends a
+        ``reassignment`` breadcrumb in one transaction so the new
+        owner can recover context via ``pm task get`` (spec §P-9).
+        ``update(assignee=...)`` remains callable from in-process
+        plugins / migrations that explicitly accept the audit gap.
 
         ``external_refs`` replaces the dict wholesale (pass ``{}`` to
         clear); it carries the API's free-form ``metadata`` surface.

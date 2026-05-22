@@ -239,6 +239,19 @@ class FakeWorkService:
         """
         with self._lock:
             task = self.get(task_id)
+            # #2064 round-9 blocker #4: live-worker-swap invariant.
+            # Mirror the pg + mock backends — refuse draft and
+            # terminal states so route-level tests can assert the 409
+            # mapping. Without this, FakeWorkService would silently
+            # append a breadcrumb to a cancelled task and the route
+            # regression below would never trip.
+            if task.work_status in (
+                WorkStatus.DRAFT, WorkStatus.DONE, WorkStatus.CANCELLED,
+            ):
+                raise InvalidTransitionError(
+                    f"Cannot reassign task in "
+                    f"'{task.work_status.value}' state."
+                )
             old_assignee = task.assignee
             task.assignee = new_assignee
             task.updated_at = datetime.now(timezone.utc)
@@ -358,11 +371,23 @@ def patched_work_service(
     so we patch the factory module itself rather than the import-site.
     """
     from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
 
     def _fake_factory(**_kwargs: object) -> FakeWorkService:
         return FakeWorkService(task_store)
 
     monkeypatch.setattr(work_factory, "create_work_service", _fake_factory)
+    # #2064 round-9 blocker #2: the API claim helper now routes
+    # through ``create_work_service_with_session`` (shared facade
+    # with the CLI) instead of ``create_work_service`` directly.
+    # Patch the shared helper too so claim-endpoint tests keep
+    # hitting the FakeWorkService instead of attempting to wire a
+    # real SessionManager against a non-existent tmux server.
+    monkeypatch.setattr(
+        work_service_factory,
+        "create_work_service_with_session",
+        _fake_factory,
+    )
     # The web-api READ helpers (``_open_work_service_readonly``)
     # already wrap ``create_work_service`` via ``contextlib.contextmanager``
     # so the patch on the factory module reaches both call sites.
@@ -557,6 +582,68 @@ def test_reassign_records_context_log_breadcrumb(
         f"breadcrumb missing old/new assignee: {body!r}"
     )
     assert "reassigned" in body.lower()
+
+
+def test_reassign_draft_returns_409(client, auth_headers, task_store) -> None:
+    """#2064 round-9 blocker #4: reassign refuses draft tasks.
+
+    Reassign is a mid-flight worker swap (spec §P-9); a draft task
+    has no live worker to swap, so the route must return 409
+    invalid_state instead of silently recording a reassignment
+    breadcrumb. Mirrors the ``/cancel`` 409 contract.
+    """
+    seeded = _seed(
+        task_store, n=70,
+        work_status=WorkStatus.DRAFT, assignee=None,
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/70/reassign",
+        headers=auth_headers,
+        json={"actor": "carol"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "invalid_state"
+    # No breadcrumb was recorded — refused BEFORE the write.
+    assert seeded.context == [], (
+        f"reassign on draft must NOT record a breadcrumb; got "
+        f"{seeded.context!r}"
+    )
+
+
+def test_reassign_cancelled_returns_409(
+    client, auth_headers, task_store,
+) -> None:
+    """#2064 round-9 blocker #4: reassign refuses cancelled tasks."""
+    seeded = _seed(
+        task_store, n=71,
+        work_status=WorkStatus.CANCELLED, assignee="pete",
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/71/reassign",
+        headers=auth_headers,
+        json={"actor": "carol"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "invalid_state"
+    assert seeded.assignee == "pete", (
+        "assignee must NOT change when reassign is refused"
+    )
+
+
+def test_reassign_done_returns_409(client, auth_headers, task_store) -> None:
+    """#2064 round-9 blocker #4: reassign refuses done tasks."""
+    seeded = _seed(
+        task_store, n=72,
+        work_status=WorkStatus.DONE, assignee="pete",
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/72/reassign",
+        headers=auth_headers,
+        json={"actor": "carol"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "invalid_state"
+    assert seeded.assignee == "pete"
 
 
 # ---------------------------------------------------------------------------

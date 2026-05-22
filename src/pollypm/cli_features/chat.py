@@ -43,10 +43,6 @@ from pollypm.web_api.token import DEFAULT_TOKEN_PATH
 _DEFAULT_BASE_URL = "http://127.0.0.1:8765"
 _BASE_URL_ENV = "POLLYPM_API_BASE"
 
-# Hard cap on response read so a misbehaving server can't blow client
-# memory. 25MB easily covers a multi-thousand-message transcript dump.
-_RESPONSE_BYTE_LIMIT = 25 * 1024 * 1024
-
 # Network timeout — generous to accommodate a JSONL-parse on a long
 # transcript, tight enough that a hung daemon surfaces as a CLI error
 # rather than blocking the operator's terminal indefinitely.

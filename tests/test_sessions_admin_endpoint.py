@@ -686,6 +686,15 @@ def test_restart_503_when_supervisor_unavailable(
 def test_pause_happy_path_then_visible_in_list(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
 ):
+    """Pause sets ``paused=True`` but does NOT mutate ``status``.
+
+    PR #2061 round 2: pause is informational only, so ``status``
+    must continue to reflect runtime health. With a fresh heartbeat
+    + present window the row is ``healthy`` AND ``paused=True``.
+    See :func:`test_status_paused_but_missing_returns_health_classification`
+    and :func:`test_status_paused_but_stale_returns_stale_with_paused_flag`
+    for the regressions this round-2 contract prevents.
+    """
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
 
@@ -696,11 +705,85 @@ def test_pause_happy_path_then_visible_in_list(
     body = response.json()
     assert body["ok"] is True
 
-    # list reflects the paused state
+    # list reflects the paused state on the dedicated boolean field
+    # — status stays as the runtime-health classification.
     listing = client.get("/api/v1/sessions", headers=auth_headers).json()
     by_name = {s["name"]: s for s in listing["sessions"]}
     assert by_name["operator"]["paused"] is True
-    assert by_name["operator"]["status"] == "paused"
+    # status must be a real health value, not the legacy "paused" string.
+    assert by_name["operator"]["status"] in {"healthy", "stale"}
+    assert by_name["operator"]["status"] != "paused"
+
+
+def test_status_paused_but_missing_returns_health_classification(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+):
+    """Pausing a missing session must NOT mask the missing classification.
+
+    PR #2061 round 2 regression: previously the route surfaced
+    ``status="paused"`` for any tagged session, even when the tmux
+    window was absent. Because the supervisor / recovery / dispatch
+    loops do NOT consume the marker (#2068), the operator would see
+    "paused" and assume the daemon had quiesced when in fact the
+    session had simply gone missing. ``status`` must reflect runtime
+    health regardless of the pause marker.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows([])  # tmux window absent → missing
+
+    # Pause then list.
+    pause = client.post(
+        "/api/v1/sessions/operator/pause", headers=auth_headers,
+    )
+    assert pause.status_code == 200, pause.text
+    listing = client.get("/api/v1/sessions", headers=auth_headers).json()
+    row = next(s for s in listing["sessions"] if s["name"] == "operator")
+
+    # The whole point of round 2: missing wins over the informational
+    # pause tag.
+    assert row["status"] == "missing"
+    assert row["paused"] is True
+
+
+def test_status_paused_but_stale_returns_stale_with_paused_flag(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+):
+    """Pausing a stale session must NOT mask the stale classification.
+
+    Same PR #2061 round 2 contract on the heartbeat-age side. A
+    long-quiet session needs to be visible as ``stale`` so the
+    operator knows the heartbeat has aged out, even if it has also
+    been tagged informationally as paused.
+    """
+    # Heartbeat well past the 5-min stale threshold (>1 day old).
+    patch_heartbeat({"operator": "2025-01-01T00:00:00Z"})
+    patch_tmux_windows(["operator"])  # window present so we exercise stale, not missing
+
+    pause = client.post(
+        "/api/v1/sessions/operator/pause", headers=auth_headers,
+    )
+    assert pause.status_code == 200, pause.text
+    listing = client.get("/api/v1/sessions", headers=auth_headers).json()
+    row = next(s for s in listing["sessions"] if s["name"] == "operator")
+
+    assert row["status"] == "stale"
+    assert row["paused"] is True
+
+
+def test_status_unpaused_session_reports_paused_false(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+):
+    """Baseline: an un-tagged session reports ``paused=False``.
+
+    Sanity-anchor for the round-2 contract — confirms the new
+    boolean field defaults correctly when no pause marker exists.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    listing = client.get("/api/v1/sessions", headers=auth_headers).json()
+    row = next(s for s in listing["sessions"] if s["name"] == "operator")
+    assert row["paused"] is False
+    assert row["status"] != "paused"
 
 
 def test_pause_is_idempotent(

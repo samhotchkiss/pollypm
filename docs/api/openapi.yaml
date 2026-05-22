@@ -988,11 +988,14 @@ paths:
       description: |
         Mirrors `pm sessions` (#2039) — one row per configured (and
         enabled) session in `[sessions]` config with classification
-        (`healthy` / `stale` / `missing` / `unknown` / `paused`) derived
+        (`healthy` / `stale` / `missing` / `unknown`) derived
         from the latest heartbeat row plus a tmux storage-closet probe.
-        Read-side is fail-soft: a pg-pool outage degrades to
-        `status=unknown` rather than 5xx so the inventory remains
-        visible in degraded environments.
+        The operator-set pause marker is surfaced via the separate
+        `paused: bool` field so it cannot mask the runtime-health
+        classification (see `SessionInfo.paused`). Read-side is
+        fail-soft: a pg-pool outage degrades to `status=unknown`
+        rather than 5xx so the inventory remains visible in degraded
+        environments.
       responses:
         "200":
           description: List of configured sessions.
@@ -1126,9 +1129,11 @@ paths:
         Idempotent. Writes the session name into the project's pause
         marker (`<base_dir>/paused-sessions.json`) using atomic
         tmp+rename, with `fcntl.flock` serialising concurrent
-        pause/resume callers. `GET /api/v1/sessions` surfaces
-        `status="paused"` for tagged sessions; the tmux window itself
-        is left alone.
+        pause/resume callers. `GET /api/v1/sessions` surfaces the
+        marker on the separate `paused: true` field; the `status`
+        field continues to reflect actual runtime health (so a
+        paused-but-missing session reports `status="missing"` AND
+        `paused=true`). The tmux window itself is left alone.
       responses:
         "200":
           description: Pause recorded (or already paused).
@@ -2405,14 +2410,22 @@ components:
     # ---- Sessions admin (Phase 2 §10) -------------------------------
     SessionStatus:
       type: string
-      enum: [healthy, stale, missing, unknown, paused]
+      enum: [healthy, stale, missing, unknown]
       description: |
-        Live classification mirroring `pm sessions`. `healthy` =
-        heartbeat <=5min old AND tmux window present. `stale` =
-        heartbeat older than 5min. `missing` = tmux window absent
-        (beats `stale` — pane is the more urgent problem). `unknown` =
-        no heartbeat row yet (fresh boot OR pg outage). `paused` =
-        operator-set quiesce flag via POST /sessions/{name}/pause.
+        Live runtime-health classification mirroring `pm sessions`.
+        `healthy` = heartbeat <=5min old AND tmux window present.
+        `stale` = heartbeat older than 5min. `missing` = tmux window
+        absent (beats `stale` — pane is the more urgent problem).
+        `unknown` = no heartbeat row yet (fresh boot OR pg outage).
+
+        Pause is NOT a value of this enum. The operator-set pause
+        marker is exposed as the separate `SessionInfo.paused`
+        boolean so a paused-but-missing or paused-but-stale session
+        still reports its true runtime state. Folding pause into
+        `status` was removed in PR #2061 round 2 because the
+        supervisor / recovery / dispatch loops do not consume the
+        marker today (see #2068) — `status="paused"` would have
+        misled operators into believing the daemon had quiesced.
 
     SessionInfo:
       type: object
@@ -2468,8 +2481,13 @@ components:
         paused:
           type: boolean
           description: |
-            True when an operator has paused the session via POST
-            /sessions/{name}/pause.
+            Informational marker set via POST
+            /sessions/{name}/pause. The supervisor / recovery /
+            dispatch loops do NOT currently consume this marker (see
+            #2068). The `status` field above remains the source of
+            truth for runtime health — a paused-but-missing session
+            reports `status="missing"` AND `paused=true`, not
+            `status="paused"`.
 
     SessionsListResponse:
       type: object

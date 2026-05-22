@@ -19,9 +19,12 @@ Endpoints
   ``unsafe_mid_turn_unknown`` when the safety probe itself fails)
   unless ``?safety=force``.
 - ``POST   /api/v1/sessions/{name}/pause``     — write an
-  **informational** pause marker (consumers can observe it via
-  ``GET /api/v1/sessions`` but the supervisor / recovery / dispatch
-  loops do NOT yet consume it; see ``ActionResult.message``).
+  **informational** pause marker. Consumers can observe it via the
+  separate ``paused: bool`` field on ``GET /api/v1/sessions`` rows;
+  the ``status`` field is unaffected (Codex PR #2061 round 2 —
+  pause must NEVER mask the real runtime-health classification).
+  The supervisor / recovery / dispatch loops do NOT yet consume
+  this marker (see ``ActionResult.message`` and #2068).
   Idempotent.
 - ``POST   /api/v1/sessions/{name}/resume``    — remove the marker.
   Idempotent.
@@ -61,14 +64,21 @@ Design notes
 
 * **Pause / resume — informational only.** No existing supervisor /
   recovery / dispatch loop consumes the pause marker today, so this
-  surface is documented as **informational** (the cockpit + this API's
-  ``GET /sessions`` surface ``status="paused"``, but background loops
-  still act on the session). The response ``message`` and OpenAPI
-  description both call this out so operators are not misled into
-  thinking the marker quiesces the daemon. Daemon-side enforcement is
-  a follow-up (issue filed in the PR). Both operations are idempotent
-  and return 200, and concurrent writes are serialised by an
-  ``fcntl.flock`` on the marker file.
+  surface is documented as **informational**. Crucially, the marker
+  is exposed as a *separate* ``paused: bool`` field on the
+  ``SessionInfo`` row rather than as a value of ``status`` (Codex
+  PR #2061 round 2). Folding it into ``status`` was incoherent with
+  the round-1 "informational only" stance: a paused-but-missing
+  session reported ``status="paused"`` and operators believed the
+  daemon had quiesced when in fact the session was simply absent.
+  Now ``status`` reflects pure runtime health (``healthy`` /
+  ``stale`` / ``missing`` / ``unknown``) and ``paused`` carries the
+  operator intent. The response ``message`` and OpenAPI description
+  both call this out so operators are not misled into thinking the
+  marker quiesces the daemon. Daemon-side enforcement is tracked as
+  follow-up #2068. Both operations are idempotent and return 200,
+  and concurrent writes are serialised by an ``fcntl.flock`` on the
+  marker file.
 
 * **pg outages → 503.** ``GET`` endpoints downgrade pg outages to a
   best-effort response (``status="unknown"`` on the affected row).
@@ -138,11 +148,15 @@ class SessionInfo(BaseModel):
     window_name: str
     tmux_session: str
     window_present: bool
-    status: Literal["healthy", "stale", "missing", "unknown", "paused"]
+    status: Literal["healthy", "stale", "missing", "unknown"]
     last_heartbeat_iso: str | None = None
     last_heartbeat_age_seconds: int | None = None
     auth_token_present: bool
     enabled: bool
+    # Informational marker (Codex PR #2061 round 2). Decoupled from
+    # ``status`` so a paused-but-missing or paused-but-stale session
+    # still reports its true runtime health — the daemon does NOT
+    # consume this marker today (see #2068).
     paused: bool = False
 
 
@@ -291,17 +305,22 @@ def _classify_status(
     *,
     window_present: bool,
     age_seconds: int | None,
-    paused: bool,
 ) -> str:
-    """Return one of healthy/stale/missing/unknown/paused.
+    """Return one of healthy/stale/missing/unknown.
 
-    Matches :func:`pollypm.cli_features.sessions_health._classify_status`
-    except we surface ``paused`` first — operator intent overrides the
-    runtime signals (a paused session may still have a healthy pane,
-    but the cockpit / recovery loop should treat it as quiesced).
+    Mirrors :func:`pollypm.cli_features.sessions_health._classify_status`
+    exactly: a pure runtime-health classification derived from tmux
+    presence + heartbeat age.
+
+    The pause marker is intentionally NOT consulted here (Codex PR
+    #2061 round 2). Pause is informational only — the supervisor /
+    recovery / dispatch loops do not consume it (#2068) — so folding
+    it into ``status`` would mask the real runtime state and let an
+    operator believe they had quiesced the daemon when in fact a
+    paused-but-missing session was reporting ``status="paused"``
+    instead of ``status="missing"``. Callers consume the separate
+    :attr:`SessionInfo.paused` boolean for the informational signal.
     """
-    if paused:
-        return "paused"
     if not window_present:
         return "missing"
     if age_seconds is None:
@@ -485,7 +504,6 @@ def _build_session_info(
     status = _classify_status(
         window_present=window_present,
         age_seconds=age,
-        paused=paused,
     )
     auth_token_present = bool(getattr(session, "auth_token", "") or "")
     return SessionInfo(
@@ -686,9 +704,12 @@ def _find_session(config: Any, name: str) -> Any:
 def list_sessions_endpoint(config: ConfigDep) -> SessionsListResponse:
     """GET /api/v1/sessions — mirror ``pm sessions``.
 
-    Returns one row per configured (and enabled) session. ``paused``
-    rows come from the pause marker (see :func:`_load_paused_names`);
-    ``status`` follows the same thresholds the CLI uses.
+    Returns one row per configured (and enabled) session. ``status``
+    is the pure runtime-health classification (``healthy`` / ``stale``
+    / ``missing`` / ``unknown``) and follows the same thresholds the
+    CLI uses. ``paused`` is a separate informational boolean drawn
+    from the pause marker (see :func:`_load_paused_names`) and does
+    NOT influence ``status`` — see :func:`_classify_status` for why.
     """
     storage_session = _storage_session_name(config)
     windows = _list_storage_closet_windows(storage_session)
@@ -856,8 +877,12 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
 
     Writes ``<base_dir>/paused-sessions.json`` (atomic tmp+rename,
     serialised via ``fcntl.flock`` against concurrent pause/resume
-    callers) so ``GET /api/v1/sessions`` can surface
-    ``status="paused"``. Idempotent: pausing an already-paused
+    callers) so ``GET /api/v1/sessions`` surfaces ``paused=true`` on
+    the affected row. The ``status`` field continues to reflect
+    actual runtime health (``healthy`` / ``stale`` / ``missing`` /
+    ``unknown``) — a paused-but-missing session reports
+    ``status="missing"`` AND ``paused=true``, not ``status="paused"``
+    (Codex PR #2061 round 2). Idempotent: pausing an already-paused
     session returns 200 with no state change.
     """
     _find_session(config, name)  # 404 if unknown

@@ -139,6 +139,28 @@ class HeartbeatUnavailable(Exception):
     """
 
 
+class _WorkerFacadeUnavailable(Exception):
+    """Raised when the work-service open/list itself failed.
+
+    Codex #2043 review v6 blocker 1: the *public* facade
+    :func:`pollypm.web_api.service.list_active_worker_sessions` catches
+    ``_open_work_service_readonly`` open failures and
+    ``list_worker_sessions`` read failures, returning ``[]`` in both
+    cases. That collapsed "no active workers" and "could not query
+    workers" into the same signal — so a real pg outage on a
+    ``task-<project>-<n>`` send fell out as ``404 session_unknown``
+    instead of ``503 service_unavailable``.
+
+    The strict worker-lookup path
+    (:func:`_list_worker_sessions_strict`) bypasses the public facade
+    and re-raises the underlying exception wrapped in this typed class
+    so :func:`_resolve_surface` can map it to a typed 503. The public
+    facade is unchanged — non-strict callers (e.g. read endpoints that
+    legitimately want "best-effort list, empty on failure") still get
+    the swallow-and-return-`[]` behavior.
+    """
+
+
 # Per-spec §2.3 — worker sessions follow ``task-<project>-<n>``. The
 # pattern check below lets ``_resolve_surface`` skip the worker facade
 # for sessions that syntactically cannot be workers, avoiding a pg hit
@@ -235,13 +257,21 @@ class ChatSendResponse(BaseModel):
 
 
 def _session_unknown(session_name: str) -> APIError:
+    # Codex #2043 review v6 blocker 3: do not advertise
+    # ``GET /api/v1/chat/sessions`` here — that endpoint ships in
+    # #2045 and is still blocked. This PR (send-only) stays
+    # independently mergeable by pointing the operator at surfaces
+    # they can enumerate today (CLI / config).
     return APIError(
         status_code=404,
         code="session_unknown",
         message=f"No chat surface registered for session: {session_name!r}",
         hint=(
-            "Use GET /api/v1/chat/sessions to discover registered surfaces. "
-            "Per-task workers must appear in WorkService.list_worker_sessions."
+            "List available sessions via the `pm sessions` CLI or "
+            "`pollypm.toml` (`[sessions.*]` for operator/architect/"
+            "advisor, `task-{project}-{N}` for active workers). "
+            "Per-task workers must appear in "
+            "`WorkService.list_worker_sessions(active_only=True)`."
         ),
     )
 
@@ -452,14 +482,66 @@ def _selections_invalid(invalid: list[str], valid: list[str]) -> APIError:
 def _list_worker_sessions(config: Any) -> list[Any]:
     """Return active :class:`WorkerSessionRecord` rows or ``[]``.
 
-    Delegates to the public service-layer facade. Tests monkeypatch
-    this module-level name (``chat_send_routes._list_worker_sessions``)
-    to feed fake records into :func:`_resolve_surface`. Raises any
-    exception from the underlying facade so the resolver can map
-    worker-pattern lookup failure to a typed 503 — see the
-    ``_resolve_surface`` body for that mapping.
+    Delegates to the public service-layer facade. Kept for any
+    non-strict caller / test scaffolding that wants the empty-on-
+    outage behavior. The strict send path uses
+    :func:`_list_worker_sessions_strict` instead — see Codex #2043
+    review v6 blocker 1 for why the strict path bypasses this facade.
     """
     return list(list_active_worker_sessions(config)) or []
+
+
+def _list_worker_sessions_strict(config: Any) -> list[Any]:
+    """Strict worker-lookup: bypass the public facade.
+
+    Codex #2043 review v6 blocker 1: the public facade
+    :func:`pollypm.web_api.service.list_active_worker_sessions`
+    swallows ``_open_work_service_readonly`` open failures and
+    ``list_worker_sessions`` read failures and returns ``[]``. That
+    conflates "no active workers" with "could not query workers", so
+    a real pg / work-service outage on a ``task-<project>-<n>`` send
+    fell out as ``404 session_unknown`` instead of
+    ``503 service_unavailable``. The v5 wrapper *would* have re-raised
+    if the facade itself raised, but the facade never raised in
+    production — it always returned ``[]``.
+
+    This helper opens the work-service directly, so any failure on
+    the open OR the ``list_worker_sessions`` call propagates as a
+    typed :class:`_WorkerFacadeUnavailable` that :func:`_resolve_surface`
+    maps to ``503 service_unavailable``. A missing project (config
+    has no ``project``) returns ``[]`` (genuinely no workers, not an
+    outage). An empty list from a successful ``list_worker_sessions``
+    call also returns ``[]``.
+
+    Tests monkeypatch this module-level name to feed fake records or
+    simulate the outage path without touching pg. The mandatory
+    regression test for v6 monkeypatches
+    :func:`pollypm.web_api.service._open_work_service_readonly` to
+    raise, exercising the real public-facade-bypass path end-to-end.
+    """
+    project = getattr(config, "project", None)
+    if project is None:
+        return []
+    project_key = getattr(project, "name", "")
+    project_path = getattr(project, "root_dir", None)
+    if not project_key or project_path is None:
+        return []
+    try:
+        from pollypm.web_api.service import _open_work_service_readonly
+
+        with _open_work_service_readonly(
+            config=config,
+            project_key=project_key,
+            project_path=project_path,
+        ) as work_service:
+            list_fn = getattr(work_service, "list_worker_sessions", None)
+            if not callable(list_fn):
+                return []
+            return list(list_fn(active_only=True))
+    except _WorkerFacadeUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _WorkerFacadeUnavailable(str(exc) or type(exc).__name__) from exc
 
 
 # ---------------------------------------------------------------------------
@@ -492,18 +574,36 @@ def _resolve_surface(config: Any, session_name: str) -> ChatSurface:
     is_worker_pattern = _looks_like_worker_session(session_name)
     worker_records: list[Any]
     if is_worker_pattern:
+        # Strict path: bypass the public facade so open/list outages
+        # propagate as :class:`_WorkerFacadeUnavailable` and map to a
+        # typed 503 (Codex #2043 review v6 blocker 1). The public
+        # facade swallows those failures into ``[]``, which would
+        # collapse into ``404 session_unknown`` here.
         try:
-            worker_records = _list_worker_sessions(config)
-        except Exception as exc:  # noqa: BLE001
-            # Worker-pattern name + lookup raised → tell the operator
-            # the lookup failed instead of returning 404 (which would
-            # imply the worker definitely isn't registered).
+            worker_records = _list_worker_sessions_strict(config)
+        except _WorkerFacadeUnavailable as exc:
             logger.debug(
                 "chat_send: worker session lookup failed for %r",
                 session_name,
                 exc_info=True,
             )
-            raise _service_unavailable_worker_lookup(str(exc) or type(exc).__name__) from exc
+            raise _service_unavailable_worker_lookup(
+                str(exc) or type(exc).__name__,
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            # Any other unexpected exception (test seam raising
+            # ``RuntimeError`` directly, an unhandled programming
+            # error in the helper) also routes to 503 rather than
+            # leaking a 500 — the operator's actionable signal is
+            # still "lookup failed, can't tell".
+            logger.debug(
+                "chat_send: worker session lookup raised for %r",
+                session_name,
+                exc_info=True,
+            )
+            raise _service_unavailable_worker_lookup(
+                str(exc) or type(exc).__name__,
+            ) from exc
     else:
         worker_records = []
 

@@ -454,9 +454,16 @@ paths:
       responses:
         "200":
           description: |
-            Message sent. The response header `X-PollyPM-Warning:
-            agent-may-be-streaming` may be present when
-            `safety=loose` allowed a mid-stream send.
+            Message sent. One of the following `X-PollyPM-Warning`
+            values may be present when `safety=loose` allowed the send
+            past a gate whose signal was either confirmed-streaming or
+            unavailable:
+
+            - `agent-may-be-streaming` — heartbeat < 2 s old.
+            - `heartbeat-unavailable` — pg / heartbeat lookup failed
+              (loose-mode best-effort; strict-mode 409s instead).
+            - `transcript-unavailable` — events.jsonl tail read failed
+              (loose-mode best-effort; strict-mode 409s instead).
           content:
             application/json:
               schema:
@@ -464,9 +471,27 @@ paths:
           headers:
             X-PollyPM-Warning:
               description: |
-                Set to `agent-may-be-streaming` when `safety=loose`
-                bypassed a mid-stream gate. Absent on strict sends.
-              schema: { type: string }
+                Set when `safety=loose` allowed a send past a gate that
+                would otherwise block (strict mode) or that could not be
+                evaluated (best-effort fallback). One of:
+
+                - `agent-may-be-streaming` — heartbeat indicated
+                  mid-stream (< 2 s old); loose bypassed it.
+                - `heartbeat-unavailable` — pg / heartbeat reader
+                  raised; loose continued without the signal. Strict
+                  mode would have returned `409 unsafe_unavailable_heartbeat`.
+                - `transcript-unavailable` — events.jsonl tail couldn't
+                  be read (permissions, IO error, decode failure); loose
+                  continued without the mid-tool signal. Strict mode
+                  would have returned `409 unsafe_unavailable_transcript`.
+
+                Absent on strict sends (those fail closed instead).
+              schema:
+                type: string
+                enum:
+                  - agent-may-be-streaming
+                  - heartbeat-unavailable
+                  - transcript-unavailable
         "400":
           description: |
             Typed `invalid_request`, `answer_to_missing`,
@@ -481,27 +506,60 @@ paths:
           description: |
             `session_unknown` — `session_name` is not in
             `config.sessions` and (for `task-{project}-{N}`) has no
-            active worker-session record.
+            active worker-session record. Distinguished from
+            `503 service_unavailable`, which is returned when the
+            worker-service lookup itself fails for a worker-pattern
+            name.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "409":
           description: |
-            Typed `unsafe_mid_tool`, `unsafe_mid_stream`,
-            `pane_dead`, or `pane_invalid`.
+            Typed safety-gate or pane failures:
+
+            - `unsafe_mid_tool` — agent's latest assistant response has
+              an unmatched `tool_use_id`, or the transcript resolver
+              couldn't fingerprint an exact archive while other
+              archives exist for the project.
+            - `unsafe_mid_stream` — heartbeat < 2 s old (strict).
+            - `unsafe_unavailable_transcript` — strict mode and the
+              events.jsonl tail read failed (permissions, IO error,
+              decode failure). Loose mode continues with
+              `X-PollyPM-Warning: transcript-unavailable`; force mode
+              ignores.
+            - `unsafe_unavailable_heartbeat` — strict mode and the
+              pg heartbeat lookup raised (import / `latest_heartbeat`
+              failure / malformed timestamp). Loose mode continues
+              with `X-PollyPM-Warning: heartbeat-unavailable`; force
+              mode ignores. A missing heartbeat row (no record yet)
+              is NOT unavailable — that's the genuine "not streaming"
+              signal and the send proceeds.
+            - `pane_dead` — target pane is `pane_dead=1` in tmux.
+            - `pane_invalid` — requested `pane` index is < 0, not
+              present on the window, or the `list-panes` probe failed.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: |
-            Typed `window_missing` (the surface is registered but its
-            tmux window is not running, including the race where the
-            window disappears between validation and `send-keys`),
-            `tmux_unavailable` (tmux binary missing or the tmux
-            server timed out), or `send_failed` (generic send
-            failure — subprocess error, paste-buffer load failure).
+            Typed backing-store / process failures:
+
+            - `window_missing` — the session is registered but its
+              tmux window is not running (including the race where the
+              window disappears between validation and `send-keys`).
+            - `tmux_unavailable` — tmux binary missing or the tmux
+              server timed out / is unreachable.
+            - `send_failed` — generic `send-keys` failure (subprocess
+              error, paste-buffer load failure).
+            - `service_unavailable` — worker-session lookup failed for
+              a `task-{project}-{N}` send (work-service open or
+              `list_worker_sessions` raised). Distinct from
+              `404 session_unknown`, which means the worker definitely
+              isn't registered. Retry once the work-service backing
+              store is reachable (Codex #2043 review v5 blocker 3 +
+              v6 blocker 1).
           content:
             application/json:
               schema:

@@ -115,9 +115,18 @@ def _default_no_workers(monkeypatch: pytest.MonkeyPatch):
     Tests that need worker validation override this via
     :func:`_patch_worker_sessions`. Keeps the router off the real
     work-service factory (pg) during unit tests.
+
+    Both the legacy facade-wrapped seam (``_list_worker_sessions``)
+    and the v6 strict seam (``_list_worker_sessions_strict``) are
+    patched: the route reads the strict seam now (Codex #2043 review
+    v6 blocker 1) but tests that pre-date v6 still reach for the
+    legacy name and we want them to keep working.
     """
     monkeypatch.setattr(
         chat_send_routes, "_list_worker_sessions", lambda config: [],
+    )
+    monkeypatch.setattr(
+        chat_send_routes, "_list_worker_sessions_strict", lambda config: [],
     )
 
 
@@ -299,15 +308,26 @@ def _patch_worker_sessions(
     monkeypatch: pytest.MonkeyPatch,
     records: list[FakeWorkerSessionRecord],
 ) -> None:
-    """Make :func:`chat_send._list_worker_sessions` return ``records``.
+    """Make the chat-send worker seams return ``records``.
 
     Avoids spinning up pg / the work-service in the router-level tests
     — the gate we actually care about is whether the resolver accepts
     a session_name only when the active worker-session row exists.
+
+    Patches both the legacy facade-wrapped seam and the v6 strict
+    seam so tests work regardless of which one the production code
+    paths through (Codex #2043 review v6 blocker 1 swung the live
+    route from ``_list_worker_sessions`` to
+    ``_list_worker_sessions_strict``).
     """
     monkeypatch.setattr(
         chat_send_routes,
         "_list_worker_sessions",
+        lambda config: list(records),
+    )
+    monkeypatch.setattr(
+        chat_send_routes,
+        "_list_worker_sessions_strict",
         lambda config: list(records),
     )
 
@@ -2090,6 +2110,9 @@ def test_operator_send_does_not_open_worker_facade(
         return []
 
     monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _track)
+    monkeypatch.setattr(
+        chat_send_routes, "_list_worker_sessions_strict", _track,
+    )
 
     response = client.post(
         "/api/v1/chat/operator/send",
@@ -2119,6 +2142,9 @@ def test_architect_send_does_not_open_worker_facade(
         return []
 
     monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _track)
+    monkeypatch.setattr(
+        chat_send_routes, "_list_worker_sessions_strict", _track,
+    )
 
     response = client.post(
         "/api/v1/chat/architect_myproj/send",
@@ -2145,7 +2171,13 @@ def test_worker_session_send_calls_worker_facade(
         call_count["n"] += 1
         return [FakeWorkerSessionRecord(task_project="myproj", task_number=42)]
 
+    # Route reads the strict seam now (Codex v6 blocker 1). Patching
+    # the legacy seam too keeps the assertion stable if a future
+    # refactor swaps which one runs first.
     monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _track)
+    monkeypatch.setattr(
+        chat_send_routes, "_list_worker_sessions_strict", _track,
+    )
 
     response = client.post(
         "/api/v1/chat/task-myproj-42/send",
@@ -2175,7 +2207,12 @@ def test_worker_facade_failure_returns_503_service_unavailable(
     def _raise(config):  # noqa: ARG001
         raise RuntimeError("pg pool exhausted")
 
+    # v6: route reads the strict seam — patch it so the synthetic
+    # outage is what _resolve_surface actually sees.
     monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _raise)
+    monkeypatch.setattr(
+        chat_send_routes, "_list_worker_sessions_strict", _raise,
+    )
 
     response = client.post(
         "/api/v1/chat/task-myproj-42/send",
@@ -2202,6 +2239,9 @@ def test_non_worker_session_with_worker_facade_failure_still_404(
         raise RuntimeError("would fail if asked")
 
     monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _raise)
+    monkeypatch.setattr(
+        chat_send_routes, "_list_worker_sessions_strict", _raise,
+    )
 
     response = client.post(
         "/api/v1/chat/arbitrary-name/send",
@@ -2222,3 +2262,117 @@ def test_looks_like_worker_session_pattern() -> None:
     assert not chat_send_routes._looks_like_worker_session("task-myproj")
     assert not chat_send_routes._looks_like_worker_session("task-myproj-abc")
     assert not chat_send_routes._looks_like_worker_session("task--42")
+
+
+# ---------------------------------------------------------------------------
+# Codex #2043 review v6 blocker 1 — strict path bypasses public facade
+# ---------------------------------------------------------------------------
+
+
+def test_real_open_work_service_failure_returns_503(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review v6 blocker 1 — real facade-outage path.
+
+    Pre-v6 the v5 regression test monkeypatched
+    ``_list_worker_sessions`` directly, but the live facade
+    :func:`pollypm.web_api.service.list_active_worker_sessions`
+    catches ``_open_work_service_readonly`` failures and returns
+    ``[]`` — so a real pg outage still collapsed into a misleading
+    ``404 session_unknown`` in production.
+
+    The v6 fix in chat_send.py routes the strict worker lookup
+    through :func:`_list_worker_sessions_strict`, which opens
+    :func:`pollypm.web_api.service._open_work_service_readonly`
+    directly and propagates failures as
+    :class:`_WorkerFacadeUnavailable` → ``503 service_unavailable``.
+
+    This test exercises the real public-facade-bypass path: we
+    monkeypatch the contextmanager so it raises on enter, then verify
+    a worker-pattern POST returns 503 (NOT 404) and the autouse
+    ``_default_no_workers`` patch doesn't short-circuit the new path.
+    """
+    _set_storage_closet_windows(patched_tmux, ["task-myproj-7"])
+    _patch_heartbeat_age(monkeypatch, None)
+
+    # Override the autouse fixture's strict-seam stub so the strict
+    # helper actually executes (and reaches the real
+    # ``_open_work_service_readonly``).
+    monkeypatch.setattr(
+        chat_send_routes,
+        "_list_worker_sessions_strict",
+        chat_send_routes._list_worker_sessions_strict.__wrapped__
+        if hasattr(chat_send_routes._list_worker_sessions_strict, "__wrapped__")
+        else chat_send_routes._list_worker_sessions_strict,
+    )
+
+    import pollypm.web_api.service as service_mod
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _boom(*args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("pg pool down")
+        yield  # pragma: no cover — generator protocol shim
+
+    monkeypatch.setattr(service_mod, "_open_work_service_readonly", _boom)
+
+    response = client.post(
+        "/api/v1/chat/task-myproj-7/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    assert response.json()["error"]["code"] == "service_unavailable"
+    assert "pg pool down" in response.json()["error"]["message"]
+
+
+def test_list_worker_sessions_strict_returns_empty_when_no_workers(
+    api_config: PollyPMConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct unit: strict helper returns ``[]`` for a real empty list.
+
+    A successful ``_open_work_service_readonly`` whose
+    ``list_worker_sessions`` returns ``[]`` is the genuine "no active
+    workers" case — must NOT raise. Only open/list failures raise.
+    """
+    from contextlib import contextmanager
+
+    class _StubSvc:
+        @staticmethod
+        def list_worker_sessions(*, active_only: bool = True) -> list[Any]:
+            return []
+
+    @contextmanager
+    def _stub(*args, **kwargs):  # noqa: ARG001
+        yield _StubSvc()
+
+    import pollypm.web_api.service as service_mod
+
+    monkeypatch.setattr(service_mod, "_open_work_service_readonly", _stub)
+
+    assert chat_send_routes._list_worker_sessions_strict(api_config) == []
+
+
+def test_list_worker_sessions_strict_raises_typed_on_facade_open_failure(
+    api_config: PollyPMConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct unit: open failure → :class:`_WorkerFacadeUnavailable`."""
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _boom(*args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("connect refused")
+        yield  # pragma: no cover
+
+    import pollypm.web_api.service as service_mod
+
+    monkeypatch.setattr(service_mod, "_open_work_service_readonly", _boom)
+
+    with pytest.raises(chat_send_routes._WorkerFacadeUnavailable):
+        chat_send_routes._list_worker_sessions_strict(api_config)

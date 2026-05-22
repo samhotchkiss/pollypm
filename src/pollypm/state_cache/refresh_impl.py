@@ -35,7 +35,6 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -67,38 +66,15 @@ def build_refresh_fn(
     a config reload during a long-running cockpit picks up the new
     paths automatically.
 
-    PR #2026 review: the closure also memoises a single ``store``
-    (StateStore) across refresh calls and reuses it for the
-    heartbeat-prefetch path. Without this, every per-project refresh
-    would build a fresh ``Supervisor(load_config(DEFAULT_CONFIG_PATH))``
-    inside :func:`_heartbeats_for_sessions` — heavy supervisor/store
-    setup on the cache's hot path, AND wrong-config when the cockpit
-    was launched against a non-default config. The cached store is
-    keyed by ``id(config)``: a config reload (new instance) drops the
-    old store and lazily opens a new one against the active config.
+    PR #2026 re-review: heartbeat prefetch now routes through the
+    pg facade (``pollypm.storage.pg_heartbeats.latest_heartbeat``)
+    instead of opening a legacy sqlite state store. The previous
+    memoised-store shim conflicted with the no-sqlite runtime
+    direction (#1737 / #2039) and returned the wrong rows when the
+    active backend was Postgres. The pg facade owns its own pool, so
+    there's nothing to memoise in this closure anymore — the refresh
+    function is a thin config-provider wrapper.
     """
-
-    # Cached (id(config), store) tuple. ``id(config)`` flips when the
-    # provider returns a freshly-loaded config object, so a reload
-    # transparently invalidates this slot without an explicit hook.
-    cached_store: dict[str, Any] = {"config_id": None, "store": None}
-
-    def _store_for(config: Any) -> Any | None:
-        """Return a StateStore for ``config``, reused across refreshes."""
-
-        try:
-            current_id = id(config)
-        except Exception:  # noqa: BLE001
-            return None
-        if (
-            cached_store["store"] is not None
-            and cached_store["config_id"] == current_id
-        ):
-            return cached_store["store"]
-        store = _open_store(config)
-        cached_store["config_id"] = current_id
-        cached_store["store"] = store
-        return store
 
     def _refresh(project_key: str) -> ProjectStateCacheEntry | None:
         try:
@@ -111,51 +87,13 @@ def build_refresh_fn(
                 exc_info=True,
             )
             return empty_entry(project_key)
-        store = _store_for(config)
-        return compute_entry_for_project(project_key, config, store=store)
+        return compute_entry_for_project(project_key, config)
 
     return _refresh
 
 
-def _open_store(config: Any) -> Any | None:
-    """Open a :class:`StateStore` against ``config`` for heartbeat reads.
-
-    PR #2026 review: replaces the per-project
-    ``Supervisor(load_config(DEFAULT_CONFIG_PATH))`` init inside
-    :func:`_heartbeats_for_sessions`. We don't need the full
-    Supervisor — only ``store.latest_heartbeat(session_name)`` —
-    so we open the StateStore directly against the injected config's
-    ``state_db`` path. Read-only because the refresher never writes.
-    Failures degrade silently to ``None``; the heartbeat prefetch
-    then returns ``{}`` and the rail's direct fall-through covers
-    the gap.
-    """
-
-    try:
-        from pollypm.storage.state import StateStore
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "state_cache: StateStore import failed; "
-            "heartbeat prefetch disabled",
-            exc_info=True,
-        )
-        return None
-    try:
-        state_db = getattr(getattr(config, "project", None), "state_db", None)
-        if not state_db:
-            return None
-        return StateStore(state_db, readonly=True)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "state_cache: StateStore open failed; "
-            "heartbeat prefetch disabled",
-            exc_info=True,
-        )
-        return None
-
-
 def compute_entry_for_project(
-    project_key: str, config: Any, *, store: Any | None = None,
+    project_key: str, config: Any,
 ) -> ProjectStateCacheEntry:
     """Recompute the entry for ``project_key`` against ``config``.
 
@@ -188,14 +126,10 @@ def compute_entry_for_project(
     # so cockpit_rail can short-circuit its per-project ``latest_heartbeat()``
     # calls. Best-effort: failures degrade silently to an empty mapping
     # (the rail's fall-through path re-fetches direct).
-    # PR #2026 review: ``store`` is threaded from ``build_refresh_fn`` so
-    # we reuse a single StateStore across the refresh pass instead of
-    # building ``Supervisor(load_config(DEFAULT_CONFIG_PATH))`` per
-    # project. When called without a store (tests, ad-hoc callers) we
-    # skip the heartbeat prefetch entirely — the rail's direct fall-through
-    # covers the gap.
+    # PR #2026 re-review: routes through the pg heartbeats facade —
+    # no more legacy sqlite state-store dependency in state_cache.
     latest_heartbeat_by_session = _heartbeats_for_sessions(
-        live_workers, store=store,
+        live_workers, config=config,
     )
 
     entry = ProjectStateCacheEntry(
@@ -423,7 +357,7 @@ def _categorize_and_rollup(
 def _heartbeats_for_sessions(
     live_workers: list[Any],
     *,
-    store: Any | None = None,
+    config: Any | None = None,
 ) -> dict[str, Any]:
     """Return ``{session_name: HeartbeatRecord}`` for ``live_workers``.
 
@@ -436,20 +370,40 @@ def _heartbeats_for_sessions(
     The mapping is keyed by ``session.name`` (matching the rail's
     ``_session_name_for_item`` resolution path) — NOT by task identity.
 
-    PR #2026 review: ``store`` is passed in from
-    :func:`build_refresh_fn`, which memoises it across the entire
-    refresh pass and rebuilds only when the active config changes
-    (keyed by ``id(config)``). Previously this function built a
-    ``Supervisor(load_config(DEFAULT_CONFIG_PATH))`` per project,
-    which (a) reintroduced heavy supervisor/store setup on the very
-    hot path the cache exists to flatten, and (b) ignored the
-    injected config — a cockpit launched against a non-default config
-    would read heartbeats from the wrong workspace. With ``store=None``
-    we skip the prefetch and let the rail's direct fall-through
-    handle it (correct behaviour, just no perf win for that pass).
+    PR #2026 re-review: routes strictly through
+    :func:`pollypm.storage.pg_heartbeats.latest_heartbeat`. The
+    previous implementation opened a legacy sqlite state store
+    against the per-project sqlite db, which (a) reintroduced a
+    sqlite dependency the no-sqlite runtime track (#1737, #2039)
+    had just removed, and (b) returned stale rows when the active
+    backend was Postgres (the unified ``heartbeats`` table lives in
+    pg post-cutover).
+
+    Any pg failure — import error, connection failure, per-session
+    query error — is swallowed and surfaces as a missing key in the
+    returned mapping. Downstream consumers already treat a missing
+    heartbeat as ``None`` (the rail's direct fall-through then
+    re-queries). On total facade unavailability we return ``{}``,
+    matching the previous early-return shape.
+
+    Note: ``pg_heartbeats`` exposes only a per-session reader. This
+    function issues N individual ``latest_heartbeat(name)`` calls.
+    A bulk ``latest_heartbeats(names)`` facade would let us collapse
+    these into one SELECT and is worth adding once another caller
+    needs it — flagged in the commit message but out of scope here.
     """
 
-    if not live_workers or store is None:
+    if not live_workers:
+        return {}
+
+    try:
+        from pollypm.storage.pg_heartbeats import latest_heartbeat
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "state_cache: pg_heartbeats import failed; "
+            "heartbeat prefetch disabled",
+            exc_info=True,
+        )
         return {}
 
     out: dict[str, Any] = {}
@@ -463,7 +417,7 @@ def _heartbeats_for_sessions(
         if not session_name:
             continue
         try:
-            heartbeat = store.latest_heartbeat(session_name)
+            heartbeat = latest_heartbeat(session_name, config=config)
         except Exception:  # noqa: BLE001
             heartbeat = None
         if heartbeat is not None:

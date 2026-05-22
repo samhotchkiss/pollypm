@@ -359,35 +359,204 @@ def test_run_with_fix_false_does_not_invoke_fixes(client, auth_headers, patch_re
 def test_run_504_when_check_exceeds_budget(
     client, auth_headers, patch_registry, monkeypatch,
 ):
-    """A check overrunning the wall-clock budget surfaces 504 timeout."""
+    """A real hanging check surfaces 504 within the budget (P0 round-1).
+
+    Earlier revisions of this test stubbed ``time.monotonic`` after
+    ``run_checks`` returned — that only proved post-facto
+    classification. The real contract is that the HTTP request worker
+    is bounded: a check that blocks past the budget must produce 504
+    on time. We sleep longer than the budget in a stubbed
+    ``run_checks`` and assert (a) status code, (b) wall-clock
+    response time stays within budget + small slack (the executor
+    abandons the worker thread rather than waiting for it).
+    """
+    import time as _time
+
     patch_registry([_check("alpha", _ok("alpha"))])
 
-    # Stub ``run_checks`` to claim a long elapsed time without sleeping.
-    fake_report = DoctorReport()
-    fake_report.duration_seconds = 999.0
+    hang_event = __import__("threading").Event()
 
-    def fake_run_checks(checks):  # type: ignore[no-untyped-def]
-        return fake_report
+    def hanging_run_checks(checks):  # type: ignore[no-untyped-def]
+        # Block well past the request budget. The route's executor
+        # abandons this thread on timeout; ``hang_event`` lets the
+        # test release it cleanly after assertions.
+        hang_event.wait(timeout=30.0)
+        return DoctorReport()
 
-    monkeypatch.setattr(doctor_routes, "run_checks", fake_run_checks)
-    # Force the monotonic clock to report a huge gap so the budget
-    # check triggers regardless of how fast the fake runner returns.
-    counter = {"t": 0.0}
+    monkeypatch.setattr(doctor_routes, "run_checks", hanging_run_checks)
 
-    def fake_monotonic() -> float:
-        counter["t"] += 100.0
-        return counter["t"]
-
-    monkeypatch.setattr(doctor_routes.time, "monotonic", fake_monotonic)
+    t0 = _time.monotonic()
     response = client.post(
         "/api/v1/doctor/run",
         headers=auth_headers,
         json={"check": "alpha"},
-        params={"timeout_seconds": 5},
+        params={"timeout_seconds": 1},
     )
+    elapsed = _time.monotonic() - t0
+
+    # Release the leaked worker thread so the suite shuts down cleanly.
+    hang_event.set()
+
     assert response.status_code == 504
     body = response.json()
     assert body["error"]["code"] == "timeout"
+    # The 504 must return within budget + slack (executor + HTTP + asserts).
+    # If the request waited for the hanging thread, this would be ~30s.
+    assert elapsed < 5.0, f"504 took {elapsed:.1f}s; should be near 1s budget"
+
+
+def test_run_fix_serialized_under_concurrency(
+    client, auth_headers, patch_registry, monkeypatch,
+):
+    """Two concurrent ``fix=true`` calls: one succeeds, one returns 409.
+
+    Single-flight is enforced via ``_FIX_OPERATION_LOCK`` on the
+    route module. We hold ``apply_fixes`` long enough for the second
+    request to race in, then assert exactly one 200 and one 409
+    ``conflict`` (Codex round-1 P0 on PR #2058).
+    """
+    import threading
+
+    counter = {"n": 0}
+
+    def stateful_run() -> CheckResult:
+        counter["n"] += 1
+        return _fail("alpha", fixable=True) if counter["n"] % 2 == 1 else _ok("alpha")
+
+    check = Check(name="alpha", run=stateful_run, category="test", severity="error")
+    patch_registry([check])
+
+    # Block ``apply_fixes`` so the first request holds the operation
+    # lock long enough for the second one to race in and 409.
+    release = threading.Event()
+    in_flight = threading.Event()
+    real_apply = doctor_routes.apply_fixes
+
+    def slow_apply_fixes(report):  # type: ignore[no-untyped-def]
+        in_flight.set()
+        release.wait(timeout=10.0)
+        return real_apply(report)
+
+    monkeypatch.setattr(doctor_routes, "apply_fixes", slow_apply_fixes)
+
+    results: list[int] = []
+    bodies: list[dict[str, Any]] = []
+
+    def fire():
+        resp = client.post(
+            "/api/v1/doctor/run",
+            headers=auth_headers,
+            json={"check": "alpha", "fix": True},
+        )
+        results.append(resp.status_code)
+        bodies.append(resp.json())
+
+    t1 = threading.Thread(target=fire, daemon=True)
+    t1.start()
+    # Wait for the first request to enter ``apply_fixes`` so the
+    # operation lock is definitely held when the second fires.
+    assert in_flight.wait(timeout=5.0), "first request never entered apply_fixes"
+
+    t2 = threading.Thread(target=fire, daemon=True)
+    t2.start()
+    t2.join(timeout=5.0)
+
+    # Release the first request and wait for it to finish.
+    release.set()
+    t1.join(timeout=10.0)
+
+    assert sorted(results) == [200, 409], f"expected one 200 + one 409, got {results}"
+    busy_body = next(b for b, code in zip(bodies, results) if code == 409)
+    assert busy_body["error"]["code"] == "conflict"
+
+
+def test_run_rejected_for_non_default_config(
+    auth_headers, token, patch_registry, workspace, project_root, tmp_path,
+):
+    """``pm serve --config /tmp/foo`` → doctor refuses with 400.
+
+    Doctor checks load ``DEFAULT_CONFIG_PATH`` internally; a
+    non-default config would cause the route to report on / mutate
+    the wrong workspace (Codex round-1 P0 on PR #2058). The reject
+    path covers all three endpoints — assert on POST /run as the
+    write surface that matters most.
+    """
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+    )
+    from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
+
+    base_dir = workspace / ".pollypm"
+    fake_path = tmp_path / "custom" / "pollypm.toml"
+    fake_path.parent.mkdir()
+    fake_path.write_text("# fake non-default config\n")
+
+    cfg = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "myproj": KnownProject(
+                key="myproj",
+                path=project_root,
+                name="My Project",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+    )
+    cfg.config_path = fake_path  # non-default
+
+    token_path, _value = token
+    app = create_app(config=cfg, token_path=token_path)
+    custom_client = TestClient(app)
+
+    patch_registry([_check("alpha", _ok("alpha"))])
+
+    resp = custom_client.post(
+        "/api/v1/doctor/run",
+        headers=auth_headers,
+        json={"check": "alpha", "fix": True},
+    )
+    assert resp.status_code == 400
+    body = resp.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "default config" in body["error"]["message"].lower()
+
+    # Also covers GET endpoints.
+    resp_checks = custom_client.get("/api/v1/doctor/checks", headers=auth_headers)
+    assert resp_checks.status_code == 400
 
 
 def test_run_requires_auth(client, patch_registry):

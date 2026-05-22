@@ -24,6 +24,7 @@ the cache via :func:`_reset_last_report` so cases don't leak state.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import threading
 import time
@@ -32,6 +33,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
+from pollypm.config import DEFAULT_CONFIG_PATH
 from pollypm.doctor import (
     Check,
     CheckResult,
@@ -43,7 +45,7 @@ from pollypm.doctor import (
     _auto_fix_supported,  # type: ignore[attr-defined]
     _registered_checks,  # type: ignore[attr-defined]
 )
-from pollypm.web_api.errors import APIError, invalid_request, not_found
+from pollypm.web_api.errors import APIError, conflict, invalid_request, not_found
 from pollypm.web_api.routes._deps import ConfigDep
 
 logger = logging.getLogger(__name__)
@@ -150,6 +152,16 @@ class DoctorRunResponse(DoctorReportResponse):
 
 _LAST_REPORT_LOCK = threading.Lock()
 _LAST_REPORT: tuple[DoctorReport, float] | None = None
+
+
+# Operation-level single-flight lock for ``POST /doctor/run`` when
+# ``fix=true``. ``_LAST_REPORT_LOCK`` above only guards the cache slot;
+# without this second lock, two concurrent callers can each invoke
+# ``apply_fixes`` on the same filesystem/session/storage state and
+# interleave the post-fix verify writes (Codex round-1 P0 on PR #2058).
+# Acquired non-blocking — a second concurrent ``fix=true`` returns a
+# typed 409 ``busy`` rather than queueing behind the first.
+_FIX_OPERATION_LOCK = threading.Lock()
 
 
 def _record_last_report(report: DoctorReport) -> float:
@@ -281,6 +293,68 @@ def _check_timeout(name: str | None, elapsed: float) -> APIError:
     )
 
 
+def _fix_busy_error() -> APIError:
+    """Typed 409 returned when a concurrent ``fix=true`` is in flight.
+
+    Doctor fixes touch shared state (filesystem, tmux sessions, the
+    Postgres heartbeat tables); we serialize the run+fix+verify
+    sequence with :data:`_FIX_OPERATION_LOCK`. Callers that race a
+    second ``fix=true`` request get an immediate 409 ``busy`` rather
+    than blocking on the lock or running fixes a second time.
+    """
+    return conflict(
+        "Doctor fix already in progress",
+        hint=(
+            "Wait for the in-flight POST /doctor/run (fix=true) to complete, "
+            "then retry. Doctor fixes are single-flight."
+        ),
+    )
+
+
+def _reject_non_default_config(config: Any) -> None:
+    """Refuse to run doctor against a non-default config path.
+
+    Many checks/fixes in :mod:`pollypm.doctor` load
+    :data:`pollypm.config.DEFAULT_CONFIG_PATH` internally rather than
+    accepting an injected :class:`PollyPMConfig`. When ``pm serve
+    --config <path>`` is used, the endpoint would otherwise *report*
+    on (and with ``fix=true`` *mutate*) the wrong workspace — a real
+    cross-config leak (Codex round-1 P0 on PR #2058).
+
+    Until the doctor module grows a config-accepting facade, refuse
+    explicit non-default configs with a typed 400. The default config
+    path (``~/.pollypm/pollypm.toml``) is the only one the checks
+    themselves load, so passing through that case is safe.
+
+    ``config.config_path`` is ``None`` for in-memory fixtures (tests),
+    which we pass through — there's no on-disk config to disagree
+    with the checks' internal loads.
+    """
+    config_path = getattr(config, "config_path", None)
+    if config_path is None:
+        return
+    try:
+        resolved = config_path.resolve()
+        default_resolved = DEFAULT_CONFIG_PATH.resolve()
+    except OSError:
+        # Couldn't resolve (file moved between requests, transient I/O
+        # error). Compare unresolved as a fallback so we still refuse
+        # the obvious cross-config case rather than silently passing.
+        resolved = config_path
+        default_resolved = DEFAULT_CONFIG_PATH
+    if resolved == default_resolved:
+        return
+    raise invalid_request(
+        "Doctor endpoints only support the default config path",
+        hint=(
+            f"`pm serve --config {config_path}` is loaded, but doctor "
+            f"checks load `{DEFAULT_CONFIG_PATH}` internally and would "
+            "mutate the wrong workspace. Run `pm doctor` from the CLI "
+            "instead, or restart `pm serve` without --config."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Core runners (broken out for ease of testing)
 # ---------------------------------------------------------------------------
@@ -308,19 +382,54 @@ def _run_with_budget(
     name: str | None,
     timeout: float,
 ) -> DoctorReport:
-    """Run the selected checks and return a report, or 504 on overrun.
+    """Run the selected checks under a real wall-clock budget.
 
     ``run_checks`` itself doesn't honor a timeout — individual checks
-    each have their own short subprocess timeouts (see ``_run_cmd``).
-    The wall-clock overrun check below is a defensive backstop in
-    case a check hangs in pure Python (e.g. a network call that
-    bypassed the timeout helper). 504 lets the client decide whether
-    to retry the offending check in isolation.
+    each have their own short subprocess timeouts (see ``_run_cmd``),
+    but a pure-Python hang (network call, stuck storage probe, blocking
+    fix path) would otherwise hold the request worker forever.
+
+    To bound the HTTP request, we hand ``run_checks`` off to a
+    single-shot :class:`concurrent.futures.ThreadPoolExecutor` and
+    wait at most ``timeout`` seconds for the result. On overrun we
+    raise a typed 504 ``timeout`` immediately — the worker thread is
+    *not* cancelled (Python stdlib has no safe way to interrupt
+    arbitrary blocking code) and is allowed to finish in the
+    background. The HTTP caller sees the 504 within the budget; the
+    leaked thread is the accepted v1 RC tradeoff (Codex round-1 P0
+    on PR #2058).
+
+    ``DoctorThreadLeak`` is intentionally not raised on leak: the
+    leak is silent and best-effort cleanup happens when the thread
+    finally returns.
     """
     t0 = time.monotonic()
-    report = run_checks(selected)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="doctor-run",
+    )
+    try:
+        future = executor.submit(run_checks, selected)
+        try:
+            report = future.result(timeout=timeout)
+        except concurrent.futures.TimeoutError:
+            elapsed = time.monotonic() - t0
+            logger.warning(
+                "doctor: run exceeded %.1fs budget for %s; abandoning worker thread",
+                timeout,
+                name or "all checks",
+            )
+            raise _check_timeout(name, elapsed) from None
+    finally:
+        # ``wait=False`` so we don't block the request on the leaked
+        # worker thread when the budget already fired. If the future
+        # finished cleanly the shutdown is effectively a no-op.
+        executor.shutdown(wait=False)
+
     elapsed = time.monotonic() - t0
     if elapsed > timeout:
+        # Defensive: the future returned just past the deadline. Still
+        # surface 504 so the caller sees a consistent contract.
         raise _check_timeout(name, elapsed)
     return report
 
@@ -347,9 +456,10 @@ def list_doctor_checks_endpoint(config: ConfigDep) -> DoctorChecksResponse:
     # ``config`` is accepted so the dependency injection keeps the
     # auth guard active (FastAPI only resolves the dep chain when the
     # route declares one). Doctor checks themselves currently load
-    # their own config inside each probe (spec note: deferred
-    # refactor); pass-through is intentional.
-    _ = config
+    # ``DEFAULT_CONFIG_PATH`` inside each probe — :func:`_reject_non_default_config`
+    # refuses ``--config <other>`` so the catalog matches the workspace
+    # the checks would actually probe (Codex round-1 P0 on PR #2058).
+    _reject_non_default_config(config)
     checks = _registered_checks()
     return DoctorChecksResponse(checks=[_check_info(c) for c in checks])
 
@@ -369,7 +479,7 @@ def get_doctor_report_endpoint(config: ConfigDep) -> DoctorReportResponse:
     plumbed through (spec §7.1 deliberately scopes "last report" to
     the API's own surface).
     """
-    _ = config
+    _reject_non_default_config(config)
     cached = _read_last_report()
     if cached is None:
         raise not_found(
@@ -416,62 +526,82 @@ def run_doctor_endpoint(
 
     The whole sequence (run + optional fix + post-fix verify) is
     capped at ``timeout_seconds``; overrun → 504 ``timeout``.
+
+    When ``fix=true`` the run+fix+verify sequence is serialized via
+    :data:`_FIX_OPERATION_LOCK`; concurrent ``fix=true`` callers get
+    a typed 409 ``busy`` (Codex round-1 P0).
     """
-    _ = config
+    _reject_non_default_config(config)
     payload = body or DoctorRunRequest()
 
     selected = _select_checks(payload.check)
-    t0 = time.monotonic()
-    report = _run_with_budget(
-        selected, name=payload.check, timeout=timeout_seconds,
-    )
 
-    fixes_applied: list[dict[str, Any]] = []
+    # Single-flight gate for ``fix=true``. Acquire non-blocking so a
+    # second concurrent caller returns 409 immediately rather than
+    # queueing behind the in-flight fix. ``fix=false`` is read-only
+    # for our purposes (each check has its own internal locks) and
+    # is allowed to overlap.
+    fix_lock_held = False
     if payload.fix:
-        # ``apply_fixes`` skips passing/skipped checks itself — no need
-        # to filter on the caller side. Returns a list of
-        # ``(name, success, message)`` tuples; we coerce to JSON for
-        # the wire response.
-        try:
-            raw = apply_fixes(report)
-        except Exception as exc:  # noqa: BLE001 — bubble as 500 via outer handler
-            logger.exception("doctor: apply_fixes raised: %s", exc)
-            raise
-        fixes_applied = [
-            {"name": name, "ok": ok, "message": message}
-            for (name, ok, message) in raw
-        ]
+        fix_lock_held = _FIX_OPERATION_LOCK.acquire(blocking=False)
+        if not fix_lock_held:
+            raise _fix_busy_error()
 
-        # Re-run just the checks we tried to fix so the response
-        # reflects the post-fix state (issue #1063 style verification:
-        # don't trust the handler's self-report).
-        fixed_names = {entry["name"] for entry in fixes_applied}
-        if fixed_names:
-            rerun_checks = [c for c in selected if c.name in fixed_names]
-            elapsed_so_far = time.monotonic() - t0
-            remaining = timeout_seconds - elapsed_so_far
-            if remaining <= 0:
-                raise _check_timeout(payload.check, elapsed_so_far)
-            verify_report = _run_with_budget(
-                rerun_checks,
-                name=payload.check,
-                timeout=max(remaining, 1.0),
-            )
-            # Splice verify-report rows back into the original report
-            # so the response always reflects the latest state. The
-            # original report is a dataclass — build a new merged list
-            # of ``(check, result)`` tuples and mutate in place.
-            verify_index = {
-                check.name: result
-                for check, result in verify_report.results
-            }
-            merged: list[tuple[Check, CheckResult]] = []
-            for check, result in report.results:
-                replacement = verify_index.get(check.name)
-                merged.append((check, replacement if replacement else result))
-            report.results = merged
+    try:
+        t0 = time.monotonic()
+        report = _run_with_budget(
+            selected, name=payload.check, timeout=timeout_seconds,
+        )
 
-    generated_at = _record_last_report(report)
+        fixes_applied: list[dict[str, Any]] = []
+        if payload.fix:
+            # ``apply_fixes`` skips passing/skipped checks itself — no need
+            # to filter on the caller side. Returns a list of
+            # ``(name, success, message)`` tuples; we coerce to JSON for
+            # the wire response.
+            try:
+                raw = apply_fixes(report)
+            except Exception as exc:  # noqa: BLE001 — bubble as 500 via outer handler
+                logger.exception("doctor: apply_fixes raised: %s", exc)
+                raise
+            fixes_applied = [
+                {"name": name, "ok": ok, "message": message}
+                for (name, ok, message) in raw
+            ]
+
+            # Re-run just the checks we tried to fix so the response
+            # reflects the post-fix state (issue #1063 style verification:
+            # don't trust the handler's self-report).
+            fixed_names = {entry["name"] for entry in fixes_applied}
+            if fixed_names:
+                rerun_checks = [c for c in selected if c.name in fixed_names]
+                elapsed_so_far = time.monotonic() - t0
+                remaining = timeout_seconds - elapsed_so_far
+                if remaining <= 0:
+                    raise _check_timeout(payload.check, elapsed_so_far)
+                verify_report = _run_with_budget(
+                    rerun_checks,
+                    name=payload.check,
+                    timeout=max(remaining, 1.0),
+                )
+                # Splice verify-report rows back into the original report
+                # so the response always reflects the latest state. The
+                # original report is a dataclass — build a new merged list
+                # of ``(check, result)`` tuples and mutate in place.
+                verify_index = {
+                    check.name: result
+                    for check, result in verify_report.results
+                }
+                merged: list[tuple[Check, CheckResult]] = []
+                for check, result in report.results:
+                    replacement = verify_index.get(check.name)
+                    merged.append((check, replacement if replacement else result))
+                report.results = merged
+
+        generated_at = _record_last_report(report)
+    finally:
+        if fix_lock_held:
+            _FIX_OPERATION_LOCK.release()
     base = _build_report_response(report, generated_at=generated_at)
     return DoctorRunResponse(
         generated_at=base.generated_at,
@@ -495,6 +625,7 @@ __all__ = [
     "DoctorReportResponse",
     "DoctorRunRequest",
     "DoctorRunResponse",
+    "_FIX_OPERATION_LOCK",
     "_reset_last_report",
     "get_doctor_report_endpoint",
     "list_doctor_checks_endpoint",

@@ -162,10 +162,11 @@ _AWAITS_USER_TTL_SECONDS = 1.0
 _AWAITS_USER_CACHE: dict[int, tuple[float, tuple[object, ...]]] = {}
 
 
-# Move A PR 2 — divergence sampler for the cache-routed fast path
-# (``docs/design/move-a-state-cache.md`` §6.2 last bullet). One
-# counter per routed call site so the sampling rate is local; the
-# busy site doesn't borrow samples from a quiet site.
+# Move A PR 4 — cache fall-through gate for the cache-routed fast path
+# (``docs/design/move-a-state-cache.md`` §6.2). No runtime sampling
+# (deferred per #2050). Counter retained as a historical test-only
+# helper; production fall-through is gated by config-identity + partial
+# cache + workspace-root + actionable-rail-alerts checks.
 _AWAITS_USER_DIVERGENCE_COUNTER = _DivergenceCounter()
 
 

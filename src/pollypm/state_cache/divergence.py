@@ -36,9 +36,9 @@ __all__ = [
 ]
 
 
-# 1-in-N sampling cadence. Constant so the §8 acceptance gate ("0
-# WARN lines for 24h") has a single, reviewable knob. Tests override
-# by constructing their own :class:`DivergenceCounter`.
+# 1-in-N sampling cadence. Historical / test-only. Production no-ops
+# as of PR4 (#2029). Tests override by constructing their own
+# :class:`DivergenceCounter`.
 DIVERGENCE_SAMPLE_RATE = 50
 
 
@@ -210,8 +210,8 @@ def log_divergence(call_site: str, reason: str) -> None:
     """Emit the canonical WARN line for a sampled mismatch.
 
     Centralised so log scrapers can pin a single string template
-    (``state_cache: divergence at <site>: <reason>``). PR 4 will
-    promote this to an alert once it has been silent for 14 days.
+    (``state_cache: divergence at <site>: <reason>``). Pre-PR4 design
+    rationale; superseded — no runtime sampler in production.
     """
 
     logger.warning("state_cache: divergence at %s: %s", call_site, reason)

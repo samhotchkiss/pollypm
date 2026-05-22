@@ -100,8 +100,11 @@ Added, Changed, and Removed.
   no `heartbeat.*` invalidation, so any prefetch could only serve a
   stale snapshot. Bulk heartbeat prefetch is deferred to #2050 (once
   the refresher subscribes to heartbeat audit events). Each call
-  site keeps a flag-off fall-through, so behaviour is unchanged
-  until PR 4 flips the default. Flag still defaults OFF.
+  site keeps a fall-through gate (config-identity mismatch, partial
+  cache, workspace-root inbox, actionable rail alerts). As of PR
+  #2029 (PR 4), `POLLYPM_STATE_CACHE` defaults ON; set to 0 to
+  disable. The cache is authoritative per identity-stamped
+  snapshots; rollback path is the kill-switch.
 
 ### Removed
 - Rail-side 2s TTL on `CockpitRouter._project_categorizations`

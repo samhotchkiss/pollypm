@@ -1,4 +1,8 @@
-"""Move A PR 2 parity tests — cached vs direct paths agree.
+"""Tests for the state-cache parity contract.
+
+Uses ``always=True`` on the historical :class:`DivergenceCounter` to
+exercise the test-only helper; production behavior is sampler-off per
+PR #2029.
 
 Pins ``docs/design/move-a-state-cache.md`` §6.2 / §7 / §8.4:
 
@@ -6,9 +10,6 @@ Pins ``docs/design/move-a-state-cache.md`` §6.2 / §7 / §8.4:
   ``project_state_map_from_config`` — must return semantically equal
   results on the cached-fast-path branch and the direct-DB branch
   for any config the cache has fully populated.
-* The 1-in-N divergence sampler logs a WARN when an injected
-  mismatch lands; the WARN line is the surface PR 4's telemetry gate
-  reads.
 * ``tests/test_inbox_default_lens.py``'s three-surfaces-one-predicate
   invariant (``cockpit_inbox.py:268-295``) is NOT regressed — the
   routed helper still returns identical content when the cache is on
@@ -371,7 +372,8 @@ class TestProjectStateMapParity:
 
 
 class TestDivergenceSampler:
-    """The 1-in-N sampler logs a WARN line on mismatch."""
+    """Test-only helper exercise: ``always=True`` for test setup, not
+    runtime sampling. Production is sampler-off per PR #2029."""
 
     def test_sampler_fires_on_nth_call(self) -> None:
         # PR 4: pass ``always=True`` so the cache-authoritative no-op

@@ -836,11 +836,11 @@ def restart_session_endpoint(
     """
     session = _find_session(config, name)
 
-    # Safety gate (Codex PR #2061 P0 #2 + round 6). Strict mode (the
+    # Safety gate (Codex PR #2061 P0 #2 + rounds 6+7). Strict mode (the
     # default) fails *closed* — a probe that cannot answer "is this
     # agent currently working?" must not be treated as "agent is idle".
     #
-    # The probe now reads from the SAME source as the rest of the API
+    # The probe reads from the SAME source as the rest of the API
     # contract (config + tmux direct) instead of going through
     # :class:`TmuxSessionService.is_turn_active_strict`, which depends
     # on the legacy :class:`StateStore.list_sessions()` row set. In
@@ -848,11 +848,17 @@ def restart_session_endpoint(
     # :func:`pollypm.storage.pg_sessions.upsert_session` on the launch
     # path) so the legacy store is empty/stale and the in-service
     # strict probe returned ``False`` (fail-open) for actively-working
-    # agents. ``probe_strict_turn_active`` re-resolves the configured
-    # window from ``config.sessions[name]`` →
-    # ``list_storage_closet_windows`` → direct
-    # :class:`pollypm.tmux.client.TmuxClient` calls so the answer cannot
-    # diverge from what ``GET /api/v1/sessions/{name}`` reports.
+    # agents.
+    #
+    # Round 7: the probe OWNS window discovery directly via
+    # ``TmuxClient.has_session`` / ``TmuxClient.list_windows`` so a
+    # tmux outage raises :class:`TmuxProbeUnavailable` → 503
+    # ``unsafe_mid_turn_unknown``. The previous round-6 wiring threaded
+    # the fail-soft :func:`_list_storage_closet_windows` helper into the
+    # probe, which returned ``{}`` for any tmux failure → probe saw
+    # "window absent" → returned ``False`` (looks idle) → destructive
+    # restart proceeded against an unobservable agent. The fail-soft
+    # helper is still correct for the read-side GET paths above.
     #
     # Supervisor construction is deferred until after the probe passes:
     # ``Supervisor()`` opens the legacy sqlite ``state.db`` and runs
@@ -864,14 +870,8 @@ def restart_session_endpoint(
         try:
             from pollypm.tmux.client import TmuxClient
 
-            # Reuse the same window dict the route's read-side helpers
-            # use so the probe and ``GET /api/v1/sessions/{name}``
-            # cannot diverge for the same session (Codex PR #2061
-            # round 6 single-source contract).
-            storage_session = _storage_session_name(config)
-            windows = _list_storage_closet_windows(storage_session)
             mid_turn = _probe_strict_turn_active(
-                config, name, TmuxClient(), windows=windows,
+                config, name, TmuxClient(),
             )
         except _TmuxProbeUnavailable as exc:
             raise _unsafe_mid_turn_unknown(name, str(exc)) from exc

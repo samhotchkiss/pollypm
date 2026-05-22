@@ -170,8 +170,6 @@ def probe_strict_turn_active(
     config: Any,
     session_name: str,
     tmux_client: Any,
-    *,
-    windows: dict[str, Any] | None = None,
 ) -> bool:
     """Return True iff the configured session has a live mid-turn pane.
 
@@ -181,9 +179,11 @@ def probe_strict_turn_active(
 
     * ``config.sessions[name]`` — the canonical configured-session
       registry (mirrors what ``GET /api/v1/sessions`` walks);
-    * ``windows`` (or :func:`list_storage_closet_windows`) — the live
-      tmux window inventory used to compute ``info.window_present`` on
-      ``GET /api/v1/sessions/{name}``;
+    * direct :class:`pollypm.tmux.client.TmuxClient` ``has_session`` /
+      ``list_windows`` calls — owned by the probe itself, NOT the
+      fail-soft :func:`list_storage_closet_windows` helper — so a tmux
+      outage raises :class:`TmuxProbeUnavailable` instead of looking
+      identical to "window genuinely absent" (Codex PR #2061 round 7);
     * direct :class:`pollypm.tmux.client.TmuxClient` ``list_panes`` /
       ``capture_pane`` calls against the resolved pane.
 
@@ -198,12 +198,24 @@ def probe_strict_turn_active(
     on healthy production setups and the restart proceeded to destroy
     a working pane — fail-open in the worst possible way.
 
-    ``windows`` (optional) lets the caller pass an already-computed
-    ``{window_name: TmuxWindow}`` dict (from
-    :func:`list_storage_closet_windows`) so the probe and the route's
-    ``info.window_present`` cannot diverge even with a flaky tmux
-    server between back-to-back calls. When omitted, the probe
-    computes it itself.
+    Round 7 followup: the probe NO LONGER accepts a pre-computed
+    ``windows`` dict. Threading the fail-soft
+    :func:`list_storage_closet_windows` result in let a tmux outage
+    (``{}`` returned for ``CalledProcessError`` / ``FileNotFoundError``
+    / timeout) look identical to "window genuinely absent" → probe
+    returned ``False`` (looks idle) → strict restart proceeded. The
+    probe now owns window discovery directly so it can distinguish:
+
+    * tmux call **succeeds, no matching window** → return ``False``
+      (nothing to interrupt; the relaunch can safely create a fresh
+      window).
+    * tmux call **raises** → propagate as ``TmuxProbeUnavailable`` →
+      route maps to ``503 unsafe_mid_turn_unknown`` (fail-closed).
+
+    The fail-soft :func:`list_storage_closet_windows` helper is still
+    correct for the read-side GET detail/list paths — losing tmux
+    there should degrade gracefully, not 503 a read-only summary. Only
+    the destructive restart safety gate needs the strict variant.
 
     Returns
     -------
@@ -214,16 +226,21 @@ def probe_strict_turn_active(
         ``False`` if:
         * the session isn't configured (caller's 404 lookup already
           ran, but be lenient — nothing to "be mid-turn" on),
-        * the tmux window is absent (nothing to interrupt),
-        * the pane is dead (nothing to interrupt),
+        * tmux reliably reports the storage-closet session is absent
+          (no tmux server / session not yet booted) → nothing to
+          interrupt,
+        * the tmux window is absent → nothing to interrupt,
+        * the pane is dead → nothing to interrupt,
         * or the pane text shows no active-turn marker.
 
     Raises
     ------
     TmuxProbeUnavailable
-        Any failure of ``list_panes`` / ``capture_pane`` — propagated
-        so the route maps to ``503 unsafe_mid_turn_unknown`` instead of
-        silently returning ``False``.
+        Any failure of the underlying ``TmuxClient`` calls
+        (``has_session`` / ``list_windows`` / ``list_panes`` /
+        ``capture_pane``) — propagated so the route maps to
+        ``503 unsafe_mid_turn_unknown`` instead of silently returning
+        ``False``.
     """
     sessions = getattr(config, "sessions", None) or {}
     session = sessions.get(session_name)
@@ -243,11 +260,32 @@ def probe_strict_turn_active(
     if not storage_session:
         return False
 
-    if windows is None:
-        windows = list_storage_closet_windows(storage_session)
+    # Owned window discovery (Codex PR #2061 round 7). ANY exception
+    # from the underlying tmux calls is "unknown" — raise
+    # ``TmuxProbeUnavailable`` so the route maps to 503
+    # ``unsafe_mid_turn_unknown`` instead of treating tmux outage as
+    # "window absent → safe to restart".
+    try:
+        session_present = tmux_client.has_session(storage_session)
+    except Exception as exc:  # noqa: BLE001
+        raise TmuxProbeUnavailable(
+            f"tmux.has_session failed: {exc!s}",
+        ) from exc
+    if not session_present:
+        # tmux is up and reliably reports the storage-closet session
+        # isn't there — definitive "nothing to interrupt".
+        return False
+
+    try:
+        windows_list = tmux_client.list_windows(storage_session)
+    except Exception as exc:  # noqa: BLE001
+        raise TmuxProbeUnavailable(
+            f"tmux.list_windows failed: {exc!s}",
+        ) from exc
+    windows = {getattr(w, "name", ""): w for w in windows_list}
     window = windows.get(window_name)
     if window is None:
-        # No tmux window for the configured session → nothing to
+        # tmux reliably reported no window with this name → nothing to
         # interrupt. The route may still proceed to relaunch into a
         # fresh window; the strict gate does not block that.
         return False

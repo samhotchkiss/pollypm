@@ -782,16 +782,34 @@ def test_restart_strict_blocks_when_state_store_empty_but_tmux_window_live(
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
 
     # Stub TmuxClient at the construction site so the strict probe's
-    # list_panes + capture_pane don't shell out to a real tmux. The
-    # pane text mimics Codex's mid-turn marker.
+    # has_session + list_windows + list_panes + capture_pane don't
+    # shell out to a real tmux. Round 7: the probe now owns window
+    # discovery, so the fake must implement ``has_session`` /
+    # ``list_windows`` too — not just the pane-level calls.
+    # The pane text mimics Codex's mid-turn marker.
     class _FakePane:
         def __init__(self, pane_id: str, *, active: bool = True) -> None:
             self.pane_id = pane_id
             self.active = active
 
+    class _FakeWindow:
+        def __init__(self, name: str, pane_id: str) -> None:
+            self.name = name
+            self.pane_id = pane_id
+            self.pane_dead = False
+            self.session = "pollypm-test-storage-closet"
+
     class _FakeTmuxClient:
         def __init__(self) -> None:
             self.calls: list[tuple[str, Any]] = []
+
+        def has_session(self, name: str) -> bool:
+            self.calls.append(("has_session", name))
+            return True
+
+        def list_windows(self, name: str):  # noqa: ARG002
+            self.calls.append(("list_windows", name))
+            return [_FakeWindow("operator", "%9")]
 
         def list_panes(self, target: str):  # noqa: ARG002
             self.calls.append(("list_panes", target))
@@ -838,7 +856,20 @@ def test_restart_strict_503_when_tmux_probe_raises(
 
     import subprocess
 
+    class _FakeWindow:
+        def __init__(self, name: str, pane_id: str) -> None:
+            self.name = name
+            self.pane_id = pane_id
+            self.pane_dead = False
+            self.session = "pollypm-test-storage-closet"
+
     class _FakeTmuxClient:
+        def has_session(self, name: str) -> bool:  # noqa: ARG002
+            return True
+
+        def list_windows(self, name: str):  # noqa: ARG002
+            return [_FakeWindow("operator", "%9")]
+
         def list_panes(self, target: str):  # noqa: ARG002
             return []
 
@@ -859,6 +890,151 @@ def test_restart_strict_503_when_tmux_probe_raises(
     body = response.json()
     assert body["error"]["code"] == "unsafe_mid_turn_unknown"
     assert sup.restart_calls == []
+
+
+def test_restart_strict_503_when_window_listing_raises(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_supervisor,
+):
+    """Codex PR #2061 round 7 — window listing failure → fail-closed 503.
+
+    The round-6 implementation threaded the fail-soft
+    :func:`_list_storage_closet_windows` helper into the probe; that
+    helper catches every tmux failure (``CalledProcessError``,
+    ``FileNotFoundError``, timeout, etc.) and returns ``{}``. The
+    probe then saw "no window matching this session" → returned
+    ``False`` (looks idle) → the destructive restart proceeded against
+    an unobservable agent. Round 7 fix: the probe owns window
+    discovery directly via ``TmuxClient.has_session`` /
+    ``TmuxClient.list_windows`` so a tmux failure raises
+    :class:`TmuxProbeUnavailable` → 503 ``unsafe_mid_turn_unknown``.
+
+    Pointedly we do NOT patch ``_list_storage_closet_windows`` here —
+    the round-6 path would route through that fail-soft helper and
+    swallow the ``CalledProcessError`` into ``{}`` → "absent" → 200
+    restart. Round 7 bypasses the helper entirely, so a raise from
+    ``has_session`` propagates as ``TmuxProbeUnavailable`` → 503.
+    Reproducer reference: this test FAILS against round 6 (revert the
+    ``windows=`` signature in :func:`probe_strict_turn_active` and the
+    route's ``_list_storage_closet_windows`` threading → run the test
+    → observe 200 ``ok`` with ``Supervisor.restart_session`` called
+    instead of 503).
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+
+    import subprocess
+
+    class _FakeTmuxClient:
+        """Tmux outage: has_session raises CalledProcessError."""
+
+        def has_session(self, name: str):  # noqa: ARG002
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=["tmux", "has-session"],
+            )
+
+        def list_windows(self, name: str):  # noqa: ARG002 — defensive
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=["tmux", "list-windows"],
+            )
+
+    monkeypatch.setattr(
+        "pollypm.tmux.client.TmuxClient", lambda: _FakeTmuxClient(),
+    )
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "unsafe_mid_turn_unknown"
+    # The destructive facade was NEVER touched — round 7 fail-closed.
+    assert sup.restart_calls == []
+
+
+def test_restart_strict_proceeds_when_window_genuinely_absent(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_supervisor,
+):
+    """Codex PR #2061 round 7 — definitive "no window" still allows restart.
+
+    The fail-closed gate added in round 7 must NOT regress the
+    legitimate "window is genuinely absent" case: tmux is up, replies
+    successfully, but there's no storage-closet window for this
+    session (e.g. first boot, after a crash). The probe should return
+    ``False`` (nothing to interrupt) so the restart can create a fresh
+    window — same behaviour as round 6, just now reached via a
+    successful tmux call instead of a swallowed exception.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+
+    class _FakeTmuxClient:
+        """Tmux works fine, just no storage-closet session yet."""
+
+        def has_session(self, name: str) -> bool:  # noqa: ARG002
+            # Reliable "no" from tmux — analogous to returncode=1 with
+            # "session not found" — NOT a server outage.
+            return False
+
+        def list_windows(self, name: str):  # noqa: ARG002 — not reached
+            raise AssertionError(
+                "list_windows must not be called when has_session is False",
+            )
+
+    monkeypatch.setattr(
+        "pollypm.tmux.client.TmuxClient", lambda: _FakeTmuxClient(),
+    )
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    # The relaunch facade was invoked — definitive "no window" is a
+    # green-light for the strict gate.
+    assert len(sup.restart_calls) == 1
+    assert sup.restart_calls[0]["session_name"] == "operator"
+
+
+def test_restart_force_still_bypasses_window_listing_failure(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_supervisor,
+):
+    """Codex PR #2061 round 7 — ``?safety=force`` still bypasses a broken probe.
+
+    Operator escalation override: ``force`` is destructive *by design*
+    and exists precisely so a flaky probe can be worked around. A
+    tmux outage that would 503 the default strict path must still let
+    ``?safety=force`` reach :meth:`Supervisor.restart_session`. This
+    pins that the round-7 fail-closed contract was applied to the
+    strict gate, not to the entire restart path.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+
+    import subprocess
+
+    class _FakeTmuxClient:
+        def has_session(self, name: str):  # noqa: ARG002
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=["tmux", "has-session"],
+            )
+
+    monkeypatch.setattr(
+        "pollypm.tmux.client.TmuxClient", lambda: _FakeTmuxClient(),
+    )
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart?safety=force",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    # Force bypassed the probe entirely → facade called even though
+    # tmux is broken.
+    assert len(sup.restart_calls) == 1
+    assert sup.restart_calls[0]["session_name"] == "operator"
 
 
 def test_restart_strict_503_when_supervisor_unavailable(

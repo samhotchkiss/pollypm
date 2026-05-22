@@ -72,7 +72,6 @@ from __future__ import annotations
 
 import logging
 import os
-import re
 import subprocess
 import uuid
 from datetime import UTC, datetime
@@ -89,7 +88,11 @@ from pollypm.web_api.chat import (
 )
 from pollypm.web_api.errors import APIError
 from pollypm.web_api.routes._deps import ConfigDep
-from pollypm.web_api.service import list_active_worker_sessions
+from pollypm.web_api.service import (
+    list_active_worker_sessions,
+    list_active_worker_sessions_strict,
+)
+from pollypm.work.task_state import parse_task_window_name
 
 logger = logging.getLogger(__name__)
 
@@ -165,13 +168,16 @@ class _WorkerFacadeUnavailable(Exception):
 # pattern check below lets ``_resolve_surface`` skip the worker facade
 # for sessions that syntactically cannot be workers, avoiding a pg hit
 # on every operator/architect/advisor send (Codex #2043 review v5
-# blocker 3).
-_WORKER_SESSION_PATTERN = re.compile(r"^task-[A-Za-z0-9_.-]+-\d+$")
+# blocker 3). Codex #2043 review v7 blocker 3: delegate to the
+# canonical parser in :mod:`pollypm.work.task_state` so we don't
+# duplicate the ``task-<project>-<n>`` regex (worker / project keys
+# may legitimately include ``_``, ``.``, ``-`` — the parser is the
+# source of truth).
 
 
 def _looks_like_worker_session(session_name: str) -> bool:
     """True when ``session_name`` syntactically matches ``task-<proj>-<n>``."""
-    return bool(_WORKER_SESSION_PATTERN.match(session_name))
+    return parse_task_window_name(session_name) is not None
 
 
 # ---------------------------------------------------------------------------
@@ -492,26 +498,26 @@ def _list_worker_sessions(config: Any) -> list[Any]:
 
 
 def _list_worker_sessions_strict(config: Any) -> list[Any]:
-    """Strict worker-lookup: bypass the public facade.
+    """Strict worker-lookup via the public service facade.
 
-    Codex #2043 review v6 blocker 1: the public facade
+    Codex #2043 review v6 blocker 1 / v7 blocker 2: the *non-strict*
+    public facade
     :func:`pollypm.web_api.service.list_active_worker_sessions`
     swallows ``_open_work_service_readonly`` open failures and
     ``list_worker_sessions`` read failures and returns ``[]``. That
     conflates "no active workers" with "could not query workers", so
     a real pg / work-service outage on a ``task-<project>-<n>`` send
     fell out as ``404 session_unknown`` instead of
-    ``503 service_unavailable``. The v5 wrapper *would* have re-raised
-    if the facade itself raised, but the facade never raised in
-    production — it always returned ``[]``.
+    ``503 service_unavailable``.
 
-    This helper opens the work-service directly, so any failure on
-    the open OR the ``list_worker_sessions`` call propagates as a
-    typed :class:`_WorkerFacadeUnavailable` that :func:`_resolve_surface`
-    maps to ``503 service_unavailable``. A missing project (config
-    has no ``project``) returns ``[]`` (genuinely no workers, not an
-    outage). An empty list from a successful ``list_worker_sessions``
-    call also returns ``[]``.
+    v7 fix: route through the *strict* public facade
+    :func:`pollypm.web_api.service.list_active_worker_sessions_strict`
+    which propagates open/list failures. This wrapper then translates
+    any raised exception into the typed
+    :class:`_WorkerFacadeUnavailable` that :func:`_resolve_surface`
+    maps to ``503 service_unavailable``. Pre-v7 we reached into the
+    private ``_open_work_service_readonly`` context manager directly,
+    a service-boundary violation flagged by Codex round-7 review.
 
     Tests monkeypatch this module-level name to feed fake records or
     simulate the outage path without touching pg. The mandatory
@@ -519,25 +525,8 @@ def _list_worker_sessions_strict(config: Any) -> list[Any]:
     :func:`pollypm.web_api.service._open_work_service_readonly` to
     raise, exercising the real public-facade-bypass path end-to-end.
     """
-    project = getattr(config, "project", None)
-    if project is None:
-        return []
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
-    if not project_key or project_path is None:
-        return []
     try:
-        from pollypm.web_api.service import _open_work_service_readonly
-
-        with _open_work_service_readonly(
-            config=config,
-            project_key=project_key,
-            project_path=project_path,
-        ) as work_service:
-            list_fn = getattr(work_service, "list_worker_sessions", None)
-            if not callable(list_fn):
-                return []
-            return list(list_fn(active_only=True))
+        return list(list_active_worker_sessions_strict(config))
     except _WorkerFacadeUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -1122,15 +1111,25 @@ def _tmux_session_for_send(config: Any, project_key: str | None) -> str:
     All chat surfaces (operator, architect, advisor, per-task workers)
     live inside the project's storage-closet session — matches the
     invariant the supervisor enforces
-    (``Supervisor.storage_closet_session_name``). We don't import the
-    supervisor here to keep the HTTP layer light; the suffix
-    convention is stable enough to inline.
+    (``Supervisor.storage_closet_session_name``).
+
+    Codex #2043 review v7 blocker 4: source the ``-storage-closet``
+    suffix from :data:`Supervisor._STORAGE_CLOSET_SESSION_SUFFIX` so
+    we don't inline the literal alongside the supervisor's own
+    builder. Mirrors :func:`pollypm.cli_features.tier4
+    ._resolve_storage_closet_session` and the runtime-services
+    ``storage_closet_name`` builder — keep one source of truth.
     """
+    from pollypm.supervisor import Supervisor
+
     project = getattr(config, "project", None)
     tmux_session = getattr(project, "tmux_session", None) if project else None
     if not isinstance(tmux_session, str) or not tmux_session:
         tmux_session = project_key or "pollypm"
-    return f"{tmux_session}-storage-closet"
+    suffix = getattr(
+        Supervisor, "_STORAGE_CLOSET_SESSION_SUFFIX", "-storage-closet",
+    )
+    return f"{tmux_session}{suffix}"
 
 
 def _resolve_pane_target(

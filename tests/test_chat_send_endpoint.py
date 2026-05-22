@@ -121,7 +121,19 @@ def _default_no_workers(monkeypatch: pytest.MonkeyPatch):
     patched: the route reads the strict seam now (Codex #2043 review
     v6 blocker 1) but tests that pre-date v6 still reach for the
     legacy name and we want them to keep working.
+
+    Codex #2043 review v7 blocker 1: stash the original strict helper
+    on the module as ``_list_worker_sessions_strict_original`` so tests
+    that need to exercise the real public-facade-bypass path (#2043 v6
+    regression) can restore it without relying on ``__wrapped__``
+    (the lambda below has no ``__wrapped__``).
     """
+    monkeypatch.setattr(
+        chat_send_routes,
+        "_list_worker_sessions_strict_original",
+        chat_send_routes._list_worker_sessions_strict,
+        raising=False,
+    )
     monkeypatch.setattr(
         chat_send_routes, "_list_worker_sessions", lambda config: [],
     )
@@ -2300,13 +2312,14 @@ def test_real_open_work_service_failure_returns_503(
 
     # Override the autouse fixture's strict-seam stub so the strict
     # helper actually executes (and reaches the real
-    # ``_open_work_service_readonly``).
+    # ``_open_work_service_readonly``). The autouse fixture stashed
+    # the unpatched original on the module as
+    # ``_list_worker_sessions_strict_original`` for exactly this case
+    # (Codex #2043 review v7 blocker 1).
     monkeypatch.setattr(
         chat_send_routes,
         "_list_worker_sessions_strict",
-        chat_send_routes._list_worker_sessions_strict.__wrapped__
-        if hasattr(chat_send_routes._list_worker_sessions_strict, "__wrapped__")
-        else chat_send_routes._list_worker_sessions_strict,
+        chat_send_routes._list_worker_sessions_strict_original,
     )
 
     import pollypm.web_api.service as service_mod
@@ -2355,6 +2368,13 @@ def test_list_worker_sessions_strict_returns_empty_when_no_workers(
 
     monkeypatch.setattr(service_mod, "_open_work_service_readonly", _stub)
 
+    # Restore the original strict helper (autouse fixture replaces it).
+    monkeypatch.setattr(
+        chat_send_routes,
+        "_list_worker_sessions_strict",
+        chat_send_routes._list_worker_sessions_strict_original,
+    )
+
     assert chat_send_routes._list_worker_sessions_strict(api_config) == []
 
 
@@ -2373,6 +2393,15 @@ def test_list_worker_sessions_strict_raises_typed_on_facade_open_failure(
     import pollypm.web_api.service as service_mod
 
     monkeypatch.setattr(service_mod, "_open_work_service_readonly", _boom)
+
+    # Codex #2043 review v7 blocker 1: the autouse fixture replaces
+    # the module-level strict helper with a no-op lambda. Restore the
+    # original (stashed by that fixture) before exercising the unit.
+    monkeypatch.setattr(
+        chat_send_routes,
+        "_list_worker_sessions_strict",
+        chat_send_routes._list_worker_sessions_strict_original,
+    )
 
     with pytest.raises(chat_send_routes._WorkerFacadeUnavailable):
         chat_send_routes._list_worker_sessions_strict(api_config)

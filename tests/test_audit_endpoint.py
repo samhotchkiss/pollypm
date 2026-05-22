@@ -741,3 +741,129 @@ def test_audit_grep_short_pathological_pattern_does_not_hang(
     # three do, but we only assert >= 1 to keep the test robust on a
     # faster future machine where some lines happen to complete in time.
     assert body.get("_pattern_timeouts", 0) >= 1, body
+
+
+# ---------------------------------------------------------------------------
+# Round-3 guardrails (Codex review on PR #2062): parsed-timestamp ``since``
+# comparison + malformed-row gating for both grep AND stats.
+# See ``src/pollypm/audit/query.py::iter_matching_events`` docstring step 4.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_grep_since_handles_tz_offsets(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``since`` must compare parsed datetimes, not raw ISO strings.
+
+    Round-2 code did a lexicographic ``line < since_iso`` compare which
+    let timezone-offset rows leak through: ``2026-05-21T01:00:00+02:00``
+    is lexicographically AFTER ``2026-05-21T00:00:00+00:00`` but is
+    actually ``2026-05-20T23:00:00Z`` — one hour BEFORE the cutoff, so
+    it must be EXCLUDED. Round-3 fixes the compare by parsing both sides.
+    """
+    # 01:00 local with +02:00 offset = 23:00 UTC the previous day.
+    older_tz_offset_ts = "2026-05-21T01:00:00+02:00"
+    # Anything clearly fresher than the cutoff so we can confirm the
+    # filter still admits valid rows in the same query.
+    fresh_ts = "2026-05-21T05:00:00+00:00"
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(subject="myproj/should-be-excluded", ts=older_tz_offset_ts),
+            _make_event(subject="myproj/should-be-kept", ts=fresh_ts),
+        ],
+    )
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={
+            "project": "myproj",
+            "since": "2026-05-21T00:00:00Z",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    subjects = [e["subject"] for e in response.json()["events"]]
+    # The +02:00 row is older than the cutoff in real time; it MUST be
+    # dropped. Round-2 (raw string compare) erroneously included it.
+    assert "myproj/should-be-excluded" not in subjects
+    assert subjects == ["myproj/should-be-kept"]
+
+
+def test_audit_grep_malformed_ts_skipped(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Rows whose ``ts`` doesn't parse must be excluded + counted.
+
+    Independent of ``since`` — even with no time-window filter, a
+    record with ``ts="not-a-date"`` is unsafe to keep (the response
+    model needs a datetime, and downstream consumers expect ordered
+    chronology). The walker drops it and increments the diagnostic
+    counter so the operator sees that history was silently elided.
+    """
+    log_path = _per_project_log(project_root)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    good = _make_event(subject="myproj/good", ts="2026-05-21T00:00:00+00:00")
+    bad = _make_event(subject="myproj/bad", ts="not-a-date")
+    with open(log_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(good) + "\n")
+        fh.write(json.dumps(bad) + "\n")
+
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    subjects = [e["subject"] for e in body["events"]]
+    assert subjects == ["myproj/good"]
+    # The malformed row was caught by the walker (round-3 parse gate)
+    # rather than the older Pydantic-level coerce — either way the
+    # counter on the response envelope must reflect it.
+    assert body["_malformed_rows_skipped"] >= 1
+
+
+def test_audit_stats_skips_malformed_rows(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``/audit/stats`` total must NOT count malformed-ts rows.
+
+    Round-2 stats iterated raw rows without validating ``ts`` — a
+    corrupt archive row inflated ``total``. Round-3 routes stats
+    through the same parse-gated walker, so totals stay symmetric
+    with what ``/audit/grep`` would return.
+    """
+    log_path = _per_project_log(project_root)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    valid = [
+        _make_event(event="task.created", ts="2026-05-21T00:00:00+00:00"),
+        _make_event(event="task.created", ts="2026-05-21T00:01:00+00:00"),
+    ]
+    invalid = [
+        _make_event(event="task.created", ts="not-a-date"),
+        _make_event(event="task.created", ts="2026-13-45T99:99:99Z"),
+    ]
+    with open(log_path, "w", encoding="utf-8") as fh:
+        for record in valid + invalid:
+            fh.write(json.dumps(record) + "\n")
+
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "30d"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Only the two valid rows count — the malformed pair is gated out
+    # before reaching the by-event counter.
+    assert body["total"] == 2
+    assert body["by_event"] == {"task.created": 2}

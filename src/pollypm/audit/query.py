@@ -512,7 +512,19 @@ def iter_matching_events(
     2. JSON decode.
     3. ``event_type``: exact ``.event`` field match (string equality,
        NOT regex).
-    4. ``since``: drop events with ``ts < since``.
+    4. ``ts`` parse — rows whose ``ts`` field is missing, non-string,
+       or fails ISO-8601 parsing are dropped and counted under
+       ``stats["malformed_rows_skipped"]`` (Codex round-3 finding,
+       PR #2062). Both ``since`` filtering AND ``/audit/stats`` totals
+       go through this gate so a malformed archived row can't inflate
+       the count.
+    5. ``since``: drop events whose parsed ``ts`` is older than the
+       cutoff. Parsed as ``datetime`` objects so a record like
+       ``2026-05-21T01:00:00+02:00`` (≡ ``2026-05-20T23:00:00Z``) is
+       correctly excluded by ``since=2026-05-21T00:00:00Z`` — earlier
+       round-2 code did a raw-string lex compare here, which let
+       lex-greater-but-time-earlier rows through (timezone offsets
+       sort wrong; malformed strings passed through entirely).
 
     Malformed JSON lines are skipped silently — the live audit log can
     have a truncated tail mid-write and we don't want one bad line to
@@ -531,7 +543,6 @@ def iter_matching_events(
       ``stats["pattern_timeouts"]`` is bumped so the caller can
       surface the count in its response envelope.
     """
-    since_iso = since.isoformat() if since is not None else None
     use_bounded_regex = (
         bounded_regex and pattern is not None and pattern.pattern and not literal
     )
@@ -575,12 +586,24 @@ def iter_matching_events(
                         continue
                     if event_type is not None and record.get("event") != event_type:
                         continue
-                    if since_iso is not None:
-                        ts_str = str(record.get("ts", ""))
-                        if ts_str and ts_str < since_iso:
-                            parsed = parse_event_ts(ts_str)
-                            if parsed is None or parsed < since:
-                                continue
+                    # Always parse the timestamp — both ``since``
+                    # filtering and downstream counters need a real
+                    # ``datetime`` (string compare is broken for
+                    # tz-offset rows; see docstring filter step 4).
+                    # Malformed rows are dropped + counted so callers
+                    # can surface the diagnostic.
+                    ts_raw = record.get("ts")
+                    parsed_ts = (
+                        parse_event_ts(ts_raw) if isinstance(ts_raw, str) else None
+                    )
+                    if parsed_ts is None:
+                        if stats is not None:
+                            stats["malformed_rows_skipped"] = (
+                                stats.get("malformed_rows_skipped", 0) + 1
+                            )
+                        continue
+                    if since is not None and parsed_ts < since:
+                        continue
                     yield record
     finally:
         if session is not None:

@@ -1286,3 +1286,282 @@ def test_archive_rolls_back_with_real_load_config_cache(
     get_response = client_.get("/api/v1/projects/myproj", headers=headers)
     assert get_response.status_code == 200
     assert get_response.json()["key"] == "myproj"
+
+
+# ---------------------------------------------------------------------------
+# Codex round 6 on PR #2063 — lost-update race across concurrent API writers.
+#
+# Two clients pausing different projects concurrently each deepcopy the same
+# cached load_config snapshot, mutate their own project, then both write with
+# ``force=True``. The second writer's snapshot still has the first writer's
+# project at the OLD value — so the first write is silently reverted on disk.
+# Per-request reloads (post-#2056) don't help because the race is between two
+# requests, both of which reload at the same moment before either writes.
+#
+# Fix: ``set_project_tracked`` and ``archive_project`` hold an exclusive
+# ``fcntl.flock`` on a sibling lockfile across the entire load → mutate →
+# write → reload sequence. Two writers serialise at the lock; the loser
+# reloads AFTER the winner's mtime updates and merges the winner's mutation
+# forward.
+#
+# These tests call the service helpers directly with a ``threading.Barrier``
+# so the race window is real — exercising via TestClient would funnel through
+# Starlette's threadpool and dilute the reproduction. Pattern borrowed from
+# ``tests/test_pg_notifications_race.py``.
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_pause_on_different_projects_preserves_both(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Codex round 6: two concurrent pauses on DIFFERENT projects.
+
+    Without ``_config_write_lock`` both threads load the same cached
+    snapshot, deepcopy, flip their own ``tracked``, and write — the
+    second writer's snapshot still has the first writer's project at
+    ``tracked=True``, so the second write silently reverts the first.
+    Under the lock the loser reloads AFTER the winner's write commits;
+    final TOML reflects BOTH ``a.tracked=False`` and ``b.tracked=False``.
+    """
+    import threading
+
+    from pollypm.web_api.service import set_project_tracked
+
+    project_a_root = tmp_path / "project_a"
+    project_a_root.mkdir()
+    (project_a_root / ".pollypm").mkdir()
+    project_b_root = tmp_path / "project_b"
+    project_b_root.mkdir()
+    (project_b_root / ".pollypm").mkdir()
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "project_a": KnownProject(
+                key="project_a",
+                path=project_a_root,
+                name="Project A",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+            "project_b": KnownProject(
+                key="project_b",
+                path=project_b_root,
+                name="Project B",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    # Two distinct live snapshots — one per "request". In production
+    # post-#2056 each request gets its own per-request reload, but
+    # load_config caches on mtime so both still resolve to the same
+    # cached object. The lock has to serialise the RMW regardless.
+    live_a = load_config(config_path)
+    live_b = load_config(config_path)
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException | None] = [None, None]
+
+    def _worker(slot: int, live: PollyPMConfig, key: str) -> None:
+        try:
+            barrier.wait(timeout=10)
+            set_project_tracked(
+                live,
+                key,
+                tracked=False,
+                reason=f"round-6 concurrent {key}",
+                actor="api",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors[slot] = exc
+
+    t1 = threading.Thread(target=_worker, args=(0, live_a, "project_a"))
+    t2 = threading.Thread(target=_worker, args=(1, live_b, "project_b"))
+    t1.start()
+    t2.start()
+    t1.join(timeout=20)
+    t2.join(timeout=20)
+
+    assert errors == [None, None], f"workers raised: {errors!r}"
+
+    # BOTH mutations must survive on disk — the round-6 invariant.
+    final = load_config(config_path)
+    assert final.projects["project_a"].tracked is False, (
+        "project_a's pause was reverted by project_b's write — Codex "
+        "round-6 lost-update race regression. Lock missing on the "
+        "config RMW path."
+    )
+    assert final.projects["project_b"].tracked is False, (
+        "project_b's pause was reverted by project_a's write — Codex "
+        "round-6 lost-update race regression. Lock missing on the "
+        "config RMW path."
+    )
+
+
+def test_concurrent_archive_and_pause_preserves_both(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Codex round 6 mirror: concurrent archive + pause on different keys.
+
+    Archive of ``project_a`` and pause of ``project_b`` must both
+    survive. Without the lock the loser reverts the winner's mutation
+    (either the archive resurrects, or the pause is reverted to
+    tracked=True). Under the lock both land durably.
+    """
+    import threading
+
+    from pollypm.web_api.service import archive_project, set_project_tracked
+
+    project_a_root = tmp_path / "project_a"
+    project_a_root.mkdir()
+    (project_a_root / ".pollypm").mkdir()
+    project_b_root = tmp_path / "project_b"
+    project_b_root.mkdir()
+    (project_b_root / ".pollypm").mkdir()
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "project_a": KnownProject(
+                key="project_a",
+                path=project_a_root,
+                name="Project A",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+            "project_b": KnownProject(
+                key="project_b",
+                path=project_b_root,
+                name="Project B",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    live_a = load_config(config_path)
+    live_b = load_config(config_path)
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException | None] = [None, None]
+
+    def _archive_worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            archive_project(
+                live_a,
+                "project_a",
+                reason="round-6 concurrent archive",
+                actor="api",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors[0] = exc
+
+    def _pause_worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            set_project_tracked(
+                live_b,
+                "project_b",
+                tracked=False,
+                reason="round-6 concurrent pause",
+                actor="api",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors[1] = exc
+
+    t1 = threading.Thread(target=_archive_worker)
+    t2 = threading.Thread(target=_pause_worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=20)
+    t2.join(timeout=20)
+
+    assert errors == [None, None], f"workers raised: {errors!r}"
+
+    # BOTH mutations must survive on disk.
+    final = load_config(config_path)
+    assert "project_a" not in final.projects, (
+        "project_a's archive was reverted by project_b's pause — Codex "
+        "round-6 lost-update race regression on the archive path."
+    )
+    assert "project_b" in final.projects, (
+        "project_b was clobbered by the archive write — concurrent-edit "
+        "preservation regression."
+    )
+    assert final.projects["project_b"].tracked is False, (
+        "project_b's pause was reverted by project_a's archive — Codex "
+        "round-6 lost-update race regression."
+    )

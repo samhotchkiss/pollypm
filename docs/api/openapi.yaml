@@ -1305,12 +1305,28 @@ components:
       type: string
       enum: [strict, loose, force]
       description: |
-        Safety gate level. `strict` (default) enforces mid-tool +
-        mid-stream checks and fails closed when the resolver can't
-        fingerprint a transcript to the requested surface. `loose`
-        keeps mid-tool but allows mid-stream sends with the
-        `X-PollyPM-Warning: agent-may-be-streaming` response header.
-        `force` bypasses both gates.
+        Safety gate level.
+
+        * `strict` (default): All safety gates active. Fails closed
+          (409) when signals are unavailable as well as when they
+          report unsafe:
+          - `unsafe_mid_tool` — open tool_use in the latest assistant
+            turn.
+          - `unsafe_mid_stream` — heartbeat <2s old.
+          - `unsafe_unavailable_transcript` — transcript file exists
+            but can't be read (permissions, IO error). Mid-tool gate
+            can't be evaluated; strict fails closed.
+          - `unsafe_unavailable_heartbeat` — pg pool / heartbeat
+            backing-store outage. Mid-stream gate can't be evaluated;
+            strict fails closed.
+        * `loose`: Mid-tool gate active. Mid-stream check is
+          best-effort. Continues on unavailable signals and surfaces
+          one of the following `X-PollyPM-Warning` response headers:
+          `agent-may-be-streaming`, `heartbeat-unavailable`, or
+          `transcript-unavailable`.
+        * `force`: All safety gates bypassed. Pane and window
+          validation (`pane_invalid`, `pane_dead`, `window_missing`,
+          `tmux_unavailable`) is NOT bypassed.
 
     ChatSendRequest:
       type: object

@@ -34,9 +34,16 @@ Safety gates per spec §4.1 / §4.3:
   :func:`pollypm.storage.pg_heartbeats.latest_heartbeat` and reject
   when it landed within the last 2s.
 
-``safety=strict`` (default) enforces both. ``safety=loose`` keeps the
-mid-tool check but allows mid-stream sends with a warning header.
-``safety=force`` bypasses the mid-tool / mid-stream /
+``safety=strict`` (default) enforces both AND fails closed when the
+signals themselves can't be evaluated — an unreadable transcript
+yields ``409 unsafe_unavailable_transcript`` and a pg/heartbeat outage
+yields ``409 unsafe_unavailable_heartbeat`` (Codex #2043 review v5
+blockers 1+2; pre-v5 both modes silently collapsed to "safe to
+send"). ``safety=loose`` keeps the mid-tool check but allows
+mid-stream sends with a warning header; on unavailable signals it
+continues with ``X-PollyPM-Warning: transcript-unavailable`` /
+``heartbeat-unavailable`` so the operator sees the gate was
+best-effort. ``safety=force`` bypasses the mid-tool / mid-stream /
 missing-transcript safety gates only. Pane and window existence +
 liveness errors (``409 pane_invalid``, ``409 pane_dead``,
 ``503 window_missing``, ``503 tmux_unavailable``) are NOT bypassed
@@ -65,6 +72,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import subprocess
 import uuid
 from datetime import UTC, datetime
@@ -86,6 +94,62 @@ from pollypm.web_api.service import list_active_worker_sessions
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["Chat"])
+
+
+# ---------------------------------------------------------------------------
+# Strict-mode "signal unavailable" exceptions (Codex #2043 review v5)
+# ---------------------------------------------------------------------------
+#
+# Pre-v5 the tail reader returned ``[]`` on every read/decode failure and
+# the heartbeat helper returned ``None`` on every pg/import failure. Both
+# routes interpreted the "empty" signal as "no problem detected" — so an
+# unreadable transcript or a pg outage silently let a strict send
+# through. That defeated the whole point of strict mode.
+#
+# The fix is tri-state: distinguish "signal evaluated and clean" from
+# "signal could not be evaluated". The exceptions below mark the
+# unavailable case explicitly so the route can fail closed in strict
+# mode, emit a warning header in loose mode, and ignore in force mode.
+
+
+class TranscriptUnavailable(Exception):
+    """Raised when the transcript tail can't be evaluated.
+
+    Covers ``stat`` / ``open`` / ``read`` / ``decode`` failures on the
+    resolved ``events.jsonl``. The strict-mode mid-tool gate maps this
+    to ``409 unsafe_unavailable_transcript``; loose mode continues with
+    a warning header; force mode ignores entirely.
+    """
+
+
+class HeartbeatUnavailable(Exception):
+    """Raised when the heartbeat signal can't be evaluated.
+
+    Covers ``pollypm.storage.pg_heartbeats`` import failure,
+    ``latest_heartbeat`` raising (pg pool down, network outage,
+    auth failure), or a malformed ``created_at`` string. The
+    strict-mode mid-stream gate maps this to
+    ``409 unsafe_unavailable_heartbeat``; loose mode continues with a
+    warning header; force mode ignores entirely.
+
+    NOTE: a *missing* heartbeat row (no record exists for the session
+    yet) is NOT unavailable — that's a real "not streaming" signal and
+    the helper returns ``None`` for it. Only actual evaluation failures
+    raise.
+    """
+
+
+# Per-spec §2.3 — worker sessions follow ``task-<project>-<n>``. The
+# pattern check below lets ``_resolve_surface`` skip the worker facade
+# for sessions that syntactically cannot be workers, avoiding a pg hit
+# on every operator/architect/advisor send (Codex #2043 review v5
+# blocker 3).
+_WORKER_SESSION_PATTERN = re.compile(r"^task-[A-Za-z0-9_.-]+-\d+$")
+
+
+def _looks_like_worker_session(session_name: str) -> bool:
+    """True when ``session_name`` syntactically matches ``task-<proj>-<n>``."""
+    return bool(_WORKER_SESSION_PATTERN.match(session_name))
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +195,17 @@ class ChatSendRequest(BaseModel):
     safety: Literal["strict", "loose", "force"] = Field(
         default="strict",
         description=(
-            "Safety gate level: strict (default) enforces mid-tool and "
-            "mid-stream checks; loose keeps mid-tool but skips mid-stream "
-            "(emits warning header); force bypasses both."
+            "Safety gate level.\n\n"
+            "- strict (default): All safety gates active. Fails closed "
+            "(409) when signals are unavailable — unreadable transcript "
+            "yields unsafe_unavailable_transcript; pg/heartbeat outage "
+            "yields unsafe_unavailable_heartbeat.\n"
+            "- loose: Mid-tool gate active. Mid-stream check best-effort "
+            "with X-PollyPM-Warning header on unavailable signals "
+            "(agent-may-be-streaming, heartbeat-unavailable, "
+            "transcript-unavailable).\n"
+            "- force: All safety gates bypassed. Pane and window "
+            "validation still active."
         ),
     )
     pane: int | None = Field(
@@ -260,6 +332,74 @@ def _unsafe_mid_stream() -> APIError:
     )
 
 
+def _unsafe_unavailable_transcript(detail: str) -> APIError:
+    """Strict-mode fail-closed when the transcript can't be read.
+
+    Codex #2043 review v5 blocker 1: pre-v5 ``_read_events_tail``
+    returned ``[]`` on stat/open/read/decode failures, which the
+    mid-tool gate treated as "no open tools". An unreadable transcript
+    (chmod 000, IO error, rotated mid-request) therefore let a strict
+    send through. The fix raises :class:`TranscriptUnavailable` from
+    the reader and maps it here in strict mode.
+    """
+    return APIError(
+        status_code=409,
+        code="unsafe_unavailable_transcript",
+        message=(
+            "Refusing to send under safety=strict because the transcript "
+            f"can't be evaluated for mid-tool safety: {detail}. "
+            "Use safety=loose to continue with a best-effort warning, or "
+            "safety=force to bypass entirely."
+        ),
+    )
+
+
+def _unsafe_unavailable_heartbeat(detail: str) -> APIError:
+    """Strict-mode fail-closed when the heartbeat signal is unavailable.
+
+    Codex #2043 review v5 blocker 2: pre-v5 ``_heartbeat_age_seconds``
+    swallowed pg outages and returned ``None``, which the mid-stream
+    gate treated as "not streaming". A pg outage therefore let a
+    strict send through even though the endpoint couldn't tell whether
+    the agent was mid-stream. The fix raises
+    :class:`HeartbeatUnavailable` from the helper and maps it here.
+    """
+    return APIError(
+        status_code=409,
+        code="unsafe_unavailable_heartbeat",
+        message=(
+            "Refusing to send under safety=strict because the heartbeat "
+            f"signal can't be evaluated for mid-stream safety: {detail}. "
+            "Use safety=loose to continue with a best-effort warning, or "
+            "safety=force to bypass entirely."
+        ),
+    )
+
+
+def _service_unavailable_worker_lookup(detail: str) -> APIError:
+    """503 when the worker-session lookup fails for an actual worker name.
+
+    Codex #2043 review v5 blocker 3: the work-service facade returned
+    ``[]`` on both "no active workers" AND open/list failure. For a
+    request whose ``session_name`` syntactically matches the worker
+    pattern, that conflation hid pg outages as ``404 session_unknown``.
+    We now route real lookup failures to ``503 service_unavailable``
+    so operators can distinguish "no such worker" from "can't ask".
+    """
+    return APIError(
+        status_code=503,
+        code="service_unavailable",
+        message=(
+            "Worker-session lookup failed; cannot resolve session: "
+            f"{detail}"
+        ),
+        hint=(
+            "Retry the request once the work-service backing store is "
+            "reachable. Check pg pool health."
+        ),
+    )
+
+
 def _answer_to_missing(answer_to: str) -> APIError:
     return APIError(
         status_code=400,
@@ -300,22 +440,26 @@ def _selections_invalid(invalid: list[str], valid: list[str]) -> APIError:
 # public :func:`pollypm.web_api.service.list_active_worker_sessions`
 # facade so chat_send doesn't reach into private service internals
 # (Codex #2043 review v3 block 3).
+#
+# Codex #2043 review v5 blocker 3: this wrapper re-raises any
+# exception from the underlying facade so :func:`_resolve_surface`
+# can map "worker-syntactic session_name + lookup failed" to a typed
+# ``503 service_unavailable`` (instead of the previous ``[]``
+# fallback that masqueraded as ``404 session_unknown``). The facade
+# itself already catches and returns ``[]`` on failure — tests that
+# need to simulate a worker-service outage monkeypatch THIS wrapper
+# (or its caller) to raise.
 def _list_worker_sessions(config: Any) -> list[Any]:
     """Return active :class:`WorkerSessionRecord` rows or ``[]``.
 
     Delegates to the public service-layer facade. Tests monkeypatch
     this module-level name (``chat_send_routes._list_worker_sessions``)
-    to feed fake records into :func:`_resolve_surface` without opening
-    a real work-service. Failures fall back to ``[]`` — strict mode
-    then 404s the request (the safer posture for a send call).
+    to feed fake records into :func:`_resolve_surface`. Raises any
+    exception from the underlying facade so the resolver can map
+    worker-pattern lookup failure to a typed 503 — see the
+    ``_resolve_surface`` body for that mapping.
     """
-    try:
-        return list(list_active_worker_sessions(config)) or []
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "chat_send: list_active_worker_sessions failed", exc_info=True,
-        )
-        return []
+    return list(list_active_worker_sessions(config)) or []
 
 
 # ---------------------------------------------------------------------------
@@ -332,13 +476,36 @@ def _resolve_surface(config: Any, session_name: str) -> ChatSurface:
     valid ``task-{project}-{id}`` name is rejected with
     ``404 session_unknown`` when no matching active worker is
     registered (Codex #2043 review block 2).
+
+    Worker-facade gating (Codex #2043 review v5 blocker 3):
+
+    * The worker facade is **only** queried when ``session_name``
+      syntactically matches ``task-<project>-<n>``. Operator /
+      architect / advisor sends never pay pg cost — pre-v5 every send
+      opened the work-service facade for the worker enumeration.
+    * If the lookup itself fails (pool down, table missing) for a
+      worker-syntactic name, we raise ``503 service_unavailable``
+      instead of letting the empty list collapse into a misleading
+      ``404 session_unknown``. The operator needs to know the answer
+      was "couldn't ask" rather than "definitely not registered".
     """
-    # Build a fake-handle-aware enumeration: P1's facade takes a
-    # ``work_service`` whose only contract is ``list_worker_sessions``.
-    # We pass a small adapter so tests that monkeypatch
-    # ``_list_worker_sessions`` Just Work without touching the
-    # work-service factory.
-    worker_records = _list_worker_sessions(config)
+    is_worker_pattern = _looks_like_worker_session(session_name)
+    worker_records: list[Any]
+    if is_worker_pattern:
+        try:
+            worker_records = _list_worker_sessions(config)
+        except Exception as exc:  # noqa: BLE001
+            # Worker-pattern name + lookup raised → tell the operator
+            # the lookup failed instead of returning 404 (which would
+            # imply the worker definitely isn't registered).
+            logger.debug(
+                "chat_send: worker session lookup failed for %r",
+                session_name,
+                exc_info=True,
+            )
+            raise _service_unavailable_worker_lookup(str(exc) or type(exc).__name__) from exc
+    else:
+        worker_records = []
 
     class _Adapter:
         @staticmethod
@@ -383,27 +550,58 @@ def _read_events_tail(
     long-running sessions don't force the whole transcript into memory
     each request. Skips the (likely truncated) first line when the
     file is larger than ``max_bytes``.
+
+    Tri-state failure semantics (Codex #2043 review v5 blocker 1):
+
+    * Returns ``[]`` when the file does not exist OR exists with zero
+      bytes — that's an unambiguous "no transcript content yet"
+      signal that the mid-tool gate treats as safe.
+    * Raises :class:`TranscriptUnavailable` when the file *exists*
+      but can't be evaluated (``stat`` succeeded but ``open``/``read``
+      raised ``OSError``, decode raised, etc.). Pre-v5 these all
+      collapsed into the empty list, so chmod 000 on an events.jsonl
+      with an open ``tool_call`` made the strict-mode mid-tool gate
+      fail open.
+
+    Per-line JSON parse failures still skip silently — a single
+    malformed mid-stream line shouldn't void the whole tail.
     """
     try:
         size = events_path.stat().st_size
-    except OSError:
+    except FileNotFoundError:
+        # No transcript yet — distinct from "can't read"; safe.
         return []
+    except OSError as exc:
+        raise TranscriptUnavailable(
+            f"stat({events_path}) failed: {exc}",
+        ) from exc
     if size == 0:
         return []
     start = max(0, size - max_bytes)
     try:
         fd = os.open(events_path, os.O_RDONLY)
-    except OSError:
-        return []
+    except OSError as exc:
+        # File exists (we just stat'd it) but we can't open it —
+        # permissions error, race with rotation, FS error. Unavailable.
+        raise TranscriptUnavailable(
+            f"open({events_path}) failed: {exc}",
+        ) from exc
     try:
-        os.lseek(fd, start, os.SEEK_SET)
-        raw = os.read(fd, size - start)
+        try:
+            os.lseek(fd, start, os.SEEK_SET)
+            raw = os.read(fd, size - start)
+        except OSError as exc:
+            raise TranscriptUnavailable(
+                f"read({events_path}) failed: {exc}",
+            ) from exc
     finally:
         os.close(fd)
     try:
         text = raw.decode("utf-8", errors="replace")
-    except Exception:  # noqa: BLE001
-        return []
+    except Exception as exc:  # noqa: BLE001
+        raise TranscriptUnavailable(
+            f"decode({events_path}) failed: {exc}",
+        ) from exc
     lines = text.splitlines()
     if start > 0 and lines:
         # First line is almost certainly truncated mid-record.
@@ -418,6 +616,8 @@ def _read_events_tail(
 
             obj = json.loads(line)
         except Exception:  # noqa: BLE001
+            # Per-line parse failures: skip — one bad line shouldn't
+            # void the whole tail.
             continue
         if isinstance(obj, dict):
             events.append(obj)
@@ -563,6 +763,11 @@ def _is_mid_tool(
     from the gate — used to allow the ``answer_to`` ask_user reply
     path through (the AskUserQuestion stays "open" until the user
     types a response, see :func:`_last_assistant_open_tool_ids`).
+
+    Propagates :class:`TranscriptUnavailable` from
+    :func:`_read_events_tail` so the caller can map it per safety
+    level (Codex #2043 review v5 blocker 1). Returning ``False`` here
+    on read failure (the pre-v5 behavior) defeats strict mode.
     """
     if events_path is None:
         return False
@@ -586,21 +791,40 @@ def _heartbeat_age_seconds(config: Any, session_name: str) -> float | None:
     """Return seconds since ``session_name``'s latest heartbeat, or ``None``.
 
     Reads via :func:`pollypm.storage.pg_heartbeats.latest_heartbeat`
-    (pg-only). Any failure is treated as "no signal" — the caller
-    fails-open so a flaky pool doesn't block legitimate sends.
+    (pg-only).
+
+    Tri-state semantics (Codex #2043 review v5 blocker 2):
+
+    * ``float`` — heartbeat record exists and is parseable; value is
+      seconds since it landed.
+    * ``None`` — no heartbeat record exists yet for the session
+      (genuine "not streaming" — safe).
+    * Raises :class:`HeartbeatUnavailable` — the lookup itself
+      failed (pg outage, import failure, malformed timestamp). The
+      route maps to ``409 unsafe_unavailable_heartbeat`` in strict
+      mode rather than silently failing open.
+
+    Pre-v5 every failure mode collapsed to ``None``, which the
+    mid-stream gate interpreted as "not streaming" — a pg outage
+    therefore allowed a strict send through.
     """
     try:
         from pollypm.storage.pg_heartbeats import latest_heartbeat
-    except Exception:  # noqa: BLE001
-        return None
+    except Exception as exc:  # noqa: BLE001
+        raise HeartbeatUnavailable(
+            f"pollypm.storage.pg_heartbeats import failed: {exc}",
+        ) from exc
     try:
         record = latest_heartbeat(session_name, config=config)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
             "chat_send: pg_heartbeats.latest_heartbeat failed", exc_info=True,
         )
-        return None
+        raise HeartbeatUnavailable(
+            f"latest_heartbeat({session_name!r}) raised: {exc}",
+        ) from exc
     if record is None:
+        # Genuine "no row" — safe; not unavailable.
         return None
     stamp = record.created_at
     try:
@@ -608,8 +832,13 @@ def _heartbeat_age_seconds(config: Any, session_name: str) -> float | None:
             stamp.replace("Z", "+00:00") if stamp.endswith("Z") else stamp
         )
         ts = datetime.fromisoformat(normalised)
-    except (TypeError, ValueError):
-        return None
+    except (TypeError, ValueError, AttributeError) as exc:
+        # Record exists but the timestamp is malformed — we *do* have
+        # a signal, we just can't interpret it. Treat as unavailable
+        # rather than "no record" so strict mode fails closed.
+        raise HeartbeatUnavailable(
+            f"malformed heartbeat timestamp {stamp!r}: {exc}",
+        ) from exc
     if ts.tzinfo is None:
         ts = ts.replace(tzinfo=UTC)
     return max(0.0, (datetime.now(UTC) - ts).total_seconds())
@@ -644,7 +873,14 @@ def _find_ask_user_envelope(
     """
     if events_path is None:
         return None
-    events = _read_events_tail(events_path)
+    try:
+        events = _read_events_tail(events_path)
+    except TranscriptUnavailable:
+        # Surface the same fail-closed signal the mid-tool gate would
+        # raise; the route decides how to handle per safety level.
+        # Re-raise so the route's strict/loose/force fan-out applies
+        # uniformly instead of silently returning "not found" here.
+        raise
     # P1's envelope id is ``msg_<tool_use_id>``; the raw events.jsonl
     # only carries the bare id. Try both forms so the route accepts
     # the envelope id the GET endpoints hand out AND the raw id.
@@ -965,11 +1201,33 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
     # AskUserQuestion has no matching tool_result until the user
     # types a response — without this carveout the strict gate 409s
     # every legitimate ``answer_to`` send.
+    #
+    # Transcript-unavailable handling (Codex #2043 review v5
+    # blocker 1) is uniform across this lookup and the mid-tool gate:
+    # strict mode fails closed via ``unsafe_unavailable_transcript``,
+    # loose mode continues with a warning header, force mode ignores
+    # the failure entirely. We track the helper's outcome rather than
+    # short-circuiting on the first call so the warning header lands
+    # even when the answer_to lookup is what raised.
     events_path, resolution = _resolve_session_events(surface, project_root)
     ask_envelope: dict[str, Any] | None = None
     ask_exempt_ids: set[str] = set()
+    transcript_unavailable_detail: str | None = None
     if body.answer_to is not None:
-        ask_envelope = _find_ask_user_envelope(events_path, body.answer_to)
+        try:
+            ask_envelope = _find_ask_user_envelope(events_path, body.answer_to)
+        except TranscriptUnavailable as exc:
+            transcript_unavailable_detail = str(exc)
+            # Strict and loose can't validate the answer_to lookup
+            # without the transcript. Force still proceeds (no
+            # ask_envelope means selections-only sends will fail
+            # later — that's fine; force is "I know what I'm doing").
+            if body.safety == "strict":
+                raise _unsafe_unavailable_transcript(str(exc)) from exc
+            # loose: continue; the answer_to branch below will surface
+            # ``answer_to_missing`` if the envelope can't be found, and
+            # we emit the warning header at the end of the safety
+            # block.
         if ask_envelope is not None:
             # The exempted id is the raw ``payload.id`` because the
             # mid-tool gate matches on that field; the envelope id
@@ -989,14 +1247,40 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
             # almost certainly addressing the wrong session_name.
             # Fail closed; safety=force bypasses.
             raise _unsafe_mid_tool()
-        if _is_mid_tool(events_path, exempt_tool_ids=ask_exempt_ids):
-            raise _unsafe_mid_tool()
-        age = _heartbeat_age_seconds(config, session_name)
-        streaming = age is not None and age < _MID_STREAM_WINDOW_SECONDS
+        try:
+            if _is_mid_tool(events_path, exempt_tool_ids=ask_exempt_ids):
+                raise _unsafe_mid_tool()
+        except TranscriptUnavailable as exc:
+            transcript_unavailable_detail = (
+                transcript_unavailable_detail or str(exc)
+            )
+            if body.safety == "strict":
+                raise _unsafe_unavailable_transcript(str(exc)) from exc
+            # loose: continue — warning header is set below.
+        try:
+            age = _heartbeat_age_seconds(config, session_name)
+        except HeartbeatUnavailable as exc:
+            # Strict: fail closed; loose: continue with warning header.
+            if body.safety == "strict":
+                raise _unsafe_unavailable_heartbeat(str(exc)) from exc
+            # loose
+            response.headers["X-PollyPM-Warning"] = "heartbeat-unavailable"
+            streaming = False
+        else:
+            streaming = age is not None and age < _MID_STREAM_WINDOW_SECONDS
         if body.safety == "strict" and streaming:
             raise _unsafe_mid_stream()
         if body.safety == "loose" and streaming:
             response.headers["X-PollyPM-Warning"] = "agent-may-be-streaming"
+        if (
+            body.safety == "loose"
+            and transcript_unavailable_detail is not None
+            and "X-PollyPM-Warning" not in response.headers
+        ):
+            # Loose mode + unreadable transcript: continue but surface
+            # the best-effort warning so the operator knows the
+            # mid-tool gate couldn't actually be evaluated.
+            response.headers["X-PollyPM-Warning"] = "transcript-unavailable"
 
     # 4. AskUserQuestion answer handling (§4.5).
     text_to_send: str | None
@@ -1092,6 +1376,8 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
 __all__ = [
     "ChatSendRequest",
     "ChatSendResponse",
+    "HeartbeatUnavailable",
+    "TranscriptUnavailable",
     "router",
     "send_chat_message",
 ]

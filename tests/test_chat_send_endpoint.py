@@ -1820,3 +1820,405 @@ def test_read_events_tail_empty_file(tmp_path: Path) -> None:
 
 def test_read_events_tail_missing_file(tmp_path: Path) -> None:
     assert chat_send_routes._read_events_tail(tmp_path / "nope.jsonl") == []
+
+
+# ---------------------------------------------------------------------------
+# Codex #2043 review v5 — strict mode fails closed on unavailable signals
+# ---------------------------------------------------------------------------
+
+
+def _force_transcript_unavailable(monkeypatch: pytest.MonkeyPatch, detail: str = "chmod 000") -> None:
+    """Make ``_read_events_tail`` raise :class:`TranscriptUnavailable`.
+
+    Simulates an unreadable ``events.jsonl`` (chmod 000, IO error,
+    truncated mid-rotation). Pre-v5 the route collapsed every read
+    failure into "no events" → "no open tool" → strict send proceeded.
+    """
+    def _raise(events_path, max_bytes=None):  # noqa: ARG001
+        raise chat_send_routes.TranscriptUnavailable(detail)
+
+    monkeypatch.setattr(chat_send_routes, "_read_events_tail", _raise)
+
+
+def _force_heartbeat_unavailable(monkeypatch: pytest.MonkeyPatch, detail: str = "db down") -> None:
+    """Make ``_heartbeat_age_seconds`` raise :class:`HeartbeatUnavailable`.
+
+    Simulates a pg pool / network outage on the heartbeat read. Pre-v5
+    this collapsed to ``None`` → "not streaming" → strict send through.
+    """
+    def _raise(config, session_name):  # noqa: ARG001
+        raise chat_send_routes.HeartbeatUnavailable(detail)
+
+    monkeypatch.setattr(chat_send_routes, "_heartbeat_age_seconds", _raise)
+
+
+def test_strict_fails_closed_on_unreadable_transcript(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """Codex #2043 review v5 blocker 1 — strict 409 on read failure.
+
+    A real-world chmod 000 on ``events.jsonl`` with an open
+    ``tool_call`` previously let a strict send through because the
+    tail reader returned ``[]`` for every read failure. The fix raises
+    :class:`TranscriptUnavailable`, which the strict gate maps to
+    409 ``unsafe_unavailable_transcript``.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    # Seed a transcript so the resolver picks it up (exact match), then
+    # force the tail reader to fail — that's the chmod 000 scenario.
+    _write_events_jsonl(
+        project_root, "session-unreadable", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
+    _force_transcript_unavailable(monkeypatch)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409, response.json()
+    assert response.json()["error"]["code"] == "unsafe_unavailable_transcript"
+    # Critically: nothing was sent.
+    assert patched_tmux.send_calls == []
+
+
+def test_loose_continues_with_warning_on_unreadable_transcript(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """Loose mode continues past an unreadable transcript with a warning.
+
+    Per Codex #2043 review v5 blocker 1: loose can't enforce the
+    mid-tool gate without a readable transcript, but the operator
+    explicitly opted into best-effort. Emit the
+    ``transcript-unavailable`` warning header so it's visible.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(
+        project_root, "session-unreadable-loose", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
+    _force_transcript_unavailable(monkeypatch)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello", "safety": "loose"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert response.headers.get("X-PollyPM-Warning") == "transcript-unavailable"
+
+
+def test_force_bypasses_unreadable_transcript(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """Force ignores transcript-unavailable entirely — no header, no 409."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(
+        project_root, "session-unreadable-force", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
+    _force_transcript_unavailable(monkeypatch)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello", "safety": "force"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert "X-PollyPM-Warning" not in response.headers
+
+
+def test_strict_fails_closed_on_heartbeat_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review v5 blocker 2 — strict 409 on pg outage.
+
+    The pre-v5 helper swallowed ``latest_heartbeat`` exceptions and
+    returned ``None``, which the mid-stream gate treated as "not
+    streaming". A pg outage therefore allowed the strict send. The fix
+    raises :class:`HeartbeatUnavailable`, mapping to
+    ``unsafe_unavailable_heartbeat``.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _force_heartbeat_unavailable(monkeypatch)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409, response.json()
+    assert response.json()["error"]["code"] == "unsafe_unavailable_heartbeat"
+    assert patched_tmux.send_calls == []
+
+
+def test_loose_continues_with_warning_on_heartbeat_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Loose continues past pg outage with ``heartbeat-unavailable`` header."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _force_heartbeat_unavailable(monkeypatch)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello", "safety": "loose"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert response.headers.get("X-PollyPM-Warning") == "heartbeat-unavailable"
+
+
+def test_force_bypasses_heartbeat_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Force ignores the heartbeat outage entirely."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _force_heartbeat_unavailable(monkeypatch)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello", "safety": "force"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert "X-PollyPM-Warning" not in response.headers
+
+
+def test_heartbeat_unavailable_raises_on_latest_heartbeat_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Direct unit test: pg failure → :class:`HeartbeatUnavailable`.
+
+    Reproduces Codex's exact diagnostic: ``latest_heartbeat`` raising
+    ``RuntimeError("db down")`` previously caused
+    ``_heartbeat_age_seconds`` to return ``None``. Now it raises.
+    """
+    import pollypm.storage.pg_heartbeats as pg_heartbeats
+
+    def _raise(*args, **kwargs):  # noqa: ARG001
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(pg_heartbeats, "latest_heartbeat", _raise)
+    with pytest.raises(chat_send_routes.HeartbeatUnavailable):
+        chat_send_routes._heartbeat_age_seconds(None, "operator")
+
+
+def test_heartbeat_none_when_no_record(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No row → ``None`` (genuine "not streaming"), not HeartbeatUnavailable."""
+    import pollypm.storage.pg_heartbeats as pg_heartbeats
+
+    monkeypatch.setattr(
+        pg_heartbeats,
+        "latest_heartbeat",
+        lambda *a, **kw: None,  # noqa: ARG005
+    )
+    assert chat_send_routes._heartbeat_age_seconds(None, "operator") is None
+
+
+def test_read_events_tail_raises_on_open_failure(tmp_path: Path) -> None:
+    """Codex #2043 review v5 blocker 1 — chmod 000 raises TranscriptUnavailable.
+
+    Reproduces Codex's exact diagnostic: an ``events.jsonl`` chmod'd
+    unreadable previously made ``_read_events_tail`` return ``[]``.
+    Now it raises.
+    """
+    import os as _os
+
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text(
+        json.dumps({"event_type": "tool_call", "payload": {"id": "x"}}) + "\n",
+    )
+    try:
+        _os.chmod(events_path, 0o000)
+        # Skip if running as root (chmod 000 doesn't block root reads).
+        if _os.access(events_path, _os.R_OK):
+            pytest.skip("running as root; chmod 000 does not block reads")
+        with pytest.raises(chat_send_routes.TranscriptUnavailable):
+            chat_send_routes._read_events_tail(events_path)
+    finally:
+        _os.chmod(events_path, 0o600)
+
+
+# ---------------------------------------------------------------------------
+# Codex #2043 review v5 blocker 3 — worker facade is lazy
+# ---------------------------------------------------------------------------
+
+
+def test_operator_send_does_not_open_worker_facade(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Operator/architect/advisor sends must not pay worker-facade cost.
+
+    Pre-v5 ``_resolve_surface`` called ``_list_worker_sessions``
+    unconditionally — every send opened the work-service even when
+    the requested ``session_name`` syntactically could not be a
+    worker. Operator surfaces are workspace-wide and never need the
+    worker enumeration.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+
+    call_count = {"n": 0}
+
+    def _track(config):  # noqa: ARG001
+        call_count["n"] += 1
+        return []
+
+    monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _track)
+
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert call_count["n"] == 0, (
+        "operator send must not open the worker-service facade"
+    )
+
+
+def test_architect_send_does_not_open_worker_facade(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same as the operator test for the architect surface."""
+    _set_storage_closet_windows(patched_tmux, ["pm-architect-myproj"])
+    _patch_heartbeat_age(monkeypatch, None)
+
+    call_count = {"n": 0}
+
+    def _track(config):  # noqa: ARG001
+        call_count["n"] += 1
+        return []
+
+    monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _track)
+
+    response = client.post(
+        "/api/v1/chat/architect_myproj/send",
+        json={"text": "hi"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert call_count["n"] == 0
+
+
+def test_worker_session_send_calls_worker_facade(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Worker-pattern session_name DOES open the facade exactly once."""
+    _set_storage_closet_windows(patched_tmux, ["task-myproj-42"])
+    _patch_heartbeat_age(monkeypatch, None)
+
+    call_count = {"n": 0}
+
+    def _track(config):  # noqa: ARG001
+        call_count["n"] += 1
+        return [FakeWorkerSessionRecord(task_project="myproj", task_number=42)]
+
+    monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _track)
+
+    response = client.post(
+        "/api/v1/chat/task-myproj-42/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert call_count["n"] == 1
+
+
+def test_worker_facade_failure_returns_503_service_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review v5 blocker 3 — worker lookup failure ≠ 404.
+
+    Pre-v5 the facade's ``[]`` fallback on outage masqueraded as
+    ``404 session_unknown``, hiding pg outages from the operator. For
+    a worker-pattern session_name we now distinguish "lookup failed"
+    (``503 service_unavailable``) from "no such worker" (404).
+    """
+    _set_storage_closet_windows(patched_tmux, ["task-myproj-42"])
+    _patch_heartbeat_age(monkeypatch, None)
+
+    def _raise(config):  # noqa: ARG001
+        raise RuntimeError("pg pool exhausted")
+
+    monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _raise)
+
+    response = client.post(
+        "/api/v1/chat/task-myproj-42/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    assert response.json()["error"]["code"] == "service_unavailable"
+
+
+def test_non_worker_session_with_worker_facade_failure_still_404(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],  # noqa: ARG001
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A non-worker name that doesn't match config sessions stays 404.
+
+    ``arbitrary-name`` is not worker-pattern, so the facade is never
+    queried — even if it would fail. The route returns the same
+    ``session_unknown`` it always has.
+    """
+    def _raise(config):  # noqa: ARG001
+        raise RuntimeError("would fail if asked")
+
+    monkeypatch.setattr(chat_send_routes, "_list_worker_sessions", _raise)
+
+    response = client.post(
+        "/api/v1/chat/arbitrary-name/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 404, response.json()
+    assert response.json()["error"]["code"] == "session_unknown"
+
+
+def test_looks_like_worker_session_pattern() -> None:
+    """Worker pattern: ``task-<project>-<n>`` only."""
+    assert chat_send_routes._looks_like_worker_session("task-myproj-42")
+    assert chat_send_routes._looks_like_worker_session("task-pollypm-1")
+    assert chat_send_routes._looks_like_worker_session("task-foo_bar-99")
+    assert not chat_send_routes._looks_like_worker_session("operator")
+    assert not chat_send_routes._looks_like_worker_session("architect_myproj")
+    assert not chat_send_routes._looks_like_worker_session("task-myproj")
+    assert not chat_send_routes._looks_like_worker_session("task-myproj-abc")
+    assert not chat_send_routes._looks_like_worker_session("task--42")

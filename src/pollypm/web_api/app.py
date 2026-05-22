@@ -333,6 +333,21 @@ def create_app(
     app.add_exception_handler(RequestValidationError, handle_validation_error)
     app.add_exception_handler(Exception, handle_unhandled_exception)
 
+    # Wire the briefings provider so /api/v1/briefings reports
+    # ``morning.available=true`` and render/regenerate don't 503 in
+    # normal ``pm serve`` use. The full plugin host isn't bootstrapped
+    # in the API process (it owns roster + job scheduling + cockpit
+    # rail registration — none of which the read/regenerate path
+    # needs); the only piece the briefings routes consult is the
+    # registry seam (`pollypm.briefings_registry._briefing_provider`),
+    # which the ``morning_briefing`` plugin populates via
+    # ``register_briefing_provider`` during plugin ``initialize``.
+    # Mirror that single call here so the API has the same provider
+    # the cockpit + CLI use. The import is local so a future build
+    # that disables the built-in plugin doesn't take a hard import
+    # on the plugin tree (Codex round-2 P0 on #2059).
+    _wire_briefings_provider()
+
     # Health is exempt from auth per spec §3.
     app.include_router(health_routes.router, prefix=API_V1_PREFIX)
 
@@ -419,6 +434,39 @@ def create_app(
         return JSONResponse(app.openapi())
 
     return app
+
+
+def _wire_briefings_provider() -> None:
+    """Register the built-in morning-briefing provider for the API.
+
+    The cockpit + ``pm briefing`` CLI rely on the plugin host running
+    every plugin's ``initialize`` hook, which for ``morning_briefing``
+    calls ``register_briefing_provider(list_briefings)`` (see
+    ``plugins_builtin/morning_briefing/plugin.py``). ``pm serve`` does
+    not boot the plugin host — it only loads config + builds the
+    FastAPI app — so without this nudge the API's
+    ``GET /api/v1/briefings`` reports ``morning.available=false`` and
+    render/regenerate return 503 in production.
+
+    Re-running this on every ``create_app`` call is a no-op after the
+    first one: ``register_briefing_provider`` just rebinds the module
+    slot to the same callable. Import failures are logged and
+    swallowed — a missing plugin downgrades availability to ``false``
+    (the route's fail-soft posture), it must not crash app startup.
+    """
+    try:
+        from pollypm.briefings_registry import register_briefing_provider
+        from pollypm.plugins_builtin.morning_briefing.inbox import (
+            list_briefings as _list_briefings,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "web_api: morning_briefing plugin unavailable; "
+            "GET /api/v1/briefings will report morning.available=false",
+            exc_info=True,
+        )
+        return
+    register_briefing_provider(_list_briefings)
 
 
 def _attach_security_scheme(app: FastAPI) -> None:

@@ -630,3 +630,47 @@ def test_briefings_morning_rejects_project_param(
     assert "morning" in body["error"]["message"].lower() or "project" in body[
         "error"
     ]["message"].lower()
+
+
+# ---------------------------------------------------------------------------
+# Codex round-2 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_briefings_endpoint_available_in_default_create_app(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+) -> None:
+    """`create_app` must wire the morning-briefing provider itself.
+
+    Asserts the regression for Codex round-2 P0 #2: previously
+    ``pm serve`` only called ``load_config`` + ``create_app`` and
+    never bootstrapped the plugin host, so the morning provider stayed
+    ``None`` in the registry. ``GET /api/v1/briefings`` returned
+    ``morning.available=false`` and render/regenerate 503'd in
+    production unless tests monkeypatched ``_REGISTRY`` /
+    ``_morning_available``.
+
+    No fixtures touch the registry here — the app factory itself must
+    populate the provider for the built-in ``morning`` type.
+    """
+    # Clear the registry first so we prove ``create_app`` itself
+    # repopulates it (rather than relying on stale module state from
+    # an earlier test that imported the plugin tree).
+    from pollypm.briefings_registry import register_briefing_provider
+    register_briefing_provider(None)
+
+    app = create_app(config=api_config, token_path=token_path)
+    client = TestClient(app)
+
+    response = client.get("/api/v1/briefings", headers=auth_headers)
+    assert response.status_code == 200, response.json()
+    morning = next(
+        entry for entry in response.json()["types"] if entry["name"] == "morning"
+    )
+    assert morning["available"] is True, (
+        "morning provider was not wired by create_app; "
+        "render/regenerate would 503 in production"
+    )

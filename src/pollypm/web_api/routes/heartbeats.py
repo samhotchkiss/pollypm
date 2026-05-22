@@ -267,32 +267,48 @@ def list_heartbeats_endpoint(config: ConfigDep) -> HeartbeatsListResponse:
     caller can retry; we don't paper over a pg-pool outage with an
     empty list because that would tell the cockpit "every session is
     initializing" which is dangerously misleading.
-    """
-    from pollypm.storage.pg_heartbeats import latest_heartbeat as _latest
 
-    rows: list[HeartbeatLatest] = []
-    for session_name in _configured_session_names(config):
-        try:
-            record = _latest(session_name, config=config)
-        except Exception as exc:  # noqa: BLE001 — typed translation below
-            logger.warning(
-                "heartbeats: latest_heartbeat(%s) raised; surfacing 503",
-                session_name,
-                exc_info=True,
-            )
-            raise service_unavailable(
-                f"heartbeats ledger unavailable while reading session "
-                f"{session_name!r}: {exc.__class__.__name__}",
-                hint=(
-                    "The Postgres heartbeats facade is unreachable. "
-                    "Retry shortly; check `pm doctor` and pg pool health."
-                ),
-            ) from exc
-        rows.append(_row_to_latest(
+    Performance contract (pinned by
+    ``test_list_heartbeats_uses_bulk_query``): exactly ONE
+    ``pg_heartbeats`` query for N sessions, not N. The previous loop
+    was an N+1 read that hurt dashboard polling at session counts
+    >~10. See PR #2055 round 1.
+    """
+    from pollypm.storage.pg_heartbeats import (
+        latest_heartbeats_bulk as _latest_bulk,
+    )
+
+    session_names = _configured_session_names(config)
+    try:
+        records_by_name = _latest_bulk(session_names, config=config)
+    except Exception as exc:  # noqa: BLE001 — typed translation below
+        logger.warning(
+            "heartbeats: latest_heartbeats_bulk(%d sessions) raised; "
+            "surfacing 503",
+            len(session_names),
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"heartbeats ledger unavailable while listing "
+            f"{len(session_names)} session(s): {exc.__class__.__name__}",
+            hint=(
+                "The Postgres heartbeats facade is unreachable. "
+                "Retry shortly; check `pm doctor` and pg pool health."
+            ),
+        ) from exc
+
+    rows = [
+        _row_to_latest(
             config=config,
             session_name=session_name,
-            row=record,
-        ))
+            # Sessions missing from the bulk result have never reported
+            # in — map to None so ``_row_to_latest`` produces an
+            # ``initializing`` row (matches the previous per-session
+            # ``latest_heartbeat() -> None`` behaviour).
+            row=records_by_name.get(session_name),
+        )
+        for session_name in session_names
+    ]
     return HeartbeatsListResponse(heartbeats=rows)
 
 

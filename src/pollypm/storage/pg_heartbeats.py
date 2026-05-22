@@ -127,6 +127,51 @@ def latest_heartbeat(
     return _row_to_heartbeat(row)
 
 
+def latest_heartbeats_bulk(
+    session_names: list[str],
+    *,
+    pool: "ConnectionPool | None" = None,
+    config: "PollyPMConfig | None" = None,
+) -> dict[str, HeartbeatRecord]:
+    """Return ``{session_name: latest HeartbeatRecord}`` in ONE query.
+
+    Replacement for callers that previously looped :func:`latest_heartbeat`
+    once per session (N+1 round-trips → one). Uses ``DISTINCT ON
+    (session_name)`` ordered by ``id DESC`` so each session yields its
+    most-recent row (same selection as the single-session helper).
+
+    Sessions in ``session_names`` that have never reported in are absent
+    from the returned dict — callers map missing entries to whatever
+    "no heartbeat yet" sentinel they need (the heartbeats route maps to
+    ``status="initializing"``). Returns an empty dict when
+    ``session_names`` is empty (no query issued).
+    """
+    if not session_names:
+        return {}
+    if pool is None:
+        from pollypm.storage.pg_pool import get_ro_pool
+
+        pool = get_ro_pool(config)
+    # Deduplicate while preserving sane ordering for the bind list. ``%s``
+    # with a tuple expands to the IN-list via psycopg's standard
+    # parameterisation, no string interpolation.
+    unique_names = list(dict.fromkeys(session_names))
+    with pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT ON (session_name)
+                   session_name, tmux_window, pane_id, pane_command, pane_dead,
+                   log_bytes, snapshot_path, snapshot_hash, created_at
+            FROM heartbeats
+            WHERE session_name = ANY(%s)
+            ORDER BY session_name, id DESC
+            """,
+            (unique_names,),
+        )
+        rows = cur.fetchall()
+    return {row[0]: _row_to_heartbeat(row) for row in rows}
+
+
 def recent_heartbeats(
     session_name: str,
     limit: int = 3,
@@ -209,6 +254,7 @@ def _row_to_heartbeat(row) -> HeartbeatRecord:
 __all__ = [
     "last_heartbeat_at",
     "latest_heartbeat",
+    "latest_heartbeats_bulk",
     "recent_heartbeats",
     "record_heartbeat",
 ]

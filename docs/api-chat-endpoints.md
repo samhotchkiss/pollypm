@@ -1,5 +1,11 @@
 # Chat HTTP API reference
 
+> **Status:** Reference doc for endpoints landing in PRs #2043, #2044,
+> #2045, #2047. Will be cross-checked against final implementation
+> before merge. Treat the contracts here as the *intended* shape — the
+> P3 send endpoint in particular (#2043) is still in fix-loop, so
+> field names and error codes may shift before merge.
+
 Reference for the `/api/v1/chat/*` endpoints — the HTTP surface for
 reading transcripts from, and sending messages into, the four live
 tmux-backed chat surfaces PollyPM runs (operator, architect, advisor,
@@ -7,10 +13,11 @@ per-task worker). Audience: anyone building tooling on top of PollyPM
 (custom dashboards, browser clients, scripted reply bots) and operators
 running ad-hoc `curl` against the local daemon.
 
-This document covers phase 1 of the chat API (PRs #2042–#2046). Phase 2
-(dashboard / inbox / task-manipulation endpoints) is out of scope and
-is sketched in the source spec at
-`docs/project-specs/chat-endpoints-spec.md` §8.
+This document covers phase 1 of the chat API (PRs #2042–#2047) and is
+self-contained — read this file for the contract; the implementation
+under `src/pollypm/web_api/routes/chat_*.py` is the source of truth
+for the wire format. Phase 2 (dashboard / inbox / task-manipulation
+endpoints) is out of scope.
 
 ---
 
@@ -136,18 +143,22 @@ No query params.
       "surface_type": "operator",
       "persona": "Polly",
       "project": null,
+      "task_id": null,
       "window": {
         "tmux_session": "storage-closet",
         "window_name": "pm-operator",
         "present": true,
-        "pane_id": "%17"
+        "pane_id": "%17",
+        "pane_dead": false
       },
       "transcript": {
         "source": "jsonl",
-        "path": "~/.claude/projects/-Users-sam-dev-pollypm/abc.jsonl",
-        "last_write": "2026-05-21T20:48:11Z"
+        "path": "~/.pollypm/projects/samblog/.pollypm/transcripts/abc/events.jsonl"
       },
-      "auth_token_present": true
+      "cwd": "/Users/sam/dev/samblog",
+      "provider": "claude",
+      "auth_token_present": true,
+      "worktree_path": null
     }
   ]
 }
@@ -159,9 +170,16 @@ Field notes:
   tmux. The transcript path may still be readable (the agent crashed
   but the JSONL was flushed) — render the surface as greyed-out, not
   as deleted.
-- `transcript.source` is one of `jsonl`, `capture`, or `null`. `null`
-  means we have neither a JSONL on disk nor a live pane to capture
-  from; `GET /messages` against this surface returns `messages: []`.
+- `window.pane_dead=true` is reported when tmux flags the pane as
+  exited; POST `/send` against a dead pane returns `409 pane_dead`.
+- `transcript.source` from discovery is `"jsonl"` or `null` — discovery
+  never reports `"capture"`. `null` means no events.jsonl archive exists
+  yet (brand-new surface, spec §4.8); the history endpoint can still
+  fall back to a live tmux capture when the window is present.
+- `task_id` is populated for worker surfaces only; `null` for
+  operator/architect/advisor.
+- `worktree_path` is populated for worker surfaces running inside an
+  isolated worktree; `null` otherwise.
 
 ### 3.2 `GET /api/v1/chat/{session_name}/messages`
 
@@ -177,14 +195,13 @@ Pull a window of messages from a single session's transcript.
 
 | Param | Default | Meaning |
 |---|---|---|
-| `since` | none | ISO-8601 lower bound on message timestamp (exclusive). |
-| `since_id` | none | Message id (string). Return messages strictly after this id. If both `since` and `since_id` are passed, `since_id` wins. |
-| `limit` | `100` | Max messages, capped at `500`. Values above 500 silently clamp. |
+| `since` | none | ISO-8601 lower bound on message timestamp. Both `...Z` and `...+00:00` suffix shapes accepted. |
+| `since_id` | none | Message id (string). Return messages strictly after this id. Both `since` and `since_id` are applied if passed together (the `since` lower-bound is applied first, then the cursor walk). |
+| `limit` | `100` | Max messages, must be `1..500`. Values outside that range return `422 validation_error` (FastAPI Pydantic-level rejection). |
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
 | `include_subagents` | `false` | When `true`, inline subagent transcripts inside their `subagent_result` parent's `metadata.subagent_transcript[]`. See §5.2. |
 | `include_thinking` | `false` | Include `type=thinking` blocks. Default off — usually noisy. |
-| `include_system_events` | `true` | Include compaction markers and session-start events. Set `false` for a cleaner feed. |
-| `source` | `auto` | `auto` (JSONL with capture fallback), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). |
+| `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
 
 **Response:**
 
@@ -194,24 +211,27 @@ Pull a window of messages from a single session's transcript.
   "surface_type": "operator",
   "persona": "Polly",
   "transcript_source": "jsonl",
-  "transcript_path": "~/.claude/projects/-Users-sam-dev-pollypm/abc.jsonl",
+  "transcript_path": "/Users/sam/dev/samblog/.pollypm/transcripts/abc/events.jsonl",
   "messages": [ /* MessageEnvelope[], see §4 */ ],
   "has_more": false,
   "next_cursor": "msg_xyz"
 }
 ```
 
-`next_cursor` is the `id` of the last message returned; pass it back as
-`since_id` to fetch the next page when `has_more=true`.
+`transcript_source` is one of `"jsonl"`, `"capture"`, or `null`
+(empty surface, spec §4.8). `transcript_path` is non-null only for
+`transcript_source="jsonl"`. `next_cursor` is the `id` of the last
+message returned; pass it back as `since_id` to fetch the next page
+when `has_more=true`.
 
 **Error codes:**
 
 | Status | Code | Meaning |
 |---|---|---|
 | 404 | `session_unknown` | `session_name` is not in `config.sessions` and not a live worker. |
-| 404 | `transcript_missing` | `source=jsonl` forced, but no JSONL exists. |
-| 400 | `invalid_since` | `since` is not ISO-8601 parseable. |
-| 400 | `invalid_source` | `source` is not one of the three allowed values. |
+| 404 | `archive_missing` | `source=jsonl` forced, but no `events.jsonl` archive exists for this session. |
+| 400 | `invalid_request` | `since` is not ISO-8601 parseable. (Other request-shape errors share this code; see the message body for the offending field.) |
+| 422 | `validation_error` | FastAPI's standard Pydantic rejection envelope — returned for out-of-range `limit`, unknown `source`, unknown `direction`, etc. Shape is FastAPI's default `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}`, NOT the chat router's `{code, message, hint}` envelope. |
 
 **Curl:**
 
@@ -227,6 +247,10 @@ curl -sH "Authorization: Bearer $TOKEN" \
 
 ### 3.3 `POST /api/v1/chat/{session_name}/send`
 
+> **Status:** P3 (#2043) implementation is in fix-loop; contracts
+> below may shift before merge. Cross-check against
+> `src/pollypm/web_api/routes/chat_send.py` at merge time.
+
 Inject a message into the agent's input box via tmux. Returns
 synchronously after the send; does **not** wait for the agent to
 respond. Poll `GET /messages` for the reply.
@@ -238,7 +262,7 @@ respond. Poll `GET /messages` for the reply.
   "text": "What is blocking samblog/47 right now?",
   "press_enter": true,
   "answer_to": null,
-  "selections": null,
+  "selections": [],
   "notes": null,
   "safety": "strict",
   "pane": null
@@ -247,34 +271,39 @@ respond. Poll `GET /messages` for the reply.
 
 | Field | Type | Default | Meaning |
 |---|---|---|---|
-| `text` | string | — | Free-text message. Required unless `selections` is set. |
+| `text` | string \| null | `null` | Free-text message. Required when `answer_to` is null. When `answer_to` is set, `text` is an optional free-form reply (used if `selections` is empty). |
 | `press_enter` | bool | `true` | Press Enter after typing. `false` to stage a long paste without submitting. |
-| `answer_to` | string | `null` | Id of the `ask_user` envelope this is replying to. See §5.5. |
-| `selections` | string[] | `null` | One or more option labels for an `ask_user` reply. Mutually exclusive with `text`. |
-| `notes` | string | `null` | Free-text addendum after a selection. |
-| `safety` | enum | `strict` | `strict` (reject mid-stream + mid-tool), `loose` (allow mid-stream with warning header), `force` (bypass all gates). |
-| `pane` | int | `null` | Pane index inside the window. `null` = primary pane. See §5.4. |
+| `answer_to` | string \| null | `null` | Id of the `ask_user` envelope this is replying to. See §5.5. |
+| `selections` | string[] | `[]` | One or more option labels for an `ask_user` reply. Only meaningful when `answer_to` is set. |
+| `notes` | string \| null | `null` | Free-text addendum after a selection. Also usable as the body of an `answer_to` reply when both `text` and `selections` are absent. |
+| `safety` | enum | `strict` | `strict` (reject mid-stream + mid-tool), `loose` (mid-tool still blocks, mid-stream allowed with warning header), `force` (bypass both gates). |
+| `pane` | int \| null | `null` | 0-based pane index inside the target window. `null` (or `0`) = primary/active pane. See §5.4. |
 
 **Response:**
 
 ```json
 {
   "ok": true,
-  "message_id": "msg_abc",
+  "message_id": "msg_abc123def456",
   "session_name": "operator",
-  "window_target": "storage-closet:pm-operator",
+  "window_target": "samblog-storage-closet:pm-operator",
   "characters_sent": 47,
   "method": "send_keys",
   "press_enter_at": "2026-05-21T20:53:12.500Z"
 }
 ```
 
-- `message_id` is a server-minted correlation id; it appears in
-  subsequent transcript pulls as the `id` of the user message, so a
-  caller can match its send to the rendered turn.
-- `method` is `send_keys` for short messages, `paste_buffer` for
-  messages over 100 characters (the existing tmux client picks; see
-  issue #808 for why paste-buffer is the default for long text).
+- `message_id` is a server-minted correlation id of the form
+  `msg_<uuid4-hex>`. It is **not** guaranteed to match the eventual
+  envelope `id` in the transcript — the transcript layer mints its
+  own id on ingest. Use `press_enter_at` + the next user envelope's
+  `ts` to correlate if you need to.
+- `window_target` is the tmux `session:window` (or `session:window.pane`)
+  string the daemon addressed.
+- `method` is `send_keys` for messages ≤100 characters, `paste_buffer`
+  for messages over 100 characters (see issue #808 for why
+  paste-buffer is the default for long text).
+- `press_enter_at` is `null` when `press_enter=false`.
 - When `safety=loose` and the agent appeared streaming, the response
   includes header `X-PollyPM-Warning: agent-may-be-streaming`.
 
@@ -283,16 +312,15 @@ respond. Poll `GET /messages` for the reply.
 | Status | Code | Meaning |
 |---|---|---|
 | 404 | `session_unknown` | session_name not in config and not a live worker. |
-| 503 | `window_missing` | Window configured but not in tmux. Restart the session. |
-| 409 | `pane_dead` | tmux says the pane is dead. |
-| 409 | `unsafe_mid_tool` | Open `tool_use` with no matching `tool_result`. Override with `safety=force`. See §5.1. |
-| 409 | `unsafe_mid_stream` | Heartbeat says agent streamed within last 2s. Override with `safety=loose` or `force`. See §5.3. |
-| 400 | `text_or_selections_required` | Body had neither `text` nor `selections`. |
-| 400 | `text_and_selections_exclusive` | Body had both. |
-| 400 | `answer_to_missing` | `answer_to` id not found in transcript. |
-| 400 | `answer_to_not_question` | `answer_to` references a non-`ask_user` message. |
-| 400 | `selections_no_question` | `selections` provided but `answer_to` is null. |
-| 400 | `selections_invalid` | One or more selections don't match the question's options. Response includes valid options. |
+| 503 | `window_missing` | Window configured but not present in tmux. Restart the session. |
+| 409 | `pane_dead` | tmux flagged the pane as dead. |
+| 409 | `unsafe_mid_tool` | Latest assistant turn has an open `tool_use` with no matching `tool_result`. Override with `safety=force`. See §5.1. |
+| 409 | `unsafe_mid_stream` | Heartbeat shows the session streamed within the last 2s. Override with `safety=loose` (warn-and-send) or `safety=force` (bypass). See §5.3. |
+| 400 | `answer_to_missing` | `answer_to` id was not found in the session's recent transcript. |
+| 400 | `selections_no_question` | `answer_to` references a message that isn't an `ask_user` envelope. |
+| 400 | `selections_invalid` | One or more selections don't match the question's option labels. Response message includes the valid options. |
+| 400 | `invalid_request` | Catch-all for body-shape problems: missing `text` when `answer_to` is unset; `answer_to` set but no `selections`/`text`/`notes` supplied; etc. The message body identifies the specific problem. |
+| 422 | `validation_error` | FastAPI Pydantic rejection — malformed JSON, wrong field types, `safety` not in `{strict, loose, force}`, etc. Default FastAPI envelope shape (`{"detail": [...]}`). |
 
 **Curl examples:**
 
@@ -470,9 +498,8 @@ same way.
 
 ## 5. Edge cases ("Claude's fancy stuff")
 
-The same twelve gates Sam called out in the design spec
-(`chat-endpoints-spec.md` §4). Each has a defined behavior, an override
-where applicable, and a reason it exists.
+Twelve gates the chat API has to handle correctly. Each has a defined
+behavior, an override where applicable, and a reason it exists.
 
 ### 5.1 Mid-tool sends (`409 unsafe_mid_tool`)
 
@@ -577,10 +604,12 @@ parse the natural-language answer.
 ### 5.6 Compaction events
 
 Claude Code occasionally compacts the conversation, producing a
-`system_event` with `metadata.subtype=compaction`. Included by default
-in GET; filter out with `?include_system_events=false` if your UI
-doesn't render them. Don't drop them silently if the user might wonder
-why the conversation "jumps" — render at least a horizontal rule.
+`system_event` envelope with `metadata.subtype=compaction`. These are
+always included in the GET response (phase 1 has no
+`include_system_events` toggle — filter client-side by
+`type=="system_event"` if your UI doesn't render them). Don't drop them
+silently if the user might wonder why the conversation "jumps" —
+render at least a horizontal rule.
 
 ### 5.7 Stale JSONL → tmux capture fallback
 
@@ -592,8 +621,9 @@ live — usually means Claude Code hasn't flushed mid-stream.
 envelope with `type=text` and `metadata.from_capture=true`. Ids are
 synthetic (`cap_<hash>`), stable across reads.
 
-Force pure JSONL with `?source=jsonl` (accepts `transcript_missing`
-errors). Force pure capture with `?source=capture`.
+Force pure JSONL with `?source=jsonl` (accept the possibility of a
+`404 archive_missing` response). Force pure capture with
+`?source=capture`.
 
 ### 5.8 New session, no transcript yet
 
@@ -639,6 +669,9 @@ you need structured tool data, use a Claude session.
 ---
 
 ## 6. CLI alternative — `pm chat`
+
+> The `pm chat` CLI lands in PR #2047 — these commands work once that
+> merges. The HTTP endpoints (§3) are usable directly today via `curl`.
 
 The `pm chat` CLI is a thin client over these endpoints. It exists
 because typing curl with bearer-token plumbing every time gets old.
@@ -744,21 +777,27 @@ Two gotchas:
    the JSONL but the model's working context no longer references
    them.
 
-### (h) `pm chat send` works but my curl doesn't
+### (h) `POST /send` returns `400 invalid_request` with no obvious clue
 
-Three things to check:
+Things to check:
 
 - Content-Type header (`Content-Type: application/json`).
 - Body is valid JSON (jq it first).
-- Right session_name (worker sessions are `task-<project>-<task_number>`,
+- Right `session_name` (worker sessions are `task-<project>-<task_number>`,
   hyphen between project and number, not underscore).
+- When `answer_to` is set, supply at least one of `selections`, `text`,
+  or `notes` — an `answer_to` with all three empty is rejected.
+- When `answer_to` is unset, `text` is required.
 
 ---
 
 ## 8. Cross-references
 
-- Source spec: `docs/project-specs/chat-endpoints-spec.md` (authoritative
-  design doc this reference is derived from).
+- Implementation (source of truth for the wire format):
+  - `src/pollypm/web_api/routes/chat_messages.py` — `GET /sessions`
+    and `GET /{session_name}/messages` (PR #2045).
+  - `src/pollypm/web_api/routes/chat_send.py` — `POST /{session_name}/send`
+    (PR #2043).
 - Recovery cascade and the `[PollyPM-Auth: ...]` marker contract:
   `docs/recovery-cascade.md` — explains why the per-session `auth_token`
   field exists and why it's NOT what inbound API clients use.

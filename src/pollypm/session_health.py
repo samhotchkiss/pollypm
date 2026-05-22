@@ -149,14 +149,152 @@ def list_storage_closet_windows(tmux_session: str) -> dict[str, Any]:
         return {}
 
 
+class TmuxProbeUnavailable(RuntimeError):
+    """Raised by :func:`probe_strict_turn_active` when the probe cannot answer.
+
+    The destructive ``POST /api/v1/sessions/{name}/restart`` strict
+    safety gate must fail *closed* — a transient tmux outage must not
+    look like "agent is idle" and let the restart tear down a working
+    pane (Codex PR #2061 round 3 + round 6). Callers map this to
+    ``503 unsafe_mid_turn_unknown``.
+
+    Aliases :class:`pollypm.session_services.tmux.TmuxProbeUnavailable`
+    so the route layer can catch a single exception type regardless of
+    where the probe is dispatched. The session-services exception type
+    stays alive for in-service probes; the route now prefers the
+    config/tmux-direct probe defined here.
+    """
+
+
+def probe_strict_turn_active(
+    config: Any,
+    session_name: str,
+    tmux_client: Any,
+    *,
+    windows: dict[str, Any] | None = None,
+) -> bool:
+    """Return True iff the configured session has a live mid-turn pane.
+
+    Single-sourced strict probe for the destructive restart safety gate.
+    Reads from the **same** contract surfaces the rest of the sessions-
+    admin API exposes:
+
+    * ``config.sessions[name]`` — the canonical configured-session
+      registry (mirrors what ``GET /api/v1/sessions`` walks);
+    * ``windows`` (or :func:`list_storage_closet_windows`) — the live
+      tmux window inventory used to compute ``info.window_present`` on
+      ``GET /api/v1/sessions/{name}``;
+    * direct :class:`pollypm.tmux.client.TmuxClient` ``list_panes`` /
+      ``capture_pane`` calls against the resolved pane.
+
+    Pointedly NOT routed through :class:`TmuxSessionService` /
+    :class:`pollypm.storage.state.StateStore`. Codex PR #2061 round 6
+    caught that production session registration is now in pg (via
+    :func:`pollypm.storage.pg_sessions.upsert_session`, called from the
+    Supervisor launch path), so the legacy ``StateStore.list_sessions``
+    (which the in-service strict probe consults) can be empty or stale
+    even when the configured session and tmux pane exist. With that
+    split source the in-service probe returned ``False`` (looks-idle)
+    on healthy production setups and the restart proceeded to destroy
+    a working pane — fail-open in the worst possible way.
+
+    ``windows`` (optional) lets the caller pass an already-computed
+    ``{window_name: TmuxWindow}`` dict (from
+    :func:`list_storage_closet_windows`) so the probe and the route's
+    ``info.window_present`` cannot diverge even with a flaky tmux
+    server between back-to-back calls. When omitted, the probe
+    computes it itself.
+
+    Returns
+    -------
+    bool
+        ``True`` if the pane is live and shows a recognised active-turn
+        marker (Claude Code's ``working`` / ``⏺`` or Codex's
+        ``working (...)`` + ``esc to interrupt``).
+        ``False`` if:
+        * the session isn't configured (caller's 404 lookup already
+          ran, but be lenient — nothing to "be mid-turn" on),
+        * the tmux window is absent (nothing to interrupt),
+        * the pane is dead (nothing to interrupt),
+        * or the pane text shows no active-turn marker.
+
+    Raises
+    ------
+    TmuxProbeUnavailable
+        Any failure of ``list_panes`` / ``capture_pane`` — propagated
+        so the route maps to ``503 unsafe_mid_turn_unknown`` instead of
+        silently returning ``False``.
+    """
+    sessions = getattr(config, "sessions", None) or {}
+    session = sessions.get(session_name)
+    if session is None:
+        # Lookup by ``name`` attribute too — config may be keyed by
+        # role / window / etc. in test fixtures.
+        for candidate in sessions.values():
+            if getattr(candidate, "name", "") == session_name:
+                session = candidate
+                break
+    if session is None:
+        return False
+
+    window_name = getattr(session, "window_name", None) or session_name
+    tmux_session = getattr(getattr(config, "project", None), "tmux_session", "") or ""
+    storage_session = storage_session_name(tmux_session) if tmux_session else ""
+    if not storage_session:
+        return False
+
+    if windows is None:
+        windows = list_storage_closet_windows(storage_session)
+    window = windows.get(window_name)
+    if window is None:
+        # No tmux window for the configured session → nothing to
+        # interrupt. The route may still proceed to relaunch into a
+        # fresh window; the strict gate does not block that.
+        return False
+    pane_id = getattr(window, "pane_id", None)
+    if pane_id is None:
+        return False
+    if getattr(window, "pane_dead", False):
+        return False
+
+    target = f"{getattr(window, 'session', storage_session)}:{window_name}"
+    try:
+        panes = tmux_client.list_panes(target)
+    except Exception as exc:  # noqa: BLE001
+        raise TmuxProbeUnavailable(
+            f"tmux.list_panes failed: {exc!s}",
+        ) from exc
+    active_pane_id = pane_id
+    for pane in panes:
+        if getattr(pane, "active", False):
+            active_pane_id = getattr(pane, "pane_id", pane_id)
+            break
+
+    try:
+        text = tmux_client.capture_pane(active_pane_id, lines=200)
+    except Exception as exc:  # noqa: BLE001
+        raise TmuxProbeUnavailable(
+            f"tmux.capture_pane failed: {exc!s}",
+        ) from exc
+
+    lowered = text.lower()
+    if "⏺" in text or "working" in lowered:
+        return True
+    if "working (" in lowered and "esc to interrupt" in lowered:
+        return True
+    return False
+
+
 __all__ = [
     "STALE_HEARTBEAT_SECONDS",
     "STORAGE_CLOSET_SUFFIX",
+    "TmuxProbeUnavailable",
     "age_seconds",
     "classify_status",
     "humanize_age",
     "latest_heartbeat",
     "list_storage_closet_windows",
     "parse_iso",
+    "probe_strict_turn_active",
     "storage_session_name",
 ]

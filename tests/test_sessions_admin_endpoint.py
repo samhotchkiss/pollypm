@@ -302,6 +302,46 @@ def patch_tmux_service(monkeypatch: pytest.MonkeyPatch):
 
 
 @pytest.fixture
+def patch_strict_probe(monkeypatch: pytest.MonkeyPatch):
+    """Install a stub for ``_probe_strict_turn_active`` on the route module.
+
+    Codex PR #2061 round 6: the destructive restart safety gate now
+    calls :func:`pollypm.session_health.probe_strict_turn_active`
+    directly (config + tmux client, no :class:`TmuxSessionService` /
+    legacy :class:`StateStore`). Tests assert the route consults this
+    config/tmux-direct probe by patching the route's reference to it.
+
+    Pass ``mid_turn=True`` to force the 409 unsafe_mid_turn branch,
+    ``raises=RuntimeError(...)`` to force the 503
+    unsafe_mid_turn_unknown branch.
+    """
+    from pollypm.session_health import TmuxProbeUnavailable
+
+    def install(
+        *,
+        mid_turn: bool = False,
+        raises: Exception | None = None,
+    ) -> dict[str, Any]:
+        calls: list[tuple[Any, str, Any]] = []
+
+        def fake(
+            config: Any, name: str, tmux_client: Any, **kwargs: Any,
+        ) -> bool:
+            calls.append((config, name, tmux_client))
+            if raises is not None:
+                if isinstance(raises, TmuxProbeUnavailable):
+                    raise raises
+                raise TmuxProbeUnavailable(str(raises)) from raises
+            return mid_turn
+
+        monkeypatch.setattr(
+            sessions_admin_routes, "_probe_strict_turn_active", fake,
+        )
+        return {"calls": calls}
+    return install
+
+
+@pytest.fixture
 def patch_supervisor(monkeypatch: pytest.MonkeyPatch):
     """Install a stub for ``_build_supervisor`` on the route module.
 
@@ -462,6 +502,67 @@ def test_get_session_404_unknown(
     assert response.json()["error"]["code"] == "not_found"
 
 
+def test_get_session_window_present_consistent_between_info_and_health(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_tmux_service,
+):
+    """``info.window_present`` and ``health.window_present`` must agree.
+
+    Codex PR #2061 round 6: ``info.window_present`` is built from the
+    shared :func:`pollypm.session_health.list_storage_closet_windows`
+    helper (config + tmux direct), while ``health.window_present``
+    used to come from :meth:`TmuxSessionService.health` →
+    ``self._store.list_sessions()`` on the legacy :class:`StateStore`.
+    On a pg-backed install with no legacy-StateStore session rows the
+    two fields could disagree for the same configured session — one
+    reporting ``True`` (window genuinely live), the other ``False``
+    (in-service ``get()`` saw no StateStore record so returned a
+    "window absent" health snapshot).
+
+    The fix single-sources ``health.window_present`` to the value
+    already computed for ``info`` from the canonical helper. This test
+    pins the contract: a live window is reported as present on BOTH
+    fields, an absent window as missing on BOTH.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+
+    # _FakeTmuxService has window_present=True by default → in the
+    # baseline this matched info. We force window_present=False on the
+    # in-service health snapshot to simulate the round-6 split-source
+    # bug (StateStore-empty install): without the fix,
+    # health.window_present is False while info.window_present is True
+    # (because list_storage_closet_windows DID find the window).
+    patch_tmux_service(_FakeTmuxService(
+        turn_active=False, window_present=False,
+    ))
+
+    response = client.get(
+        "/api/v1/sessions/operator", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["info"]["window_present"] is True
+    # Without the round-6 fix this would be False.
+    assert body["health"]["window_present"] == body["info"]["window_present"], (
+        "info.window_present and health.window_present must single-source "
+        "from the same config/tmux helper — Codex PR #2061 round 6."
+    )
+
+    # And the negative direction: when the window is absent both
+    # fields must report False.
+    patch_tmux_windows([])
+    patch_tmux_service(_FakeTmuxService(
+        turn_active=False, window_present=True,
+    ))
+    response = client.get(
+        "/api/v1/sessions/operator", headers=auth_headers,
+    )
+    body = response.json()
+    assert body["info"]["window_present"] is False
+    assert body["health"]["window_present"] == body["info"]["window_present"]
+
+
 # ---------------------------------------------------------------------------
 # POST /sessions/{name}/restart
 # ---------------------------------------------------------------------------
@@ -469,7 +570,7 @@ def test_get_session_404_unknown(
 
 def test_restart_routes_through_supervisor_facade(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     """Restart goes through ``Supervisor.restart_session`` (PR #2061 P0 #1).
 
@@ -482,7 +583,7 @@ def test_restart_routes_through_supervisor_facade(
     """
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    svc = patch_tmux_service(_FakeTmuxService(turn_active=False))
+    probe = patch_strict_probe(mid_turn=False)
     sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
@@ -491,9 +592,9 @@ def test_restart_routes_through_supervisor_facade(
     body = response.json()
     assert body["ok"] is True
     assert "operator" in (body.get("message") or "")
-    # The route did NOT poke the raw destroy/create helpers — the
-    # facade owns that pair.
-    assert svc.calls == []
+    # The strict probe was consulted (config/tmux-direct, not the
+    # legacy StateStore-dependent in-service probe).
+    assert len(probe["calls"]) == 1
     # The facade was called once with the session, the configured
     # account (effective_account is None in this stub), and the
     # api_restart failure_type so the recovery audit chain attributes
@@ -507,7 +608,7 @@ def test_restart_routes_through_supervisor_facade(
 
 def test_restart_prefers_effective_account_over_configured(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     """When the runtime carries an ``effective_account`` it wins.
 
@@ -518,7 +619,7 @@ def test_restart_prefers_effective_account_over_configured(
     """
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    patch_tmux_service(_FakeTmuxService(turn_active=False))
+    patch_strict_probe(mid_turn=False)
     sup = patch_supervisor(
         _FakeSupervisor(effective_account="recovery_account"),
     )
@@ -531,12 +632,12 @@ def test_restart_prefers_effective_account_over_configured(
 
 def test_restart_facade_failure_503_daemon_unavailable(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     """``Supervisor.restart_session`` raising → 503, not 500."""
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    patch_tmux_service(_FakeTmuxService(turn_active=False))
+    patch_strict_probe(mid_turn=False)
     patch_supervisor(
         _FakeSupervisor(restart_raises=RuntimeError("tmux server down")),
     )
@@ -549,11 +650,11 @@ def test_restart_facade_failure_503_daemon_unavailable(
 
 def test_restart_refuses_mid_turn(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    svc = patch_tmux_service(_FakeTmuxService(turn_active=True))
+    patch_strict_probe(mid_turn=True)
     sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
@@ -561,29 +662,25 @@ def test_restart_refuses_mid_turn(
     assert response.status_code == 409
     body = response.json()
     assert body["error"]["code"] == "unsafe_mid_turn"
-    # neither the raw service nor the facade was touched
-    assert svc.calls == []
+    # The destructive facade was NEVER touched.
     assert sup.restart_calls == []
 
 
 def test_restart_strict_fail_closed_when_probe_raises(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     """Strict-mode probe failure → 503 ``unsafe_mid_turn_unknown``.
 
-    PR #2061 P0 #2 regression: the previous ``_is_turn_active``
-    swallowed every exception and returned ``False``, so a transient
-    tmux/parse failure looked like "agent is idle" and the route
-    happily destroyed an actively-working agent. Strict mode (the
-    default) must fail *closed* — the safety gate refuses the restart
-    when it cannot evaluate the mid-turn signal.
+    PR #2061 P0 #2 + round 6: a transient tmux failure must not look
+    like "agent is idle" and let the route destroy an actively-working
+    agent. The route now consults the config/tmux-direct
+    :func:`pollypm.session_health.probe_strict_turn_active` helper,
+    which raises :class:`TmuxProbeUnavailable` on tmux outage.
     """
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    svc = patch_tmux_service(
-        _FakeTmuxService(turn_active_raises=RuntimeError("tmux probe timeout")),
-    )
+    patch_strict_probe(raises=RuntimeError("tmux probe timeout"))
     sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
@@ -592,13 +689,12 @@ def test_restart_strict_fail_closed_when_probe_raises(
     body = response.json()
     assert body["error"]["code"] == "unsafe_mid_turn_unknown"
     # The destructive path was NEVER reached.
-    assert svc.calls == []
     assert sup.restart_calls == []
 
 
 def test_restart_force_bypasses_safety_probe_entirely(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     """``?safety=force`` skips the probe even when it would raise.
 
@@ -607,9 +703,7 @@ def test_restart_force_bypasses_safety_probe_entirely(
     """
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    patch_tmux_service(
-        _FakeTmuxService(turn_active_raises=RuntimeError("tmux probe timeout")),
-    )
+    probe = patch_strict_probe(raises=RuntimeError("tmux probe timeout"))
     sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart?safety=force",
@@ -617,15 +711,17 @@ def test_restart_force_bypasses_safety_probe_entirely(
     )
     assert response.status_code == 200, response.text
     assert len(sup.restart_calls) == 1
+    # force MUST bypass the probe entirely.
+    assert probe["calls"] == []
 
 
 def test_restart_force_overrides_mid_turn(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    patch_tmux_service(_FakeTmuxService(turn_active=True))
+    patch_strict_probe(mid_turn=True)
     sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart?safety=force",
@@ -638,11 +734,11 @@ def test_restart_force_overrides_mid_turn(
 
 def test_restart_404_unknown_session(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
     patch_heartbeat({})
     patch_tmux_windows([])
-    patch_tmux_service(_FakeTmuxService())
+    patch_strict_probe(mid_turn=False)
     patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/nope/restart", headers=auth_headers,
@@ -651,302 +747,109 @@ def test_restart_404_unknown_session(
     assert response.json()["error"]["code"] == "not_found"
 
 
-def test_restart_503_when_tmux_service_unavailable(
-    client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
-):
-    patch_heartbeat({})
-    patch_tmux_windows([])
-    patch_tmux_service(None)  # tmux service construction failed
-    patch_supervisor(_FakeSupervisor())
-    response = client.post(
-        "/api/v1/sessions/operator/restart", headers=auth_headers,
-    )
-    assert response.status_code == 503
-    assert response.json()["error"]["code"] == "daemon_unavailable"
-
-
-def test_restart_strict_fails_closed_when_real_tmux_probe_fails(
+def test_restart_strict_blocks_when_state_store_empty_but_tmux_window_live(
     client, config, auth_headers, monkeypatch, patch_heartbeat,
     patch_tmux_windows, patch_supervisor,
 ):
-    """Real ``TmuxSessionService`` fail-soft must not bypass the strict gate.
+    """Codex PR #2061 round 6 regression — the headline fail-open case.
 
-    Codex PR #2061 round 3: the production ``TmuxSessionService.list``
-    swallows ``self._store.list_sessions()`` failures and returns no
-    handles; ``health`` swallows pane / capture failures; and
-    ``is_turn_active`` then returns ``False`` (looks-idle). The
-    round-2 regression used a fake that raised directly from
-    ``is_turn_active`` — so the test passed while a real outage
-    happily skipped the strict gate. This test hits the actual
-    :class:`TmuxSessionService` with a store that raises from
-    ``list_sessions`` (the exact path Codex flagged) and asserts the
-    route returns 503 ``unsafe_mid_turn_unknown`` and NEVER calls the
-    supervisor restart facade.
+    Production session registration is in pg
+    (``supervisor._record_launch`` → ``pollypm.storage.pg_sessions.upsert_session``),
+    so the legacy :class:`StateStore.list_sessions()` row set can be
+    empty/stale even when the configured session has a live, actively-
+    working tmux pane. The prior round-5 strict probe (
+    :meth:`TmuxSessionService.is_turn_active_strict`) saw "no
+    StateStore row" → returned ``False`` (looks-idle) → the destructive
+    restart proceeded and could destroy a working agent.
+
+    The round-6 fix: the strict probe reads from the SAME source as
+    the rest of the API contract — ``config.sessions[name]`` +
+    :func:`pollypm.session_health.list_storage_closet_windows` + direct
+    :class:`pollypm.tmux.client.TmuxClient` calls. With the legacy
+    StateStore empty but a live tmux window and active-turn pane text,
+    default restart MUST return 409 ``unsafe_mid_turn`` and MUST NOT
+    call :meth:`Supervisor.restart_session`.
+
+    This test is constructed to FAIL against the round-5
+    implementation (StateStore-dependent probe → False → 200 restart)
+    and PASS against the round-6 implementation (config/tmux-direct
+    probe → True → 409). Verified by reverting the new helper +
+    restart call site and re-running.
     """
-    from pollypm.session_services.tmux import TmuxSessionService
-
-    class _BrokenStore:
-        """Mirrors a real pg / state-store outage on ``list_sessions``."""
-
-        def list_sessions(self):
-            raise RuntimeError("state store unavailable")
-
-    real_svc = TmuxSessionService(
-        config=config,
-        store=_BrokenStore(),
-    )
-    monkeypatch.setattr(
-        sessions_admin_routes,
-        "_build_tmux_service",
-        lambda _config: real_svc,
-    )
-
-    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    # Stub list_storage_closet_windows so the route's helper sees the
+    # configured "operator" window as present + live.
     patch_tmux_windows(["operator"])
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+
+    # Stub TmuxClient at the construction site so the strict probe's
+    # list_panes + capture_pane don't shell out to a real tmux. The
+    # pane text mimics Codex's mid-turn marker.
+    class _FakePane:
+        def __init__(self, pane_id: str, *, active: bool = True) -> None:
+            self.pane_id = pane_id
+            self.active = active
+
+    class _FakeTmuxClient:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, Any]] = []
+
+        def list_panes(self, target: str):  # noqa: ARG002
+            self.calls.append(("list_panes", target))
+            return [_FakePane("%9", active=True)]
+
+        def capture_pane(self, pane_id: str, lines: int = 200):  # noqa: ARG002
+            self.calls.append(("capture_pane", pane_id))
+            return "working (10s) esc to interrupt\n"
+
+    fake_client = _FakeTmuxClient()
+    monkeypatch.setattr(
+        "pollypm.tmux.client.TmuxClient", lambda: fake_client,
+    )
+
     sup = patch_supervisor(_FakeSupervisor())
 
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
     )
-    assert response.status_code == 503, response.text
+    assert response.status_code == 409, response.text
     body = response.json()
-    assert body["error"]["code"] == "unsafe_mid_turn_unknown"
-    # Destructive facade must not have been touched.
+    assert body["error"]["code"] == "unsafe_mid_turn"
+    # The destructive facade was NEVER touched even though no
+    # legacy-StateStore row exists for "operator".
     assert sup.restart_calls == []
+    # The strict probe DID consult the live tmux pane.
+    assert any(call[0] == "capture_pane" for call in fake_client.calls)
 
 
-def test_build_tmux_service_routes_through_supervisor_facade_not_get_store(
-    config, monkeypatch,
-):
-    """Production wiring proof — ``_build_tmux_service`` MUST NOT use ``get_store``.
-
-    Codex PR #2061 round 5 blocker 1: the prior wiring was
-    ``_build_tmux_service`` → ``TmuxSessionService(store=get_store(config))``.
-    On a stock pg install ``get_store(config)`` returns the unified
-    :class:`pollypm.store.backends.pg_store.PgStore`, which exposes
-    ``append_event`` / ``query_messages`` / etc. but NO
-    ``list_sessions``. ``TmuxSessionService.list()`` and the round-3
-    strict probe call ``self._store.list_sessions()``, so every
-    production strict-restart raised ``AttributeError`` inside the
-    probe and the route returned ``503 unsafe_mid_turn_unknown`` even
-    for actually-idle agents.
-
-    The round-5 fix routes the service through
-    :func:`pollypm.service_api.build_supervisor` →
-    :attr:`Supervisor.session_service`. The supervisor's own session-
-    service property wires the correct
-    :class:`pollypm.storage.state.StateStore` (which DOES expose
-    ``list_sessions``).
-
-    This regression pins the wiring by:
-
-    1. Patching :func:`pollypm.store.registry.get_store` to raise so
-       any call to it from ``_build_tmux_service`` would propagate.
-    2. Patching :func:`pollypm.service_api.build_supervisor` to return
-       a fake whose ``.session_service`` is a sentinel object.
-    3. Asserting that the sentinel comes back through
-       ``_build_tmux_service`` — i.e. the route consults the
-       supervisor facade, not ``get_store``.
-
-    Without the fix this test fails because ``_build_tmux_service``
-    falls into the ``get_store(config)`` path and either returns a
-    PgStore-backed service (sentinel mismatch) or hits the simulated
-    failure.
-    """
-    from pollypm.web_api.routes import sessions_admin as routes
-    from pollypm.store import registry as store_registry
-
-    sentinel_service = object()
-
-    class _FakeSupervisor:
-        session_service = sentinel_service
-
-    # If the route reaches for get_store(config) we want it to be
-    # obvious in the failure mode.
-    def _boom_get_store(_config):
-        raise AssertionError(
-            "_build_tmux_service must NOT call get_store directly — "
-            "it must route through service_api.build_supervisor so the "
-            "service inherits Supervisor.store (StateStore, not PgStore). "
-            "Codex PR #2061 round 5 blocker 1."
-        )
-
-    monkeypatch.setattr(store_registry, "get_store", _boom_get_store)
-
-    # Patch the facade builder the route consults so we can inject
-    # our sentinel-bearing supervisor without touching the database.
-    monkeypatch.setattr(
-        "pollypm.service_api.build_supervisor",
-        lambda _config, **_kwargs: _FakeSupervisor(),
-    )
-
-    service = routes._build_tmux_service(config)
-    assert service is sentinel_service
-
-
-def test_restart_strict_succeeds_when_supervisor_wires_correct_store(
+def test_restart_strict_503_when_tmux_probe_raises(
     client, config, auth_headers, monkeypatch, patch_heartbeat,
-    patch_tmux_windows,
+    patch_tmux_windows, patch_supervisor,
 ):
-    """Strict-mode restart succeeds when supervisor wires a healthy probe.
+    """Tmux ``capture_pane`` outage → strict probe fails closed (503).
 
-    Codex PR #2061 round 5 blocker 1 — companion to
-    :func:`test_build_tmux_service_routes_through_supervisor_facade_not_get_store`.
-    The prior wiring would 503 every restart on a pg-backed install
-    because the strict probe blew up on
-    ``PgStore.list_sessions``. The post-round-5 wiring routes through
-    the supervisor whose session-service has the correct StateStore;
-    when that probe says "idle", the restart MUST succeed.
-
-    We monkeypatch ``_build_supervisor`` to return a fake whose
-    ``session_service.is_turn_active_strict`` returns False (idle) —
-    no AttributeError. The route must then call the supervisor's
-    ``restart_session`` exactly once and return 200.
+    Codex PR #2061 round 3 + round 6: with a live tmux window the
+    strict probe still must propagate a ``capture_pane`` failure as
+    :class:`pollypm.session_health.TmuxProbeUnavailable` so the route
+    returns ``503 unsafe_mid_turn_unknown`` (fail-closed). Carried
+    forward from round 3 against the new config/tmux-direct probe.
     """
-    from pollypm.session_services.tmux import TmuxSessionService
+    patch_tmux_windows(["operator"])
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
 
-    class _HealthyStore:
-        """Mirrors StateStore.list_sessions shape — returns no rows."""
+    import subprocess
 
-        def list_sessions(self):
+    class _FakeTmuxClient:
+        def list_panes(self, target: str):  # noqa: ARG002
             return []
 
-    real_svc = TmuxSessionService(
-        config=config,
-        store=_HealthyStore(),
-    )
+        def capture_pane(self, pane_id: str, lines: int = 200):  # noqa: ARG002
+            raise subprocess.CalledProcessError(
+                returncode=1, cmd=["tmux", "capture-pane"],
+            )
 
-    class _FakeSupervisorWithHealthyProbe:
-        def __init__(self, svc: TmuxSessionService) -> None:
-            self.session_service = svc
-            self.restart_calls: list[dict[str, Any]] = []
-
-        def get_session_runtime(self, name: str) -> Any:  # noqa: ARG002
-            return None
-
-        def restart_session(
-            self, session_name: str, account_name: str, *, failure_type: str,
-        ) -> None:
-            self.restart_calls.append({
-                "session_name": session_name,
-                "account_name": account_name,
-                "failure_type": failure_type,
-            })
-
-    fake_sup = _FakeSupervisorWithHealthyProbe(real_svc)
     monkeypatch.setattr(
-        sessions_admin_routes,
-        "_build_supervisor",
-        lambda _config: fake_sup,
+        "pollypm.tmux.client.TmuxClient", lambda: _FakeTmuxClient(),
     )
-    # Do NOT monkeypatch _build_tmux_service — the production path
-    # must construct it from fake_sup.session_service.
-
-    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
-    patch_tmux_windows([])  # no live windows → strict probe returns False (idle)
-
-    response = client.post(
-        "/api/v1/sessions/operator/restart", headers=auth_headers,
-    )
-    # The strict probe must NOT spuriously 503; the route consults
-    # the supervisor's correctly-wired session service.
-    assert response.status_code == 200, response.text
-    assert len(fake_sup.restart_calls) == 1
-    assert fake_sup.restart_calls[0]["session_name"] == "operator"
-
-
-def test_restart_force_still_bypasses_strict_probe_failure(
-    client, config, auth_headers, monkeypatch, patch_heartbeat,
-    patch_tmux_windows, patch_supervisor,
-):
-    """``?safety=force`` must still bypass the round-3 strict probe.
-
-    The operator-escalation override is destructive by design and must
-    proceed even when the strict probe can't evaluate the mid-turn
-    signal. This is the round-3 counterpart of
-    :func:`test_restart_force_bypasses_safety_probe_entirely` against
-    the real-svc failure path.
-    """
-    from pollypm.session_services.tmux import TmuxSessionService
-
-    class _BrokenStore:
-        def list_sessions(self):
-            raise RuntimeError("state store unavailable")
-
-    real_svc = TmuxSessionService(
-        config=config,
-        store=_BrokenStore(),
-    )
-    monkeypatch.setattr(
-        sessions_admin_routes,
-        "_build_tmux_service",
-        lambda _config: real_svc,
-    )
-
-    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
-    patch_tmux_windows(["operator"])
-    sup = patch_supervisor(_FakeSupervisor())
-
-    response = client.post(
-        "/api/v1/sessions/operator/restart?safety=force",
-        headers=auth_headers,
-    )
-    assert response.status_code == 200, response.text
-    assert len(sup.restart_calls) == 1
-
-
-def test_restart_strict_fails_closed_when_real_capture_pane_fails(
-    client, config, auth_headers, monkeypatch, patch_heartbeat,
-    patch_tmux_windows, patch_supervisor,
-):
-    """``capture_pane`` failure on the real service must fail closed.
-
-    Codex PR #2061 round 3 named ``capture_pane`` as a second fail-soft
-    swallow point inside ``TmuxSessionService.health``. With a healthy
-    store + window the strict probe must still propagate a
-    ``capture_pane`` outage instead of returning "looks idle".
-    """
-    from pollypm.session_services.tmux import TmuxSessionService
-
-    # Configured session record so list_sessions succeeds.
-    session_record = SimpleNamespace(
-        name="operator", window_name="operator",
-        provider="claude", account="claude_primary", cwd="/tmp",
-    )
-
-    class _OkStore:
-        def list_sessions(self):
-            return [session_record]
-
-    real_svc = TmuxSessionService(
-        config=config,
-        store=_OkStore(),
-    )
-
-    # Window present (so the strict probe reaches the pane capture
-    # step), but ``capture_pane`` raises like a tmux outage would.
-    window = SimpleNamespace(
-        session=real_svc.storage_closet_session_name(),
-        name="operator",
-        pane_id="%9",
-        pane_dead=False,
-    )
-    monkeypatch.setattr(real_svc.tmux, "list_all_windows", lambda: [window])
-    monkeypatch.setattr(real_svc.tmux, "is_pane_alive", lambda _pid: True)
-
-    def _boom_capture(_pane_id, *, lines=200):  # noqa: ARG001
-        raise RuntimeError("tmux capture-pane failed")
-
-    monkeypatch.setattr(real_svc.tmux, "capture_pane", _boom_capture)
-    monkeypatch.setattr(
-        sessions_admin_routes,
-        "_build_tmux_service",
-        lambda _config: real_svc,
-    )
-
-    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
-    patch_tmux_windows(["operator"])
     sup = patch_supervisor(_FakeSupervisor())
 
     response = client.post(
@@ -958,20 +861,109 @@ def test_restart_strict_fails_closed_when_real_capture_pane_fails(
     assert sup.restart_calls == []
 
 
-def test_restart_503_when_supervisor_unavailable(
+def test_restart_strict_503_when_supervisor_unavailable(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service, patch_supervisor,
+    patch_strict_probe, patch_supervisor,
 ):
-    """Supervisor construction failure → 503 ``daemon_unavailable``."""
-    patch_heartbeat({})
-    patch_tmux_windows([])
-    patch_tmux_service(_FakeTmuxService(turn_active=False))
+    """Supervisor construction failure → 503 ``daemon_unavailable``.
+
+    Codex PR #2061 round 6 lifecycle note: supervisor construction is
+    deferred until AFTER the strict probe passes, so this only fires
+    on a healthy strict probe (no transient writable Supervisor on the
+    probe path). The route still returns 503 ``daemon_unavailable``
+    when the supervisor cannot be built for the actual restart.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_strict_probe(mid_turn=False)
     patch_supervisor(None)  # Supervisor() failed
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
     )
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "daemon_unavailable"
+
+
+def test_restart_strict_probe_runs_before_supervisor_constructed(
+    client, auth_headers, monkeypatch, patch_heartbeat,
+    patch_tmux_windows, patch_strict_probe,
+):
+    """Codex PR #2061 round 6 lifecycle: probe-failure path skips Supervisor().
+
+    The route must NOT construct a transient writable Supervisor (which
+    opens the legacy sqlite ``state.db`` and runs migrations as a
+    side-effect) until after the strict safety probe passes. Otherwise
+    every probe-failure 503 still pays the sqlite open/migrate cost,
+    defeating the lifecycle cleanup.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_strict_probe(raises=RuntimeError("tmux probe timeout"))
+
+    # If ``_build_supervisor`` is called on the probe-failure path,
+    # this will explode (the AssertionError propagates out of the
+    # route as a 500, which is fail-LOUDER than the silent leak we
+    # used to have).
+    def _boom_build_supervisor(_config):
+        raise AssertionError(
+            "Supervisor MUST NOT be constructed on a probe-failure path — "
+            "Codex PR #2061 round 6 lifecycle cleanup."
+        )
+
+    monkeypatch.setattr(
+        sessions_admin_routes,
+        "_build_supervisor",
+        _boom_build_supervisor,
+    )
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    # Probe failed → 503 unsafe_mid_turn_unknown (not a 500 from the
+    # boom_build_supervisor sentinel).
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "unsafe_mid_turn_unknown"
+
+
+def test_restart_strict_supervisor_closed_after_use(
+    client, auth_headers, monkeypatch, patch_heartbeat,
+    patch_tmux_windows, patch_strict_probe,
+):
+    """Per-request Supervisor is closed after the restart returns.
+
+    Codex PR #2061 round 6 lifecycle note: ``Supervisor.__init__``
+    opens the legacy sqlite ``state.db``; the route uses the
+    supervisor for one or two public calls and then discards it. The
+    route now explicitly calls ``supervisor.stop()`` in a ``finally``
+    so the connection doesn't leak across restart calls.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_strict_probe(mid_turn=False)
+
+    class _CloseTrackingSupervisor(_FakeSupervisor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.stop_calls = 0
+
+        def stop(self) -> None:
+            self.stop_calls += 1
+
+    sup = _CloseTrackingSupervisor()
+    monkeypatch.setattr(
+        sessions_admin_routes, "_build_supervisor", lambda _c: sup,
+    )
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert len(sup.restart_calls) == 1
+    assert sup.stop_calls == 1, (
+        "Supervisor.stop() must be called in finally to close the "
+        "legacy sqlite state.db connection (Codex PR #2061 round 6 "
+        "lifecycle note)."
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -103,6 +103,9 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
 from pollypm.session_health import (
+    TmuxProbeUnavailable as _TmuxProbeUnavailable,
+)
+from pollypm.session_health import (
     age_seconds as _age_seconds,
 )
 from pollypm.session_health import (
@@ -113,6 +116,9 @@ from pollypm.session_health import (
 )
 from pollypm.session_health import (
     list_storage_closet_windows as _list_storage_closet_windows,
+)
+from pollypm.session_health import (
+    probe_strict_turn_active as _probe_strict_turn_active,
 )
 from pollypm.session_health import (
     storage_session_name as _shared_storage_session_name,
@@ -500,11 +506,33 @@ def _build_tmux_service(config: Any) -> Any | None:
         return None
 
 
-def _session_health(svc: Any | None, name: str) -> SessionHealthSnapshot:
-    """Best-effort health probe via :class:`TmuxSessionService`."""
+def _session_health(
+    svc: Any | None,
+    name: str,
+    *,
+    info_window_present: bool | None = None,
+) -> SessionHealthSnapshot:
+    """Best-effort health probe via :class:`TmuxSessionService`.
+
+    ``info_window_present`` (when supplied) overrides the
+    ``window_present`` field that ``svc.health(name)`` would compute.
+    Codex PR #2061 round 6 caught that ``info.window_present`` and
+    ``health.window_present`` could disagree for the same configured
+    session: ``info`` is built from the shared
+    :func:`pollypm.session_health.list_storage_closet_windows` helper
+    (config + tmux direct), while ``svc.health()`` routes through
+    :class:`TmuxSessionService.health` → ``self._store.list_sessions()``
+    on the legacy :class:`StateStore`. On production the pg-facade owns
+    session registration, so the legacy store can be empty and
+    ``health.window_present`` would report ``False`` for a window that
+    ``info.window_present`` reported ``True``. Threading the canonical
+    ``windows`` dict in keeps both fields single-sourced.
+    """
     if svc is None:
         return SessionHealthSnapshot(
-            window_present=False, pane_alive=False, pane_dead=True,
+            window_present=bool(info_window_present) if info_window_present is not None else False,
+            pane_alive=False,
+            pane_dead=True,
             pane_command=None,
         )
     try:
@@ -512,11 +540,18 @@ def _session_health(svc: Any | None, name: str) -> SessionHealthSnapshot:
     except Exception:  # noqa: BLE001
         logger.debug("svc.health(%s) failed", name, exc_info=True)
         return SessionHealthSnapshot(
-            window_present=False, pane_alive=False, pane_dead=True,
+            window_present=bool(info_window_present) if info_window_present is not None else False,
+            pane_alive=False,
+            pane_dead=True,
             pane_command=None,
         )
+    window_present = (
+        bool(info_window_present)
+        if info_window_present is not None
+        else bool(getattr(h, "window_present", False))
+    )
     return SessionHealthSnapshot(
-        window_present=bool(getattr(h, "window_present", False)),
+        window_present=window_present,
         pane_alive=bool(getattr(h, "pane_alive", False)),
         pane_dead=bool(getattr(h, "pane_dead", True)),
         pane_command=getattr(h, "pane_command", None),
@@ -616,6 +651,30 @@ def _build_supervisor(config: Any) -> Any | None:
     except Exception:  # noqa: BLE001
         logger.debug("Supervisor construction failed", exc_info=True)
         return None
+
+
+def _close_supervisor_quietly(supervisor: Any | None) -> None:
+    """Close a transient per-request :class:`Supervisor` without raising.
+
+    Codex PR #2061 round 6 lifecycle note: ``Supervisor.__init__``
+    opens the legacy sqlite ``state.db`` (and runs migrations) as a
+    side-effect, so each per-request construction holds a writable
+    connection until close. The route uses the supervisor for one or
+    two public method calls (``get_session_runtime`` /
+    ``restart_session``) and then discards it; without an explicit
+    close we'd leak fds across many restart calls. :meth:`Supervisor.stop`
+    is the documented teardown — best-effort here because a failure to
+    close should never mask a successful restart.
+    """
+    if supervisor is None:
+        return
+    stop = getattr(supervisor, "stop", None)
+    if not callable(stop):
+        return
+    try:
+        stop()
+    except Exception:  # noqa: BLE001
+        logger.debug("supervisor.stop() raised on quiet close", exc_info=True)
 
 
 def _resolve_restart_account(supervisor: Any, session: Any) -> str | None:
@@ -720,7 +779,15 @@ def get_session_endpoint(name: str, config: ConfigDep) -> SessionDetail:
         paused=paused,
     )
     svc = _build_tmux_service(config)
-    health = _session_health(svc, name)
+    # Single-source ``window_present`` with the value already computed
+    # for ``info`` from the shared ``list_storage_closet_windows``
+    # helper. Avoids the round-6 split-source bug where
+    # ``info.window_present`` (config/tmux direct) and
+    # ``health.window_present`` (StateStore-dependent) could disagree
+    # for the same configured session on pg-backed installs.
+    health = _session_health(
+        svc, name, info_window_present=info.window_present,
+    )
     turn_active = _is_turn_active(svc, name)
     return SessionDetail(
         info=info,
@@ -768,17 +835,54 @@ def restart_session_endpoint(
       can't be constructed, or if ``restart_session`` raises.
     """
     session = _find_session(config, name)
-    svc = _build_tmux_service(config)
-    if svc is None:
-        raise _daemon_unavailable(name, "tmux session service unavailable")
 
-    # Safety gate (Codex PR #2061 P0 #2). Strict mode (the default)
-    # fails *closed* — a probe that cannot answer "is this agent
-    # currently working?" must not be treated as "agent is idle".
+    # Safety gate (Codex PR #2061 P0 #2 + round 6). Strict mode (the
+    # default) fails *closed* — a probe that cannot answer "is this
+    # agent currently working?" must not be treated as "agent is idle".
+    #
+    # The probe now reads from the SAME source as the rest of the API
+    # contract (config + tmux direct) instead of going through
+    # :class:`TmuxSessionService.is_turn_active_strict`, which depends
+    # on the legacy :class:`StateStore.list_sessions()` row set. In
+    # production the pg facade owns session registration (via
+    # :func:`pollypm.storage.pg_sessions.upsert_session` on the launch
+    # path) so the legacy store is empty/stale and the in-service
+    # strict probe returned ``False`` (fail-open) for actively-working
+    # agents. ``probe_strict_turn_active`` re-resolves the configured
+    # window from ``config.sessions[name]`` →
+    # ``list_storage_closet_windows`` → direct
+    # :class:`pollypm.tmux.client.TmuxClient` calls so the answer cannot
+    # diverge from what ``GET /api/v1/sessions/{name}`` reports.
+    #
+    # Supervisor construction is deferred until after the probe passes:
+    # ``Supervisor()`` opens the legacy sqlite ``state.db`` and runs
+    # migrations as a side-effect, so building it up-front on every
+    # probe / probe-failure would add sqlite open/migrate latency to a
+    # read-flavoured safety check. We pay that cost only when we're
+    # actually going to invoke the destructive restart.
     if safety != "force":
         try:
-            mid_turn = _is_turn_active(svc, name, strict=True)
-        except _TurnProbeUnavailable as exc:
+            from pollypm.tmux.client import TmuxClient
+
+            # Reuse the same window dict the route's read-side helpers
+            # use so the probe and ``GET /api/v1/sessions/{name}``
+            # cannot diverge for the same session (Codex PR #2061
+            # round 6 single-source contract).
+            storage_session = _storage_session_name(config)
+            windows = _list_storage_closet_windows(storage_session)
+            mid_turn = _probe_strict_turn_active(
+                config, name, TmuxClient(), windows=windows,
+            )
+        except _TmuxProbeUnavailable as exc:
+            raise _unsafe_mid_turn_unknown(name, str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            # Defensive: any unexpected error from the probe is treated
+            # as "cannot evaluate" (fail-closed). The typed exception
+            # above covers the documented tmux-call failures.
+            logger.debug(
+                "probe_strict_turn_active(%s) unexpected failure",
+                name, exc_info=True,
+            )
             raise _unsafe_mid_turn_unknown(name, str(exc)) from exc
         if mid_turn:
             raise _unsafe_mid_turn(name)
@@ -795,30 +899,41 @@ def restart_session_endpoint(
     supervisor = _build_supervisor(config)
     if supervisor is None:
         raise _daemon_unavailable(name, "supervisor unavailable")
-    account_name = _resolve_restart_account(supervisor, session)
-    if not account_name:
-        raise _daemon_unavailable(
-            name, "no effective or configured account on session",
-        )
-
     try:
-        supervisor.restart_session(
-            name, account_name, failure_type="api_restart",
-        )
-    except KeyError as exc:
-        # ``Supervisor.restart_session`` raises ``KeyError`` for an
-        # unknown account; surface as 503 because the API contract is
-        # "the daemon couldn't honor the request" rather than a client
-        # validation error (the account was resolved from runtime/config).
-        logger.debug("restart_session unknown account for %s", name, exc_info=True)
-        raise _daemon_unavailable(
-            name, f"unknown restart account: {exc!s}",
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("supervisor.restart_session(%s) failed", name, exc_info=True)
-        raise _daemon_unavailable(
-            name, f"restart_session raised: {exc!s}",
-        ) from exc
+        account_name = _resolve_restart_account(supervisor, session)
+        if not account_name:
+            raise _daemon_unavailable(
+                name, "no effective or configured account on session",
+            )
+
+        try:
+            supervisor.restart_session(
+                name, account_name, failure_type="api_restart",
+            )
+        except KeyError as exc:
+            # ``Supervisor.restart_session`` raises ``KeyError`` for an
+            # unknown account; surface as 503 because the API contract is
+            # "the daemon couldn't honor the request" rather than a client
+            # validation error (the account was resolved from runtime/config).
+            logger.debug(
+                "restart_session unknown account for %s", name, exc_info=True,
+            )
+            raise _daemon_unavailable(
+                name, f"unknown restart account: {exc!s}",
+            ) from exc
+        except Exception as exc:  # noqa: BLE001
+            logger.debug(
+                "supervisor.restart_session(%s) failed", name, exc_info=True,
+            )
+            raise _daemon_unavailable(
+                name, f"restart_session raised: {exc!s}",
+            ) from exc
+    finally:
+        # Per-request transient supervisor — close so we don't leak the
+        # sqlite ``state.db`` connection on every restart call (Codex
+        # PR #2061 round 6 lifecycle note). Best-effort: ``stop`` is
+        # idempotent against missing internal state.
+        _close_supervisor_quietly(supervisor)
 
     return ActionResult(ok=True, message=f"restarted {name}")
 

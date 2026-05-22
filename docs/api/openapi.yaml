@@ -4018,6 +4018,17 @@ components:
             row failed `Event` validation (typically a non-ISO `ts`
             from an old schema version) and was skipped rather than
             failing the response. (Codex P0 finding, PR #2062 round 2.)
+        _pattern_timeouts:
+          type: integer
+          default: 0
+          description: |
+            Diagnostic counter. Non-zero when at least one line's regex
+            search exceeded the per-line timeout (100 ms) and was
+            skipped as a no-match. Always zero when `safe_regex=false`
+            (the default literal-substring mode). Surfaced so operators
+            running a deliberately exploratory regex can tell when the
+            ReDoS guardrail fired vs. there genuinely being no matches.
+            (Codex P0 finding, PR #2062 round 2.)
 
     AuditStatsResponse:
       type: object

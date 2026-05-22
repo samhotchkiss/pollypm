@@ -33,14 +33,241 @@ from __future__ import annotations
 
 import gzip
 import json
+import multiprocessing
+import multiprocessing.connection
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Iterable, Iterator, MutableMapping
 
 from pollypm.audit.log import central_log_path
 from pollypm.config import load_config
 from pollypm.projects import project_audit_log_path
+
+
+# ---------------------------------------------------------------------------
+# Bounded-time regex search — ReDoS guardrail (PR #2062 round 2 Codex P0).
+# ---------------------------------------------------------------------------
+#
+# Stdlib ``re`` has no per-call timeout. The 200-char pattern cap added in
+# round 1 keeps the *pattern* small but does nothing to stop a short
+# pathological pattern like ``(a+)+b`` against backtracking-heavy input
+# (each input line independently triggers catastrophic backtracking that
+# the C engine will not surface back to Python until it finishes — and
+# the engine holds the GIL throughout, so daemon threads don't help
+# either: the calling thread can't wake up to honour its timeout).
+#
+# The only stdlib path that actually interrupts a runaway match is the
+# OS killing the process. We pay for that with a fork per request: a
+# child worker is spawned lazily the first time we need to match a
+# regex line, and the parent drives it via a Pipe with a per-line
+# wall-clock deadline. When a line exceeds the deadline the child is
+# ``terminate()``d (kernel signal — works through the GIL because the
+# C runtime checks pending signals at every regex backtrack step in
+# CPython's signal-aware loop), a fresh child is spawned, and the
+# diagnostic counter is bumped. Worst-case cost: ``(matched_lines + N_timeouts) * fork_cost``.
+#
+# We deliberately don't ship a long-lived pool because the only point
+# of forking is to make ``terminate()`` available — sharing a worker
+# across requests would let one ReDoS query break the next request's
+# search even without a timeout.
+_PER_LINE_TIMEOUT_S = 0.1  # 100 ms per line is well above any sane operator regex.
+
+# Startup is much slower than steady state: spawning a forkserver helper
+# (first call only) plus forking and importing ``pollypm.audit.query``
+# in the child can take ~1-2 s on a cold macOS test runner. We grant the
+# very first line a generous startup grace so the legitimate operator
+# query doesn't get falsely timed out by fork-server warmup. Once the
+# child is alive and answering, subsequent lines are bound by
+# ``_PER_LINE_TIMEOUT_S``.
+_STARTUP_GRACE_S = 5.0
+
+# ``fork`` is fastest but unsafe in multi-threaded parents (TestClient,
+# FastAPI workers), and CPython deprecated it on Linux/macOS in 3.12+.
+# ``forkserver`` runs a tiny single-threaded helper that fork()s the
+# worker on demand — safe with threads, only available on POSIX.
+# ``spawn`` is the fallback (Windows or unusual platforms) but is
+# significantly slower (~200 ms per child). The choice happens once at
+# import; on the supported platforms (macOS / Linux) we always land on
+# ``forkserver``.
+try:
+    _MP_CTX = multiprocessing.get_context("forkserver")
+    # Preload our own module in the forkserver helper so each child
+    # fork doesn't have to re-import it. Cuts steady-state respawn
+    # cost from ~80 ms (cold import) to ~10 ms (fork only).
+    try:
+        _MP_CTX.set_forkserver_preload(["pollypm.audit.query"])
+    except Exception:  # noqa: BLE001 — best-effort optimisation
+        pass
+except ValueError:
+    _MP_CTX = multiprocessing.get_context("spawn")
+
+
+def _regex_worker_main(
+    pattern_str: str,
+    request_conn: "multiprocessing.connection.Connection",
+) -> None:
+    """Worker entry point. Compiles ``pattern_str`` once and loops on lines."""
+    compiled = re.compile(pattern_str)
+    while True:
+        try:
+            line = request_conn.recv()
+        except (EOFError, OSError):
+            return
+        if line is None:  # graceful shutdown sentinel
+            return
+        try:
+            match = compiled.search(line)
+        except Exception:  # noqa: BLE001
+            match = None
+        try:
+            request_conn.send(bool(match))
+        except (BrokenPipeError, OSError):
+            return
+
+
+class _BoundedRegexSession:
+    """Per-request driver for the regex worker process.
+
+    Lazily spawns a child the first time :meth:`search` is called, and
+    keeps the same child for subsequent lines. When a search exceeds
+    the per-line deadline the child is killed and a fresh one is
+    spawned on the next call — the abandoned worker can take as long
+    as it needs to finish backtracking; the OS reaps it.
+
+    Call :meth:`close` (or use as a context manager) at the end of the
+    request to terminate the child cleanly.
+    """
+
+    def __init__(self, pattern: re.Pattern[str]) -> None:
+        self._pattern_str = pattern.pattern
+        self._process: multiprocessing.Process | None = None
+        self._conn: "multiprocessing.connection.Connection | None" = None
+        # First call to a fresh worker pays for forkserver warmup +
+        # ``import pollypm.audit.query`` in the child; subsequent calls
+        # only pay the round-trip. Track first-call separately so the
+        # initial line isn't falsely flagged as a ReDoS timeout.
+        self._needs_warmup = True
+
+    def __enter__(self) -> "_BoundedRegexSession":
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self.close()
+
+    def _spawn(self) -> None:
+        parent_conn, child_conn = _MP_CTX.Pipe(duplex=True)
+        process = _MP_CTX.Process(
+            target=_regex_worker_main,
+            args=(self._pattern_str, child_conn),
+            name="audit-regex-worker",
+            daemon=True,
+        )
+        process.start()
+        # Close the child end in the parent so EOF propagates when the
+        # child dies (otherwise our recv() blocks forever).
+        child_conn.close()
+        self._process = process
+        self._conn = parent_conn
+
+    def search(self, line: str) -> tuple[bool, bool]:
+        """Return ``(matched, timed_out)`` for ``line``.
+
+        On timeout: kills the child, returns ``(False, True)``. The
+        next call respawns. On crash: returns ``(False, True)`` too —
+        we'd rather count a phantom timeout than silently drop matches.
+        """
+        if self._process is None or self._conn is None:
+            self._spawn()
+        assert self._conn is not None
+        assert self._process is not None
+        try:
+            self._conn.send(line)
+        except (BrokenPipeError, OSError):
+            self._teardown()
+            return (False, True)
+        # Wait for the child's response with a wall-clock deadline.
+        # ``poll`` is the only Pipe API that takes a timeout in stdlib
+        # multiprocessing.
+        deadline = _STARTUP_GRACE_S if self._needs_warmup else _PER_LINE_TIMEOUT_S
+        self._needs_warmup = False
+        if not self._conn.poll(deadline):
+            self._teardown()
+            return (False, True)
+        try:
+            matched = bool(self._conn.recv())
+        except (EOFError, OSError):
+            self._teardown()
+            return (False, True)
+        return (matched, False)
+
+    def _teardown(self) -> None:
+        if self._process is not None:
+            try:
+                self._process.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self._process.join(timeout=0.5)
+            except Exception:  # noqa: BLE001
+                pass
+            if self._process.is_alive():
+                try:
+                    self._process.kill()
+                except Exception:  # noqa: BLE001
+                    pass
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+        self._process = None
+        self._conn = None
+        # Don't re-arm warmup grace for respawns: by the time a respawn
+        # happens, the forkserver helper is already running and module
+        # imports are cached, so subsequent forks land within the
+        # per-line timeout. Re-arming would let a sustained ReDoS
+        # attack reset the budget on every line.
+
+    def close(self) -> None:
+        # Polite shutdown: send sentinel, give the child a moment, then
+        # terminate if it ignores us.
+        if self._conn is not None and self._process is not None and self._process.is_alive():
+            try:
+                self._conn.send(None)
+            except (BrokenPipeError, OSError):
+                pass
+        self._teardown()
+
+
+def safe_pattern_search(
+    pattern: re.Pattern[str], line: str
+) -> re.Match[str] | None:
+    """Bounded-time wrapper around ``pattern.search``.
+
+    Compatibility shim — spawns a one-shot worker process, runs the
+    search with the per-line timeout, and returns the match (or
+    ``None`` on no-match / timeout / crash). Callers that need to
+    distinguish timeout from no-match should use
+    :class:`_BoundedRegexSession` directly so they can read both
+    return-tuple fields.
+
+    Because each call forks its own worker, this helper is only
+    appropriate for one-off lookups. The walker in
+    :func:`iter_matching_events` uses :class:`_BoundedRegexSession`
+    instead so the fork cost is amortised across an entire request.
+    """
+    with _BoundedRegexSession(pattern) as session:
+        matched, _timed_out = session.search(line)
+    if not matched:
+        return None
+    # The worker only returned a bool to keep the IPC payload tiny; the
+    # caller of this helper only needs match-or-not, so we re-run the
+    # search in-process on the matched line to materialise the Match
+    # object. This is safe because we already know the line did NOT
+    # cause catastrophic backtracking (otherwise the worker would have
+    # timed out instead of returning True).
+    return pattern.search(line)
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +496,8 @@ def iter_matching_events(
     literal: str | None = None,
     since: datetime | None,
     event_type: str | None,
+    stats: MutableMapping[str, int] | None = None,
+    bounded_regex: bool = False,
 ) -> Iterator[dict]:
     """Stream parsed events from ``targets`` that pass every filter.
 
@@ -288,37 +517,74 @@ def iter_matching_events(
     Malformed JSON lines are skipped silently — the live audit log can
     have a truncated tail mid-write and we don't want one bad line to
     mask the rest of the matches.
+
+    Regex behaviour depends on ``bounded_regex``:
+
+    * ``False`` (default — CLI / trusted-caller path): runs
+      ``pattern.search`` inline. The operator chose the pattern; if it
+      backtracks catastrophically that's on them and ``Ctrl+C`` is the
+      escape hatch.
+    * ``True`` (HTTP / untrusted-caller path): each line goes through
+      a multiprocessing worker with a per-line wall-clock budget
+      (:data:`_PER_LINE_TIMEOUT_S`). Timed-out lines are treated as
+      no-matches and (if ``stats`` is provided)
+      ``stats["pattern_timeouts"]`` is bumped so the caller can
+      surface the count in its response envelope.
     """
     since_iso = since.isoformat() if since is not None else None
-    for path in targets:
-        for chain_path in walk_log_chain(path):
-            for line in open_log_lines(chain_path):
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                # Cheap reject — literal substring is much cheaper than
-                # regex and immune to catastrophic backtracking.
-                if literal:
-                    if literal not in stripped:
+    use_bounded_regex = (
+        bounded_regex and pattern is not None and pattern.pattern and not literal
+    )
+    session: _BoundedRegexSession | None = (
+        _BoundedRegexSession(pattern) if use_bounded_regex else None  # type: ignore[arg-type]
+    )
+    try:
+        for path in targets:
+            for chain_path in walk_log_chain(path):
+                for line in open_log_lines(chain_path):
+                    stripped = line.strip()
+                    if not stripped:
                         continue
-                elif pattern is not None and pattern.pattern:
-                    if not pattern.search(stripped):
-                        continue
-                try:
-                    record = json.loads(stripped)
-                except json.JSONDecodeError:
-                    continue
-                if not isinstance(record, dict):
-                    continue
-                if event_type is not None and record.get("event") != event_type:
-                    continue
-                if since_iso is not None:
-                    ts_str = str(record.get("ts", ""))
-                    if ts_str and ts_str < since_iso:
-                        parsed = parse_event_ts(ts_str)
-                        if parsed is None or parsed < since:
+                    # Cheap reject — literal substring is much cheaper
+                    # than regex and immune to catastrophic backtracking.
+                    if literal:
+                        if literal not in stripped:
                             continue
-                yield record
+                    elif session is not None:
+                        matched, timed_out = session.search(stripped)
+                        if timed_out:
+                            if stats is not None:
+                                stats["pattern_timeouts"] = (
+                                    stats.get("pattern_timeouts", 0) + 1
+                                )
+                            continue
+                        if not matched:
+                            continue
+                    elif pattern is not None and pattern.pattern:
+                        # Trusted-caller path (CLI / in-process callers
+                        # that opted out of bounded_regex). The operator
+                        # owns the pattern; if it backtracks they can
+                        # Ctrl+C.
+                        if not pattern.search(stripped):
+                            continue
+                    try:
+                        record = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(record, dict):
+                        continue
+                    if event_type is not None and record.get("event") != event_type:
+                        continue
+                    if since_iso is not None:
+                        ts_str = str(record.get("ts", ""))
+                        if ts_str and ts_str < since_iso:
+                            parsed = parse_event_ts(ts_str)
+                            if parsed is None or parsed < since:
+                                continue
+                    yield record
+    finally:
+        if session is not None:
+            session.close()
 
 
 __all__ = [
@@ -327,5 +593,6 @@ __all__ = [
     "parse_event_ts",
     "parse_since",
     "resolve_target_files",
+    "safe_pattern_search",
     "walk_log_chain",
 ]

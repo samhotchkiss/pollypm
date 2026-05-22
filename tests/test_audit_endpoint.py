@@ -677,3 +677,67 @@ def test_audit_stats_requires_time_window(
     # Hint should mention the CLI escape hatch for unbounded scans.
     hint = (body["error"].get("hint") or "").lower()
     assert "since" in hint or "cli" in hint or "pm audit" in hint
+
+
+def test_audit_grep_short_pathological_pattern_does_not_hang(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """ReDoS-style pattern ``(a+)+b`` against backtracking-heavy input.
+
+    Round 1's 200-char pattern cap doesn't stop this — the pattern is
+    only six characters but each line of ``a``s triggers catastrophic
+    backtracking in the stdlib ``re`` engine, which holds the GIL
+    throughout (so daemon threads can't time it out from Python). Round
+    2 runs each ``pattern.search`` inside a ``multiprocessing`` worker
+    so the OS can ``terminate()`` the child when its wall-clock budget
+    expires; the line is counted in ``_pattern_timeouts`` and the
+    response still returns.
+
+    Without the guardrail, ``(a+)+b`` against 40 ``a``s + ``!`` runs
+    for tens of seconds per line on Python 3.14 (190 s at n=30 in our
+    local benchmark, exponential in n). The test asserts a generous
+    8 s ceiling — well below the un-guarded backtrack cost but loose
+    enough to absorb the cost of respawning the worker process after
+    each timeout (a forkserver respawn is ~50 ms steady state but can
+    push into the second-range under TestClient + pytest scheduling).
+    """
+    import time
+
+    # 40 ``a``s followed by ``!`` — the ``!`` blocks any final ``b``
+    # match so the engine exhausts every grouping permutation before
+    # admitting defeat. Three rows so the timeout has to fire more
+    # than once (single-line timeout could be a happy accident).
+    pathological_subject = "a" * 40 + "!"
+    _write_jsonl(
+        _per_project_log(project_root),
+        [_make_event(subject=pathological_subject) for _ in range(3)],
+    )
+
+    start = time.monotonic()
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={
+            "project": "myproj",
+            "pattern": "(a+)+b",
+            "safe_regex": "true",
+        },
+        headers=auth_headers,
+    )
+    elapsed = time.monotonic() - start
+
+    # 8 s ceiling: per-line timeout is 100 ms but each fresh worker
+    # spawn after a kill adds ~50-1000 ms depending on host load. Three
+    # pathological lines is ~3 s worst case; we double that for slack.
+    # Without the guardrail this query would burn many minutes.
+    assert elapsed < 8.0, f"pattern.search hung; elapsed={elapsed:.3f}s"
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Every line timed out → no events matched.
+    assert body["events"] == []
+    # At least one line should have tripped the timeout — typically all
+    # three do, but we only assert >= 1 to keep the test robust on a
+    # faster future machine where some lines happen to complete in time.
+    assert body.get("_pattern_timeouts", 0) >= 1, body

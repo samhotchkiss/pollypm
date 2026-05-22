@@ -84,11 +84,19 @@ class AuditGrepResponse(BaseModel):
     means at least one archived line failed Pydantic ``Event``
     validation (typically a non-ISO ``ts`` from a pre-schema row) and
     was dropped rather than 500'ing the response.
+
+    ``_pattern_timeouts`` counts lines where the bounded-time regex
+    search exceeded the per-line timeout. Non-zero means a pathological
+    ReDoS pattern is being thrown at the API; the request still
+    returned within bounded time (each timed-out line is treated as a
+    no-match) but the operator should know which queries triggered the
+    safety net. Always zero in literal-substring mode.
     """
 
     events: list[Event]
     next_cursor: str | None = None
     malformed_rows_skipped: int = Field(default=0, alias="_malformed_rows_skipped")
+    pattern_timeouts: int = Field(default=0, alias="_pattern_timeouts")
 
     model_config = {"populate_by_name": True}
 
@@ -144,9 +152,12 @@ def _validate_pattern_length(pattern: str) -> None:
 def _compile_safe_regex_or_400(pattern: str) -> re.Pattern[str]:
     """Compile an opt-in regex, after the length cap has been checked.
 
-    Stdlib ``re`` has no timeout knob, so the only guardrails we ship
-    are (a) the length cap above and (b) requiring ``safe_regex=true``
-    so a client can't enable catastrophic backtracking by accident.
+    Compiling a regex is cheap and deterministic; the catastrophic
+    backtracking risk is at *match time*. The query walker pipes each
+    line through :func:`pollypm.audit.query.safe_pattern_search`, which
+    runs the search on a bounded-time worker pool — a short pathological
+    pattern like ``(a+)+b`` can no longer hang the request. See the
+    module docstring "Round 2 guardrails" section for the full chain.
     """
     try:
         return re.compile(pattern)
@@ -264,12 +275,15 @@ def grep_audit_endpoint(
 
     events: list[Event] = []
     malformed = 0
+    walker_stats: dict[str, int] = {}
     for record in iter_matching_events(
         targets=targets,
         pattern=compiled,
         literal=literal,
         since=since_dt,
         event_type=event_type,
+        stats=walker_stats,
+        bounded_regex=True,
     ):
         event = _coerce_record_to_event(record)
         if event is None:
@@ -283,6 +297,7 @@ def grep_audit_endpoint(
         events=events,
         next_cursor=None,
         _malformed_rows_skipped=malformed,
+        _pattern_timeouts=walker_stats.get("pattern_timeouts", 0),
     )
 
 

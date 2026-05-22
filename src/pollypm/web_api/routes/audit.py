@@ -5,36 +5,36 @@ Implements the historical-query side of the audit surface:
 * ``GET /api/v1/audit/grep`` — mirrors ``pm audit grep`` (PR #2036).
   Filters: ``project``, ``since`` (ISO-8601 or ``1h``/``24h``/``7d``
   shortcut), ``event_type`` (exact match on ``.event``), ``pattern``
-  (Python ``re.search`` regex on the raw JSONL line), ``limit``
-  (default 100, max 1000).
+  (literal substring by default; opt-in regex via ``safe_regex=true``),
+  ``limit`` (default 100, max 1000).
 * ``GET /api/v1/audit/stats`` — aggregate counts over the same target
-  files. Returns ``{by_event, by_severity, total, since}``.
+  files. Returns ``{by_event, by_severity, total, since}``. The HTTP
+  surface REQUIRES a bounded time window (``since`` query param) —
+  unbounded full-history scans must use the CLI (``pm audit grep``).
 
 The streaming side (``GET /api/v1/audit/stream``) is already shipped
 as ``GET /api/v1/events`` (Phase 1 SSE). This module intentionally does
 not re-route that path — it would duplicate the stream multiplexer for
 no operator benefit (see Phase 2 spec §8.1).
 
-Helper reuse (per spec): the route module is a thin adapter over the
-private helpers in :mod:`pollypm.cli_features.audit`:
+Module boundary (Codex P1 review, PR #2062 round 2): rotation-aware
+query helpers live in :mod:`pollypm.audit.query`, NOT in
+``cli_features.audit``. The CLI module is a thin Typer adapter over
+the same domain code; both surfaces share parse/walk semantics.
 
-* :func:`_resolve_target_files` — picks the right per-project +
-  central-tail paths based on the ``project`` filter. The web API
-  passes the in-memory :class:`PollyPMConfig` directly so the helper
-  doesn't reload the user's config from disk on every request.
-* :func:`_iter_matching_events` — applies the cheap→expensive filter
-  chain (regex first against the raw line, then ``event_type``
-  equality, then ``since``). Streams rather than slurps so a multi-MB
-  rotated ``.gz`` archive doesn't blow memory.
-* :func:`parse_since` — ISO-8601 / shortcut parsing, identical to the
-  CLI surface so the API contract matches what ``pm audit grep --since``
-  accepts.
+HTTP guardrails added in round 2:
 
-This is intentionally a separate router file (not folded into
-``events.py``) because the streaming and grep surfaces have distinct
-auth requirements (SSE uses ``?token=`` query auth; grep + stats use
-bearer-only) and distinct response shapes (``text/event-stream`` vs.
-``application/json``).
+* ReDoS: ``pattern`` is a LITERAL substring match by default. Regex
+  is opt-in via ``safe_regex=true``; both modes cap pattern length
+  at :data:`_PATTERN_LENGTH_MAX` so a pathological client can't ship
+  a 100 KB regex through the audit walker.
+* Malformed rows: corrupt ``ts`` values (and any other
+  ``ValidationError``-raising field) are skipped per-row with a counted
+  diagnostic on the response (``_malformed_rows_skipped``) — one bad
+  archived line no longer 500s the entire query.
+* Unbounded stats: ``/audit/stats`` requires ``since``; without it the
+  endpoint returns ``400 invalid_request`` pointing the operator at
+  the CLI for whole-history aggregation.
 """
 
 from __future__ import annotations
@@ -44,12 +44,12 @@ from datetime import datetime, timezone
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Query
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
-from pollypm.cli_features.audit import (
-    _iter_matching_events,
-    _resolve_target_files,
+from pollypm.audit.query import (
+    iter_matching_events,
     parse_since,
+    resolve_target_files,
 )
 from pollypm.web_api.errors import invalid_request
 from pollypm.web_api.models import Event
@@ -64,6 +64,13 @@ router = APIRouter(tags=["Audit"])
 _GREP_LIMIT_DEFAULT = 100
 _GREP_LIMIT_MAX = 1000
 
+# Cap pattern length (literal AND regex). Anything longer is almost
+# certainly an abuse vector — operator patterns top out around 50
+# chars in practice. 200 chars leaves headroom for json-escape-heavy
+# regexes without giving an attacker room for a 50 KB catastrophic
+# backtracker (Codex round-1 P0 ReDoS finding).
+_PATTERN_LENGTH_MAX = 200
+
 
 class AuditGrepResponse(BaseModel):
     """Body for ``GET /audit/grep``.
@@ -72,10 +79,18 @@ class AuditGrepResponse(BaseModel):
     future paging (cursor encoding lives outside this PR per the
     "Phase 2 audit query" scope) — we always return ``None`` today so
     clients see the field shape without depending on its value.
+
+    ``_malformed_rows_skipped`` is a diagnostic counter — non-zero
+    means at least one archived line failed Pydantic ``Event``
+    validation (typically a non-ISO ``ts`` from a pre-schema row) and
+    was dropped rather than 500'ing the response.
     """
 
     events: list[Event]
     next_cursor: str | None = None
+    malformed_rows_skipped: int = Field(default=0, alias="_malformed_rows_skipped")
+
+    model_config = {"populate_by_name": True}
 
 
 class AuditStatsResponse(BaseModel):
@@ -85,7 +100,8 @@ class AuditStatsResponse(BaseModel):
     so totals + per-event / per-severity counts match what a manual
     grep would produce. ``since`` echoes the parsed-and-normalized
     cutoff so the client can confirm the server interpreted shortcuts
-    like ``24h`` against its own clock.
+    like ``24h`` against its own clock. The HTTP surface requires
+    ``since`` to keep stats bounded (see module docstring).
     """
 
     total: int
@@ -97,31 +113,41 @@ class AuditStatsResponse(BaseModel):
 def _parse_since_or_400(value: str | None) -> datetime | None:
     """Wrap :func:`parse_since` to raise the typed API error.
 
-    The CLI helper raises ``typer.BadParameter`` for invalid inputs;
-    we re-raise as ``400 invalid_request`` so the API contract (spec
-    §6 error envelope) is consistent. Returns ``None`` when the
-    caller passed nothing — no filter requested.
+    The neutral helper raises :class:`ValueError`; we re-raise as
+    ``400 invalid_request`` so the API contract (spec §6 error
+    envelope) is consistent. Returns ``None`` when the caller passed
+    nothing — no filter requested.
     """
     if value is None:
         return None
     try:
         return parse_since(value)
-    except Exception as exc:  # noqa: BLE001 — typer.BadParameter is the only path, but stay defensive
+    except ValueError as exc:
         raise invalid_request(
             f"invalid 'since' value {value!r}",
             hint="ISO-8601 (e.g. 2026-05-21T03:14:15Z) or shortcut like 1h / 24h / 7d",
         ) from exc
 
 
-def _compile_pattern_or_400(pattern: str | None) -> re.Pattern[str]:
-    """Compile the grep pattern or raise ``400 invalid_request``.
+def _validate_pattern_length(pattern: str) -> None:
+    """Reject over-long patterns up-front (ReDoS guardrail, P0)."""
+    if len(pattern) > _PATTERN_LENGTH_MAX:
+        raise invalid_request(
+            f"'pattern' is {len(pattern)} chars; max is {_PATTERN_LENGTH_MAX}",
+            hint=(
+                "Audit-grep patterns are operator-scale (a few dozen chars). "
+                "Truncate the pattern or filter via project/event_type/since."
+            ),
+        )
 
-    ``None`` / empty pattern is treated as "match everything" so the
-    endpoint works as a project/event-type filter without forcing the
-    caller to send ``pattern=.``.
+
+def _compile_safe_regex_or_400(pattern: str) -> re.Pattern[str]:
+    """Compile an opt-in regex, after the length cap has been checked.
+
+    Stdlib ``re`` has no timeout knob, so the only guardrails we ship
+    are (a) the length cap above and (b) requiring ``safe_regex=true``
+    so a client can't enable catastrophic backtracking by accident.
     """
-    if not pattern:
-        return re.compile(r"")
     try:
         return re.compile(pattern)
     except re.error as exc:
@@ -131,29 +157,38 @@ def _compile_pattern_or_400(pattern: str | None) -> re.Pattern[str]:
         ) from exc
 
 
-def _coerce_record_to_event(record: dict[str, Any]) -> Event:
+def _coerce_record_to_event(record: dict[str, Any]) -> Event | None:
     """Reshape an audit JSON record into the ``Event`` response model.
 
-    Tolerates the schema-version + ts shape the writer emits (see
-    :func:`pollypm.audit.log._build_record`). Strings that pydantic
-    cannot parse as ``datetime`` are passed through verbatim; the
-    response_model serializer will normalize them on output.
+    Returns ``None`` instead of raising when the record is too
+    malformed for Pydantic to accept (typically a non-ISO ``ts``
+    string from a pre-schema archived row). Callers should increment
+    a diagnostic counter so the operator can tell that historical
+    rows were silently dropped vs. there simply being no matches.
     """
-    return Event(
-        schema=int(record.get("schema", 1)),
-        ts=record.get("ts") or datetime.now(timezone.utc),
-        project=str(record.get("project") or ""),
-        event=str(record.get("event") or ""),
-        subject=str(record.get("subject") or ""),
-        actor=str(record.get("actor") or ""),
-        status=str(record.get("status") or "ok"),
-        metadata=record.get("metadata") or None,
-    )
+    try:
+        return Event(
+            schema=int(record.get("schema", 1)),
+            ts=record.get("ts") or datetime.now(timezone.utc),
+            project=str(record.get("project") or ""),
+            event=str(record.get("event") or ""),
+            subject=str(record.get("subject") or ""),
+            actor=str(record.get("actor") or ""),
+            status=str(record.get("status") or "ok"),
+            metadata=record.get("metadata") or None,
+        )
+    except ValidationError:
+        return None
+    except (TypeError, ValueError):
+        # ``int(record.get("schema"))`` etc. can blow up on garbage
+        # input types — treat the same as a validation miss.
+        return None
 
 
 @router.get(
     "/audit/grep",
     response_model=AuditGrepResponse,
+    response_model_by_alias=True,
     summary="Search audit-log events (rotation-aware)",
     operation_id="grepAudit",
 )
@@ -173,8 +208,23 @@ def grep_audit_endpoint(
     ] = None,
     pattern: Annotated[
         str | None,
-        Query(description="Python regex (re.search) over the raw JSONL line."),
+        Query(
+            description=(
+                "Substring matched against the raw JSONL line. Literal by "
+                "default; pass safe_regex=true to interpret as a Python "
+                f"re.search pattern. Capped at {_PATTERN_LENGTH_MAX} chars."
+            ),
+        ),
     ] = None,
+    safe_regex: Annotated[
+        bool,
+        Query(
+            description=(
+                "Opt in to regex semantics for 'pattern'. Default false "
+                "(literal substring) avoids ReDoS hazards on the API worker."
+            ),
+        ),
+    ] = False,
     limit: Annotated[
         int,
         Query(
@@ -190,27 +240,50 @@ def grep_audit_endpoint(
 
     Streams the rotation-aware target files (live ``.jsonl`` + ``.gz``
     archives newest-first) and applies filters in cheap→expensive
-    order: regex first, then ``event_type``, then ``since``. The
-    response is capped at ``limit`` matches; the spec leaves cursor
-    pagination to a follow-up PR (always returns ``next_cursor=null``
-    today).
+    order: substring/regex first, then ``event_type``, then ``since``.
+    The response is capped at ``limit`` matches; the spec leaves
+    cursor pagination to a follow-up PR (always returns
+    ``next_cursor=null`` today).
     """
     since_dt = _parse_since_or_400(since)
-    compiled = _compile_pattern_or_400(pattern)
-    targets = _resolve_target_files(project_filter=project, config=config)
+
+    literal: str | None = None
+    compiled: re.Pattern[str] | None = None
+    if pattern:
+        _validate_pattern_length(pattern)
+        if safe_regex:
+            compiled = _compile_safe_regex_or_400(pattern)
+        else:
+            literal = pattern
+    elif safe_regex:
+        # Treat ``safe_regex=true`` with no pattern as "match anything"
+        # — operator probably just enabled it speculatively.
+        pass
+
+    targets = resolve_target_files(project_filter=project, config=config)
 
     events: list[Event] = []
-    for record in _iter_matching_events(
+    malformed = 0
+    for record in iter_matching_events(
         targets=targets,
         pattern=compiled,
+        literal=literal,
         since=since_dt,
         event_type=event_type,
     ):
-        events.append(_coerce_record_to_event(record))
+        event = _coerce_record_to_event(record)
+        if event is None:
+            malformed += 1
+            continue
+        events.append(event)
         if len(events) >= limit:
             break
 
-    return AuditGrepResponse(events=events, next_cursor=None)
+    return AuditGrepResponse(
+        events=events,
+        next_cursor=None,
+        _malformed_rows_skipped=malformed,
+    )
 
 
 @router.get(
@@ -227,27 +300,40 @@ def stats_audit_endpoint(
     ] = None,
     since: Annotated[
         str | None,
-        Query(description="ISO-8601 timestamp or shortcut (1h, 24h, 7d)."),
+        Query(
+            description=(
+                "REQUIRED. ISO-8601 timestamp or shortcut (1h, 24h, 7d). "
+                "The HTTP surface refuses unbounded full-history stats — "
+                "use the CLI (`pm audit grep`) for that."
+            ),
+        ),
     ] = None,
 ) -> AuditStatsResponse:
     """Return per-event and per-severity counts over the target files.
 
-    Uses the same target-file resolver + matching engine as
-    :func:`grep_audit_endpoint` but with a match-everything pattern
-    so the aggregation reflects the full set the operator could grep
-    (subject only to ``project`` + ``since``). ``severity`` maps to
-    the audit record's ``status`` field (``ok`` / ``warn`` / ``error``)
-    — the same vocabulary :func:`pollypm.audit.log.emit` writes today.
+    Bounded by ``since`` (mandatory on the HTTP surface — see module
+    docstring). ``severity`` maps to the audit record's ``status``
+    field (``ok`` / ``warn`` / ``error``) — the same vocabulary
+    :func:`pollypm.audit.log.emit` writes today.
     """
+    if since is None:
+        raise invalid_request(
+            "'since' is required for /audit/stats",
+            hint=(
+                "Pass an ISO-8601 timestamp or shortcut (e.g. since=24h). "
+                "Use the CLI `pm audit grep` for unbounded history scans."
+            ),
+        )
     since_dt = _parse_since_or_400(since)
-    targets = _resolve_target_files(project_filter=project, config=config)
+    targets = resolve_target_files(project_filter=project, config=config)
 
     by_event: dict[str, int] = {}
     by_severity: dict[str, int] = {}
     total = 0
-    for record in _iter_matching_events(
+    for record in iter_matching_events(
         targets=targets,
-        pattern=re.compile(r""),
+        pattern=None,
+        literal=None,
         since=since_dt,
         event_type=None,
     ):

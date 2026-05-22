@@ -252,7 +252,7 @@ def test_grep_regex_pattern_filters_lines(
     project_root: Path,
     audit_home: Path,
 ) -> None:
-    """Pattern is a Python regex (``re.search``) over the raw JSONL line."""
+    """Pattern is a Python regex (``re.search``) when ``safe_regex=true``."""
     _write_jsonl(
         _per_project_log(project_root),
         [
@@ -263,13 +263,43 @@ def test_grep_regex_pattern_filters_lines(
     )
     response = client.get(
         "/api/v1/audit/grep",
-        params={"project": "myproj", "pattern": r"myproj/\d+"},
+        params={
+            "project": "myproj",
+            "pattern": r"myproj/\d+",
+            "safe_regex": "true",
+        },
         headers=auth_headers,
     )
     assert response.status_code == 200
     subjects = [e["subject"] for e in response.json()["events"]]
     # ``myproj/abc`` doesn't match the digit-only suffix regex.
     assert subjects == ["myproj/1", "myproj/12"]
+
+
+def test_grep_default_pattern_is_literal_substring(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Without ``safe_regex=true``, ``pattern`` is matched as a substring."""
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(subject="myproj/1"),
+            _make_event(subject="myproj/12"),
+            _make_event(subject="myproj/abc"),
+        ],
+    )
+    # ``\d+`` is treated as the literal six characters, not a regex —
+    # nothing matches.
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "pattern": r"\d+"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert response.json()["events"] == []
 
 
 def test_grep_since_shortcut_drops_old_events(
@@ -391,10 +421,10 @@ def test_grep_invalid_regex_returns_400_invalid_request(
     auth_headers: dict[str, str],
     audit_home: Path,
 ) -> None:
-    """Unbalanced group → ``400 invalid_request`` (not a 500)."""
+    """Unbalanced group with ``safe_regex=true`` → ``400 invalid_request``."""
     response = client.get(
         "/api/v1/audit/grep",
-        params={"pattern": "(unbalanced"},
+        params={"pattern": "(unbalanced", "safe_regex": "true"},
         headers=auth_headers,
     )
     assert response.status_code == 400, response.text
@@ -443,7 +473,7 @@ def test_stats_counts_by_event_and_severity(
     )
     response = client.get(
         "/api/v1/audit/stats",
-        params={"project": "myproj"},
+        params={"project": "myproj", "since": "30d"},
         headers=auth_headers,
     )
     assert response.status_code == 200, response.text
@@ -481,7 +511,7 @@ def test_stats_with_project_filter_isolates_one_project(
     )
     response = client.get(
         "/api/v1/audit/stats",
-        params={"project": "myproj"},
+        params={"project": "myproj", "since": "30d"},
         headers=auth_headers,
     )
     assert response.status_code == 200
@@ -528,7 +558,7 @@ def test_stats_empty_log_returns_zero_total(
     """No files at all → ``total=0`` (not a 500)."""
     response = client.get(
         "/api/v1/audit/stats",
-        params={"project": "myproj"},
+        params={"project": "myproj", "since": "24h"},
         headers=auth_headers,
     )
     assert response.status_code == 200
@@ -536,3 +566,114 @@ def test_stats_empty_log_returns_zero_total(
     assert body["total"] == 0
     assert body["by_event"] == {}
     assert body["by_severity"] == {}
+
+
+# ---------------------------------------------------------------------------
+# Round-2 guardrails (Codex review on PR #2062): ReDoS, malformed rows,
+# unbounded stats. See module docstring in
+# ``src/pollypm/web_api/routes/audit.py``.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_grep_pattern_length_capped(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """Patterns longer than 200 chars → ``400 invalid_request``."""
+    long_pattern = "a" * 500
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"pattern": long_pattern},
+        headers=auth_headers,
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "pattern" in body["error"]["message"]
+
+
+def test_audit_grep_pathological_pattern_returns_safely(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """ReDoS pattern returns within budget when default literal mode is on.
+
+    ``(a+)+b`` over ``aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!`` is the canonical
+    catastrophic-backtracking demo. The HTTP surface treats ``pattern``
+    as a literal substring by default, so this query must NOT hang —
+    it should complete in well under a second and just return no hits.
+    """
+    import time
+
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(subject=f"myproj/{'a' * 30}!"),
+            _make_event(subject="myproj/normal"),
+        ],
+    )
+    start = time.monotonic()
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "pattern": "(a+)+b"},
+        headers=auth_headers,
+    )
+    elapsed = time.monotonic() - start
+    assert response.status_code == 200, response.text
+    # Literal substring search over a handful of small lines must be
+    # near-instant; a 1 s budget is generous and unambiguously below
+    # what a catastrophic regex would take on the same input.
+    assert elapsed < 1.0, f"literal-mode grep took {elapsed:.3f}s (ReDoS regression?)"
+    # The literal string "(a+)+b" is never present in any line.
+    assert response.json()["events"] == []
+
+
+def test_audit_grep_malformed_row_skipped_not_500(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """A row with a non-ISO ``ts`` must be skipped, not 500 the response."""
+    log_path = _per_project_log(project_root)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Mix one valid event with one malformed one (bad ``ts``).
+    good = _make_event(subject="myproj/good", ts="2026-05-21T00:00:00+00:00")
+    bad = _make_event(subject="myproj/bad", ts="not-a-date")
+    with open(log_path, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(good) + "\n")
+        fh.write(json.dumps(bad) + "\n")
+
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    subjects = [e["subject"] for e in body["events"]]
+    assert subjects == ["myproj/good"]
+    assert body["_malformed_rows_skipped"] >= 1
+
+
+def test_audit_stats_requires_time_window(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """``/audit/stats`` without ``since`` → ``400 invalid_request`` with hint."""
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "since" in body["error"]["message"]
+    # Hint should mention the CLI escape hatch for unbounded scans.
+    hint = (body["error"].get("hint") or "").lower()
+    assert "since" in hint or "cli" in hint or "pm audit" in hint

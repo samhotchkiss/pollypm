@@ -1171,13 +1171,7 @@ def get_task_detail(
                 raise
             except Exception:  # noqa: BLE001
                 return None
-            plan: APIPlan | None = None
-            if _is_plan_task(task) and _is_in_review(task):
-                try:
-                    plan = _build_plan(svc, task)
-                except Exception:  # noqa: BLE001
-                    plan = None
-            return _task_to_detail(task, plan=plan)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "get_task_detail: backing store error for %s/%s: %s",
@@ -1277,15 +1271,10 @@ def queue_task(
                     hint="Fix the failing gate (e.g. add a description) before queueing.",
                 ) from exc
             # Re-read so the response carries the post-transition
-            # snapshot the client would see on a follow-up GET.
+            # snapshot the client would see on a follow-up GET — that
+            # includes plan hydration for plan-review tasks (#2064 r4).
             task = svc.get(task_id)
-            plan: APIPlan | None = None
-            if _is_plan_task(task) and _is_in_review(task):
-                try:
-                    plan = _build_plan(svc, task)
-                except Exception:  # noqa: BLE001
-                    plan = None
-            return _task_to_detail(task, plan=plan)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "queue_task: backing store error for %s: %s",
@@ -1340,7 +1329,7 @@ def claim_task(
                     hint="Only queued+unblocked tasks can be claimed.",
                 ) from exc
             task = svc.get(task_id)
-            return _task_to_detail(task)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "claim_task: backing store error for %s: %s",
@@ -1400,7 +1389,7 @@ def cancel_task(
                     hint="Tasks in terminal state (done/cancelled) cannot be cancelled again.",
                 ) from exc
             task = svc.get(task_id)
-            return _task_to_detail(task)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "cancel_task: backing store error for %s: %s",
@@ -1462,7 +1451,7 @@ def reassign_task(
                     code="validation_error",
                     message=str(exc) or "Reassignment failed validation.",
                 ) from exc
-            return _task_to_detail(task)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "reassign_task: backing store error for %s: %s",
@@ -1632,7 +1621,7 @@ def patch_task(
                     ) from exc
 
             task = svc.get(task_id)
-            return _task_to_detail(task)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "patch_task: backing store error for %s: %s",
@@ -2342,6 +2331,33 @@ def _task_to_summary(task) -> APITaskSummary:
         plan_version=getattr(task, "plan_version", None),
         updated_at=getattr(task, "updated_at", None),
     )
+
+
+def _task_to_detail_with_plan(task, *, svc) -> APITaskDetail:
+    """Return :class:`APITaskDetail` with ``plan`` hydrated for plan reviews.
+
+    Mirrors the rule applied at :func:`get_task_detail` (the canonical
+    GET-shape builder) and :func:`queue_task`: if the task is a plan
+    task currently in review, build the ``APIPlan`` payload from the
+    same ``_build_plan`` helper the GET path uses. Any mutation helper
+    that returns a :class:`TaskActionResult` (claim / reassign / patch
+    / queue / cancel) MUST route through this helper so the response's
+    ``task`` field carries the same shape as a follow-up GET — the
+    ``TaskActionResult`` envelope is documented as the
+    refresh-without-follow-up-GET contract (#2064 round-4, spec §5.3,
+    ``src/pollypm/web_api/models.py:347``).
+
+    Plan hydration is best-effort: ``_build_plan`` exceptions collapse
+    to ``plan=None`` rather than 500'ing the mutation, matching the
+    long-standing GET behaviour.
+    """
+    plan: APIPlan | None = None
+    if _is_plan_task(task) and _is_in_review(task):
+        try:
+            plan = _build_plan(svc, task)
+        except Exception:  # noqa: BLE001
+            plan = None
+    return _task_to_detail(task, plan=plan)
 
 
 def _task_to_detail(task, *, plan: APIPlan | None = None) -> APITaskDetail:

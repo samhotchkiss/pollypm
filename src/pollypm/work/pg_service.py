@@ -1457,9 +1457,22 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                # ``FOR UPDATE`` takes a row-level lock on the task row
+                # for the duration of this transaction (#2064 round-4
+                # concurrency blocker). Two concurrent reassigns
+                # without the lock would both read the same ``old``
+                # value under READ COMMITTED and emit two breadcrumbs
+                # naming the same predecessor — losing the second
+                # writer's view of the handoff (``pete -> nora`` +
+                # ``pete -> olga`` instead of ``pete -> nora`` +
+                # ``nora -> olga``). With the lock, the second SELECT
+                # waits on the first transaction's UPDATE; when it
+                # unblocks it reads the freshly-committed assignee,
+                # so the breadcrumb chain stays coherent.
                 cur.execute(
                     "SELECT assignee FROM work_tasks "
-                    "WHERE project = %s AND task_number = %s",
+                    "WHERE project = %s AND task_number = %s "
+                    "FOR UPDATE",
                     (project, task_number),
                 )
                 row = cur.fetchone()

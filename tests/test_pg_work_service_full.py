@@ -279,6 +279,183 @@ def test_reassign_task_missing_task_raises(pg_service):
         )
 
 
+def test_concurrent_reassign_serializes_breadcrumbs(pg_service):
+    """Spec §P-9 + concurrency safety (#2064 round-4 blocker #2).
+
+    Two concurrent reassigns of the same task must produce a coherent
+    breadcrumb chain: the second writer's entry MUST name the first
+    writer's new assignee as its predecessor (not the original owner).
+
+    Without ``SELECT ... FOR UPDATE`` on the row read, both
+    transactions read the same ``old_assignee`` under READ COMMITTED,
+    serialise on the UPDATE, and emit two breadcrumbs with the SAME
+    ``from`` value — losing the second writer's view of the
+    intermediate state. With the row lock, the second SELECT waits on
+    the first commit and reads the freshly-updated assignee, so the
+    chain reads ``pete -> nora`` then ``nora -> olga``.
+
+    The threading scheduler doesn't reliably produce that interleaving
+    in CI, so this test forces it deterministically: thread 1 grabs an
+    `Event` checkpoint between SELECT and UPDATE (impossible to spy on
+    inside the SUT without instrumentation), so instead we drive the
+    race directly with two threads and an `Event` chain. The trick:
+    thread 1 calls ``reassign_task``, but we hold its commit by
+    monkey-patching ``conn.commit`` for that one call so thread 2 can
+    run its full ``reassign_task`` SELECT *before* thread 1 commits.
+    That way ``FOR UPDATE`` is the only thing forcing thread 2 to
+    block on thread 1's row lock; without it, thread 2 reads
+    ``pete`` and the chain breaks.
+
+    Regression target: this fails on the prior head (sources[1] ==
+    'pete'); passes once the SELECT takes ``FOR UPDATE``.
+    """
+    import re
+    import threading
+
+    task = _make_draft(
+        pg_service, roles={"worker": "pete", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="pete")
+    assert pg_service.get(task.task_id).assignee == "pete"
+
+    # Two events to choreograph the race:
+    # * ``t1_acquired_lock``: t1 has run SELECT (+ UPDATE, depending on
+    #   the codepath) but not yet committed. With FOR UPDATE in place,
+    #   the SELECT alone takes the row lock.
+    # * ``t2_finished_select``: t2 attempted its SELECT. Without
+    #   FOR UPDATE this returns immediately with ``pete``; with
+    #   FOR UPDATE it blocks until t1 commits.
+    t1_acquired_lock = threading.Event()
+    t2_started = threading.Event()
+    errors: list[BaseException] = []
+
+    def _t1_reassign() -> None:
+        try:
+            # Wrap the underlying pool connection so we can interpose
+            # a delay between t1's row-lock acquisition and its
+            # commit. We do this by replacing _pool.connection one-shot.
+            original_connection = pg_service._pool.connection
+
+            class _DelayingConn:
+                def __init__(self, real_cm):
+                    self._real_cm = real_cm
+                    self._real_conn = None
+
+                def __enter__(self):
+                    self._real_conn = self._real_cm.__enter__()
+                    original_commit = self._real_conn.commit
+
+                    def _delayed_commit():
+                        # Row lock is held now (FOR UPDATE) or the
+                        # UPDATE has fired (without FOR UPDATE).
+                        # Either way, t2 can race its SELECT.
+                        t1_acquired_lock.set()
+                        # Give t2 a chance to issue its SELECT
+                        # against the row. With FOR UPDATE, t2's
+                        # SELECT blocks on t1's lock until commit
+                        # below; without it, t2's SELECT returns
+                        # immediately with stale ``pete``.
+                        t2_started.wait(timeout=3)
+                        return original_commit()
+
+                    self._real_conn.commit = _delayed_commit
+                    return self._real_conn
+
+                def __exit__(self, *a):
+                    return self._real_cm.__exit__(*a)
+
+            # Patch only for this single call, then restore.
+            def _one_shot_connection():
+                pg_service._pool.connection = original_connection
+                return _DelayingConn(original_connection())
+
+            pg_service._pool.connection = _one_shot_connection
+            pg_service.reassign_task(
+                task.task_id, new_assignee="nora", actor="api-nora"
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+            t1_acquired_lock.set()
+            t2_started.set()
+
+    def _t2_reassign() -> None:
+        try:
+            # Wait until t1 has its row lock / has issued its UPDATE.
+            assert t1_acquired_lock.wait(timeout=5), (
+                "t1 never reached the pre-commit checkpoint"
+            )
+            # Signal t2 has started its attempt. We set this BEFORE
+            # the SELECT so t1's commit can proceed even if t2's
+            # SELECT blocks on the lock (the FOR UPDATE case).
+            t2_started.set()
+            pg_service.reassign_task(
+                task.task_id, new_assignee="olga", actor="api-olga"
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    t1 = threading.Thread(target=_t1_reassign)
+    t2 = threading.Thread(target=_t2_reassign)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+    assert not t1.is_alive() and not t2.is_alive(), (
+        "thread deadlocked — FOR UPDATE may have a starvation bug"
+    )
+    assert not errors, f"reassign thread raised: {errors!r}"
+
+    # ``get_context`` returns ``ORDER BY id DESC`` (most recent first).
+    # Reverse so ``chronological[0]`` is the FIRST writer's breadcrumb
+    # and ``chronological[1]`` is the SECOND writer's breadcrumb.
+    raw_entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    chronological = list(reversed(raw_entries))
+    assert len(chronological) == 2, (
+        f"expected exactly two reassignment entries, got: "
+        f"{raw_entries!r}"
+    )
+    pattern = re.compile(
+        r"worker reassigned from (?P<src>\S+) to (?P<dst>\S+)"
+    )
+    parsed = []
+    for entry in chronological:
+        match = pattern.search(entry.text)
+        assert match is not None, (
+            f"breadcrumb missing spec-shape body: {entry.text!r}"
+        )
+        parsed.append((match.group("src"), match.group("dst")))
+
+    sources = [src for src, _ in parsed]
+    destinations = [dst for _, dst in parsed]
+    assert set(destinations) == {"nora", "olga"}, (
+        f"both new assignees must appear as breadcrumb destinations; "
+        f"got sources={sources} destinations={destinations}"
+    )
+    # The first writer saw the original assignee.
+    assert sources[0] == "pete", (
+        f"first breadcrumb must name the original assignee; "
+        f"got sources={sources}"
+    )
+    # The second writer MUST have seen the first writer's
+    # destination as their source — that's the FOR UPDATE invariant.
+    # Without the lock, BOTH transactions read ``pete`` and the chain
+    # is broken (``sources[1] == 'pete'`` instead of the first
+    # writer's new assignee). This is the regression we're guarding.
+    assert sources[1] == destinations[0], (
+        f"second breadcrumb's ``from`` must match the first's ``to`` "
+        f"(coherent handoff chain); got sources={sources} "
+        f"destinations={destinations}. Without ``SELECT FOR UPDATE`` "
+        f"both reads see ``pete`` and the chain is broken."
+    )
+    # Final state matches the second writer (UPDATE serialised on
+    # the row lock).
+    final = pg_service.get(task.task_id)
+    assert final.assignee == destinations[1]
+
+
 def test_update_combined_assignee_and_external_refs_single_call(pg_service):
     """Combining columns in one update() call — single transaction.
 

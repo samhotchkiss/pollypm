@@ -223,6 +223,44 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     return result
 
 
+def _workspace_root_inbox_has_open(config) -> bool:
+    """True iff there is at least one open workspace-root inbox row.
+
+    "Workspace-root" = messages with ``scope IN ('', 'inbox')`` —
+    these are NOT keyed to any tracked project, so the refresher's
+    per-project filter in
+    ``state_cache/refresh_impl.py::_awaits_user_items_for`` drops them
+    on the floor. The cache's per-project entries can never represent
+    them, so any cache-routed read MUST fall through whenever the
+    workspace-root inbox is non-empty.
+
+    Filed as a follow-up issue (PR #2026 review blocker 3): teach the
+    cache to carry a workspace-root entry so this gate can go away.
+
+    Best-effort: a pg outage / import failure returns ``False`` so the
+    fast-path still wins on the common "no workspace-root noise" case.
+    A false negative here would mis-attribute the divergence to the
+    sampler, which is the same risk the old code had.
+    """
+
+    try:
+        from pollypm.cockpit_pg_aggregates import open_messages
+    except Exception:  # noqa: BLE001
+        return False
+    known_projects = set(getattr(config, "projects", {}).keys())
+    try:
+        rows = open_messages(config, known_projects=known_projects, limit=50)
+    except Exception:  # noqa: BLE001
+        return False
+    if not rows:
+        return False
+    for row in rows:
+        scope = (row.get("scope") or "").strip()
+        if scope == "" or scope == "inbox":
+            return True
+    return False
+
+
 def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     """Return the cache-routed result, or ``None`` to fall through.
 
@@ -232,6 +270,12 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     * The cache has no entries yet (cold start — the refresher hasn't
       populated anything; falling through avoids serving an empty list
       while the cache warms up).
+    * Any tracked project is missing from the snapshot (partial cache).
+    * Any workspace-root awaits-user message exists live (PR #2026
+      review blocker 3) — the refresher does not project workspace-root
+      messages into any per-project entry, so the cache cannot
+      represent them and a partial answer would silently drop them
+      from the rail badge / inbox count.
     * Any unexpected exception (defensive — broken cache must never
       crash the rail badge).
 
@@ -264,6 +308,12 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     # under-report. Fall through to the direct sweep so the missing
     # project's items are included.
     if not known_projects.issubset(snapshot.keys()):
+        return None
+    # Workspace-root guard (PR #2026 review blocker 3): the refresher
+    # only projects per-project messages, so any open workspace-root
+    # inbox row would be missing from the cache. Defer to the direct
+    # path whenever one exists.
+    if _workspace_root_inbox_has_open(config):
         return None
     cached_items: list[object] = []
     for project_key, entry in snapshot.items():
@@ -457,6 +507,12 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     under-count any tracked project that hasn't been refreshed yet —
     the rail badge would silently drop work that's still waiting on
     the user.
+
+    Workspace-root fall-through (PR #2026 review blocker 3): the
+    refresher does not project workspace-root inbox messages
+    (``scope IN ('', 'inbox')``) into any per-project entry, so the
+    cached sum would silently under-count them. Defer to the direct
+    sweep whenever the workspace-root inbox is non-empty.
     """
 
     try:
@@ -477,6 +533,10 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     # cache would be silently omitted from the sum. Fall through to the
     # direct path so the badge stays correct during the boot-time gap.
     if not known_projects.issubset(snapshot.keys()):
+        return None
+    # Workspace-root guard (PR #2026 review blocker 3): see
+    # ``_maybe_cache_route_awaits_user`` for rationale.
+    if _workspace_root_inbox_has_open(config):
         return None
     total = 0
     for project_key, entry in snapshot.items():

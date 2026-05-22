@@ -902,7 +902,11 @@ class TestProjectStateRollupsParity:
 
 
 class TestLatestHeartbeatParity:
-    """PR 3 (§5 row 9): cockpit_rail ``latest_heartbeat()`` reads snapshot."""
+    """PR #2026 review blocker 2: ``_latest_heartbeat_cached`` is now a
+    direct-facade pass-through until cache invalidation on heartbeat
+    writes lands (filed as follow-up). The "cached" name is preserved
+    for call-site stability; the body bypasses the cache snapshot.
+    """
 
     def _router(self, tmp_path: Path):
         from pollypm.cockpit_rail import CockpitRouter
@@ -917,79 +921,101 @@ class TestLatestHeartbeatParity:
         )
         return CockpitRouter(config_path)
 
-    def test_cache_hit_skips_supervisor_store(
+    def test_always_reads_direct_facade_even_with_populated_cache(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Cache holds a heartbeat → supervisor.store.latest_heartbeat is skipped."""
+        """Even with a populated cache, the direct pg facade is the
+        source of truth — guards against the stale-snapshot pathology
+        the cache had with no heartbeat-write invalidation.
+        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         router = self._router(tmp_path)
 
-        hb = SimpleNamespace(
+        stale_hb = SimpleNamespace(
             session_name="worker_alpha/1",
             created_at="2026-05-20T01:00:00Z",
+            tag="STALE_CACHE",
         )
         entries = {
             "alpha": _entry(
                 "alpha",
                 state=ProjectState.WORKING,
                 items=[],
-                latest_heartbeat_by_session={"worker_alpha/1": hb},
+                latest_heartbeat_by_session={"worker_alpha/1": stale_hb},
             ),
         }
         _seed_cache(monkeypatch, entries)
 
-        store_calls = {"n": 0}
+        fresh_hb = SimpleNamespace(
+            session_name="worker_alpha/1",
+            created_at="2026-05-21T01:00:00Z",
+            tag="FRESH_DIRECT",
+        )
+        pg_calls: list[str] = []
 
-        class _Store:
-            def latest_heartbeat(self, name):  # noqa: ANN001, ANN201
-                store_calls["n"] += 1
-                return None
+        def _direct(name, *, config=None):  # noqa: ANN001, ANN201
+            pg_calls.append(name)
+            return fresh_hb
 
-        supervisor = SimpleNamespace(store=_Store())
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _direct,
+        )
+
+        supervisor = SimpleNamespace(store=None, config=None)
         result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
-        assert store_calls["n"] == 0
-        assert result is hb
+        # Direct facade hit; cached stale snapshot ignored.
+        assert pg_calls == ["worker_alpha/1"]
+        assert result is fresh_hb
+        assert getattr(result, "tag", None) == "FRESH_DIRECT"
 
-    def test_cache_miss_falls_back_to_supervisor_store(
+    def test_pg_failure_falls_back_to_supervisor_store(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Unknown session → call supervisor.store.latest_heartbeat."""
+        """If pg_heartbeats raises, fall back to supervisor.store."""
 
-        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         router = self._router(tmp_path)
-        _seed_cache(monkeypatch, {})  # empty cache
+        fallback = SimpleNamespace(created_at="2026-05-20T02:00:00Z")
+
+        def _boom(name, *, config=None):  # noqa: ANN001, ANN201
+            raise RuntimeError("pg pool unreachable")
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _boom,
+        )
 
         store_calls: list[str] = []
-        fallback = SimpleNamespace(created_at="2026-05-20T02:00:00Z")
 
         class _Store:
             def latest_heartbeat(self, name):  # noqa: ANN001, ANN201
                 store_calls.append(name)
                 return fallback
 
-        supervisor = SimpleNamespace(store=_Store())
+        supervisor = SimpleNamespace(store=_Store(), config=None)
         result = router._latest_heartbeat_cached(supervisor, "worker_beta/3")
         assert store_calls == ["worker_beta/3"]
         assert result is fallback
 
-    def test_flag_off_always_uses_store(
+    def test_flag_off_still_uses_direct_facade(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Flag off — every call routes to ``supervisor.store``."""
+        """Flag state is irrelevant — the cache is fully bypassed."""
 
         monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
         router = self._router(tmp_path)
 
-        called: list[str] = []
         hb = SimpleNamespace(created_at="2026-05-20T03:00:00Z")
+        called: list[str] = []
 
-        class _Store:
-            def latest_heartbeat(self, name):  # noqa: ANN001, ANN201
-                called.append(name)
-                return hb
+        def _direct(name, *, config=None):  # noqa: ANN001, ANN201
+            called.append(name)
+            return hb
 
-        supervisor = SimpleNamespace(store=_Store())
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _direct,
+        )
+
+        supervisor = SimpleNamespace(store=None, config=None)
         result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
         assert called == ["worker_alpha/1"]
         assert result is hb
@@ -1050,3 +1076,298 @@ class TestProjectCategorizationsNoTtl:
         assert not hasattr(
             CockpitRouter, "_PROJECT_CATEGORIZATIONS_TTL_SECONDS",
         )
+
+
+# ── PR #2026 review blockers — fall-through regression tests ────────
+
+
+class TestPr2026ReviewBlocker1ActionableAlertFallthrough:
+    """Blocker 1: cache fast-path MUST defer when a live actionable
+    task alert exists, because the direct ``rollup_project_state``
+    folds alerts into ``rail_state`` / ``badge`` / ``reason`` /
+    ``actionable_key`` and the cache entry's ``rail_*`` fields were
+    computed without alert state.
+    """
+
+    def _router(self, tmp_path: Path):
+        from pollypm.cockpit_rail import CockpitRouter
+
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            'name = "PollyPM"\n'
+            f'root_dir = "{tmp_path}"\n'
+            'tmux_session = "pollypm"\n'
+            f'base_dir = "{tmp_path / ".pollypm"}"\n'
+        )
+        return CockpitRouter(config_path)
+
+    def test_actionable_alert_forces_cache_fallthrough(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Cached base state WORKING, live actionable alert exists →
+        the cache MUST decline so the direct path can paint RED.
+        """
+
+        from pollypm.cockpit_project_state import ProjectRailState
+        from pollypm.cockpit_rail import CockpitRouter
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        config = _make_config(["alpha"], tmp_path)
+
+        # Cache entry says WORKING / NONE — no idea about the alert.
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WORKING, items=[],
+                rail_state=ProjectRailState.WORKING,
+                rail_badge=None,
+                rail_sort_rank=0,
+                rail_reason="worker active",
+                approvals_pending=0,
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        # Live actionable alert for alpha/1 — should turn alpha RED.
+        alert = SimpleNamespace(
+            alert_type="stuck_on_task:alpha/1",
+            severity="high",
+            message="stuck",
+        )
+
+        # Cache fast-path declines (the gate fires).
+        assert (
+            router._maybe_cache_route_rollups(config, alerts=[alert]) is None
+        )
+
+    def test_no_alert_still_uses_cache_fast_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Empty / non-actionable alerts → cache fast-path stays available."""
+
+        from pollypm.cockpit_project_state import ProjectRailState
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        config = _make_config(["alpha"], tmp_path)
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WORKING, items=[],
+                rail_state=ProjectRailState.WORKING,
+                rail_badge=None,
+                rail_reason="worker active",
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        rollups = router._maybe_cache_route_rollups(config, alerts=[])
+        assert rollups is not None
+        assert rollups["alpha"].state is ProjectRailState.WORKING
+        # No alerts → actionable_key is None (matches direct path).
+        assert rollups["alpha"].actionable_key is None
+
+
+class TestPr2026ReviewBlocker2HeartbeatNoStale:
+    """Blocker 2: heartbeat reads MUST reflect the latest pg write
+    immediately. The cache had no invalidation on heartbeat ticks and
+    would serve a stale snapshot indefinitely — until the follow-up
+    issue lands, every call hits the direct facade.
+    """
+
+    def _router(self, tmp_path: Path):
+        from pollypm.cockpit_rail import CockpitRouter
+
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            'name = "PollyPM"\n'
+            f'root_dir = "{tmp_path}"\n'
+            'tmux_session = "pollypm"\n'
+            f'base_dir = "{tmp_path / ".pollypm"}"\n'
+        )
+        return CockpitRouter(config_path)
+
+    def test_newer_store_heartbeat_reflected_immediately(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """A second pg write is visible on the next call — no stale cache."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+
+        # Seed the cache with an OLD heartbeat to prove we're not
+        # reading from it.
+        stale = SimpleNamespace(created_at="2026-05-20T01:00:00Z", n="stale")
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WORKING, items=[],
+                latest_heartbeat_by_session={"worker_alpha/1": stale},
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        # First direct read.
+        first = SimpleNamespace(created_at="2026-05-20T02:00:00Z", n="first")
+        second = SimpleNamespace(created_at="2026-05-20T03:00:00Z", n="second")
+        state = {"next": first}
+
+        def _direct(name, *, config=None):  # noqa: ANN001, ANN201
+            return state["next"]
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _direct,
+        )
+
+        supervisor = SimpleNamespace(store=None, config=None)
+        assert router._latest_heartbeat_cached(
+            supervisor, "worker_alpha/1",
+        ) is first
+        # Simulate a fresh pg row landing. Without cache invalidation,
+        # the stale snapshot would have won; the direct-facade contract
+        # means the next call sees the newer row.
+        state["next"] = second
+        assert router._latest_heartbeat_cached(
+            supervisor, "worker_alpha/1",
+        ) is second
+
+
+class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
+    """Blocker 3: workspace-root inbox messages (``scope IN ('', 'inbox')``)
+    are not represented in any per-project cache entry, so the cache
+    routes for awaits-user list + count MUST fall through to the
+    direct path whenever the workspace-root inbox is non-empty.
+    """
+
+    def test_workspace_root_message_forces_list_fallthrough(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """A live workspace-root row → list cache declines, direct path runs.
+
+        Pinned to the cached vs direct equality: both MUST return the
+        same set of items (workspace-root included), proving the
+        fall-through is what carried the workspace row.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+
+        # Per-project items the cache CAN represent.
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # The workspace-root item with project="inbox" — the cache
+        # CANNOT represent this (refresher filters by project_key only).
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-1",
+        )
+        # And the workspace-root probe MUST see it (simulate pg row).
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_workspace_root_inbox_has_open",
+            lambda cfg: True,
+        )
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WAITING, items=per_project,
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        # Direct sweep returns BOTH (per-project + workspace-root).
+        direct_items = list(per_project) + [workspace_root]
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(direct_items)
+
+        monkeypatch.setattr(
+            cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
+        )
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        result = cockpit_inbox.pm_inbox_awaits_user_list(config)
+        assert direct_called["n"] == 1
+        # Workspace-root item is in the result (would have been
+        # silently dropped if we had stayed on the fast-path).
+        ids = {getattr(item, "message_id", None) or getattr(item, "task_id", None) for item in result}
+        assert "ws-root-1" in ids
+        assert "alpha/1" in ids
+
+    def test_workspace_root_message_forces_count_fallthrough(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Same gate fires on the count helper — sums match direct len()."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-2",
+        )
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_workspace_root_inbox_has_open",
+            lambda cfg: True,
+        )
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WAITING, items=per_project,
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        direct_items = list(per_project) + [workspace_root]
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            lambda cfg: list(direct_items),
+        )
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        # Cache would have returned 1 (only alpha); fall-through gives 2.
+        assert counted == 2
+
+    def test_workspace_root_empty_keeps_cache_fast_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Empty workspace-root → cache fast-path stays available."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_workspace_root_inbox_has_open",
+            lambda cfg: False,
+        )
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WAITING, items=per_project,
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        # Pin the sampler off so the divergence-comparator path
+        # doesn't masquerade as a fall-through. Earlier tests in this
+        # module may have swapped in a rate-1 counter that would
+        # sample every call; restore a fresh default-rate counter.
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        # Direct sweep MUST NOT be called.
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project)
+
+        monkeypatch.setattr(
+            cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
+        )
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        result = cockpit_inbox.pm_inbox_awaits_user_list(config)
+        assert direct_called["n"] == 0
+        assert len(result) == 1

@@ -1535,18 +1535,34 @@ class CockpitRouter:
     ) -> object | None:
         """Return the latest heartbeat for ``session_name``.
 
-        Move A PR 3 (#1664, design §5 row 9): with the cache flag on
-        AND the per-project entry populated, the heartbeat is read
-        from ``entry.latest_heartbeat_by_session[session_name]`` —
-        no per-project pg query. Falls through to
-        ``supervisor.store.latest_heartbeat`` on cold cache, missing
-        session, or any unexpected failure (e.g. the cache lagging
-        a brand-new session).
+        PR #2026 review blocker 2 (fall-through workaround): the cache
+        fast-path is DISABLED until the refresher learns to invalidate
+        on heartbeat writes. ``state_cache/refresher.py`` only listens
+        for ``task.*`` / ``marker.*`` audit events, so a fresh
+        heartbeat row never invalidates ``latest_heartbeat_by_session``
+        — the cache would serve a stale snapshot indefinitely and
+        drive the UI's "offline" / "stale" treatments off it.
+
+        Until ``heartbeat.*`` invalidation lands (filed as a follow-up
+        issue), every call hits the direct pg facade. Method name kept
+        for call-site stability (no API change).
         """
 
-        cached = self._maybe_cache_heartbeat(session_name)
-        if cached is not None:
-            return cached
+        try:
+            from pollypm.storage import pg_heartbeats
+        except Exception:  # noqa: BLE001
+            pg_heartbeats = None  # type: ignore[assignment]
+        config = getattr(supervisor, "config", None)
+        if pg_heartbeats is not None:
+            try:
+                return pg_heartbeats.latest_heartbeat(
+                    session_name, config=config,
+                )
+            except Exception:  # noqa: BLE001
+                # pg pool unreachable / transient — fall through to
+                # the store facade so the rail still has SOMETHING to
+                # render. Both paths read the same heartbeats table.
+                pass
         store = getattr(supervisor, "store", None)
         if store is None:
             return None
@@ -1554,34 +1570,6 @@ class CockpitRouter:
             return store.latest_heartbeat(session_name)
         except Exception:  # noqa: BLE001
             return None
-
-    def _maybe_cache_heartbeat(self, session_name: str) -> object | None:
-        """Cache fast-path for :meth:`_latest_heartbeat_cached`.
-
-        Returns ``None`` whenever a cache miss should defer to the
-        direct path — flag off, cold cache, unknown session, any
-        unexpected failure.
-        """
-
-        try:
-            from pollypm.state_cache import get_cache, is_enabled
-        except Exception:  # noqa: BLE001
-            return None
-        if not is_enabled():
-            return None
-        try:
-            cache = get_cache()
-            snapshot = cache.snapshot()
-        except Exception:  # noqa: BLE001
-            return None
-        if not snapshot:
-            return None
-        for entry in snapshot.values():
-            mapping = getattr(entry, "latest_heartbeat_by_session", None) or {}
-            heartbeat = mapping.get(session_name)
-            if heartbeat is not None:
-                return heartbeat
-        return None
 
     # ── #989 — alert metadata attachment ────────────────────────────────
     #
@@ -2031,16 +2019,24 @@ class CockpitRouter:
         """Cache fast-path for :meth:`_project_state_rollups`.
 
         Returns ``None`` when the env flag is off, the cache is cold,
-        or the cache is missing any tracked project. The fall-through
-        path then runs the direct per-project rollup compute.
+        the cache is missing any tracked project, OR any tracked
+        project has a live actionable task alert. The fall-through
+        path then runs the direct per-project rollup compute, which
+        re-derives RED / badge / reason from the alerts.
 
-        When the cache is authoritative, the alert-derived
-        ``actionable_task_alert_ids`` is folded into a fresh
-        :class:`ProjectStateRollup` per project — the cache's
-        ``rail_*`` fields don't depend on alerts (the refresher
-        doesn't have them), so we re-derive ``actionable_key`` from
-        the live alert list while keeping the cached rail_state /
-        badge / rank / reason / approvals_pending.
+        Alert fall-through rationale (PR #2026 review blocker 1):
+        ``rollup_project_state`` folds ``actionable_task_alert_ids``
+        into the final ``rail_state`` / ``rail_badge`` / ``rail_reason``
+        / ``actionable_key`` — a live ``stuck_on_task:<project>/<n>``
+        or ``no_session_for_assignment:<project>/<n>`` alert can flip
+        a WORKING project to RED and reshape ``actionable_key`` into
+        the issues-route id. The cache entry's ``rail_*`` fields were
+        computed by the refresher WITHOUT alert state, so we cannot
+        synthesize a rollup that matches the direct path when an
+        actionable alert exists. Decline the cache for that whole
+        rendering so the direct path produces the authoritative answer.
+        Follow-up issue: cache ``actionable_alert_task_ids`` into the
+        refresher so the fast-path stays available with alerts.
         """
 
         try:
@@ -2063,6 +2059,15 @@ class CockpitRouter:
         if not all(key in snapshot_keys for key in known_keys):
             return None
 
+        # PR #2026 review blocker 1: ANY tracked project with a live
+        # actionable task alert forces fall-through. We don't try to
+        # serve the unaffected projects from cache because callers
+        # consume the whole map at once and a partial answer would
+        # mix cached + direct semantics in a single render.
+        for project_key in known_keys:
+            if actionable_alert_task_ids(alerts, project_key=project_key):
+                return None
+
         rollups: dict[str, ProjectStateRollup] = {}
         for project_key in known_keys:
             entry = snapshot[project_key]
@@ -2070,20 +2075,15 @@ class CockpitRouter:
             if rail_state is None:
                 # Refresher hasn't filled in rail fields yet — defer.
                 return None
-            # Re-derive actionable_key from live alerts (the cache
-            # entry doesn't carry alert state).
-            actionable_ids = actionable_alert_task_ids(
-                alerts, project_key=project_key,
-            )
-            actionable_key = (
-                next(iter(sorted(actionable_ids)), None)
-                if actionable_ids else None
-            )
             rollups[project_key] = ProjectStateRollup(
                 state=rail_state,
                 badge=getattr(entry, "rail_badge", None),
                 sort_rank=int(getattr(entry, "rail_sort_rank", 0) or 0),
-                actionable_key=actionable_key,
+                # No actionable alerts in scope (gated above), so the
+                # actionable_key derived from alerts is always None
+                # here — matches the direct path's behavior when
+                # ``actionable_task_alert_ids`` is empty.
+                actionable_key=None,
                 reason=str(getattr(entry, "rail_reason", "") or ""),
                 approvals_pending=int(
                     getattr(entry, "approvals_pending", 0) or 0

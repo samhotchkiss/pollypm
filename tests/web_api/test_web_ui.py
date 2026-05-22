@@ -111,11 +111,33 @@ def test_ui_cookie_set_from_loopback(app, token: str) -> None:
     assert resp.cookies.get(SESSION_COOKIE_NAME) == token
 
 
-def test_ui_cookie_set_from_tailscale_peer(app, token: str) -> None:
-    """Tailscale CGNAT peer is trusted — cookie is issued."""
-    resp = _ui_get_with_peer(app, "100.64.0.5")
+def test_ui_cookie_set_from_tailscale_peer(tailnet_app, token: str) -> None:
+    """Tailscale CGNAT peer is trusted when tailnet trust is enabled."""
+    resp = _ui_get_with_peer(tailnet_app, "100.64.0.5")
     assert resp.status_code == 200
     assert resp.cookies.get(SESSION_COOKIE_NAME) == token
+
+
+def test_ui_no_cookie_minted_from_cgnat_when_trust_disabled(
+    app, token: str  # noqa: ARG001 — token fixture writes the on-disk token
+) -> None:
+    """CGNAT peer hitting the default app gets HTML but no Set-Cookie.
+
+    Sister to ``test_ui_no_cookie_from_lan_client``: the default
+    ``create_app(tailnet_trust_enabled=False)`` (what ``pm serve``
+    builds whenever it didn't bind to a verified Tailscale IPv4)
+    must NOT mint a session cookie just because the source IP looks
+    like a tailnet address. RFC 6598 shared address space is also used
+    by some ISP CGNATs; trusting it unconditionally was the round-2
+    Codex blocker.
+    """
+    resp = _ui_get_with_peer(app, "100.64.0.5")
+    assert resp.status_code == 200
+    assert resp.headers["content-type"].startswith("text/html")
+    assert SESSION_COOKIE_NAME not in resp.cookies, (
+        "CGNAT peer must NOT receive Set-Cookie when tailnet trust is "
+        f"disabled; got cookies: {dict(resp.cookies)}"
+    )
 
 
 def test_ui_cookie_set_with_valid_bearer_header(app, token: str) -> None:
@@ -187,11 +209,24 @@ def test_auth_via_cookie_works(client: TestClient, token: str) -> None:
     assert response.status_code == 200
 
 
-def test_auth_via_tailscale_cgnat_ip_works(api_config, token_path: Path) -> None:
-    """A request from a 100.64.0.0/10 client IP bypasses cred checks."""
+def test_cgnat_trust_enabled_allows_credential_free_from_tailnet(
+    api_config, token_path: Path,
+) -> None:
+    """Positive test: tailnet-bound mode lets CGNAT peers in unauthenticated.
+
+    Built with ``tailnet_trust_enabled=True`` — the same mode
+    ``pm serve`` enables when it actually bound to a verified
+    Tailscale IPv4 (see ``cli_features/web_api.py`` round-2). Mirrors
+    the production wire path so the credential-free convenience for
+    tailnet users keeps working in v0.
+    """
     from pollypm.web_api import create_app
 
-    app = create_app(config=api_config, token_path=token_path)
+    app = create_app(
+        config=api_config,
+        token_path=token_path,
+        tailnet_trust_enabled=True,
+    )
     # Baseline: TestClient default peer is ``testclient`` (not a
     # tailnet IP), so without creds we expect 401.
     baseline_client = TestClient(app, base_url="http://testserver")
@@ -211,9 +246,46 @@ def test_auth_via_tailscale_cgnat_ip_works(api_config, token_path: Path) -> None
 
     resp2 = asyncio.run(_probe())
     assert resp2.status_code == 200, (
-        "Tailscale CGNAT IP (100.64.0.5) should bypass credential check; "
+        "Tailscale CGNAT IP (100.64.0.5) should bypass credential check "
+        "when tailnet_trust_enabled=True; "
         f"got {resp2.status_code} {resp2.text}"
     )
+
+
+def test_cgnat_trust_disabled_returns_401_without_credentials(
+    api_config, token_path: Path,
+) -> None:
+    """Pin the default mode: CGNAT trust is OFF in ``create_app()``.
+
+    Codex round-2 blocker: an operator who runs
+    ``pm serve --host 0.0.0.0 --allow-remote`` should get strict auth
+    on every request even if the source IP lands in 100.64.0.0/10
+    (some ISP CGNATs use RFC 6598 shared space). The default
+    ``create_app`` build — and any ``pm serve`` invocation that didn't
+    actually bind to a verified Tailscale IPv4 — must keep requiring
+    a bearer or cookie.
+    """
+    from pollypm.web_api import create_app
+
+    app = create_app(config=api_config, token_path=token_path)
+    # Defensive: confirm the keyword defaulted to False (no implicit
+    # tailnet trust). If someone flips the default we want this test
+    # to fail loud.
+
+    async def _probe() -> httpx.Response:
+        transport = httpx.ASGITransport(app=app, client=("100.64.0.5", 12345))
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://testserver",
+        ) as ac:
+            return await ac.get("/api/v1/projects")
+
+    resp = asyncio.run(_probe())
+    assert resp.status_code == 401, (
+        "Default create_app() must NOT trust CGNAT peers without creds; "
+        f"got {resp.status_code} {resp.text}"
+    )
+    body = resp.json()
+    assert body["error"]["code"] == "unauthorized"
 
 
 def test_auth_without_any_credentials_returns_401(client: TestClient) -> None:
@@ -292,6 +364,20 @@ def _run_serve_command(
         "pollypm.web_api.ensure_token",
         lambda _path: ("test-token", False),
     )
+
+    # Intercept ``create_app`` so the test can assert exactly which
+    # kwargs (notably ``tailnet_trust_enabled``) flowed through. The
+    # import inside the command body resolves the name on the
+    # ``pollypm.web_api`` package, so patch it there.
+    import pollypm.web_api as web_api_pkg
+
+    real_create_app = web_api_pkg.create_app
+
+    def _capturing_create_app(**kwargs):
+        captured["create_app_kwargs"] = dict(kwargs)
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(web_api_pkg, "create_app", _capturing_create_app)
 
     runner = CliRunner()
     result = runner.invoke(
@@ -388,6 +474,81 @@ def test_pm_serve_tailscale_warns_when_binary_missing(
     # And the warning explicitly calls out --tailscale.
     assert "--tailscale" in result.output
     assert captured["kwargs"]["host"] == "127.0.0.1"
+
+
+# -------- Round-2: tailnet trust ↔ bind-mode wiring ---------------------
+
+
+def test_pm_serve_disables_tailnet_trust_on_explicit_host_override(
+    api_config, token_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit ``--host 0.0.0.0 --allow-remote`` keeps tailnet trust OFF.
+
+    Round-2 Codex blocker: even when Tailscale IS detected, an operator
+    who deliberately overrode the bind to a non-tailnet interface
+    (e.g. 0.0.0.0 for a reverse proxy front-end) must NOT have the
+    auth dependency hand out credential-free access to peers whose
+    source IP lives in 100.64.0.0/10. Some ISP CGNATs use RFC 6598
+    shared address space; trusting it on the public interface is the
+    exact attack the round-2 review flagged.
+    """
+    result, captured = _run_serve_command(
+        api_config,
+        token_path,
+        monkeypatch,
+        detect_result="100.64.0.5",  # Tailscale IS up
+        extra_args=["--host", "0.0.0.0", "--allow-remote"],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured["kwargs"]["host"] == "0.0.0.0"
+    create_app_kwargs = captured["create_app_kwargs"]
+    assert create_app_kwargs["tailnet_trust_enabled"] is False, (
+        "Explicit --host override must NOT inherit tailnet trust even "
+        "when detect_tailscale_ip succeeds; "
+        f"got create_app kwargs: {create_app_kwargs}"
+    )
+
+
+def test_pm_serve_enables_tailnet_trust_on_auto_tailscale_bind(
+    api_config, token_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default ``pm serve`` + detected Tailscale → tailnet_trust_enabled=True.
+
+    Companion to the override test above: the auto-detect happy path
+    is the ONLY mode that opts into credential-free CGNAT access.
+    """
+    result, captured = _run_serve_command(
+        api_config,
+        token_path,
+        monkeypatch,
+        detect_result="100.64.0.5",
+    )
+    assert result.exit_code == 0, result.output
+    create_app_kwargs = captured["create_app_kwargs"]
+    assert create_app_kwargs["tailnet_trust_enabled"] is True, (
+        f"auto-tailscale bind should enable tailnet trust; got {create_app_kwargs}"
+    )
+
+
+def test_pm_serve_disables_tailnet_trust_on_loopback_fallback(
+    api_config, token_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Loopback fallback (no Tailscale detected) keeps tailnet trust OFF.
+
+    Defensive: a future change that flipped the default to True would
+    silently regress the round-2 invariant; pin it.
+    """
+    result, captured = _run_serve_command(
+        api_config,
+        token_path,
+        monkeypatch,
+        detect_result=None,
+    )
+    assert result.exit_code == 0, result.output
+    create_app_kwargs = captured["create_app_kwargs"]
+    assert create_app_kwargs["tailnet_trust_enabled"] is False, (
+        f"loopback fallback should NOT enable tailnet trust; got {create_app_kwargs}"
+    )
 
 
 # -------- P1: mobile CSS -----------------------------------------------

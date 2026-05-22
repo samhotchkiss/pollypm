@@ -17,14 +17,25 @@ acceptance modes for browser-driven sessions:
   token, so the browser never has to paste / type the token. Same
   comparison rules as the header (constant-time, rotation invalidates).
 - Tailscale CGNAT trust — request ``client.host`` inside the Tailscale
-  CGNAT range (``100.64.0.0/10``) is allowed without either credential.
-  Tailscale's network identity is itself an auth boundary; on a typical
-  personal-use Tailscale-only deployment, requiring a second secret is
-  redundant friction.
+  CGNAT range (``100.64.0.0/10``) is allowed without either credential,
+  **but only when the app was built with ``tailnet_trust_enabled=True``**.
+  ``pm serve`` only flips that flag when it actually bound to a verified
+  Tailscale IPv4 (see ``cli_features/web_api.py``). An operator who
+  runs ``pm serve --host 0.0.0.0 --allow-remote`` gets ``False`` even if
+  Tailscale is running — RFC 6598 shared address space is used by some
+  CGNAT-enabled ISPs, so an unauthenticated 100.64.x.y peer arriving on
+  a non-tailnet interface must NOT be trusted.
 
-Loopback (``127.0.0.1``, ``::1``) is NOT auto-trusted — local processes
-without the token shouldn't bypass auth on a shared machine, and the
-cookie-from-disk path already covers the local-browser convenience case.
+Loopback (``127.0.0.1``, ``::1``) is not auto-trusted by the API auth
+dependency itself — a local process without the bearer token still
+receives 401 from ``/api/v1/...``. However, ``GET /ui/`` deliberately
+mints a ``pollypm-session`` cookie from the on-disk token for any
+loopback caller (and for tailnet callers when the flag above is on) as
+a convenience for the local-operator workflow: a browser on the same
+machine shouldn't have to paste a bearer to view the cockpit. See
+``docs/pollypm-web-ui-2065-security-spec.md`` decision **d-ii** for the
+signed-off trade-off — loopback-cookie-mint is an explicit local-
+operator bypass, not an oversight.
 """
 
 from __future__ import annotations
@@ -96,7 +107,11 @@ def _extract_token(header_value: str | None) -> str | None:
     return value or None
 
 
-def make_bearer_auth_dependency(token_path: Path | None = None):
+def make_bearer_auth_dependency(
+    token_path: Path | None = None,
+    *,
+    tailnet_trust_enabled: bool = False,
+):
     """Return a FastAPI dependency that enforces bearer-token auth.
 
     Constructed at app-creation time so tests can swap in a tmp token
@@ -105,10 +120,19 @@ def make_bearer_auth_dependency(token_path: Path | None = None):
     Accepts three credential modes (in order):
     1. ``Authorization: Bearer <token>`` header.
     2. ``pollypm-session`` cookie (web UI).
-    3. Tailscale CGNAT client IP (no credential needed).
+    3. Tailscale CGNAT client IP (no credential needed) — **only when
+       ``tailnet_trust_enabled`` is True**.
+
+    The tailnet-trust flag is opt-in so a server that did NOT bind to
+    a verified Tailscale interface (e.g. ``pm serve --host 0.0.0.0
+    --allow-remote``) never grants credential-free access to peers
+    whose source IP happens to land in RFC 6598 shared address space.
+    Some ISPs use 100.64.0.0/10 for CGNAT; without the gate, those
+    peers would walk past auth.
 
     Wrong tokens / cookies still produce ``invalid_token``; missing
-    everything (and not from a tailnet IP) produces ``unauthorized``.
+    everything (and not from a trusted tailnet IP) produces
+    ``unauthorized``.
     """
 
     def _dependency(
@@ -132,7 +156,7 @@ def make_bearer_auth_dependency(token_path: Path | None = None):
             # rejecting. ``request.client`` is ``None`` for ASGI
             # transports without a peer (rare; treat as unauthenticated).
             client_host = request.client.host if request.client else None
-            if is_tailscale_ip(client_host):
+            if tailnet_trust_enabled and is_tailscale_ip(client_host):
                 return f"tailscale:{client_host}"
             raise unauthorized()
 
@@ -165,7 +189,11 @@ def make_bearer_auth_dependency(token_path: Path | None = None):
     return _dependency
 
 
-def make_sse_auth_dependency(token_path: Path | None = None):
+def make_sse_auth_dependency(
+    token_path: Path | None = None,
+    *,
+    tailnet_trust_enabled: bool = False,
+):
     """Return a FastAPI dependency for the SSE stream specifically.
 
     The browser ``EventSource`` API cannot send custom headers, so the
@@ -176,9 +204,10 @@ def make_sse_auth_dependency(token_path: Path | None = None):
     endpoints, since query strings end up in proxy / browser-history
     logs.
 
-    Also honors the v0 web UI session cookie and the Tailscale CGNAT
-    trust, matching the behavior of :func:`make_bearer_auth_dependency`,
-    so the SPA can subscribe to ``/events`` without paste-box gymnastics.
+    Also honors the v0 web UI session cookie and (when
+    ``tailnet_trust_enabled`` is True) the Tailscale CGNAT trust,
+    matching the behavior of :func:`make_bearer_auth_dependency`, so
+    the SPA can subscribe to ``/events`` without paste-box gymnastics.
     """
 
     def _dependency(
@@ -202,7 +231,7 @@ def make_sse_auth_dependency(token_path: Path | None = None):
             provided = session_cookie.strip() or None
         if provided is None:
             client_host = request.client.host if request.client else None
-            if is_tailscale_ip(client_host):
+            if tailnet_trust_enabled and is_tailscale_ip(client_host):
                 return f"tailscale:{client_host}"
             raise unauthorized()
         expected = load_token(token_path)

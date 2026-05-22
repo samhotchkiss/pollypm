@@ -246,6 +246,7 @@ def create_app(
     *,
     config: PollyPMConfig,
     token_path: Path | None = None,
+    tailnet_trust_enabled: bool = False,
 ) -> FastAPI:
     """Build a FastAPI app for ``pm serve``.
 
@@ -257,6 +258,16 @@ def create_app(
         Override the bearer-token file location. Defaults to
         ``~/.pollypm/api-token`` per spec §3. Tests pass a tmp path
         so the user's real token never surfaces.
+    tailnet_trust_enabled:
+        When ``True``, the auth dependency and the ``/ui/`` cookie gate
+        treat a request from the Tailscale CGNAT range
+        (``100.64.0.0/10``) as authenticated even without a bearer or
+        cookie. ``pm serve`` only enables this when it actually bound
+        to a verified Tailscale IPv4 — an explicit
+        ``--host 0.0.0.0 --allow-remote`` keeps the default ``False``,
+        so a CGNAT-source peer on the public interface still needs a
+        credential. Default ``False`` (closed by default; tests and
+        legacy callers stay strict).
     """
     # FastAPI's default ``openapi_url`` is public, but the spec
     # (§3) lists only ``/health`` as auth-exempt. Disable the default
@@ -340,11 +351,15 @@ def create_app(
     # Health is exempt from auth per spec §3.
     app.include_router(health_routes.router, prefix=API_V1_PREFIX)
 
-    auth_dependency = make_bearer_auth_dependency(token_path)
+    auth_dependency = make_bearer_auth_dependency(
+        token_path, tailnet_trust_enabled=tailnet_trust_enabled,
+    )
     auth_deps = [Depends(auth_dependency)]
     # SSE has its own auth dependency that also accepts ``?token=``
     # (browser EventSource cannot set custom headers — see spec §4).
-    sse_auth_dependency = make_sse_auth_dependency(token_path)
+    sse_auth_dependency = make_sse_auth_dependency(
+        token_path, tailnet_trust_enabled=tailnet_trust_enabled,
+    )
     sse_auth_deps = [Depends(sse_auth_dependency)]
 
     app.include_router(projects_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
@@ -408,7 +423,11 @@ def create_app(
     # ``pollypm-session`` cookie. The static files (app.js, styles.css)
     # are served raw; the entry route is custom so it can set the
     # cookie + return the HTML in one round-trip.
-    _mount_web_ui(app, token_path=token_path)
+    _mount_web_ui(
+        app,
+        token_path=token_path,
+        tailnet_trust_enabled=tailnet_trust_enabled,
+    )
 
     # ``security: bearerAuth`` declared at the document level so
     # generated clients carry the correct Auth scheme.
@@ -469,7 +488,12 @@ def _attach_security_scheme(app: FastAPI) -> None:
     app.openapi = _custom_openapi  # type: ignore[assignment]
 
 
-def _mount_web_ui(app: FastAPI, *, token_path: Path | None) -> None:
+def _mount_web_ui(
+    app: FastAPI,
+    *,
+    token_path: Path | None,
+    tailnet_trust_enabled: bool = False,
+) -> None:
     """Mount the v0 web UI static assets + cookie-bridge entry route.
 
     Layout:
@@ -529,9 +553,14 @@ def _mount_web_ui(app: FastAPI, *, token_path: Path | None) -> None:
         # 2. Loopback client (127.0.0.1, ::1) — local operator on
         #    the Mac itself.
         # 3. Tailscale CGNAT peer — operator hitting /ui/ from a
-        #    tailnet device. Defense-in-depth on top of the
-        #    bind-to-interface enforcement in ``pm serve`` (see
-        #    cli_features/web_api.py).
+        #    tailnet device, but **only when ``tailnet_trust_enabled``
+        #    is True** (i.e. ``pm serve`` actually bound to a verified
+        #    Tailscale interface). On an explicit
+        #    ``--host 0.0.0.0 --allow-remote`` deploy the flag is
+        #    False, so a CGNAT-source peer no longer earns a cookie:
+        #    RFC 6598 shared address space is also used by some ISP
+        #    CGNAT setups and must not be trusted on the public
+        #    interface.
         #
         # Everything else (LAN device, public-facing deploy by
         # accident, spoofed source IP through a misconfigured proxy)
@@ -541,7 +570,7 @@ def _mount_web_ui(app: FastAPI, *, token_path: Path | None) -> None:
         # docs/pollypm-web-ui-2065-security-spec.md (decision d-ii).
         client_host = request.client.host if request.client else None
         is_loopback = client_host in ("127.0.0.1", "::1")
-        is_tailnet = is_tailscale_ip(client_host)
+        is_tailnet = tailnet_trust_enabled and is_tailscale_ip(client_host)
         bearer_token = _extract_token(authorization)
         valid_bearer = False
         if bearer_token is not None and token_value is not None:

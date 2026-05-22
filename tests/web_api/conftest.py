@@ -105,7 +105,26 @@ def token(token_path: Path) -> str:
 
 @pytest.fixture
 def app(api_config, token_path, token):  # noqa: ARG001 — token fixture must run
+    # Default app is built with ``tailnet_trust_enabled=False`` to
+    # match the safest ``pm serve`` mode (loopback fallback or explicit
+    # ``--host`` override). Tests that exercise the credential-free
+    # CGNAT path should use the ``tailnet_app`` fixture below.
     return create_app(config=api_config, token_path=token_path)
+
+
+@pytest.fixture
+def tailnet_app(api_config, token_path, token):  # noqa: ARG001
+    """An app built as if ``pm serve`` bound to a verified tailnet IPv4.
+
+    Use this for tests that need credential-free CGNAT trust (the auth
+    bypass and the ``/ui/`` cookie mint from 100.64.x.y peers). Mirrors
+    the ``tailnet_trust=True`` branch in ``cli_features/web_api.py``.
+    """
+    return create_app(
+        config=api_config,
+        token_path=token_path,
+        tailnet_trust_enabled=True,
+    )
 
 
 @pytest.fixture

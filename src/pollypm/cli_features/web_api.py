@@ -213,6 +213,14 @@ def register_web_api_commands(app: typer.Typer) -> None:
         #   they don't see a tailnet bind.
         bind_mode: str
         tailscale_ip: str | None = None
+        # ``tailnet_trust`` decides whether the auth dependency and the
+        # ``/ui/`` cookie gate treat 100.64.0.0/10 peers as credential-
+        # free. It MUST stay False unless the server actually bound to
+        # a verified Tailscale IPv4; otherwise an explicit
+        # ``--host 0.0.0.0 --allow-remote`` deploy would hand out a
+        # session to any CGNAT-source peer (some ISPs use RFC 6598).
+        # Codex round-2 PR #2065.
+        tailnet_trust: bool = False
         if host is not None:
             # Explicit operator override — skip detection. Carry through
             # the existing --allow-remote gate so accidental 0.0.0.0
@@ -225,11 +233,21 @@ def register_web_api_commands(app: typer.Typer) -> None:
                     err=True,
                 )
                 raise typer.Exit(code=2)
+            # Explicit override stays untrusted by default. If the
+            # operator typed the actual tailnet IPv4, opt back into
+            # tailnet trust — that's the same wire path as the
+            # auto-detected case. Any other explicit host (loopback,
+            # 0.0.0.0, a LAN address) leaves tailnet_trust False.
+            detected = detect_tailscale_ip()
+            if detected is not None and host == detected:
+                tailscale_ip = detected
+                tailnet_trust = True
         else:
             tailscale_ip = detect_tailscale_ip()
             if tailscale_ip is not None:
                 host = tailscale_ip
                 bind_mode = "tailscale"
+                tailnet_trust = True
                 typer.echo(
                     f"[pm serve] bound {tailscale_ip}:{port} (tailscale "
                     f"mode; UI at http://{tailscale_ip}:{port}/ui/)",
@@ -263,7 +281,11 @@ def register_web_api_commands(app: typer.Typer) -> None:
                 str(token_path) if token_path is not None else str(DEFAULT_TOKEN_PATH)
             )
 
-        app_instance = create_app(config=config, token_path=token_path)
+        app_instance = create_app(
+            config=config,
+            token_path=token_path,
+            tailnet_trust_enabled=tailnet_trust,
+        )
 
         try:
             import uvicorn

@@ -22,6 +22,7 @@ touch pg, git, or any LLM call.
 from __future__ import annotations
 
 import time
+from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -178,6 +179,25 @@ class _FakeAdapterState:
 def fake_state() -> _FakeAdapterState:
     """Mutable adapter-control state shared across the test + the fixture."""
     return _FakeAdapterState()
+
+
+@pytest.fixture(autouse=True)
+def _clear_briefing_inflight() -> "Iterator[None]":
+    """Reset the module-level in-flight registry between tests.
+
+    The regenerate endpoint dedupes concurrent runs by `(type, project)`
+    using a module-level dict; a previous test that triggered a 504
+    leaves the background thread running, which would 409 the next
+    request for the same scope. We drop the entry on teardown so each
+    test starts with a clean inflight table.
+    """
+    from pollypm.web_api.routes import briefings as br
+
+    with br._INFLIGHT_LOCK:
+        br._INFLIGHT.clear()
+    yield
+    with br._INFLIGHT_LOCK:
+        br._INFLIGHT.clear()
 
 
 @pytest.fixture
@@ -432,3 +452,181 @@ def test_auth_required_for_all_briefings_routes(
         headers=no_auth,
     )
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Codex round-1 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_briefings_uses_injected_config_not_default(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`_morning_regenerate` must honor ``config.config_path``, not the
+    global default.
+
+    Asserts the regression for Codex round-1 P0 #1: previously the
+    adapter called ``load_briefing_settings(resolve_config_path(
+    DEFAULT_CONFIG_PATH))`` even when ``pm serve --config /tmp/foo``
+    had loaded a non-default file. We stub ``load_briefing_settings``
+    to record its incoming path and assert it matches the injected
+    config's ``config_path``.
+    """
+    from pollypm.web_api import create_app
+    from pollypm.web_api.routes.briefings import _morning_regenerate
+
+    # Construct a non-default TOML on disk so resolve_config_path can
+    # return a real path. Contents don't matter — the stub intercepts.
+    custom_toml = tmp_path / "custom_pollypm.toml"
+    custom_toml.write_text("# custom config used by test\n")
+    api_config.config_path = custom_toml
+
+    captured_paths: list[Path] = []
+
+    def _fake_load(path: Path):  # noqa: ANN202
+        captured_paths.append(Path(path))
+        # Return whatever default the real impl would; the regenerate
+        # path past this point is mocked by replacing fire_briefing.
+        from pollypm.plugins_builtin.morning_briefing.settings import (
+            BriefingSettings,
+        )
+        return BriefingSettings()
+
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.morning_briefing.settings.load_briefing_settings",
+        _fake_load,
+    )
+    # Short-circuit the heavy regenerate machinery — we only care that
+    # ``load_briefing_settings`` was called with the injected path.
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick.fire_briefing",
+        lambda **_kw: {
+            "fired": True,
+            "emitted": False,
+            "draft": {"date_local": "2026-05-22", "mode": "test", "markdown": "x"},
+        },
+    )
+    # Stub state.load_state since we never wrote a real one.
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.morning_briefing.state.load_state",
+        lambda _base: None,
+    )
+
+    # Build a fresh client that uses the real ``_morning_regenerate``
+    # (no patched_registry fixture). The shared executor is module
+    # level, so we don't need to recreate it.
+    app = create_app(config=api_config, token_path=token_path)
+    client = TestClient(app)
+
+    # Mark the morning provider as "available" without the real plugin
+    # tree. Patch only the availability probe — render is unused here.
+    from pollypm.web_api.routes import briefings as br
+
+    monkeypatch.setattr(br, "_morning_available", lambda _c: True)
+    # The registry was built at import time; rebuild it with the new
+    # availability callable so the endpoint trusts the stub.
+    br._REGISTRY["morning"] = br._BriefingAdapter(
+        name="morning",
+        description="real-adapter test",
+        available=lambda _c: True,
+        render_last=lambda _c: None,
+        regenerate=_morning_regenerate,
+    )
+
+    response = client.post(
+        "/api/v1/briefings/morning/regenerate",
+        json={},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    # The stub captured at least one path. Crucially it must equal the
+    # *custom* path, not the default ``~/.pollypm/pollypm.toml``.
+    assert captured_paths, "load_briefing_settings was not called"
+    assert captured_paths[0] == custom_toml.resolve()
+
+
+def test_briefings_regenerate_timeout_is_non_blocking(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_registry: dict[str, _BriefingAdapter],  # noqa: ARG001
+    fake_state: _FakeAdapterState,
+) -> None:
+    """504 must return near the timeout, not after the provider sleep.
+
+    Codex round-1 P0 #3: the old code wrapped ``ThreadPoolExecutor`` in
+    a ``with`` block, so context-manager exit blocked on
+    ``shutdown(wait=True)``. A 60 s provider with a 1 s timeout still
+    took ~60 s to respond. With the shared executor, the request
+    should return in roughly ``timeout_seconds`` (plus a small
+    bookkeeping budget).
+    """
+    fake_state.regen_delay = 60.0  # simulate a wedged provider
+    start = time.monotonic()
+    response = client.post(
+        "/api/v1/briefings/morning/regenerate?timeout_seconds=1",
+        json={"project": None},
+        headers=auth_headers,
+    )
+    elapsed = time.monotonic() - start
+    assert response.status_code == 504, response.json()
+    # Give CI a generous ceiling but well under the 60 s sleep — if
+    # the executor still blocks on shutdown, ``elapsed`` would be 60+.
+    assert elapsed < 5.0, (
+        f"timeout response took {elapsed:.2f}s; expected <5s "
+        "(non-blocking executor regression)"
+    )
+
+    # Reset state so the lingering background thread doesn't keep the
+    # in-flight registry full for the next test (it will eventually
+    # clear itself, but be polite).
+    fake_state.regen_delay = 0.0
+
+
+def test_briefings_morning_rejects_project_param(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """``project`` on a ``morning`` regenerate is 400, not silently dropped.
+
+    Codex round-1 P1: the request schema documented ``project`` as a
+    scope narrower; the morning adapter ignored it and silently
+    produced a workspace-wide briefing anyway. The new contract is
+    "reject for morning, accept-and-honor for future plugin types".
+    """
+    from pollypm.web_api import create_app
+    from pollypm.web_api.routes.briefings import _morning_regenerate
+    from pollypm.web_api.routes import briefings as br
+
+    api_config.config_path = tmp_path / "pollypm.toml"
+    api_config.config_path.write_text("")
+    monkeypatch.setattr(br, "_morning_available", lambda _c: True)
+    br._REGISTRY["morning"] = br._BriefingAdapter(
+        name="morning",
+        description="real-adapter test",
+        available=lambda _c: True,
+        render_last=lambda _c: None,
+        regenerate=_morning_regenerate,
+    )
+    app = create_app(config=api_config, token_path=token_path)
+    client = TestClient(app)
+
+    response = client.post(
+        "/api/v1/briefings/morning/regenerate",
+        json={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 400, response.json()
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "morning" in body["error"]["message"].lower() or "project" in body[
+        "error"
+    ]["message"].lower()

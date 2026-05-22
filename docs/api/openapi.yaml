@@ -2268,11 +2268,28 @@ paths:
               schema:
                 $ref: "#/components/schemas/BriefingResponse"
         "400":
-          $ref: "#/components/responses/InvalidRequest"
+          description: |
+            Bad request — currently emitted in two shapes:
+              * `body.project` was an empty / whitespace-only string.
+              * `type_name` is `morning` and the caller passed
+                `body.project`. Project-scoped morning briefings are
+                not yet implemented (morning is always whole-workspace).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            A regenerate for this `(type, project)` scope is already
+            running on the shared executor; retry after it completes.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: Provider plugin not loaded or regenerate failed.
           content:
@@ -2280,7 +2297,11 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
         "504":
-          description: Sync regenerate exceeded `timeout_seconds`.
+          description: |
+            Sync regenerate exceeded `timeout_seconds`. The request
+            returns immediately; the worker thread keeps running on
+            the shared executor so retries (after the run finishes)
+            do not duplicate work.
           content:
             application/json:
               schema:

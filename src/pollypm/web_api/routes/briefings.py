@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import concurrent.futures
 import logging
+import threading
 from datetime import UTC, datetime
 from typing import Annotated, Any, Callable
 
@@ -41,6 +42,7 @@ from pydantic import BaseModel, Field
 
 from pollypm.web_api.errors import (
     APIError,
+    conflict,
     invalid_request,
     not_found,
     service_unavailable,
@@ -53,7 +55,7 @@ router = APIRouter(tags=["Briefings"])
 
 
 # ---------------------------------------------------------------------------
-# Timeouts (kept module-level so tests can patch)
+# Timeouts + executor (kept module-level so tests can patch / share)
 # ---------------------------------------------------------------------------
 
 
@@ -61,6 +63,32 @@ router = APIRouter(tags=["Briefings"])
 # 8–12 s today, so 30 s is comfortable for the happy path; pathological
 # providers (GitHub rate-limit, LLM stall) trip the 504 path.
 DEFAULT_REGENERATE_TIMEOUT_SECONDS = 30.0
+
+
+# Shared process-wide executor for regenerate work. The old code created
+# a fresh ``ThreadPoolExecutor`` per request via ``with`` — that meant
+# the context-manager exit called ``shutdown(wait=True)`` on the
+# timed-out worker, so the request blocked until the slow provider
+# finished even after the 504 was "raised". Reusing a bounded
+# module-level executor lets ``future.result(timeout=...)`` actually
+# return early; the worker thread keeps running in the background and
+# either finishes silently or its result is discarded.
+#
+# ``max_workers`` is intentionally tiny: regenerate is heavy (LLM +
+# subprocess) and we don't want a runaway client to spawn dozens of
+# parallel briefing renders. Combined with the in-flight guard below,
+# this gives us at most one concurrent regenerate per ``(type,
+# project)`` key while letting different briefing types fan out.
+_REGEN_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="briefing-regen",
+)
+
+# In-flight registry — maps ``(type_name, project_key)`` to the
+# currently-running future. Used to reject duplicate retries with 409
+# ``conflict`` instead of stacking work on the executor.
+_INFLIGHT_LOCK = threading.Lock()
+_INFLIGHT: dict[tuple[str, str], concurrent.futures.Future[Any]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -195,14 +223,16 @@ def _morning_render_last(config: Any) -> BriefingResponse | None:
     )
 
 
-def _morning_regenerate(config: Any, body: RegenerateRequest) -> BriefingResponse:  # noqa: ARG001
+def _morning_regenerate(config: Any, body: RegenerateRequest) -> BriefingResponse:
     """Force-fire the morning briefing pipeline (spec §9.1 ``regenerate``).
 
     Mirrors ``pm briefing now`` (see
     :mod:`pollypm.plugins_builtin.morning_briefing.cli`): runs the full
     gather → synthesize → emit chain and writes to the inbox. The
-    ``project`` body field is accepted for forward compat but ignored —
-    morning briefings are always whole-workspace today.
+    ``project`` body field is rejected with 400 for the morning type —
+    morning briefings are whole-workspace only today (Phase 2 round-1
+    Codex feedback on #2059: the field used to be silently ignored,
+    which let a client think they'd narrowed scope when they hadn't).
     """
     from pollypm.plugins_builtin.morning_briefing.handlers import (
         briefing_tick as _tick,
@@ -214,14 +244,30 @@ def _morning_regenerate(config: Any, body: RegenerateRequest) -> BriefingRespons
     from pollypm.config import DEFAULT_CONFIG_PATH, resolve_config_path
     from pollypm.tz import get_timezone
 
+    if body.project is not None:
+        raise invalid_request(
+            "project-scoped morning briefings are not implemented",
+            hint=(
+                "Omit the `project` field — the morning briefing is "
+                "always whole-workspace. Per-project briefings will land "
+                "with the plugin-contributed briefing types."
+            ),
+        )
+
     base_dir = config.project.base_dir
     project_root = config.project.root_dir
 
     # ``load_briefing_settings`` reads ``[briefing]`` overrides off the
-    # toml; resolve_config_path picks the same file ``load_config``
-    # used when the config was first loaded, so the settings reflect
-    # the operator's overrides (briefing hour, timezone, …).
-    settings = load_briefing_settings(resolve_config_path(DEFAULT_CONFIG_PATH))
+    # toml. Prefer the path the running ``pm serve`` actually loaded
+    # (``config.config_path``) so a non-default ``--config`` flag is
+    # honored. Falling back to ``DEFAULT_CONFIG_PATH`` keeps the path
+    # working in tests that construct ``PollyPMConfig`` directly without
+    # touching disk. (Codex round-1 P0 on #2059: the old code always
+    # read ``DEFAULT_CONFIG_PATH``, so ``pm serve --config /tmp/foo``
+    # would write into ``foo``'s ``base_dir`` while honoring the
+    # default global TOML's briefing hour/timezone/quiet-mode.)
+    config_path = getattr(config, "config_path", None) or DEFAULT_CONFIG_PATH
+    settings = load_briefing_settings(resolve_config_path(config_path))
 
     fallback_tz = getattr(config.pollypm, "timezone", "") or ""
     timezone = get_timezone(fallback_tz)
@@ -418,10 +464,16 @@ def regenerate_briefing_endpoint(
 ) -> BriefingResponse:
     """POST /api/v1/briefings/{type_name}/regenerate — force regen.
 
-    Runs the regenerate path under a thread-pool timeout. On timeout
-    returns ``504 timeout`` per spec §2.7; the in-flight task is
-    cancelled best-effort (Python can't preempt arbitrary user code,
-    but the thread is detached so the request doesn't block forever).
+    Runs the regenerate path on a shared process-wide thread pool with
+    a wall-clock timeout. On timeout returns ``504 timeout`` per spec
+    §2.7 **immediately** — the worker keeps running in the background,
+    so the next-request retry (or the operator) doesn't have to wait
+    for the slow provider to finish.
+
+    Duplicate retries for the same ``(type, project)`` while a render
+    is still in flight are rejected with ``409 conflict``; this stops
+    a panicked client from queuing N redundant regenerates onto the
+    shared pool (Codex round-1 P0 on #2059).
     """
     adapter = _lookup_type(type_name)
     if not adapter.is_available(config):
@@ -444,32 +496,58 @@ def regenerate_briefing_endpoint(
             hint="Drop the field entirely for whole-workspace regenerate.",
         )
 
-    # Run the regenerate in a worker thread so we can enforce a wall
-    # clock timeout. ``fire_briefing`` is mostly I/O + subprocess
-    # (gather queries pg, synthesize shells out to the herald) so a
-    # thread executor is fine — we never need to interrupt CPU-bound
-    # work here.
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-        future = pool.submit(adapter.regenerate, config, request_body)
-        try:
-            return future.result(timeout=timeout_seconds)
-        except concurrent.futures.TimeoutError as exc:
-            # We can't cancel a running thread in Python; the daemon
-            # thread will finish in the background. Surface the timeout
-            # immediately so the client can retry.
-            future.cancel()
-            raise _timeout_error(type_name, timeout_seconds) from exc
-        except APIError:
-            # The adapter already raised a typed error — propagate.
-            raise
-        except Exception as exc:  # noqa: BLE001
-            logger.exception(
-                "briefings: regenerate failed for type %s", type_name,
+    # In-flight key — separate by project so e.g. ``morning`` and a
+    # future ``weekly/projA`` can run concurrently while preventing
+    # duplicates of the same scope.
+    inflight_key = (type_name, request_body.project or "")
+    with _INFLIGHT_LOCK:
+        existing = _INFLIGHT.get(inflight_key)
+        if existing is not None and not existing.done():
+            raise conflict(
+                (
+                    f"briefing {type_name!r} regenerate already in "
+                    "progress for this scope"
+                ),
+                hint=(
+                    "Wait for the running regenerate to finish, then "
+                    "retry. Concurrent regenerates of the same scope "
+                    "are deduplicated to protect the shared executor."
+                ),
             )
-            raise service_unavailable(
-                f"briefing {type_name!r} regenerate failed: {exc}",
-                hint="Check the provider plugin logs.",
-            ) from exc
+        future = _REGEN_EXECUTOR.submit(adapter.regenerate, config, request_body)
+        _INFLIGHT[inflight_key] = future
+
+    # Detach the in-flight entry once the worker finishes — runs on
+    # the executor's thread, so cleanup happens whether the request
+    # 504'd or returned normally. Wrapped in its own try so a bookkeeping
+    # exception can never propagate into the worker's result.
+    def _clear_inflight(fut: concurrent.futures.Future[Any]) -> None:
+        with _INFLIGHT_LOCK:
+            current = _INFLIGHT.get(inflight_key)
+            if current is fut:
+                _INFLIGHT.pop(inflight_key, None)
+
+    future.add_done_callback(_clear_inflight)
+
+    try:
+        return future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError as exc:
+        # Crucial: do NOT block on the future. The worker keeps
+        # running on the shared pool; the in-flight registry keeps
+        # tracking it so retries 409 instead of stacking. Returning
+        # here in <timeout_seconds + epsilon> is the contract.
+        raise _timeout_error(type_name, timeout_seconds) from exc
+    except APIError:
+        # The adapter already raised a typed error — propagate.
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception(
+            "briefings: regenerate failed for type %s", type_name,
+        )
+        raise service_unavailable(
+            f"briefing {type_name!r} regenerate failed: {exc}",
+            hint="Check the provider plugin logs.",
+        ) from exc
 
 
 __all__ = [

@@ -383,6 +383,34 @@ def _emit_project_audit(
         pass
 
 
+def _refresh_live_projects(
+    live_config: PollyPMConfig, fresh_config: PollyPMConfig
+) -> None:
+    """Replace ``live_config.projects`` in place with ``fresh_config.projects``.
+
+    Used after every config-mutation path so the long-lived
+    :class:`ConfigDep` object reflects disk state in full — both the
+    mutated project AND any concurrent external edits / additions /
+    removals.
+
+    Codex round 3 on #2063: the previous field-by-field copy
+    (``tracked`` / ``path`` / ``name``) left other ``KnownProject``
+    fields (``persona_name``, ``kind``, role/model assignments, worker
+    caps, plan enforcement, etc.) stale when an external CLI / cockpit
+    edit changed them on the same project before the API call landed.
+    The response is built from the live snapshot so the API would
+    return stale metadata while disk had the new metadata. Mirror
+    case: external project additions / removals on disk before
+    ``/archive`` would stay invisible to in-process GETs until restart.
+
+    Mutates ``live_config.projects`` in place so any external object
+    holding a reference to the dict (FastAPI ``Depends`` caches it
+    across requests) sees the new contents.
+    """
+    live_config.projects.clear()
+    live_config.projects.update(fresh_config.projects)
+
+
 def set_project_tracked(
     config: PollyPMConfig,
     project_key: str,
@@ -402,14 +430,18 @@ def set_project_tracked(
       via ``pm add-project`` after the server started).
     * Idempotency is decided AGAINST the freshly-loaded disk state
       (Codex round 2 on #2063): if disk already matches ``tracked``
-      we skip the write AND sync the live snapshot from disk so a
-      stale in-memory value can't keep lying. Deciding against the
-      long-lived ``ConfigDep`` here would let a server that booted
+      we skip the write AND fully refresh the live snapshot from disk
+      so a stale in-memory value can't keep lying. Deciding against
+      the long-lived ``ConfigDep`` here would let a server that booted
       with ``tracked=True`` short-circuit a ``/resume`` call even
       after an external edit flipped disk to ``False``.
     * Mutate the freshly-loaded copy, NOT the live ``config``.
-    * Only after the disk write succeeds do we sync the change back
-      into the live ``config`` so subsequent in-process reads see it.
+    * After every successful disk write we re-load disk and FULLY
+      refresh ``config.projects`` via :func:`_refresh_live_projects`
+      (Codex round 3 on #2063). The previous field-by-field copy left
+      other ``KnownProject`` fields (``persona_name``, ``kind``, role
+      assignments, worker caps, etc.) stale when an external edit
+      changed them on the same project before the API call.
     * If ``write_config`` raises ``OSError`` the live ``config``
       stays untouched and a subsequent GET reflects the unchanged
       disk state — no stale in-memory lie that flips back on restart.
@@ -445,17 +477,12 @@ def set_project_tracked(
 
     # Idempotency decided against DISK, not against the long-lived
     # in-memory snapshot. If disk already matches the request we still
-    # sync the live ``config`` from disk so a stale in-process value
-    # can't continue lying to subsequent GETs.
+    # FULLY refresh the live ``config.projects`` from disk so any
+    # external metadata edits (persona_name, kind, role assignments,
+    # worker caps, etc.) propagate — Codex round 3 on #2063.
     if fresh_project.tracked == tracked:
-        live_project.tracked = fresh_project.tracked
-        live_project.path = fresh_project.path
-        live_project.name = fresh_project.name
-        config.projects[project_key] = live_project
-        for key, value in fresh.projects.items():
-            if key not in config.projects:
-                config.projects[key] = value
-        return _project_to_api(config, project_key, live_project)
+        _refresh_live_projects(config, fresh)
+        return _project_to_api(config, project_key, config.projects[project_key])
 
     fresh_project.tracked = tracked
     fresh.projects[project_key] = fresh_project
@@ -468,29 +495,35 @@ def set_project_tracked(
             hint="Check write permissions on the PollyPM config file.",
         ) from exc
 
-    # Disk write succeeded — now sync the live config so in-process
-    # callers see the new state without waiting for a load_config()
-    # cache refresh. We update the existing KnownProject in place so
-    # any objects holding a reference to it observe the new value.
-    live_project.tracked = tracked
-    config.projects[project_key] = live_project
-    # Merge any external project additions that landed on disk so a
-    # subsequent in-process GET sees them too (defence-in-depth — the
-    # next load_config() will rediscover them anyway via mtime).
-    for key, value in fresh.projects.items():
-        if key not in config.projects:
-            config.projects[key] = value
+    # Disk write succeeded — re-load disk and FULLY refresh the live
+    # ``config.projects`` so in-process callers see (a) the new
+    # ``tracked`` we just wrote AND (b) any concurrent external edits
+    # to other fields / other projects that landed between our load
+    # and our write — Codex round 3 on #2063. The extra load_config()
+    # is cheap relative to the durable write we just did and ensures
+    # we never widen a write-after-read race.
+    try:
+        post_write = load_config(config_path)
+    except OSError as exc:
+        # Live config still reflects pre-write state. Surface as 503
+        # so the client can retry; subsequent GETs stay consistent.
+        raise service_unavailable(
+            f"Failed to reload config after writing {project_key}: {exc}",
+            hint="Check read permissions on the PollyPM config file.",
+        ) from exc
+    _refresh_live_projects(config, post_write)
 
+    refreshed_project = config.projects[project_key]
     _emit_project_audit(
         event="projects.tracked.set",
         config=config,
         project_key=project_key,
-        project_path=live_project.path,
+        project_path=refreshed_project.path,
         actor=actor,
         reason=reason,
         extra={"tracked": tracked},
     )
-    return _project_to_api(config, project_key, live_project)
+    return _project_to_api(config, project_key, refreshed_project)
 
 
 def archive_project(
@@ -556,8 +589,24 @@ def archive_project(
             hint="Check write permissions on the PollyPM config file.",
         ) from exc
 
-    # Disk write succeeded — sync the live config.
-    config.projects.pop(project_key, None)
+    # Disk write succeeded — re-load disk and FULLY refresh the live
+    # ``config.projects`` (Codex round 3 on #2063). The previous
+    # pop()-only sync left any concurrent external project ADDITIONS
+    # invisible to subsequent in-process ``GET /projects`` calls until
+    # the server restarted. Full refresh both drops the archived key
+    # and surfaces any external additions / metadata edits.
+    try:
+        post_archive = load_config(config_path)
+    except OSError as exc:
+        # Archive landed on disk but we can't see the post-state.
+        # Best-effort: drop the archived key from the live snapshot so
+        # the immediate response is at least internally consistent.
+        config.projects.pop(project_key, None)
+        raise service_unavailable(
+            f"Failed to reload config after archiving {project_key}: {exc}",
+            hint="Check read permissions on the PollyPM config file.",
+        ) from exc
+    _refresh_live_projects(config, post_archive)
 
     _emit_project_audit(
         event="projects.archive",

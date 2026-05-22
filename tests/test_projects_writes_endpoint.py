@@ -808,3 +808,193 @@ def test_resume_idempotent_when_disk_already_true_syncs_live(
     )
     assert get_response.status_code == 200
     assert get_response.json()["tracked"] is True
+
+
+# ---------------------------------------------------------------------------
+# Codex round 3 on PR #2063 — full live-snapshot refresh after every mutation.
+#
+# Round-2 idempotency only copied tracked/path/name from disk back into the
+# long-lived ConfigDep object. Round 3 caught that other KnownProject fields
+# (persona_name, kind, role assignments, worker caps, plan enforcement, ...)
+# stayed stale when an external CLI / cockpit edit changed them on the same
+# project before the API call. Mirror gap on archive: external project
+# additions on disk before the archive stayed invisible to GET /projects
+# until restart.
+#
+# Fix: ``_refresh_live_projects`` does a full ``clear() + update()`` from
+# the freshly-loaded disk config after every mutation path.
+# ---------------------------------------------------------------------------
+
+
+def test_pause_idempotent_refreshes_external_metadata_edit(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
+) -> None:
+    """Codex round 3: idempotent /pause must surface external metadata edits.
+
+    Start with ``myproj.tracked=False`` (already at /pause's target) and
+    ``persona_name="old"``. An external editor flips ``persona_name`` to
+    ``"new"`` on disk without changing ``tracked``. POST /pause hits the
+    idempotent branch (no write) but MUST still refresh the live
+    snapshot so the response and a subsequent GET show ``persona_name=
+    "new"``.
+
+    Pre-fix: the field-by-field copy only synced tracked/path/name, so
+    ``persona_name`` stayed stale.
+    """
+    # Boot state: tracked=False, persona_name="old".
+    config.projects["myproj"].tracked = False
+    config.projects["myproj"].persona_name = "old"
+    fresh = load_config(config_path)
+    fresh.projects["myproj"].tracked = False
+    fresh.projects["myproj"].persona_name = "old"
+    write_config(fresh, config_path, force=True)
+
+    # External editor changes persona_name to "new" without touching tracked.
+    external = load_config(config_path)
+    external.projects["myproj"].persona_name = "new"
+    write_config(external, config_path, force=True)
+    # Live snapshot is intentionally stale on persona_name.
+    assert config.projects["myproj"].persona_name == "old"
+
+    # POST /pause — target tracked=False matches disk, so the helper
+    # takes the idempotent (no-write) branch.
+    response = client.post(
+        "/api/v1/projects/myproj/pause",
+        headers=auth_headers,
+        json={"reason": "round-3 idempotent metadata refresh"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["tracked"] is False
+
+    # Live snapshot MUST now reflect the external persona_name edit —
+    # pre-fix it stayed "old" because only tracked/path/name got copied.
+    assert config.projects["myproj"].persona_name == "new", (
+        "Idempotent pause failed to refresh persona_name — Codex round-3 "
+        "regression (live snapshot only copied tracked/path/name)."
+    )
+
+
+def test_resume_write_success_refreshes_external_metadata_edit(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
+) -> None:
+    """Codex round 3: write-success /resume must surface external metadata edits.
+
+    Mirror case: live thinks ``tracked=True, persona_name="old"``. An
+    external editor lands ``tracked=False, persona_name="new"`` on disk.
+    POST /resume's target (True) differs from disk (False) so the helper
+    takes the write branch. The post-write live refresh MUST pick up the
+    new ``persona_name`` too — not just the ``tracked`` bit we wrote.
+
+    Pre-fix: only ``live_project.tracked = target`` ran, leaving
+    persona_name stale.
+    """
+    # Boot state matches disk: tracked=True, persona_name="old".
+    config.projects["myproj"].persona_name = "old"
+    fresh = load_config(config_path)
+    fresh.projects["myproj"].tracked = True
+    fresh.projects["myproj"].persona_name = "old"
+    write_config(fresh, config_path, force=True)
+
+    # External editor lands tracked=False + persona_name="new" on disk.
+    external = load_config(config_path)
+    external.projects["myproj"].tracked = False
+    external.projects["myproj"].persona_name = "new"
+    write_config(external, config_path, force=True)
+    # Live snapshot is intentionally stale (tracked=True, persona_name="old").
+    assert config.projects["myproj"].tracked is True
+    assert config.projects["myproj"].persona_name == "old"
+
+    # POST /resume — target True != disk False, so the helper writes.
+    response = client.post(
+        "/api/v1/projects/myproj/resume", headers=auth_headers, json={}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["tracked"] is True
+    # The response Project model doesn't surface persona_name directly,
+    # but the live snapshot underneath MUST reflect both fields.
+
+    # Live snapshot MUST reflect the external persona_name edit too —
+    # pre-fix only ``tracked`` was synced, leaving persona_name stale.
+    assert config.projects["myproj"].tracked is True
+    assert config.projects["myproj"].persona_name == "new", (
+        "Write-success resume failed to refresh persona_name — Codex "
+        "round-3 regression (live snapshot only synced the tracked bit)."
+    )
+
+    # Disk must reflect the resume write.
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is True
+    assert reloaded.projects["myproj"].persona_name == "new"
+
+
+def test_archive_surfaces_concurrent_external_project_addition(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Codex round 3: external project added on disk before /archive surfaces.
+
+    Start with ``myproj`` only. An external CLI lands a second project
+    ``external`` on disk between server boot and the API call. POST
+    /archive removes ``myproj``; the post-archive live refresh MUST
+    surface ``external`` to subsequent ``GET /projects`` calls.
+
+    Pre-fix: ``config.projects.pop(project_key, None)`` only dropped the
+    archived key. The external addition stayed invisible to in-process
+    GETs until restart.
+    """
+    # Sanity: live boots with myproj only.
+    assert list(config.projects.keys()) == ["myproj"]
+
+    # External CLI adds a second project on disk.
+    external_root = tmp_path / "external"
+    external_root.mkdir()
+    (external_root / ".pollypm").mkdir()
+    fresh = load_config(config_path)
+    fresh.projects["external"] = KnownProject(
+        key="external",
+        path=external_root,
+        name="External Project",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+    write_config(fresh, config_path, force=True)
+    # Live snapshot still doesn't know about ``external``.
+    assert "external" not in config.projects
+
+    # POST /archive on myproj.
+    response = client.post(
+        "/api/v1/projects/myproj/archive",
+        headers=auth_headers,
+        json={"reason": "round-3 archive refresh"},
+    )
+    assert response.status_code == 200, response.text
+
+    # Live snapshot MUST drop myproj AND surface external.
+    assert "myproj" not in config.projects
+    assert "external" in config.projects, (
+        "Archive failed to surface concurrent external project addition "
+        "— Codex round-3 regression (post-archive sync only pop()'d the "
+        "archived key)."
+    )
+
+    # And GET /projects sees external too (end-to-end via the route).
+    list_response = client.get(
+        "/api/v1/projects", headers=auth_headers
+    )
+    assert list_response.status_code == 200
+    keys = [item["key"] for item in list_response.json()["items"]]
+    assert "external" in keys, (
+        "GET /projects did not surface concurrent external addition after "
+        "archive — Codex round-3 regression."
+    )
+    assert "myproj" not in keys

@@ -1149,8 +1149,8 @@ components:
           additionalProperties: true
           description: |
             Type-dependent payload. `subagent_result` envelopes carry
-            `output_file`, `summary`, and (when `include_subagents=true`)
-            an inlined `subagent_transcript` array of child envelopes.
+            `output_file` and `summary`. `subagent_transcript` inlining
+            is deferred — see #2052.
 
     ChatMessagesResponse:
       type: object

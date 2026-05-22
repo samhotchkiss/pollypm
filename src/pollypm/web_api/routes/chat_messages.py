@@ -213,6 +213,28 @@ def _archive_missing(session_name: str) -> APIError:
     )
 
 
+def _archive_unreadable(session_name: str, detail: str) -> APIError:
+    """Spec §2.3 — explicit ``source=jsonl`` against an unreadable archive.
+
+    Returned as 503 (not 4xx): the archive exists on disk but the
+    process can't read it (permissions, transient I/O fault, mounted
+    volume gone). That's a server-side condition the caller can retry,
+    not a request-shape error (round-5 blocker 2).
+    """
+    return APIError(
+        status_code=503,
+        code="archive_unreadable",
+        message=(
+            f"events.jsonl archive for session {session_name!r} is "
+            f"present but cannot be read: {detail}"
+        ),
+        hint=(
+            "Check filesystem permissions on the archive, or drop "
+            "?source=jsonl to fall back to tmux capture."
+        ),
+    )
+
+
 def _capture_unavailable(session_name: str) -> APIError:
     return APIError(
         status_code=503,
@@ -249,12 +271,8 @@ def _invalid_query(field: str, message: str) -> APIError:
 # ---------------------------------------------------------------------------
 
 
-def _build_work_service_stub(
-    config: Any,
-    *,
-    strict: bool = False,
-) -> Any | None:
-    """Return a duck-typed stub the registry can call for workers.
+def _build_work_service_stub(config: Any) -> Any | None:
+    """Return a duck-typed stub the registry can call for workers (fail-soft).
 
     The chat registry only needs ``list_worker_sessions(active_only=...)``
     on the work-service. Rather than reach into a private context
@@ -264,40 +282,77 @@ def _build_work_service_stub(
     records. Returns ``None`` when the facade yields no records — the
     registry then skips worker enumeration entirely.
 
-    ``strict=False`` (default — used by discovery): any unexpected
+    This (non-strict) variant is used by discovery: any unexpected
     import/runtime error collapses to ``None`` so the response still
-    returns configured surfaces and never 500s.
-
-    ``strict=True`` (used by ``_find_surface`` for explicit worker
-    lookups): raises :class:`_WorkerFacadeUnavailable` when the public
-    facade can't be opened, so the caller can map the outage to a
-    typed 503 ``service_unavailable`` instead of a misleading 404
-    ``session_unknown`` (blocker 3). The facade itself swallows
-    transient errors and returns ``[]`` — to detect that, we check
-    whether the import succeeded; an empty list is treated as "no
-    workers right now" (not an outage).
+    returns configured surfaces and never 500s. For the strict-mode
+    worker lookup path (where pg outages must surface as 503 instead
+    of 404), use :func:`_build_work_service_stub_strict` — it bypasses
+    the public facade so transient facade failures aren't swallowed
+    into an empty list (round-5 blocker).
     """
     try:
         from pollypm.web_api.service import list_active_worker_sessions
-    except Exception as exc:  # noqa: BLE001
-        if strict:
-            raise _WorkerFacadeUnavailable(
-                "list_active_worker_sessions import failed"
-            ) from exc
+    except Exception:  # noqa: BLE001
         return None
     try:
         records = list_active_worker_sessions(config)
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
         logger.debug(
             "chat_messages: list_active_worker_sessions failed; "
             "skipping worker surfaces",
             exc_info=True,
         )
-        if strict:
-            raise _WorkerFacadeUnavailable(
-                "list_active_worker_sessions raised"
-            ) from exc
         return None
+    if not records:
+        return None
+    return _WorkerSessionStub(records)
+
+
+def _build_work_service_stub_strict(config: Any) -> Any | None:
+    """Strict variant: bypass the public facade for explicit worker lookups.
+
+    The public :func:`list_active_worker_sessions` facade in
+    :mod:`pollypm.web_api.service` swallows pg-pool outages and returns
+    ``[]`` (fail-open posture for discovery). Strict callers — the
+    per-session worker resolver in :func:`_find_surface` — need to tell
+    "no workers right now" apart from "the work-service can't be
+    opened" so the route can map the outage to a typed 503
+    ``service_unavailable`` instead of a misleading 404
+    ``session_unknown`` (round-5 blocker; same pattern as PR #2043 v6).
+
+    We open the work-service directly via the private
+    ``_open_work_service_readonly`` context manager and let exceptions
+    propagate as :class:`_WorkerFacadeUnavailable`. An empty result
+    list still collapses to ``None`` (matches the non-strict contract:
+    the registry skips worker enumeration when the stub is ``None``).
+    """
+    try:
+        from pollypm.web_api.service import _open_work_service_readonly
+    except Exception as exc:  # noqa: BLE001
+        raise _WorkerFacadeUnavailable(
+            "_open_work_service_readonly import failed"
+        ) from exc
+    project = getattr(config, "project", None)
+    if project is None:
+        # No default project — there can't be any per-task workers.
+        # Treat this as "no workers", not an outage.
+        return None
+    project_key = getattr(project, "name", "")
+    project_path = getattr(project, "root_dir", None)
+    if not project_key or project_path is None:
+        return None
+    try:
+        with _open_work_service_readonly(
+            config=config,
+            project_key=project_key,
+            project_path=project_path,
+        ) as work_service:
+            list_fn = getattr(work_service, "list_worker_sessions", None)
+            if not callable(list_fn):
+                return None
+            records = list(list_fn(active_only=True) or [])
+    except Exception as exc:  # noqa: BLE001
+        raise _WorkerFacadeUnavailable(str(exc)) from exc
     if not records:
         return None
     return _WorkerSessionStub(records)
@@ -366,7 +421,7 @@ def _find_surface(
     work_service: Any | None = None
     if include_workers:
         try:
-            work_service = _build_work_service_stub(config, strict=True)
+            work_service = _build_work_service_stub_strict(config)
         except _WorkerFacadeUnavailable as exc:
             raise service_unavailable(
                 f"work-service unavailable; cannot resolve worker session "
@@ -486,10 +541,19 @@ def _load_envelopes(
     if source == "jsonl":
         if archive is None or not archive.exists():
             raise _archive_missing(surface.session_name)
-        envelopes = parse_events_jsonl(
-            archive,
-            actor_fallback=actor_fallback,
-        )
+        try:
+            envelopes = parse_events_jsonl(
+                archive,
+                actor_fallback=actor_fallback,
+                strict=True,
+            )
+        except OSError as exc:
+            # The archive exists but we can't read it (permissions,
+            # transient I/O fault, etc). Explicit ``source=jsonl``
+            # callers asked for the archive specifically — return a
+            # typed 503 instead of silently swallowing to ``[]`` and
+            # responding ``200 messages=[]`` (round-5 blocker 2).
+            raise _archive_unreadable(surface.session_name, str(exc)) from exc
         return envelopes, "jsonl", archive
 
     if source == "capture":

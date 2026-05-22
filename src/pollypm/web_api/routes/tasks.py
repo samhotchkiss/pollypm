@@ -13,16 +13,67 @@ the wedge is in.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Header
+from fastapi import APIRouter, Header, Query
 
-from pollypm.web_api.errors import not_found
-from pollypm.web_api.models import ActionResult, TaskDetail
+from pollypm.web_api.errors import APIError, not_found
+from pollypm.web_api.models import ActionResult, TaskDetail, TaskListResponse
 from pollypm.web_api.routes._deps import ConfigDep
-from pollypm.web_api.service import get_task_detail, queue_task
+from pollypm.web_api.service import get_task_detail, list_all_tasks, queue_task
 
 router = APIRouter(tags=["Tasks"])
+
+
+@router.get(
+    "/tasks",
+    response_model=TaskListResponse,
+    summary="Flat list of tasks across all projects",
+    operation_id="listTasks",
+)
+def list_tasks_endpoint(
+    config: ConfigDep,
+    project: Annotated[str | None, Query(description="Filter to a single project key.")] = None,
+    # Repeatable ``status=`` per spec §5.1 — FastAPI maps a list-typed
+    # Query into ``?status=draft&status=queued`` (OR semantics on the
+    # service side).
+    status: Annotated[list[str] | None, Query(description="Filter by work_status (repeatable).")] = None,
+    assignee: Annotated[str | None, Query(description="Filter by exact assignee.")] = None,
+    since: Annotated[
+        str | None,
+        Query(description="ISO-8601 lower bound on updated_at (strictly after)."),
+    ] = None,
+    limit: Annotated[int, Query(ge=1, le=200, description="Page size (capped at 200).")] = 50,
+    cursor: Annotated[str | None, Query(description="Opaque cursor from next_cursor.")] = None,
+) -> TaskListResponse:
+    since_dt: datetime | None = None
+    if since is not None:
+        try:
+            since_dt = datetime.fromisoformat(since.replace("Z", "+00:00"))
+        except ValueError as exc:
+            # Spec §6: malformed query → 400 invalid_request with a
+            # hint about the expected format, not 422. The body shape
+            # is fine; the *value* is unparseable, but the
+            # invalid_request distinction matches how the other
+            # endpoints surface bad timestamps (e.g. /events).
+            raise APIError(
+                status_code=400,
+                code="invalid_request",
+                message=f"Invalid `since` value: {since!r}",
+                hint="Use ISO-8601 (e.g. 2026-05-22T00:00:00Z).",
+            ) from exc
+
+    items, next_cursor = list_all_tasks(
+        config,
+        project=project,
+        statuses=status,
+        assignee=assignee,
+        since=since_dt,
+        limit=limit,
+        cursor=cursor,
+    )
+    return TaskListResponse(items=items, next_cursor=next_cursor)
 
 
 @router.get(

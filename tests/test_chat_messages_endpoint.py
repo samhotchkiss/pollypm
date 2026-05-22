@@ -214,11 +214,13 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
         # Also stub the work-service stub factory so we never try to
         # open Postgres during these tests. (The route uses the
         # public ``list_active_worker_sessions`` facade in
-        # ``pollypm.web_api.service`` — Blocker 3 fix.)
+        # ``pollypm.web_api.service`` — Blocker 3 fix.) Accepts the
+        # ``strict`` kwarg that ``_find_surface`` passes when probing
+        # a worker session (v4 blocker 3).
         monkeypatch.setattr(
             chat_messages_routes,
             "_build_work_service_stub",
-            lambda _config: None,
+            lambda _config, **_kw: None,
         )
         # Stop the route from constructing a real TmuxClient (spawning
         # a subprocess at import time on systems with tmux installed).
@@ -630,60 +632,13 @@ def test_messages_endpoint_rejects_include_thinking_query_param(
     assert "thinking" not in types
 
 
-def test_messages_endpoint_inlines_subagent_transcript_when_requested(
-    client, auth_headers, patch_registry, monkeypatch, tmp_path, project_root,
-):
-    archive = tmp_path / "events.jsonl"
-    archive.write_text("x")
-    # Place the subagent transcript inside the project's allowed
-    # transcripts root so the path-traversal allowlist (blocker 3
-    # fix) permits inlining.
-    transcripts_root = project_root / ".pollypm" / "transcripts"
-    transcripts_root.mkdir(parents=True, exist_ok=True)
-    sub_archive = transcripts_root / "subagent.jsonl"
-    sub_archive.write_text("y")
-    parent = _env(
-        "result_1",
-        type_=MessageType.SUBAGENT_RESULT,
-        text="Subagent done.",
-        metadata={
-            "subagent_id": "abc",
-            "tool_use_id": "abc",
-            "output_file": str(sub_archive),
-            "summary": "Subagent done.",
-        },
-    )
-    sub_envelopes = [
-        _env("sub_1", text="step 1"),
-        _env("sub_2", text="step 2"),
-    ]
-    patch_registry([_surface(
-        "operator", SurfaceType.OPERATOR, persona="Polly",
-        transcript_path=archive,
-    )])
-
-    def fake_parser(path, *, actor_fallback="agent"):
-        if Path(path) == archive:
-            return [parent]
-        if Path(path) == sub_archive:
-            return list(sub_envelopes)
-        return []
-
-    monkeypatch.setattr(
-        chat_messages_routes, "parse_events_jsonl", fake_parser,
-    )
-    body = client.get(
-        "/api/v1/chat/operator/messages?include_subagents=true",
-        headers=auth_headers,
-    ).json()
-    assert len(body["messages"]) == 1
-    sub_transcript = body["messages"][0]["metadata"]["subagent_transcript"]
-    assert [m["id"] for m in sub_transcript] == ["sub_1", "sub_2"]
-
-
 def test_messages_endpoint_no_subagent_inlining_by_default(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
+    """``include_subagents`` is deferred (#2052) — default behavior
+    returns the parent envelope without any ``subagent_transcript``
+    field, even when the parent carries an ``output_file`` reference.
+    """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
     parent = _env(
@@ -930,90 +885,58 @@ def test_messages_endpoint_desc_cursor_pagination_no_overlap(
 # ---------------------------------------------------------------------------
 
 
-def test_messages_endpoint_rejects_absolute_path_traversal_in_subagent(
-    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+def test_messages_endpoint_rejects_include_subagents_true_with_422(
+    client, auth_headers, patch_registry, tmp_path,
 ):
-    """``output_file=/etc/passwd`` must NOT cause the API to stat/read it."""
+    """``include_subagents=true`` is deferred (#2052) and must return 422.
+
+    The v3 implementation called ``parse_events_jsonl`` on
+    ``metadata.output_file``, but that field is the raw Claude
+    subagent JSONL — a different shape than the normalized archive
+    the parser consumes. Until a proper resolver lands, the param is
+    rejected so callers don't get silently-empty inlining (and the
+    path-traversal attack surface goes with it).
+
+    Replaces the v3 path-traversal tests: those exercised the
+    allowlist that no longer exists. The 422 here forecloses on
+    ``/etc/passwd`` / ``../../../escape.jsonl`` exploits at the same
+    boundary.
+    """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
-    parent = _env(
-        "result_1",
-        type_=MessageType.SUBAGENT_RESULT,
-        text="Subagent done.",
-        metadata={
-            "subagent_id": "abc",
-            "output_file": "/etc/passwd",
-        },
-    )
     patch_registry([_surface(
         "operator", SurfaceType.OPERATOR, persona="Polly",
         transcript_path=archive,
     )])
-
-    calls: list[Path] = []
-
-    def fake_parser(path, *, actor_fallback="agent"):
-        # Track every disk access — must NOT include /etc/passwd.
-        calls.append(Path(path))
-        if Path(path) == archive:
-            return [parent]
-        return [_env("leaked", text="should never reach here")]
-
-    monkeypatch.setattr(
-        chat_messages_routes, "parse_events_jsonl", fake_parser,
-    )
-    body = client.get(
+    response = client.get(
         "/api/v1/chat/operator/messages?include_subagents=true",
         headers=auth_headers,
-    ).json()
-    # Endpoint succeeds (no raise) but subagent_transcript is NOT
-    # inlined for the rejected path.
-    assert len(body["messages"]) == 1
-    assert "subagent_transcript" not in body["messages"][0]["metadata"]
-    # Confirm the subagent_loader was never called for /etc/passwd.
-    assert Path("/etc/passwd") not in calls
-    assert Path("/etc/passwd").resolve() not in calls
+    )
+    assert response.status_code == 422
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert "include_subagents" in body["error"]["message"]
 
 
-def test_messages_endpoint_rejects_relative_path_traversal_in_subagent(
-    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+def test_messages_endpoint_include_subagents_false_explicit_is_ok(
+    client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
-    """``output_file=../../../escape.jsonl`` must not escape transcript roots."""
+    """Explicit ``include_subagents=false`` must still return 200.
+
+    Only ``=true`` trips the deferral guard.
+    """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
-    # Create the escape target somewhere accessible so we'd be able to
-    # detect a successful read if the allowlist were missing.
-    escape = tmp_path / "escape.jsonl"
-    escape.write_text("would be leaked without allowlist")
-    parent = _env(
-        "result_1",
-        type_=MessageType.SUBAGENT_RESULT,
-        text="Subagent done.",
-        metadata={
-            "subagent_id": "abc",
-            "output_file": "../../../escape.jsonl",
-        },
-    )
     patch_registry([_surface(
         "operator", SurfaceType.OPERATOR, persona="Polly",
         transcript_path=archive,
     )])
-
-    def fake_parser(path, *, actor_fallback="agent"):
-        if Path(path) == archive:
-            return [parent]
-        # Any access for a non-archive path means the allowlist
-        # let an escape through.
-        return [_env("leaked", text="boundary breach")]
-
-    monkeypatch.setattr(
-        chat_messages_routes, "parse_events_jsonl", fake_parser,
-    )
-    body = client.get(
-        "/api/v1/chat/operator/messages?include_subagents=true",
+    patch_parser({archive: [_env("a", text="hi")]})
+    response = client.get(
+        "/api/v1/chat/operator/messages?include_subagents=false",
         headers=auth_headers,
-    ).json()
-    assert "subagent_transcript" not in body["messages"][0]["metadata"]
+    )
+    assert response.status_code == 200
 
 
 # ---------------------------------------------------------------------------
@@ -1240,3 +1163,270 @@ def test_messages_endpoint_capture_uses_real_helper_with_raising_pane(
     body = response.json()
     assert body["error"]["code"] == "capture_failed"
     assert "tmux pipe closed" in body["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# Mixed tz-aware/naive timestamps regression (PR #2045 v4 blocker 2)
+# ---------------------------------------------------------------------------
+
+
+def test_messages_endpoint_mixed_tz_timestamps_no_typeerror(
+    client, auth_headers, patch_registry, patch_parser, tmp_path,
+):
+    """Mixed/missing ``ts`` values must NOT raise TypeError in sort.
+
+    Before the fix, ``_apply_filters_and_paginate`` sorted with
+    ``_parse_envelope_ts(...) or datetime.min`` — the sentinel was
+    naive while the parsed values were aware, so a single row with
+    ``ts=""`` or unparseable ``ts`` raised ``TypeError: can't compare
+    offset-naive and offset-aware datetimes`` and crashed the
+    endpoint with 500.
+
+    All 3 rows must come back in the page (the unparseable ones sort
+    to the head; their ``ts`` field surfaces as-is in the response).
+    """
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    envelopes = [
+        _env("blank", ts=""),
+        _env("good", ts="2026-05-21T10:00:00Z"),
+        _env("garbage", ts="not-a-timestamp-at-all"),
+    ]
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    patch_parser({archive: envelopes})
+
+    response = client.get(
+        "/api/v1/chat/operator/messages?direction=asc",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    ids = [m["id"] for m in body["messages"]]
+    # All 3 envelopes round-trip; unparseable rows sort to the head
+    # (sentinel is the tz-aware UTC ``datetime.min``).
+    assert set(ids) == {"blank", "good", "garbage"}
+    assert ids[-1] == "good"  # parseable timestamp sorts last in asc order
+
+
+def test_messages_endpoint_naive_ts_does_not_crash_sort(
+    client, auth_headers, patch_registry, patch_parser, tmp_path,
+):
+    """A naive ``ts`` (no Z / no offset) must coerce to UTC, not crash.
+
+    The transcript writer normalizes to ``...Z`` but capture-mode
+    paths and stale archives might surface ``2026-05-21T10:00:00``
+    (no suffix). Before the fix, mixing one such row with a normal
+    ``...Z`` row raised TypeError from the sort comparator.
+    """
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    envelopes = [
+        _env("naive", ts="2026-05-21T09:00:00"),  # no tz suffix
+        _env("aware", ts="2026-05-21T10:00:00Z"),  # explicit Z
+    ]
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    patch_parser({archive: envelopes})
+    response = client.get(
+        "/api/v1/chat/operator/messages?direction=asc",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Naive treated as UTC → "naive" (09:00) sorts before "aware" (10:00).
+    assert [m["id"] for m in body["messages"]] == ["naive", "aware"]
+
+
+# ---------------------------------------------------------------------------
+# Lazy work-service open for non-worker lookups (PR #2045 v4 blocker 3)
+# ---------------------------------------------------------------------------
+
+
+def test_messages_endpoint_operator_lookup_skips_work_service(
+    client, auth_headers, monkeypatch, tmp_path,
+):
+    """Operator lookup must NOT open the work-service.
+
+    Before the fix, every chat-messages request called
+    ``_build_work_service_stub`` regardless of whether the
+    ``session_name`` matched the worker pattern. That made pg the
+    critical path for operator/architect/advisor lookups and turned
+    a pool outage into a misleading 404.
+    """
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+
+    open_count = {"n": 0}
+
+    def counting_stub(config, *, strict=False):
+        open_count["n"] += 1
+        return None
+
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_work_service_stub", counting_stub,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client", lambda: None,
+    )
+
+    def fake_enumerate(config, work_service=None, tmux_client=None):
+        return [_surface(
+            "operator", SurfaceType.OPERATOR, persona="Polly",
+            transcript_path=archive,
+        )]
+
+    monkeypatch.setattr(
+        chat_messages_routes, "enumerate_chat_surfaces", fake_enumerate,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "parse_events_jsonl",
+        lambda path, *, actor_fallback="agent": [],
+    )
+    response = client.get(
+        "/api/v1/chat/operator/messages",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert open_count["n"] == 0, (
+        "non-worker lookup must not probe the work-service"
+    )
+
+
+def test_messages_endpoint_architect_lookup_skips_work_service(
+    client, auth_headers, monkeypatch, tmp_path,
+):
+    """Same as operator — architect_<project> lookups skip work-service."""
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+
+    open_count = {"n": 0}
+
+    def counting_stub(config, *, strict=False):
+        open_count["n"] += 1
+        return None
+
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_work_service_stub", counting_stub,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client", lambda: None,
+    )
+
+    def fake_enumerate(config, work_service=None, tmux_client=None):
+        return [_surface(
+            "architect_myproj", SurfaceType.ARCHITECT, persona="Archie",
+            project="myproj", transcript_path=archive,
+        )]
+
+    monkeypatch.setattr(
+        chat_messages_routes, "enumerate_chat_surfaces", fake_enumerate,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "parse_events_jsonl",
+        lambda path, *, actor_fallback="agent": [],
+    )
+    response = client.get(
+        "/api/v1/chat/architect_myproj/messages",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert open_count["n"] == 0
+
+
+def test_messages_endpoint_worker_lookup_opens_work_service(
+    client, auth_headers, monkeypatch, tmp_path,
+):
+    """Worker lookup MUST probe the work-service (positive control).
+
+    Pairs with the two skip-tests above so a future refactor can't
+    "fix" the skip tests by removing the worker probe entirely.
+    """
+    archive = tmp_path / "task.jsonl"
+    archive.write_text("x")
+
+    open_count = {"n": 0}
+
+    def counting_stub(config, *, strict=False):
+        open_count["n"] += 1
+        return None
+
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_work_service_stub", counting_stub,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client", lambda: None,
+    )
+
+    def fake_enumerate(config, work_service=None, tmux_client=None):
+        return [_surface(
+            "task-myproj-7", SurfaceType.WORKER, persona=None,
+            project="myproj", task_id=7, transcript_path=archive,
+        )]
+
+    monkeypatch.setattr(
+        chat_messages_routes, "enumerate_chat_surfaces", fake_enumerate,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "parse_events_jsonl",
+        lambda path, *, actor_fallback="agent": [],
+    )
+    response = client.get(
+        "/api/v1/chat/task-myproj-7/messages",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert open_count["n"] == 1
+
+
+def test_messages_endpoint_worker_lookup_503s_when_facade_unavailable(
+    client, auth_headers, monkeypatch, tmp_path,
+):
+    """Worker lookup + facade outage → 503 service_unavailable, not 404.
+
+    Before the fix, ``_build_work_service_stub`` swallowed every
+    exception and returned ``None``, which made
+    ``enumerate_chat_surfaces`` skip worker enumeration. A worker
+    lookup then fell through to 404 ``session_unknown`` — the client
+    was told "this surface doesn't exist" when really pg was down.
+    """
+    # Simulate the strict-mode failure: the stub builder raises
+    # _WorkerFacadeUnavailable when the public facade can't be opened.
+    def boom(config, *, strict=False):
+        if strict:
+            raise chat_messages_routes._WorkerFacadeUnavailable(
+                "pg pool drained"
+            )
+        return None
+
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_work_service_stub", boom,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client", lambda: None,
+    )
+    response = client.get(
+        "/api/v1/chat/task-myproj-7/messages",
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    body = response.json()
+    assert body["error"]["code"] == "service_unavailable"
+    assert "work-service" in body["error"]["message"]
+
+
+def test_is_worker_session_pattern():
+    """``_is_worker_session`` matches the canonical task-<project>-<n> form."""
+    assert chat_messages_routes._is_worker_session("task-myproj-7")
+    assert chat_messages_routes._is_worker_session("task-my-proj-123")
+    assert chat_messages_routes._is_worker_session("task-myproj.v2-1")
+    # Negative cases — non-worker session names.
+    assert not chat_messages_routes._is_worker_session("operator")
+    assert not chat_messages_routes._is_worker_session("architect_myproj")
+    assert not chat_messages_routes._is_worker_session("advisor_myproj")
+    assert not chat_messages_routes._is_worker_session("task-myproj")  # no n
+    assert not chat_messages_routes._is_worker_session("task-myproj-abc")

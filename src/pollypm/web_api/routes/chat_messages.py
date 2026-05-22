@@ -27,7 +27,8 @@ opening a read-only work-service handle (matches the pattern used by
 from __future__ import annotations
 
 import logging
-from datetime import datetime
+import re
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
@@ -45,7 +46,7 @@ from pollypm.web_api.chat import (
     is_archive_stale,
     parse_events_jsonl,
 )
-from pollypm.web_api.errors import APIError
+from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.routes._deps import ConfigDep
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,30 @@ MAX_MESSAGE_LIMIT = 500
 
 SourceMode = Literal["auto", "jsonl", "capture"]
 Direction = Literal["asc", "desc"]
+
+
+# Worker session names are ``task-{project_key}-{N}`` (registry.py:320 /
+# spec §1). The chat-messages endpoint uses this pattern to short-circuit
+# the work-service open for operator/architect/advisor lookups (blocker
+# 3): those surfaces are always discoverable from ``config`` alone, so
+# probing the per-task work-service is pure overhead and turns a pg-pool
+# outage into a misleading 404 ``session_unknown``.
+_WORKER_SESSION_PATTERN = re.compile(r"^task-[A-Za-z0-9][A-Za-z0-9_.-]*-\d+$")
+
+
+def _is_worker_session(session_name: str) -> bool:
+    """Return True iff ``session_name`` matches the worker naming pattern."""
+    return bool(_WORKER_SESSION_PATTERN.match(session_name))
+
+
+class _WorkerFacadeUnavailable(Exception):
+    """Raised by ``_build_work_service_stub`` when the facade can't be opened.
+
+    Distinct from "facade returned no records" (which collapses to
+    ``None``). Lets ``_find_surface`` translate a transient pg-pool
+    outage into a typed 503 ``service_unavailable`` instead of a
+    misleading 404 ``session_unknown`` (blocker 3).
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +249,11 @@ def _invalid_query(field: str, message: str) -> APIError:
 # ---------------------------------------------------------------------------
 
 
-def _build_work_service_stub(config: Any) -> Any | None:
+def _build_work_service_stub(
+    config: Any,
+    *,
+    strict: bool = False,
+) -> Any | None:
     """Return a duck-typed stub the registry can call for workers.
 
     The chat registry only needs ``list_worker_sessions(active_only=...)``
@@ -235,22 +264,39 @@ def _build_work_service_stub(config: Any) -> Any | None:
     records. Returns ``None`` when the facade yields no records — the
     registry then skips worker enumeration entirely.
 
-    Fail-open posture: any unexpected import/runtime error collapses
-    to ``None`` so the discovery endpoint still returns configured
-    surfaces and never 500s.
+    ``strict=False`` (default — used by discovery): any unexpected
+    import/runtime error collapses to ``None`` so the response still
+    returns configured surfaces and never 500s.
+
+    ``strict=True`` (used by ``_find_surface`` for explicit worker
+    lookups): raises :class:`_WorkerFacadeUnavailable` when the public
+    facade can't be opened, so the caller can map the outage to a
+    typed 503 ``service_unavailable`` instead of a misleading 404
+    ``session_unknown`` (blocker 3). The facade itself swallows
+    transient errors and returns ``[]`` — to detect that, we check
+    whether the import succeeded; an empty list is treated as "no
+    workers right now" (not an outage).
     """
     try:
         from pollypm.web_api.service import list_active_worker_sessions
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
+        if strict:
+            raise _WorkerFacadeUnavailable(
+                "list_active_worker_sessions import failed"
+            ) from exc
         return None
     try:
         records = list_active_worker_sessions(config)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
             "chat_messages: list_active_worker_sessions failed; "
             "skipping worker surfaces",
             exc_info=True,
         )
+        if strict:
+            raise _WorkerFacadeUnavailable(
+                "list_active_worker_sessions raised"
+            ) from exc
         return None
     if not records:
         return None
@@ -295,11 +341,41 @@ def _find_surface(
     config: Any,
     session_name: str,
     *,
-    include_workers: bool = True,
+    include_workers: bool | None = None,
 ) -> ChatSurface:
-    """Resolve ``session_name`` to a :class:`ChatSurface` or 404."""
+    """Resolve ``session_name`` to a :class:`ChatSurface` or raise.
+
+    Hot-path optimization (blocker 3): when ``session_name`` doesn't
+    match the worker pattern (``task-{project}-{N}``), we skip the
+    work-service open entirely — operator/architect/advisor surfaces
+    are always discoverable from ``config`` alone, so probing pg for
+    every lookup is pure overhead and turns a pg-pool outage into a
+    misleading 404 ``session_unknown``.
+
+    Callers may pin the behavior explicitly via ``include_workers``;
+    when unset (default) the helper infers from the session name.
+
+    For genuine worker lookups, the facade is opened in strict mode:
+    if pg is unreachable we raise 503 ``service_unavailable`` instead
+    of falling through to 404 ``session_unknown``, which would tell
+    the client to give up rather than retry.
+    """
+    if include_workers is None:
+        include_workers = _is_worker_session(session_name)
     tmux_client = _build_tmux_client()
-    work_service = _build_work_service_stub(config) if include_workers else None
+    work_service: Any | None = None
+    if include_workers:
+        try:
+            work_service = _build_work_service_stub(config, strict=True)
+        except _WorkerFacadeUnavailable as exc:
+            raise service_unavailable(
+                f"work-service unavailable; cannot resolve worker session "
+                f"{session_name!r}",
+                hint=(
+                    "The per-task worker registry depends on the work-service. "
+                    "Retry shortly; check `pm sessions` / pg pool health."
+                ),
+            ) from exc
     surfaces = enumerate_chat_surfaces(
         config,
         work_service=work_service,
@@ -328,14 +404,33 @@ def _parse_since(since: str | None) -> datetime | None:
 
 
 def _parse_envelope_ts(ts: str) -> datetime | None:
-    """Lenient ISO-8601 parse for envelope timestamps. ``None`` on failure."""
+    """Lenient ISO-8601 parse for envelope timestamps. ``None`` on failure.
+
+    Always returns a timezone-aware ``datetime`` when parse succeeds:
+    naive timestamps are coerced to UTC. This lets callers mix the
+    parsed value with the ``datetime.min.replace(tzinfo=timezone.utc)``
+    sort sentinel without ``TypeError: can't compare offset-naive and
+    offset-aware datetimes`` (blocker 2).
+    """
     if not ts:
         return None
     try:
         candidate = ts.replace("Z", "+00:00") if ts.endswith("Z") else ts
-        return datetime.fromisoformat(candidate)
+        parsed = datetime.fromisoformat(candidate)
     except (TypeError, ValueError):
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+# Sentinel used when sorting envelopes whose ``ts`` is missing /
+# unparseable. Timezone-aware so it compares against parsed tz-aware
+# timestamps without ``TypeError`` (blocker 2). Unparseable rows sort
+# to the head of an ascending sort (matching the prior behavior with
+# naive ``datetime.min``) but stay in the page — they just surface
+# with ``ts=""`` in the response.
+_TS_SORT_FLOOR = datetime.min.replace(tzinfo=timezone.utc)
 
 
 def _envelope_to_wire(envelope: MessageEnvelope) -> ChatMessageEnvelope:
@@ -492,9 +587,6 @@ def _apply_filters_and_paginate(
     since_id: str | None,
     direction: Direction,
     limit: int,
-    include_subagents: bool,
-    subagent_loader: Any,
-    allowed_subagent_roots: list[Path] | None = None,
 ) -> tuple[list[ChatMessageEnvelope], bool, str | None]:
     """Apply spec §2.2 query semantics and return ``(rows, has_more, cursor)``.
 
@@ -519,34 +611,46 @@ def _apply_filters_and_paginate(
        slice, matching the ``next_cursor`` semantics of the inbox
        endpoint).
     6. Slice to ``limit`` and compute ``has_more`` / ``next_cursor``.
-    7. Expand ``subagent_result.metadata.subagent_transcript`` when
-       ``include_subagents`` is set.
+
+    NOTE: ``include_subagents`` is deferred to #2052 — the v3
+    implementation called ``parse_events_jsonl`` on
+    ``metadata.output_file``, but that field is the raw Claude
+    task-notification subagent JSONL (different shape than the
+    normalized archive). The path-traversal allowlist and inliner
+    were removed alongside the query param.
     """
+    # Normalize the lower bound to tz-aware UTC so the comparison with
+    # parsed timestamps (always tz-aware after _parse_envelope_ts) never
+    # mixes naive + aware values (blocker 2).
+    since_aware: datetime | None = None
+    if since is not None:
+        since_aware = (
+            since if since.tzinfo is not None
+            else since.replace(tzinfo=timezone.utc)
+        )
+
     filtered: list[MessageEnvelope] = []
     for envelope in envelopes:
         if str(envelope.type) == "thinking":
             continue
-        if since is not None:
+        if since_aware is not None:
             ts = _parse_envelope_ts(envelope.ts)
             if ts is None:
                 # Drop rows we can't compare — they'd otherwise sort
                 # to a non-deterministic position relative to ``since``.
                 continue
-            # Make both sides comparable: if either is naive, drop tz.
-            if ts.tzinfo is None and since.tzinfo is not None:
-                ts = ts.replace(tzinfo=since.tzinfo)
-            elif since.tzinfo is None and ts.tzinfo is not None:
-                ts = ts.replace(tzinfo=None)
-            if ts < since:
+            if ts < since_aware:
                 continue
         filtered.append(envelope)
 
     # Stable sort by (ts, original position). Original position is
     # preserved because Python's sort is stable, but we've already
-    # filtered so we capture indices first.
+    # filtered so we capture indices first. Unparseable / missing ``ts``
+    # values fall back to a tz-aware sentinel so mixed-shape rows don't
+    # raise ``TypeError`` from a naive/aware comparison (blocker 2).
     indexed = list(enumerate(filtered))
     indexed.sort(key=lambda item: (
-        _parse_envelope_ts(item[1].ts) or datetime.min,
+        _parse_envelope_ts(item[1].ts) or _TS_SORT_FLOOR,
         item[0],
     ))
     ordered = [envelope for _, envelope in indexed]
@@ -572,174 +676,15 @@ def _apply_filters_and_paginate(
     if has_more and page:
         next_cursor = page[-1].id
 
-    if include_subagents and subagent_loader is not None:
-        page = [
-            _inline_subagent(
-                env,
-                subagent_loader,
-                allowed_roots=allowed_subagent_roots,
-            )
-            for env in page
-        ]
-
     return [_envelope_to_wire(env) for env in page], has_more, next_cursor
 
 
-def _allowed_transcript_roots(config: Any, work_service: Any = None) -> list[Path]:
-    """Compute the set of directories that may contain subagent transcripts.
-
-    Security boundary for :func:`_inline_subagent`: ``metadata.output_file``
-    is supplied by transcript content and must never be trusted as a
-    filesystem authority. Callers constrain inlining to paths that
-    live under one of these roots.
-
-    Roots covered:
-
-    - ``<workspace>/.pollypm/transcripts/`` for the operator workspace.
-    - ``<project>/.pollypm/transcripts/`` for every known project in
-      ``config.projects`` (which is the same set
-      :mod:`pollypm.web_api.chat.registry` enumerates).
-    - Worktree roots when ``work_service`` is provided — kept best-effort
-      because the worker discovery flow already gates on the same
-      work-service handle and the lookup is fail-soft.
-
-    Roots are returned ``resolve()``d (symlinks collapsed) so the
-    ``is_relative_to`` check in :func:`_inline_subagent` lines up with
-    a likewise-resolved candidate path.
-    """
-    from pollypm.projects import project_transcripts_dir
-
-    roots: list[Path] = []
-    seen: set[str] = set()
-
-    def _add(path: Path | None) -> None:
-        if path is None:
-            return
-        try:
-            resolved = path.resolve()
-        except (OSError, RuntimeError):
-            return
-        key = str(resolved)
-        if key in seen:
-            return
-        seen.add(key)
-        roots.append(resolved)
-
-    project_settings = getattr(config, "project", None)
-    if project_settings is not None:
-        for attr in ("workspace_root", "root_dir"):
-            base = getattr(project_settings, attr, None)
-            if isinstance(base, Path):
-                _add(project_transcripts_dir(base))
-
-    projects = getattr(config, "projects", None) or {}
-    for known in projects.values():
-        project_path = getattr(known, "path", None)
-        if isinstance(project_path, Path):
-            _add(project_transcripts_dir(project_path))
-
-    if work_service is not None:
-        # Worktrees can host their own .pollypm/transcripts/ tree when a
-        # task is running detached from the project root. Probe both
-        # workers_iter() and a generic "list_worktree_paths" shape so the
-        # check stays useful regardless of work-service revision.
-        for method_name in ("list_worktree_paths", "worktree_paths"):
-            method = getattr(work_service, method_name, None)
-            if not callable(method):
-                continue
-            try:
-                for entry in method() or []:
-                    if isinstance(entry, str):
-                        entry_path: Path | None = Path(entry)
-                    elif isinstance(entry, Path):
-                        entry_path = entry
-                    else:
-                        entry_path = None
-                    if entry_path is not None:
-                        _add(project_transcripts_dir(entry_path))
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "chat_messages: worktree path probe failed via %s",
-                    method_name, exc_info=True,
-                )
-            break
-
-    return roots
-
-
-def _inline_subagent(
-    envelope: MessageEnvelope,
-    subagent_loader: Any,
-    allowed_roots: list[Path] | None = None,
-) -> MessageEnvelope:
-    """When the envelope is a ``subagent_result``, inline the sub-transcript.
-
-    Spec §3.7: ``metadata.subagent_transcript`` holds the subagent's
-    own envelopes. We resolve the path via
-    ``metadata.output_file`` (set by the P1 parser when the parent
-    ``task-notification`` block carries one).
-
-    Security: ``metadata.output_file`` comes from transcript content
-    and an authenticated caller who can influence what an agent writes
-    could otherwise make the API stat/read arbitrary local paths
-    (``/etc/passwd``, ``../../../escape.jsonl``, etc.). We constrain
-    candidates to ``allowed_roots`` (project + workspace transcript
-    dirs) via :meth:`Path.resolve` + :meth:`Path.is_relative_to`. When
-    the path lives outside every allowed root we skip inlining
-    silently — no raise, just a debug log — so a malformed transcript
-    can't 500 the endpoint.
-    """
-    if str(envelope.type) != "subagent_result":
-        return envelope
-    output_file = envelope.metadata.get("output_file")
-    if not isinstance(output_file, str) or not output_file:
-        return envelope
-    roots = allowed_roots or []
-    try:
-        sub_path = Path(output_file).resolve()
-    except (OSError, RuntimeError):
-        logger.debug(
-            "chat_messages: subagent path resolve failed for %s",
-            output_file, exc_info=True,
-        )
-        return envelope
-    # Reject paths outside every allowed transcript root.
-    if not any(_is_within(sub_path, root) for root in roots):
-        logger.debug(
-            "chat_messages: subagent path %s outside allowed transcript roots "
-            "(%d roots); skipping inline",
-            output_file, len(roots),
-        )
-        return envelope
-    try:
-        if not sub_path.exists():
-            return envelope
-        sub_envelopes = subagent_loader(sub_path)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "chat_messages: subagent transcript load failed for %s",
-            output_file, exc_info=True,
-        )
-        return envelope
-    envelope.metadata = dict(envelope.metadata)
-    envelope.metadata["subagent_transcript"] = [
-        _envelope_to_wire(env).model_dump() for env in sub_envelopes
-    ]
-    return envelope
-
-
-def _is_within(candidate: Path, root: Path) -> bool:
-    """``Path.is_relative_to`` shim that tolerates pre-3.9 semantics.
-
-    Both ``candidate`` and ``root`` are expected to already be
-    ``resolve()``d so symlinks don't sneak a candidate past the
-    boundary.
-    """
-    try:
-        candidate.relative_to(root)
-        return True
-    except ValueError:
-        return False
+# NOTE: ``_inline_subagent`` / ``_allowed_transcript_roots`` /
+# ``_is_within`` were removed in PR #2045 round-4. The v3 implementation
+# called ``parse_events_jsonl`` on ``metadata.output_file``, but that
+# field is the raw Claude task-notification subagent JSONL — a totally
+# different shape than the normalized archive ``parse_events_jsonl``
+# consumes. Re-implementation tracked in #2052.
 
 
 # ---------------------------------------------------------------------------
@@ -799,12 +744,6 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
     direction: Annotated[Direction, Query(
         description="Ordering: 'desc' (newest first, default) or 'asc'.",
     )] = "desc",
-    include_subagents: Annotated[bool, Query(
-        description=(
-            "When true, inline the subagent's transcript into "
-            "subagent_result.metadata.subagent_transcript (spec §3.7)."
-        ),
-    )] = False,
     source: Annotated[SourceMode, Query(
         description=(
             "Transcript source: 'auto' (jsonl with capture fallback when "
@@ -812,20 +751,36 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
             "JSONL, 404 if absent), 'capture' (force tmux capture)."
         ),
     )] = "auto",
+    include_subagents: Annotated[bool, Query(
+        description=(
+            "DEFERRED (#2052): the v3 inliner called the normalized "
+            "events.jsonl parser on metadata.output_file, but that "
+            "field is the raw Claude subagent JSONL (different shape). "
+            "Passing include_subagents=true returns 422 until the "
+            "task-notification.output-file → normalized child archive "
+            "resolver lands."
+        ),
+    )] = False,
 ) -> ChatMessagesResponse:
     """GET /api/v1/chat/{session_name}/messages per spec §2.2."""
+    if include_subagents:
+        # Reject the deferred param explicitly so callers learn it's
+        # gone rather than silently getting un-inlined results.
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=(
+                "include_subagents is not currently supported; the "
+                "task-notification.output-file -> normalized archive "
+                "resolver is deferred."
+            ),
+            hint="Track re-implementation in #2052.",
+        )
     surface = _find_surface(config, session_name)
     since_dt = _parse_since(since)
 
     envelopes, transcript_source, transcript_path = _load_envelopes(
         surface, source=source,
-    )
-
-    # Compute path-traversal allowlist once per request — the
-    # subagent inliner uses it to reject ``metadata.output_file``
-    # values that escape known transcript roots (blocker 3).
-    allowed_roots = (
-        _allowed_transcript_roots(config) if include_subagents else None
     )
 
     rows, has_more, next_cursor = _apply_filters_and_paginate(
@@ -834,9 +789,6 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         since_id=since_id,
         direction=direction,
         limit=limit,
-        include_subagents=include_subagents,
-        subagent_loader=parse_events_jsonl,
-        allowed_subagent_roots=allowed_roots,
     )
 
     return ChatMessagesResponse(

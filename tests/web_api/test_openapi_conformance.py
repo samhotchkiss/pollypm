@@ -89,6 +89,38 @@ def test_implementation_serves_phase_1_paths(client, auth_headers) -> None:
         )
 
 
+def test_chat_message_type_enum_matches_runtime() -> None:
+    """``ChatMessageType`` in openapi.yaml must mirror ``MessageType``.
+
+    PR #2045 v4 blocker 1: the static contract listed `notification`,
+    `error`, `tool_call` (which the runtime never emits) and was
+    missing `ask_user`, `file`, `subagent_spawn`, `system_event`,
+    `tool_use` (which the runtime DOES emit). Generated clients
+    branched on values that never appeared and crashed on values
+    that did.
+
+    This assertion pins the two enums to set-equality so future
+    drift trips CI instead of a downstream client.
+    """
+    from pollypm.web_api.chat.envelope import MessageType
+
+    contract = _load_contract()
+    yaml_enum = set(
+        contract["components"]["schemas"]["ChatMessageType"]["enum"]
+    )
+    runtime_enum = {member.value for member in MessageType}
+    missing_in_yaml = runtime_enum - yaml_enum
+    extra_in_yaml = yaml_enum - runtime_enum
+    assert not missing_in_yaml, (
+        f"ChatMessageType enum is missing runtime values: {missing_in_yaml}. "
+        f"Update docs/api/openapi.yaml ChatMessageType enum to include them."
+    )
+    assert not extra_in_yaml, (
+        f"ChatMessageType enum has values the runtime never emits: "
+        f"{extra_in_yaml}. Remove them from docs/api/openapi.yaml."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     from fastapi.testclient import TestClient

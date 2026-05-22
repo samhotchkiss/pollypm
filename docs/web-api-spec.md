@@ -398,7 +398,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | POST   | `/api/v1/inbox/{id}/archive` | Archive (close) the item |
 | GET    | `/api/v1/events` | SSE stream of audit-log events (`?since=&project=&event=`) |
 | GET    | `/api/v1/chat/sessions` | Discover every chat surface (operator/architect/advisor/worker) |
-| GET    | `/api/v1/chat/{session_name}/messages` | Paginated message history for one chat surface (`?since=&since_id=&limit=&direction=&include_subagents=&source=`) |
+| GET    | `/api/v1/chat/{session_name}/messages` | Paginated message history for one chat surface (`?since=&since_id=&limit=&direction=&source=`) — `include_subagents` deferred (#2052) |
 
 That's 19 endpoints in v1. The OpenAPI document is the authoritative
 list; if anything here drifts, the YAML wins.

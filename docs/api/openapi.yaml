@@ -344,15 +344,12 @@ paths:
             enum: [asc, desc]
             default: desc
           description: Ordering — `desc` (newest first, default) or `asc`.
-        - in: query
-          name: include_subagents
-          schema: { type: boolean, default: false }
-          description: |
-            When true, inline the subagent's own transcript into
-            `subagent_result.metadata.subagent_transcript`. The inliner
-            constrains `metadata.output_file` to known transcript roots
-            (project + workspace `.pollypm/transcripts/`) — paths
-            outside the allowlist are dropped silently.
+        # NOTE: `include_subagents` is deferred — the v3 implementation
+        # called `parse_events_jsonl` on `metadata.output_file`, but
+        # `output_file` is the raw Claude task-notification subagent
+        # JSONL (different shape than the normalized archive the parser
+        # consumes). Re-implementation tracked in #2052. Requests that
+        # pass `include_subagents=true` are rejected as `422`.
         - in: query
           name: source
           schema:
@@ -382,12 +379,18 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ValidationError"
         "503":
           description: |
             Capture path failure when `source=capture` is explicit:
             `window_missing` (tmux window not running),
             `capture_unavailable` (tmux client not installed),
-            `capture_failed` (capture call raised).
+            `capture_failed` (capture call raised). Also emitted when
+            a per-task worker lookup races a work-service outage
+            (`service_unavailable`) — distinct from the 404
+            `session_unknown` that fires when the surface genuinely
+            isn't registered.
           content:
             application/json:
               schema:
@@ -1103,18 +1106,25 @@ components:
     ChatMessageType:
       type: string
       description: |
-        Envelope type per spec §3. `thinking` is reserved — the
-        transcript ingestor does not currently preserve thinking
-        blocks, so the API never emits them. The `include_thinking`
-        query param + `thinking` enum value will return once the
-        ingestor learns to round-trip them (follow-up #2048).
+        Envelope discriminator per spec §3. Mirrors the runtime
+        `MessageType` enum at `src/pollypm/web_api/chat/envelope.py:30-48`
+        — `tests/web_api/test_openapi_conformance.py::test_chat_message_type_enum_matches_runtime`
+        asserts set equality so future drift trips CI.
+
+        `thinking` is reserved — the transcript ingestor does not
+        currently preserve thinking blocks, so the API never emits
+        them. The `include_thinking` query param + `thinking` enum
+        value will return once the ingestor learns to round-trip them
+        (follow-up #2048).
       enum:
         - text
-        - tool_call
+        - tool_use
         - tool_result
+        - ask_user
+        - file
+        - subagent_spawn
         - subagent_result
-        - notification
-        - error
+        - system_event
 
     ChatMessageEnvelope:
       type: object

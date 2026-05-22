@@ -64,14 +64,19 @@ def _reset_call_site_divergence_counters():
     yield
 
 
-def _make_config(project_keys: list[str], workspace_root: Path) -> SimpleNamespace:
+def _make_config(
+    project_keys: list[str],
+    workspace_root: Path,
+    *,
+    config_path: Path | None = None,
+) -> SimpleNamespace:
     """Build a minimal config with a distinct ``workspace_root``.
 
-    The config identity helper resolves
-    ``config.project.workspace_root`` when ``config.config_path`` is
-    absent (the production ``PollyPMConfig`` shape today). Two
-    configs with different roots but overlapping project keys are
-    exactly the cross-config-leak case the guard exists to catch.
+    The config identity helper prefers ``config.config_path`` (the
+    file on disk IS the identity, per PR #2026 v9) and falls back to
+    ``config.project.workspace_root``. Two configs with the SAME
+    workspace_root but DIFFERENT config_path values are also a
+    cross-config-leak case the guard exists to catch.
     """
 
     projects = {
@@ -87,6 +92,7 @@ def _make_config(project_keys: list[str], workspace_root: Path) -> SimpleNamespa
         projects=projects,
         project=SimpleNamespace(workspace_root=str(workspace_root)),
         storage=SimpleNamespace(backend="postgres"),
+        config_path=config_path,
     )
 
 
@@ -265,6 +271,125 @@ class TestConfigIdentityGuard:
 
         # Cross-config lookup (config_B against config_A's snapshot)
         # MUST decline. Sanity-check the matching-identity path serves.
+        assert operator_view._maybe_cache_route_state_map(config_b) is None
+        served = operator_view._maybe_cache_route_state_map(config_a)
+        assert served is not None
+        assert set(served.keys()) == set(config_a.projects.keys())
+
+    def _same_root_different_path_pair(
+        self, tmp_path: Path,
+    ) -> tuple[SimpleNamespace, SimpleNamespace]:
+        """Two configs with the SAME workspace_root but DIFFERENT config_path.
+
+        PR #2026 v9 (Codex r9 blocker): even when two ``PollyPMConfig``
+        objects share a workspace_root (a real scenario when the same
+        repo is loaded via different TOML files — e.g. ``pollypm.toml``
+        vs ``pollypm.dev.toml``), the cache singleton MUST NOT serve
+        cross-config data. The ``config_path`` field (now stamped by
+        :func:`load_config`) is the on-disk identity that disambiguates
+        these cases.
+        """
+
+        shared_root = tmp_path / "workspace-shared"
+        shared_root.mkdir()
+        path_a = tmp_path / "pollypm.toml"
+        path_b = tmp_path / "pollypm.dev.toml"
+        path_a.touch()
+        path_b.touch()
+        config_a = _make_config(
+            ["alpha", "beta"], shared_root, config_path=path_a,
+        )
+        config_b = _make_config(
+            ["alpha", "beta"], shared_root, config_path=path_b,
+        )
+        # Sanity: workspace_root identical, identities differ via path.
+        assert config_a.project.workspace_root == config_b.project.workspace_root
+        assert config_identity(config_a) != config_identity(config_b)
+        return config_a, config_b
+
+    def test_route_awaits_user_declines_same_root_different_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """PR #2026 v9: same workspace_root + different config_path declines."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config_a, config_b = self._same_root_different_path_pair(tmp_path)
+        entries = {
+            key: _stamped_entry(key, config=config_a, items=[])
+            for key in config_a.projects.keys()
+        }
+        _seed_cache(monkeypatch, entries)
+
+        assert cockpit_inbox._maybe_cache_route_awaits_user(config_b) is None
+        result_a = cockpit_inbox._maybe_cache_route_awaits_user(config_a)
+        assert result_a is not None
+        assert result_a == []
+
+    def test_count_awaits_user_declines_same_root_different_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config_a, config_b = self._same_root_different_path_pair(tmp_path)
+        entries = {
+            key: _stamped_entry(key, config=config_a, items=[])
+            for key in config_a.projects.keys()
+        }
+        _seed_cache(monkeypatch, entries)
+
+        assert cockpit_inbox._maybe_cache_count_awaits_user(config_b) is None
+        assert cockpit_inbox._maybe_cache_count_awaits_user(config_a) == 0
+
+    def test_operator_view_declines_same_root_different_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config_a, config_b = self._same_root_different_path_pair(tmp_path)
+        entries = {
+            key: _stamped_entry(key, config=config_a)
+            for key in config_a.projects.keys()
+        }
+        _seed_cache(monkeypatch, entries)
+        monkeypatch.setattr(
+            operator_view,
+            "_collect_project_scans",
+            lambda cfg: [
+                SimpleNamespace(project_key=k)
+                for k in cfg.projects.keys()
+            ],
+        )
+
+        assert operator_view._maybe_cache_route_operator_view(config_b) is None
+
+    def test_rail_rollups_declines_same_root_different_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from pollypm.cockpit_rail import CockpitRouter
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config_a, config_b = self._same_root_different_path_pair(tmp_path)
+        entries = {
+            key: _stamped_entry(key, config=config_a)
+            for key in config_a.projects.keys()
+        }
+        _seed_cache(monkeypatch, entries)
+
+        router = CockpitRouter.__new__(CockpitRouter)
+        result = router._maybe_cache_route_rollups(config_b, [])
+        assert result is None
+
+    def test_state_map_route_declines_same_root_different_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """5th routed site declines on same-root different-path lookup."""
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config_a, config_b = self._same_root_different_path_pair(tmp_path)
+        entries = {
+            key: _stamped_entry(key, config=config_a, state=ProjectState.WAITING)
+            for key in config_a.projects.keys()
+        }
+        _seed_cache(monkeypatch, entries)
+
         assert operator_view._maybe_cache_route_state_map(config_b) is None
         served = operator_view._maybe_cache_route_state_map(config_a)
         assert served is not None

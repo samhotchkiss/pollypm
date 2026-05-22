@@ -382,6 +382,15 @@ class PollyPMConfig:
         default_factory=EventsRetentionSettings,
     )
     storage: StorageSettings = field(default_factory=StorageSettings)
+    # PR #2026 v9 (Codex r9 blocker): stamped by :func:`load_config`
+    # immediately after constructing this dataclass. Consumed by
+    # :func:`pollypm.state_cache.entry.config_identity` as the
+    # cross-config-leak identity (the file on disk IS the identity).
+    # Falls back to ``project.workspace_root`` when ``None`` (test
+    # fixtures + the hand-rolled config_identity test stay
+    # backward-compatible). Kept LAST + defaulted so existing
+    # positional callers don't break.
+    config_path: Path | None = None
 
 
 @dataclass(slots=True)

@@ -922,7 +922,15 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         logging=logging_settings,
         events=events,
         storage=storage,
+        config_path=config_path,
     )
+    # PR #2026 v9 (Codex r9 blocker): stamp the on-disk identity so
+    # ``state_cache.entry.config_identity`` resolves to the actual
+    # TOML path (not the workspace_root fallback). Two configs loaded
+    # from different files but sharing a workspace_root MUST resolve
+    # to distinct identities, or the cache singleton can serve
+    # cross-config data.
+    config.config_path = config_path
     # PR #2018 review fix (id 4502598240): mint auth tokens for any
     # session that lacks one, then persist back to disk. Without this,
     # legacy sessions stay at auth_token="" and watchdog/recovery

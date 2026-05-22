@@ -751,21 +751,14 @@ def archive_inbox_item(
             # short-circuit with the same 404 the read surface returns.
             if not _is_inbox_member(src_task):
                 raise not_found(f"Inbox item not found: {item_id}")
-            if reason:
-                # Record the operator-supplied reason before flipping
-                # so the audit trail captures both "why" and "how".
-                # Best-effort: a failed note must not block the
-                # archive (and must not race the strict transition).
-                try:
-                    svc.add_context(
-                        item_id, actor, f"archive reason: {reason}",
-                        entry_type="note",
-                    )
-                except Exception:  # noqa: BLE001 — non-fatal context-write
-                    logger.debug(
-                        "archive_inbox_item: reason note failed for %s",
-                        item_id, exc_info=True,
-                    )
+            # Run the strict transition FIRST so the reason note is
+            # only persisted on a successful archive (#2060 round-4
+            # blocker 2). The earlier ordering wrote the note before
+            # the transition; a losing concurrent archiver returned
+            # 409 with the reason already attached to a task that
+            # this caller had not, in fact, archived — leaving stray
+            # ``archive reason:`` notes on terminal items and a
+            # confusing audit trail.
             try:
                 svc.archive_task(item_id, actor=actor, strict=True)
             except TaskNotFoundError as exc:
@@ -781,6 +774,23 @@ def archive_inbox_item(
                     ),
                     hint="Items in a terminal state cannot be re-archived.",
                 ) from exc
+            if reason:
+                # Record the operator-supplied reason AFTER the strict
+                # transition succeeds so failed archives leave no
+                # note. Best-effort: a failed context-write must not
+                # roll back the (already-committed) archive — the
+                # transition itself is the source of truth, the note
+                # is supplementary audit context.
+                try:
+                    svc.add_context(
+                        item_id, actor, f"archive reason: {reason}",
+                        entry_type="note",
+                    )
+                except Exception:  # noqa: BLE001 — non-fatal context-write
+                    logger.debug(
+                        "archive_inbox_item: reason note failed for %s",
+                        item_id, exc_info=True,
+                    )
             task = svc.get(item_id)
             return _task_to_detail(task)
     except _BACKING_STORE_ERRORS as exc:

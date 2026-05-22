@@ -1151,3 +1151,186 @@ def test_membership_helper_accepts_chat_and_plan_review() -> None:
     assert _is_inbox_member(_PlanReviewLabel()) is True
     assert _is_inbox_member(_PlanReviewFlow()) is True
     assert _is_inbox_member(_NonInbox()) is False
+
+
+# ---------------------------------------------------------------------------
+# Archive reason ordering (#2060 round-4, blocker 2)
+#
+# Round-3 wrote the ``archive reason:`` context note BEFORE calling
+# the strict archive. If the strict archive lost a concurrent race
+# (rowcount == 0 → InvalidTransitionError) the API surfaced 409 to
+# the caller, but the reason note had already been persisted —
+# stamping a "this is why I archived" annotation onto a task this
+# caller never actually archived. Round-4 reorders: strict archive
+# first, then (only on success) the reason note. These tests pin the
+# ordering so the regression can't slip back in.
+# ---------------------------------------------------------------------------
+
+
+class _ConcurrentLoserStubTask:
+    """Looks like an inbox item (chat-flow) so the membership guard
+    accepts it; the conflict is raised by ``archive_task``, not by
+    the predicate."""
+
+    task_id = "myproj/1"
+    project = "myproj"
+    task_number = 1
+    title = "Inbox item"
+    description = "ping"
+    flow_template_id = "chat"  # Passes _is_inbox_member.
+    labels: list[str] = []
+
+    @property
+    def work_status(self):  # noqa: D401
+        from pollypm.work.models import WorkStatus
+        return WorkStatus.IN_PROGRESS
+
+
+class _ArchiveRaceLoserSvc:
+    """Records every mutation and raises on ``archive_task``.
+
+    Mirrors the pg ``strict=True`` rowcount==0 path: the conditional
+    UPDATE returned zero rows because a concurrent archiver beat us,
+    so the canonical writer raises ``InvalidTransitionError``. The
+    test asserts the reason note was NOT persisted before that raise.
+    """
+
+    def __init__(self) -> None:
+        self.archive_calls = 0
+        self.add_context_calls: list[tuple] = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, item_id):
+        return _ConcurrentLoserStubTask()
+
+    def archive_task(self, item_id, *, actor, strict=False):
+        self.archive_calls += 1
+        from pollypm.work.service_support import InvalidTransitionError
+        raise InvalidTransitionError(
+            f"Inbox item {item_id} already terminal (concurrent race loser)."
+        )
+
+    def add_context(self, *args, **kwargs):
+        # Record the call so the test can assert it never happened.
+        self.add_context_calls.append((args, kwargs))
+
+
+def test_archive_strict_loser_does_not_persist_reason_note(
+    config, monkeypatch,
+) -> None:
+    """Concurrent archive loser must not stamp a reason note.
+
+    Reproduces #2060 round-4 blocker 2: when ``archive_task(strict=True)``
+    raises ``InvalidTransitionError`` (rowcount==0 because another
+    writer won the race), the API surfaces 409. Before the fix, the
+    handler had already persisted ``archive reason: <text>`` as a
+    context note — falsely attributing an archive to a caller whose
+    transition lost. The fix reorders so the note is only written
+    after the strict transition succeeds.
+
+    This test fails on the broken ordering (note persisted) and
+    passes after the fix (note skipped).
+    """
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    svc = _ArchiveRaceLoserSvc()
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(
+            config, "myproj/1", reason="testing", actor="api",
+        )
+    # 1. Loser sees the documented 409 invalid_state envelope.
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.code == "invalid_state"
+    # 2. Strict archive WAS attempted (otherwise we wouldn't have
+    #    raised, and the ordering question would be moot).
+    assert svc.archive_calls == 1
+    # 3. Critical: reason note was NOT persisted. A failed archive
+    #    must leave no ``archive reason:`` audit row.
+    assert svc.add_context_calls == [], (
+        "archive_inbox_item persisted a reason note for a 409-loser "
+        "concurrent archive. The reason write must happen AFTER the "
+        "strict transition succeeds (#2060 round-4)."
+    )
+
+
+def test_archive_strict_success_persists_reason_note_after_transition(
+    config, monkeypatch,
+) -> None:
+    """Happy path still records the reason — but only after archive.
+
+    The fix must not regress the existing behaviour: on a successful
+    archive, the reason note IS persisted. This guards against a
+    too-aggressive fix that drops the note entirely.
+    """
+    from pollypm.web_api import service as web_service
+
+    class _SuccessSvc:
+        def __init__(self) -> None:
+            self.archive_calls = 0
+            self.add_context_calls: list[tuple] = []
+            self.call_order: list[str] = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, item_id):
+            return _ConcurrentLoserStubTask()
+
+        def archive_task(self, item_id, *, actor, strict=False):
+            self.archive_calls += 1
+            self.call_order.append("archive_task")
+            return None
+
+        def add_context(self, *args, **kwargs):
+            self.add_context_calls.append((args, kwargs))
+            self.call_order.append("add_context")
+
+    svc = _SuccessSvc()
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    # Bypass the final ``_task_to_detail`` since the stub task does
+    # not carry every relationship attribute — this test cares only
+    # about the call ordering of archive_task vs add_context, not
+    # the response envelope shape (that's pinned elsewhere).
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+    monkeypatch.setattr(
+        web_service, "_task_to_detail", lambda task, plan=None: None,
+    )
+    web_service.archive_inbox_item(
+        config, "myproj/1", reason="testing", actor="api",
+    )
+    # Both ran, and archive_task ran FIRST (the ordering is the fix).
+    assert svc.archive_calls == 1
+    assert len(svc.add_context_calls) == 1
+    assert svc.call_order.index("archive_task") < svc.call_order.index(
+        "add_context"
+    ), (
+        "Reason note was written before archive_task — the round-4 "
+        "ordering fix has regressed (#2060)."
+    )
+    # Reason payload is intact.
+    args, kwargs = svc.add_context_calls[0]
+    # Positional shape: (item_id, actor, text, entry_type=...).
+    assert args[0] == "myproj/1"
+    assert "archive reason: testing" in args[2]

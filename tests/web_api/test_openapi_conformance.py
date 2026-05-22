@@ -185,6 +185,44 @@ def test_static_yaml_does_not_advertise_idempotency_on_inbox_writes() -> None:
         )
 
 
+def test_static_yaml_declares_503_on_inbox_write_paths() -> None:
+    """Static contract must declare 503 on every inbox-write path.
+
+    Round 4 of #2060: the FastAPI route decorators in
+    ``src/pollypm/web_api/routes/inbox.py`` list ``503`` for archive /
+    snooze / promote-to-task / mark-read / reply, and the service
+    helpers map ``_BACKING_STORE_ERRORS`` to the
+    ``service_unavailable`` typed error envelope. The static
+    ``docs/api/openapi.yaml`` was missing 503 entries on those paths,
+    so a generated client would not know to handle a backing-store
+    outage with the same error shape it sees from the live server.
+
+    This test pins the contract: every inbox-write path must declare
+    503 under its ``responses:`` block (either inline or via a shared
+    ``$ref`` to ``#/components/responses/ServiceUnavailable``).
+    """
+    contract = _load_contract()
+    inbox_write_paths = [
+        "/inbox/{id}/reply",
+        "/inbox/{id}/archive",
+        "/inbox/{id}/snooze",
+        "/inbox/{id}/promote-to-task",
+        "/inbox/{id}/mark-read",
+    ]
+    paths = contract.get("paths", {})
+    for path in inbox_write_paths:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        responses = post.get("responses", {}) or {}
+        # OpenAPI status codes are stringly-typed in YAML.
+        assert "503" in responses, (
+            f"{path} POST missing 503 response in static contract "
+            "(#2060 round-4). The FastAPI handler maps backing-store "
+            "errors to a 503 with the service_unavailable envelope; "
+            "the YAML must say so too."
+        )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

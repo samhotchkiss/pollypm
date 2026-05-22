@@ -877,6 +877,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /inbox/{id}/archive:
     parameters:
@@ -904,6 +906,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /inbox/{id}/snooze:
     parameters:
@@ -937,6 +941,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /inbox/{id}/promote-to-task:
     parameters:
@@ -962,6 +968,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /inbox/{id}/mark-read:
     parameters:
@@ -987,6 +995,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /config:
     get:
@@ -1217,6 +1227,15 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     Conflict:
       description: Concurrent write conflict; state changed between read and write.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/ErrorResponse"
+    ServiceUnavailable:
+      description: |
+        Backing store (work-service / pg) unavailable.
+        Returned with error code `service_unavailable`. Retry shortly;
+        check `pm doctor` if the failure persists.
       content:
         application/json:
           schema:

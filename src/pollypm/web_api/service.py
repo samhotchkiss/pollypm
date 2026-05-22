@@ -644,6 +644,387 @@ def queue_task(
 
 
 # ---------------------------------------------------------------------------
+# Inbox write helpers (Phase 2 — spec §4.1)
+#
+# Each helper opens a fresh work-service via :func:`create_work_service`
+# — the same canonical writer the cockpit uses. The Web API is never a
+# second writer surface; it's a thin adapter that maps inbox-item ids
+# (``project/n``) onto the existing work-service inbox methods and
+# translates the resulting exceptions into typed error envelopes (§6).
+#
+# Why these live next to ``queue_task`` and not under
+# ``pollypm.work.inbox_cli``: the CLI helpers all assume a Typer call
+# graph (they ``raise typer.Exit`` on failure and write to stdout for
+# bulk modes). Routing an HTTP request through Typer is the wrong
+# shape; the helpers below call the same underlying ``PgWorkService``
+# methods (``archive_task``, ``add_reply``, ``mark_read``,
+# ``add_context``, ``create``) the CLI invokes.
+# ---------------------------------------------------------------------------
+
+
+# Statuses we treat as "already archived" for the inbox archive
+# endpoint. ``archive_task`` itself is idempotent (returns the row
+# unchanged when terminal) — but the spec wants a typed 409 so the
+# client can tell "I just archived it" from "someone else already
+# did". We pre-check the status and surface the conflict instead of
+# silently no-op'ing.
+_ALREADY_ARCHIVED_STATUSES: frozenset[str] = frozenset({"done", "cancelled"})
+
+
+def _project_key_from_inbox_id(item_id: str) -> str:
+    """Pull the project key off an inbox item id (``project/n``).
+
+    Inbox ids use the same ``project/task_number`` shape task ids use
+    (see :func:`_task_to_inbox_item`); the first segment is always the
+    project key. We accept ``msg:<n>`` here too so a future router
+    that wants to route those onto the unified messages store can
+    branch on the prefix — for now ``msg:`` ids raise ``not_found``
+    because the Web API only addresses chat-flow tasks.
+    """
+    if "/" not in item_id:
+        raise not_found(
+            f"Inbox item not found: {item_id}",
+            hint=(
+                "Inbox ids look like 'project/n'. Message-store ids "
+                "(``msg:<n>``) are not yet supported on this surface."
+            ),
+        )
+    return item_id.split("/", 1)[0]
+
+
+def _resolve_inbox_project(
+    config: PollyPMConfig, item_id: str
+) -> tuple[str, KnownProject]:
+    """Return ``(project_key, project)`` for an inbox id, or 404.
+
+    Centralizes the "id → registered project" lookup so every inbox
+    write endpoint reports the same error shape on unknown ids.
+    """
+    key = _project_key_from_inbox_id(item_id)
+    project = config.projects.get(key)
+    if project is None:
+        raise not_found(f"Project not registered: {key}")
+    return key, project
+
+
+def archive_inbox_item(
+    config: PollyPMConfig,
+    item_id: str,
+    *,
+    reason: str | None = None,
+    actor: str = "api",
+) -> APITaskDetail:
+    """Archive an inbox item via ``svc.archive_task``.
+
+    Returns the post-transition :class:`TaskDetail` so the client can
+    re-render without a follow-up GET. Returns 409 ``invalid_state``
+    when the item is already terminal (mirrors the spec §4.3 contract:
+    "archive a resolved item → invalid_state").
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import TaskNotFoundError
+
+    key, project = _resolve_inbox_project(config, item_id)
+    try:
+        with create_work_service(
+            config=config, project_key=key, project_path=project.path
+        ) as svc:
+            try:
+                current = svc.get(item_id)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Inbox item not found: {item_id}") from exc
+            status = getattr(current.work_status, "value", str(current.work_status))
+            if status in _ALREADY_ARCHIVED_STATUSES:
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=f"Inbox item {item_id} is already {status}.",
+                    hint="Items in a terminal state cannot be re-archived.",
+                )
+            if reason:
+                # Record the operator-supplied reason before flipping
+                # so the audit trail captures both "why" and "how".
+                try:
+                    svc.add_context(
+                        item_id, actor, f"archive reason: {reason}",
+                        entry_type="note",
+                    )
+                except Exception:  # noqa: BLE001 — non-fatal context-write
+                    logger.debug(
+                        "archive_inbox_item: reason note failed for %s",
+                        item_id, exc_info=True,
+                    )
+            try:
+                svc.archive_task(item_id, actor=actor)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Inbox item not found: {item_id}") from exc
+            task = svc.get(item_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "archive_inbox_item: backing store error for %s: %s",
+            item_id, exc, exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while archiving {item_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def snooze_inbox_item(
+    config: PollyPMConfig,
+    item_id: str,
+    *,
+    duration_seconds: int | None = None,
+    until: datetime | None = None,
+    reason: str | None = None,
+    actor: str = "api",
+) -> APITaskDetail:
+    """Snooze an inbox item until a future time.
+
+    No native ``svc.snooze`` exists on the work-service (#1776 only
+    shipped reply/mark_read/archive). We persist the snooze as a
+    structured ``snooze`` context entry whose text encodes the
+    wake-up time + reason; the cockpit's inbox-curation predicate
+    can later read these to hide snoozed rows from the default view.
+
+    Exactly one of ``duration_seconds`` / ``until`` must be supplied.
+    """
+    from datetime import timedelta, timezone
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import TaskNotFoundError
+
+    if duration_seconds is None and until is None:
+        raise APIError(
+            status_code=400,
+            code="invalid_request",
+            message="Snooze requires duration_seconds or until.",
+            hint="Pass `duration_seconds` (>=1) or an ISO-8601 `until`.",
+        )
+    if duration_seconds is not None and until is not None:
+        raise APIError(
+            status_code=400,
+            code="invalid_request",
+            message="Pass duration_seconds OR until, not both.",
+        )
+    now = datetime.now(timezone.utc)
+    if until is None:
+        until = now + timedelta(seconds=duration_seconds or 0)
+    # Coerce to tz-aware UTC for a stable comparison.
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=timezone.utc)
+    if until <= now:
+        raise APIError(
+            status_code=400,
+            code="invalid_request",
+            message="Snooze until must be in the future.",
+        )
+    # Spec §4.3: ``until`` > 30 days out is rejected.
+    if (until - now) > timedelta(days=30):
+        raise APIError(
+            status_code=400,
+            code="invalid_request",
+            message="Snooze until is more than 30 days out.",
+            hint="Use a wake-time within 30 days.",
+        )
+
+    key, project = _resolve_inbox_project(config, item_id)
+    try:
+        with create_work_service(
+            config=config, project_key=key, project_path=project.path
+        ) as svc:
+            try:
+                current = svc.get(item_id)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Inbox item not found: {item_id}") from exc
+            status = getattr(current.work_status, "value", str(current.work_status))
+            if status in _ALREADY_ARCHIVED_STATUSES:
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=f"Inbox item {item_id} is {status}; cannot snooze.",
+                )
+            payload_parts = [f"snoozed until {until.isoformat()}"]
+            if reason:
+                payload_parts.append(f"reason: {reason}")
+            try:
+                svc.add_context(
+                    item_id, actor, "; ".join(payload_parts),
+                    entry_type="snooze",
+                )
+            except TaskNotFoundError as exc:
+                raise not_found(f"Inbox item not found: {item_id}") from exc
+            task = svc.get(item_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "snooze_inbox_item: backing store error for %s: %s",
+            item_id, exc, exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while snoozing {item_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def mark_read_inbox_item(
+    config: PollyPMConfig,
+    item_id: str,
+    *,
+    actor: str = "api",
+) -> APITaskDetail:
+    """Record a read-marker on an inbox item via ``svc.mark_read``.
+
+    Idempotent: re-opening the same item is a no-op (the work-service
+    method itself collapses repeats). Returns the current task detail
+    so the client can refresh its UI without a follow-up GET.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import TaskNotFoundError
+
+    key, project = _resolve_inbox_project(config, item_id)
+    try:
+        with create_work_service(
+            config=config, project_key=key, project_path=project.path
+        ) as svc:
+            try:
+                svc.mark_read(item_id, actor=actor)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Inbox item not found: {item_id}") from exc
+            task = svc.get(item_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "mark_read_inbox_item: backing store error for %s: %s",
+            item_id, exc, exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while marking-read {item_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def reply_inbox_item(
+    config: PollyPMConfig,
+    item_id: str,
+    *,
+    body: str,
+    owner: str | None = None,
+    actor: str = "api",
+) -> APITaskDetail:
+    """Append a reply to an inbox thread via ``svc.add_reply``.
+
+    The work-service strips whitespace and rejects empty bodies via
+    :class:`ValidationError`; we map that to 422 so the client can
+    show the underlying message.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    key, project = _resolve_inbox_project(config, item_id)
+    actor_name = owner or actor or "operator"
+    try:
+        with create_work_service(
+            config=config, project_key=key, project_path=project.path
+        ) as svc:
+            try:
+                svc.add_reply(item_id, body, actor=actor_name)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Inbox item not found: {item_id}") from exc
+            except WorkValidationError as exc:
+                raise APIError(
+                    status_code=422,
+                    code="validation_error",
+                    message=str(exc) or "Reply body failed validation.",
+                ) from exc
+            task = svc.get(item_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "reply_inbox_item: backing store error for %s: %s",
+            item_id, exc, exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while replying to {item_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def promote_inbox_to_task(
+    config: PollyPMConfig,
+    item_id: str,
+    *,
+    target_project: str | None = None,
+    prompt: str | None = None,
+    title: str | None = None,
+    actor: str = "api",
+) -> APITaskDetail:
+    """Create a new task derived from an inbox item.
+
+    The source item stays open (cockpit operator can archive it
+    separately if they want). The new task lands in the same project
+    by default — pass ``target_project`` to redirect. The new task's
+    description is ``prompt`` when provided, else the source item's
+    description / preview.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import TaskNotFoundError
+
+    src_key, src_project = _resolve_inbox_project(config, item_id)
+    dest_key = target_project or src_key
+    dest_project = config.projects.get(dest_key)
+    if dest_project is None:
+        raise not_found(f"Project not registered: {dest_key}")
+
+    try:
+        with create_work_service(
+            config=config, project_key=src_key, project_path=src_project.path
+        ) as src_svc:
+            try:
+                src_task = src_svc.get(item_id)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Inbox item not found: {item_id}") from exc
+            src_title = title or f"From inbox: {src_task.title}"
+            src_description = (
+                prompt or src_task.description or src_task.title or ""
+            )
+            src_priority = getattr(
+                getattr(src_task, "priority", None), "value", "normal",
+            )
+
+        # Open a fresh service against the destination project so the
+        # write lands on the right per-row ``project`` column even when
+        # cross-project promotion is used.
+        with create_work_service(
+            config=config, project_key=dest_key, project_path=dest_project.path
+        ) as dest_svc:
+            new_task = dest_svc.create(
+                title=src_title,
+                description=src_description,
+                type="task",
+                project=dest_key,
+                flow_template="standard",
+                roles={"requester": actor},
+                priority=src_priority or "normal",
+                created_by=actor,
+                labels=["promoted-from-inbox", f"source:{item_id}"],
+            )
+            return _task_to_detail(dest_svc.get(new_task.task_id))
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "promote_inbox_to_task: backing store error for %s: %s",
+            item_id, exc, exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while promoting {item_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+# ---------------------------------------------------------------------------
 # Plan helpers
 # ---------------------------------------------------------------------------
 
@@ -1225,6 +1606,7 @@ def load_api_config(config_path: Path | None) -> PollyPMConfig:
 
 
 __all__ = [
+    "archive_inbox_item",
     "audit_event_to_api",
     "get_active_plan",
     "get_inbox_item",
@@ -1234,5 +1616,10 @@ __all__ = [
     "list_project_tasks",
     "list_projects",
     "load_api_config",
+    "mark_read_inbox_item",
     "project_drilldown",
+    "promote_inbox_to_task",
+    "queue_task",
+    "reply_inbox_item",
+    "snooze_inbox_item",
 ]

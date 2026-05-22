@@ -320,6 +320,66 @@ class InboxListResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Inbox write requests (Phase 2 — #1548, spec §4.1)
+# ---------------------------------------------------------------------------
+
+
+class InboxArchiveRequest(BaseModel):
+    """Body for ``POST /inbox/{id}/archive``.
+
+    ``reason`` is optional metadata recorded in the audit trail so the
+    operator can later answer "why did this disappear?". The cockpit
+    archive action doesn't require one.
+    """
+
+    reason: str | None = None
+
+
+class InboxSnoozeRequest(BaseModel):
+    """Body for ``POST /inbox/{id}/snooze``.
+
+    Exactly one of ``duration_seconds`` or ``until`` must be supplied.
+    ``duration_seconds`` is the simpler shape for clients ("snooze for
+    1h"); ``until`` lets the caller pin a wall-clock wake time.
+    """
+
+    duration_seconds: int | None = Field(default=None, ge=1)
+    until: datetime | None = None
+    reason: str | None = None
+
+
+class InboxPromoteRequest(BaseModel):
+    """Body for ``POST /inbox/{id}/promote-to-task``.
+
+    ``project`` overrides the destination project (default: same as
+    source). ``prompt`` becomes the new task's description; if omitted
+    we fall back to the source item's subject + preview.
+    """
+
+    project: str | None = None
+    prompt: str | None = None
+    title: str | None = None
+
+
+class InboxMarkReadRequest(BaseModel):
+    """Body for ``POST /inbox/{id}/mark-read`` (empty body allowed)."""
+
+    actor: str | None = None
+
+
+class InboxReplyRequest(BaseModel):
+    """Body for ``POST /inbox/{id}/reply``.
+
+    Mirrors the spec's snake_case shape; ``body`` carries the reply
+    text. ``owner`` is open metadata so the cockpit can tag who's
+    talking (defaults to ``operator``).
+    """
+
+    body: str = Field(min_length=1)
+    owner: InboxOwnerStr | None = None
+
+
+# ---------------------------------------------------------------------------
 # Events (SSE payload)
 # ---------------------------------------------------------------------------
 
@@ -348,10 +408,15 @@ __all__ = [
     "Event",
     "FlowNodeExecution",
     "HealthResponse",
+    "InboxArchiveRequest",
     "InboxItem",
     "InboxItemDetail",
     "InboxListResponse",
+    "InboxMarkReadRequest",
     "InboxMessage",
+    "InboxPromoteRequest",
+    "InboxReplyRequest",
+    "InboxSnoozeRequest",
     "Plan",
     "PlanJudgmentCall",
     "Project",

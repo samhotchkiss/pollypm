@@ -854,8 +854,8 @@ paths:
       - $ref: "#/components/parameters/InboxId"
     post:
       tags: [Inbox]
-      operationId: replyInbox
-      summary: Reply to a thread
+      operationId: replyInboxItem
+      summary: Append a reply to an inbox thread
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
@@ -865,12 +865,12 @@ paths:
             schema:
               $ref: "#/components/schemas/InboxReplyRequest"
       responses:
-        "201":
-          description: Reply appended to the thread.
+        "200":
+          description: Reply appended; returns the updated task detail.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/InboxMessage"
+                $ref: "#/components/schemas/TaskDetail"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
@@ -885,23 +885,118 @@ paths:
       - $ref: "#/components/parameters/InboxId"
     post:
       tags: [Inbox]
-      operationId: archiveInbox
+      operationId: archiveInboxItem
       summary: Archive (close) an inbox item
       parameters:
         - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboxArchiveRequest"
       responses:
         "200":
-          description: Item moved to `closed/`.
+          description: Item moved to a terminal state; returns the task detail.
           content:
             application/json:
               schema:
-                $ref: "#/components/schemas/ActionResult"
+                $ref: "#/components/schemas/TaskDetail"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+
+  /inbox/{id}/snooze:
+    parameters:
+      - $ref: "#/components/parameters/InboxId"
+    post:
+      tags: [Inbox]
+      operationId: snoozeInboxItem
+      summary: Snooze an inbox item until a future time
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboxSnoozeRequest"
+      responses:
+        "200":
+          description: Snooze marker recorded; returns the task detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDetail"
+        "400":
+          description: Snooze window invalid (missing, in past, or >30d out).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /inbox/{id}/promote-to-task:
+    parameters:
+      - $ref: "#/components/parameters/InboxId"
+    post:
+      tags: [Inbox]
+      operationId: promoteInboxItem
+      summary: Promote an inbox item into a new actionable task
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboxPromoteRequest"
+      responses:
+        "200":
+          description: New task created; body carries the new TaskDetail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /inbox/{id}/mark-read:
+    parameters:
+      - $ref: "#/components/parameters/InboxId"
+    post:
+      tags: [Inbox]
+      operationId: markInboxItemRead
+      summary: Record a read-marker on an inbox item
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InboxMarkReadRequest"
+      responses:
+        "200":
+          description: Read marker recorded (idempotent); returns the task detail.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /config:
     get:
@@ -2109,11 +2204,59 @@ components:
 
     InboxReplyRequest:
       type: object
-      required: [message]
+      required: [body]
       properties:
-        message:
+        body:
           type: string
           minLength: 1
+        owner:
+          $ref: "#/components/schemas/InboxOwner"
+
+    InboxArchiveRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: |
+            Optional operator-supplied reason for archiving; recorded
+            as a context note before the state transition.
+
+    InboxSnoozeRequest:
+      type: object
+      description: |
+        Exactly one of `duration_seconds` or `until` must be supplied.
+        `until` must be < 30 days in the future.
+      properties:
+        duration_seconds:
+          type: integer
+          minimum: 1
+        until:
+          type: string
+          format: date-time
+        reason:
+          type: string
+
+    InboxPromoteRequest:
+      type: object
+      description: |
+        Optional overrides for the new task. ``project`` defaults to
+        the source item's project; ``prompt`` defaults to the source
+        item's description / subject; ``title`` defaults to
+        "From inbox: <source-title>".
+      properties:
+        project:
+          type: string
+        prompt:
+          type: string
+        title:
+          type: string
+
+    InboxMarkReadRequest:
+      type: object
+      properties:
+        actor:
+          type: string
+          description: Actor to record on the read marker (default `api`).
 
     # ---- Events -----------------------------------------------------
     Event:

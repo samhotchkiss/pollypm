@@ -491,8 +491,12 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: |
-            `window_missing` — the surface is registered but its
-            tmux window is not running.
+            Typed `window_missing` (the surface is registered but its
+            tmux window is not running, including the race where the
+            window disappears between validation and `send-keys`),
+            `tmux_unavailable` (tmux binary missing or the tmux
+            server timed out), or `send_failed` (generic send
+            failure — subprocess error, paste-buffer load failure).
           content:
             application/json:
               schema:

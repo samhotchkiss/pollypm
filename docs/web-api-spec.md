@@ -296,10 +296,17 @@ codes on top of the standard set above:
 | 409 | `unsafe_mid_stream` | pg heartbeat for `session_name` is < 2 s old |
 | 409 | `pane_dead` | Target pane is `pane_dead=1` in tmux |
 | 409 | `pane_invalid` | Requested `pane` index is < 0, not present on the window, or the `list-panes` probe failed |
-| 503 | `window_missing` | The session is registered but its tmux window is not running |
+| 503 | `window_missing` | The session is registered but its tmux window is not running (or it disappears between validation and `send-keys`) |
+| 503 | `tmux_unavailable` | tmux binary missing or the tmux server timed out / is unreachable |
+| 503 | `send_failed` | Generic `send-keys` failure (subprocess error, paste-buffer load failure) |
 
 `safety=force` bypasses every 409 above. `safety=loose` keeps the
 mid-tool gate but allows mid-stream sends with a response header.
+
+Explicit `pane` (including `pane=0`) always validates via
+`list_panes()` and routes to the indexed target (`session:window.N`);
+only an omitted `pane` falls back to the window-level (active-pane)
+target.
 
 ---
 

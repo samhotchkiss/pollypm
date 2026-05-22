@@ -9,9 +9,11 @@ The router is a thin adapter over the P1 shared facade in
 - :func:`pollypm.web_api.chat.enumerate_chat_surfaces` resolves
   ``session_name`` → :class:`ChatSurface` (window, transcript, cwd).
   Workers are validated against the work-service's active
-  :class:`WorkerSessionRecord` rows; an authenticated caller cannot
-  address a stale or unrelated tmux window by guessing
-  ``task-{project}-{id}`` names (Codex review block 2 in #2043).
+  :class:`WorkerSessionRecord` rows via the public service facade
+  :func:`pollypm.web_api.service.list_active_worker_sessions`;
+  an authenticated caller cannot address a stale or unrelated tmux
+  window by guessing ``task-{project}-{id}`` names (Codex review
+  block 2 in #2043, public-facade refactor for #2043 review v3).
 - :func:`pollypm.web_api.chat.resolve_transcript_path` produces the
   exact ``events.jsonl`` for the session, with ``cwd``-based scoping
   so multi-session projects don't bleed transcripts (Codex review
@@ -36,16 +38,30 @@ Safety gates per spec §4.1 / §4.3:
 mid-tool check but allows mid-stream sends with a warning header.
 ``safety=force`` bypasses everything.
 
-Pane validation: ``pane >= 0`` plus a ``list_panes`` probe verifies the
-requested pane exists AND is alive before any ``send_keys``. Negative
-or nonexistent panes now raise ``409 pane_invalid`` / ``409 pane_dead``
-instead of leaking subprocess errors (Codex review block 5 in #2043).
+Pane validation: explicit ``pane`` (including ``pane=0``) always goes
+through ``list_panes(target)`` to verify the requested index exists
+AND is alive before any ``send_keys``. Only ``pane is None`` falls
+back to the window-level (default active-pane) target — explicit
+``pane=0`` no longer silently aliases to the active pane (Codex
+review v3 block 1 in #2043). Negative or nonexistent panes raise
+``409 pane_invalid``; dead panes raise ``409 pane_dead``.
+
+Send failures: ``tmux.send_keys`` can raise ``DeadPaneError`` (mapped
+to ``409 pane_dead``), ``FileNotFoundError`` when the tmux binary is
+missing (``503 tmux_unavailable``), ``subprocess.CalledProcessError``
+when the window/pane disappears between validation and send
+(``503 window_missing``), ``subprocess.TimeoutExpired`` when the tmux
+server is wedged (``503 tmux_unavailable``), and arbitrary
+``OSError`` from paste-buffer load failures (``503 send_failed``).
+Every send-time failure now returns a typed envelope instead of a
+generic 500 (Codex review v3 block 2 in #2043).
 """
 
 from __future__ import annotations
 
 import logging
 import os
+import subprocess
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -61,6 +77,7 @@ from pollypm.web_api.chat import (
 )
 from pollypm.web_api.errors import APIError
 from pollypm.web_api.routes._deps import ConfigDep
+from pollypm.web_api.service import list_active_worker_sessions
 
 logger = logging.getLogger(__name__)
 
@@ -181,6 +198,42 @@ def _pane_invalid(pane: int, target: str) -> APIError:
     )
 
 
+def _send_failed(target: str, detail: str) -> APIError:
+    """Generic send failure (subprocess error, paste-buffer load fail).
+
+    Spec §6 ``send_failed``. Wraps the underlying subprocess /
+    paste-buffer exception so the operator gets actionable text
+    instead of a generic 500 envelope (Codex #2043 review v3 block 2).
+    """
+    return APIError(
+        status_code=503,
+        code="send_failed",
+        message=f"tmux send_keys failed for {target!r}: {detail}",
+        hint=(
+            "Retry the request; if it keeps failing inspect the tmux "
+            "session directly or check the cockpit for an unhealthy pane."
+        ),
+    )
+
+
+def _tmux_unavailable(detail: str) -> APIError:
+    """tmux process is unreachable (binary missing, server wedged/timed out).
+
+    Spec §6 ``tmux_unavailable``. Distinguishes "the tmux server
+    itself is down" from "the specific window vanished" so the
+    operator knows whether retrying will help.
+    """
+    return APIError(
+        status_code=503,
+        code="tmux_unavailable",
+        message=f"tmux unavailable: {detail}",
+        hint=(
+            "The tmux binary is missing or the tmux server timed out. "
+            "Try `pm up` to restart the storage-closet session."
+        ),
+    )
+
+
 def _unsafe_mid_tool() -> APIError:
     return APIError(
         status_code=409,
@@ -234,90 +287,29 @@ def _selections_invalid(invalid: list[str], valid: list[str]) -> APIError:
 
 
 # ---------------------------------------------------------------------------
-# Worker-service handle (mirrors P2's pattern in chat_messages.py)
+# Worker-session discovery (thin wrapper over the public service facade)
 # ---------------------------------------------------------------------------
 
 
-class _WorkServiceHandle:
-    """Defers the ``_open_work_service_readonly`` ctx until first use.
-
-    The route function only needs the service for the duration of one
-    :func:`enumerate_chat_surfaces` call; this wrapper keeps the
-    ``with`` block readable.
-    """
-
-    def __init__(self, factory: Any, **kwargs: Any) -> None:
-        self._factory = factory
-        self._kwargs = kwargs
-        self._cm: Any = None
-
-    def __enter__(self) -> Any:
-        self._cm = self._factory(**self._kwargs)
-        return self._cm.__enter__()
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self._cm is not None:
-            try:
-                self._cm.__exit__(exc_type, exc, tb)
-            finally:
-                self._cm = None
-
-
-def _open_work_service_for_discovery(config: Any) -> _WorkServiceHandle | None:
-    """Best-effort handle for enumerating per-task workers.
-
-    Returns ``None`` when the work-service can't be opened (no DB
-    yet, pg pool down, etc.). The caller then enumerates configured
-    surfaces only — the send route never 500s because the worker
-    table is unreachable; it just won't recognise worker sessions.
-    """
-    try:
-        from pollypm.web_api.service import _open_work_service_readonly
-    except Exception:  # noqa: BLE001
-        return None
-    project = getattr(config, "project", None)
-    if project is None:
-        return None
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
-    if not project_key or project_path is None:
-        return None
-    return _WorkServiceHandle(
-        _open_work_service_readonly,
-        config=config,
-        project_key=project_key,
-        project_path=project_path,
-    )
-
-
-# Test seam: a thin wrapper around the work-service open so tests can
-# monkeypatch :func:`_list_worker_sessions` without spinning up pg.
+# Test seam: routes monkeypatch this to inject fake worker records
+# without spinning up pg. The default implementation delegates to the
+# public :func:`pollypm.web_api.service.list_active_worker_sessions`
+# facade so chat_send doesn't reach into private service internals
+# (Codex #2043 review v3 block 3).
 def _list_worker_sessions(config: Any) -> list[Any]:
     """Return active :class:`WorkerSessionRecord` rows or ``[]``.
 
-    Wraps :func:`_open_work_service_readonly` so the per-task worker
-    validation gate stays mock-friendly. Failures fall back to an
-    empty list — strict mode then 404s the request (the safer
-    posture for an authenticated send call).
+    Delegates to the public service-layer facade. Tests monkeypatch
+    this module-level name (``chat_send_routes._list_worker_sessions``)
+    to feed fake records into :func:`_resolve_surface` without opening
+    a real work-service. Failures fall back to ``[]`` — strict mode
+    then 404s the request (the safer posture for a send call).
     """
-    handle = _open_work_service_for_discovery(config)
-    if handle is None:
-        return []
     try:
-        with handle as svc:
-            list_fn = getattr(svc, "list_worker_sessions", None)
-            if not callable(list_fn):
-                return []
-            try:
-                return list(list_fn(active_only=True)) or []
-            except Exception:  # noqa: BLE001
-                logger.debug(
-                    "chat_send: list_worker_sessions failed", exc_info=True,
-                )
-                return []
+        return list(list_active_worker_sessions(config)) or []
     except Exception:  # noqa: BLE001
         logger.debug(
-            "chat_send: _open_work_service_for_discovery failed", exc_info=True,
+            "chat_send: list_active_worker_sessions failed", exc_info=True,
         )
         return []
 
@@ -763,10 +755,22 @@ def _resolve_pane_target(
 ) -> tuple[str, bool]:
     """Return ``(target, present)`` for a window + optional pane index.
 
-    ``present`` is True when the window exists. When the window
-    exists but a requested pane index is out of range, this raises
-    ``409 pane_invalid``; a dead pane raises ``409 pane_dead``
-    (Codex #2043 review block 5).
+    ``present`` is True when the window exists.
+
+    - ``pane_index is None`` — default active-pane target
+      (``session:window``). Uses ``window.pane_dead`` from
+      ``list_windows`` as the liveness signal.
+    - ``pane_index >= 0`` (including 0) — explicit pane target. ALWAYS
+      probes ``list_panes(window_target)`` to verify the index exists
+      AND is alive, then routes to ``session:window.N``. Explicit
+      ``pane=0`` does NOT alias to the window-level target — tmux's
+      active pane is not necessarily index 0, and silently aliasing
+      bypasses the pane existence/liveness checks the explicit form
+      is supposed to add (Codex #2043 review v3 block 1).
+    - ``pane_index < 0`` — rejected with ``409 pane_invalid``.
+
+    Raises ``409 pane_invalid`` for out-of-range / missing panes,
+    ``409 pane_dead`` for dead panes (Codex #2043 review block 5).
     """
     try:
         windows = tmux.list_windows(storage_session)
@@ -779,20 +783,23 @@ def _resolve_pane_target(
     if not matching:
         return f"{storage_session}:{window_name}", False
     window = matching[0]
-    # Default-pane path: window.pane_dead from list_windows is the
-    # active-pane health bit, which is the right signal when the
-    # caller didn't pick a specific pane.
-    if pane_index is None or pane_index == 0:
+    # Default-pane path: caller didn't pick a specific pane, so we
+    # use tmux's active-pane target. window.pane_dead from
+    # list_windows is the active-pane health bit, which is the right
+    # signal here.
+    if pane_index is None:
         if window.pane_dead:
             raise _pane_dead(f"{storage_session}:{window_name}")
         return f"{storage_session}:{window_name}", True
-    # Specific pane requested. Pane indexes must be >= 0 and the pane
-    # has to exist on the window AND be alive. Without this gate a
-    # negative or out-of-range index slips through to ``send_keys``
-    # and surfaces as a 500.
-    if pane_index < 0:
-        raise _pane_invalid(pane_index, f"{storage_session}:{window_name}")
+    # Specific pane requested (including 0). Pane indexes must be
+    # >= 0 and the pane has to exist on the window AND be alive.
+    # Without this gate a negative or out-of-range index slips
+    # through to ``send_keys`` and surfaces as a 500 — and explicit
+    # ``pane=0`` would silently go to tmux's active pane, which is
+    # not guaranteed to be pane 0.
     window_target = f"{storage_session}:{window_name}"
+    if pane_index < 0:
+        raise _pane_invalid(pane_index, window_target)
     try:
         panes = tmux.list_panes(window_target)
     except Exception:  # noqa: BLE001
@@ -919,7 +926,41 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
     try:
         tmux.send_keys(target, text_to_send, press_enter=body.press_enter)
     except DeadPaneError as exc:
+        # Pane died between validation and send. Already mapped to a
+        # typed 409 before this refactor — keep that shape.
         raise _pane_dead(str(exc)) from exc
+    except FileNotFoundError as exc:
+        # Tmux binary missing entirely. The server can't reach tmux —
+        # this is a deployment problem, not a per-request bug.
+        raise _tmux_unavailable(f"tmux binary not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        # Tmux server itself wedged (see ``TmuxClient.run`` for the
+        # canonical 15s timeout). The send may or may not have landed;
+        # 503 lets the operator retry with knowledge of the cause.
+        raise _tmux_unavailable(
+            f"tmux command timed out after {exc.timeout}s",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        # Most commonly: the window disappeared between
+        # ``list_windows`` validation and the actual ``send-keys``
+        # invocation (e.g. supervisor torn it down mid-request).
+        # ``send-keys`` returns exit code 1 with "can't find session"
+        # / "can't find window" on stderr. The window_missing envelope
+        # is documented for exactly this race (Codex #2043 review v3
+        # block 2).
+        stderr = (exc.stderr or "").strip().lower()
+        if "can't find" in stderr or "no such" in stderr or "session not found" in stderr:
+            raise _window_missing(target) from exc
+        # Other subprocess failures (permissions, malformed args we
+        # didn't sanitize, etc.) — generic send_failed envelope.
+        raise _send_failed(
+            target, exc.stderr.strip() if exc.stderr else f"exit {exc.returncode}",
+        ) from exc
+    except OSError as exc:
+        # Paste-buffer load failure (tempfile creation, load-buffer
+        # disk IO error). Map to send_failed so the operator can
+        # retry rather than seeing a 500.
+        raise _send_failed(target, str(exc)) from exc
     if body.press_enter:
         press_enter_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
 

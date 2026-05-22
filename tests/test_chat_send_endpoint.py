@@ -564,6 +564,135 @@ def test_dead_pane_error_from_send_keys_maps_to_409(
     assert body["error"]["code"] == "pane_dead"
 
 
+def test_send_keys_subprocess_window_missing_maps_to_503_window_missing(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review v3 block 2 — window disappears post-validation.
+
+    ``list_windows`` saw the window during validation, but tmux tore
+    it down before the ``send-keys`` shell-out completed. The
+    subprocess returns exit code 1 with ``can't find window`` on
+    stderr. Pre-fix this surfaced as a generic 500; we now map it
+    to a typed 503 ``window_missing`` so the operator knows the
+    surface vanished mid-flight (vs. tmux being entirely down).
+    """
+    import subprocess as _subprocess
+
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.send_side_effect = _subprocess.CalledProcessError(
+        returncode=1,
+        cmd=["tmux", "send-keys"],
+        stderr="can't find window: pm-operator",
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    assert response.json()["error"]["code"] == "window_missing"
+
+
+def test_send_keys_generic_subprocess_failure_maps_to_503_send_failed(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A subprocess error that isn't a missing window → ``send_failed``.
+
+    E.g. permissions/escape issues that tmux rejects. The operator
+    gets the underlying stderr in ``message`` and a documented 503
+    code instead of a generic 500.
+    """
+    import subprocess as _subprocess
+
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.send_side_effect = _subprocess.CalledProcessError(
+        returncode=2,
+        cmd=["tmux", "send-keys"],
+        stderr="usage: send-keys ...",
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "send_failed"
+
+
+def test_send_keys_tmux_missing_binary_maps_to_503_tmux_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``FileNotFoundError`` from subprocess.run → ``tmux_unavailable``."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.send_side_effect = FileNotFoundError(
+        "[Errno 2] No such file or directory: 'tmux'",
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "tmux_unavailable"
+
+
+def test_send_keys_tmux_timeout_maps_to_503_tmux_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``subprocess.TimeoutExpired`` (wedged tmux) → ``tmux_unavailable``."""
+    import subprocess as _subprocess
+
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.send_side_effect = _subprocess.TimeoutExpired(
+        cmd=["tmux", "send-keys"], timeout=15,
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "tmux_unavailable"
+
+
+def test_send_keys_paste_buffer_oserror_maps_to_503_send_failed(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """OSError on long-text paste-buffer path → ``send_failed`` (not 500)."""
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.send_side_effect = OSError("disk full while writing paste buffer")
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        # >100 chars to trigger the paste_buffer path in production
+        # (though the fake just raises regardless — the gate we care
+        # about is the route's exception handler).
+        json={"text": "x" * 250},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "send_failed"
+
+
 # ---------------------------------------------------------------------------
 # Safety: mid-tool
 # ---------------------------------------------------------------------------
@@ -1051,23 +1180,108 @@ def test_pane_index_targets_split_pane(
     )
 
 
-def test_pane_zero_targets_default_pane(
+def test_explicit_pane_zero_validates_via_list_panes(
     client: TestClient,
     auth_headers: dict[str, str],
     patched_tmux: type[FakeTmuxClient],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """Codex #2043 review v3 block 1 — explicit pane=0 != active pane.
+
+    tmux's active pane is NOT necessarily index 0 (the user can split
+    and focus the new pane). The pre-fix router treated
+    ``pane is None`` and ``pane == 0`` the same and shipped the send
+    to the window-level target (active pane). That bypasses
+    ``list_panes`` validation AND can land in the wrong pane.
+
+    The fix: any explicit integer (including 0) routes through
+    ``list_panes`` and addresses ``session:window.0`` explicitly.
+    Here we seed pane 0 alive and pane 1 alive — the request must
+    land on ``...:pm-operator.0``, NOT the window-level target.
+    """
     _set_storage_closet_windows(patched_tmux, ["pm-operator"])
     _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.panes_by_target = {
+        "pollypm-test-storage-closet:pm-operator": [
+            FakePane(pane_index=0),
+            FakePane(pane_index=1),  # active in tmux but we asked for 0
+        ],
+    }
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"text": "hello", "pane": 0},
         headers=auth_headers,
     )
-    assert response.status_code == 200
+    assert response.status_code == 200, response.json()
     body = response.json()
-    # pane=0 stays on the default window-level target (matches the
-    # existing send_keys behaviour).
+    # Explicit pane=0 now resolves to the indexed target. The
+    # pre-fix code returned the window-level target and would have
+    # landed on tmux's active pane (potentially pane 1).
+    assert body["window_target"] == (
+        "pollypm-test-storage-closet:pm-operator.0"
+    )
+    target, _text, _enter = patched_tmux.send_calls[0]
+    assert target == "pollypm-test-storage-closet:pm-operator.0", (
+        "explicit pane=0 must not fall through to the window-level "
+        "(active-pane) target"
+    )
+
+
+def test_explicit_pane_zero_409s_when_pane_zero_dead(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Companion to the above: dead pane 0 must 409 instead of silent fallthrough.
+
+    Pre-fix, ``pane=0`` aliased to the window-level target whose
+    ``pane_dead`` bit reflected the ACTIVE pane. If the active pane
+    happened to be alive (pane 1) the request would succeed and the
+    text would land in pane 1 — the operator never finds out pane 0
+    was dead.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.panes_by_target = {
+        "pollypm-test-storage-closet:pm-operator": [
+            FakePane(pane_index=0, pane_dead=True),
+            FakePane(pane_index=1),  # alive but the caller asked for 0
+        ],
+    }
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello", "pane": 0},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409, response.json()
+    assert response.json()["error"]["code"] == "pane_dead"
+    # And critically: nothing was sent.
+    assert patched_tmux.send_calls == []
+
+
+def test_default_pane_none_uses_window_level_target(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``pane`` omitted (None) still uses the window-level target.
+
+    This is the only case that goes to tmux's active pane without
+    a ``list_panes`` probe — explicit indexes always validate.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    # Note: no panes_by_target — list_panes would fail. Default-pane
+    # path must not call it.
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hello"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    body = response.json()
     assert body["window_target"] == "pollypm-test-storage-closet:pm-operator"
 
 

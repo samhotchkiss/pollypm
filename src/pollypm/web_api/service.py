@@ -388,24 +388,35 @@ def _refresh_live_projects(
 ) -> None:
     """Replace ``live_config.projects`` in place with ``fresh_config.projects``.
 
-    Used after every config-mutation path so the long-lived
-    :class:`ConfigDep` object reflects disk state in full — both the
+    Used after every config-mutation path so the in-request
+    :class:`ConfigDep` snapshot reflects disk state in full — both the
     mutated project AND any concurrent external edits / additions /
-    removals.
+    removals — before we build the response body off it.
 
-    Codex round 3 on #2063: the previous field-by-field copy
+    Post-#2056 the ``ConfigDep`` provider reloads via
+    ``load_config(config_path)`` per request, so cross-request
+    consistency is already guaranteed by the reload. This refresh is
+    therefore load-bearing only for:
+
+    * the IN-REQUEST response (we serialize from
+      ``config.projects[key]`` after the refresh, so it picks up the
+      post-write disk state without an extra ``_project_to_api`` arg
+      rewrite), AND
+    * the in-memory fallback path (``config_path is None``), where
+      tests construct :class:`PollyPMConfig` directly and the app
+      factory wires a startup-frozen ``lambda: config`` provider with
+      no per-request reload.
+
+    Codex round 3 on #2063: a previous field-by-field copy
     (``tracked`` / ``path`` / ``name``) left other ``KnownProject``
-    fields (``persona_name``, ``kind``, role/model assignments, worker
-    caps, plan enforcement, etc.) stale when an external CLI / cockpit
-    edit changed them on the same project before the API call landed.
-    The response is built from the live snapshot so the API would
-    return stale metadata while disk had the new metadata. Mirror
-    case: external project additions / removals on disk before
-    ``/archive`` would stay invisible to in-process GETs until restart.
+    fields (``persona_name``, ``kind``, role assignments, worker caps,
+    plan enforcement, etc.) stale when an external edit changed them on
+    the same project before the API call landed. Full ``clear() +
+    update()`` propagates every field plus external add/remove on other
+    keys.
 
     Mutates ``live_config.projects`` in place so any external object
-    holding a reference to the dict (FastAPI ``Depends`` caches it
-    across requests) sees the new contents.
+    holding a reference to the dict sees the new contents.
     """
     live_config.projects.clear()
     live_config.projects.update(fresh_config.projects)
@@ -427,21 +438,32 @@ def set_project_tracked(
       that landed between server boot and this call are preserved —
       we never write back the long-lived ``ConfigDep`` snapshot with
       ``force=True`` (that would silently drop e.g. a project added
-      via ``pm add-project`` after the server started).
+      via ``pm add-project`` after the server started). Post-#2056
+      the request's ``config`` is itself a per-request
+      ``load_config(config_path)`` reload, so the extra
+      ``load_config`` here is a cheap cache hit on the production
+      path AND still required for the in-memory fallback path
+      (``config_path is None``) where ``config`` is a startup-frozen
+      object.
     * Idempotency is decided AGAINST the freshly-loaded disk state
       (Codex round 2 on #2063): if disk already matches ``tracked``
-      we skip the write AND fully refresh the live snapshot from disk
-      so a stale in-memory value can't keep lying. Deciding against
-      the long-lived ``ConfigDep`` here would let a server that booted
-      with ``tracked=True`` short-circuit a ``/resume`` call even
-      after an external edit flipped disk to ``False``.
-    * Mutate the freshly-loaded copy, NOT the live ``config``.
+      we skip the write AND refresh the request's snapshot from disk
+      so the response body is built from disk state, not from any
+      stale field.
+    * Mutate the freshly-loaded copy via DEEP COPY, NOT the live
+      ``config`` — ``load_config`` is memoised by path, so the
+      ``fresh_cached`` snapshot IS the same object as the request's
+      ``config`` whenever the server was bootstrapped via
+      ``load_config(config_path)``. Without the deep copy, a write
+      failure after mutating ``fresh.tracked`` would leak a stale
+      lie into the cache (Codex round 4 on #2063).
     * After every successful disk write we re-load disk and FULLY
       refresh ``config.projects`` via :func:`_refresh_live_projects`
-      (Codex round 3 on #2063). The previous field-by-field copy left
-      other ``KnownProject`` fields (``persona_name``, ``kind``, role
-      assignments, worker caps, etc.) stale when an external edit
-      changed them on the same project before the API call.
+      so the in-request response reflects the post-write state plus
+      any concurrent external edits (Codex round 3 on #2063). Post-
+      #2056 the NEXT request reloads from disk anyway, so this is
+      mainly load-bearing for the current response and for the
+      in-memory fallback path.
     * If ``write_config`` raises ``OSError`` the live ``config``
       stays untouched and a subsequent GET reflects the unchanged
       disk state — no stale in-memory lie that flips back on restart.

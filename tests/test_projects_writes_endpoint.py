@@ -144,7 +144,10 @@ def client(app) -> TestClient:
 
 
 def test_pause_happy_path_sets_tracked_false(
-    client: TestClient, auth_headers: dict[str, str], config: PollyPMConfig
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
 ) -> None:
     response = client.post(
         "/api/v1/projects/myproj/pause",
@@ -155,12 +158,19 @@ def test_pause_happy_path_sets_tracked_false(
     body = response.json()
     assert body["key"] == "myproj"
     assert body["tracked"] is False
-    # Side effect: in-memory config flipped + persisted TOML reflects it.
-    assert config.projects["myproj"].tracked is False
+    # Side effect: persisted TOML reflects the flip. Post-#2056 the
+    # route reloads via ``load_config(config_path)`` per request, so the
+    # original fixture ``config`` object is no longer what the route
+    # mutates — assert against disk (Pattern A).
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is False
 
 
 def test_pause_is_idempotent_on_already_paused(
-    client: TestClient, auth_headers: dict[str, str], config: PollyPMConfig
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
 ) -> None:
     """Already-paused → 200 with the current snapshot.
 
@@ -179,7 +189,10 @@ def test_pause_is_idempotent_on_already_paused(
     second = client.post("/api/v1/projects/myproj/pause", headers=auth_headers)
     assert second.status_code == 200, second.text
     assert second.json()["tracked"] is False
-    assert config.projects["myproj"].tracked is False
+    # Disk reflects the paused state (Pattern A — post-#2056 per-request
+    # reload, the fixture ``config`` object is not the route's snapshot).
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is False
 
 
 # ---------------------------------------------------------------------------
@@ -188,17 +201,28 @@ def test_pause_is_idempotent_on_already_paused(
 
 
 def test_resume_happy_path_sets_tracked_true(
-    client: TestClient, auth_headers: dict[str, str], config: PollyPMConfig
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
 ) -> None:
-    # Start from paused.
-    config.projects["myproj"].tracked = False
+    # Start from paused — write to disk so the per-request load_config
+    # reload sees ``tracked=False`` (post-#2056 the route reloads via
+    # ``load_config(config_path)`` per request, so an in-memory mutation
+    # to the fixture ``config`` would be invisible to the route).
+    paused = load_config(config_path)
+    paused.projects["myproj"].tracked = False
+    write_config(paused, config_path, force=True)
+
     response = client.post(
         "/api/v1/projects/myproj/resume", headers=auth_headers, json={}
     )
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["tracked"] is True
-    assert config.projects["myproj"].tracked is True
+    # Assert against disk (Pattern A).
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is True
 
 
 def test_resume_is_idempotent_on_already_tracked(
@@ -219,7 +243,10 @@ def test_resume_is_idempotent_on_already_tracked(
 
 
 def test_archive_happy_path_removes_from_config(
-    client: TestClient, auth_headers: dict[str, str], config: PollyPMConfig
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
 ) -> None:
     response = client.post(
         "/api/v1/projects/myproj/archive",
@@ -231,7 +258,10 @@ def test_archive_happy_path_removes_from_config(
     assert body["ok"] is True
     assert "archived" in body["message"].lower()
     assert "deprecated" in body["message"]
-    assert "myproj" not in config.projects
+    # Disk reflects the removal (Pattern A — post-#2056 per-request
+    # reload, the fixture ``config`` object is not the route's snapshot).
+    reloaded = load_config(config_path)
+    assert "myproj" not in reloaded.projects
 
 
 def test_archive_irreversible_resume_after_archive_returns_404(
@@ -780,19 +810,20 @@ def test_resume_idempotent_when_disk_already_true_syncs_live(
     config: PollyPMConfig,
     config_path: Path,
 ) -> None:
-    """Codex round 2: when disk already matches target, sync the live snapshot.
+    """Codex round 2 (restated post-#2056): idempotent /resume reflects disk.
 
-    Live boots as ``tracked=False`` (stale); disk is actually
-    ``tracked=True``. /resume's target equals disk so the helper takes
-    the no-write idempotent branch but MUST still sync live so a
-    subsequent GET doesn't keep lying.
+    Post-#2056 the route reloads via ``load_config(config_path)`` per
+    request, so the "live snapshot" concept that round-2 pinned is gone:
+    every request gets the freshly-loaded disk state. The invariant we
+    still care about is that an idempotent /resume (disk already at the
+    target) returns 200 with the disk-backed snapshot AND a follow-up
+    GET keeps reflecting the disk value. Pattern A — assert via disk +
+    a subsequent GET, not via the fixture ``config`` object.
     """
     # Disk = True (already at /resume's target).
     fresh = load_config(config_path)
     fresh.projects["myproj"].tracked = True
     write_config(fresh, config_path, force=True)
-    # Live is stale (False).
-    config.projects["myproj"].tracked = False
 
     response = client.post(
         "/api/v1/projects/myproj/resume", headers=auth_headers, json={}
@@ -800,9 +831,11 @@ def test_resume_idempotent_when_disk_already_true_syncs_live(
     assert response.status_code == 200, response.text
     assert response.json()["tracked"] is True
 
-    # Live snapshot must have been synced from disk even though no write
-    # happened — otherwise GET keeps returning the stale value.
-    assert config.projects["myproj"].tracked is True
+    # Disk is unchanged at True.
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is True
+    # A follow-up GET reflects disk too (the per-request reload picks up
+    # the same disk state).
     get_response = client.get(
         "/api/v1/projects/myproj", headers=auth_headers
     )
@@ -832,32 +865,27 @@ def test_pause_idempotent_refreshes_external_metadata_edit(
     config: PollyPMConfig,
     config_path: Path,
 ) -> None:
-    """Codex round 3: idempotent /pause must surface external metadata edits.
+    """Codex round 3 (restated post-#2056): idempotent /pause reflects disk metadata.
 
-    Start with ``myproj.tracked=False`` (already at /pause's target) and
-    ``persona_name="old"``. An external editor flips ``persona_name`` to
-    ``"new"`` on disk without changing ``tracked``. POST /pause hits the
-    idempotent branch (no write) but MUST still refresh the live
-    snapshot so the response and a subsequent GET show ``persona_name=
-    "new"``.
+    Start with ``tracked=False, persona_name="new"`` on disk (the post-
+    external-edit state). POST /pause hits the idempotent branch (target
+    matches disk) and MUST return a response Project whose
+    ``persona_name`` reflects the disk value, plus a follow-up GET that
+    sees the same value.
 
-    Pre-fix: the field-by-field copy only synced tracked/path/name, so
-    ``persona_name`` stayed stale.
+    Post-#2056 the route reloads via ``load_config(config_path)`` per
+    request, so the "live snapshot refresh" the round-3 patch added is
+    no longer necessary for the NEXT request — that request reloads from
+    disk anyway. What we still pin is that the response built from the
+    in-request reload reflects all disk fields, not just ``tracked``.
     """
-    # Boot state: tracked=False, persona_name="old".
-    config.projects["myproj"].tracked = False
-    config.projects["myproj"].persona_name = "old"
-    fresh = load_config(config_path)
-    fresh.projects["myproj"].tracked = False
-    fresh.projects["myproj"].persona_name = "old"
-    write_config(fresh, config_path, force=True)
-
-    # External editor changes persona_name to "new" without touching tracked.
-    external = load_config(config_path)
-    external.projects["myproj"].persona_name = "new"
-    write_config(external, config_path, force=True)
-    # Live snapshot is intentionally stale on persona_name.
-    assert config.projects["myproj"].persona_name == "old"
+    # Disk = tracked=False, persona_name="new" — the state after an
+    # external editor changed both ``tracked`` (to match the target) and
+    # ``persona_name`` between server boot and this call.
+    disk = load_config(config_path)
+    disk.projects["myproj"].tracked = False
+    disk.projects["myproj"].persona_name = "new"
+    write_config(disk, config_path, force=True)
 
     # POST /pause — target tracked=False matches disk, so the helper
     # takes the idempotent (no-write) branch.
@@ -867,14 +895,22 @@ def test_pause_idempotent_refreshes_external_metadata_edit(
         json={"reason": "round-3 idempotent metadata refresh"},
     )
     assert response.status_code == 200, response.text
-    assert response.json()["tracked"] is False
+    body = response.json()
+    assert body["tracked"] is False
+    # Response Project surfaces persona_name — must reflect the disk
+    # value the route reloaded.
+    assert body["persona_name"] == "new"
 
-    # Live snapshot MUST now reflect the external persona_name edit —
-    # pre-fix it stayed "old" because only tracked/path/name got copied.
-    assert config.projects["myproj"].persona_name == "new", (
-        "Idempotent pause failed to refresh persona_name — Codex round-3 "
-        "regression (live snapshot only copied tracked/path/name)."
+    # A subsequent GET still reflects disk (Pattern A).
+    get_response = client.get(
+        "/api/v1/projects/myproj", headers=auth_headers
     )
+    assert get_response.status_code == 200
+    assert get_response.json()["persona_name"] == "new"
+    # Disk unchanged.
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].persona_name == "new"
+    assert reloaded.projects["myproj"].tracked is False
 
 
 def test_resume_write_success_refreshes_external_metadata_edit(
@@ -883,32 +919,26 @@ def test_resume_write_success_refreshes_external_metadata_edit(
     config: PollyPMConfig,
     config_path: Path,
 ) -> None:
-    """Codex round 3: write-success /resume must surface external metadata edits.
+    """Codex round 3 (restated post-#2056): write-success /resume preserves external metadata.
 
-    Mirror case: live thinks ``tracked=True, persona_name="old"``. An
-    external editor lands ``tracked=False, persona_name="new"`` on disk.
-    POST /resume's target (True) differs from disk (False) so the helper
-    takes the write branch. The post-write live refresh MUST pick up the
-    new ``persona_name`` too — not just the ``tracked`` bit we wrote.
+    Disk has ``tracked=False, persona_name="new"`` after an external
+    editor changed both fields. POST /resume's target (True) differs
+    from disk (False) so the helper writes. The write MUST preserve the
+    external ``persona_name`` edit (concurrent-edit preservation, Codex
+    P0 #2 still applies) and the response MUST surface it.
 
-    Pre-fix: only ``live_project.tracked = target`` ran, leaving
-    persona_name stale.
+    Post-#2056 the route reloads via ``load_config(config_path)`` per
+    request, so we don't pin a "live snapshot refresh" anymore — the
+    next request reloads from disk anyway. What we pin is that the
+    durable write preserves concurrent external metadata edits and the
+    response reflects the post-write disk state.
     """
-    # Boot state matches disk: tracked=True, persona_name="old".
-    config.projects["myproj"].persona_name = "old"
-    fresh = load_config(config_path)
-    fresh.projects["myproj"].tracked = True
-    fresh.projects["myproj"].persona_name = "old"
-    write_config(fresh, config_path, force=True)
-
-    # External editor lands tracked=False + persona_name="new" on disk.
+    # Disk: tracked=False (so /resume must write True), persona_name=
+    # "new" from an external edit we must not clobber.
     external = load_config(config_path)
     external.projects["myproj"].tracked = False
     external.projects["myproj"].persona_name = "new"
     write_config(external, config_path, force=True)
-    # Live snapshot is intentionally stale (tracked=True, persona_name="old").
-    assert config.projects["myproj"].tracked is True
-    assert config.projects["myproj"].persona_name == "old"
 
     # POST /resume — target True != disk False, so the helper writes.
     response = client.post(
@@ -917,21 +947,17 @@ def test_resume_write_success_refreshes_external_metadata_edit(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["tracked"] is True
-    # The response Project model doesn't surface persona_name directly,
-    # but the live snapshot underneath MUST reflect both fields.
+    # Response Project surfaces persona_name — must reflect the
+    # external edit the write preserved.
+    assert body["persona_name"] == "new"
 
-    # Live snapshot MUST reflect the external persona_name edit too —
-    # pre-fix only ``tracked`` was synced, leaving persona_name stale.
-    assert config.projects["myproj"].tracked is True
-    assert config.projects["myproj"].persona_name == "new", (
-        "Write-success resume failed to refresh persona_name — Codex "
-        "round-3 regression (live snapshot only synced the tracked bit)."
-    )
-
-    # Disk must reflect the resume write.
+    # Disk must reflect the resume write AND preserve persona_name.
     reloaded = load_config(config_path)
     assert reloaded.projects["myproj"].tracked is True
-    assert reloaded.projects["myproj"].persona_name == "new"
+    assert reloaded.projects["myproj"].persona_name == "new", (
+        "Write-success resume clobbered concurrent external persona_name "
+        "edit — Codex P0 #2 (concurrent-edit preservation) regression."
+    )
 
 
 def test_archive_surfaces_concurrent_external_project_addition(
@@ -941,20 +967,19 @@ def test_archive_surfaces_concurrent_external_project_addition(
     config_path: Path,
     tmp_path: Path,
 ) -> None:
-    """Codex round 3: external project added on disk before /archive surfaces.
+    """Codex round 3 (restated post-#2056): /archive preserves external additions.
 
-    Start with ``myproj`` only. An external CLI lands a second project
-    ``external`` on disk between server boot and the API call. POST
-    /archive removes ``myproj``; the post-archive live refresh MUST
-    surface ``external`` to subsequent ``GET /projects`` calls.
+    Start with ``myproj`` only on disk. An external CLI lands a second
+    project ``external`` on disk between server boot and the API call.
+    POST /archive removes ``myproj``; the durable write MUST preserve
+    ``external`` (Codex P0 #2 concurrent-edit preservation), and a
+    subsequent GET /projects reloads disk and surfaces ``external``.
 
-    Pre-fix: ``config.projects.pop(project_key, None)`` only dropped the
-    archived key. The external addition stayed invisible to in-process
-    GETs until restart.
+    Post-#2056 the route reloads via ``load_config(config_path)`` per
+    request, so we don't pin a "live snapshot refresh" anymore — we
+    pin the durable invariant (disk reflects archive + preserves the
+    concurrent add) and the GET round-trip.
     """
-    # Sanity: live boots with myproj only.
-    assert list(config.projects.keys()) == ["myproj"]
-
     # External CLI adds a second project on disk.
     external_root = tmp_path / "external"
     external_root.mkdir()
@@ -968,8 +993,6 @@ def test_archive_surfaces_concurrent_external_project_addition(
         kind=ProjectKind.GIT,
     )
     write_config(fresh, config_path, force=True)
-    # Live snapshot still doesn't know about ``external``.
-    assert "external" not in config.projects
 
     # POST /archive on myproj.
     response = client.post(
@@ -979,15 +1002,16 @@ def test_archive_surfaces_concurrent_external_project_addition(
     )
     assert response.status_code == 200, response.text
 
-    # Live snapshot MUST drop myproj AND surface external.
-    assert "myproj" not in config.projects
-    assert "external" in config.projects, (
-        "Archive failed to surface concurrent external project addition "
-        "— Codex round-3 regression (post-archive sync only pop()'d the "
-        "archived key)."
+    # Disk MUST drop myproj AND preserve external (Pattern A).
+    reloaded = load_config(config_path)
+    assert "myproj" not in reloaded.projects
+    assert "external" in reloaded.projects, (
+        "Archive clobbered concurrent external project addition — "
+        "Codex P0 #2 (concurrent-edit preservation) regression."
     )
 
-    # And GET /projects sees external too (end-to-end via the route).
+    # And GET /projects sees external too (end-to-end via the per-request
+    # reload).
     list_response = client.get(
         "/api/v1/projects", headers=auth_headers
     )
@@ -995,7 +1019,7 @@ def test_archive_surfaces_concurrent_external_project_addition(
     keys = [item["key"] for item in list_response.json()["items"]]
     assert "external" in keys, (
         "GET /projects did not surface concurrent external addition after "
-        "archive — Codex round-3 regression."
+        "archive."
     )
     assert "myproj" not in keys
 

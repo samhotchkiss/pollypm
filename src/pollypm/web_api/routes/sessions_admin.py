@@ -759,6 +759,76 @@ def list_sessions_endpoint(config: ConfigDep) -> SessionsListResponse:
     return SessionsListResponse(sessions=rows)
 
 
+def _health_from_window(window: Any | None) -> SessionHealthSnapshot:
+    """Compute a :class:`SessionHealthSnapshot` from a ``TmuxWindow``.
+
+    Codex PR #2061 round 8 lifecycle fix: the GET detail path used to
+    build a transient :class:`pollypm.supervisor.Supervisor` (via
+    :func:`_build_tmux_service` → :attr:`Supervisor.session_service`)
+    just to call :meth:`TmuxSessionService.health`. ``Supervisor.__init__``
+    opens the legacy sqlite ``state.db`` and runs migrations as a
+    side-effect, so every GET poll leaked a writable connection until
+    GC eventually closed it.
+
+    The ``TmuxWindow`` returned by :func:`list_storage_closet_windows`
+    already carries everything the :class:`SessionHealthSnapshot`
+    fields need: ``pane_id``, ``pane_dead``, ``pane_current_command``.
+    No Supervisor, no StateStore, no transient connections — just the
+    same fail-soft tmux read the GET path already performs for window
+    discovery.
+    """
+    if window is None:
+        return SessionHealthSnapshot(
+            window_present=False,
+            pane_alive=False,
+            pane_dead=True,
+            pane_command=None,
+        )
+    pane_dead = bool(getattr(window, "pane_dead", False))
+    return SessionHealthSnapshot(
+        window_present=True,
+        pane_alive=not pane_dead,
+        pane_dead=pane_dead,
+        pane_command=getattr(window, "pane_current_command", None) or None,
+    )
+
+
+def _is_turn_active_failsoft(window: Any | None) -> bool:
+    """Fail-soft mid-turn check for the GET detail surface.
+
+    Replaces the read-side call to :meth:`TmuxSessionService.is_turn_active`
+    so the GET path no longer needs a transient :class:`Supervisor` (the
+    only source of a backend-correct :class:`TmuxSessionService`).
+    Returns ``False`` on any failure — the read path must not 500 on a
+    transient tmux outage, and "agent might be working" is not a useful
+    signal to surface from a read endpoint anyway. The destructive
+    restart path still routes through
+    :func:`pollypm.session_health.probe_strict_turn_active` (config /
+    tmux-direct, fail-closed).
+    """
+    if window is None:
+        return False
+    pane_id = getattr(window, "pane_id", None)
+    if pane_id is None or getattr(window, "pane_dead", False):
+        return False
+    try:
+        from pollypm.tmux.client import TmuxClient
+
+        tmux = TmuxClient()
+        text = tmux.capture_pane(pane_id, lines=200)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "GET-detail is_turn_active capture_pane failed", exc_info=True,
+        )
+        return False
+    lowered = text.lower()
+    if "⏺" in text or "working" in lowered:
+        return True
+    if "working (" in lowered and "esc to interrupt" in lowered:
+        return True
+    return False
+
+
 @router.get(
     "/sessions/{name}",
     response_model=SessionDetail,
@@ -766,7 +836,25 @@ def list_sessions_endpoint(config: ConfigDep) -> SessionsListResponse:
     operation_id="getSession",
 )
 def get_session_endpoint(name: str, config: ConfigDep) -> SessionDetail:
-    """GET /api/v1/sessions/{name} — detail payload."""
+    """GET /api/v1/sessions/{name} — detail payload.
+
+    Codex PR #2061 round 8: this path no longer constructs a
+    :class:`pollypm.supervisor.Supervisor`. The previous wiring went
+    through :func:`_build_tmux_service` → :attr:`Supervisor.session_service`
+    purely to call :meth:`TmuxSessionService.health` + ``is_turn_active``,
+    but ``Supervisor.__init__`` opens the legacy sqlite ``state.db`` as
+    a side-effect and the GET path never called ``Supervisor.stop()`` →
+    every poll leaked an fd / sqlite connection.
+
+    The detail payload is now built from the same sources the list
+    endpoint uses: ``config.sessions`` (configured-session registry),
+    :func:`list_storage_closet_windows` (fail-soft tmux read),
+    :func:`latest_heartbeat` (pg facade), plus the pause marker. The
+    health snapshot is derived from the ``TmuxWindow`` already in hand
+    (``pane_id`` / ``pane_dead`` / ``pane_current_command``) and
+    ``is_turn_active`` does its own small fail-soft ``capture_pane``
+    call. No Supervisor, no StateStore, no transient connections.
+    """
     session = _find_session(config, name)
     storage_session = _storage_session_name(config)
     windows = _list_storage_closet_windows(storage_session)
@@ -778,17 +866,10 @@ def get_session_endpoint(name: str, config: ConfigDep) -> SessionDetail:
         windows=windows,
         paused=paused,
     )
-    svc = _build_tmux_service(config)
-    # Single-source ``window_present`` with the value already computed
-    # for ``info`` from the shared ``list_storage_closet_windows``
-    # helper. Avoids the round-6 split-source bug where
-    # ``info.window_present`` (config/tmux direct) and
-    # ``health.window_present`` (StateStore-dependent) could disagree
-    # for the same configured session on pg-backed installs.
-    health = _session_health(
-        svc, name, info_window_present=info.window_present,
-    )
-    turn_active = _is_turn_active(svc, name)
+    window_name = session.window_name or session.name
+    window = windows.get(window_name)
+    health = _health_from_window(window)
+    turn_active = _is_turn_active_failsoft(window)
     return SessionDetail(
         info=info,
         config=_build_session_config_view(session),

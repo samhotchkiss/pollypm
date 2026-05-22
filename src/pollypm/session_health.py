@@ -260,13 +260,33 @@ def probe_strict_turn_active(
     if not storage_session:
         return False
 
-    # Owned window discovery (Codex PR #2061 round 7). ANY exception
+    # Owned window discovery (Codex PR #2061 round 7 + 8). ANY exception
     # from the underlying tmux calls is "unknown" — raise
     # ``TmuxProbeUnavailable`` so the route maps to 503
     # ``unsafe_mid_turn_unknown`` instead of treating tmux outage as
     # "window absent → safe to restart".
+    #
+    # Round 8: prefer ``has_session_strict`` over the default
+    # fail-soft ``has_session``. The fail-soft variant returns ``False``
+    # for **any** non-zero rc — including rc=124 which
+    # :meth:`pollypm.tmux.client.TmuxClient.run` synthesises for a
+    # tmux-server timeout under ``check=False``. That conflated a real
+    # absent session (rc=1) with a wedged server (rc=124), and the
+    # probe then returned ``False`` (looks-absent → safe) for an
+    # unobservable tmux. The strict variant raises
+    # :class:`TmuxProbeUnavailable` for rc=124 / unexpected rc /
+    # ``TimeoutExpired`` and only returns ``False`` on a reliable
+    # rc=1 "session does not exist". Custom tmux clients without the
+    # strict method fall back to ``has_session`` (any exception they
+    # raise still propagates via the except below).
+    has_session_call = getattr(
+        tmux_client, "has_session_strict", None,
+    ) or tmux_client.has_session
     try:
-        session_present = tmux_client.has_session(storage_session)
+        session_present = has_session_call(storage_session)
+    except TmuxProbeUnavailable:
+        # Strict helper already crafted a precise diagnostic.
+        raise
     except Exception as exc:  # noqa: BLE001
         raise TmuxProbeUnavailable(
             f"tmux.has_session failed: {exc!s}",

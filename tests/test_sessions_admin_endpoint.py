@@ -892,6 +892,167 @@ def test_restart_strict_503_when_tmux_probe_raises(
     assert sup.restart_calls == []
 
 
+def test_restart_strict_503_when_tmux_has_session_times_out(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_supervisor,
+):
+    """Codex PR #2061 round 8 — rc=124 timeout from has-session → 503.
+
+    The real :meth:`pollypm.tmux.client.TmuxClient.run` synthesises a
+    ``CompletedProcess`` with ``returncode=124`` when the underlying
+    ``subprocess.TimeoutExpired`` fires under ``check=False``. The
+    prior fail-soft :meth:`TmuxClient.has_session` then returned
+    ``False`` for **any** non-zero rc, conflating a real "session
+    absent" (rc=1) with a wedged tmux server (rc=124). The strict
+    probe therefore treated a tmux outage as a definitive "nothing to
+    interrupt" and the destructive restart proceeded against an
+    unobservable agent — exact reproduction Codex documented in round 8.
+
+    Round 8 fix: a new :meth:`TmuxClient.has_session_strict` returns
+    ``False`` only on rc=1 and raises
+    :class:`pollypm.session_health.TmuxProbeUnavailable` on rc=124 /
+    any other rc / ``TimeoutExpired``. The strict probe in
+    :func:`pollypm.session_health.probe_strict_turn_active` now calls
+    that strict variant so the route maps tmux-server outage to
+    ``503 unsafe_mid_turn_unknown`` (fail-closed).
+
+    Reproducer reference: this test FAILS against round 7 (revert
+    ``has_session_strict`` to the fail-soft ``has_session`` call in
+    :func:`probe_strict_turn_active` → run → observe 200 ``ok`` with
+    ``Supervisor.restart_session`` called once instead of 503).
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+
+    import subprocess
+
+    from pollypm.tmux.client import TmuxClient
+
+    # Patch ``TmuxClient.run`` to return the rc=124 CompletedProcess
+    # the real wrapper would synthesise after a wedged-tmux timeout.
+    # We patch the method (not a stub class) so ``has_session_strict``
+    # exercises its real branch logic — the round-8 fix lives there.
+    def fake_run(self, *args, **kwargs):  # noqa: ARG001
+        return subprocess.CompletedProcess(
+            args=["tmux", *args],
+            returncode=124,
+            stdout="",
+            stderr="tmux command timed out after 15s",
+        )
+
+    monkeypatch.setattr(TmuxClient, "run", fake_run)
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "unsafe_mid_turn_unknown"
+    # The destructive facade was NEVER touched — round 8 fail-closed.
+    assert sup.restart_calls == []
+
+
+def test_restart_strict_503_when_tmux_has_session_raises_timeout(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_supervisor,
+):
+    """Codex PR #2061 round 8 — ``subprocess.TimeoutExpired`` → 503.
+
+    Defensive companion to
+    :func:`test_restart_strict_503_when_tmux_has_session_times_out`.
+    Today :meth:`TmuxClient.run` converts ``TimeoutExpired`` into
+    rc=124 under ``check=False``, but a future signature change or
+    test stub could re-raise. The strict variant must propagate
+    either flavour as :class:`TmuxProbeUnavailable` → 503.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+
+    import subprocess
+
+    from pollypm.tmux.client import TmuxClient
+
+    def fake_run(self, *args, **kwargs):  # noqa: ARG001
+        raise subprocess.TimeoutExpired(cmd=["tmux", *args], timeout=15)
+
+    monkeypatch.setattr(TmuxClient, "run", fake_run)
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "unsafe_mid_turn_unknown"
+    assert sup.restart_calls == []
+
+
+def test_get_session_does_not_construct_supervisor(
+    client, auth_headers, monkeypatch, patch_heartbeat, patch_tmux_windows,
+):
+    """Codex PR #2061 round 8 — GET detail path must not build Supervisor.
+
+    The previous GET detail wiring went through
+    :func:`_build_tmux_service` → :attr:`Supervisor.session_service`
+    purely to call :meth:`TmuxSessionService.health` +
+    :meth:`is_turn_active`. ``Supervisor.__init__`` opens the legacy
+    sqlite ``state.db`` (and runs migrations) as a side-effect, and
+    the GET path never called ``Supervisor.stop()`` → repeated polling
+    leaked fds + sqlite connections.
+
+    Round 8 fix: the GET path computes ``health`` directly from the
+    ``TmuxWindow`` already returned by
+    :func:`list_storage_closet_windows` (``pane_id`` / ``pane_dead`` /
+    ``pane_current_command``) and runs a small fail-soft
+    ``capture_pane`` for ``is_turn_active``. No Supervisor, no
+    StateStore, no transient connections.
+
+    This test pins the contract by exploding if either
+    :func:`_build_supervisor` or :func:`_build_tmux_service` is called
+    during a GET — fail-LOUDER than the silent leak it replaced.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+
+    def _boom_build_supervisor(_config):
+        raise AssertionError(
+            "GET /api/v1/sessions/{name} MUST NOT construct a "
+            "Supervisor — Codex PR #2061 round 8 lifecycle cleanup.",
+        )
+
+    def _boom_build_tmux_service(_config):
+        raise AssertionError(
+            "GET /api/v1/sessions/{name} MUST NOT build a transient "
+            "TmuxSessionService (which constructs a Supervisor) — "
+            "Codex PR #2061 round 8 lifecycle cleanup.",
+        )
+
+    monkeypatch.setattr(
+        sessions_admin_routes, "_build_supervisor", _boom_build_supervisor,
+    )
+    monkeypatch.setattr(
+        sessions_admin_routes, "_build_tmux_service",
+        _boom_build_tmux_service,
+    )
+
+    response = client.get(
+        "/api/v1/sessions/operator", headers=auth_headers,
+    )
+    # 200 — the GET path computed the detail payload entirely from
+    # config + the shared list_storage_closet_windows helper +
+    # latest_heartbeat. Neither Supervisor nor TmuxSessionService was
+    # constructed (which would have tripped the asserts above and
+    # surfaced as a 500).
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["info"]["name"] == "operator"
+    assert body["info"]["window_present"] is True
+    # The health snapshot still reports the live window — derived
+    # directly from the TmuxWindow returned by
+    # list_storage_closet_windows.
+    assert body["health"]["window_present"] is True
+    assert body["health"]["pane_alive"] is True
+
+
 def test_restart_strict_503_when_window_listing_raises(
     client, config, auth_headers, monkeypatch, patch_heartbeat,
     patch_supervisor,

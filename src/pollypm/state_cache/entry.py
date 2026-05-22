@@ -23,7 +23,55 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-__all__ = ["ProjectStateCacheEntry", "empty_entry"]
+__all__ = ["ProjectStateCacheEntry", "config_identity", "empty_entry"]
+
+
+def config_identity(config: Any) -> str:
+    """Return a canonical string identity for ``config``.
+
+    PR #2026 v7 (Codex r7 blocker): the cache singleton can serve
+    cross-config data when two ``PollyPMConfig`` objects share project
+    keys but were loaded from different on-disk roots. Every cache
+    lookup must compare this identity against the snapshot's stamped
+    identity and decline on mismatch.
+
+    Identity preference order:
+
+    1. ``config.config_path`` (resolved) — when a future refactor adds
+       this attribute, prefer it (the file on disk IS the identity).
+       :func:`pollypm.supervisor.SupervisorWorker._reviewer_auto_provision`
+       already probes for it via ``getattr`` for the same reason.
+    2. ``config.project.workspace_root`` (resolved) — every loaded
+       ``PollyPMConfig`` has one; it's the workspace root the config
+       was parsed against. Two configs with overlapping project keys
+       but different workspace roots are exactly the
+       cross-config-leak case this guard exists to catch.
+    3. Empty string — fall through. The guard treats two empties as
+       equal so test fixtures that don't set either field still work;
+       production configs always have a workspace_root.
+    """
+
+    try:
+        cfg_path = getattr(config, "config_path", None)
+        if cfg_path is not None:
+            try:
+                return str(Path(cfg_path).resolve())
+            except Exception:  # noqa: BLE001
+                return str(cfg_path)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        project = getattr(config, "project", None)
+        if project is not None:
+            wsr = getattr(project, "workspace_root", None)
+            if wsr:
+                try:
+                    return str(Path(wsr).resolve())
+                except Exception:  # noqa: BLE001
+                    return str(wsr)
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -73,6 +121,7 @@ class ProjectStateCacheEntry:
 
     # ── heartbeats / live workers ──────────────────────────────────
     live_worker_sessions: tuple[Any, ...] = ()
+    # Populated when #2050 lands a heartbeat invalidation contract.
     latest_heartbeat_by_session: dict[str, Any] = field(default_factory=dict)
 
     # ── task statuses (recompute rail glyphs without re-opening) ───
@@ -84,6 +133,17 @@ class ProjectStateCacheEntry:
     version: int = 0
     computed_at: float = 0.0
     source_db_path: Path | None = None
+
+    # ── config identity (PR #2026 v7) ─────────────────────────────
+    # Stamped by the refresher at compute time (see
+    # ``refresh_impl.compute_entry_for_project``). Every cache-routed
+    # call site MUST compare this against the live config's identity
+    # (via :func:`config_identity`) before consuming the entry — when
+    # they disagree the entry was computed against a different config
+    # and serving it would leak cross-config data. Defaults to ``""``
+    # so legacy fixtures that construct entries by hand still satisfy
+    # the guard against a config with no identity (e.g. unit tests).
+    config_identity: str = ""
 
 
 def empty_entry(

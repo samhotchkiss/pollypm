@@ -35,11 +35,14 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
-from pollypm.state_cache.entry import ProjectStateCacheEntry, empty_entry
+from pollypm.state_cache.entry import (
+    ProjectStateCacheEntry,
+    config_identity,
+    empty_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +69,14 @@ def build_refresh_fn(
     invokes per project. It loads the config fresh on every call so
     a config reload during a long-running cockpit picks up the new
     paths automatically.
+
+    PR #2026 v3 (Codex re-review): heartbeat prefetch removed entirely.
+    The two rail consumers (``cockpit_rail._latest_heartbeat_cached``)
+    were converted to direct pg-facade reads because the refresher had
+    no ``heartbeat.*`` audit-event subscription and so could only ever
+    serve a stale snapshot. Until that invalidation lands (filed as
+    #2050 follow-up) there's nothing for the refresher to prefetch —
+    the closure is a thin config-provider wrapper.
     """
 
     def _refresh(project_key: str) -> ProjectStateCacheEntry | None:
@@ -114,10 +125,15 @@ def compute_entry_for_project(
         awaits_user_items=list(awaits_user_items),
     )
 
-    # PR 2 only needs to populate the fields the routed call sites
-    # read — leave the rest at the entry defaults so the cache stays
-    # cheap to construct. PR 3 will widen this when the remaining
-    # call sites land.
+    # PR #2026 v3 (Codex re-review blocker 2): the heartbeat prefetch
+    # path was dead code. ``cockpit_rail._latest_heartbeat_cached``
+    # bypasses ``entry.latest_heartbeat_by_session`` and reads
+    # ``pollypm.storage.pg_heartbeats`` directly because the refresher
+    # has no ``heartbeat.*`` audit-event subscription and can only
+    # serve stale snapshots. Populating the field meant N pg reads
+    # per project per refresh with zero consumers. The entry field is
+    # retained (defaults to ``{}``) so callers don't crash on
+    # attribute access; the bulk-prefetch wiring lands with #2050.
     entry = ProjectStateCacheEntry(
         project_key=project_key,
         project_path=project_path,
@@ -133,6 +149,12 @@ def compute_entry_for_project(
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
         computed_at=time.monotonic(),
+        # PR #2026 v7 (Codex r7 blocker): stamp the config identity so
+        # every cache lookup can verify the snapshot was computed
+        # against the same config the caller holds. Without this the
+        # singleton cache can serve cross-config data whenever two
+        # configs share project keys.
+        config_identity=config_identity(config),
     )
     return entry
 
@@ -207,7 +229,10 @@ def _categorize_and_rollup(
     config: Any,
     tracked: bool,
     awaits_user_items: list[Any],
-) -> tuple[Any, str, str, tuple[Any, Any, int, str, int] | None]:
+) -> tuple[
+    Any, str, str,
+    tuple[Any, Any, int, str, int] | None,
+]:
     """Run ``categorize_project`` + ``rollup_project_state`` for one project.
 
     Returns ``(state, glyph, detail, rollup_tuple_or_None)``. The
@@ -215,6 +240,12 @@ def _categorize_and_rollup(
     approvals_pending)`` — kept positional so the caller can ``zip``
     it into the entry fields without a second import of the rollup
     types here.
+
+    PR #2026 v3 (Codex re-review blocker 2): no longer returns
+    ``live_workers``. The heartbeat prefetch that consumed that list
+    was dead code (cockpit_rail bypasses the cache for heartbeats);
+    keeping the slice-svc roster query alive cost N pg reads per
+    refresh with zero readers.
 
     Failures degrade silently — a broken work-service drops the
     project to IDLE (or PAUSED when not tracked) with no rollup.

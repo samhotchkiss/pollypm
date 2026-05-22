@@ -24,10 +24,13 @@ callers + the test suite.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+
+logger = logging.getLogger(__name__)
 
 from pollypm.cockpit_inbox_sources import (
     _inbox_db_sources,
@@ -223,6 +226,54 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     return result
 
 
+def _workspace_root_inbox_has_open(config) -> bool:
+    """True iff there is at least one open workspace-root inbox row.
+
+    "Workspace-root" = messages with ``scope IN ('', 'inbox')`` —
+    these are NOT keyed to any tracked project, so the refresher's
+    per-project filter in
+    ``state_cache/refresh_impl.py::_awaits_user_items_for`` drops them
+    on the floor. The cache's per-project entries can never represent
+    them, so any cache-routed read MUST fall through whenever the
+    workspace-root inbox is non-empty.
+
+    Filed as a follow-up issue (PR #2026 review blocker 3): teach the
+    cache to carry a workspace-root entry so this gate can go away.
+
+    PR #2026 v3 (Codex re-review): delegates to the dedicated SQL
+    existence query :func:`pollypm.cockpit_pg_aggregates.has_workspace_root_open_messages`
+    so the answer no longer depends on whether the newest N rows happen
+    to include a workspace-root row. The old ``open_messages(limit=50)``
+    + Python-side scan path silently dropped workspace work whenever 50+
+    newer project-scoped rows pushed the workspace-root row out of the
+    window.
+
+    Returns True on any failure (import or probe). Conservative — forces
+    cache fall-through. A false positive here is safe (the direct sweep
+    just runs); a false negative would silently drop workspace-root work,
+    violating the cache-authoritative invariant.
+    """
+
+    try:
+        from pollypm.cockpit_pg_aggregates import (
+            has_workspace_root_open_messages,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "workspace-root inbox probe import failed; assuming inbox is non-empty to force conservative cache decline",
+            exc_info=True,
+        )
+        return True
+    try:
+        return bool(has_workspace_root_open_messages(config))
+    except Exception:
+        logger.warning(
+            "workspace-root inbox probe failed; assuming inbox is non-empty to force cache fall-through",
+            exc_info=True,
+        )
+        return True  # conservative: force cache decline
+
+
 def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     """Return the cache-routed result, or ``None`` to fall through.
 
@@ -232,6 +283,16 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     * The cache has no entries yet (cold start — the refresher hasn't
       populated anything; falling through avoids serving an empty list
       while the cache warms up).
+    * Any snapshot entry was stamped with a different config identity
+      than the live ``config`` (PR #2026 v7 — the singleton cache can
+      serve cross-config data when project keys overlap; the
+      config-identity stamp catches this).
+    * Any tracked project is missing from the snapshot (partial cache).
+    * Any workspace-root awaits-user message exists live (PR #2026
+      review blocker 3) — the refresher does not project workspace-root
+      messages into any per-project entry, so the cache cannot
+      represent them and a partial answer would silently drop them
+      from the rail badge / inbox count.
     * Any unexpected exception (defensive — broken cache must never
       crash the rail badge).
 
@@ -257,7 +318,41 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
         # audit-log event.
         return None
 
+    # Config-identity guard (PR #2026 v7 — Codex r7 blocker): the
+    # cache is a process-wide singleton. If any snapshot entry was
+    # computed against a different ``config`` (different config_path /
+    # workspace_root) than the one the caller passed in, serving it
+    # would leak cross-config data — most acutely when the two configs
+    # share project keys. Decline and let the direct path run.
+    #
+    # Entries with an empty ``config_identity`` (legacy / unstamped —
+    # only test fixtures today) skip the check: the real refresher
+    # always stamps a non-empty identity, so a stamped-vs-unstamped
+    # mismatch can only happen in synthetic test setups.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+
     known_projects = set(getattr(config, "projects", {}).keys())
+    # Partial-cache guard (PR #2026 review): any tracked project missing
+    # from the snapshot would be silently dropped from ``cached_items``,
+    # causing the rail badge + count helper that falls through here to
+    # under-report. Fall through to the direct sweep so the missing
+    # project's items are included.
+    if not known_projects.issubset(snapshot.keys()):
+        return None
+    # Workspace-root guard (PR #2026 review blocker 3): the refresher
+    # only projects per-project messages, so any open workspace-root
+    # inbox row would be missing from the cache. Defer to the direct
+    # path whenever one exists.
+    if _workspace_root_inbox_has_open(config):
+        return None
     cached_items: list[object] = []
     for project_key, entry in snapshot.items():
         if project_key not in known_projects:
@@ -418,8 +513,90 @@ def _count_inbox_tasks_for_label(config) -> int:
     The function name is kept for backward compatibility with existing
     callers; the return value is now an item count, not just a task
     count.
+
+    Move A PR 3 (#1664): when ``POLLYPM_STATE_CACHE=1`` AND the cache
+    has every tracked project populated, this sums
+    ``entry.awaits_user_count`` across the snapshot directly. The
+    snapshot read is O(N projects) and skips the workspace-wide pg
+    sweep entirely. Falls through to ``len(pm_inbox_awaits_user_list)``
+    on cold OR partial cache (any tracked project missing from the
+    snapshot) so the three-surfaces-one-predicate invariant still
+    holds (the public helper itself routes through the same cache
+    when populated).
     """
+    cached = _maybe_cache_count_awaits_user(config)
+    if cached is not None:
+        return cached
     return len(pm_inbox_awaits_user_list(config))
+
+
+def _maybe_cache_count_awaits_user(config) -> int | None:
+    """Return the cache-routed count, or ``None`` to fall through.
+
+    Same gating as :func:`_maybe_cache_route_awaits_user`: flag off,
+    cold cache, or any unexpected failure → ``None`` so the caller
+    falls back to the direct path. Skips the workspace-wide sweep
+    when the cache is authoritative for every tracked project.
+
+    Partial-cache fall-through (PR #2026 review): if any tracked
+    project in ``config.projects`` is missing from the cache snapshot
+    we MUST return ``None`` so the caller runs the direct sweep.
+    Summing only the projects that happen to be cached would
+    under-count any tracked project that hasn't been refreshed yet —
+    the rail badge would silently drop work that's still waiting on
+    the user.
+
+    Workspace-root fall-through (PR #2026 review blocker 3): the
+    refresher does not project workspace-root inbox messages
+    (``scope IN ('', 'inbox')``) into any per-project entry, so the
+    cached sum would silently under-count them. Defer to the direct
+    sweep whenever the workspace-root inbox is non-empty.
+    """
+
+    try:
+        from pollypm.state_cache import get_cache, is_enabled
+    except Exception:  # noqa: BLE001
+        return None
+    if not is_enabled():
+        return None
+    try:
+        cache = get_cache()
+        snapshot = cache.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    if not snapshot:
+        return None
+    # Config-identity guard (PR #2026 v7 — Codex r7 blocker): same
+    # rationale as ``_maybe_cache_route_awaits_user``. Without this,
+    # the count sums entries that were computed against a different
+    # ``config``, double-counting work between two configs that
+    # share project keys. Unstamped entries (``""``) skip the check —
+    # only test fixtures construct those.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+    known_projects = set(getattr(config, "projects", {}).keys())
+    # Partial-cache guard: a tracked project not yet refreshed into the
+    # cache would be silently omitted from the sum. Fall through to the
+    # direct path so the badge stays correct during the boot-time gap.
+    if not known_projects.issubset(snapshot.keys()):
+        return None
+    # Workspace-root guard (PR #2026 review blocker 3): see
+    # ``_maybe_cache_route_awaits_user`` for rationale.
+    if _workspace_root_inbox_has_open(config):
+        return None
+    total = 0
+    for project_key, entry in snapshot.items():
+        if project_key not in known_projects:
+            continue
+        total += int(getattr(entry, "awaits_user_count", 0) or 0)
+    return total
 
 
 def pm_inbox_filtered_list(

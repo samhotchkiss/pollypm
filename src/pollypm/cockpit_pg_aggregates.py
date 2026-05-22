@@ -364,6 +364,92 @@ def open_messages(
     return rows
 
 
+def has_workspace_root_open_messages(
+    config: "PollyPMConfig | None",
+) -> bool:
+    """Returns True if any workspace-root open message exists.
+
+    **CONSERVATIVE:** returns True on ANY pg failure (pool/query) — see
+    Move A cache-authoritative invariant. Pure SQL existence query
+    (``LIMIT 1``) — independent of how many newer rows exist.
+
+    "Workspace-root" = messages with ``scope IN ('', 'inbox')``. The
+    state-cache refresher's per-project filter
+    (``state_cache/refresh_impl.py::_awaits_user_items_for``) drops
+    these on the floor because they aren't keyed to any tracked
+    project, so any cache-routed read MUST fall through whenever this
+    returns True.
+
+    PR #2026 v3 (Codex re-review blocker 1): the previous
+    implementation re-used :func:`open_messages` with ``limit=50`` and
+    scanned the newest 50 rows in Python for ``scope == "" / "inbox"``.
+    On a busy workspace with 50+ newer project-scoped rows + 1 older
+    workspace-root row, the probe returned False and the cache
+    silently dropped the workspace work. This helper pushes the
+    existence check into SQL (``LIMIT 1`` on a workspace-root
+    predicate) so the answer is independent of how many newer
+    project-scoped rows exist.
+
+    PR #2026 v5 (Codex round-5 blocker): pool/query failures now return
+    ``True`` (with warning log) instead of ``False``. The caller
+    ``_workspace_root_inbox_has_open`` expects this helper to either
+    return a real answer or raise; v4 wrapped the outer call in
+    try/except but the helper itself was swallowing pg errors and
+    returning False, defeating the conservative-on-error guard. Cache
+    authoritativeness requires that any signal we cannot prove returns
+    the safe answer that forces fall-through.
+
+    NOTE: This function's failure contract intentionally diverges from other
+    helpers in this module. On pg pool/query failure, it returns True (conservative).
+    Callers MUST treat True as "exists OR unknown" — not as "row definitely exists."
+    This preserves the cache-authoritative invariant for the Move A awaits-user cache:
+    the cache declines when any source it cannot represent might have data.
+    """
+
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool, get_rw_pool
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "workspace-root inbox probe encountered pool error (pg_pool import failed); assuming inbox is non-empty to force conservative cache decline",
+            exc_info=True,
+        )
+        return True
+
+    try:
+        pool = get_ro_pool(config)
+    except Exception:  # noqa: BLE001
+        try:
+            pool = get_rw_pool(config)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "workspace-root inbox probe encountered pool error; assuming inbox is non-empty to force conservative cache decline",
+                exc_info=True,
+            )
+            return True
+
+    sql = (
+        "SELECT 1 "
+        "  FROM messages "
+        " WHERE recipient = %s "
+        "   AND state = %s "
+        "   AND type IN ('notify', 'inbox_task', 'alert') "
+        "   AND (scope = '' OR scope IS NULL OR scope = 'inbox') "
+        " LIMIT 1"
+    )
+    params: list[object] = ["user", "open"]
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "workspace-root inbox probe encountered query error; assuming inbox is non-empty to force conservative cache decline",
+            exc_info=True,
+        )
+        return True
+    return row is not None
+
+
 # --------------------------------------------------------------------------- #
 # Public API surface
 # --------------------------------------------------------------------------- #
@@ -372,6 +458,7 @@ def open_messages(
 __all__ = [
     "all_tasks_for_project",
     "all_tasks_grouped",
+    "has_workspace_root_open_messages",
     "inbox_tasks_for_project",
     "inbox_tasks_grouped",
     "open_messages",

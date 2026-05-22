@@ -1,5 +1,13 @@
 # Move A — In-Process Project-State Cache with Epoch-Driven Invalidation
 
+## Implementation drift (2026-05-22)
+
+The shipped Move A behavior diverges from the original design in three places. This section is the source of truth; the original sections below are kept for historical context but should be read as superseded where they conflict.
+
+- `latest_heartbeat_by_session` is reserved on `ProjectStateCacheEntry` but NOT populated. Rail heartbeat sites read `pollypm.storage.pg_heartbeats.latest_heartbeat` directly via `CockpitRouter._latest_heartbeat_cached`. Bulk prefetch + cache invalidation deferred to [#2050](https://github.com/samhotchkiss/pollypm/issues/2050).
+- `_maybe_cache_route_rollups` declines (returns `None`) when any tracked project has a live actionable alert — cache cannot recompute the alert-to-rollup contract. Tracked in [#2049](https://github.com/samhotchkiss/pollypm/issues/2049).
+- `_maybe_cache_route_awaits_user` / `_maybe_cache_count_awaits_user` decline when the workspace-root inbox has any open message (via `has_workspace_root_open_messages` probe). Workspace-root inbox isn't yet represented in cache entries. Tracked in [#2051](https://github.com/samhotchkiss/pollypm/issues/2051).
+
 Design document for issue [#1664](https://github.com/samhotchkiss/pollypm/issues/1664).
 Status: **proposed** (design only; implementation deferred to post-RC).
 Authors: Sam, with research from the 2026-05-18 rail-perf review on [#1634](https://github.com/samhotchkiss/pollypm/issues/1634).

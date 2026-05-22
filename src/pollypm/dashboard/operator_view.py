@@ -449,7 +449,18 @@ def load_operator_view_from_config(config) -> OperatorDashboardView:  # noqa: AN
        against an adapter view of the prefetched dicts. Serial loop —
        no DB I/O remains in the per-project step, so parallel threads
        buy nothing.
+
+    Move A PR 3 (#1664): when ``POLLYPM_STATE_CACHE=1`` AND the cache
+    has every tracked project populated, this iterates
+    ``cache.snapshot()`` and builds rows from the pre-computed
+    ``state`` / ``glyph`` / ``detail`` fields, skipping the bulk
+    work-service open + prefetch entirely. Falls through to the
+    direct path on cold / partial cache.
     """
+    cached_view = _maybe_cache_route_operator_view(config)
+    if cached_view is not None:
+        return cached_view
+
     scans = _collect_project_scans(config)
     waiting_by_project = _waiting_items_by_project(config)
 
@@ -564,6 +575,29 @@ def _maybe_cache_route_state_map(config) -> dict[str, ProjectState] | None:
     if not snapshot:
         return None
 
+    # Config-identity guard (PR #2026 v8 — Codex r8 blocker): the
+    # cache is a process-wide singleton. If any snapshot entry was
+    # computed against a different ``config`` (different config_path /
+    # workspace_root) than the one the caller passed in, serving it
+    # would leak cross-config data — most acutely when the two configs
+    # share project keys. Decline and let the direct path run.
+    #
+    # Mirrors the v7 guards on the other 4 routed sites
+    # (cockpit_inbox._maybe_cache_{route,count}_awaits_user,
+    # operator_view._maybe_cache_route_operator_view, and
+    # cockpit_rail._maybe_cache_route_rollups). Entries with an empty
+    # ``config_identity`` (legacy / unstamped — test fixtures only)
+    # skip the check so the existing parity tests still serve.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+
     projects = getattr(config, "projects", {}) or {}
     known_keys = set(projects.keys())
     if not known_keys:
@@ -595,6 +629,97 @@ def _maybe_cache_route_state_map(config) -> dict[str, ProjectState] | None:
                 _log_divergence("project_state_map_from_config", reason)
 
     return cached_map
+
+
+def _maybe_cache_route_operator_view(config) -> "OperatorDashboardView | None":  # noqa: ANN001
+    """Return the cache-routed dashboard view, or ``None`` to fall through.
+
+    Move A PR 3 (#1664): with the env flag on AND the cache populated
+    for every tracked project, the dashboard view is built from
+    pre-computed ``state`` / ``glyph`` / ``detail`` fields on each
+    cache entry — no bulk work-service open, no per-project query
+    fanout. The fall-through path covers cold start and any project
+    the refresher hasn't filled yet.
+    """
+
+    try:
+        from pollypm.state_cache import get_cache, is_enabled
+    except Exception:  # noqa: BLE001
+        return None
+    if not is_enabled():
+        return None
+    try:
+        cache = get_cache()
+        snapshot = cache.snapshot()
+    except Exception:  # noqa: BLE001
+        return None
+    if not snapshot:
+        return None
+
+    # Config-identity guard (PR #2026 v7 — Codex r7 blocker): decline
+    # if any snapshot entry was computed against a different config
+    # than the live one (different config_path / workspace_root).
+    # Without this, the dashboard view can mix cached state from one
+    # workspace into another whenever project keys overlap. Unstamped
+    # entries (``""``) skip the check — only test fixtures construct
+    # those.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    scans = _collect_project_scans(config)
+    if not scans:
+        return OperatorDashboardView(
+            waiting=(), working=(), idle=(), paused=(),
+        )
+    # Authoritative only when every tracked project has a cache entry.
+    snapshot_keys = set(snapshot.keys())
+    if not all(scan.project_key in snapshot_keys for scan in scans):
+        return None
+
+    waiting: list[OperatorDashboardRow] = []
+    working: list[OperatorDashboardRow] = []
+    idle: list[OperatorDashboardRow] = []
+    paused: list[OperatorDashboardRow] = []
+    for scan in scans:
+        entry = snapshot[scan.project_key]
+        state = getattr(entry, "state", None)
+        if state is None:
+            # Refresher hasn't filled in state yet — defer.
+            return None
+        glyph = getattr(entry, "glyph", "") or glyph_for_project_state(state)
+        detail = getattr(entry, "detail", "") or "Quiet"
+        row = OperatorDashboardRow(
+            project_key=scan.project_key,
+            state=state,
+            glyph=glyph,
+            detail=detail,
+        )
+        if state is ProjectState.WAITING:
+            waiting.append(row)
+        elif state is ProjectState.WORKING:
+            working.append(row)
+        elif state is ProjectState.PAUSED:
+            paused.append(row)
+        else:
+            idle.append(row)
+
+    waiting.sort(key=lambda r: r.project_key.lower())
+    working.sort(key=lambda r: r.project_key.lower())
+    idle.sort(key=lambda r: r.project_key.lower())
+    paused.sort(key=lambda r: r.project_key.lower())
+    return OperatorDashboardView(
+        waiting=tuple(waiting),
+        working=tuple(working),
+        idle=tuple(idle),
+        paused=tuple(paused),
+    )
 
 
 def _direct_project_state_map_from_config(

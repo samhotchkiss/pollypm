@@ -1,13 +1,15 @@
 """Tests for the :envvar:`POLLYPM_STATE_CACHE` env flag.
 
-PR 1 ships the cache OFF by default. When off, :func:`get_cache`
-returns a shim whose ``snapshot()`` is ``{}`` and ``get()`` returns
-``None`` — so call sites that opt in later (PR 2+) can hold a
-``StateCacheLike`` reference unconditionally without checking the flag.
+Post-PR4: cache defaults ON. These tests pin the kill-switch
+(``POLLYPM_STATE_CACHE=0``) fall-through path and the env-flag parser.
+When the kill-switch is set, :func:`get_cache` returns a shim whose
+``snapshot()`` is ``{}`` and ``get()`` returns ``None`` — so call sites
+can hold a ``StateCacheLike`` reference unconditionally without checking
+the flag.
 
 Importing :mod:`pollypm.state_cache` MUST be side-effect-free in
 either mode; the refresher only starts on the first :func:`get_cache`
-call when the flag is on.
+call when the cache is active.
 """
 
 from __future__ import annotations
@@ -37,31 +39,50 @@ def _isolate_singletons():
     reset_for_test()
 
 
-def test_flag_default_is_off(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_flag_default_is_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Move A PR 4 (#1664, design §6.4): default is now ON.
+
+    With no env var set, the cache is enabled. The env var stays as a
+    kill-switch — :func:`is_enabled` returns False only when it's
+    explicitly disabled (``0`` / ``false`` / ``no`` / ``off``).
+    """
     monkeypatch.delenv(ENV_FLAG, raising=False)
-    assert is_enabled() is False
+    assert is_enabled() is True
 
 
-@pytest.mark.parametrize("value", ["1", "true", "TRUE", "yes", "on"])
-def test_truthy_values_enable_flag(
+@pytest.mark.parametrize(
+    "value", ["1", "true", "TRUE", "yes", "on", "", "  ", "garbage"]
+)
+def test_non_falsy_values_keep_cache_enabled(
     monkeypatch: pytest.MonkeyPatch, value: str,
 ) -> None:
+    """PR 4: only the explicit kill-switch values disable.
+
+    Empty string + whitespace + unknown values all leave the cache
+    enabled because the default is now ON.
+    """
     monkeypatch.setenv(ENV_FLAG, value)
     assert is_enabled() is True
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", "off", "", "  "])
-def test_falsy_values_disable_flag(
+@pytest.mark.parametrize("value", ["0", "false", "FALSE", "no", "off"])
+def test_kill_switch_values_disable_flag(
     monkeypatch: pytest.MonkeyPatch, value: str,
 ) -> None:
+    """PR 4: ``POLLYPM_STATE_CACHE=0`` (and siblings) still disables.
+
+    Kept for one release per design §6.4 so an emergency rollback is
+    a process restart with the env var set.
+    """
     monkeypatch.setenv(ENV_FLAG, value)
     assert is_enabled() is False
 
 
-def test_get_cache_returns_shim_when_off(
+def test_get_cache_returns_shim_when_killswitch_set(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(ENV_FLAG, raising=False)
+    """With ``POLLYPM_STATE_CACHE=0`` the shim cache is returned."""
+    monkeypatch.setenv(ENV_FLAG, "0")
     cache = get_cache()
     assert cache.get("alpha") is None
     assert cache.snapshot() == {}
@@ -72,6 +93,22 @@ def test_get_cache_returns_shim_when_off(
     cache.invalidate(None)
     # No refresher gets created in shim mode.
     assert get_refresher() is None
+
+
+def test_get_cache_returns_real_cache_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR 4 default: with no env var set, the real cache + refresher come up."""
+    monkeypatch.delenv(ENV_FLAG, raising=False)
+    cache = get_cache()
+    try:
+        assert isinstance(cache, ProjectStateCache)
+        # Refresher came up alongside the cache.
+        refresher = get_refresher()
+        assert refresher is not None
+        assert refresher.running
+    finally:
+        reset_for_test()
 
 
 def test_get_cache_returns_real_cache_when_on(
@@ -101,7 +138,8 @@ def test_get_cache_is_idempotent_singleton(
 def test_shim_singleton_is_stable_across_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.delenv(ENV_FLAG, raising=False)
+    """The shim is shared when the kill-switch is set."""
+    monkeypatch.setenv(ENV_FLAG, "0")
     a = get_cache()
     b = get_cache()
     assert a is b
@@ -204,6 +242,70 @@ def test_singleton_wires_project_keys_provider_for_initial_refresh(
         assert set(snapshot.keys()) == {"alpha", "beta", "gamma"}
     finally:
         reset_for_test()
+
+
+# ── PR #2029 — divergence sampler is deterministic-off in production ──
+
+
+class TestDivergenceSamplerNoop:
+    """PR #2029: the in-process sampler is deterministic-off.
+
+    The legacy "sample when kill-switch is set" branch was
+    unreachable (routed call sites guard on ``is_enabled()`` and
+    return early before touching the sampler), so it was removed.
+    The class is preserved so existing route-site sentinels keep
+    working; ``always=True`` remains as the test escape hatch.
+    """
+
+    def test_sampler_is_silent_by_default(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """No env var → cache authoritative → sampler returns False."""
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        monkeypatch.delenv(ENV_FLAG, raising=False)
+        counter = DivergenceCounter(rate=1)
+        for _ in range(50):
+            assert counter.should_sample() is False
+
+    def test_sampler_is_silent_when_flag_explicitly_on(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``POLLYPM_STATE_CACHE=1`` → cache authoritative → no samples."""
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        monkeypatch.setenv(ENV_FLAG, "1")
+        counter = DivergenceCounter(rate=1)
+        for _ in range(50):
+            assert counter.should_sample() is False
+
+    def test_sampler_is_silent_when_killswitch_set(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Kill-switch set → routes short-circuit before the sampler.
+
+        PR #2029 removed the kill-switch sampling branch entirely.
+        Routed call sites return early via ``is_enabled()`` when the
+        kill-switch is set, so the sampler is never reached in
+        production. Verify it stays silent here too.
+        """
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        monkeypatch.setenv(ENV_FLAG, "0")
+        counter = DivergenceCounter(rate=3)
+        for _ in range(10):
+            assert counter.should_sample() is False
+
+    def test_always_override_drives_legacy_cadence(
+        self, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """``always=True`` is the test-only escape hatch for parity tests."""
+        from pollypm.state_cache.divergence import DivergenceCounter
+
+        monkeypatch.delenv(ENV_FLAG, raising=False)
+        counter = DivergenceCounter(rate=2, always=True)
+        results = [counter.should_sample() for _ in range(4)]
+        assert results == [False, True, False, True]
 
 
 def test_singleton_provider_degrades_gracefully_on_config_failure(

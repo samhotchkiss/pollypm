@@ -73,6 +73,15 @@ Added, Changed, and Removed.
   PR #2016 review blocker.
 
 ### Changed
+- State-cache routing (Move A PR 4, closes #1664) flips the
+  `POLLYPM_STATE_CACHE` env-flag default from OFF to **ON**. The
+  cache is now the authoritative source for the 7 hot-path call
+  sites routed in PRs 2 and 3. After PR4 lands, there is no
+  runtime parity sampler. The cache is authoritative by default.
+  Rollback path is `POLLYPM_STATE_CACHE=0` which makes every
+  routed call site fall through to the direct facade. Parity is
+  covered by tests; runtime divergence telemetry is deferred to
+  future observability work.
 - State-cache routing (Move A PR 3, refs #1664) extends the
   `POLLYPM_STATE_CACHE=1` fast path to the remaining 5 hot-path call
   sites from `docs/design/move-a-state-cache.md` §5. With the flag
@@ -91,8 +100,11 @@ Added, Changed, and Removed.
   no `heartbeat.*` invalidation, so any prefetch could only serve a
   stale snapshot. Bulk heartbeat prefetch is deferred to #2050 (once
   the refresher subscribes to heartbeat audit events). Each call
-  site keeps a flag-off fall-through, so behaviour is unchanged
-  until PR 4 flips the default. Flag still defaults OFF.
+  site keeps a fall-through gate (config-identity mismatch, partial
+  cache, workspace-root inbox, actionable rail alerts). As of PR
+  #2029 (PR 4), `POLLYPM_STATE_CACHE` defaults ON; set to 0 to
+  disable. The cache is authoritative per identity-stamped
+  snapshots; rollback path is the kill-switch.
 
 ### Removed
 - Rail-side 2s TTL on `CockpitRouter._project_categorizations`

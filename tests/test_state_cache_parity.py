@@ -1,4 +1,8 @@
-"""Move A PR 2 parity tests — cached vs direct paths agree.
+"""Tests for the state-cache parity contract.
+
+Uses ``always=True`` on the historical :class:`DivergenceCounter` to
+exercise the test-only helper; production behavior is sampler-off per
+PR #2029.
 
 Pins ``docs/design/move-a-state-cache.md`` §6.2 / §7 / §8.4:
 
@@ -6,9 +10,6 @@ Pins ``docs/design/move-a-state-cache.md`` §6.2 / §7 / §8.4:
   ``project_state_map_from_config`` — must return semantically equal
   results on the cached-fast-path branch and the direct-DB branch
   for any config the cache has fully populated.
-* The 1-in-N divergence sampler logs a WARN when an injected
-  mismatch lands; the WARN line is the surface PR 4's telemetry gate
-  reads.
 * ``tests/test_inbox_default_lens.py``'s three-surfaces-one-predicate
   invariant (``cockpit_inbox.py:268-295``) is NOT regressed — the
   routed helper still returns identical content when the cache is on
@@ -206,7 +207,7 @@ class TestAwaitsUserParity:
 
         Pins the §6.2 contract: "Flag off → unchanged behavior."
         """
-        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
         direct = self._direct_items()
         config = _make_config(["alpha", "beta", "gamma"], tmp_path)
 
@@ -293,7 +294,7 @@ class TestProjectStateMapParity:
     ) -> None:
         """Flag off — the public helper bypasses the cache fast-path entirely."""
 
-        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
         config = _make_config(["alpha", "beta", "gamma"], tmp_path)
         # The fast-path returns None when the flag is off; we pin that
         # explicitly rather than re-running the (real-DB-touching)
@@ -371,10 +372,13 @@ class TestProjectStateMapParity:
 
 
 class TestDivergenceSampler:
-    """The 1-in-N sampler logs a WARN line on mismatch."""
+    """Test-only helper exercise: ``always=True`` for test setup, not
+    runtime sampling. Production is sampler-off per PR #2029."""
 
     def test_sampler_fires_on_nth_call(self) -> None:
-        counter = DivergenceCounter(rate=3)
+        # PR 4: pass ``always=True`` so the cache-authoritative no-op
+        # doesn't short-circuit the sampler under test.
+        counter = DivergenceCounter(rate=3, always=True)
         # Calls 1, 2 → no sample; call 3 → sample.
         assert counter.should_sample() is False
         assert counter.should_sample() is False
@@ -430,7 +434,7 @@ class TestDivergenceSampler:
         _seed_cache(monkeypatch, entries)
 
         # Force every call to sample by swapping in a rate-1 counter.
-        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter(rate=1)
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter(rate=1, always=True)
 
         monkeypatch.setattr(
             cockpit_inbox,
@@ -470,7 +474,7 @@ class TestDivergenceSampler:
         }
         _seed_cache(monkeypatch, entries)
 
-        operator_view._STATE_MAP_DIVERGENCE_COUNTER = DivergenceCounter(rate=1)
+        operator_view._STATE_MAP_DIVERGENCE_COUNTER = DivergenceCounter(rate=1, always=True)
 
         monkeypatch.setattr(
             operator_view,
@@ -511,7 +515,7 @@ class TestDivergenceSampler:
             "alpha": _entry("alpha", state=ProjectState.WAITING, items=[item])
         }
         _seed_cache(monkeypatch, entries)
-        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter(rate=1)
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter(rate=1, always=True)
         monkeypatch.setattr(
             cockpit_inbox,
             "_pm_inbox_awaits_user_list_uncached",
@@ -549,7 +553,7 @@ class TestInboxDefaultLensInvariant:
     def test_count_helper_matches_list_length_flag_off(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
         items = self._items()
         config = _make_config(["alpha", "beta"], tmp_path)
         monkeypatch.setattr(
@@ -632,7 +636,7 @@ class TestCountInboxTasksForLabelParity:
     ) -> None:
         """Flag off — falls back to ``len(pm_inbox_awaits_user_list)``."""
 
-        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
         config = _make_config(["alpha", "beta"], tmp_path)
         items = [
             _inbox_item(project="alpha", source="task", ident="alpha/1"),
@@ -757,7 +761,7 @@ class TestLoadOperatorViewParity:
     ) -> None:
         """Flag off — the cache fast-path returns ``None``."""
 
-        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
         config = _make_config(["alpha"], tmp_path)
         # Direct path will open svc=None → IDLE branch; tracked
         # projects with no awaits-user items land in idle.
@@ -1001,7 +1005,7 @@ class TestLatestHeartbeatParity:
     ) -> None:
         """Flag state is irrelevant — the cache is fully bypassed."""
 
-        monkeypatch.delenv("POLLYPM_STATE_CACHE", raising=False)
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
         router = self._router(tmp_path)
 
         hb = SimpleNamespace(created_at="2026-05-20T03:00:00Z")

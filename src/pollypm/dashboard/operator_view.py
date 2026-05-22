@@ -544,21 +544,20 @@ def _scan_to_state(
     )
 
 
-# Move A PR 2 — divergence sampler for the cache-routed fast path
-# (``docs/design/move-a-state-cache.md`` §6.2 last bullet). Per-call-site
-# counter so a busy site doesn't borrow samples from a quiet one.
+# Move A PR 4 — cache-routed fast path for the dashboard state map
+# (``docs/design/move-a-state-cache.md`` §6.2). Cache is authoritative
+# by default; ``POLLYPM_STATE_CACHE=0`` forces fall-through. Counter
+# retained as a historical test-only helper. Production path: cache
+# lookup with kill-switch + identity fall-throughs.
 _STATE_MAP_DIVERGENCE_COUNTER = _DivergenceCounter()
 
 
 def _maybe_cache_route_state_map(config) -> dict[str, ProjectState] | None:
     """Return the cache-routed state map, or ``None`` to fall through.
 
-    Returns ``None`` when the env flag is off, when the cache is cold
-    (no entries yet — letting the direct path warm it via the
-    refresher), when the cache lacks a state for any tracked project
-    (the direct path is needed to fill the gap), or on any
-    unexpected exception. The 1-in-N divergence sampler then runs
-    both paths and logs a WARN on mismatch.
+    Cache lookup; fall through to direct path on cache miss / cache
+    disabled / config-identity mismatch / partial coverage (cache
+    lacks a state for any tracked project).
     """
 
     try:
@@ -784,9 +783,11 @@ def project_state_map_from_config(config) -> dict[str, ProjectState]:  # noqa: A
 
     Move A PR 2 (#1664): with ``POLLYPM_STATE_CACHE=1`` AND the cache
     populated, this collapses to ``{key: entry.state for ... in
-    snapshot.items()}`` and skips the bulk work-service open. Flag is
-    OFF by default; PR 4 flips it after divergence-sampler telemetry
-    is green.
+    snapshot.items()}`` and skips the bulk work-service open.
+    ``POLLYPM_STATE_CACHE`` defaults ON as of PR #2029. Set to 0 to
+    fall through to the direct facade for incident rollback. Per-route
+    fall-through gates: config-identity mismatch, partial-cache,
+    workspace-root inbox, actionable rail alerts.
     """
     cached_map = _maybe_cache_route_state_map(config)
     if cached_map is not None:

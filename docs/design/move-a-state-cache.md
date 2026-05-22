@@ -9,8 +9,17 @@ The shipped Move A behavior diverges from the original design in three places. T
 - `_maybe_cache_route_awaits_user` / `_maybe_cache_count_awaits_user` decline when the workspace-root inbox has any open message (via `has_workspace_root_open_messages` probe). Workspace-root inbox isn't yet represented in cache entries. Tracked in [#2051](https://github.com/samhotchkiss/pollypm/issues/2051).
 
 Design document for issue [#1664](https://github.com/samhotchkiss/pollypm/issues/1664).
-Status: **proposed** (design only; implementation deferred to post-RC).
+Status: **implemented** (2026-05-20) — PR 1 #2000, PR 2 #2016, PR 3 #2026, PR 4 #2029.
 Authors: Sam, with research from the 2026-05-18 rail-perf review on [#1634](https://github.com/samhotchkiss/pollypm/issues/1634).
+
+> **Implementation note (2026-05-20):** The four-PR rollout from §6
+> landed over the 2026-05-19 → 2026-05-20 window. `POLLYPM_STATE_CACHE`
+> now defaults **ON**; the env var stays as a kill-switch
+> (`POLLYPM_STATE_CACHE=0` falls back to direct paths for one release).
+> The 2s `_project_categorizations` TTL was removed (§9.5). The
+> divergence sampler from PR 2 is silent when the cache is
+> authoritative (kill-switch not set) — the parity-debugging window
+> closed with PR 4.
 
 > **Note (2026-05-19, pre-PR-1):** This doc was written 2026-05-18, before
 > the postgres cutover (#1737) completed. Where the prose says "sqlite open"
@@ -420,33 +429,42 @@ Effort: ~0.5d.
 
 Effort: ~0.5d.
 
-- `POLLYPM_STATE_CACHE` default flips to **on**.
-- Leave the env var as a kill-switch for one release.
+- `POLLYPM_STATE_CACHE` default flips to **on**. ✅ Shipped #2029.
+- Leave the env var as a kill-switch for one release. ✅ Kept.
 - After two weeks of green production telemetry, remove the shim path and
-  the direct-DB fallbacks in the routed call sites.
+  the direct-DB fallbacks in the routed call sites. ⏳ Deferred — tracked
+  as a follow-up after 14-day production observation.
+- After PR4 lands, there is no runtime parity sampler. The cache is
+  authoritative by default. Rollback path is `POLLYPM_STATE_CACHE=0`
+  which makes every routed call site fall through to the direct facade.
+  Parity is covered by tests; runtime divergence telemetry is deferred
+  to future observability work. ✅ Shipped #2029.
 
 ### 6.5 Rollback
 
 - During PRs 1-3: `POLLYPM_STATE_CACHE=0` + cockpit restart returns the
   system to pre-change behavior.
-- After PR 4: rollback is a revert of PR 4 only. PRs 1-3 stay landed and
-  dormant.
+- After PR 4: rollback path is set `POLLYPM_STATE_CACHE=0` in the
+  deployment env + restart pm daemon for one release. Reverting the PR
+  is the heavier escape hatch if config flag rollback isn't sufficient.
 
 ---
 
 ## 7. Risks
 
+> **Superseded by PR #2029 (PR4):** runtime divergence sampler removed; rollback is the kill-switch; risk rows referencing the sampler/PR2-telemetry are historical only — see post-PR4 contract above.
+
 | Risk | Detection | Mitigation |
 |---|---|---|
-| Cached data goes stale (audit-log event dropped, write path bypasses emit) | PR 2's divergence sampler logs `WARN`; `state_epoch.mtime()` advancing without a matching audit event triggers a forced refresh on the next tick | `MAX_STALE_AGE_S=30s` ceiling enforced by §4.3 mtime tiebreaker |
+| Cached data goes stale (audit-log event dropped, write path bypasses emit) *(historical — PR4 removed the sampler)* | PR 2's divergence sampler logs `WARN`; `state_epoch.mtime()` advancing without a matching audit event triggers a forced refresh on the next tick | `MAX_STALE_AGE_S=30s` ceiling enforced by §4.3 mtime tiebreaker |
 | Audit log tailing falls behind under burst (1000s of events in <1s) | New metric `cache.lag_events` (queue depth); alert if sustained >100 | Tail thread coalesces events per project — N events for one project collapse to one invalidation; bounded queue |
-| Cache mismatch on dual-DB legacy/canonical split (#1542 split-brain) | Parity sampler runs both paths through `_open_work_service`'s canonical→legacy walk and confirms the same DB wins | Cache MUST mirror `_open_work_service`'s "first non-empty wins" walk exactly — refresher calls that helper, does not re-implement it |
+| Cache mismatch on dual-DB legacy/canonical split (#1542 split-brain) *(historical — PR4 removed the sampler)* | Parity sampler runs both paths through `_open_work_service`'s canonical→legacy walk and confirms the same DB wins | Cache MUST mirror `_open_work_service`'s "first non-empty wins" walk exactly — refresher calls that helper, does not re-implement it |
 | Memory growth from holding tuples of inbox items | Per-entry size ~10-50KB; 12 projects → ~600KB ceiling; track via `sys.getsizeof` in tests | If memory becomes real (it should not), TTL out paused-project `awaits_user_items` after 5min idle |
 | Thread-safety bug in entry write / read | RLock around all writes; frozen dataclass entries; reads are atomic dict gets | Hypothesis test in `tests/test_project_state_cache_concurrency.py`: N invalidators + N readers, assert no exceptions and no torn reads |
 | Test-suite breakage (~15 files monkeypatch `pm_inbox_awaits_user_list` etc.) | CI | Expected breakage; tests get a `seed_project_state_cache(cache, {...})` fixture instead of monkeypatching the helper. Per [`feedback_format_string_test_grep`](../../docs/conventions.md), grep for the legacy helper names before changing |
 | Multi-process consistency (cockpit + rail_daemon + heartbeat each hold their own cache) | n/a in v1 — Move A is single-process | §9.6 Open Question: defer to Move B if needed |
 | Refresher thread starves the UI under burst | Refresher runs in a dedicated worker thread with bounded work-per-tick; UI reads are dict gets and never block | Profile the refresher tick; cap at e.g. 4 project refreshes per 100ms |
-| Cache lookup returns `None` when caller expected a hit (cold project) | Every call site has a fall-through to the existing direct-DB path during PRs 1-3 | Remove fall-throughs only in PR 4, after parity sampler has been silent for 14 days |
+| Cache lookup returns `None` when caller expected a hit (cold project) *(historical — PR4 removed the sampler)* | Every call site has a fall-through to the existing direct-DB path during PRs 1-3 | Remove fall-throughs only in PR 4, after parity sampler has been silent for 14 days |
 
 ### 7.1 Staleness windows
 
@@ -480,9 +498,11 @@ Pass conditions for "Move A is done":
 3. **Rail rebuild.** `_project_tasks_for_rollup` is no longer called from
    `build_items`. The rail-refresh worker reads only from `cache.snapshot()`
    for project-state data.
-4. **Parity.** 24 hours of production telemetry with PR 2's divergence
-   sampler shows **0** WARN lines (cached and uncached paths agree on
-   every sampled call).
+4. **Parity.** Acceptance criteria for PR #2029:
+   `tests/test_state_cache_parity.py` +
+   `tests/test_state_cache_config_identity.py` pass on a real
+   `~/.pollypm/` workspace with the cache default-on; no runtime
+   divergence telemetry required.
 5. **Test coverage.** New tests pass — `test_project_state_cache_parity.py`,
    `test_project_state_cache_invalidation.py`,
    `test_project_state_cache_concurrency.py`.

@@ -272,10 +272,16 @@ class TestScanPollypmHome:
 
     def test_cap_hit_flags_unbounded(self, tmp_path, monkeypatch):
         """When snapshots/ blows past the cap, NOTES gets the warning."""
-        from pollypm.cli_features import storage as storage_mod
+        # PR #2054 round 2: scanner internals moved to the neutral
+        # ``pollypm.storage_report`` module so the web API can consume
+        # them without dragging the Typer CLI in. The cap constant is
+        # bound at import time inside ``scan_pollypm_home``, so we
+        # patch the canonical location (the CLI re-export is a static
+        # name and patching it has no effect on the scanner).
+        from pollypm import storage_report as storage_mod
 
         # Lower the cap so the test runs fast.
-        monkeypatch.setattr(storage_mod, "_SCAN_FILE_CAP", 5)
+        monkeypatch.setattr(storage_mod, "SCAN_FILE_CAP", 5)
         home = _make_home(tmp_path)
         report = scan_pollypm_home(home)
         by_name = {row.name: row for row in report.rows}

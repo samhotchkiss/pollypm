@@ -397,6 +397,56 @@ class Event(BaseModel):
     model_config = {"populate_by_name": True}
 
 
+# ---------------------------------------------------------------------------
+# Storage (Phase 2 §12) — disk-usage report for ~/.pollypm/.
+# ---------------------------------------------------------------------------
+
+
+class StorageEntry(BaseModel):
+    """One row of the storage report — totals for a single subdir.
+
+    Mirrors :class:`pollypm.cli_features.storage.DirScan` on the wire.
+    ``cap_hit=True`` means the scan stopped early at the
+    ``_SCAN_FILE_CAP`` guard (snapshots/ only today) and ``files`` /
+    ``bytes`` are lower bounds; NOTES carries the human-facing flag.
+    """
+
+    name: str
+    files: int = 0
+    bytes: int = 0
+    oldest_mtime: datetime | None = None
+    newest_mtime: datetime | None = None
+    cap_hit: bool = False
+    note: str = ""
+
+
+class StorageConfigFiles(BaseModel):
+    """Top-level ``~/.pollypm/*`` config files (TOML, state.db, pid, …).
+
+    Separated from subdirs on the report so the bytes column doesn't
+    distort the sort order — mirrors the CLI's ``config files`` row.
+    """
+
+    files: int = 0
+    bytes: int = 0
+    newest_mtime: datetime | None = None
+
+
+class StorageReport(BaseModel):
+    """Whole ``~/.pollypm/`` storage report.
+
+    Mirrors ``pm storage report --json`` (#2040). Phase 2 §12 keeps
+    prune off-API; this surface is read-only.
+    """
+
+    home: str
+    generated_at: datetime
+    total_files: int = 0
+    total_bytes: int = 0
+    subdirs: list[StorageEntry] = Field(default_factory=list)
+    config_files: StorageConfigFiles = Field(default_factory=StorageConfigFiles)
+
+
 __all__ = [
     "ActionResult",
     "Artifact",
@@ -423,6 +473,9 @@ __all__ = [
     "ProjectActivityEntry",
     "ProjectDrilldown",
     "ProjectListResponse",
+    "StorageConfigFiles",
+    "StorageEntry",
+    "StorageReport",
     "TaskDetail",
     "TaskListResponse",
     "TaskRelationships",

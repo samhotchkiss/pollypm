@@ -73,6 +73,11 @@ tags:
       restart / pause / resume actions for one session at a time.
       Per-task worker surfaces live under `Chat` — this surface only
       covers the static launch plan from `[sessions]` config.
+  - name: Storage
+    description: |
+      Read-only ~/.pollypm/ disk-usage report. Mirrors
+      `pm storage report --json` (#2040). Prune is CLI-only per the
+      Phase 2 spec — no DELETE / POST endpoints here.
 
 paths:
   /health:
@@ -1281,6 +1286,81 @@ paths:
           description: |
             Filesystem error while writing the pause marker
             (`code=service_unavailable`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /storage:
+    get:
+      tags: [Storage]
+      operationId: getStorageReport
+      summary: ~/.pollypm/ disk-usage report
+      description: |
+        Returns the whole-home storage report — every canonical subdir
+        of `~/.pollypm/` (snapshots, transcripts, homes, agent_homes,
+        worktrees, audit, artifacts, checkpoints, dossier, logs) plus a
+        rollup of top-level config files (`pollypm.toml`, `state.db`,
+        etc.).
+
+        Mirrors `pm storage report --json` (#2040). The scan is
+        eventually-consistent: a file written mid-walk may surface as a
+        partial size on this response.
+
+        A non-existent `~/.pollypm/` is a normal mode (fresh install
+        or alternate `base_dir`) — the endpoint returns `200` with an
+        empty `subdirs` list and zero totals, not `503`.
+
+        Per the Phase 2 spec §12.2 there is **no** prune endpoint;
+        deletion stays CLI-only (`pm storage prune`).
+      responses:
+        "200":
+          description: Storage report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageReport"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Storage tree scan failed (mid-request unmount, etc).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /storage/{subdir}:
+    parameters:
+      - in: path
+        name: subdir
+        required: true
+        schema: { type: string }
+        description: |
+          One of the canonical `~/.pollypm/` subdir names: `snapshots`,
+          `transcripts`, `homes`, `agent_homes`, `worktrees`, `audit`,
+          `artifacts`, `checkpoints`, `dossier`, `logs`.
+    get:
+      tags: [Storage]
+      operationId: getStorageSubdir
+      summary: Single ~/.pollypm/ subdir slice
+      description: |
+        Returns one row of the storage report — same shape as the
+        entries in `StorageReport.subdirs[]`. Restricted to the
+        canonical subdir list; arbitrary user paths are not accepted
+        (use `GET /api/v1/storage` for the whole-home view).
+      responses:
+        "200":
+          description: Subdir scan.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StorageEntry"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Storage tree scan failed.
           content:
             application/json:
               schema:
@@ -2723,3 +2803,76 @@ components:
             heuristic: Claude shows `⏺` / "Working"; Codex shows
             "working (...) esc to interrupt"). Used by POST
             /sessions/{name}/restart as the `unsafe_mid_turn` gate.
+
+    # ---- Storage ----------------------------------------------------
+    StorageEntry:
+      type: object
+      required: [name, files, bytes, cap_hit, note]
+      description: |
+        One row of the storage report — totals for a single `~/.pollypm/`
+        subdir. When `cap_hit` is true, the scan stopped early at the
+        50k-file safety cap (snapshots/ only today) and `files` / `bytes`
+        are lower bounds.
+      properties:
+        name:
+          type: string
+          description: Subdir name (relative to `~/.pollypm/`).
+        files:
+          type: integer
+          description: File count walked under this subdir (lower bound when `cap_hit`).
+        bytes:
+          type: integer
+          description: Sum of file sizes in bytes (lower bound when `cap_hit`).
+        oldest_mtime:
+          type: string
+          format: date-time
+          nullable: true
+        newest_mtime:
+          type: string
+          format: date-time
+          nullable: true
+        cap_hit:
+          type: boolean
+          description: True iff the scan stopped at the file-count cap.
+        note:
+          type: string
+          description: Human-facing NOTES badge (unbounded-growth flag, orphan worktrees, audit rotation, etc.).
+
+    StorageConfigFiles:
+      type: object
+      required: [files, bytes]
+      description: |
+        Rollup of top-level `~/.pollypm/*` config artifacts (TOML,
+        `state.db`, `*.pid`, `errors.log`, etc.) — separated from the
+        subdir rows so they don't distort sort order.
+      properties:
+        files: { type: integer }
+        bytes: { type: integer }
+        newest_mtime:
+          type: string
+          format: date-time
+          nullable: true
+
+    StorageReport:
+      type: object
+      required: [home, generated_at, total_files, total_bytes, subdirs, config_files]
+      description: |
+        Whole `~/.pollypm/` storage report. Mirrors the JSON form of
+        `pm storage report` (#2040).
+      properties:
+        home:
+          type: string
+          description: Absolute path of the scanned home directory.
+        generated_at:
+          type: string
+          format: date-time
+        total_files:
+          type: integer
+        total_bytes:
+          type: integer
+        subdirs:
+          type: array
+          items:
+            $ref: "#/components/schemas/StorageEntry"
+        config_files:
+          $ref: "#/components/schemas/StorageConfigFiles"

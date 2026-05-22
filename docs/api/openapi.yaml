@@ -893,17 +893,33 @@ paths:
       summary: Selective task edits (labels, status, metadata)
       description: |
         Partial update — every field is optional. Lists replace, not
-        merge (spec §5.4). `status` is mapped to the matching
-        lifecycle method (`queued` → `svc.queue`, `cancelled` →
-        `svc.cancel`); other statuses raise `422 validation_error`
-        with a hint pointing to the dedicated transition endpoint.
-        `metadata` is stored as the task's `external_refs` map.
-        Labels + metadata land in a single atomic `svc.update(...)`
-        call; an illegal `status` transition is rejected up front so
-        labels/metadata are NOT half-committed. `Idempotency-Key` and
-        `If-Match` are intentionally NOT accepted — no replay cache
-        or version-token enforcement exists yet (#2064 round-1,
-        mirrors #2060).
+        merge (spec §5.4). `metadata` is stored as the task's
+        `external_refs` map.
+
+        **PATCH cannot combine `status` with other fields.** Requests
+        that send `status` together with `labels` or `metadata` are
+        rejected with `400 invalid_request` BEFORE any write occurs.
+        This narrows the contract so each PATCH is naturally atomic:
+        a status-only PATCH routes through the work-service lifecycle
+        method (`queued` → `svc.queue`, `cancelled` → `svc.cancel`)
+        as a single transaction, and a field-only PATCH (labels
+        and/or metadata) lands in one `svc.update(...)` call. The
+        combined shape was racy under concurrent writers — a status
+        flip between the preflight and the lifecycle call could
+        leave labels committed while the status write 409'd
+        (#2064 round-2).
+
+        Clients that need to change status alongside other fields
+        must send separate PATCH requests, or use the dedicated
+        status endpoints (`/queue`, `/cancel`, `/claim`,
+        `/reassign`). `status` values without a direct PATCH→lifecycle
+        map (e.g. `in_progress`, `review`) raise `422
+        validation_error` with a hint pointing to the dedicated
+        transition endpoint.
+
+        `Idempotency-Key` and `If-Match` are intentionally NOT
+        accepted — no replay cache or version-token enforcement
+        exists yet (#2064, mirrors #2060).
       requestBody:
         required: true
         content:
@@ -918,6 +934,8 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/TaskActionResult"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
         "404":

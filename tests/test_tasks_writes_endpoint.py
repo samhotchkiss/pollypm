@@ -580,83 +580,167 @@ def test_patch_multiple_fields_one_request(
     assert body["task"]["external_refs"] == {"ref": "ABC-1"}
 
 
-def test_patch_atomic_rollback_on_partial_failure(
+# ---------------------------------------------------------------------------
+# PATCH atomicity contract (#2064 round-2)
+# ---------------------------------------------------------------------------
+#
+# Codex round-2 caught that combining ``status`` with labels/metadata
+# in a single PATCH is racy: ``svc.update`` (labels/metadata) and the
+# lifecycle methods (``svc.queue`` / ``svc.cancel``) commit in
+# separate transactions, so a concurrent writer can flip the status
+# between an in-memory preflight and the lifecycle call — leaving
+# labels/metadata committed while the status write 409s. Round-2 fix:
+# refuse the combined shape with ``400 invalid_request`` at the route
+# layer BEFORE any work-service call. Each PATCH is now naturally
+# atomic (status-only → one lifecycle call; field-only → one
+# ``svc.update`` call).
+
+
+def test_patch_rejects_status_combined_with_labels(
     client, auth_headers, task_store
 ) -> None:
-    """Multi-field PATCH whose status transition fails MUST NOT mutate labels.
+    """PATCH with ``status`` + ``labels`` → 400 invalid_request."""
+    _seed(task_store, n=14, work_status=WorkStatus.DRAFT, labels=["original"])
+    response = client.patch(
+        "/api/v1/tasks/myproj/14",
+        headers=auth_headers,
+        json={"status": "queued", "labels": ["new"]},
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "status" in body["error"]["message"].lower()
+    assert "labels" in body["error"]["message"].lower()
+    # Hint should point at the workarounds.
+    hint = (body["error"].get("hint") or "").lower()
+    assert "separate" in hint or "/queue" in hint
 
-    Regression for #2064 round-1 Codex P0: PATCH with labels + an
-    illegal status transition used to commit the labels first, then
-    409 on the status write — leaving labels mutated. The fix
-    preflights the transition against the in-memory task BEFORE any
-    write, so a 409 leaves labels (and external_refs) untouched.
 
-    Reproduction matches the Codex repro:
-        labels=['new'] + status='queued' on an in_progress task.
+def test_patch_rejects_status_combined_with_metadata(
+    client, auth_headers, task_store
+) -> None:
+    """PATCH with ``status`` + ``metadata`` → 400 invalid_request."""
+    _seed(task_store, n=15, work_status=WorkStatus.DRAFT, external_refs={})
+    response = client.patch(
+        "/api/v1/tasks/myproj/15",
+        headers=auth_headers,
+        json={"status": "queued", "metadata": {"jira": "X-1"}},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_request"
 
-    ``svc.queue`` only accepts ``draft``, so this transition is
-    refused. The labels write must NOT happen.
+
+def test_patch_status_only_routes_to_queue(
+    client, auth_headers, task_store
+) -> None:
+    """Status-only PATCH on a draft task → calls ``svc.queue``, returns 200."""
+    seeded = _seed(task_store, n=16, work_status=WorkStatus.DRAFT)
+    response = client.patch(
+        "/api/v1/tasks/myproj/16",
+        headers=auth_headers,
+        json={"status": "queued"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["task"]["work_status"] == "queued"
+    # The lifecycle method actually fired (not just a no-op pass-through).
+    assert seeded.work_status == WorkStatus.QUEUED
+
+
+def test_patch_fields_only_is_atomic(client, auth_headers, task_store) -> None:
+    """Field-only PATCH → single ``svc.update(...)`` call carrying both fields.
+
+    Spy on the fake work-service's ``update`` method to assert exactly
+    ONE call lands with BOTH ``labels`` and ``external_refs`` in the
+    same kwargs dict — the contract that makes the write atomic at the
+    DB layer (``PgWorkService.update`` batches into one UPDATE).
+    """
+    _seed(task_store, n=17, labels=["old"], external_refs={"k": "v0"})
+
+    from pollypm.work import factory as work_factory
+
+    update_calls: list[dict[str, object]] = []
+    real_factory = work_factory.create_work_service
+
+    def _spy_factory(**kwargs):
+        svc = real_factory(**kwargs)
+        real_update = svc.update
+
+        def _recording_update(task_id, **fields):
+            update_calls.append({"task_id": task_id, "fields": dict(fields)})
+            return real_update(task_id, **fields)
+
+        svc.update = _recording_update  # type: ignore[method-assign]
+        return svc
+
+    import pollypm.work.factory as wf
+
+    orig = wf.create_work_service
+    wf.create_work_service = _spy_factory
+    try:
+        response = client.patch(
+            "/api/v1/tasks/myproj/17",
+            headers=auth_headers,
+            json={
+                "labels": ["new"],
+                "metadata": {"k": "v1", "ref": "ABC-1"},
+            },
+        )
+    finally:
+        wf.create_work_service = orig
+
+    assert response.status_code == 200, response.text
+    assert len(update_calls) == 1, (
+        f"expected exactly one svc.update call (atomic batch); "
+        f"got {len(update_calls)}: {update_calls}"
+    )
+    fields = update_calls[0]["fields"]
+    assert "labels" in fields and "external_refs" in fields, (
+        "both labels and external_refs must land in the same update "
+        f"call for atomicity; got: {fields}"
+    )
+    assert fields["labels"] == ["new"]
+    assert fields["external_refs"] == {"k": "v1", "ref": "ABC-1"}
+
+
+def test_patch_no_partial_commit_on_status_combined(
+    client, auth_headers, task_store
+) -> None:
+    """Combined-shape rejection happens BEFORE any mutation.
+
+    The route layer must short-circuit on the 400 BEFORE opening a
+    work-service or calling ``svc.update`` / lifecycle methods. Seed a
+    task in a state where the status transition WOULD succeed
+    (draft → queued) so that, if the rejection accidentally landed
+    after the field write, the labels would silently change. The 400
+    guarantees neither side commits.
     """
     seeded = _seed(
         task_store,
-        n=14,
-        work_status=WorkStatus.IN_PROGRESS,
+        n=18,
+        work_status=WorkStatus.DRAFT,
         labels=["original"],
         external_refs={"keep": "me"},
     )
     response = client.patch(
-        "/api/v1/tasks/myproj/14",
+        "/api/v1/tasks/myproj/18",
         headers=auth_headers,
         json={
-            "labels": ["new"],
+            "labels": ["clobber"],
             "metadata": {"jira": "X-1"},
             "status": "queued",
         },
     )
-    assert response.status_code == 409, response.text
-    assert response.json()["error"]["code"] == "invalid_state"
-    # Labels + metadata MUST be unchanged in the store.
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_request"
+    # Nothing changed in the store.
     assert seeded.labels == ["original"], (
-        "labels were mutated despite the status transition failing; "
-        "PATCH is not atomic (#2064 regression)."
+        "labels mutated despite the combined-shape rejection; the 400 "
+        "must short-circuit BEFORE any work-service write."
     )
-    assert seeded.external_refs == {"keep": "me"}, (
-        "external_refs were mutated despite the status transition "
-        "failing; PATCH is not atomic (#2064 regression)."
-    )
-    # The work_status must also be unchanged (we never called queue).
-    assert seeded.work_status == WorkStatus.IN_PROGRESS
-
-
-def test_patch_unsupported_status_does_not_mutate_other_fields(
-    client, auth_headers, task_store
-) -> None:
-    """Unsupported PATCH status target (422) MUST NOT mutate labels.
-
-    Companion to ``test_patch_atomic_rollback_on_partial_failure``:
-    even before reaching the work-service, an unsupported status
-    (e.g. ``in_progress``) returns 422. Labels/metadata must not be
-    pre-written speculatively.
-    """
-    seeded = _seed(
-        task_store,
-        n=15,
-        work_status=WorkStatus.QUEUED,
-        labels=["keep"],
-        external_refs={"x": "1"},
-    )
-    response = client.patch(
-        "/api/v1/tasks/myproj/15",
-        headers=auth_headers,
-        json={
-            "labels": ["clobber"],
-            "metadata": {"y": "2"},
-            "status": "review",
-        },
-    )
-    assert response.status_code == 422, response.text
-    assert seeded.labels == ["keep"]
-    assert seeded.external_refs == {"x": "1"}
+    assert seeded.external_refs == {"keep": "me"}
+    assert seeded.work_status == WorkStatus.DRAFT
 
 
 def test_patch_nonexistent_task_returns_404(client, auth_headers) -> None:

@@ -1483,49 +1483,6 @@ _PATCH_STATUS_TO_METHOD: dict[str, str] = {
 }
 
 
-def _preflight_status_transition(
-    current_status: str, target_status: str
-) -> None:
-    """Reject illegal PATCH ``status`` transitions BEFORE any writes.
-
-    The PATCH atomicity contract (#2064 round-1): all-or-nothing across
-    labels + metadata + status. The status lifecycle methods (``queue``,
-    ``cancel``) each commit their own row update, so we MUST gate them
-    in memory before touching any other column — otherwise a 409 from
-    the status transition would leave the earlier ``svc.update(labels=...)``
-    already committed.
-
-    Raises ``APIError(409, invalid_state)`` if the transition would be
-    rejected by the lifecycle method. Only validates the rules that
-    ``svc.queue`` / ``svc.cancel`` themselves enforce — the actual
-    side-effects still run inside the work-service and may surface
-    additional gate failures we can't preflight (claim-cascade etc.),
-    but those don't apply to queue/cancel which are pure status flips.
-    """
-    if target_status == "queued":
-        # ``svc.queue`` only accepts ``draft`` (single transition).
-        if current_status != "draft":
-            raise APIError(
-                status_code=409,
-                code="invalid_state",
-                message=(
-                    f"Cannot queue task in {current_status!r} state. "
-                    "Only draft tasks can be queued."
-                ),
-            )
-    elif target_status == "cancelled":
-        # ``svc.cancel`` refuses terminal states.
-        if current_status in {"done", "cancelled"}:
-            raise APIError(
-                status_code=409,
-                code="invalid_state",
-                message=(
-                    f"Cannot cancel task in terminal state "
-                    f"{current_status!r}."
-                ),
-            )
-
-
 def patch_task(
     config: PollyPMConfig,
     project_key: str,
@@ -1538,16 +1495,29 @@ def patch_task(
 ) -> APITaskDetail:
     """Selective edits — labels / status / metadata.
 
-    Applies provided fields atomically: labels + metadata land in a
-    single ``svc.update(...)`` call (one DB transaction), and the
-    ``status`` transition is preflighted in memory before any writes
-    so a 409 from the lifecycle method doesn't leave labels/metadata
-    half-committed. ``status`` is mapped to the matching lifecycle
-    method (``queue``, ``cancel``) when supported; everything else
-    (in_progress / review / on_hold / etc.) returns 422 with a hint
-    to the dedicated transition endpoint. ``metadata`` is stored as
-    ``external_refs`` (the existing free-form per-task key/value
-    surface).
+    Atomicity contract (#2064 round-2): the route layer refuses any
+    request that combines ``status`` with ``labels`` / ``metadata``
+    (returns ``400 invalid_request``) BEFORE this helper is called.
+    That means each invocation here is one of two shapes:
+
+    1. **Status-only PATCH** → routed through the matching lifecycle
+       method (``svc.queue`` / ``svc.cancel``). A single work-service
+       call, single DB write — naturally atomic.
+    2. **Field-only PATCH** (labels and/or metadata) → one
+       ``svc.update(...)`` call, batched into one ``UPDATE`` row
+       statement by ``PgWorkService.update`` — naturally atomic.
+
+    The previous in-memory preflight that gated labels+status across
+    two service calls was racy under concurrent writers (the task's
+    status could flip between preflight and the lifecycle call,
+    leaving labels committed and the status write 409'ing). The
+    narrowed contract above removes the racy code path entirely.
+
+    ``status`` is mapped to the matching lifecycle method (``queue``,
+    ``cancel``) when supported; everything else (in_progress /
+    review / on_hold / etc.) returns 422 with a hint to the dedicated
+    transition endpoint. ``metadata`` is stored as ``external_refs``
+    (the existing free-form per-task key/value surface).
     """
     from pollypm.work.factory import create_work_service
     from pollypm.work.service_support import (
@@ -1596,28 +1566,18 @@ def patch_task(
         ) as svc:
             # Confirm task exists up-front so empty-PATCH still 404s.
             try:
-                current = svc.get(task_id)
+                svc.get(task_id)
             except _BACKING_STORE_ERRORS:
                 raise
             except Exception as exc:  # noqa: BLE001
                 raise not_found(f"Task not found: {task_id}") from exc
 
-            # Atomicity gate (#2064 round-1): preflight the status
-            # transition against the in-memory task BEFORE any writes
-            # so a 409 doesn't leave labels/metadata half-committed.
-            if status is not None:
-                current_status = (
-                    current.work_status.value
-                    if hasattr(current.work_status, "value")
-                    else str(current.work_status)
-                )
-                _preflight_status_transition(current_status, status)
-
-            # Labels + metadata land in ONE ``svc.update(...)`` call so
-            # they share a single DB transaction. ``PgWorkService.update``
-            # already batches set-clauses into a single UPDATE; combining
-            # the calls here prevents the labels-commit-then-metadata-
-            # fails partial-write window.
+            # Field-only PATCH: labels and/or metadata land in ONE
+            # ``svc.update(...)`` call so they share a single DB
+            # transaction. ``PgWorkService.update`` batches set-clauses
+            # into a single UPDATE; combining the fields here prevents
+            # any labels-commit-then-metadata-fails partial-write
+            # window. Cannot coexist with ``status`` (route-layer 400).
             combined_fields: dict[str, object] = {}
             if labels is not None:
                 combined_fields["labels"] = labels
@@ -1638,10 +1598,10 @@ def patch_task(
                         ),
                     ) from exc
 
-            # Status: lifecycle method (queue/cancel). Preflighted above,
-            # but the work-service may still raise (e.g. row vanished
-            # between get + write, or a future gate the preflight
-            # doesn't know about); keep the translation in place.
+            # Status-only PATCH: route through the lifecycle owner
+            # (``svc.queue`` / ``svc.cancel``). One service call, one
+            # DB write — atomic. The route layer guarantees this
+            # branch never coexists with a labels/metadata write.
             if status is not None:
                 method_name = _PATCH_STATUS_TO_METHOD[status]
                 try:

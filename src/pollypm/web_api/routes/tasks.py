@@ -24,7 +24,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query
 
-from pollypm.web_api.errors import APIError, not_found
+from pollypm.web_api.errors import APIError, invalid_request, not_found
 from pollypm.web_api.models import (
     ActionResult,
     TaskActionResult,
@@ -280,6 +280,12 @@ def reassign_task_endpoint(
     summary="Selective task edits (labels, status, metadata)",
     operation_id="patchTask",
     responses={
+        "400": {
+            "description": (
+                "Cannot combine `status` with other mutable fields in a "
+                "single PATCH."
+            ),
+        },
         "401": {"description": "Missing or invalid bearer token."},
         "404": {"description": "Project or task not found."},
         "409": {"description": "Status transition refused by the state machine."},
@@ -294,6 +300,32 @@ def patch_task_endpoint(
 ) -> TaskActionResult:
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
+    # Atomicity contract (#2064 round-2): PATCH cannot combine
+    # ``status`` with labels/metadata. ``svc.update(...)`` and the
+    # lifecycle methods (``svc.queue`` / ``svc.cancel``) commit in
+    # separate transactions, so a concurrent writer can flip the
+    # task's status between the in-memory preflight and the
+    # lifecycle call — leaving labels/metadata committed while the
+    # status write 409s. Refuse the combined shape up front; clients
+    # should send one PATCH per concern, or use the dedicated
+    # ``/queue`` / ``/cancel`` / ``/claim`` / ``/reassign`` endpoints
+    # for status changes. Rejecting BEFORE any work-service call
+    # guarantees no partial commit.
+    if body.status is not None and (
+        body.labels is not None or body.metadata is not None
+    ):
+        raise invalid_request(
+            (
+                "PATCH cannot combine `status` with `labels` or "
+                "`metadata` in a single request."
+            ),
+            hint=(
+                "Send separate PATCH requests (one for status, one "
+                "for the other fields), or use the dedicated status "
+                "endpoints (POST /tasks/{project}/{n}/queue, /cancel, "
+                "/claim, /reassign)."
+            ),
+        )
     task = patch_task(
         config,
         project,

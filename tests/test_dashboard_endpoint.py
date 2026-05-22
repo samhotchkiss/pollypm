@@ -635,6 +635,75 @@ def test_dashboard_daemon_status_reflects_unfiltered_sessions(
     assert body["daemon_status"] == "up"
 
 
+def test_dashboard_daemon_status_down_when_only_unknown_sessions(
+    client, auth_headers, patch_gather, patch_list_projects,
+):
+    """Regression for Codex round-2 review on PR #2057.
+
+    ``dashboard_data.gather`` appends a ``SessionActivity`` for every
+    planned launch in ``config.projects`` regardless of whether a
+    runtime row exists in pg — when no runtime is found, the row is
+    stamped with the synthetic ``status="unknown"`` sentinel. On a
+    configured workspace with the supervisor down, ``active_sessions``
+    is therefore non-empty even though the daemon is genuinely down.
+    ``daemon_status`` must look past the placeholder rows and only
+    treat real runtime-backed statuses as ``"up"``.
+    """
+    patch_list_projects([_api_project("myproj")])
+    patch_gather(_make_data(
+        active_sessions=[
+            # Only synthetic "unknown" placeholder rows — no runtime
+            # records in pg, daemon is down.
+            SessionActivity(
+                name="myproj-operator", role="operator", project="myproj",
+                project_label="My Project", status="unknown",
+                description="unknown", age_seconds=0.0,
+            ),
+            SessionActivity(
+                name="myproj-worker", role="worker", project="myproj",
+                project_label="My Project", status="unknown",
+                description="unknown", age_seconds=0.0,
+            ),
+        ],
+    ))
+
+    body = client.get("/api/v1/dashboard", headers=auth_headers).json()
+    # The placeholder rows pass through (the cockpit panel shows them
+    # too), but daemon_status must reflect liveness, not list-length.
+    assert len(body["active_sessions"]) == 2
+    assert body["daemon_status"] == "down"
+
+
+def test_dashboard_daemon_status_up_when_mixed_unknown_and_live(
+    client, auth_headers, patch_gather, patch_list_projects,
+):
+    """A single live runtime row is enough to flip daemon_status="up",
+    even when surrounded by synthetic ``unknown`` placeholders for
+    other configured-but-not-running sessions.
+    """
+    patch_list_projects([
+        _api_project("myproj"),
+        _api_project("otherproj"),
+    ])
+    patch_gather(_make_data(
+        active_sessions=[
+            SessionActivity(
+                name="myproj-operator", role="operator", project="myproj",
+                project_label="My Project", status="unknown",
+                description="unknown", age_seconds=0.0,
+            ),
+            SessionActivity(
+                name="otherproj-worker", role="worker", project="otherproj",
+                project_label="Other Project", status="healthy",
+                description="idle", age_seconds=5.0,
+            ),
+        ],
+    ))
+
+    body = client.get("/api/v1/dashboard", headers=auth_headers).json()
+    assert body["daemon_status"] == "up"
+
+
 def test_dashboard_account_usages_passthrough(
     client, auth_headers, patch_gather, patch_list_projects,
 ):

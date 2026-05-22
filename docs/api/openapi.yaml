@@ -304,9 +304,16 @@ paths:
           status; it is NOT a 503.
         - A transient pg / work-service outage that breaks the gather
           surfaces as `503 service_unavailable` so clients retry.
-        - `?project=<key>` narrows the project list, rollup counters,
-          and the per-project rows (commits, sessions, messages) to
-          one project — useful for the per-project drilldown view.
+        - `?project=<key>` narrows the response to one project. The
+          project list and per-project rows (sessions, commits,
+          completed items, recent messages) are scoped to that key,
+          along with the three project-derived rollup counters
+          (`tracked_count`, `open_inbox_count`, `pending_plan_reviews`).
+          The four global activity counters (`alert_count`,
+          `sweep_count_24h`, `message_count_24h`, `recovery_count_24h`)
+          and `daemon_status` remain workspace-wide. See the
+          `scoped_fields` array in the response for the authoritative
+          enumeration of which fields were narrowed.
       parameters:
         - in: query
           name: project

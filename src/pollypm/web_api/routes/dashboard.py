@@ -349,10 +349,25 @@ def get_dashboard_endpoint(
     # Derive daemon health from the UNFILTERED gather result. This is a
     # system-wide signal — a caller polling ``?project=foo`` must still
     # see ``daemon_status="up"`` when the supervisor is healthy and the
-    # only live sessions happen to be on ``bar``. Reordered above the
+    # only live sessions happen to be on ``bar``. Computed above the
     # per-project list slice below so the filter cannot mask supervisor
     # state.
-    daemon_status = "up" if data.active_sessions else "down"
+    #
+    # We can't use ``bool(data.active_sessions)`` directly: ``gather``
+    # appends a ``SessionActivity`` for every planned launch in
+    # ``config.projects`` (see ``dashboard_data.gather`` around L823),
+    # and rows with no matching ``runtime_map`` entry are stamped with
+    # the synthetic ``status="unknown"`` sentinel. On a configured
+    # workspace with the supervisor down and no runtime rows in pg, the
+    # active-sessions list is still non-empty — so list-truthiness would
+    # report ``daemon_status="up"`` while the daemon is genuinely down
+    # (Codex review on #2057). Only rows whose status came from a real
+    # runtime record (anything other than ``"unknown"``) count as live.
+    daemon_status = (
+        "up"
+        if any(s.status != "unknown" for s in data.active_sessions)
+        else "down"
+    )
 
     # Narrow per-project lists when ?project= is set so the response is
     # self-consistent (a caller filtering to one project shouldn't see

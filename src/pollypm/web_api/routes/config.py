@@ -71,13 +71,43 @@ _SECRET_NAME_SUBSTRINGS: tuple[str, ...] = (
     # Codex round-2 P0 on PR #2056: real env credentials whose key
     # names lack "token"/"secret"/"api_key" still need redaction.
     # ``access_key`` catches ``AWS_ACCESS_KEY_ID`` / ``*_ACCESS_KEY``;
-    # ``pat`` catches ``GITHUB_PAT`` / personal access tokens; ``dsn``
-    # and ``database_url`` cover DSN-style connection strings whose
-    # value-shape check might miss query-only password forms.
+    # ``dsn`` and ``database_url`` cover DSN-style connection strings
+    # whose value-shape check might miss query-only password forms.
+    # NOTE: ``pat`` is intentionally NOT in this substring list — it
+    # falsely flags ordinary path keys (``path``, ``project_path``,
+    # ``config_path``). PAT detection lives in
+    # :data:`_SECRET_EXACT_NAMES_LOWER` (exact match) and
+    # :data:`_SECRET_NAME_SUFFIXES` (boundary-aware suffix match).
     "access_key",
-    "pat",
     "dsn",
     "database_url",
+)
+
+
+# Exact key names (compared case-insensitively against the lowercased
+# key) that always denote credentials. Used for provider-specific token
+# names whose substring form would over-redact ordinary keys — most
+# notably ``GITHUB_PAT`` (substring ``pat`` would match ``path``,
+# ``project_path``, ``config_path``). Codex round-4 P0 on PR #2056.
+_SECRET_EXACT_NAMES_LOWER: frozenset[str] = frozenset(
+    {
+        "github_pat",
+        "github_token",
+    },
+)
+
+
+# Suffixes (compared case-insensitively against the lowercased key)
+# that denote credentials when they form the *end* of a key name. This
+# is the boundary-aware replacement for the old raw ``pat`` substring:
+# ``_PAT`` matches ``GITHUB_PAT`` / ``GITLAB_PAT`` / ``WHATEVER_PAT``
+# but not ``path`` / ``compat_layer``. ``_TOKEN``, ``_KEY``, and
+# ``_SECRET`` are already covered by the substring list above; we keep
+# the suffix set narrow to ``_PAT`` to avoid duplication.
+_SECRET_NAME_SUFFIXES: frozenset[str] = frozenset(
+    {
+        "_pat",
+    },
 )
 
 
@@ -125,14 +155,31 @@ _URL_QUERY_SECRET_KEYS: frozenset[str] = frozenset(
 def _looks_secret(field_name: str) -> bool:
     """Return True iff ``field_name`` matches the credential heuristic.
 
-    Case-insensitive substring match against
-    :data:`_SECRET_NAME_SUBSTRINGS`. The match is deliberately
-    over-eager — false positives (redacting a non-secret field whose
-    name happens to contain ``"auth"``) are operationally fine; false
-    negatives (leaking a real secret) are not.
+    Three layers, all case-insensitive:
+
+    1. Substring match against :data:`_SECRET_NAME_SUBSTRINGS` (the
+       broad heuristic — ``token`` / ``secret`` / ``auth`` / …).
+    2. Exact match against :data:`_SECRET_EXACT_NAMES_LOWER` for
+       provider-specific token names whose substring form would
+       over-redact (``GITHUB_PAT``, ``GITHUB_TOKEN``).
+    3. Suffix match against :data:`_SECRET_NAME_SUFFIXES` so generic
+       ``*_PAT`` names redact without false-positiving ordinary path
+       keys (Codex round-4 P0 on PR #2056: ``path`` / ``project_path``
+       / ``config_path`` were over-redacted by a raw ``pat`` substring).
+
+    The match is deliberately over-eager on the *secret* side — false
+    positives (redacting a non-secret field whose name happens to
+    contain ``"auth"``) are operationally fine; false negatives
+    (leaking a real secret) are not. The PAT carve-outs above only
+    narrow detection where the prior heuristic measurably broke
+    operator visibility on non-secret keys.
     """
     lower = field_name.lower()
-    return any(needle in lower for needle in _SECRET_NAME_SUBSTRINGS)
+    if any(needle in lower for needle in _SECRET_NAME_SUBSTRINGS):
+        return True
+    if lower in _SECRET_EXACT_NAMES_LOWER:
+        return True
+    return any(lower.endswith(suffix) for suffix in _SECRET_NAME_SUFFIXES)
 
 
 def _value_has_url_userinfo(value: Any) -> bool:

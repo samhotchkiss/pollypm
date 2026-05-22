@@ -916,8 +916,13 @@ paths:
         - **Name-substring match (case-insensitive):** any field whose
           key contains `api_key`, `apikey`, `token`, `secret`,
           `password`, `passwd`, `pwd`, `auth`, `private_key`,
-          `credential`, `credentials`, `access_key`, `pat`, `dsn`, or
+          `credential`, `credentials`, `access_key`, `dsn`, or
           `database_url`.
+        - **Name — exact / suffix match (case-insensitive):** keys
+          ending in `_PAT` (e.g. `GITHUB_PAT`, `GITLAB_PAT`), plus the
+          specific names `GITHUB_PAT` and `GITHUB_TOKEN`. The boundary
+          check keeps ordinary path keys (`path`, `project_path`,
+          `config_path`) visible.
         - **Value-shape — URL credentials:** values that parse as a
           URL with userinfo (`scheme://user:pass@host/...`) **or** with
           credential-bearing query params (`?password=...`,

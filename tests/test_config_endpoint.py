@@ -667,6 +667,117 @@ def test_value_shape_redaction_for_bare_credential_value(
 
 
 # ---------------------------------------------------------------------------
+# PAT detection boundary (Codex round-4 P0 on PR #2056)
+# ---------------------------------------------------------------------------
+
+
+def test_path_keys_are_not_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """Ordinary path-shaped keys must NOT be redacted by PAT detection.
+
+    Codex round-4 P0 on PR #2056 caught the prior raw ``pat`` substring
+    over-redacting ``path`` / ``project_path`` / ``config_path``. These
+    keys are core operator-visible config (project location, etc.) and
+    leaking PAT detection onto them broke the read-only config contract.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    # Stash a few innocuous path-shaped entries on the env map; the
+    # walker will see them at the same nesting depth as a real PAT.
+    config.accounts["codex_primary"].env = {
+        "path": "/tmp/project",
+        "project_path": "/tmp/project",
+        "config_path": "/tmp/pollypm.toml",
+        "PUBLIC_FLAG": "ok",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["path"] == "/tmp/project"
+    assert env["project_path"] == "/tmp/project"
+    assert env["config_path"] == "/tmp/pollypm.toml"
+    assert env["PUBLIC_FLAG"] == "ok"
+
+
+def test_github_pat_still_redacted_by_name(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """``GITHUB_PAT`` must still redact via exact name match.
+
+    Pins that the round-4 boundary fix didn't regress the round-2 PAT
+    coverage. Uses a value that doesn't match the ``^ghp_…`` regex so
+    only the name-side path can carry the redaction.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    # Value-shape regex deliberately won't match (no ``ghp_`` prefix);
+    # only the exact-name check protects this entry.
+    config.accounts["codex_primary"].env = {
+        "GITHUB_PAT": "not-shaped-like-a-real-pat-but-still-a-secret",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["GITHUB_PAT"] == REDACTED
+    assert "not-shaped-like-a-real-pat-but-still-a-secret" not in response_text(body)
+
+
+def test_provider_pat_suffixes_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """Generic ``*_PAT`` keys redact via suffix match.
+
+    The round-4 fix replaced the raw ``pat`` substring with a
+    boundary-aware ``_PAT`` suffix check. Any provider-prefixed PAT
+    name (``GITLAB_PAT``, ``BITBUCKET_PAT``, … or a custom
+    ``WHATEVER_PAT``) must still redact even though it's not in the
+    exact-name allowlist.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "WHATEVER_PAT": "opaque-token-value-12345",
+        "GITLAB_PAT": "glpat-deadbeefcafebabe",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["WHATEVER_PAT"] == REDACTED
+    assert env["GITLAB_PAT"] == REDACTED
+    raw = response_text(body)
+    assert "opaque-token-value-12345" not in raw
+    assert "glpat-deadbeefcafebabe" not in raw
+
+
+# ---------------------------------------------------------------------------
 # DSN-with-query-string-password redaction (Codex round-2 P0 on PR #2056)
 # ---------------------------------------------------------------------------
 

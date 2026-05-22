@@ -229,52 +229,76 @@ def create_worker_session(
     if not prompt or not prompt.strip():
         prompt = suggest_worker_prompt(config_path, project_key=project_key)
 
-    for existing in config.sessions.values():
-        if existing.role == role and existing.project == project_key and existing.enabled:
-            raise typer.BadParameter(
-                f"Project {project_key} already has {role} session {existing.name}"
-            )
-
-    session_key = session_name or _make_role_session_name(
-        role, project_key, set(config.sessions)
-    )
     # Workers use a ``pa`` worktree lane; non-worker roles (e.g. architect)
     # take a lane named after the role so they don't collide with workers.
     lane_kind = "pa" if role == "worker" else role
-    worktree = ensure_worktree(
-        config_path,
-        project_key=project_key,
-        lane_kind=lane_kind,
-        lane_key=session_key,
-        session_name=session_key,
-    )
     window_prefix = "worker" if role == "worker" else role
-    worker = SessionConfig(
-        name=session_key,
-        role=role,
-        provider=active_provider,
-        account=account_name,
-        cwd=Path(worktree.path) if worktree is not None else project.path,
-        project=project_key,
-        window_name=f"{window_prefix}-{project_key}",
-        prompt=prompt,
-        agent_profile=agent_profile,
-        args=default_session_args(
-            active_provider,
-            open_permissions=config.pollypm.open_permissions_by_default,
-            role=role,
-            model=active_model,
-        ),
-    )
-    # #2063 round 7: hold the shared RMW lock around the commit, and
-    # re-load INSIDE the lock so any disk edits that landed while we
-    # were resolving role / creating the worktree merge forward rather
-    # than being overwritten by our older snapshot.
+
+    # #2063 round 11: pull the duplicate-role check, session_key allocation,
+    # worktree creation, AND the commit ALL inside the same critical section.
+    # Round 7 had moved only the commit inside the lock, but the uniqueness
+    # check ran against the pre-lock snapshot. Two concurrent ``pm worker-
+    # start`` calls for the same project/role could both pass the pre-lock
+    # check, both compute the same ``session_key``, both create a worktree,
+    # and both commit — the second write would clobber the first, orphaning
+    # one worktree and leaving the config inconsistent. Holding the lock
+    # across the entire load → check → allocate → ensure_worktree → commit
+    # sequence collapses that race: the loser sees the winner's session in
+    # ``fresh.sessions`` and raises before touching the filesystem.
+    worktree = None
     try:
         with config_rmw_lock(config_path):
             fresh = load_config(config_path)
+            for existing in fresh.sessions.values():
+                if (
+                    existing.role == role
+                    and existing.project == project_key
+                    and existing.enabled
+                ):
+                    raise typer.BadParameter(
+                        f"Project {project_key} already has {role} session {existing.name}"
+                    )
+            if session_name is not None and session_name in fresh.sessions:
+                # Explicit session name collision — surface a clear error
+                # rather than overwriting the existing entry.
+                raise typer.BadParameter(
+                    f"Session name {session_name!r} is already in use"
+                )
+            session_key = session_name or _make_role_session_name(
+                role, project_key, set(fresh.sessions)
+            )
+            worktree = ensure_worktree(
+                config_path,
+                project_key=project_key,
+                lane_kind=lane_kind,
+                lane_key=session_key,
+                session_name=session_key,
+            )
+            worker = SessionConfig(
+                name=session_key,
+                role=role,
+                provider=active_provider,
+                account=account_name,
+                cwd=Path(worktree.path) if worktree is not None else project.path,
+                project=project_key,
+                window_name=f"{window_prefix}-{project_key}",
+                prompt=prompt,
+                agent_profile=agent_profile,
+                args=default_session_args(
+                    active_provider,
+                    open_permissions=fresh.pollypm.open_permissions_by_default,
+                    role=role,
+                    model=active_model,
+                ),
+            )
             fresh.sessions[session_key] = worker
             write_config(fresh, config_path, force=True)
+    except typer.BadParameter:
+        # Uniqueness failures and operator-input errors leave the worktree
+        # state alone — either we never created one (duplicate role check
+        # fired first) or the worktree belongs to a sibling session that
+        # legitimately won the race.
+        raise
     except Exception as exc:
         if worktree is not None and worktree.path and Path(worktree.path).exists():
             import shutil

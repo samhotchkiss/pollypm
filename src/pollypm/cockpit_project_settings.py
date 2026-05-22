@@ -33,7 +33,7 @@ from textual.widgets import (
 )
 
 from pollypm.account_usage_sampler import load_cached_account_usage
-from pollypm.config import GLOBAL_CONFIG_DIR, load_config, write_config
+from pollypm.config import GLOBAL_CONFIG_DIR, config_rmw_lock, load_config, write_config
 from pollypm.cockpit_project_advisor_log import render_advisor_log_lines
 from pollypm.cockpit_settings_confirm import _SettingsConfirmModal
 from pollypm.cockpit_settings_history import (
@@ -549,13 +549,18 @@ class PollyProjectSettingsApp(App[None]):
         assignment: ModelAssignment,
     ) -> None:
         try:
-            config = load_config(self.config_path)
-            project = config.projects.get(self.project_key)
-            if project is None:
-                self._notify(f"Project not found: {self.project_key}")
-                return
-            project.role_assignments[role] = assignment
-            write_config(config, self.config_path, force=True)
+            # #2063 round 7: hold the shared RMW lock across the full
+            # load → mutate → write so a concurrent API ``/pause`` or
+            # CLI write can't slot in and clobber the role override
+            # (or have its own write clobbered by ours).
+            with config_rmw_lock(self.config_path):
+                config = load_config(self.config_path)
+                project = config.projects.get(self.project_key)
+                if project is None:
+                    self._notify(f"Project not found: {self.project_key}")
+                    return
+                project.role_assignments[role] = assignment
+                write_config(config, self.config_path, force=True)
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Role update failed: {exc}")
             return
@@ -565,13 +570,16 @@ class PollyProjectSettingsApp(App[None]):
 
     def _clear_project_role_override(self, role: str) -> None:
         try:
-            config = load_config(self.config_path)
-            project = config.projects.get(self.project_key)
-            if project is None:
-                self._notify(f"Project not found: {self.project_key}")
-                return
-            project.role_assignments.pop(role, None)
-            write_config(config, self.config_path, force=True)
+            # #2063 round 7: hold the shared RMW lock — see
+            # ``_save_project_role_assignment`` above for rationale.
+            with config_rmw_lock(self.config_path):
+                config = load_config(self.config_path)
+                project = config.projects.get(self.project_key)
+                if project is None:
+                    self._notify(f"Project not found: {self.project_key}")
+                    return
+                project.role_assignments.pop(role, None)
+                write_config(config, self.config_path, force=True)
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Role update failed: {exc}")
             return
@@ -788,17 +796,17 @@ class PollyProjectSettingsApp(App[None]):
         if button is None:
             return
         new_channel = "beta" if button.id == "release-channel-beta" else "stable"
+        # #2063 round 7: hold the shared RMW lock across the full
+        # load → mutate → write so a concurrent project write can't
+        # land in between and lose its edit.
         try:
-            config = load_config(self.config_path)
-        except Exception as exc:  # noqa: BLE001
-            self._notify(f"Release channel update failed: {exc}")
-            return
-        current = getattr(getattr(config, "pollypm", None), "release_channel", "stable")
-        if current == new_channel:
-            return
-        config.pollypm.release_channel = new_channel
-        try:
-            write_config(config, self.config_path, force=True)
+            with config_rmw_lock(self.config_path):
+                config = load_config(self.config_path)
+                current = getattr(getattr(config, "pollypm", None), "release_channel", "stable")
+                if current == new_channel:
+                    return
+                config.pollypm.release_channel = new_channel
+                write_config(config, self.config_path, force=True)
         except Exception as exc:  # noqa: BLE001
             self._notify(f"Release channel update failed: {exc}")
             return

@@ -1565,3 +1565,254 @@ def test_concurrent_archive_and_pause_preserves_both(
         "project_b's pause was reverted by project_a's archive — Codex "
         "round-6 lost-update race regression."
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex round 7 on PR #2063 — shared config_rmw_lock invariant across API
+# and non-API writers.
+#
+# Round 6's API-local ``_config_write_lock`` closed the API-vs-API
+# lost-update window, but a CLI / cockpit writer that does its own
+# ``load_config → mutate → write_config`` outside the lock still raced the
+# API path: a CLI ``pm projects remove`` (or cockpit role-assignment edit)
+# that landed between an API helper's ``load_config`` and ``write_config``
+# was silently overwritten by the API's older snapshot. Codex reproduced
+# this by monkey-patching ``pollypm.config.write_config`` to flip a
+# project's ``persona_name`` immediately before the API pause wrote its
+# snapshot for a different project — the final TOML had the API mutation
+# but the external persona_name edit was lost.
+#
+# Fix: ``pollypm.config.config_rmw_lock`` is the shared lock primitive.
+# Every in-tree config writer wraps its full RMW under it: API helpers
+# (``set_project_tracked`` / ``archive_project``), CLI helpers
+# (``pollypm.projects.remove_project`` / ``register_project`` /
+# ``rename_project`` / ``enable_tracked_project`` / ``set_workspace_root``),
+# accounts (``add_account_via_login`` / ``remove_account`` /
+# ``set_controller_account`` / ``set_open_permissions_default`` /
+# ``toggle_failover_account`` / ``relogin_account``), workers, onboarding,
+# the cockpit project-settings + roles editors, and the project-planning
+# plugin session-purge. ``write_config`` ALSO acquires the lock for defence
+# in depth (re-entrant per thread so nested wraps don't deadlock).
+#
+# These tests pin the cross-writer invariant: a CLI writer running
+# concurrently with the API on the same config must preserve both
+# mutations.
+# ---------------------------------------------------------------------------
+
+
+def test_concurrent_api_pause_and_cli_remove_preserves_both(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Codex round 7: API pause + CLI remove on different projects.
+
+    Real reproduction: thread 1 calls the API ``set_project_tracked``
+    helper to pause ``project_a``; thread 2 calls
+    ``pollypm.projects.remove_project`` (the same code path the CLI
+    ``pm projects remove`` uses) to drop ``project_c``. Both threads
+    sync via a ``threading.Barrier`` so they race the RMW.
+
+    Pre-fix (round-6 lock local to web_api): the CLI helper had no
+    lock, so its ``load_config`` happened concurrently with the API's,
+    its mutation ran outside the API's serialised window, and either
+    the API's write reverted the CLI remove (``project_c`` resurrects)
+    or the CLI's write reverted the API pause (``project_a.tracked``
+    stays True). Post-fix (round 7): both writers acquire
+    ``pollypm.config.config_rmw_lock``, so the loser reloads AFTER the
+    winner's mtime updates and BOTH mutations land on disk.
+    """
+    import threading
+
+    from pollypm.projects import remove_project
+    from pollypm.web_api.service import set_project_tracked
+
+    project_a_root = tmp_path / "project_a"
+    project_a_root.mkdir()
+    (project_a_root / ".pollypm").mkdir()
+    project_c_root = tmp_path / "project_c"
+    project_c_root.mkdir()
+    (project_c_root / ".pollypm").mkdir()
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "project_a": KnownProject(
+                key="project_a",
+                path=project_a_root,
+                name="Project A",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+            "project_c": KnownProject(
+                key="project_c",
+                path=project_c_root,
+                name="Project C",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    live_a = load_config(config_path)
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException | None] = [None, None]
+
+    def _api_pause_worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            set_project_tracked(
+                live_a,
+                "project_a",
+                tracked=False,
+                reason="round-7 cross-writer pause",
+                actor="api",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors[0] = exc
+
+    def _cli_remove_worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            # CLI path — does its own load_config + mutate +
+            # write_config under the shared RMW lock.
+            remove_project(config_path, "project_c")
+        except BaseException as exc:  # noqa: BLE001
+            errors[1] = exc
+
+    t1 = threading.Thread(target=_api_pause_worker)
+    t2 = threading.Thread(target=_cli_remove_worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=20)
+    t2.join(timeout=20)
+
+    assert errors == [None, None], f"workers raised: {errors!r}"
+
+    # BOTH mutations must survive on disk — the round-7 invariant.
+    final = load_config(config_path)
+    assert "project_a" in final.projects, (
+        "project_a vanished — CLI remove clobbered the API pause's "
+        "project list. Codex round-7 cross-writer invariant violated."
+    )
+    assert final.projects["project_a"].tracked is False, (
+        "project_a's API pause was reverted by the CLI remove's write — "
+        "Codex round-7 lost-update across API + CLI writers."
+    )
+    assert "project_c" not in final.projects, (
+        "project_c was resurrected by the API pause's write — Codex "
+        "round-7 lost-update across API + CLI writers."
+    )
+
+
+def test_config_rmw_lock_is_reentrant_within_thread(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+) -> None:
+    """Codex round 7: ``config_rmw_lock`` must be re-entrant per thread.
+
+    ``write_config`` ALSO acquires ``config_rmw_lock`` (defence in depth
+    for stray callers that forget to wrap the full RMW). Without per-
+    thread re-entrancy, the API helpers — which wrap the full RMW and
+    THEN call ``write_config`` inside that block — would deadlock the
+    moment ``write_config`` tries to acquire the lock its caller already
+    holds.
+
+    Pin the invariant: nested ``with config_rmw_lock(path):`` inside the
+    same thread completes without deadlock AND a ``write_config`` call
+    inside the outer wrap also returns. A regression in the depth
+    counter would hang this test until the pytest timeout fires.
+    """
+    from pollypm.config import config_rmw_lock
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "myproj": KnownProject(
+                key="myproj",
+                path=project_root,
+                name="My Project",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    with config_rmw_lock(config_path):
+        with config_rmw_lock(config_path):
+            # write_config takes the lock internally; this is the
+            # API-helper pattern in production.
+            fresh = load_config(config_path)
+            fresh.projects["myproj"].tracked = False
+            write_config(fresh, config_path, force=True)
+
+    # Sanity: the write actually landed on disk.
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is False

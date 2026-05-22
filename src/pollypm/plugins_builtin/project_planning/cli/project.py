@@ -857,7 +857,7 @@ def _purge_project_sessions(
     a project that no longer exists in the config — exactly the
     leaked-worker mode #1561's issue body calls out.
     """
-    from pollypm.config import write_config
+    from pollypm.config import config_rmw_lock, write_config
     from pollypm.session_services import create_tmux_client
 
     config = load_config(config_path)
@@ -890,9 +890,15 @@ def _purge_project_sessions(
     # tmux server doesn't block the config cleanup — the user can always
     # re-run ``pm reset`` to mop up tmux state, but they can't recover
     # if the [sessions.*] entries stay and block ``remove_project``.
-    for session in matches:
-        config.sessions.pop(session.name, None)
-    write_config(config, config_path, force=True)
+    #
+    # #2063 round 7: hold the shared RMW lock and re-load INSIDE so
+    # any concurrent edits during the tmux teardown merge forward.
+    matched_names = [session.name for session in matches]
+    with config_rmw_lock(config_path):
+        fresh = load_config(config_path)
+        for name in matched_names:
+            fresh.sessions.pop(name, None)
+        write_config(fresh, config_path, force=True)
     return results
 
 

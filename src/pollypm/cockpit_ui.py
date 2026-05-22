@@ -134,7 +134,7 @@ from pollypm.cockpit_metrics import (  # noqa: F401  (re-exported)
     PollyMetricsApp,
     _MetricsDrillDownModal,
 )
-from pollypm.config import load_config, write_config
+from pollypm.config import config_rmw_lock, load_config, write_config
 from pollypm.cockpit_palette import (  # noqa: F401  (re-exported)
     CommandPaletteModal,
     KeyboardHelpModal,
@@ -4807,9 +4807,14 @@ class PollySettingsPaneApp(App[None]):
         assignment: ModelAssignment,
     ) -> None:
         try:
-            config = load_config(self.config_path)
-            config.pollypm.role_assignments[role] = assignment
-            write_config(config, self.config_path, force=True)
+            # #2063 round 7: hold the shared RMW lock across the full
+            # load → mutate → write so a concurrent API / project
+            # write can't slot in and lose its edit (or have its own
+            # write clobbered by ours).
+            with config_rmw_lock(self.config_path):
+                config = load_config(self.config_path)
+                config.pollypm.role_assignments[role] = assignment
+                write_config(config, self.config_path, force=True)
         except Exception as exc:  # noqa: BLE001
             try:
                 self.notify(f"Role update failed: {exc}", severity="error")
@@ -4828,9 +4833,12 @@ class PollySettingsPaneApp(App[None]):
 
     def _clear_global_role_assignment(self, role: str) -> None:
         try:
-            config = load_config(self.config_path)
-            config.pollypm.role_assignments.pop(role, None)
-            write_config(config, self.config_path, force=True)
+            # #2063 round 7: hold the shared RMW lock — see
+            # ``_write_global_role_assignment`` above for rationale.
+            with config_rmw_lock(self.config_path):
+                config = load_config(self.config_path)
+                config.pollypm.role_assignments.pop(role, None)
+                write_config(config, self.config_path, force=True)
         except Exception as exc:  # noqa: BLE001
             try:
                 self.notify(f"Role update failed: {exc}", severity="error")
@@ -5503,24 +5511,28 @@ class PollySettingsPaneApp(App[None]):
     ) -> None:
         if not assignments:
             return
-        config = load_config(self.config_path)
-        sessions = getattr(config, "sessions", {}) or {}
-        accounts = getattr(config, "accounts", {}) or {}
-        changed = False
-        for session_name, target_key in assignments.items():
-            session = sessions.get(session_name)
-            account = accounts.get(target_key)
-            if session is None or account is None:
-                continue
-            if getattr(session, "account", None) != target_key:
-                session.account = target_key
-                changed = True
-            provider = getattr(account, "provider", None)
-            if provider is not None and getattr(session, "provider", None) != provider:
-                session.provider = provider
-                changed = True
-        if changed:
-            write_config(config, self.config_path, force=True)
+        # #2063 round 7: hold the shared RMW lock across the full
+        # load → mutate → write so a concurrent API / project write
+        # can't slot in and lose its edit.
+        with config_rmw_lock(self.config_path):
+            config = load_config(self.config_path)
+            sessions = getattr(config, "sessions", {}) or {}
+            accounts = getattr(config, "accounts", {}) or {}
+            changed = False
+            for session_name, target_key in assignments.items():
+                session = sessions.get(session_name)
+                account = accounts.get(target_key)
+                if session is None or account is None:
+                    continue
+                if getattr(session, "account", None) != target_key:
+                    session.account = target_key
+                    changed = True
+                provider = getattr(account, "provider", None)
+                if provider is not None and getattr(session, "provider", None) != provider:
+                    session.provider = provider
+                    changed = True
+            if changed:
+                write_config(config, self.config_path, force=True)
 
     def _active_table(self) -> DataTable | None:
         if self._active_section == "accounts":

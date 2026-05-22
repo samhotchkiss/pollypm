@@ -12,7 +12,7 @@ from pathlib import Path
 import typer
 
 from pollypm.agent_profiles.defaults import heartbeat_prompt, polly_prompt
-from pollypm.config import GLOBAL_CONFIG_DIR, load_config, write_config
+from pollypm.config import GLOBAL_CONFIG_DIR, config_rmw_lock, load_config, write_config
 from pollypm.models import AccountConfig, PollyPMConfig, ProviderKind
 from pollypm.onboarding import (
     _decode_jwt_payload,
@@ -548,13 +548,21 @@ def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[st
     if provider is ProviderKind.CLAUDE:
         _prime_claude_home(final_home)
 
-    config.accounts[key] = AccountConfig(
-        name=key,
-        provider=provider,
-        email=email,
-        home=final_home,
-    )
-    write_config(config, config_path, force=True)
+    # #2063 round 7: hold the shared RMW lock around the final
+    # load → mutate → write so a concurrent API / project write can't
+    # slot in and lose its edit (or have its own write clobbered).
+    # We intentionally re-load INSIDE the lock so any disk edits that
+    # landed while the user was completing the tmux login are merged
+    # forward rather than overwritten.
+    with config_rmw_lock(config_path):
+        fresh = load_config(config_path)
+        fresh.accounts[key] = AccountConfig(
+            name=key,
+            provider=provider,
+            email=email,
+            home=final_home,
+        )
+        write_config(fresh, config_path, force=True)
     return key, email
 
 
@@ -579,8 +587,20 @@ def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:
     if detected_email:
         if account.provider is ProviderKind.CLAUDE:
             _prime_claude_home(account.home)
-        config.accounts[account_name].email = detected_email
-        write_config(config, path=config_path, force=True)
+        # #2063 round 7: re-load INSIDE the shared RMW lock so any disk
+        # edits that landed while the tmux login was running merge
+        # forward instead of being overwritten.
+        with config_rmw_lock(config_path):
+            fresh = load_config(config_path)
+            account_entry = fresh.accounts.get(account_name)
+            if account_entry is None:
+                # Disk-side delete raced this relogin — bail without
+                # resurrecting a removed account.
+                raise typer.BadParameter(
+                    f"Account {account_name} was removed during login."
+                )
+            account_entry.email = detected_email
+            write_config(fresh, path=config_path, force=True)
         return account_name, detected_email
 
     raise typer.BadParameter(
@@ -590,17 +610,20 @@ def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:
 
 
 def remove_account(config_path: Path, identifier: str, *, delete_home: bool = False) -> tuple[str, str]:
-    config = load_config(config_path)
-    account_name, account = _resolve_account_identifier(config, identifier)
-    _validate_account_removal(config, account_name)
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        account_name, account = _resolve_account_identifier(config, identifier)
+        _validate_account_removal(config, account_name)
 
-    del config.accounts[account_name]
-    if config.pollypm.controller_account == account_name:
-        config.pollypm.controller_account = next(iter(config.accounts), "")
-    config.pollypm.failover_accounts = [
-        name for name in config.pollypm.failover_accounts if name != account_name
-    ]
-    write_config(config, path=config_path, force=True)
+        del config.accounts[account_name]
+        if config.pollypm.controller_account == account_name:
+            config.pollypm.controller_account = next(iter(config.accounts), "")
+        config.pollypm.failover_accounts = [
+            name for name in config.pollypm.failover_accounts if name != account_name
+        ]
+        write_config(config, path=config_path, force=True)
 
     if delete_home and account.home and account.home.exists():
         import shutil
@@ -611,68 +634,78 @@ def remove_account(config_path: Path, identifier: str, *, delete_home: bool = Fa
 
 
 def set_controller_account(config_path: Path, identifier: str) -> tuple[str, str]:
-    config = load_config(config_path)
-    account_name, account = _resolve_account_identifier(config, identifier)
-    previous = config.pollypm.controller_account
-    config.pollypm.controller_account = account_name
-    config.sessions["heartbeat"].account = account_name
-    config.sessions["heartbeat"].provider = account.provider
-    config.sessions["heartbeat"].prompt = heartbeat_prompt()
-    config.sessions["heartbeat"].agent_profile = "heartbeat"
-    config.sessions["heartbeat"].args = default_control_args(
-        account.provider,
-        open_permissions=config.pollypm.open_permissions_by_default,
-    )
-    config.sessions["operator"].account = account_name
-    config.sessions["operator"].provider = account.provider
-    config.sessions["operator"].prompt = polly_prompt()
-    config.sessions["operator"].agent_profile = "polly"
-    config.sessions["operator"].args = default_control_args(
-        account.provider,
-        open_permissions=config.pollypm.open_permissions_by_default,
-    )
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write so concurrent project / API writes can't
+    # land in between.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        account_name, account = _resolve_account_identifier(config, identifier)
+        previous = config.pollypm.controller_account
+        config.pollypm.controller_account = account_name
+        config.sessions["heartbeat"].account = account_name
+        config.sessions["heartbeat"].provider = account.provider
+        config.sessions["heartbeat"].prompt = heartbeat_prompt()
+        config.sessions["heartbeat"].agent_profile = "heartbeat"
+        config.sessions["heartbeat"].args = default_control_args(
+            account.provider,
+            open_permissions=config.pollypm.open_permissions_by_default,
+        )
+        config.sessions["operator"].account = account_name
+        config.sessions["operator"].provider = account.provider
+        config.sessions["operator"].prompt = polly_prompt()
+        config.sessions["operator"].agent_profile = "polly"
+        config.sessions["operator"].args = default_control_args(
+            account.provider,
+            open_permissions=config.pollypm.open_permissions_by_default,
+        )
 
-    failover = [name for name in config.pollypm.failover_accounts if name != account_name]
-    if previous and previous != account_name and previous in config.accounts and previous not in failover:
-        failover.insert(0, previous)
-    config.pollypm.failover_accounts = failover
-    config.pollypm.failover_enabled = bool(failover)
-    write_config(config, path=config_path, force=True)
+        failover = [name for name in config.pollypm.failover_accounts if name != account_name]
+        if previous and previous != account_name and previous in config.accounts and previous not in failover:
+            failover.insert(0, previous)
+        config.pollypm.failover_accounts = failover
+        config.pollypm.failover_enabled = bool(failover)
+        write_config(config, path=config_path, force=True)
     return account_name, account.email or account_name
 
 
 def set_open_permissions_default(config_path: Path, enabled: bool) -> bool:
-    config = load_config(config_path)
-    config.pollypm.open_permissions_by_default = enabled
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        config.pollypm.open_permissions_by_default = enabled
 
-    for session_name in ("heartbeat", "operator"):
-        session = config.sessions.get(session_name)
-        if session is None:
-            continue
-        session.args = default_control_args(session.provider, open_permissions=enabled)
+        for session_name in ("heartbeat", "operator"):
+            session = config.sessions.get(session_name)
+            if session is None:
+                continue
+            session.args = default_control_args(session.provider, open_permissions=enabled)
 
-    write_config(config, path=config_path, force=True)
+        write_config(config, path=config_path, force=True)
     return enabled
 
 
 def toggle_failover_account(config_path: Path, identifier: str) -> tuple[str, bool]:
-    config = load_config(config_path)
-    account_name, _account = _resolve_account_identifier(config, identifier)
-    if account_name == config.pollypm.controller_account:
-        raise typer.BadParameter("The controller account cannot also be in the failover list.")
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        account_name, _account = _resolve_account_identifier(config, identifier)
+        if account_name == config.pollypm.controller_account:
+            raise typer.BadParameter("The controller account cannot also be in the failover list.")
 
-    failover = list(config.pollypm.failover_accounts)
-    enabled: bool
-    if account_name in failover:
-        failover = [name for name in failover if name != account_name]
-        enabled = False
-    else:
-        failover.append(account_name)
-        enabled = True
+        failover = list(config.pollypm.failover_accounts)
+        enabled: bool
+        if account_name in failover:
+            failover = [name for name in failover if name != account_name]
+            enabled = False
+        else:
+            failover.append(account_name)
+            enabled = True
 
-    config.pollypm.failover_accounts = failover
-    config.pollypm.failover_enabled = bool(failover)
-    write_config(config, path=config_path, force=True)
+        config.pollypm.failover_accounts = failover
+        config.pollypm.failover_enabled = bool(failover)
+        write_config(config, path=config_path, force=True)
     return account_name, enabled
 
 

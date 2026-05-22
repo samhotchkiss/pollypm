@@ -383,49 +383,20 @@ def _emit_project_audit(
         pass
 
 
-@contextlib.contextmanager
-def _config_write_lock(config_path: Path):
-    """Serialise config read-modify-write across concurrent API requests.
-
-    Codex round 6 on #2063 caught a lost-update race: two clients
-    pausing different projects concurrently each ``deepcopy`` the same
-    cached load_config snapshot, mutate their own project, then both
-    write with ``force=True``. The second writer's snapshot still has
-    the first writer's project at the OLD value — so the first write
-    is silently reverted on disk. Per-request reloads (post-#2056)
-    don't help because the race is between two requests, both of which
-    reload at the same moment before either writes.
-
-    Fix: hold an exclusive ``fcntl.flock`` on a sibling lockfile for
-    the entire ``load_config → mutate → write_config`` sequence. The
-    lockfile is created on first use (``open(..., "a+")`` is
-    create-if-missing without truncation). Lock release is best-effort
-    in the ``finally`` block so a propagating exception still unlocks.
-
-    POSIX-only. PollyPM ships as a personal-use Mac/Linux deployment;
-    Windows isn't a supported target.
-
-    The lock is per ``config_path`` so two unrelated configs (e.g.
-    multi-tenant dev setups) don't serialise against each other.
-    """
-    import fcntl
-
-    lock_path = config_path.with_suffix(config_path.suffix + ".lock")
-    # Ensure parent exists — config_path may not have been created yet
-    # on the very first request after a fresh install, but the parent
-    # ``.pollypm/`` always exists by the time the API is up.
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    # "a+" creates if missing without truncating; we never read from
-    # or write to the lockfile, only flock its fd.
-    with open(lock_path, "a+") as lock_fh:
-        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            try:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+# Codex round 7 on #2063 moved the config-write lock primitive into
+# :mod:`pollypm.config` (``config_rmw_lock``) so CLI / cockpit / onboarding
+# writers participate in the same serialisation invariant. Round 6's
+# local ``_config_write_lock`` only serialised API-vs-API; a CLI write
+# that landed between an API helper's ``load_config`` and
+# ``write_config`` was still silently overwritten by the API's older
+# snapshot (the exact reproduction Codex documented on round 7).
+#
+# The API helpers below import ``config_rmw_lock`` from ``pollypm.config``
+# and wrap their full read-modify-write under it. All in-tree CLI /
+# cockpit writers do the same — see ``pollypm.projects``,
+# ``pollypm.accounts``, ``pollypm.workers``, ``pollypm.onboarding``,
+# ``pollypm.cockpit_ui``, ``pollypm.cockpit_project_settings``, and
+# ``pollypm.plugins_builtin.project_planning.cli.project``.
 
 
 def _refresh_live_projects(
@@ -479,16 +450,19 @@ def set_project_tracked(
 
     Concurrent-safe write semantics (Codex review on #2063):
 
-    * The entire read-modify-write section is serialised by an
-      exclusive ``fcntl.flock`` on a sibling lockfile (Codex round 6
-      on #2063 — ``_config_write_lock``). Without this lock, two
-      concurrent ``/pause`` calls on DIFFERENT projects could each
-      deepcopy the same cached snapshot, mutate their own project,
-      and then both write ``force=True`` — the second writer would
-      silently revert the first writer's change on disk. The flock
-      forces request B to reload AFTER request A's write commits, so
-      its deepcopy reflects A's mutation and the merged write
-      preserves both.
+    * The entire read-modify-write section is serialised by the
+      SHARED :func:`pollypm.config.config_rmw_lock` (Codex round 7 on
+      #2063 promoted the round-6 API-local flock to a project-wide
+      invariant). Every other in-tree config writer — ``pm
+      add-project`` / ``pm rename-project`` / ``pm remove-project``,
+      the cockpit role-assignment editor, accounts, workers, the
+      project-planning plugin's session-purge — wraps its full
+      load → mutate → write under the same lock, so a CLI write that
+      lands while we're inside this block blocks on the flock instead
+      of clobbering our snapshot (or being clobbered by us). The
+      lockfile is a sibling of ``config_path`` (``<path>.lock``); the
+      lock is per-path so two unrelated configs (multi-tenant dev
+      setups) don't serialise against each other.
     * Re-load the on-disk TOML so any external CLI / cockpit edits
       that landed between server boot and this call are preserved —
       we never write back the long-lived ``ConfigDep`` snapshot with
@@ -529,7 +503,7 @@ def set_project_tracked(
     """
     import copy
 
-    from pollypm.config import load_config, write_config
+    from pollypm.config import config_rmw_lock, load_config, write_config
 
     # Bind to the original (in-memory) project up-front so the 404 path
     # doesn't pay for a disk reload or take the lock.
@@ -538,12 +512,15 @@ def set_project_tracked(
         raise not_found(f"Project not registered: {project_key}")
 
     config_path = _resolve_config_write_path(config)
-    # Hold the per-config write lock across the entire RMW so two
-    # concurrent requests on different projects can't lose each other's
-    # writes (Codex round 6 on #2063). The lock is released BEFORE we
-    # return; subsequent callers' load_config sees the updated mtime
-    # and reloads fresh.
-    with _config_write_lock(config_path):
+    # Hold the SHARED per-config RMW lock across the entire
+    # load → mutate → write → reload. Two concurrent API requests on
+    # different projects can't lose each other's writes (Codex round
+    # 6), AND a concurrent CLI/cockpit ``load_config → mutate →
+    # write_config`` sequence on the same config can't slot in between
+    # our load and our write to lose its edit (Codex round 7). The
+    # lock is released BEFORE we return; subsequent callers'
+    # load_config sees the updated mtime and reloads fresh.
+    with config_rmw_lock(config_path):
         # Reload from disk so we don't lose concurrent CLI / cockpit
         # edits (e.g. an external ``pm add-project`` that added a new
         # project key the in-memory server hasn't seen yet). Under the
@@ -664,16 +641,20 @@ def archive_project(
     session references map to ``409 conflict`` with the blocking
     session names in the body.
 
-    Codex round 6 on #2063: the entire ``remove_project`` call + the
-    post-write reload runs under the same ``_config_write_lock`` used
-    by :func:`set_project_tracked`. Without this, an archive on
-    project A and a pause on project B could each load the same
-    cached config, mutate their own key, and write — losing one
-    mutation. The flock serialises the read-modify-write at the API
-    entry point.
+    Codex round 7 on #2063: the entire ``remove_project`` call + the
+    post-write reload runs under the SHARED
+    :func:`pollypm.config.config_rmw_lock`. The facade itself also
+    acquires the lock (re-entrant per thread, so the nested acquire
+    is a no-op). Without this shared invariant, an archive on project
+    A and a CLI ``pm projects remove`` on project B could each load
+    the same cached config, mutate their own key, and write — losing
+    one mutation. The shared lock serialises the read-modify-write
+    across BOTH API and CLI entry points (round 6's API-local flock
+    only protected API-vs-API).
     """
     import typer
 
+    from pollypm.config import config_rmw_lock
     from pollypm.projects import remove_project as _remove_project_facade
 
     live_project = config.projects.get(project_key)
@@ -683,13 +664,13 @@ def archive_project(
     label = live_project.display_label()
     project_path = live_project.path
     config_path = _resolve_config_write_path(config)
-    # Hold the per-config flock across the facade call AND the post-
-    # archive reload so we serialise with any concurrent
-    # ``set_project_tracked`` or sibling ``archive_project`` call
-    # against the same config (Codex round 6 on #2063). The lock is
-    # released BEFORE the audit emit; subsequent API writers' load_
-    # config sees our committed mtime and reloads fresh.
-    with _config_write_lock(config_path):
+    # Hold the SHARED per-config RMW lock across the facade call AND
+    # the post-archive reload so we serialise with any concurrent
+    # API ``set_project_tracked`` / sibling ``archive_project`` call
+    # AND with concurrent CLI / cockpit writers (Codex round 7 on
+    # #2063). The lock is released BEFORE the audit emit; subsequent
+    # writers' load_config sees our committed mtime and reloads fresh.
+    with config_rmw_lock(config_path):
         # Snapshot the live project entry so we can roll back the in-
         # memory state if ``remove_project`` raises OSError after
         # mutation. The facade does ``config = load_config(...);

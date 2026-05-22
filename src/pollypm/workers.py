@@ -8,7 +8,7 @@ import typer
 
 from pollypm.accounts import is_account_runtime_unavailable
 from pollypm.acct import detect_logged_in
-from pollypm.config import load_config, write_config
+from pollypm.config import config_rmw_lock, load_config, write_config
 from pollypm.onboarding import default_session_args
 from pollypm.models import ProviderKind, SessionConfig
 from pollypm.role_routing import resolved_provider_kind, resolve_role_assignment
@@ -266,11 +266,16 @@ def create_worker_session(
             model=active_model,
         ),
     )
-    config.sessions[session_key] = worker
+    # #2063 round 7: hold the shared RMW lock around the commit, and
+    # re-load INSIDE the lock so any disk edits that landed while we
+    # were resolving role / creating the worktree merge forward rather
+    # than being overwritten by our older snapshot.
     try:
-        write_config(config, config_path, force=True)
+        with config_rmw_lock(config_path):
+            fresh = load_config(config_path)
+            fresh.sessions[session_key] = worker
+            write_config(fresh, config_path, force=True)
     except Exception as exc:
-        del config.sessions[session_key]
         if worktree is not None and worktree.path and Path(worktree.path).exists():
             import shutil
             shutil.rmtree(worktree.path, ignore_errors=True)
@@ -325,15 +330,18 @@ def stop_worker_session(config_path: Path, session_name: str) -> None:
 
 
 def remove_worker_session(config_path: Path, session_name: str) -> None:
-    config = load_config(config_path)
-    session = config.sessions.get(session_name)
-    if session is None:
-        raise typer.BadParameter(f"Unknown session: {session_name}")
-    if session.role != "worker":
-        raise typer.BadParameter("Only worker sessions can be removed from the worker manager.")
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        session = config.sessions.get(session_name)
+        if session is None:
+            raise typer.BadParameter(f"Unknown session: {session_name}")
+        if session.role != "worker":
+            raise typer.BadParameter("Only worker sessions can be removed from the worker manager.")
 
-    del config.sessions[session_name]
-    write_config(config, config_path, force=True)
+        del config.sessions[session_name]
+        write_config(config, config_path, force=True)
 
 
 def _make_worker_session_name(project_key: str, existing: set[str]) -> str:

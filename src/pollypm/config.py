@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import threading
 import tomllib
 from pathlib import Path
 
@@ -1436,20 +1438,125 @@ def write_example_config(path: Path = DEFAULT_CONFIG_PATH, force: bool = False) 
     )
 
 
+# ---------------------------------------------------------------------------
+# Shared read-modify-write lock for the global TOML.
+#
+# Codex round 7 on #2063 caught that the previous lock (lived inside
+# ``pollypm.web_api.service`` as ``_config_write_lock``) only serialised
+# concurrent API writers against each other. CLI / cockpit callers that
+# do their own ``load_config → mutate → write_config`` sequence still
+# raced the API path: a CLI write that lands between the API helper's
+# ``load_config`` and ``write_config`` is silently overwritten when the
+# API later writes its older snapshot.
+#
+# Fix: move the lock primitive HERE and have every read-modify-write
+# call site wrap the whole RMW with :func:`config_rmw_lock`. The lock
+# is re-entrant per thread (thread-local depth counter), so nested
+# acquisitions inside ``write_config`` itself don't deadlock when a
+# caller already holds it for the full RMW.
+#
+# POSIX-only. PollyPM ships as a personal-use Mac/Linux deployment;
+# Windows isn't a supported target.
+# ---------------------------------------------------------------------------
+
+
+_rmw_lock_state = threading.local()
+
+
+def _config_lock_path(config_path: Path) -> Path:
+    """Return the sibling lockfile path for ``config_path``.
+
+    Resolves the path so two callers that pass equivalent relative /
+    absolute / symlinked paths still hit the same lockfile and serialise
+    against each other.
+    """
+    resolved = config_path.resolve() if config_path.exists() else config_path
+    return resolved.with_suffix(resolved.suffix + ".lock")
+
+
+@contextlib.contextmanager
+def config_rmw_lock(config_path: Path):
+    """Serialise the read-modify-write cycle for ``config_path``.
+
+    Use this around the full ``load_config → mutate → write_config``
+    sequence whenever a caller might race other config writers
+    (API, CLI, cockpit, onboarding). Holding the lock across the entire
+    RMW — not just the write — closes the lost-update window where two
+    writers each load the same disk snapshot, mutate disjoint fields,
+    and both write back, with the second writer clobbering the first.
+
+    The lock is implemented as an exclusive ``fcntl.flock`` on a sibling
+    lockfile (``<config_path>.lock``). Re-entrant per thread via a
+    thread-local depth counter: nested ``with config_rmw_lock(...):``
+    inside the same thread (notably ``write_config``'s own internal
+    acquire) is a cheap no-op rather than a deadlock.
+
+    Cross-thread contention is handled by ``flock`` itself — the second
+    thread blocks until the first releases. Cross-process contention
+    works the same way (the lockfile path is process-shared).
+
+    POSIX-only. The lockfile is created on first use; release is best-
+    effort in the ``finally`` so a propagating exception still unlocks.
+
+    Codex round 6 on #2063 first introduced this primitive inside the
+    web_api module; Codex round 7 moved it here so CLI / cockpit
+    writers participate in the same invariant.
+    """
+    import fcntl
+
+    depth = getattr(_rmw_lock_state, "depth", 0)
+    if depth > 0:
+        # Already held by this thread — re-entrant no-op so callers
+        # that wrap the full RMW don't deadlock against ``write_config``'s
+        # internal acquire.
+        _rmw_lock_state.depth = depth + 1
+        try:
+            yield
+        finally:
+            _rmw_lock_state.depth -= 1
+        return
+
+    lock_path = _config_lock_path(config_path)
+    # Ensure parent exists — config_path may not have been created yet
+    # on the very first write after a fresh install, but the parent
+    # ``.pollypm/`` always exists by the time any caller reaches here.
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # "a+" creates if missing without truncating; we never read or write
+    # the lockfile itself, only flock its fd.
+    with open(lock_path, "a+") as lock_fh:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        _rmw_lock_state.depth = 1
+        try:
+            yield
+        finally:
+            _rmw_lock_state.depth = 0
+            try:
+                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+
+
 def write_config(config: PollyPMConfig, path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
     if path.exists() and not force:
         raise FileExistsError(f"Config already exists: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Always UTF-8 — TOML is UTF-8 by spec, and a non-UTF-8 default
-    # locale (Windows CP-1252, ``LC_ALL=C``) would mangle non-ASCII
-    # project names or personas (``café``, ``プロジェクト``) that
-    # round-trip through the cockpit settings UI.
-    path.write_text(_render_global_config(config), encoding="utf-8")
-    for project_key, project in config.projects.items():
-        local_path = project_config_path(project.path)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_text(
-            _render_project_local_config(config, project_key),
-            encoding="utf-8",
-        )
+    # Defence in depth: even if a caller forgets to wrap the full RMW
+    # with :func:`config_rmw_lock`, the WRITE itself is still serialised
+    # so two writers can't interleave their multi-file (global + per-
+    # project local) write sequence and produce a torn config on disk.
+    # The lock is re-entrant per thread, so the common case where the
+    # caller already holds it for the full RMW is a cheap no-op here.
+    with config_rmw_lock(path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Always UTF-8 — TOML is UTF-8 by spec, and a non-UTF-8 default
+        # locale (Windows CP-1252, ``LC_ALL=C``) would mangle non-ASCII
+        # project names or personas (``café``, ``プロジェクト``) that
+        # round-trip through the cockpit settings UI.
+        path.write_text(_render_global_config(config), encoding="utf-8")
+        for project_key, project in config.projects.items():
+            local_path = project_config_path(project.path)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text(
+                _render_project_local_config(config, project_key),
+                encoding="utf-8",
+            )
     return path

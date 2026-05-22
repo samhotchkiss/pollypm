@@ -12,7 +12,7 @@ from pathlib import Path
 
 import typer
 
-from pollypm.config import load_config, write_config
+from pollypm.config import config_rmw_lock, load_config, write_config
 from pollypm.doc_scaffold import scaffold_docs
 from pollypm.models import KnownProject, ProjectKind
 from pollypm.task_backends import FileTaskBackend, get_task_backend
@@ -480,15 +480,19 @@ def scaffold_issue_tracker(project_path: Path) -> Path:
 
 
 def enable_tracked_project(config_path: Path, project_key: str) -> KnownProject:
-    config = load_config(config_path)
-    project = config.projects.get(project_key)
-    if project is None:
-        raise typer.BadParameter(f"Unknown project: {project_key}")
-    scaffold_issue_tracker(project.path)
-    project.kind = detect_project_kind(project.path)
-    project.tracked = True
-    config.projects[project_key] = project
-    write_config(config, config_path, force=True)
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write so a concurrent API or cockpit writer
+    # can't slot a write between our load and ours and lose its edit.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        project = config.projects.get(project_key)
+        if project is None:
+            raise typer.BadParameter(f"Unknown project: {project_key}")
+        scaffold_issue_tracker(project.path)
+        project.kind = detect_project_kind(project.path)
+        project.tracked = True
+        config.projects[project_key] = project
+        write_config(config, config_path, force=True)
     return project
 
 
@@ -666,44 +670,48 @@ def register_project(
     project goes cold. See savethenovel "silently invisible fresh
     project" failure mode.
     """
-    config = load_config(config_path)
-    normalized_path = normalize_project_path(repo_path)
-    if not normalized_path.exists() or not normalized_path.is_dir():
-        raise typer.BadParameter(f"{normalized_path} is not a directory.")
-    for project in config.projects.values():
-        if normalize_project_path(project.path) == normalized_path:
-            return project
+    # #2063 round 7: hold the shared RMW lock so a concurrent API
+    # ``/pause`` or cockpit-driven write can't land between our load and
+    # write and clobber the new project entry (or vice versa).
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        normalized_path = normalize_project_path(repo_path)
+        if not normalized_path.exists() or not normalized_path.is_dir():
+            raise typer.BadParameter(f"{normalized_path} is not a directory.")
+        for project in config.projects.values():
+            if normalize_project_path(project.path) == normalized_path:
+                return project
 
-    if slug is None:
-        key = make_project_key(normalized_path, set(config.projects))
-    else:
-        key = slug.strip()
-        canonical = slugify_project_key(key)
-        if not canonical:
-            raise typer.BadParameter(
-                f"Slug {slug!r} does not yield a valid key "
-                "(at least one alphanumeric character required)."
-            )
-        if canonical != key:
-            raise typer.BadParameter(
-                f"Slug {slug!r} is not in canonical form. "
-                f"Try {canonical!r}."
-            )
-        if key in config.projects:
-            raise typer.BadParameter(
-                f"A project already exists at slug {key!r}. "
-                "Pick a different slug or remove the conflict first."
-            )
-    project = KnownProject(
-        key=key,
-        path=normalized_path,
-        name=name or normalized_path.name,
-        persona_name=default_persona_name(name or normalized_path.name),
-        kind=detect_project_kind(normalized_path),
-        tracked=bool(tracked),
-    )
-    config.projects[key] = project
-    write_config(config, config_path, force=True)
+        if slug is None:
+            key = make_project_key(normalized_path, set(config.projects))
+        else:
+            key = slug.strip()
+            canonical = slugify_project_key(key)
+            if not canonical:
+                raise typer.BadParameter(
+                    f"Slug {slug!r} does not yield a valid key "
+                    "(at least one alphanumeric character required)."
+                )
+            if canonical != key:
+                raise typer.BadParameter(
+                    f"Slug {slug!r} is not in canonical form. "
+                    f"Try {canonical!r}."
+                )
+            if key in config.projects:
+                raise typer.BadParameter(
+                    f"A project already exists at slug {key!r}. "
+                    "Pick a different slug or remove the conflict first."
+                )
+        project = KnownProject(
+            key=key,
+            path=normalized_path,
+            name=name or normalized_path.name,
+            persona_name=default_persona_name(name or normalized_path.name),
+            kind=detect_project_kind(normalized_path),
+            tracked=bool(tracked),
+        )
+        config.projects[key] = project
+        write_config(config, config_path, force=True)
     ensure_project_scaffold(normalized_path)
     return project
 
@@ -748,99 +756,108 @@ def rename_project(
             f"Try {normalized_new!r}."
         )
 
-    config = load_config(config_path)
-    if old_slug not in config.projects:
-        raise typer.BadParameter(f"Unknown project: {old_slug}")
-    if old_slug == new_slug:
-        raise typer.BadParameter("New slug must differ from the old slug.")
-    if new_slug in config.projects:
-        raise typer.BadParameter(
-            f"A project already exists at key {new_slug!r}. "
-            "Pick a different slug or remove the conflict first."
-        )
-
-    warnings: list[str] = []
-    project = config.projects[old_slug]
-    renamed_project = KnownProject(
-        key=new_slug,
-        path=project.path,
-        name=project.name,
-        persona_name=project.persona_name,
-        kind=project.kind,
-        tracked=project.tracked,
-        role_assignments=dict(project.role_assignments),
-    )
-
-    session_updates: list[tuple[str, str, str]] = []  # (name, old_project, new_project)
-    for session_name, session in config.sessions.items():
-        if session.project == old_slug:
-            session_updates.append((session_name, old_slug, new_slug))
-
-    # Flag live state the rename doesn't touch.
-    for session_name, _, _ in session_updates:
-        if session_name.endswith(f"_{old_slug}") or session_name.endswith(old_slug):
-            warnings.append(
-                f"Session name {session_name!r} still contains the old "
-                f"slug; restart the session to pick up the new name."
-            )
-    tmux_windows_mentioning_old = [
-        s.window_name for s in config.sessions.values()
-        if s.window_name and old_slug in s.window_name
-    ]
-    if tmux_windows_mentioning_old:
-        warnings.append(
-            f"Tmux window names still reference {old_slug!r}: "
-            f"{', '.join(sorted(set(tmux_windows_mentioning_old)))}. "
-            "Kill + relaunch each affected session to pick up new names."
-        )
-    work_db = project_state_db_path(project.path)
-    if work_db.exists():
-        warnings.append(
-            f"Work-service task IDs in {work_db} still use the old "
-            f"slug (e.g. {old_slug}/1). Existing tasks keep their IDs; "
-            "new tasks will use the new slug."
-        )
-    worktree_root = project_worktrees_dir(project.path)
-    if worktree_root.exists():
-        old_worktrees = [p.name for p in worktree_root.iterdir() if old_slug in p.name]
-        if old_worktrees:
-            warnings.append(
-                f"Worktree directories under {worktree_root} still use "
-                f"the old slug: {', '.join(sorted(old_worktrees))}. "
-                "Safe to leave; new worktrees will use the new slug."
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write so concurrent API / cockpit writers can't
+    # clobber the rename (or have their own write clobbered by it).
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        if old_slug not in config.projects:
+            raise typer.BadParameter(f"Unknown project: {old_slug}")
+        if old_slug == new_slug:
+            raise typer.BadParameter("New slug must differ from the old slug.")
+        if new_slug in config.projects:
+            raise typer.BadParameter(
+                f"A project already exists at key {new_slug!r}. "
+                "Pick a different slug or remove the conflict first."
             )
 
-    if dry_run:
-        return project, warnings
+        warnings: list[str] = []
+        project = config.projects[old_slug]
+        renamed_project = KnownProject(
+            key=new_slug,
+            path=project.path,
+            name=project.name,
+            persona_name=project.persona_name,
+            kind=project.kind,
+            tracked=project.tracked,
+            role_assignments=dict(project.role_assignments),
+        )
 
-    # Apply mutations.
-    del config.projects[old_slug]
-    config.projects[new_slug] = renamed_project
-    for session_name, _old, new in session_updates:
-        session = config.sessions[session_name]
-        config.sessions[session_name] = replace(session, project=new)
-    write_config(config, config_path, force=True)
+        session_updates: list[tuple[str, str, str]] = []  # (name, old_project, new_project)
+        for session_name, session in config.sessions.items():
+            if session.project == old_slug:
+                session_updates.append((session_name, old_slug, new_slug))
+
+        # Flag live state the rename doesn't touch.
+        for session_name, _, _ in session_updates:
+            if session_name.endswith(f"_{old_slug}") or session_name.endswith(old_slug):
+                warnings.append(
+                    f"Session name {session_name!r} still contains the old "
+                    f"slug; restart the session to pick up the new name."
+                )
+        tmux_windows_mentioning_old = [
+            s.window_name for s in config.sessions.values()
+            if s.window_name and old_slug in s.window_name
+        ]
+        if tmux_windows_mentioning_old:
+            warnings.append(
+                f"Tmux window names still reference {old_slug!r}: "
+                f"{', '.join(sorted(set(tmux_windows_mentioning_old)))}. "
+                "Kill + relaunch each affected session to pick up new names."
+            )
+        work_db = project_state_db_path(project.path)
+        if work_db.exists():
+            warnings.append(
+                f"Work-service task IDs in {work_db} still use the old "
+                f"slug (e.g. {old_slug}/1). Existing tasks keep their IDs; "
+                "new tasks will use the new slug."
+            )
+        worktree_root = project_worktrees_dir(project.path)
+        if worktree_root.exists():
+            old_worktrees = [p.name for p in worktree_root.iterdir() if old_slug in p.name]
+            if old_worktrees:
+                warnings.append(
+                    f"Worktree directories under {worktree_root} still use "
+                    f"the old slug: {', '.join(sorted(old_worktrees))}. "
+                    "Safe to leave; new worktrees will use the new slug."
+                )
+
+        if dry_run:
+            return project, warnings
+
+        # Apply mutations.
+        del config.projects[old_slug]
+        config.projects[new_slug] = renamed_project
+        for session_name, _old, new in session_updates:
+            session = config.sessions[session_name]
+            config.sessions[session_name] = replace(session, project=new)
+        write_config(config, config_path, force=True)
     return renamed_project, warnings
 
 
 def remove_project(config_path: Path, project_key: str) -> KnownProject:
-    config = load_config(config_path)
-    project = config.projects.get(project_key)
-    if project is None:
-        raise typer.BadParameter(f"Unknown project: {project_key}")
-    session_refs = [
-        session.name
-        for session in config.sessions.values()
-        if session.project == project_key and session.enabled
-    ]
-    if session_refs:
-        session_word = "session" if len(session_refs) == 1 else "sessions"
-        raise typer.BadParameter(
-            f"Project {project_key} is still used by "
-            f"{session_word}: {', '.join(session_refs)}"
-        )
-    del config.projects[project_key]
-    write_config(config, config_path, force=True)
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write. This is the exact callsite Codex round-7
+    # reproduced as the lost-update vehicle: an external CLI removal
+    # racing the API ``/pause`` lost the API mutation (or vice versa).
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        project = config.projects.get(project_key)
+        if project is None:
+            raise typer.BadParameter(f"Unknown project: {project_key}")
+        session_refs = [
+            session.name
+            for session in config.sessions.values()
+            if session.project == project_key and session.enabled
+        ]
+        if session_refs:
+            session_word = "session" if len(session_refs) == 1 else "sessions"
+            raise typer.BadParameter(
+                f"Project {project_key} is still used by "
+                f"{session_word}: {', '.join(session_refs)}"
+            )
+        del config.projects[project_key]
+        write_config(config, config_path, force=True)
     return project
 
 
@@ -883,9 +900,12 @@ def scan_projects(
 
 
 def set_workspace_root(config_path: Path, workspace_root: Path) -> Path:
-    config = load_config(config_path)
-    config.project.workspace_root = normalize_project_path(workspace_root)
-    write_config(config, config_path, force=True)
+    # #2063 round 7: hold the shared RMW lock so a concurrent project
+    # write can't slot between our load and write and lose its edit.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        config.project.workspace_root = normalize_project_path(workspace_root)
+        write_config(config, config_path, force=True)
     return config.project.workspace_root
 
 

@@ -1466,12 +1466,46 @@ _rmw_lock_state = threading.local()
 def _config_lock_path(config_path: Path) -> Path:
     """Return the sibling lockfile path for ``config_path``.
 
-    Resolves the path so two callers that pass equivalent relative /
-    absolute / symlinked paths still hit the same lockfile and serialise
-    against each other.
+    Canonicalises via :func:`os.path.realpath` (which works whether or
+    not the target exists) so two callers that pass equivalent
+    relative / absolute / symlinked paths still hit the same lockfile
+    and serialise against each other. Crucially, fresh-config
+    initialisation (when ``config_path`` does not yet exist on disk)
+    also produces a stable canonical lock path, so the first-write
+    creation guard participates in the same invariant as subsequent
+    writes.
     """
-    resolved = config_path.resolve() if config_path.exists() else config_path
-    return resolved.with_suffix(resolved.suffix + ".lock")
+    import os
+
+    canonical = Path(os.path.realpath(str(config_path)))
+    return canonical.with_suffix(canonical.suffix + ".lock")
+
+
+def _canonical_lock_key(config_path: Path) -> Path:
+    """Canonical key for thread-local re-entrancy tracking.
+
+    Must match the canonicalisation used by :func:`_config_lock_path`
+    so a nested acquire is recognised as re-entrant only when it
+    targets the same on-disk lockfile.
+    """
+    import os
+
+    return Path(os.path.realpath(str(config_path)))
+
+
+def _held_locks() -> dict:
+    """Thread-local map: canonical config path -> [fh_or_None, depth].
+
+    Tracks every config path this thread currently holds (or has
+    re-entered). The outermost frame for a given path owns the file
+    handle and is responsible for releasing the flock; re-entrant
+    frames store ``None`` for the handle and only bump the depth.
+    """
+    held = getattr(_rmw_lock_state, "held", None)
+    if held is None:
+        held = {}
+        _rmw_lock_state.held = held
+    return held
 
 
 @contextlib.contextmanager
@@ -1486,10 +1520,11 @@ def config_rmw_lock(config_path: Path):
     and both write back, with the second writer clobbering the first.
 
     The lock is implemented as an exclusive ``fcntl.flock`` on a sibling
-    lockfile (``<config_path>.lock``). Re-entrant per thread via a
-    thread-local depth counter: nested ``with config_rmw_lock(...):``
-    inside the same thread (notably ``write_config``'s own internal
-    acquire) is a cheap no-op rather than a deadlock.
+    lockfile (``<config_path>.lock``). Re-entrancy is tracked **per
+    canonical config path**: a nested ``with config_rmw_lock(path):``
+    against the SAME path is a cheap no-op (so ``write_config``'s
+    internal acquire doesn't deadlock its outer caller), but a nested
+    acquire against a DIFFERENT path takes that path's flock normally.
 
     Cross-thread contention is handled by ``flock`` itself — the second
     thread blocks until the first releases. Cross-process contention
@@ -1499,21 +1534,30 @@ def config_rmw_lock(config_path: Path):
     effort in the ``finally`` so a propagating exception still unlocks.
 
     Codex round 6 on #2063 first introduced this primitive inside the
-    web_api module; Codex round 7 moved it here so CLI / cockpit
-    writers participate in the same invariant.
+    web_api module; round 7 moved it here so CLI / cockpit writers
+    participate in the same invariant; round 8 (this revision) replaced
+    the path-blind depth counter with per-path tracking so nested
+    acquires against a different config never silently bypass that
+    config's flock.
     """
     import fcntl
 
-    depth = getattr(_rmw_lock_state, "depth", 0)
-    if depth > 0:
-        # Already held by this thread — re-entrant no-op so callers
-        # that wrap the full RMW don't deadlock against ``write_config``'s
-        # internal acquire.
-        _rmw_lock_state.depth = depth + 1
+    key = _canonical_lock_key(config_path)
+    held = _held_locks()
+
+    if key in held:
+        # Re-entrant for THIS specific path — bump depth, don't touch
+        # flock. The outermost frame still owns the file handle and
+        # will release it when its own depth decrements back to zero.
+        entry = held[key]
+        entry[1] += 1
         try:
             yield
         finally:
-            _rmw_lock_state.depth -= 1
+            entry[1] -= 1
+            # Re-entrant frames never own the flock so they never
+            # release it; only the outermost frame (where ``fh`` is
+            # non-None) does the unlock + close below.
         return
 
     lock_path = _config_lock_path(config_path)
@@ -1523,29 +1567,48 @@ def config_rmw_lock(config_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     # "a+" creates if missing without truncating; we never read or write
     # the lockfile itself, only flock its fd.
-    with open(lock_path, "a+") as lock_fh:
+    lock_fh = open(lock_path, "a+")
+    try:
         fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
-        _rmw_lock_state.depth = 1
+        entry = [lock_fh, 1]
+        held[key] = entry
         try:
             yield
         finally:
-            _rmw_lock_state.depth = 0
+            # The outermost frame is the only one that releases the
+            # flock. Any nested re-entrant frames decremented inside
+            # the ``yield`` and left the entry in ``held`` with
+            # ``depth == 1`` — i.e. matching our own outer acquire.
             try:
-                fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
-            except OSError:
-                pass
+                del held[key]
+            finally:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    finally:
+        try:
+            lock_fh.close()
+        except OSError:
+            pass
 
 
 def write_config(config: PollyPMConfig, path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
-    if path.exists() and not force:
-        raise FileExistsError(f"Config already exists: {path}")
     # Defence in depth: even if a caller forgets to wrap the full RMW
     # with :func:`config_rmw_lock`, the WRITE itself is still serialised
     # so two writers can't interleave their multi-file (global + per-
     # project local) write sequence and produce a torn config on disk.
     # The lock is re-entrant per thread, so the common case where the
     # caller already holds it for the full RMW is a cheap no-op here.
+    #
+    # The ``force=False`` existence guard MUST run INSIDE the lock —
+    # otherwise two writers initialising a fresh config can both observe
+    # ``path.exists() == False`` before either takes the lock, both pass
+    # the guard, and the second writer silently clobbers the first
+    # (Codex round 8 on #2063).
     with config_rmw_lock(path):
+        if path.exists() and not force:
+            raise FileExistsError(f"Config already exists: {path}")
         path.parent.mkdir(parents=True, exist_ok=True)
         # Always UTF-8 — TOML is UTF-8 by spec, and a non-UTF-8 default
         # locale (Windows CP-1252, ``LC_ALL=C``) would mangle non-ASCII

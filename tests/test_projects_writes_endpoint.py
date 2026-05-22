@@ -1816,3 +1816,202 @@ def test_config_rmw_lock_is_reentrant_within_thread(
     # Sanity: the write actually landed on disk.
     reloaded = load_config(config_path)
     assert reloaded.projects["myproj"].tracked is False
+
+
+# ---------------------------------------------------------------------------
+# Codex round 8 regressions: per-path re-entrancy + first-write race
+# ---------------------------------------------------------------------------
+
+
+def _hold_lock_child(lock_path_str: str, hold_seconds: float, ready_path_str: str) -> None:
+    """Helper executed in a child process to hold an exclusive flock.
+
+    Opens ``lock_path_str`` (must be the canonical sibling lockfile
+    of some config path), acquires ``LOCK_EX``, touches
+    ``ready_path_str`` so the parent knows the lock is held, then
+    sleeps for ``hold_seconds`` before releasing.
+    """
+    import fcntl
+    import time
+    from pathlib import Path as _Path
+
+    lock_path = _Path(lock_path_str)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+") as fh:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        _Path(ready_path_str).write_text("ready", encoding="utf-8")
+        time.sleep(hold_seconds)
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+
+
+def test_config_rmw_lock_does_not_bypass_different_path(
+    tmp_path: Path,
+) -> None:
+    """Codex round 8: nested acquire on a DIFFERENT path must take that path's flock.
+
+    Round 7's depth counter was path-blind: once any config_rmw_lock
+    was held by the thread, a nested acquire on a different config
+    path skipped the flock entirely, letting another process hold the
+    second path's lock while this thread was supposedly inside it.
+
+    Repro: child process holds ``path_b``'s flock for HOLD_SECONDS.
+    Parent thread enters ``config_rmw_lock(path_a)`` and then nests
+    ``config_rmw_lock(path_b)``. The inner acquire MUST block until
+    the child releases — i.e. elapsed wall-clock time inside the
+    nested acquire must be close to HOLD_SECONDS, not ~0.
+    """
+    import multiprocessing
+    import time
+
+    from pollypm.config import _config_lock_path, config_rmw_lock
+
+    path_a = tmp_path / "a" / ".pollypm" / "pollypm.toml"
+    path_b = tmp_path / "b" / ".pollypm" / "pollypm.toml"
+    path_a.parent.mkdir(parents=True, exist_ok=True)
+    path_b.parent.mkdir(parents=True, exist_ok=True)
+
+    ready_marker = tmp_path / "child_ready.flag"
+    hold_seconds = 2.0
+    lock_b_path = _config_lock_path(path_b)
+
+    # Use spawn so the child does not inherit any thread-local lock
+    # state from the parent process.
+    ctx = multiprocessing.get_context("spawn")
+    child = ctx.Process(
+        target=_hold_lock_child,
+        args=(str(lock_b_path), hold_seconds, str(ready_marker)),
+    )
+    child.start()
+    try:
+        # Wait until the child has actually acquired the flock.
+        deadline = time.monotonic() + 10.0
+        while not ready_marker.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert ready_marker.exists(), "child process did not signal ready"
+
+        start = time.monotonic()
+        with config_rmw_lock(path_a):
+            with config_rmw_lock(path_b):
+                inner_acquired_at = time.monotonic()
+        elapsed = inner_acquired_at - start
+
+        # The inner acquire must have BLOCKED on the child's flock.
+        # Round 7's path-blind no-op returned in microseconds; the
+        # per-path fix should wait for the child to release. Allow a
+        # generous margin for scheduling jitter.
+        assert elapsed >= hold_seconds * 0.5, (
+            f"nested acquire on different path bypassed flock: "
+            f"elapsed={elapsed:.3f}s, expected >= {hold_seconds * 0.5:.3f}s"
+        )
+    finally:
+        child.join(timeout=10.0)
+        if child.is_alive():  # pragma: no cover — safety net
+            child.terminate()
+            child.join(timeout=5.0)
+
+
+def test_first_write_race_serialized_by_lock(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+) -> None:
+    """Codex round 8: ``write_config(force=False)`` must serialise the existence check.
+
+    Round 7 evaluated ``if path.exists() and not force`` BEFORE taking
+    the lock. Two writers racing to initialise the same fresh config
+    could both observe ``False``, both enter the lock sequentially, and
+    both write — silently clobbering the first writer. With the
+    existence check inside the lock, exactly one writer wins and the
+    other gets ``FileExistsError``.
+    """
+    import threading
+
+    base_dir = workspace / ".pollypm"
+
+    def _make_seed(persona: str) -> PollyPMConfig:
+        return PollyPMConfig(
+            project=ProjectSettings(
+                name="PollyPM",
+                root_dir=workspace,
+                tmux_session="pollypm-test",
+                workspace_root=workspace,
+                base_dir=base_dir,
+                logs_dir=base_dir / "logs",
+                snapshots_dir=base_dir / "snapshots",
+                state_db=base_dir / "state.db",
+            ),
+            pollypm=PollyPMSettings(
+                controller_account="codex_primary",
+                open_permissions_by_default=False,
+                failover_enabled=False,
+                failover_accounts=[],
+                heartbeat_backend="local",
+                scheduler_backend="inline",
+                lease_timeout_minutes=30,
+            ),
+            accounts={
+                "codex_primary": AccountConfig(
+                    name="codex_primary",
+                    provider=ProviderKind.CODEX,
+                    email="codex@example.com",
+                    runtime=RuntimeKind.LOCAL,
+                    home=base_dir / "homes" / "codex_primary",
+                ),
+            },
+            sessions={},
+            projects={
+                "myproj": KnownProject(
+                    key="myproj",
+                    path=project_root,
+                    name=f"My Project ({persona})",
+                    tracked=True,
+                    kind=ProjectKind.GIT,
+                ),
+            },
+            memory=MemorySettings(backend="file"),
+            config_path=config_path,
+        )
+
+    # Ensure no leftover config from any prior fixture wiring.
+    if config_path.exists():
+        config_path.unlink()
+
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, BaseException | None]] = []
+    results_lock = threading.Lock()
+
+    def _writer(persona: str) -> None:
+        seed = _make_seed(persona)
+        barrier.wait()
+        try:
+            write_config(seed, config_path, force=False)
+            with results_lock:
+                results.append((persona, None))
+        except BaseException as exc:  # noqa: BLE001 — captured for the assert
+            with results_lock:
+                results.append((persona, exc))
+
+    t1 = threading.Thread(target=_writer, args=("alpha",), daemon=True)
+    t2 = threading.Thread(target=_writer, args=("bravo",), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15.0)
+    t2.join(timeout=15.0)
+    assert not t1.is_alive() and not t2.is_alive(), "writers deadlocked"
+
+    successes = [r for r in results if r[1] is None]
+    failures = [r for r in results if r[1] is not None]
+
+    assert len(successes) == 1, (
+        f"expected exactly one writer to succeed, got "
+        f"successes={[r[0] for r in successes]}, "
+        f"failures={[(p, type(e).__name__) for p, e in failures]}"
+    )
+    assert len(failures) == 1, (
+        f"expected exactly one writer to raise FileExistsError, got "
+        f"failures={[(p, type(e).__name__, str(e)) for p, e in failures]}"
+    )
+    assert isinstance(failures[0][1], FileExistsError), (
+        f"loser must raise FileExistsError, got {type(failures[0][1]).__name__}: "
+        f"{failures[0][1]!r}"
+    )

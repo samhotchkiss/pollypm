@@ -24,10 +24,13 @@ callers + the test suite.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
+
+logger = logging.getLogger(__name__)
 
 from pollypm.cockpit_inbox_sources import (
     _inbox_db_sources,
@@ -259,8 +262,12 @@ def _workspace_root_inbox_has_open(config) -> bool:
         return False
     try:
         return bool(has_workspace_root_open_messages(config))
-    except Exception:  # noqa: BLE001
-        return False
+    except Exception:
+        logger.warning(
+            "workspace-root inbox probe failed; assuming inbox is non-empty to force cache fall-through",
+            exc_info=True,
+        )
+        return True  # conservative: force cache decline
 
 
 def _maybe_cache_route_awaits_user(config) -> list[object] | None:

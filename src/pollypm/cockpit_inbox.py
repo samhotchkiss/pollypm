@@ -248,10 +248,10 @@ def _workspace_root_inbox_has_open(config) -> bool:
     newer project-scoped rows pushed the workspace-root row out of the
     window.
 
-    Best-effort: a pg outage / import failure returns ``False`` so the
-    fast-path still wins on the common "no workspace-root noise" case.
-    A false negative here would mis-attribute the divergence to the
-    sampler, which is the same risk the old code had.
+    Returns True on any failure (import or probe). Conservative — forces
+    cache fall-through. A false positive here is safe (the direct sweep
+    just runs); a false negative would silently drop workspace-root work,
+    violating the cache-authoritative invariant.
     """
 
     try:
@@ -259,7 +259,11 @@ def _workspace_root_inbox_has_open(config) -> bool:
             has_workspace_root_open_messages,
         )
     except Exception:  # noqa: BLE001
-        return False
+        logger.warning(
+            "workspace-root inbox probe import failed; assuming inbox is non-empty to force conservative cache decline",
+            exc_info=True,
+        )
+        return True
     try:
         return bool(has_workspace_root_open_messages(config))
     except Exception:

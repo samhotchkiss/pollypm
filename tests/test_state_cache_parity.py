@@ -1550,3 +1550,172 @@ class TestPr2026V3WorkspaceRootProbeUnbounded:
         # The fast-path MUST decline so the direct sweep can carry
         # the workspace-root row.
         assert cockpit_inbox._maybe_cache_route_awaits_user(config) is None
+
+    # ── PR #2026 v6 regression tests (Codex round-6 blocker) ──────────
+    #
+    # The v5 helper returns True on pool/query failure to keep the cache
+    # authoritative-or-deferred. These tests pin that contract end-to-end:
+    # (1) the helper itself returns True on each failure mode, and
+    # (2) the failure flows through _maybe_cache_{route,count}_awaits_user
+    # as a fall-through (cache declines).
+
+    def test_pool_open_failure_returns_true_conservative(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """``has_workspace_root_open_messages`` must return True when the
+        pg pool cannot be opened — conservative-on-failure contract.
+        """
+
+        from pollypm import cockpit_pg_aggregates
+
+        config = _make_config(["alpha"], tmp_path)
+
+        def _boom_ro(_cfg: Any) -> Any:
+            raise RuntimeError("ro pool unavailable")
+
+        def _boom_rw(_cfg: Any) -> Any:
+            raise RuntimeError("rw pool unavailable")
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_ro_pool", _boom_ro,
+        )
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_rw_pool", _boom_rw,
+        )
+
+        assert (
+            cockpit_pg_aggregates.has_workspace_root_open_messages(config)
+            is True
+        )
+
+    def test_query_failure_returns_true_conservative(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Pool open succeeds but ``cur.execute()`` raises — the helper
+        must still return True (conservative).
+        """
+
+        from pollypm import cockpit_pg_aggregates
+
+        config = _make_config(["alpha"], tmp_path)
+
+        class _FakeCursor:
+            def __enter__(self) -> "_FakeCursor":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def execute(self, _sql: str, _params: Any) -> None:
+                raise RuntimeError("query exploded")
+
+            def fetchone(self) -> Any:
+                return None
+
+        class _FakeConn:
+            def __enter__(self) -> "_FakeConn":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def cursor(self) -> _FakeCursor:
+                return _FakeCursor()
+
+        class _FakePool:
+            def connection(self) -> _FakeConn:
+                return _FakeConn()
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
+        )
+
+        assert (
+            cockpit_pg_aggregates.has_workspace_root_open_messages(config)
+            is True
+        )
+
+    def test_pool_failure_drives_cache_fall_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Pool failure → wrapper returns True → ``_maybe_cache_route_awaits_user``
+        declines so the direct sweep carries any uncached awaits-user work.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+
+        def _boom_ro(_cfg: Any) -> Any:
+            raise RuntimeError("ro pool unavailable")
+
+        def _boom_rw(_cfg: Any) -> Any:
+            raise RuntimeError("rw pool unavailable")
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_ro_pool", _boom_ro,
+        )
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_rw_pool", _boom_rw,
+        )
+
+        # Cache seeded with an uncached-style entry — the only way the
+        # fast-path can decline is via the workspace-root guard, which
+        # depends on the failing probe.
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.IDLE, items=[],
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        assert cockpit_inbox._maybe_cache_route_awaits_user(config) is None
+
+    def test_query_failure_drives_count_fall_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Query failure → wrapper returns True → ``_maybe_cache_count_awaits_user``
+        declines so the rail badge falls back to the direct sweep.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+
+        class _FakeCursor:
+            def __enter__(self) -> "_FakeCursor":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def execute(self, _sql: str, _params: Any) -> None:
+                raise RuntimeError("query exploded")
+
+            def fetchone(self) -> Any:
+                return None
+
+        class _FakeConn:
+            def __enter__(self) -> "_FakeConn":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def cursor(self) -> _FakeCursor:
+                return _FakeCursor()
+
+        class _FakePool:
+            def connection(self) -> _FakeConn:
+                return _FakeConn()
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
+        )
+
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.IDLE, items=[],
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        assert cockpit_inbox._maybe_cache_count_awaits_user(config) is None

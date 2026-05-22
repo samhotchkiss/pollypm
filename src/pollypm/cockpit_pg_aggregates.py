@@ -398,6 +398,12 @@ def has_workspace_root_open_messages(
     returning False, defeating the conservative-on-error guard. Cache
     authoritativeness requires that any signal we cannot prove returns
     the safe answer that forces fall-through.
+
+    NOTE: This function's failure contract intentionally diverges from other
+    helpers in this module. On pg pool/query failure, it returns True (conservative).
+    Callers MUST treat True as "exists OR unknown" — not as "row definitely exists."
+    This preserves the cache-authoritative invariant for the Move A awaits-user cache:
+    the cache declines when any source it cannot represent might have data.
     """
 
     try:

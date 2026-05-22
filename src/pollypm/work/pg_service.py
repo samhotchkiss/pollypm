@@ -1364,6 +1364,14 @@ class PgWorkService:
         Slice B port of ``update_task`` (service_queries.py). Refuses
         ``work_status`` and ``flow_template`` changes — those go through
         the lifecycle methods.
+
+        Note on ``assignee``: this method writes the column but does
+        **not** record the context-log breadcrumb the work-service spec
+        (§P-9) requires for a mid-flight worker swap. PATCH callers that
+        merely correct an assignee field may continue to use this path;
+        callers that represent a real handoff (``POST /tasks/{p}/{n}/
+        reassign``) MUST call :meth:`reassign_task` instead so the new
+        owner can recover context from ``pm task get``.
         """
         if "work_status" in fields:
             raise ValidationError(
@@ -1412,6 +1420,87 @@ class PgWorkService:
         if self._sync is not None:
             try:
                 self._sync.on_update(task, list(fields.keys()))
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "sync.on_update failed for %s",
+                    task.task_id,
+                    exc_info=True,
+                )
+        return task
+
+    def reassign_task(
+        self,
+        task_id: str,
+        *,
+        new_assignee: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> Task:
+        """Reassign a mid-flight task; atomic assignee+context-log write (#2064 round-3).
+
+        Implements work-service spec §P-9: a worker swap on an
+        ``in_progress`` task MUST leave a breadcrumb in the context log
+        so the new owner can recover context via ``pm task get``.
+        ``svc.update(assignee=...)`` (the column-only path used by
+        non-handoff PATCHes) does not record this entry; routes that
+        represent a real handoff (``POST /tasks/{p}/{n}/reassign``)
+        call this method instead.
+
+        Atomicity: the ``UPDATE work_tasks SET assignee = ...`` and the
+        ``INSERT INTO work_context_entries`` commit in the same
+        transaction. Failure of either rolls both back, so observers
+        never see a new assignee without the matching breadcrumb (or
+        vice versa).
+        """
+        project, task_number = _parse_task_id(task_id)
+        now = _now_iso()
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT assignee FROM work_tasks "
+                    "WHERE project = %s AND task_number = %s",
+                    (project, task_number),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise TaskNotFoundError(f"Task '{task_id}' not found.")
+                old_assignee = row[0]
+                # Column write — same SQL shape as update(assignee=...)
+                # but inline so the context-log INSERT lands in the
+                # same transaction.
+                cur.execute(
+                    "UPDATE work_tasks "
+                    "SET assignee = %s, updated_at = %s "
+                    "WHERE project = %s AND task_number = %s",
+                    (new_assignee, now, project, task_number),
+                )
+                # Breadcrumb body matches the spec's example wording so
+                # operators / agents can grep for "reassigned from".
+                old_label = old_assignee if old_assignee else "<unassigned>"
+                body = (
+                    f"worker reassigned from {old_label} to {new_assignee}"
+                )
+                if reason:
+                    body += f" (reason: {reason})"
+                cur.execute(
+                    "INSERT INTO work_context_entries "
+                    "(task_project, task_number, actor, text, created_at, "
+                    "entry_type) VALUES (%s, %s, %s, %s, %s, %s)",
+                    (
+                        project,
+                        task_number,
+                        actor,
+                        body,
+                        now,
+                        "reassignment",
+                    ),
+                )
+            conn.commit()
+        task = self.get(task_id)
+        if self._sync is not None:
+            try:
+                self._sync.on_update(task, ["assignee"])
             except Exception:  # noqa: BLE001
                 logger.warning(
                     "sync.on_update failed for %s",

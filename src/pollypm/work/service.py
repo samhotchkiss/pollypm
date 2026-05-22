@@ -140,7 +140,34 @@ class WorkService(Protocol):
     def update(self, task_id: str, **fields: object) -> Task:
         """Update mutable fields (title, description, priority, labels, roles).
 
-        Cannot change ``work_status`` directly -- use lifecycle methods instead.
+        Low-level column writer. Cannot change ``work_status`` directly --
+        use lifecycle methods instead. ``assignee`` is accepted for PATCH
+        callers but does **not** record the handoff context the
+        work-service spec requires for mid-flight reassignment (§P-9). For
+        a live worker swap use :meth:`reassign_task`, which is atomic and
+        leaves a breadcrumb in the context log.
+        """
+        ...
+
+    def reassign_task(
+        self,
+        task_id: str,
+        *,
+        new_assignee: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> Task:
+        """Mid-flight reassign: update ``assignee`` AND append context entry atomically.
+
+        Implements the work-service spec §P-9 invariant: when a live
+        worker is swapped, the new owner needs a breadcrumb in the
+        context log so they can recover context via ``pm task get``.
+        The column write and the context-log row commit in a single
+        transaction; failure of either rolls both back.
+
+        ``actor`` is the operator/agent who initiated the reassignment
+        (recorded on the context entry). ``reason``, when present, is
+        appended to the breadcrumb body.
         """
         ...
 

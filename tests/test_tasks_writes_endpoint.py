@@ -53,6 +53,23 @@ from pollypm.work.service_support import (
 
 
 @dataclass
+class FakeContextEntry:
+    """Minimal context-entry shape ``_task_to_detail`` reads.
+
+    ``_task_to_detail`` (web_api/service.py) wraps each ``task.context``
+    item in :class:`APIContextEntry`, reading ``.actor``, ``.timestamp``,
+    ``.text``, ``.entry_type`` as attributes. Mirror exactly that
+    surface so the FakeWorkService can append a breadcrumb without
+    blowing up the response serialiser.
+    """
+
+    actor: str
+    text: str
+    entry_type: str = "note"
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+
+@dataclass
 class FakeTask:
     """Subset of :class:`pollypm.work.models.Task` the API helpers read.
 
@@ -202,6 +219,41 @@ class FakeWorkService:
                     )
                 setattr(task, key, value)
             task.updated_at = datetime.now(timezone.utc)
+            return task
+
+    def reassign_task(
+        self,
+        task_id: str,
+        *,
+        new_assignee: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> FakeTask:
+        """Mirror :meth:`PgWorkService.reassign_task` (#2064 round-3).
+
+        Atomically updates ``assignee`` and appends a context entry —
+        the work-service §P-9 invariant. The endpoint regression below
+        asserts the breadcrumb is recorded; if this implementation
+        regressed to a bare ``setattr(task, 'assignee', ...)`` that
+        test would fail with an empty ``task.context`` list.
+        """
+        with self._lock:
+            task = self.get(task_id)
+            old_assignee = task.assignee
+            task.assignee = new_assignee
+            task.updated_at = datetime.now(timezone.utc)
+            old_label = old_assignee if old_assignee else "<unassigned>"
+            body = f"worker reassigned from {old_label} to {new_assignee}"
+            if reason:
+                body += f" (reason: {reason})"
+            # ``context`` is the same list the route layer reads back
+            # through ``_task_to_detail`` — append the breadcrumb in
+            # the spec wording so the test can grep for it.
+            task.context.append(
+                FakeContextEntry(
+                    actor=actor, text=body, entry_type="reassignment",
+                )
+            )
             return task
 
 
@@ -464,6 +516,47 @@ def test_reassign_nonexistent_returns_404(client, auth_headers) -> None:
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
+
+
+def test_reassign_records_context_log_breadcrumb(
+    client, auth_headers, task_store
+) -> None:
+    """Spec §P-9: mid-flight reassign MUST leave a context-log entry.
+
+    The new worker needs the breadcrumb to recover context via ``pm
+    task get``. If the route layer regresses to
+    ``svc.update(assignee=...)`` (the column-only path) this assertion
+    fails with an empty ``task.context`` list — that's exactly the
+    bug the round-3 review caught on the prior head.
+    """
+    seeded = _seed(
+        task_store, n=21,
+        work_status=WorkStatus.IN_PROGRESS, assignee="pete",
+    )
+    assert seeded.context == [], "Precondition: no entries before reassign."
+    response = client.post(
+        "/api/v1/tasks/myproj/21/reassign",
+        headers=auth_headers,
+        json={"actor": "nora"},
+    )
+    assert response.status_code == 200, response.text
+    assert seeded.assignee == "nora"
+    # The handoff must leave a breadcrumb naming both ends of the
+    # swap — that's the spec wording (§P-9) and how operators / agents
+    # grep the context log.
+    reassign_entries = [
+        e for e in seeded.context
+        if getattr(e, "entry_type", None) == "reassignment"
+    ]
+    assert len(reassign_entries) == 1, (
+        f"expected exactly one reassignment context entry, got "
+        f"{seeded.context!r}"
+    )
+    body = reassign_entries[0].text
+    assert "pete" in body and "nora" in body, (
+        f"breadcrumb missing old/new assignee: {body!r}"
+    )
+    assert "reassigned" in body.lower()
 
 
 # ---------------------------------------------------------------------------

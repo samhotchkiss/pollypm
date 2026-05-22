@@ -377,6 +377,34 @@ class MockWorkService:
         task.updated_at = _now()
         return deepcopy(task)
 
+    def reassign_task(
+        self,
+        task_id: str,
+        *,
+        new_assignee: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> Task:
+        """In-memory mirror of :meth:`PgWorkService.reassign_task` (#2064)."""
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        old_assignee = task.assignee
+        task.assignee = new_assignee
+        task.updated_at = _now()
+        old_label = old_assignee if old_assignee else "<unassigned>"
+        body = f"worker reassigned from {old_label} to {new_assignee}"
+        if reason:
+            body += f" (reason: {reason})"
+        entry = ContextEntry(
+            actor=actor,
+            timestamp=_now(),
+            text=body,
+            entry_type="reassignment",
+        )
+        self._context.setdefault(task_id, []).append(entry)
+        return deepcopy(task)
+
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:
         task = self._tasks.get(task_id)
         if task is None:

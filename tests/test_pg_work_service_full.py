@@ -189,6 +189,96 @@ def test_update_external_refs_empty_dict_clears(pg_service):
     assert refetched.external_refs == {}
 
 
+def test_reassign_task_appends_context_log_breadcrumb(pg_service):
+    """Spec §P-9 invariant: mid-flight reassign leaves a context entry.
+
+    ``svc.update(assignee=...)`` (the PATCH path) writes the column
+    silently. ``svc.reassign_task(...)`` MUST also append a
+    ``reassignment`` row to ``work_context_entries`` so the new owner
+    can recover context via ``pm task get``. PR #2064 round-3 added
+    this method; the prior head routed reassigns through ``update``
+    and dropped the breadcrumb.
+
+    Verifies:
+    * the assignee column is updated;
+    * exactly one context entry is appended with ``entry_type =
+      'reassignment'`` and body matching the spec's example wording
+      (``worker reassigned from pete to nora``);
+    * the entry's actor reflects the operator passed in;
+    * both writes are visible after a fresh ``get(task_id)`` (i.e.
+      the transaction committed).
+    """
+    # ``claim`` resolves ``assignee`` via the ``worker`` role on the
+    # task, not via the ``actor`` argument — so wire roles.worker=pete
+    # explicitly to get a pete-claimed task.
+    task = _make_draft(
+        pg_service, roles={"worker": "pete", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="pete")
+    # Sanity: claim landed pete on the assignee column.
+    assert pg_service.get(task.task_id).assignee == "pete"
+    # No reassignment entries on the freshly-claimed task.
+    pre_entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert pre_entries == []
+
+    updated = pg_service.reassign_task(
+        task.task_id, new_assignee="nora", actor="api"
+    )
+    assert updated.assignee == "nora"
+
+    # Re-read independently so we know both writes survived commit.
+    refetched = pg_service.get(task.task_id)
+    assert refetched.assignee == "nora"
+
+    entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert len(entries) == 1, (
+        f"expected exactly one reassignment breadcrumb, got: {entries!r}"
+    )
+    entry = entries[0]
+    assert entry.entry_type == "reassignment"
+    assert entry.actor == "api"
+    assert "pete" in entry.text and "nora" in entry.text, (
+        f"breadcrumb must name old + new assignee; got: {entry.text!r}"
+    )
+    assert "reassigned" in entry.text.lower()
+
+
+def test_reassign_task_optional_reason_lands_in_breadcrumb(pg_service):
+    """A non-empty ``reason`` is appended to the breadcrumb body."""
+    task = _make_draft(
+        pg_service, roles={"worker": "pete", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="pete")
+
+    pg_service.reassign_task(
+        task.task_id,
+        new_assignee="nora",
+        actor="ops",
+        reason="pete went offline",
+    )
+    entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert len(entries) == 1
+    assert "pete went offline" in entries[0].text
+
+
+def test_reassign_task_missing_task_raises(pg_service):
+    """Unknown task → TaskNotFoundError BEFORE any column write."""
+    from pollypm.work.service_support import TaskNotFoundError
+
+    with pytest.raises(TaskNotFoundError):
+        pg_service.reassign_task(
+            "demo/9999", new_assignee="nora", actor="api"
+        )
+
+
 def test_update_combined_assignee_and_external_refs_single_call(pg_service):
     """Combining columns in one update() call — single transaction.
 

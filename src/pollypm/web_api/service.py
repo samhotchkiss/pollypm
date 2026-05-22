@@ -1421,16 +1421,15 @@ def reassign_task(
     *,
     actor: str,
 ) -> APITaskDetail:
-    """Change the task's ``assignee`` via the work-service ``update``.
+    """Change the task's ``assignee`` via :meth:`WorkService.reassign_task`.
 
-    PgWorkService has no dedicated ``reassign`` lifecycle method —
-    spec §5.3 names ``svc.reassign`` but the actual writer surface
-    keeps ``assignee`` as a plain column. We thread it through
-    ``svc.update(assignee=...)`` (admitted to
-    ``_UPDATE_ALLOWED_COLUMNS`` in this same PR) so the audit
-    ``work.task.updated`` row mirrors any other column edit. State-
-    machine transitions (``claim``, ``cancel`` …) remain the canonical
-    path for status changes.
+    Routes through the dedicated ``reassign_task`` work-service method
+    (#2064 round-3) rather than ``svc.update(assignee=...)`` so the
+    column write and the context-log breadcrumb commit in a single
+    transaction. Spec §P-9 requires that mid-flight reassignment record
+    a row like ``"worker reassigned from pete to nora"`` so the new
+    owner can recover context via ``pm task get``. Using ``update``
+    would update the column silently and break that invariant.
     """
     from pollypm.work.factory import create_work_service
     from pollypm.work.service_support import (
@@ -1448,7 +1447,13 @@ def reassign_task(
             config=config, project_key=project_key, project_path=project.path
         ) as svc:
             try:
-                svc.update(task_id, assignee=actor)
+                # ``actor`` in the request body is the *new assignee*
+                # (see :class:`TaskReassignRequest`). We attribute the
+                # context-log entry to the API surface — the HTTP layer
+                # is the operator of the handoff.
+                task = svc.reassign_task(
+                    task_id, new_assignee=actor, actor="api"
+                )
             except TaskNotFoundError as exc:
                 raise not_found(f"Task not found: {task_id}") from exc
             except WorkValidationError as exc:
@@ -1457,7 +1462,6 @@ def reassign_task(
                     code="validation_error",
                     message=str(exc) or "Reassignment failed validation.",
                 ) from exc
-            task = svc.get(task_id)
             return _task_to_detail(task)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(

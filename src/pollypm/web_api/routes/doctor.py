@@ -28,7 +28,7 @@ import concurrent.futures
 import logging
 import threading
 import time
-from typing import Annotated, Any
+from typing import Annotated, Any, Callable, TypeVar
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
@@ -376,62 +376,140 @@ def _select_checks(name: str | None) -> list[Check]:
     raise _unknown_check(name, [c.name for c in registered])
 
 
+# Shared bounded executor for all doctor work (checks + fixes + verify).
+#
+# Round-3 (Codex on PR #2058) flagged the prior per-request executor as a
+# DoS vector: each timeout abandoned a worker thread, so a client retrying
+# a stuck check could accumulate unbounded background workers. Switching
+# to a single module-level pool caps the number of in-flight (or leaked)
+# doctor workers at ``max_workers``. When all slots are saturated by hung
+# workers, new ``submit`` calls queue — but in practice ``fix=true`` is
+# single-flighted by :data:`_FIX_OPERATION_LOCK` (one fix at a time) and
+# ``fix=false`` runs are read-only / fast, so 2 slots is more than enough
+# for the v1 RC surface. Tuning lives here if we ever need more.
+_DOCTOR_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="doctor",
+)
+
+
+_T = TypeVar("_T")
+
+
 def _run_with_budget(
-    selected: list[Check],
-    *,
-    name: str | None,
-    timeout: float,
-) -> DoctorReport:
-    """Run the selected checks under a real wall-clock budget.
+    fn: Callable[..., _T],
+    *args: Any,
+    budget_s: float,
+    name: str | None = None,
+    **kwargs: Any,
+) -> _T:
+    """Run ``fn(*args, **kwargs)`` under a real wall-clock budget.
 
-    ``run_checks`` itself doesn't honor a timeout — individual checks
-    each have their own short subprocess timeouts (see ``_run_cmd``),
+    Doctor work (``run_checks`` itself, ``apply_fixes``, the post-fix
+    verify rerun) doesn't honor a Python-level timeout — individual
+    checks have their own short subprocess timeouts (see ``_run_cmd``),
     but a pure-Python hang (network call, stuck storage probe, blocking
-    fix path) would otherwise hold the request worker forever.
+    fix on a flaky filesystem) would otherwise hold the request worker
+    forever.
 
-    To bound the HTTP request, we hand ``run_checks`` off to a
-    single-shot :class:`concurrent.futures.ThreadPoolExecutor` and
-    wait at most ``timeout`` seconds for the result. On overrun we
-    raise a typed 504 ``timeout`` immediately — the worker thread is
-    *not* cancelled (Python stdlib has no safe way to interrupt
-    arbitrary blocking code) and is allowed to finish in the
-    background. The HTTP caller sees the 504 within the budget; the
-    leaked thread is the accepted v1 RC tradeoff (Codex round-1 P0
-    on PR #2058).
+    To bound the HTTP request, the callable is dispatched to a shared
+    bounded :class:`concurrent.futures.ThreadPoolExecutor`
+    (:data:`_DOCTOR_EXECUTOR`) and we wait at most ``budget_s`` seconds
+    for the result. On overrun we raise a typed 504 ``timeout``
+    immediately — the worker thread is *not* cancelled (Python stdlib
+    has no safe way to interrupt arbitrary blocking code) and is
+    allowed to finish in the background, eating its slot in the pool
+    until it returns. The HTTP caller sees the 504 within the budget;
+    the leaked thread is the accepted v1 RC tradeoff (Codex round-1 P0
+    on PR #2058). The shared pool bounds the total number of leaks
+    (Codex round-3 P0 on PR #2058).
 
-    ``DoctorThreadLeak`` is intentionally not raised on leak: the
-    leak is silent and best-effort cleanup happens when the thread
-    finally returns.
+    ``name`` is used purely for the 504 message; the caller (the
+    endpoint) supplies the user-facing check name (or ``None`` for
+    "all checks").
     """
     t0 = time.monotonic()
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="doctor-run",
-    )
+    future = _DOCTOR_EXECUTOR.submit(fn, *args, **kwargs)
     try:
-        future = executor.submit(run_checks, selected)
-        try:
-            report = future.result(timeout=timeout)
-        except concurrent.futures.TimeoutError:
-            elapsed = time.monotonic() - t0
-            logger.warning(
-                "doctor: run exceeded %.1fs budget for %s; abandoning worker thread",
-                timeout,
-                name or "all checks",
-            )
-            raise _check_timeout(name, elapsed) from None
-    finally:
-        # ``wait=False`` so we don't block the request on the leaked
-        # worker thread when the budget already fired. If the future
-        # finished cleanly the shutdown is effectively a no-op.
-        executor.shutdown(wait=False)
+        result = future.result(timeout=budget_s)
+    except concurrent.futures.TimeoutError:
+        elapsed = time.monotonic() - t0
+        logger.warning(
+            "doctor: %s exceeded %.1fs budget; abandoning worker thread",
+            name or "run",
+            budget_s,
+        )
+        raise _check_timeout(name, elapsed) from None
 
     elapsed = time.monotonic() - t0
-    if elapsed > timeout:
+    if elapsed > budget_s:
         # Defensive: the future returned just past the deadline. Still
         # surface 504 so the caller sees a consistent contract.
         raise _check_timeout(name, elapsed)
-    return report
+    return result
+
+
+def _run_full_fix_under_budget(
+    selected: list[Check],
+) -> tuple[DoctorReport, list[dict[str, Any]]]:
+    """Run ``run_checks`` → ``apply_fixes`` → verify rerun in one closure.
+
+    Round-3 (Codex on PR #2058): the prior implementation called the
+    initial run under :func:`_run_with_budget` and the verify rerun
+    under :func:`_run_with_budget`, but :func:`apply_fixes` itself was
+    called inline. A hanging fix (stuck subprocess, blocked filesystem
+    on a network mount, jammed worktree git op) would therefore block
+    the HTTP worker past the documented ``timeout_seconds`` ceiling
+    with no 504.
+
+    By packing all three phases into one closure dispatched through
+    :func:`_run_with_budget`, the wall-clock budget covers the full
+    sequence end-to-end. A hang in any phase trips the timeout and
+    surfaces 504 within the budget.
+
+    Returns ``(merged_report, fixes_applied)``. ``fixes_applied`` is
+    the wire-shape list of attempted fixes (matches the JSON we ship
+    back to clients).
+    """
+    report = run_checks(selected)
+
+    # ``apply_fixes`` skips passing/skipped checks itself — no need to
+    # filter on the caller side. Returns a list of
+    # ``(name, success, message)`` tuples; we coerce to JSON for the
+    # wire response.
+    try:
+        raw = apply_fixes(report)
+    except Exception as exc:  # noqa: BLE001 — bubble as 500 via outer handler
+        logger.exception("doctor: apply_fixes raised: %s", exc)
+        raise
+    fixes_applied = [
+        {"name": name, "ok": ok, "message": message}
+        for (name, ok, message) in raw
+    ]
+
+    # Re-run just the checks we tried to fix so the response reflects
+    # the post-fix state (issue #1063 style verification: don't trust
+    # the handler's self-report). All within the same budget — if the
+    # caller's timeout fires mid-verify, the outer future cancels and
+    # surfaces 504 just like a hang in the initial run.
+    fixed_names = {entry["name"] for entry in fixes_applied}
+    if fixed_names:
+        rerun_checks = [c for c in selected if c.name in fixed_names]
+        verify_report = run_checks(rerun_checks)
+        # Splice verify-report rows back into the original report so
+        # the response always reflects the latest state. The original
+        # report is a dataclass — build a new merged list of
+        # ``(check, result)`` tuples and mutate in place.
+        verify_index = {
+            check.name: result for check, result in verify_report.results
+        }
+        merged: list[tuple[Check, CheckResult]] = []
+        for check, result in report.results:
+            replacement = verify_index.get(check.name)
+            merged.append((check, replacement if replacement else result))
+        report.results = merged
+
+    return report, fixes_applied
 
 
 # ---------------------------------------------------------------------------
@@ -547,56 +625,28 @@ def run_doctor_endpoint(
         if not fix_lock_held:
             raise _fix_busy_error()
 
+    fixes_applied: list[dict[str, Any]] = []
     try:
-        t0 = time.monotonic()
-        report = _run_with_budget(
-            selected, name=payload.check, timeout=timeout_seconds,
-        )
-
-        fixes_applied: list[dict[str, Any]] = []
         if payload.fix:
-            # ``apply_fixes`` skips passing/skipped checks itself — no need
-            # to filter on the caller side. Returns a list of
-            # ``(name, success, message)`` tuples; we coerce to JSON for
-            # the wire response.
-            try:
-                raw = apply_fixes(report)
-            except Exception as exc:  # noqa: BLE001 — bubble as 500 via outer handler
-                logger.exception("doctor: apply_fixes raised: %s", exc)
-                raise
-            fixes_applied = [
-                {"name": name, "ok": ok, "message": message}
-                for (name, ok, message) in raw
-            ]
-
-            # Re-run just the checks we tried to fix so the response
-            # reflects the post-fix state (issue #1063 style verification:
-            # don't trust the handler's self-report).
-            fixed_names = {entry["name"] for entry in fixes_applied}
-            if fixed_names:
-                rerun_checks = [c for c in selected if c.name in fixed_names]
-                elapsed_so_far = time.monotonic() - t0
-                remaining = timeout_seconds - elapsed_so_far
-                if remaining <= 0:
-                    raise _check_timeout(payload.check, elapsed_so_far)
-                verify_report = _run_with_budget(
-                    rerun_checks,
-                    name=payload.check,
-                    timeout=max(remaining, 1.0),
-                )
-                # Splice verify-report rows back into the original report
-                # so the response always reflects the latest state. The
-                # original report is a dataclass — build a new merged list
-                # of ``(check, result)`` tuples and mutate in place.
-                verify_index = {
-                    check.name: result
-                    for check, result in verify_report.results
-                }
-                merged: list[tuple[Check, CheckResult]] = []
-                for check, result in report.results:
-                    replacement = verify_index.get(check.name)
-                    merged.append((check, replacement if replacement else result))
-                report.results = merged
+            # Round-3 (Codex on PR #2058): the entire run+apply+verify
+            # sequence is wrapped in one budget so a hanging
+            # ``apply_fixes`` can't escape the timeout contract. The
+            # post-fix verify rerun shares the same wall-clock budget;
+            # if apply_fixes itself consumes the budget, the future
+            # times out before verify even starts and we surface 504.
+            report, fixes_applied = _run_with_budget(
+                _run_full_fix_under_budget,
+                selected,
+                budget_s=timeout_seconds,
+                name=payload.check,
+            )
+        else:
+            report = _run_with_budget(
+                run_checks,
+                selected,
+                budget_s=timeout_seconds,
+                name=payload.check,
+            )
 
         generated_at = _record_last_report(report)
     finally:

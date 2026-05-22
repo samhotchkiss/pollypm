@@ -405,6 +405,65 @@ def test_run_504_when_check_exceeds_budget(
     assert elapsed < 5.0, f"504 took {elapsed:.1f}s; should be near 1s budget"
 
 
+def test_apply_fixes_hang_returns_504_within_budget(
+    client, auth_headers, patch_registry, monkeypatch,
+):
+    """A hanging ``apply_fixes`` must surface 504 within budget (P0 round-3).
+
+    Before this fix, only ``run_checks`` and the post-fix verify rerun
+    were dispatched through ``_run_with_budget``; ``apply_fixes`` was
+    called inline, so a hung fix (stuck subprocess, blocked filesystem,
+    jammed worktree git op) would hold the request worker indefinitely
+    even though the endpoint documents the whole ``run + fix + verify``
+    sequence as bounded by ``timeout_seconds``.
+
+    This test simulates that hang: ``run_checks`` returns immediately
+    with a fixable failure, ``apply_fixes`` sleeps well past the
+    request budget. The endpoint must return 504 within the budget +
+    small slack, not block on the sleeping fix. Without the round-3
+    fix this test sees a ~60s wait; with it, ~1s.
+    """
+    import time as _time
+
+    patch_registry([_check("alpha", _fail("alpha", fixable=True))])
+
+    hang_event = __import__("threading").Event()
+
+    def hanging_apply_fixes(report):  # type: ignore[no-untyped-def]
+        # Block well past the request budget. The shared executor
+        # abandons this thread on timeout; ``hang_event`` lets the
+        # test release it cleanly after assertions so the daemon
+        # thread doesn't linger across the suite.
+        hang_event.wait(timeout=60.0)
+        return []
+
+    monkeypatch.setattr(doctor_routes, "apply_fixes", hanging_apply_fixes)
+
+    t0 = _time.monotonic()
+    response = client.post(
+        "/api/v1/doctor/run",
+        headers=auth_headers,
+        json={"check": "alpha", "fix": True},
+        params={"timeout_seconds": 2},
+    )
+    elapsed = _time.monotonic() - t0
+
+    # Release the leaked worker thread so the executor slot recovers
+    # before the next test runs.
+    hang_event.set()
+
+    assert response.status_code == 504, (
+        f"expected 504 within budget, got {response.status_code}: {response.json()}"
+    )
+    body = response.json()
+    assert body["error"]["code"] == "timeout"
+    # If apply_fixes wasn't bounded, this elapsed would be ~60s. Allow
+    # a few seconds of slack for executor dispatch + TestClient.
+    assert elapsed < 5.0, (
+        f"504 took {elapsed:.1f}s; apply_fixes must be wrapped in the same budget"
+    )
+
+
 def test_run_fix_serialized_under_concurrency(
     client, auth_headers, patch_registry, monkeypatch,
 ):

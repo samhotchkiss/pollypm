@@ -602,11 +602,16 @@ def test_messages_endpoint_includes_thinking_when_requested(
 
 
 def test_messages_endpoint_inlines_subagent_transcript_when_requested(
-    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+    client, auth_headers, patch_registry, monkeypatch, tmp_path, project_root,
 ):
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
-    sub_archive = tmp_path / "subagent.jsonl"
+    # Place the subagent transcript inside the project's allowed
+    # transcripts root so the path-traversal allowlist (blocker 3
+    # fix) permits inlining.
+    transcripts_root = project_root / ".pollypm" / "transcripts"
+    transcripts_root.mkdir(parents=True, exist_ok=True)
+    sub_archive = transcripts_root / "subagent.jsonl"
     sub_archive.write_text("y")
     parent = _env(
         "result_1",
@@ -836,3 +841,263 @@ def test_messages_endpoint_resolves_architect_session(
     ).json()
     assert body["surface_type"] == "architect"
     assert body["persona"] == "Archie"
+
+
+# ---------------------------------------------------------------------------
+# Regression: descending cursor pagination (PR #2045 blocker 2)
+# ---------------------------------------------------------------------------
+
+
+def test_messages_endpoint_desc_cursor_pagination_no_overlap(
+    client, auth_headers, patch_registry, patch_parser, tmp_path,
+):
+    """25 messages, limit=10, default direction=desc.
+
+    Walks page 1 -> next_cursor -> page 2 and asserts no message id
+    appears in both pages. Before the fix, ``_apply_filters_and_paginate``
+    applied ``since_id`` in source order while paginating in reversed
+    order — so the desc page 2 was a duplicate of page 1.
+    """
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    envelopes = [
+        _env(f"msg_{i:03d}", ts=f"2026-05-21T10:{i:02d}:00Z")
+        for i in range(25)
+    ]
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    patch_parser({archive: envelopes})
+
+    page1 = client.get(
+        "/api/v1/chat/operator/messages?limit=10",
+        headers=auth_headers,
+    ).json()
+    page1_ids = [m["id"] for m in page1["messages"]]
+    assert len(page1_ids) == 10
+    assert page1["has_more"] is True
+    # desc order: newest first.
+    assert page1_ids[0] == "msg_024"
+    assert page1_ids[-1] == "msg_015"
+    assert page1["next_cursor"] == "msg_015"
+
+    page2 = client.get(
+        f"/api/v1/chat/operator/messages?limit=10&since_id={page1['next_cursor']}",
+        headers=auth_headers,
+    ).json()
+    page2_ids = [m["id"] for m in page2["messages"]]
+    assert len(page2_ids) == 10
+    # Strictly after cursor in desc order: msg_014..msg_005.
+    assert page2_ids[0] == "msg_014"
+    assert page2_ids[-1] == "msg_005"
+    # No overlap between pages — the duplication bug shipped both
+    # pages as msg_024..msg_015 before the fix.
+    assert set(page1_ids).isdisjoint(set(page2_ids))
+
+
+# ---------------------------------------------------------------------------
+# Security: subagent path-traversal allowlist (PR #2045 blocker 3)
+# ---------------------------------------------------------------------------
+
+
+def test_messages_endpoint_rejects_absolute_path_traversal_in_subagent(
+    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+):
+    """``output_file=/etc/passwd`` must NOT cause the API to stat/read it."""
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    parent = _env(
+        "result_1",
+        type_=MessageType.SUBAGENT_RESULT,
+        text="Subagent done.",
+        metadata={
+            "subagent_id": "abc",
+            "output_file": "/etc/passwd",
+        },
+    )
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+
+    calls: list[Path] = []
+
+    def fake_parser(path, *, include_thinking=False, actor_fallback="agent"):
+        # Track every disk access — must NOT include /etc/passwd.
+        calls.append(Path(path))
+        if Path(path) == archive:
+            return [parent]
+        return [_env("leaked", text="should never reach here")]
+
+    monkeypatch.setattr(
+        chat_messages_routes, "parse_events_jsonl", fake_parser,
+    )
+    body = client.get(
+        "/api/v1/chat/operator/messages?include_subagents=true",
+        headers=auth_headers,
+    ).json()
+    # Endpoint succeeds (no raise) but subagent_transcript is NOT
+    # inlined for the rejected path.
+    assert len(body["messages"]) == 1
+    assert "subagent_transcript" not in body["messages"][0]["metadata"]
+    # Confirm the subagent_loader was never called for /etc/passwd.
+    assert Path("/etc/passwd") not in calls
+    assert Path("/etc/passwd").resolve() not in calls
+
+
+def test_messages_endpoint_rejects_relative_path_traversal_in_subagent(
+    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+):
+    """``output_file=../../../escape.jsonl`` must not escape transcript roots."""
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    # Create the escape target somewhere accessible so we'd be able to
+    # detect a successful read if the allowlist were missing.
+    escape = tmp_path / "escape.jsonl"
+    escape.write_text("would be leaked without allowlist")
+    parent = _env(
+        "result_1",
+        type_=MessageType.SUBAGENT_RESULT,
+        text="Subagent done.",
+        metadata={
+            "subagent_id": "abc",
+            "output_file": "../../../escape.jsonl",
+        },
+    )
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+
+    def fake_parser(path, *, include_thinking=False, actor_fallback="agent"):
+        if Path(path) == archive:
+            return [parent]
+        # Any access for a non-archive path means the allowlist
+        # let an escape through.
+        return [_env("leaked", text="boundary breach")]
+
+    monkeypatch.setattr(
+        chat_messages_routes, "parse_events_jsonl", fake_parser,
+    )
+    body = client.get(
+        "/api/v1/chat/operator/messages?include_subagents=true",
+        headers=auth_headers,
+    ).json()
+    assert "subagent_transcript" not in body["messages"][0]["metadata"]
+
+
+# ---------------------------------------------------------------------------
+# source=capture strict failure modes (PR #2045 blocker 5)
+# ---------------------------------------------------------------------------
+
+
+def test_messages_endpoint_source_capture_503s_when_window_missing(
+    client, auth_headers, patch_registry,
+):
+    """Explicit ``source=capture`` + missing window → 503 window_missing."""
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=None, present=False,
+    )])
+    response = client.get(
+        "/api/v1/chat/operator/messages?source=capture",
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "window_missing"
+
+
+def test_messages_endpoint_source_capture_503s_when_tmux_unavailable(
+    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+):
+    """Explicit ``source=capture`` + TmuxClient None → 503 capture_unavailable."""
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive, present=True,
+    )])
+    # patch_registry already stubs _build_tmux_client → None. With
+    # window.present=True, source=capture should now raise
+    # capture_unavailable instead of returning 200 + [].
+    response = client.get(
+        "/api/v1/chat/operator/messages?source=capture",
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "capture_unavailable"
+
+
+def test_messages_endpoint_source_capture_503s_when_capture_raises(
+    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+):
+    """Explicit ``source=capture`` + capture_envelopes raises → 503 capture_failed."""
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive, present=True,
+    )])
+    # Give the route a non-None tmux client so it gets past the
+    # availability check, then make capture_envelopes blow up.
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client", lambda: object(),
+    )
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("tmux pipe closed")
+
+    monkeypatch.setattr(
+        chat_messages_routes, "capture_envelopes", boom,
+    )
+    response = client.get(
+        "/api/v1/chat/operator/messages?source=capture",
+        headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "capture_failed"
+    assert "tmux pipe closed" in response.json()["error"]["message"]
+
+
+def test_messages_endpoint_source_auto_still_fail_soft_on_capture_error(
+    client, auth_headers, patch_registry, patch_parser, monkeypatch, tmp_path,
+):
+    """``source=auto`` keeps the fail-soft contract.
+
+    When the archive is stale and capture explodes, ``auto`` falls
+    back to whatever JSONL exists — never 503s. This is the contract
+    boundary that blocker 5 carved out: only the explicit
+    ``source=capture`` gets strict errors.
+    """
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    monkeypatch.setattr(
+        chat_messages_routes, "is_archive_stale",
+        lambda path, **kw: True,
+    )
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive, present=True,
+    )])
+    patch_parser({archive: [_env("from_jsonl", text="recovered")]})
+
+    def boom(*args, **kwargs):
+        raise RuntimeError("tmux pipe closed")
+
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client", lambda: object(),
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "capture_envelopes", boom,
+    )
+
+    response = client.get(
+        "/api/v1/chat/operator/messages?source=auto",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    # Falls back to whatever JSONL holds.
+    assert body["transcript_source"] == "jsonl"
+    assert [m["id"] for m in body["messages"]] == ["from_jsonl"]

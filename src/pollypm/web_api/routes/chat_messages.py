@@ -188,6 +188,29 @@ def _archive_missing(session_name: str) -> APIError:
     )
 
 
+def _capture_unavailable(session_name: str) -> APIError:
+    return APIError(
+        status_code=503,
+        code="capture_unavailable",
+        message=(
+            f"tmux client unavailable; cannot satisfy source=capture for "
+            f"session {session_name!r}."
+        ),
+        hint="Install tmux or drop ?source=capture to fall back to the JSONL archive.",
+    )
+
+
+def _capture_failed(session_name: str, detail: str) -> APIError:
+    return APIError(
+        status_code=503,
+        code="capture_failed",
+        message=(
+            f"tmux capture failed for session {session_name!r}: {detail}"
+        ),
+        hint="Retry shortly; check tmux server health with `pm sessions`.",
+    )
+
+
 def _invalid_query(field: str, message: str) -> APIError:
     return APIError(
         status_code=400,
@@ -384,8 +407,16 @@ def _load_envelopes(
         return envelopes, "jsonl", archive
 
     if source == "capture":
-        envelopes = _capture_for_surface(surface, actor_fallback=actor_fallback)
-        return envelopes, ("capture" if envelopes else None), None
+        # Explicit capture: surface errors instead of returning 200 +
+        # empty (spec §4.7 / blocker 5). Missing window → 503
+        # window_missing, no tmux client → 503 capture_unavailable,
+        # raise → 503 capture_failed.
+        envelopes = _capture_for_surface(
+            surface,
+            actor_fallback=actor_fallback,
+            strict=True,
+        )
+        return envelopes, "capture", None
 
     # source == "auto" — prefer JSONL, fall back to capture when the
     # archive is missing or stale (spec §4.7).
@@ -417,12 +448,31 @@ def _capture_for_surface(
     surface: ChatSurface,
     *,
     actor_fallback: str,
+    strict: bool = False,
 ) -> list[MessageEnvelope]:
-    """Capture the surface's tmux pane into envelopes, fail-soft to []."""
+    """Capture the surface's tmux pane into envelopes.
+
+    ``strict=False`` (used by ``source=auto``) keeps the fail-soft
+    behavior: every failure mode collapses to ``[]`` so ``auto`` can
+    fall back to the JSONL archive (spec §4.7 / §4.8).
+
+    ``strict=True`` (used by explicit ``source=capture``) raises a
+    typed :class:`APIError` for each failure mode so the caller gets
+    an actionable 503 instead of an empty 200 (blocker 5):
+
+    - missing tmux window → ``window_missing``
+    - no tmux client / not installed → ``capture_unavailable``
+    - capture call raises → ``capture_failed``
+    """
     if not surface.window.present:
+        if strict:
+            target = f"{surface.window.tmux_session}:{surface.window.window_name}"
+            raise _window_missing(target)
         return []
     tmux_client = _build_tmux_client()
     if tmux_client is None:
+        if strict:
+            raise _capture_unavailable(surface.session_name)
         return []
     target = f"{surface.window.tmux_session}:{surface.window.window_name}"
     try:
@@ -432,11 +482,16 @@ def _capture_for_surface(
             target=target,
             actor_fallback=actor_fallback,
         )
-    except Exception:  # noqa: BLE001
+    except APIError:
+        # Already a typed error — propagate without wrapping.
+        raise
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
             "chat_messages: capture failed for %s", surface.session_name,
             exc_info=True,
         )
+        if strict:
+            raise _capture_failed(surface.session_name, str(exc)) from exc
         return []
 
 
@@ -450,24 +505,30 @@ def _apply_filters_and_paginate(
     include_thinking: bool,
     include_subagents: bool,
     subagent_loader: Any,
+    allowed_subagent_roots: list[Path] | None = None,
 ) -> tuple[list[ChatMessageEnvelope], bool, str | None]:
     """Apply spec §2.2 query semantics and return ``(rows, has_more, cursor)``.
 
-    Filtering order:
+    Filtering order (cursor MUST be applied after sort, because
+    ``next_cursor`` is the LAST id in the page in the requested
+    direction — applying ``since_id`` in source order would slice the
+    wrong half for ``direction=desc``, duplicating page 1 on page 2):
 
     1. Drop ``thinking`` envelopes when ``include_thinking`` is false
        (defensive — the P1 parser already drops these by default, but
        a custom ``parse_events_jsonl(..., include_thinking=True)``
        caller could feed them through here).
     2. ``since`` lower-bound on envelope ``ts``.
-    3. ``since_id`` cursor walk — strictly after the matching id (the
-       cursor itself is excluded from the slice, matching the
-       ``next_cursor`` semantics of the inbox endpoint).
-    4. Sort by timestamp + position. JSONL ordering is already
+    3. Sort by timestamp + position. JSONL ordering is already
        chronological; we re-sort defensively so the response is
        deterministic even when the parser returns shuffled rows.
-    5. Slice to ``limit`` and compute ``has_more`` / ``next_cursor``.
-    6. Expand ``subagent_result.metadata.subagent_transcript`` when
+    4. Reverse for ``direction=desc``.
+    5. ``since_id`` cursor walk — strictly after the matching id in
+       the ordered sequence (the cursor itself is excluded from the
+       slice, matching the ``next_cursor`` semantics of the inbox
+       endpoint).
+    6. Slice to ``limit`` and compute ``has_more`` / ``next_cursor``.
+    7. Expand ``subagent_result.metadata.subagent_transcript`` when
        ``include_subagents`` is set.
     """
     filtered: list[MessageEnvelope] = []
@@ -489,15 +550,6 @@ def _apply_filters_and_paginate(
                 continue
         filtered.append(envelope)
 
-    if since_id is not None:
-        cursor_index = -1
-        for idx, envelope in enumerate(filtered):
-            if envelope.id == since_id:
-                cursor_index = idx
-                break
-        if cursor_index >= 0:
-            filtered = filtered[cursor_index + 1 :]
-
     # Stable sort by (ts, original position). Original position is
     # preserved because Python's sort is stable, but we've already
     # filtered so we capture indices first.
@@ -510,6 +562,18 @@ def _apply_filters_and_paginate(
     if direction == "desc":
         ordered.reverse()
 
+    # Apply cursor AFTER ordering so ``next_cursor`` (the last id of
+    # the previous page in the same direction) advances to the next
+    # slice instead of slicing source-order and re-emitting page 1.
+    if since_id is not None:
+        cursor_index = -1
+        for idx, envelope in enumerate(ordered):
+            if envelope.id == since_id:
+                cursor_index = idx
+                break
+        if cursor_index >= 0:
+            ordered = ordered[cursor_index + 1 :]
+
     has_more = len(ordered) > limit
     page = ordered[:limit]
 
@@ -518,33 +582,147 @@ def _apply_filters_and_paginate(
         next_cursor = page[-1].id
 
     if include_subagents and subagent_loader is not None:
-        page = [_inline_subagent(env, subagent_loader, include_thinking)
-                for env in page]
+        page = [
+            _inline_subagent(
+                env,
+                subagent_loader,
+                include_thinking,
+                allowed_roots=allowed_subagent_roots,
+            )
+            for env in page
+        ]
 
     return [_envelope_to_wire(env) for env in page], has_more, next_cursor
+
+
+def _allowed_transcript_roots(config: Any, work_service: Any = None) -> list[Path]:
+    """Compute the set of directories that may contain subagent transcripts.
+
+    Security boundary for :func:`_inline_subagent`: ``metadata.output_file``
+    is supplied by transcript content and must never be trusted as a
+    filesystem authority. Callers constrain inlining to paths that
+    live under one of these roots.
+
+    Roots covered:
+
+    - ``<workspace>/.pollypm/transcripts/`` for the operator workspace.
+    - ``<project>/.pollypm/transcripts/`` for every known project in
+      ``config.projects`` (which is the same set
+      :mod:`pollypm.web_api.chat.registry` enumerates).
+    - Worktree roots when ``work_service`` is provided — kept best-effort
+      because the worker discovery flow already gates on the same
+      work-service handle and the lookup is fail-soft.
+
+    Roots are returned ``resolve()``d (symlinks collapsed) so the
+    ``is_relative_to`` check in :func:`_inline_subagent` lines up with
+    a likewise-resolved candidate path.
+    """
+    from pollypm.projects import project_transcripts_dir
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            return
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(resolved)
+
+    project_settings = getattr(config, "project", None)
+    if project_settings is not None:
+        for attr in ("workspace_root", "root_dir"):
+            base = getattr(project_settings, attr, None)
+            if isinstance(base, Path):
+                _add(project_transcripts_dir(base))
+
+    projects = getattr(config, "projects", None) or {}
+    for known in projects.values():
+        project_path = getattr(known, "path", None)
+        if isinstance(project_path, Path):
+            _add(project_transcripts_dir(project_path))
+
+    if work_service is not None:
+        # Worktrees can host their own .pollypm/transcripts/ tree when a
+        # task is running detached from the project root. Probe both
+        # workers_iter() and a generic "list_worktree_paths" shape so the
+        # check stays useful regardless of work-service revision.
+        for method_name in ("list_worktree_paths", "worktree_paths"):
+            method = getattr(work_service, method_name, None)
+            if not callable(method):
+                continue
+            try:
+                for entry in method() or []:
+                    if isinstance(entry, str):
+                        entry_path: Path | None = Path(entry)
+                    elif isinstance(entry, Path):
+                        entry_path = entry
+                    else:
+                        entry_path = None
+                    if entry_path is not None:
+                        _add(project_transcripts_dir(entry_path))
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "chat_messages: worktree path probe failed via %s",
+                    method_name, exc_info=True,
+                )
+            break
+
+    return roots
 
 
 def _inline_subagent(
     envelope: MessageEnvelope,
     subagent_loader: Any,
     include_thinking: bool,
+    allowed_roots: list[Path] | None = None,
 ) -> MessageEnvelope:
     """When the envelope is a ``subagent_result``, inline the sub-transcript.
 
     Spec §3.7: ``metadata.subagent_transcript`` holds the subagent's
     own envelopes. We resolve the path via
     ``metadata.output_file`` (set by the P1 parser when the parent
-    ``task-notification`` block carries one). Failures are silent —
-    a missing or unreadable subagent transcript just leaves the
-    metadata empty.
+    ``task-notification`` block carries one).
+
+    Security: ``metadata.output_file`` comes from transcript content
+    and an authenticated caller who can influence what an agent writes
+    could otherwise make the API stat/read arbitrary local paths
+    (``/etc/passwd``, ``../../../escape.jsonl``, etc.). We constrain
+    candidates to ``allowed_roots`` (project + workspace transcript
+    dirs) via :meth:`Path.resolve` + :meth:`Path.is_relative_to`. When
+    the path lives outside every allowed root we skip inlining
+    silently — no raise, just a debug log — so a malformed transcript
+    can't 500 the endpoint.
     """
     if str(envelope.type) != "subagent_result":
         return envelope
     output_file = envelope.metadata.get("output_file")
     if not isinstance(output_file, str) or not output_file:
         return envelope
+    roots = allowed_roots or []
     try:
-        sub_path = Path(output_file)
+        sub_path = Path(output_file).resolve()
+    except (OSError, RuntimeError):
+        logger.debug(
+            "chat_messages: subagent path resolve failed for %s",
+            output_file, exc_info=True,
+        )
+        return envelope
+    # Reject paths outside every allowed transcript root.
+    if not any(_is_within(sub_path, root) for root in roots):
+        logger.debug(
+            "chat_messages: subagent path %s outside allowed transcript roots "
+            "(%d roots); skipping inline",
+            output_file, len(roots),
+        )
+        return envelope
+    try:
         if not sub_path.exists():
             return envelope
         sub_envelopes = subagent_loader(
@@ -562,6 +740,20 @@ def _inline_subagent(
         _envelope_to_wire(env).model_dump() for env in sub_envelopes
     ]
     return envelope
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """``Path.is_relative_to`` shim that tolerates pre-3.9 semantics.
+
+    Both ``candidate`` and ``root`` are expected to already be
+    ``resolve()``d so symlinks don't sneak a candidate past the
+    boundary.
+    """
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -657,6 +849,13 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         surface, source=source, include_thinking=include_thinking,
     )
 
+    # Compute path-traversal allowlist once per request — the
+    # subagent inliner uses it to reject ``metadata.output_file``
+    # values that escape known transcript roots (blocker 3).
+    allowed_roots = (
+        _allowed_transcript_roots(config) if include_subagents else None
+    )
+
     rows, has_more, next_cursor = _apply_filters_and_paginate(
         envelopes,
         since=since_dt,
@@ -666,6 +865,7 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         include_thinking=include_thinking,
         include_subagents=include_subagents,
         subagent_loader=parse_events_jsonl,
+        allowed_subagent_roots=allowed_roots,
     )
 
     return ChatMessagesResponse(

@@ -39,6 +39,9 @@ PHASE_1_PATHS: set[tuple[str, str]] = {
     ("GET", "/events"),
     # Phase 2 wedge — first write endpoint, see #1548.
     ("POST", "/tasks/{project}/{n}/queue"),
+    # Phase 2 — chat GET endpoints (PR #2045).
+    ("GET", "/chat/sessions"),
+    ("GET", "/chat/{session_name}/messages"),
 }
 
 

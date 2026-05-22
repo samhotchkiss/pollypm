@@ -37,7 +37,7 @@ import threading
 from datetime import UTC, datetime
 from typing import Annotated, Any, Callable
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from pollypm.web_api.errors import (
@@ -55,7 +55,8 @@ router = APIRouter(tags=["Briefings"])
 
 
 # ---------------------------------------------------------------------------
-# Timeouts + executor (kept module-level so tests can patch / share)
+# Timeouts (the executor + in-flight registry live on ``app.state``;
+# see :func:`pollypm.web_api.app._lifespan`).
 # ---------------------------------------------------------------------------
 
 
@@ -65,30 +66,43 @@ router = APIRouter(tags=["Briefings"])
 DEFAULT_REGENERATE_TIMEOUT_SECONDS = 30.0
 
 
-# Shared process-wide executor for regenerate work. The old code created
-# a fresh ``ThreadPoolExecutor`` per request via ``with`` — that meant
-# the context-manager exit called ``shutdown(wait=True)`` on the
-# timed-out worker, so the request blocked until the slow provider
-# finished even after the 504 was "raised". Reusing a bounded
-# module-level executor lets ``future.result(timeout=...)`` actually
-# return early; the worker thread keeps running in the background and
-# either finishes silently or its result is discarded.
-#
-# ``max_workers`` is intentionally tiny: regenerate is heavy (LLM +
-# subprocess) and we don't want a runaway client to spawn dozens of
-# parallel briefing renders. Combined with the in-flight guard below,
-# this gives us at most one concurrent regenerate per ``(type,
-# project)`` key while letting different briefing types fan out.
-_REGEN_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4,
-    thread_name_prefix="briefing-regen",
-)
+def _get_executor(request: Request) -> concurrent.futures.ThreadPoolExecutor:
+    """Resolve the briefings executor from app-level state.
 
-# In-flight registry — maps ``(type_name, project_key)`` to the
-# currently-running future. Used to reject duplicate retries with 409
-# ``conflict`` instead of stacking work on the executor.
-_INFLIGHT_LOCK = threading.Lock()
-_INFLIGHT: dict[tuple[str, str], concurrent.futures.Future[Any]] = {}
+    The executor's lifecycle is owned by the FastAPI lifespan context
+    (``app._lifespan`` in ``web_api/app.py``) so it's cleanly shut
+    down at app teardown — no zombie worker threads after ``pm
+    serve`` exits (Codex round-4 on #2059).
+    """
+    executor = getattr(request.app.state, "briefing_executor", None)
+    if executor is None:  # pragma: no cover — only hit if lifespan didn't run
+        raise service_unavailable(
+            "briefings executor is not initialized",
+            hint=(
+                "The FastAPI lifespan didn't run; ensure ``create_app`` "
+                "is invoked through the standard ASGI server (uvicorn) "
+                "or a TestClient context manager."
+            ),
+        )
+    return executor
+
+
+def _get_inflight(
+    request: Request,
+) -> tuple[dict[tuple[str, str], concurrent.futures.Future[Any]], threading.Lock]:
+    """Resolve the in-flight registry + its lock from app-level state."""
+    state = request.app.state
+    inflight = getattr(state, "briefing_inflight", None)
+    lock = getattr(state, "briefing_inflight_lock", None)
+    if inflight is None or lock is None:  # pragma: no cover
+        raise service_unavailable(
+            "briefings in-flight registry is not initialized",
+            hint=(
+                "The FastAPI lifespan didn't run; ensure ``create_app`` "
+                "is invoked through the standard ASGI server."
+            ),
+        )
+    return inflight, lock
 
 
 # ---------------------------------------------------------------------------
@@ -457,6 +471,7 @@ def render_briefing_endpoint(
 def regenerate_briefing_endpoint(
     type_name: str,
     config: ConfigDep,
+    request: Request,
     body: RegenerateRequest | None = None,
     timeout_seconds: Annotated[float, Query(
         ge=1.0, le=600.0,
@@ -504,8 +519,10 @@ def regenerate_briefing_endpoint(
     # future ``weekly/projA`` can run concurrently while preventing
     # duplicates of the same scope.
     inflight_key = (type_name, request_body.project or "")
-    with _INFLIGHT_LOCK:
-        existing = _INFLIGHT.get(inflight_key)
+    executor = _get_executor(request)
+    inflight, inflight_lock = _get_inflight(request)
+    with inflight_lock:
+        existing = inflight.get(inflight_key)
         if existing is not None and not existing.done():
             raise conflict(
                 (
@@ -518,18 +535,18 @@ def regenerate_briefing_endpoint(
                     "are deduplicated to protect the shared executor."
                 ),
             )
-        future = _REGEN_EXECUTOR.submit(adapter.regenerate, config, request_body)
-        _INFLIGHT[inflight_key] = future
+        future = executor.submit(adapter.regenerate, config, request_body)
+        inflight[inflight_key] = future
 
     # Detach the in-flight entry once the worker finishes — runs on
     # the executor's thread, so cleanup happens whether the request
     # 504'd or returned normally. Wrapped in its own try so a bookkeeping
     # exception can never propagate into the worker's result.
     def _clear_inflight(fut: concurrent.futures.Future[Any]) -> None:
-        with _INFLIGHT_LOCK:
-            current = _INFLIGHT.get(inflight_key)
+        with inflight_lock:
+            current = inflight.get(inflight_key)
             if current is fut:
-                _INFLIGHT.pop(inflight_key, None)
+                inflight.pop(inflight_key, None)
 
     future.add_done_callback(_clear_inflight)
 

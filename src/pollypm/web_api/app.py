@@ -138,13 +138,40 @@ class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
             _futures_thread.threading.Thread = original_thread_cls  # type: ignore[attr-defined,misc]
 
 
+# Briefings regenerate uses a small dedicated thread pool so a slow
+# provider (LLM stall, GitHub rate-limit) trips the route's wall-clock
+# timeout without hanging the request thread. The pool + its in-flight
+# bookkeeping live on ``app.state`` and are owned by the lifespan
+# context below: startup creates them, shutdown cancels in-flight work
+# and waits briefly for cooperative completion. Previously these were
+# module-level globals in ``routes/briefings.py``; that left zombie
+# threads alive after ``pm serve`` shutdown because there was no
+# FastAPI hook to call ``shutdown(cancel_futures=True)`` (Codex
+# round-4 on #2059). Workers are daemon threads + evicted from
+# ``concurrent.futures._threads_queues`` on grace-period overrun so a
+# wedged provider can't keep the interpreter alive past app teardown
+# (Codex round-7 on #2059 — mirror the #2058 doctor-executor pattern).
+_BRIEFING_REGEN_MAX_WORKERS = 2
+_BRIEFING_REGEN_THREAD_PREFIX = "briefing-regen"
+# Bound on the post-shutdown wait for in-flight briefing workers.
+# Regenerate is bounded server-side by the route's wall-clock timeout
+# (~30s default per spec §2.7); we don't block app teardown that long
+# — a timed-out worker has already overrun its budget, so we cancel
+# queued work, wait briefly for cooperative completion, then evict
+# survivors so the interpreter can exit. Same shape as
+# :data:`_DOCTOR_SHUTDOWN_GRACE_S`.
+_BRIEFING_SHUTDOWN_GRACE_S = 5.0
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """FastAPI lifespan that owns the doctor executor + locks.
+    """FastAPI lifespan that owns the doctor + briefings executors.
 
     Startup attaches the following attributes to ``app.state`` so the
-    doctor routes resolve them via ``request.app.state`` rather than
-    reaching into module-level globals:
+    routes resolve them via ``request.app.state`` rather than reaching
+    into module-level globals:
+
+    Doctor (Codex round-5 on #2058):
 
     - ``doctor_executor``: shared :class:`DaemonThreadPoolExecutor`
       for check / fix / verify work. ``max_workers=2`` matches the
@@ -163,12 +190,30 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     - ``doctor_last_report``: the cache slot itself
       (``tuple[DoctorReport, float] | None``).
 
-    Shutdown cancels not-yet-started futures, then calls
-    ``executor.shutdown(wait=False, cancel_futures=True)`` so the
-    teardown doesn't block on a wedged check. We then wait up to
-    :data:`_DOCTOR_SHUTDOWN_GRACE_S` for cooperative completion and
-    log a warning if any worker is still alive (the v1 RC tradeoff:
-    we can't kill the thread, but we can refuse to block on it).
+    Briefings (Codex round-4 + round-7 on #2059):
+
+    - ``briefing_executor``: shared :class:`DaemonThreadPoolExecutor`
+      for regen work. ``max_workers=2`` is intentionally tiny — regen
+      is heavy (LLM + subprocess); combined with the per-scope
+      in-flight guard, this caps fan-out at "one concurrent regen per
+      (type, project)". Mirrors the doctor executor's daemon-thread
+      + atexit-eviction discipline so a wedged provider can't keep
+      ``pm serve`` alive after shutdown — Codex round-7 on #2059
+      flagged that the round-6 daemon-only change is not
+      process-safe without the eviction half from #2058.
+    - ``briefing_inflight``: ``{(type, project_key): Future}`` so
+      duplicate retries are rejected with 409 instead of stacking
+      work on the executor.
+    - ``briefing_inflight_lock``: guards the dict.
+
+    Shutdown cancels not-yet-started futures for each executor, then
+    calls ``executor.shutdown(wait=False, cancel_futures=True)`` so
+    the teardown doesn't block on a wedged worker. We then wait up to
+    the configured grace for cooperative completion and evict any
+    survivors from ``concurrent.futures._threads_queues`` so the
+    stdlib's ``_python_exit`` atexit hook can't join them and hold
+    the interpreter open (the v1 RC tradeoff: we can't kill the
+    thread, but we can refuse to block on it).
     """
     # Daemon-thread executor so a wedged worker doesn't keep the
     # interpreter alive past app shutdown. ``executor.shutdown(wait=
@@ -187,55 +232,104 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     app.state.doctor_fix_lock = threading.Lock()
     app.state.doctor_last_report_lock = threading.Lock()
     app.state.doctor_last_report = None
+    # Briefings executor reuses the same daemon-thread helper so a
+    # wedged regen provider (LLM stall, GitHub rate-limit) can't keep
+    # ``pm serve`` alive after shutdown. Codex round-7 on #2059 flagged
+    # that the round-6 daemon-only change isn't process-safe without
+    # mirroring the atexit eviction from #2058 — done at teardown
+    # below.
+    app.state.briefing_executor = DaemonThreadPoolExecutor(
+        max_workers=_BRIEFING_REGEN_MAX_WORKERS,
+        thread_name_prefix=_BRIEFING_REGEN_THREAD_PREFIX,
+    )
+    app.state.briefing_inflight: dict[tuple[str, str], concurrent.futures.Future[Any]] = {}
+    app.state.briefing_inflight_lock = threading.Lock()
     try:
         yield
     finally:
-        executor = app.state.doctor_executor
+        # Briefings teardown first: cancel in-flight registry entries,
+        # then run the shared shutdown helper. Doctor uses the same
+        # helper to inherit the cancel-futures + grace-wait + atexit
+        # eviction discipline.
         try:
-            # ``cancel_futures=True`` drops anything still queued;
-            # ``wait=False`` so a wedged in-flight worker can't block
-            # FastAPI teardown indefinitely (the v1 RC tradeoff
-            # documented in routes/doctor.py:_await_with_budget).
-            executor.shutdown(wait=False, cancel_futures=True)
+            with app.state.briefing_inflight_lock:
+                for future in list(app.state.briefing_inflight.values()):
+                    future.cancel()
+                app.state.briefing_inflight.clear()
         except Exception:  # noqa: BLE001
             logger.warning(
-                "lifespan: doctor executor shutdown raised", exc_info=True,
+                "lifespan: failed to clear briefing in-flight registry",
+                exc_info=True,
             )
-        # Best-effort wait for the worker threads to finish naturally.
-        # If they don't, log + leak rather than hang the app teardown.
-        deadline = time.monotonic() + _DOCTOR_SHUTDOWN_GRACE_S
+        _shutdown_daemon_executor(
+            app.state.briefing_executor,
+            label="briefing executor",
+            grace_s=_BRIEFING_SHUTDOWN_GRACE_S,
+        )
+        _shutdown_daemon_executor(
+            app.state.doctor_executor,
+            label="doctor executor",
+            grace_s=_DOCTOR_SHUTDOWN_GRACE_S,
+        )
+
+
+def _shutdown_daemon_executor(
+    executor: concurrent.futures.ThreadPoolExecutor,
+    *,
+    label: str,
+    grace_s: float,
+) -> None:
+    """Cancel + grace-wait + atexit-evict a daemon executor.
+
+    Shared between the doctor and briefings executors so both inherit
+    the same teardown discipline:
+
+    1. ``shutdown(wait=False, cancel_futures=True)`` drops queued
+       futures and releases lifespan immediately. A wedged in-flight
+       worker can't block FastAPI teardown — the v1 RC tradeoff
+       documented in routes/doctor.py:_await_with_budget and mirrored
+       for briefings on #2059.
+    2. Best-effort grace wait so cooperative workers can finish.
+    3. Survivors are popped from
+       ``concurrent.futures._threads_queues`` so the stdlib's
+       ``_python_exit`` atexit hook can't join them and keep
+       ``pm serve`` alive past interpreter teardown. Combined with
+       ``daemon=True`` workers (see :class:`DaemonThreadPoolExecutor`)
+       the process can actually exit. Codex round-6 on #2058 +
+       round-7 on #2059.
+    """
+    try:
+        executor.shutdown(wait=False, cancel_futures=True)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "lifespan: %s shutdown raised", label, exc_info=True,
+        )
+    deadline = time.monotonic() + grace_s
+    try:
+        workers = list(getattr(executor, "_threads", []) or [])
+    except Exception:  # noqa: BLE001
+        workers = []
+    while time.monotonic() < deadline and any(t.is_alive() for t in workers):
+        time.sleep(0.05)
+    still_running = [t for t in workers if t.is_alive()]
+    if still_running:
+        logger.warning(
+            "lifespan: %s: %d worker(s) still running after %.1fs grace; "
+            "leaking thread(s) past app teardown",
+            label,
+            len(still_running),
+            grace_s,
+        )
         try:
-            workers = list(getattr(executor, "_threads", []) or [])
+            for t in still_running:
+                _futures_thread._threads_queues.pop(t, None)
         except Exception:  # noqa: BLE001
-            workers = []
-        while time.monotonic() < deadline and any(t.is_alive() for t in workers):
-            time.sleep(0.05)
-        still_running = [t for t in workers if t.is_alive()]
-        if still_running:
             logger.warning(
-                "lifespan: doctor executor: %d worker(s) still running after "
-                "%.1fs grace; leaking thread(s) past app teardown",
-                len(still_running),
-                _DOCTOR_SHUTDOWN_GRACE_S,
+                "lifespan: failed to evict wedged %s worker(s) from "
+                "concurrent.futures._threads_queues",
+                label,
+                exc_info=True,
             )
-            # ``concurrent.futures`` registers an ``atexit`` hook
-            # (``_python_exit``) that joins every executor worker
-            # via the module-level ``_threads_queues`` dict. That
-            # join blocks ``pm serve`` interpreter exit even when
-            # the workers are daemon threads. Pop our workers out
-            # of that mapping so the atexit hook can't reach them
-            # — combined with ``daemon=True`` (see
-            # :class:`DaemonThreadPoolExecutor`) the process can
-            # now exit. Codex round-6 on #2058.
-            try:
-                for t in still_running:
-                    _futures_thread._threads_queues.pop(t, None)
-            except Exception:  # noqa: BLE001
-                logger.warning(
-                    "lifespan: failed to evict wedged doctor worker(s) "
-                    "from concurrent.futures._threads_queues",
-                    exc_info=True,
-                )
 
 
 def create_app(
@@ -264,9 +358,11 @@ def create_app(
         docs_url=None,  # we serve OpenAPI via the spec endpoint
         redoc_url=None,
         openapi_url=None,
-        # Lifespan owns the doctor ThreadPoolExecutor + single-flight
-        # fix lock + last-report cache so they're cleanly torn down on
-        # app exit (Codex round-5 on #2058). Routes read them off
+        # Lifespan owns the doctor + briefings ThreadPoolExecutors,
+        # the doctor single-flight fix lock + last-report cache, and
+        # the briefings in-flight registry — so they're cleanly torn
+        # down on app exit (Codex round-5 on #2058 + round-4/round-7
+        # on #2059). Routes read them off
         # ``request.app.state`` rather than module-level globals.
         lifespan=_lifespan,
     )

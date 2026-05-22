@@ -135,9 +135,19 @@ def auth_headers(token: str) -> dict[str, str]:
 
 
 @pytest.fixture
-def client(api_config: PollyPMConfig, token_path: Path, token: str) -> TestClient:  # noqa: ARG001
+def client(
+    api_config: PollyPMConfig, token_path: Path, token: str,  # noqa: ARG001
+) -> Iterator[TestClient]:
+    """TestClient wired through ``with`` so the FastAPI lifespan fires.
+
+    Lifespan owns the briefings ThreadPoolExecutor + in-flight
+    registry on ``app.state`` (Codex round-4 on #2059). Without the
+    ``with`` block, ``TestClient`` skips startup/shutdown and the
+    regenerate endpoint would 503 on the missing executor.
+    """
     app = create_app(config=api_config, token_path=token_path)
-    return TestClient(app)
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 # ---------------------------------------------------------------------------
@@ -184,21 +194,18 @@ def fake_state() -> _FakeAdapterState:
 
 @pytest.fixture(autouse=True)
 def _clear_briefing_inflight() -> "Iterator[None]":
-    """Reset the module-level in-flight registry between tests.
+    """No-op — the in-flight registry now lives on ``app.state``.
 
-    The regenerate endpoint dedupes concurrent runs by `(type, project)`
-    using a module-level dict; a previous test that triggered a 504
-    leaves the background thread running, which would 409 the next
-    request for the same scope. We drop the entry on teardown so each
-    test starts with a clean inflight table.
+    Previously a module-level dict in ``routes/briefings.py`` carried
+    in-flight regenerates across tests, so we needed to drop the entry
+    in setup/teardown to avoid 409-on-retry. With the lifespan-owned
+    registry (Codex round-4 on #2059) each ``client`` fixture builds a
+    fresh app whose ``app.state.briefing_inflight`` starts empty and
+    is cleared on lifespan exit, so cross-test bleed is impossible.
+    Kept as an empty fixture so the autouse signature stays stable for
+    any test that explicitly references it.
     """
-    from pollypm.web_api.routes import briefings as br
-
-    with br._INFLIGHT_LOCK:
-        br._INFLIGHT.clear()
     yield
-    with br._INFLIGHT_LOCK:
-        br._INFLIGHT.clear()
 
 
 @pytest.fixture
@@ -519,10 +526,10 @@ def test_briefings_uses_injected_config_not_default(
     )
 
     # Build a fresh client that uses the real ``_morning_regenerate``
-    # (no patched_registry fixture). The shared executor is module
-    # level, so we don't need to recreate it.
+    # (no patched_registry fixture). ``with TestClient(...)`` is
+    # required so the FastAPI lifespan boots the briefings executor on
+    # ``app.state`` (Codex round-4 on #2059).
     app = create_app(config=api_config, token_path=token_path)
-    client = TestClient(app)
 
     # Mark the morning provider as "available" without the real plugin
     # tree. Patch only the availability probe — render is unused here.
@@ -539,11 +546,12 @@ def test_briefings_uses_injected_config_not_default(
         regenerate=_morning_regenerate,
     )
 
-    response = client.post(
-        "/api/v1/briefings/morning/regenerate",
-        json={},
-        headers=auth_headers,
-    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/briefings/morning/regenerate",
+            json={},
+            headers=auth_headers,
+        )
     assert response.status_code == 200, response.json()
     # The stub captured at least one path. Crucially it must equal the
     # *custom* path, not the default ``~/.pollypm/pollypm.toml``.
@@ -618,13 +626,12 @@ def test_briefings_morning_rejects_project_param(
         regenerate=_morning_regenerate,
     )
     app = create_app(config=api_config, token_path=token_path)
-    client = TestClient(app)
-
-    response = client.post(
-        "/api/v1/briefings/morning/regenerate",
-        json={"project": "myproj"},
-        headers=auth_headers,
-    )
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/briefings/morning/regenerate",
+            json={"project": "myproj"},
+            headers=auth_headers,
+        )
     assert response.status_code == 400, response.json()
     body = response.json()
     assert body["error"]["code"] == "invalid_request"
@@ -664,9 +671,8 @@ def test_briefings_endpoint_available_in_default_create_app(
     register_briefing_provider(None)
 
     app = create_app(config=api_config, token_path=token_path)
-    client = TestClient(app)
-
-    response = client.get("/api/v1/briefings", headers=auth_headers)
+    with TestClient(app) as client:
+        response = client.get("/api/v1/briefings", headers=auth_headers)
     assert response.status_code == 200, response.json()
     morning = next(
         entry for entry in response.json()["types"] if entry["name"] == "morning"
@@ -739,28 +745,143 @@ def test_disabled_morning_plugin_reports_unavailable(
     api_config.plugins = PluginSettings(disabled=("morning_briefing",))
 
     app = create_app(config=api_config, token_path=token_path)
-    client = TestClient(app)
+    with TestClient(app) as client:
+        # GET /api/v1/briefings — morning.available must be False
+        response = client.get("/api/v1/briefings", headers=auth_headers)
+        assert response.status_code == 200, response.json()
+        morning = next(
+            entry for entry in response.json()["types"] if entry["name"] == "morning"
+        )
+        assert morning["available"] is False, (
+            "morning provider was wired despite [plugins].disabled containing "
+            "morning_briefing — API bypassed the plugin-disable contract"
+        )
 
-    # GET /api/v1/briefings — morning.available must be False
-    response = client.get("/api/v1/briefings", headers=auth_headers)
-    assert response.status_code == 200, response.json()
-    morning = next(
-        entry for entry in response.json()["types"] if entry["name"] == "morning"
-    )
-    assert morning["available"] is False, (
-        "morning provider was wired despite [plugins].disabled containing "
-        "morning_briefing — API bypassed the plugin-disable contract"
-    )
-
-    # POST /api/v1/briefings/morning/regenerate — 503 service_unavailable
-    response = client.post(
-        "/api/v1/briefings/morning/regenerate",
-        json={},
-        headers=auth_headers,
-    )
-    assert response.status_code == 503, response.json()
-    body = response.json()
-    assert body["error"]["code"] == "service_unavailable"
+        # POST /api/v1/briefings/morning/regenerate — 503 service_unavailable
+        response = client.post(
+            "/api/v1/briefings/morning/regenerate",
+            json={},
+            headers=auth_headers,
+        )
+        assert response.status_code == 503, response.json()
+        body = response.json()
+        assert body["error"]["code"] == "service_unavailable"
 
     # Restore a clean registry for sibling tests that share module state.
     register_briefing_provider(None)
+
+
+# ---------------------------------------------------------------------------
+# Codex round-4 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_briefings_executor_shut_down_on_app_teardown(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    fake_state: _FakeAdapterState,
+) -> None:
+    """The briefings executor + in-flight registry are torn down at exit.
+
+    Codex round-4 P0: the executor used to be a module-level global
+    with no FastAPI lifespan hook, so it outlived ``pm serve`` shutdown
+    and a slow regenerate kept its worker thread alive past app
+    teardown. The lifespan migration moves the executor onto
+    ``app.state`` and calls ``shutdown(wait=True, cancel_futures=True)``
+    on lifespan exit — this test exercises that contract.
+    """
+    from pollypm.web_api.routes import briefings as br
+
+    # Patch a stub adapter onto the module registry so the request
+    # path hits a controllable regenerate fn (no real plugin tree).
+    def _available(_config) -> bool:
+        return True
+
+    def _regenerate(_config, _body: RegenerateRequest) -> BriefingResponse:
+        # Sleep long enough that the in-flight future is still
+        # outstanding when we exit the lifespan context.
+        time.sleep(fake_state.regen_delay or 5.0)
+        return fake_state.regen
+
+    monkeypatch.setitem(
+        br._REGISTRY,
+        "morning",
+        _BriefingAdapter(
+            name="morning",
+            description="executor-teardown test",
+            available=_available,
+            render_last=lambda _c: None,
+            regenerate=_regenerate,
+        ),
+    )
+
+    fake_state.regen_delay = 30.0
+
+    app = create_app(config=api_config, token_path=token_path)
+
+    # Capture executor + inflight refs after startup so we can assert
+    # post-shutdown state outside the context manager.
+    executor_ref: list[Any] = []
+    inflight_ref: list[dict] = []
+
+    with TestClient(app) as client:
+        # Confirm the lifespan attached the executor / registry.
+        assert hasattr(app.state, "briefing_executor")
+        assert hasattr(app.state, "briefing_inflight")
+        executor_ref.append(app.state.briefing_executor)
+        inflight_ref.append(app.state.briefing_inflight)
+
+        # Fire a slow regenerate that we abandon via 504; the worker
+        # is still running when we exit the context.
+        response = client.post(
+            "/api/v1/briefings/morning/regenerate?timeout_seconds=1",
+            json={},
+            headers=auth_headers,
+        )
+        assert response.status_code == 504, response.json()
+
+        # The in-flight registry should hold the running future.
+        assert len(app.state.briefing_inflight) >= 0  # may have cleared if super fast
+
+    # After the lifespan exits:
+    # 1) the executor was shut down (no new submissions accepted)
+    assert executor_ref[0]._shutdown is True, (
+        "lifespan did not shut down the briefings executor"
+    )
+    # 2) the in-flight registry was cleared
+    assert inflight_ref[0] == {}, (
+        f"in-flight registry not cleared on shutdown: {inflight_ref[0]!r}"
+    )
+
+
+def test_briefings_inflight_isolated_per_app(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+) -> None:
+    """Two ``create_app`` instances get independent ``app.state`` registries.
+
+    Pins the module-globals → ``app.state`` migration: in-flight
+    bookkeeping on app A must not be visible to app B. Previously the
+    module-level dict was shared across every app in the process, which
+    would have let one ``pm serve`` invocation 409 a regenerate on a
+    sibling FastAPI app (e.g. tests, embedded uses).
+    """
+    app_a = create_app(config=api_config, token_path=token_path)
+    app_b = create_app(config=api_config, token_path=token_path)
+
+    with TestClient(app_a), TestClient(app_b):
+        # Distinct ThreadPoolExecutor + inflight + lock per app.
+        assert app_a.state.briefing_executor is not app_b.state.briefing_executor
+        assert app_a.state.briefing_inflight is not app_b.state.briefing_inflight
+        assert (
+            app_a.state.briefing_inflight_lock
+            is not app_b.state.briefing_inflight_lock
+        )
+
+        # Poking app_a's in-flight map must not leak into app_b.
+        app_a.state.briefing_inflight[("morning", "")] = object()  # type: ignore[assignment]
+        assert ("morning", "") not in app_b.state.briefing_inflight

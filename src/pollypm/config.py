@@ -1022,14 +1022,21 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
                     fresh = _parse_config(config_path)
                     if ensure_session_auth_tokens(fresh):
                         write_config(fresh, config_path, force=True)
-                    # Reflect any tokens minted on disk into the live
-                    # snapshot the caller receives, so subsequent reads
-                    # of ``config.sessions[*].auth_token`` see the same
-                    # value as the on-disk TOML.
-                    for name, fresh_session in fresh.sessions.items():
-                        live_session = config.sessions.get(name)
-                        if live_session is not None:
-                            live_session.auth_token = fresh_session.auth_token
+                    # #2063 round 10 (Codex blocker): swap the live
+                    # snapshot for the post-lock ``fresh`` object.
+                    # Round 9 only copied ``sessions[*].auth_token`` back
+                    # into the pre-lock ``config``, then cached that
+                    # pre-lock snapshot under the post-write mtime. Any
+                    # concurrent edit to a non-token field that landed
+                    # between the initial parse and the locked re-parse
+                    # would be on disk but invisible to every subsequent
+                    # ``load_config`` call until the file mtime changed
+                    # again — a stale-cache trap on the same path the
+                    # rest of this PR is tightening. ``fresh`` already
+                    # has the freshly-minted tokens AND any concurrent
+                    # disk edits, so it is the canonical post-write
+                    # state for both the return value and the cache.
+                    config = fresh
             except Exception:  # noqa: BLE001
                 # Persistence failure is non-fatal — tokens stay in
                 # memory for the rest of this process; next load_config

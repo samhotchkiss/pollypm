@@ -1012,3 +1012,113 @@ def test_write_config_round_trips_non_ascii_project_name(tmp_path: Path) -> None
     # Bytes must contain the UTF-8 encoding of "café" (c-a-f + 0xC3 0xA9).
     raw = config_path.read_bytes()
     assert b"caf\xc3\xa9" in raw
+
+
+def test_load_config_auto_persist_returns_post_lock_snapshot(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """Concurrent disk edit during auth-token auto-persist must be visible.
+
+    #2063 round 10 (Codex blocker): round 9 wrapped the legacy
+    ``ensure_session_auth_tokens()`` write in ``config_rmw_lock`` and
+    re-parsed under the lock as ``fresh``, but then only copied
+    ``sessions[*].auth_token`` back into the pre-lock ``config`` and
+    cached that pre-lock snapshot under the post-write mtime. If any
+    config edit landed between the initial parse and the locked
+    re-parse, disk kept the edit but the process cache served the
+    stale pre-lock object as if it matched the latest mtime —
+    subsequent ``load_config(path)`` calls returned stale config
+    indefinitely.
+
+    Reproduction (Codex's): seed a legacy session missing
+    ``auth_token`` plus a project ``persona_name='Old'``. Monkeypatch
+    ``ensure_session_auth_tokens`` so its FIRST invocation rewrites
+    ``persona_name='New'`` to disk before returning (simulates a
+    concurrent CLI/API edit racing the auto-persist). After the fix
+    both the first and the second ``load_config(path)`` must observe
+    the post-lock state: minted token AND the concurrent edit.
+    """
+    import pollypm.config as config_module
+    import pollypm.session_auth as session_auth
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        """
+[project]
+name = "PollyPM"
+tmux_session = "pollypm"
+
+[pollypm]
+controller_account = "claude_primary"
+
+[accounts.claude_primary]
+provider = "claude"
+home = ".pollypm/homes/claude_primary"
+
+[sessions.heartbeat]
+role = "heartbeat-supervisor"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[sessions.operator]
+role = "operator-pm"
+provider = "claude"
+account = "claude_primary"
+cwd = "."
+
+[projects.myproj]
+path = "myproj"
+persona_name = "Old"
+"""
+    )
+
+    # Clear any cache entry for this path from earlier tests / module
+    # state so the load below exercises the auto-persist branch.
+    config_module._config_cache.pop(config_path.resolve(), None)
+
+    original = session_auth.ensure_session_auth_tokens
+    call_count = {"n": 0}
+
+    def patched(cfg):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # Simulate a concurrent CLI edit landing between the
+            # pre-lock parse and the locked re-parse: rewrite the
+            # persona on disk BEFORE we mint tokens on the pre-lock
+            # snapshot. The locked re-parse inside load_config will
+            # then see persona='New'.
+            disk = config_path.read_text()
+            assert 'persona_name = "Old"' in disk
+            config_path.write_text(
+                disk.replace('persona_name = "Old"', 'persona_name = "New"')
+            )
+        return original(cfg)
+
+    monkeypatch.setattr(session_auth, "ensure_session_auth_tokens", patched)
+
+    loaded = config_module.load_config(config_path)
+
+    # 1. Auto-persist worked: operator session now carries a minted token.
+    assert loaded.sessions["operator"].auth_token, (
+        "ensure_session_auth_tokens must have minted + persisted a token"
+    )
+    # 2. The concurrent persona_name edit (visible only to the locked
+    #    re-parse) is reflected in the returned snapshot. Pre-fix this
+    #    returned 'Old' because load_config returned the pre-lock object.
+    assert loaded.projects["myproj"].persona_name == "New", (
+        "load_config must return the post-lock snapshot that observed "
+        "the concurrent disk edit, not the stale pre-lock parse"
+    )
+    # 3. A subsequent load_config call must also see the post-lock
+    #    state. Pre-fix the cache held the pre-lock object under the
+    #    post-write mtime, so this call kept returning 'Old' forever.
+    again = config_module.load_config(config_path)
+    assert again.projects["myproj"].persona_name == "New", (
+        "load_config cache stored the stale pre-lock snapshot; "
+        "subsequent calls return stale config indefinitely"
+    )
+    assert again.sessions["operator"].auth_token == loaded.sessions[
+        "operator"
+    ].auth_token

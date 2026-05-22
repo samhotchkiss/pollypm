@@ -43,6 +43,8 @@ PHASE_1_PATHS: set[tuple[str, str]] = {
     ("GET", "/chat/{session_name}/messages"),
     # Chat-endpoints P3 (#2043) — POST send path.
     ("POST", "/chat/{session_name}/send"),
+    # Phase 6 P0 — cross-project flat task list (spec §5.1).
+    ("GET", "/tasks"),
 }
 
 

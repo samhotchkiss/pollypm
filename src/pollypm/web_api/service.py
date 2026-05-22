@@ -1005,6 +1005,145 @@ def list_project_tasks(
         ) from exc
 
 
+class StaleCursorError(Exception):
+    """Raised when ``list_all_tasks`` is given a cursor that no longer
+    matches any item in the current snapshot.
+
+    Round 1 of Codex review on PR #2067 noted that the previous
+    behaviour (silently restart at page one) creates duplicate rows
+    and infinite-pagination loops under concurrent updates. We now
+    raise this typed error so the route layer can map it to a 400
+    ``invalid_request`` rather than mask the failure.
+    """
+
+
+def list_all_tasks(
+    config: PollyPMConfig,
+    *,
+    project: str | None = None,
+    statuses: list[str] | None = None,
+    assignee: str | None = None,
+    since: datetime | None = None,
+    limit: int = 50,
+    cursor: str | None = None,
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, str]]]:
+    """Cross-project flat task list (spec §5.1 / Phase 6 P0).
+
+    No cross-project helper exists on the work-service yet, so we
+    iterate the registered projects, call :meth:`list_tasks` per
+    project, and concatenate. This is acceptable for v1 — workspaces
+    are small (<20 projects, low hundreds of tasks each) and the
+    per-project DB open is the same cost ``list_project_tasks`` pays.
+    A native cross-project query can replace this body without
+    changing the route signature.
+
+    * ``project`` — when set, restricts to a single project. The
+      result is equivalent to ``list_project_tasks`` minus the 404 on
+      unknown project (an unknown project here yields an empty page,
+      matching the cross-project "no matches" semantics).
+    * ``statuses`` — repeatable status filter; OR semantics. Empty /
+      ``None`` means no status filter.
+    * ``assignee`` — exact-match assignee filter.
+    * ``since`` — only tasks with ``updated_at > since`` are returned.
+      Must be timezone-aware; the route layer rejects naive ISO
+      values before they reach this helper.
+    * Pagination uses an opaque cursor; the cursor encodes the
+      ``(updated_at_iso, task_id)`` of the last item on the previous
+      page. A cursor that no longer matches any item raises
+      :class:`StaleCursorError` (route maps to 400) so clients restart
+      from page one explicitly — silently restarting would create
+      duplicate rows / infinite loops under concurrent updates
+      (PR #2067 Codex round 1, P0 #3).
+
+    Returns ``(page, next_cursor, warnings)``. ``warnings`` is a list
+    of ``{"project": <key>, "error": <code>}`` dicts — one entry per
+    project whose backing store raised during this request. An empty
+    list means every project read succeeded; the partial-failure
+    surface is explicit so a pg outage on one project can't hide
+    behind a 200 with a silently-truncated body (PR #2067 Codex round
+    1, P0 #1).
+    """
+    keys: Iterable[str]
+    if project is not None:
+        keys = (project,) if project in config.projects else ()
+    else:
+        keys = config.projects.keys()
+
+    status_filter = set(statuses or [])
+    summaries: list[APITaskSummary] = []
+    warnings: list[dict[str, str]] = []
+    for key in keys:
+        proj = config.projects[key]
+        try:
+            with _open_work_service_readonly(
+                config=config, project_key=key, project_path=proj.path
+            ) as svc:
+                # The work-service ``list_tasks`` only supports a
+                # single ``work_status`` filter, so we apply the
+                # OR-set client-side; assignee + since likewise apply
+                # client-side to keep the wrapper portable across
+                # backends.
+                tasks = svc.list_tasks(project=key)
+        except _BACKING_STORE_ERRORS as exc:
+            logger.warning(
+                "list_all_tasks: backing store error for %s; surfacing as warning: %s",
+                key,
+                exc,
+                exc_info=True,
+            )
+            warnings.append({"project": key, "error": "service_unavailable"})
+            continue
+
+        for task in tasks:
+            if status_filter:
+                value = _enum_value(getattr(task, "work_status", ""))
+                if value not in status_filter:
+                    continue
+            if assignee is not None:
+                if (getattr(task, "assignee", None) or "") != assignee:
+                    continue
+            if since is not None:
+                updated = getattr(task, "updated_at", None)
+                if updated is not None and updated <= since:
+                    continue
+            summaries.append(_task_to_summary(task))
+
+    # Newest-first ordering is the most useful default for cross-
+    # project list views (cockpit "what changed recently?"). Tasks
+    # without ``updated_at`` sort to the end via the epoch fallback so
+    # the cursor encoding stays well-defined. Use a tz-aware epoch so
+    # the sort key is comparable with the offset-aware ``updated_at``
+    # values pg returns.
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
+    summaries.sort(
+        key=lambda t: (t.updated_at or epoch, t.task_id),
+        reverse=True,
+    )
+
+    cursor_idx = 0
+    if cursor is not None:
+        matched = False
+        for idx, item in enumerate(summaries):
+            cursor_key = f"{(item.updated_at or epoch).isoformat()}|{item.task_id}"
+            if cursor_key == cursor:
+                cursor_idx = idx + 1
+                matched = True
+                break
+        if not matched:
+            # Empty-result + cursor is the only ambiguous case (the
+            # caller could legitimately be paging past the end of a
+            # now-empty list). Treat any other miss as a stale cursor
+            # and force the client to restart explicitly.
+            raise StaleCursorError(cursor)
+
+    page = summaries[cursor_idx : cursor_idx + limit]
+    next_cursor: str | None = None
+    if cursor_idx + limit < len(summaries) and page:
+        tail = page[-1]
+        next_cursor = f"{(tail.updated_at or epoch).isoformat()}|{tail.task_id}"
+    return page, next_cursor, warnings
+
+
 def get_task_detail(
     config: PollyPMConfig, project_key: str, task_number: int
 ) -> APITaskDetail | None:
@@ -2388,6 +2527,7 @@ __all__ = [
     "get_project",
     "get_task_detail",
     "init_project_guide_for_role",
+    "list_all_tasks",
     "list_inbox",
     "list_project_tasks",
     "list_projects",
@@ -2399,4 +2539,5 @@ __all__ = [
     "reply_inbox_item",
     "set_project_tracked",
     "snooze_inbox_item",
+    "StaleCursorError",
 ]

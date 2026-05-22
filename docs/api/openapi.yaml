@@ -1,4 +1,10 @@
 openapi: 3.1.0
+# Phase 6 cleanup: removed stale entries for `/doctor`, `POST /projects`,
+# `POST /projects/{key}/chat`, `POST /projects/{key}/plan`, and the
+# `/tasks/{project}/{n}/approve` + `/reject` pair. None were wired in
+# `pollypm.web_api.app`. The plan approve/reject flow is tracked
+# separately as Phase 3 work; doctor reads live at `/doctor/checks`
+# and `/doctor/report`.
 info:
   title: PollyPM Web API
   version: 0.1.0
@@ -110,25 +116,6 @@ paths:
                     schema_version: 1
                     started_at: "2026-05-07T12:00:00Z"
 
-  /doctor:
-    get:
-      tags: [Health]
-      operationId: getDoctor
-      summary: Structured pm doctor output
-      description: |
-        Mirrors the structured JSON output of `pm doctor` (PR #1347).
-        Returns each check with status (ok / warn / fail), an actor
-        message, and an optional remediation hint.
-      responses:
-        "200":
-          description: Doctor results (200 even when checks fail; consult `overall`).
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/DoctorResponse"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-
   /projects:
     get:
       tags: [Projects]
@@ -154,41 +141,6 @@ paths:
                       $ref: "#/components/schemas/Project"
         "401":
           $ref: "#/components/responses/Unauthorized"
-
-    post:
-      tags: [Projects]
-      operationId: registerProject
-      summary: Register a new project
-      description: Mirrors `pm add-project`. Idempotent on `path`.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RegisterProjectRequest"
-            examples:
-              minimal:
-                value:
-                  path: /Users/me/dev/myrepo
-              full:
-                value:
-                  path: /Users/me/dev/myrepo
-                  name: My Project
-                  slug: myproj
-                  tracked: true
-      responses:
-        "201":
-          description: Project registered (or returned if already present at path).
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/Project"
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "422":
-          $ref: "#/components/responses/ValidationError"
 
   /projects/{key}:
     parameters:
@@ -524,6 +476,7 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+
   /chat/sessions:
     get:
       tags: [Chat]
@@ -841,6 +794,77 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /tasks:
+    get:
+      tags: [Tasks]
+      operationId: listTasks
+      summary: Flat list of tasks across all projects
+      description: |
+        Cross-project flat task list (spec §5.1). The per-project list
+        at `/projects/{key}/tasks` keeps its narrow contract; this
+        endpoint exists so a single round trip can populate cross-
+        project surfaces (cockpit dashboards, web UI task board).
+        Pagination matches the per-project list (opaque `cursor` +
+        `next_cursor`); filters are stackable.
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+          description: Limit results to this project key.
+        - in: query
+          name: status
+          schema:
+            $ref: "#/components/schemas/TaskStatus"
+          description: |
+            Filter by `work_status`. Repeatable — pass `status=draft&status=queued`
+            to OR multiple statuses.
+        - in: query
+          name: assignee
+          schema: { type: string }
+          description: Filter by assignee (exact match).
+        - in: query
+          name: since
+          schema:
+            type: string
+            format: date-time
+          description: |
+            ISO-8601 lower bound on `updated_at`. Only tasks whose
+            `updated_at` is strictly after this value are returned.
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+        - in: query
+          name: cursor
+          schema: { type: string }
+          description: Opaque cursor from a previous response's `next_cursor`.
+      responses:
+        "200":
+          description: |
+            Page of task summaries. The optional `warnings` array
+            lists any projects whose backing store failed during this
+            request — clients should surface that to the operator
+            rather than treat a 200 with warnings as a complete read.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskListResponse"
+        "400":
+          description: |
+            `invalid_request` — a query parameter was rejected.
+            Includes:
+              - `since` malformed or missing a timezone offset
+                (task `updated_at` values are tz-aware; a naive
+                `since` would compare-error to a 500).
+              - `cursor` is stale (the item it referenced has been
+                updated or deleted). Restart paging without the
+                `cursor` parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
   /tasks/{project}/{n}:
     parameters:
       - $ref: "#/components/parameters/ProjectKey2"
@@ -863,80 +887,6 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
-
-  /tasks/{project}/{n}/approve:
-    parameters:
-      - $ref: "#/components/parameters/ProjectKey2"
-      - $ref: "#/components/parameters/TaskNumber"
-    post:
-      tags: [Tasks]
-      operationId: approveTask
-      summary: Approve plan or code review
-      description: |
-        Approves the current review-node execution. The `kind` field
-        on the request body discriminates plan-review vs
-        code-review approvals; absent it, the API approves whichever
-        review is active.
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-      requestBody:
-        required: false
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/ApproveRequest"
-      responses:
-        "200":
-          description: Approval recorded.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ActionResult"
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-
-  /tasks/{project}/{n}/reject:
-    parameters:
-      - $ref: "#/components/parameters/ProjectKey2"
-      - $ref: "#/components/parameters/TaskNumber"
-    post:
-      tags: [Tasks]
-      operationId: rejectTask
-      summary: Reject plan or code review with a reason
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: "#/components/schemas/RejectRequest"
-            examples:
-              plan:
-                value:
-                  kind: plan
-                  reason: "Scope is too broad — split into 3 tasks first."
-      responses:
-        "200":
-          description: Rejection recorded; task transitions to `rework`.
-          content:
-            application/json:
-              schema:
-                $ref: "#/components/schemas/ActionResult"
-        "401":
-          $ref: "#/components/responses/Unauthorized"
-        "404":
-          $ref: "#/components/responses/NotFound"
-        "409":
-          $ref: "#/components/responses/Conflict"
-        "422":
-          $ref: "#/components/responses/ValidationError"
 
   /tasks/{project}/{n}/queue:
     parameters:
@@ -2694,6 +2644,29 @@ components:
         next_cursor:
           type: string
           description: Absent when no more pages.
+        warnings:
+          type: array
+          description: |
+            Per-project partial-failure notices. Absent/empty when
+            every project read succeeded. One entry per project whose
+            backing store raised during this request (clients should
+            render the partial-failure state explicitly rather than
+            assume the body is complete).
+          items:
+            $ref: "#/components/schemas/TaskListWarning"
+
+    TaskListWarning:
+      type: object
+      required: [project, error]
+      properties:
+        project:
+          type: string
+          description: Project key whose backing store failed.
+        error:
+          type: string
+          description: |
+            Short error code (e.g. `service_unavailable`). Stable across
+            releases so clients can switch on it.
 
     ApproveRequest:
       type: object

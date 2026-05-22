@@ -3,10 +3,14 @@
 Registers two surfaces on the root ``pm`` Typer app:
 
 - ``pm serve [--port N] [--host H] [--allow-remote] [--tailscale]`` —
-  run the FastAPI app from :mod:`pollypm.web_api`. ``--tailscale``
-  shells out to ``tailscale ip -4`` and binds the resulting tailnet
-  address in addition to loopback so the web UI is reachable from any
-  device on the operator's tailnet.
+  run the FastAPI app from :mod:`pollypm.web_api`. Default ``pm serve``
+  auto-detects Tailscale: if ``tailscale ip -4`` returns an IPv4 the
+  daemon binds that tailnet interface (tailnet-trust mode); otherwise
+  it falls back to ``127.0.0.1`` (loopback mode). ``--tailscale`` is a
+  no-op back-compat flag — auto-detection covers the same path. To
+  force loopback even when Tailscale is running, pass
+  ``--host 127.0.0.1`` explicitly; that override stays in untrusted
+  mode (bearer/cookie required for every request).
 - ``pm api regen-token`` — rotate the bearer token. Lives under a
   dedicated ``pm api`` sub-app so future admin commands (``pm api
   show-token``, ``pm api status``) can land beside it without

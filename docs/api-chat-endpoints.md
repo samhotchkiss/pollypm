@@ -55,11 +55,26 @@ API directly instead.
 The chat API reuses PollyPM's existing daemon-wide bearer-token auth.
 
 - Token lives at `~/.pollypm/api-token` (created on first `pm up`).
-- Pass it via `Authorization: Bearer <token>` on every request.
-- The daemon listens on `127.0.0.1:8765` by default. For remote access,
-  use `pm serve --allow-remote --host 0.0.0.0`. Without `--allow-remote`,
-  non-loopback binds are rejected. Defense in depth: even on Tailscale,
-  authenticated devices must still present the bearer token.
+- The default daemon listener depends on Tailscale detection (see
+  `docs/web-api-spec.md` §3 for the full bind matrix): `pm serve`
+  binds the auto-detected tailnet IPv4 when `tailscale ip -4`
+  succeeds, otherwise it falls back to `127.0.0.1:8765`.
+- In `tailnet_trust_enabled=True` mode (auto-selected when the daemon
+  bound to a verified Tailscale IPv4), tailnet peers can call the API
+  **without** a bearer token. Loopback callers get a
+  `pollypm-session` cookie via `GET /ui/` for browser convenience.
+  The `Authorization: Bearer <token>` header is still accepted in
+  every mode.
+- In `tailnet_trust_enabled=False` mode (loopback default, or any
+  explicit `--host` override that isn't the detected Tailscale IPv4,
+  including `--host 0.0.0.0 --allow-remote`), every request needs an
+  `Authorization: Bearer <token>` header or the `pollypm-session`
+  cookie (issued from `GET /ui/` for loopback callers or for any
+  caller that already presents a valid bearer header).
+- The `/ui/` cookie bootstrap is gated to: loopback callers, verified
+  Tailscale peers when trust is enabled, or callers that already
+  present a valid bearer header. CGNAT-source peers in untrusted
+  mode get 401 and no `Set-Cookie`.
 
 The chat API does **not** use the per-session `auth_token` field on
 `SessionConfig`. That token is for outbound PollyPM → agent control

@@ -367,7 +367,11 @@ def open_messages(
 def has_workspace_root_open_messages(
     config: "PollyPMConfig | None",
 ) -> bool:
-    """Return True iff any open workspace-root inbox row exists.
+    """Returns True if any workspace-root open message exists.
+
+    **CONSERVATIVE:** returns True on ANY pg failure (pool/query) — see
+    Move A cache-authoritative invariant. Pure SQL existence query
+    (``LIMIT 1``) — independent of how many newer rows exist.
 
     "Workspace-root" = messages with ``scope IN ('', 'inbox')``. The
     state-cache refresher's per-project filter
@@ -386,18 +390,24 @@ def has_workspace_root_open_messages(
     predicate) so the answer is independent of how many newer
     project-scoped rows exist.
 
-    Best-effort: pool import / query failure returns ``False`` so the
-    fast-path still wins on the common "no workspace-root noise" case.
+    PR #2026 v5 (Codex round-5 blocker): pool/query failures now return
+    ``True`` (with warning log) instead of ``False``. The caller
+    ``_workspace_root_inbox_has_open`` expects this helper to either
+    return a real answer or raise; v4 wrapped the outer call in
+    try/except but the helper itself was swallowing pg errors and
+    returning False, defeating the conservative-on-error guard. Cache
+    authoritativeness requires that any signal we cannot prove returns
+    the safe answer that forces fall-through.
     """
 
     try:
         from pollypm.storage.pg_pool import get_ro_pool, get_rw_pool
     except Exception:  # noqa: BLE001
         logger.warning(
-            "pg aggregates: pg_pool import failed (workspace-root probe)",
+            "workspace-root inbox probe encountered pool error (pg_pool import failed); assuming inbox is non-empty to force conservative cache decline",
             exc_info=True,
         )
-        return False
+        return True
 
     try:
         pool = get_ro_pool(config)
@@ -406,10 +416,10 @@ def has_workspace_root_open_messages(
             pool = get_rw_pool(config)
         except Exception:  # noqa: BLE001
             logger.warning(
-                "pg aggregates: pg pool open failed (workspace-root probe)",
+                "workspace-root inbox probe encountered pool error; assuming inbox is non-empty to force conservative cache decline",
                 exc_info=True,
             )
-            return False
+            return True
 
     sql = (
         "SELECT 1 "
@@ -427,10 +437,10 @@ def has_workspace_root_open_messages(
             row = cur.fetchone()
     except Exception:  # noqa: BLE001
         logger.warning(
-            "pg aggregates: workspace-root probe query failed",
+            "workspace-root inbox probe encountered query error; assuming inbox is non-empty to force conservative cache decline",
             exc_info=True,
         )
-        return False
+        return True
     return row is not None
 
 

@@ -847,6 +847,96 @@ def test_patch_nonexistent_task_returns_404(client, auth_headers) -> None:
 
 
 # ---------------------------------------------------------------------------
+# PATCH extras / no-op contract (#2064 round-6)
+# ---------------------------------------------------------------------------
+#
+# Codex round-6 caught two silent-success paths:
+#   1. ``TaskPatchRequest`` had no ``extra=`` config, so Pydantic
+#      dropped unknown keys (``priority``, role-assignment fields,
+#      typos like ``metdata``) and forwarded an all-``None`` body —
+#      the route then returned ``200 ok`` after a single ``svc.get``,
+#      masking client bugs.
+#   2. An explicit empty body (``{}`` or ``{labels: null, ...}``)
+#      took the same silent path.
+# Round-6 fix:
+#   - ``model_config = {"extra": "forbid"}`` in ``TaskPatchRequest``
+#     → FastAPI's request validator returns ``422`` for extras.
+#   - Route-layer no-op guard returns ``400 invalid_request`` for
+#     all-``None`` bodies.
+
+
+def test_patch_rejects_unknown_field(
+    client, auth_headers, task_store
+) -> None:
+    """PATCH with an unsupported field (`priority`) → 422 from Pydantic.
+
+    Without ``extra=forbid``, this body would be silently coerced to
+    ``{labels: None, status: None, metadata: None}`` and return 200.
+    The forbid config turns it into a ``422 Unprocessable Entity`` —
+    FastAPI's default for request-body validation failures, which is
+    a stronger client signal than our typed ``invalid_request``.
+    """
+    seeded = _seed(task_store, n=20, labels=["keep"])
+    response = client.patch(
+        "/api/v1/tasks/myproj/20",
+        headers=auth_headers,
+        json={"priority": "high"},
+    )
+    # Pydantic extras → 422; the FastAPI validation envelope is fine.
+    assert response.status_code == 422, response.text
+    # Nothing on the task changed.
+    assert seeded.labels == ["keep"]
+
+
+def test_patch_rejects_misspelled_field(
+    client, auth_headers, task_store
+) -> None:
+    """A typo (``metdata`` instead of ``metadata``) is rejected, not silently ignored."""
+    seeded = _seed(task_store, n=21, external_refs={"jira": "X-1"})
+    response = client.patch(
+        "/api/v1/tasks/myproj/21",
+        headers=auth_headers,
+        json={"metdata": {"jira": "X-2"}},
+    )
+    assert response.status_code == 422, response.text
+    # Original external_refs preserved.
+    assert seeded.external_refs == {"jira": "X-1"}
+
+
+def test_patch_rejects_empty_body(client, auth_headers, task_store) -> None:
+    """PATCH ``{}`` → 400 invalid_request; surfaces client-side payload bugs."""
+    seeded = _seed(task_store, n=22, labels=["unchanged"])
+    response = client.patch(
+        "/api/v1/tasks/myproj/22",
+        headers=auth_headers,
+        json={},
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    msg = body["error"]["message"].lower()
+    assert "at least one" in msg
+    assert "labels" in msg and "status" in msg and "metadata" in msg
+    # Nothing changed.
+    assert seeded.labels == ["unchanged"]
+
+
+def test_patch_rejects_all_null_body(
+    client, auth_headers, task_store
+) -> None:
+    """PATCH with every field explicitly ``null`` is still a no-op → 400."""
+    seeded = _seed(task_store, n=23, labels=["unchanged"])
+    response = client.patch(
+        "/api/v1/tasks/myproj/23",
+        headers=auth_headers,
+        json={"labels": None, "status": None, "metadata": None},
+    )
+    assert response.status_code == 400, response.text
+    assert response.json()["error"]["code"] == "invalid_request"
+    assert seeded.labels == ["unchanged"]
+
+
+# ---------------------------------------------------------------------------
 # Auth
 # ---------------------------------------------------------------------------
 

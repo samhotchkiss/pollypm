@@ -300,6 +300,26 @@ def patch_task_endpoint(
 ) -> TaskActionResult:
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
+    # No-op guard (#2064 round-6): ``TaskPatchRequest`` makes every
+    # field optional so the wire shape can carry "just labels" or
+    # "just status" without sending the others. An all-``None`` body
+    # has no observable effect on the task, but the handler would
+    # still ``svc.get(...)`` and respond ``200 ok`` — masking client
+    # bugs (e.g. a frontend that forgot to attach the form payload).
+    # Refuse the empty shape up front with the same typed-error
+    # helper the combined-shape check below uses.
+    if body.labels is None and body.status is None and body.metadata is None:
+        raise invalid_request(
+            (
+                "PATCH body must include at least one of: "
+                "`labels`, `status`, `metadata`."
+            ),
+            hint=(
+                "Send the field you want to change; an empty body "
+                "or one with only `null` values is rejected to "
+                "surface client-side payload bugs."
+            ),
+        )
     # Atomicity contract (#2064 round-2): PATCH cannot combine
     # ``status`` with labels/metadata. ``svc.update(...)`` and the
     # lifecycle methods (``svc.queue`` / ``svc.cancel``) commit in

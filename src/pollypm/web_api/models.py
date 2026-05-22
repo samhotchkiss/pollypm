@@ -337,7 +337,17 @@ class TaskPatchRequest(BaseModel):
     reachable via the work-service's direct setters (e.g.
     ``in_progress``, ``review``) also raise 422 with a hint pointing
     to the dedicated transition endpoint.
+
+    ``extra="forbid"`` (Codex round-6, #2064): without it Pydantic
+    silently drops misspelled keys (e.g. ``metdata``) and forwards an
+    all-``None`` body, so the route returns ``200 ok`` even though
+    nothing changed. Forbidding extras turns typos / unsupported
+    fields like ``priority`` into a ``422 Unprocessable Entity`` from
+    FastAPI's request validator, giving the client an actionable
+    error instead of a silent no-op.
     """
+
+    model_config = {"extra": "forbid"}
 
     labels: list[str] | None = None
     status: str | None = None

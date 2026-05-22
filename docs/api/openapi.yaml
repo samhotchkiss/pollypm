@@ -52,6 +52,13 @@ tags:
       Chat-surface discovery and message history. The discovery endpoint
       enumerates operator/architect/advisor/worker surfaces; the messages
       endpoint paginates each surface's envelope stream.
+  - name: Dashboard
+    description: |
+      Aggregate cockpit / rail state. Read-only snapshot of projects,
+      rollup counters, active sessions, recent commits, completed items,
+      recent messages, token usage, and account quotas. SSE streaming
+      variant (`/dashboard/stream`) ships in a follow-up PR per Phase 2
+      §3.2.
 
 paths:
   /health:
@@ -279,6 +286,64 @@ paths:
           $ref: "#/components/responses/NotFound"
         "422":
           $ref: "#/components/responses/ValidationError"
+
+  /dashboard:
+    get:
+      tags: [Dashboard]
+      operationId: getDashboard
+      summary: Aggregate dashboard / cockpit state
+      description: |
+        Returns the operator's whole-system snapshot — the same shape
+        the cockpit rail computes. Read-only and eventually-consistent;
+        for sub-second freshness use the deferred `/dashboard/stream`
+        SSE channel (Phase 2 §3.2, follow-up PR).
+
+        Per spec §3.3:
+        - A daemon-down state is normal — the response carries
+          `daemon_status: "down"` with `active_sessions: []` and a 200
+          status; it is NOT a 503.
+        - A transient pg / work-service outage that breaks the gather
+          surfaces as `503 service_unavailable` so clients retry.
+        - `?project=<key>` narrows the project list, rollup counters,
+          and the per-project rows (commits, sessions, messages) to
+          one project — useful for the per-project drilldown view.
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+          description: Narrow the response to a single project key.
+        - in: query
+          name: include_token_history
+          schema: { type: boolean, default: false }
+          description: |
+            Include `daily_tokens` (last 30 days as `[date, tokens]`
+            pairs). Off by default — the list can be large.
+        - in: query
+          name: include_briefing
+          schema: { type: boolean, default: false }
+          description: |
+            Include the morning-briefing narrative in the response.
+            Off by default — the body can be megabytes.
+      responses:
+        "200":
+          description: Aggregate dashboard snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: |
+            Backing-store / gather failure (`service_unavailable`).
+            Distinct from a daemon-down state, which is returned as a
+            200 response with `daemon_status: "down"`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /chat/sessions:
     get:
@@ -1116,6 +1181,164 @@ components:
         actor: { type: string }
         status: { type: string }
         summary: { type: string }
+
+    # ---- Dashboard (Phase 2 §3) -------------------------------------
+    SessionActivity:
+      type: object
+      required: [name, role, project, project_label, status, description, age_seconds]
+      properties:
+        name: { type: string }
+        role: { type: string }
+        project: { type: string }
+        project_label: { type: string }
+        status: { type: string }
+        description: { type: string }
+        age_seconds: { type: number, format: float }
+
+    CommitInfo:
+      type: object
+      required: [hash, message, author, age_seconds, project]
+      properties:
+        hash: { type: string }
+        message: { type: string }
+        author: { type: string }
+        age_seconds: { type: number, format: float }
+        project: { type: string }
+
+    CompletedItem:
+      type: object
+      required: [title, kind, project, age_seconds]
+      properties:
+        title: { type: string }
+        kind:
+          type: string
+          description: |
+            One of `issue`, `commit`, or `pr`. Open-ended — clients
+            should treat unknown values like `issue`.
+        project: { type: string }
+        age_seconds: { type: number, format: float }
+
+    InboxPreview:
+      type: object
+      required: [sender, title, project, task_id, age_seconds]
+      properties:
+        sender: { type: string }
+        title: { type: string }
+        project: { type: string }
+        task_id: { type: string }
+        age_seconds: { type: number, format: float }
+
+    AccountQuotaUsage:
+      type: object
+      required: [account_name, provider, email, used_pct, summary, severity]
+      properties:
+        account_name: { type: string }
+        provider: { type: string }
+        email: { type: string }
+        used_pct: { type: integer }
+        summary: { type: string }
+        severity: { type: string }
+        limit_label:
+          type: string
+          default: limit
+        reset_at:
+          type: string
+          description: |
+            ISO-8601 timestamp string, or empty string when the
+            provider does not expose a reset window.
+
+    DashboardRollups:
+      type: object
+      required:
+        - tracked_count
+        - open_inbox_count
+        - pending_plan_reviews
+        - alert_count
+        - sweep_count_24h
+        - message_count_24h
+        - recovery_count_24h
+      properties:
+        tracked_count: { type: integer }
+        open_inbox_count: { type: integer }
+        pending_plan_reviews: { type: integer }
+        alert_count: { type: integer }
+        sweep_count_24h: { type: integer }
+        message_count_24h: { type: integer }
+        recovery_count_24h: { type: integer }
+
+    DashboardTokens:
+      type: object
+      required: [today, total]
+      properties:
+        today: { type: integer }
+        total: { type: integer }
+
+    DashboardResponse:
+      type: object
+      required:
+        - generated_at
+        - daemon_status
+        - projects
+        - rollups
+        - active_sessions
+        - recent_commits
+        - completed_items
+        - recent_messages
+        - tokens
+        - account_usages
+      properties:
+        generated_at: { type: string, format: date-time }
+        daemon_status:
+          type: string
+          description: |
+            `up` (active sessions present) or `down` (no active
+            sessions / supervisor unreachable). Per spec §3.3, a down
+            daemon is a normal operating mode, not a 503.
+        projects:
+          type: array
+          items:
+            $ref: "#/components/schemas/Project"
+        rollups:
+          $ref: "#/components/schemas/DashboardRollups"
+        active_sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionActivity"
+        recent_commits:
+          type: array
+          items:
+            $ref: "#/components/schemas/CommitInfo"
+        completed_items:
+          type: array
+          items:
+            $ref: "#/components/schemas/CompletedItem"
+        recent_messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/InboxPreview"
+        tokens:
+          $ref: "#/components/schemas/DashboardTokens"
+        account_usages:
+          type: array
+          items:
+            $ref: "#/components/schemas/AccountQuotaUsage"
+        daily_tokens:
+          type: array
+          description: |
+            Optional `[date, tokens]` pairs (last 30 days). Only
+            populated when `?include_token_history=true`.
+          items:
+            type: array
+            minItems: 2
+            maxItems: 2
+            prefixItems:
+              - type: string
+              - type: integer
+        briefing:
+          type: string
+          description: |
+            Optional morning-briefing narrative. Only populated when
+            `?include_briefing=true`.
 
     ProjectDrilldown:
       allOf:

@@ -1005,6 +1005,18 @@ def list_project_tasks(
         ) from exc
 
 
+class StaleCursorError(Exception):
+    """Raised when ``list_all_tasks`` is given a cursor that no longer
+    matches any item in the current snapshot.
+
+    Round 1 of Codex review on PR #2067 noted that the previous
+    behaviour (silently restart at page one) creates duplicate rows
+    and infinite-pagination loops under concurrent updates. We now
+    raise this typed error so the route layer can map it to a 400
+    ``invalid_request`` rather than mask the failure.
+    """
+
+
 def list_all_tasks(
     config: PollyPMConfig,
     *,
@@ -1014,7 +1026,7 @@ def list_all_tasks(
     since: datetime | None = None,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APITaskSummary], str | None]:
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, str]]]:
     """Cross-project flat task list (spec §5.1 / Phase 6 P0).
 
     No cross-project helper exists on the work-service yet, so we
@@ -1033,15 +1045,23 @@ def list_all_tasks(
       ``None`` means no status filter.
     * ``assignee`` — exact-match assignee filter.
     * ``since`` — only tasks with ``updated_at > since`` are returned.
-      Tasks missing ``updated_at`` are kept (treated as "always
-      newer") so the filter never silently drops untracked tasks.
+      Must be timezone-aware; the route layer rejects naive ISO
+      values before they reach this helper.
     * Pagination uses an opaque cursor; the cursor encodes the
       ``(updated_at_iso, task_id)`` of the last item on the previous
-      page so paging is stable when tasks are updated between calls.
+      page. A cursor that no longer matches any item raises
+      :class:`StaleCursorError` (route maps to 400) so clients restart
+      from page one explicitly — silently restarting would create
+      duplicate rows / infinite loops under concurrent updates
+      (PR #2067 Codex round 1, P0 #3).
 
-    Backing-store failures on individual projects degrade to "skip
-    that project" so a single bad DB doesn't 503 the whole flat list
-    (matches the inbox aggregator's posture).
+    Returns ``(page, next_cursor, warnings)``. ``warnings`` is a list
+    of ``{"project": <key>, "error": <code>}`` dicts — one entry per
+    project whose backing store raised during this request. An empty
+    list means every project read succeeded; the partial-failure
+    surface is explicit so a pg outage on one project can't hide
+    behind a 200 with a silently-truncated body (PR #2067 Codex round
+    1, P0 #1).
     """
     keys: Iterable[str]
     if project is not None:
@@ -1051,6 +1071,7 @@ def list_all_tasks(
 
     status_filter = set(statuses or [])
     summaries: list[APITaskSummary] = []
+    warnings: list[dict[str, str]] = []
     for key in keys:
         proj = config.projects[key]
         try:
@@ -1065,11 +1086,12 @@ def list_all_tasks(
                 tasks = svc.list_tasks(project=key)
         except _BACKING_STORE_ERRORS as exc:
             logger.warning(
-                "list_all_tasks: backing store error for %s; skipping: %s",
+                "list_all_tasks: backing store error for %s; surfacing as warning: %s",
                 key,
                 exc,
                 exc_info=True,
             )
+            warnings.append({"project": key, "error": "service_unavailable"})
             continue
 
         for task in tasks:
@@ -1089,8 +1111,10 @@ def list_all_tasks(
     # Newest-first ordering is the most useful default for cross-
     # project list views (cockpit "what changed recently?"). Tasks
     # without ``updated_at`` sort to the end via the epoch fallback so
-    # the cursor encoding stays well-defined.
-    epoch = datetime.min
+    # the cursor encoding stays well-defined. Use a tz-aware epoch so
+    # the sort key is comparable with the offset-aware ``updated_at``
+    # values pg returns.
+    epoch = datetime.min.replace(tzinfo=timezone.utc)
     summaries.sort(
         key=lambda t: (t.updated_at or epoch, t.task_id),
         reverse=True,
@@ -1098,18 +1122,26 @@ def list_all_tasks(
 
     cursor_idx = 0
     if cursor is not None:
+        matched = False
         for idx, item in enumerate(summaries):
             cursor_key = f"{(item.updated_at or epoch).isoformat()}|{item.task_id}"
             if cursor_key == cursor:
                 cursor_idx = idx + 1
+                matched = True
                 break
+        if not matched:
+            # Empty-result + cursor is the only ambiguous case (the
+            # caller could legitimately be paging past the end of a
+            # now-empty list). Treat any other miss as a stale cursor
+            # and force the client to restart explicitly.
+            raise StaleCursorError(cursor)
 
     page = summaries[cursor_idx : cursor_idx + limit]
     next_cursor: str | None = None
     if cursor_idx + limit < len(summaries) and page:
         tail = page[-1]
         next_cursor = f"{(tail.updated_at or epoch).isoformat()}|{tail.task_id}"
-    return page, next_cursor
+    return page, next_cursor, warnings
 
 
 def get_task_detail(
@@ -2507,4 +2539,5 @@ __all__ = [
     "reply_inbox_item",
     "set_project_tracked",
     "snooze_inbox_item",
+    "StaleCursorError",
 ]

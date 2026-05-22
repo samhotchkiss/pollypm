@@ -266,9 +266,28 @@ class TaskDetail(TaskSummary):
     plan: Plan | None = None
 
 
+class TaskListWarning(BaseModel):
+    """Per-project partial-failure notice on the cross-project task list.
+
+    Round 1 of Codex review on PR #2067 flagged that silently skipping
+    a project on backing-store failure makes the flat list look
+    complete when it is not (operator can't tell that pg outage on one
+    project is hiding live work behind 200). The aggregator now
+    surfaces every skipped project here so clients can render the
+    partial-failure surface explicitly.
+    """
+
+    project: str
+    error: str  # short code, e.g. "service_unavailable"
+
+
 class TaskListResponse(BaseModel):
     items: list[TaskSummary]
     next_cursor: str | None = None
+    # Empty/absent means every project read succeeded. One entry per
+    # project whose backing store raised during this request — see
+    # ``TaskListWarning`` for the rationale.
+    warnings: list[TaskListWarning] | None = None
 
 
 class ProjectDrilldown(Project):
@@ -478,6 +497,7 @@ __all__ = [
     "StorageReport",
     "TaskDetail",
     "TaskListResponse",
+    "TaskListWarning",
     "TaskRelationships",
     "TaskSummary",
     "Transition",

@@ -19,9 +19,19 @@ from typing import Annotated
 from fastapi import APIRouter, Header, Query
 
 from pollypm.web_api.errors import APIError, not_found
-from pollypm.web_api.models import ActionResult, TaskDetail, TaskListResponse
+from pollypm.web_api.models import (
+    ActionResult,
+    TaskDetail,
+    TaskListResponse,
+    TaskListWarning,
+)
 from pollypm.web_api.routes._deps import ConfigDep
-from pollypm.web_api.service import get_task_detail, list_all_tasks, queue_task
+from pollypm.web_api.service import (
+    StaleCursorError,
+    get_task_detail,
+    list_all_tasks,
+    queue_task,
+)
 
 router = APIRouter(tags=["Tasks"])
 
@@ -63,17 +73,51 @@ def list_tasks_endpoint(
                 message=f"Invalid `since` value: {since!r}",
                 hint="Use ISO-8601 (e.g. 2026-05-22T00:00:00Z).",
             ) from exc
+        # P0 #2 (PR #2067 Codex round 1): task ``updated_at`` is
+        # offset-aware in pg, so a naive ``since`` would trigger
+        # ``TypeError: can't compare offset-naive and offset-aware``
+        # inside ``list_all_tasks`` and surface as a 500 on
+        # syntactically-valid input. Reject naive timestamps with a
+        # typed 400 — explicit is better than implicit timezone
+        # assumptions.
+        if since_dt.tzinfo is None or since_dt.tzinfo.utcoffset(since_dt) is None:
+            raise APIError(
+                status_code=400,
+                code="invalid_request",
+                message=f"`since` must include a timezone offset: {since!r}",
+                hint="Use an offset suffix (e.g. 2026-05-22T00:00:00Z or +00:00).",
+            )
 
-    items, next_cursor = list_all_tasks(
-        config,
-        project=project,
-        statuses=status,
-        assignee=assignee,
-        since=since_dt,
-        limit=limit,
-        cursor=cursor,
+    try:
+        items, next_cursor, warnings = list_all_tasks(
+            config,
+            project=project,
+            statuses=status,
+            assignee=assignee,
+            since=since_dt,
+            limit=limit,
+            cursor=cursor,
+        )
+    except StaleCursorError as exc:
+        # P0 #3 (PR #2067 Codex round 1): a cursor that no longer
+        # matches any current item used to silently restart at page
+        # one, creating duplicate rows / infinite-pagination loops
+        # under concurrent updates. Surface it as a typed 400 so the
+        # client restarts without a cursor explicitly.
+        raise APIError(
+            status_code=400,
+            code="invalid_request",
+            message="Cursor is stale (item no longer exists or has been updated).",
+            hint="Retry the request without the `cursor` parameter to restart paging.",
+        ) from exc
+
+    return TaskListResponse(
+        items=items,
+        next_cursor=next_cursor,
+        warnings=(
+            [TaskListWarning(**w) for w in warnings] if warnings else None
+        ),
     )
-    return TaskListResponse(items=items, next_cursor=next_cursor)
 
 
 @router.get(

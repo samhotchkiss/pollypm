@@ -831,11 +831,29 @@ paths:
           description: Opaque cursor from a previous response's `next_cursor`.
       responses:
         "200":
-          description: Page of task summaries.
+          description: |
+            Page of task summaries. The optional `warnings` array
+            lists any projects whose backing store failed during this
+            request — clients should surface that to the operator
+            rather than treat a 200 with warnings as a complete read.
           content:
             application/json:
               schema:
                 $ref: "#/components/schemas/TaskListResponse"
+        "400":
+          description: |
+            `invalid_request` — a query parameter was rejected.
+            Includes:
+              - `since` malformed or missing a timezone offset
+                (task `updated_at` values are tz-aware; a naive
+                `since` would compare-error to a 500).
+              - `cursor` is stale (the item it referenced has been
+                updated or deleted). Restart paging without the
+                `cursor` parameter.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2521,6 +2539,29 @@ components:
         next_cursor:
           type: string
           description: Absent when no more pages.
+        warnings:
+          type: array
+          description: |
+            Per-project partial-failure notices. Absent/empty when
+            every project read succeeded. One entry per project whose
+            backing store raised during this request (clients should
+            render the partial-failure state explicitly rather than
+            assume the body is complete).
+          items:
+            $ref: "#/components/schemas/TaskListWarning"
+
+    TaskListWarning:
+      type: object
+      required: [project, error]
+      properties:
+        project:
+          type: string
+          description: Project key whose backing store failed.
+        error:
+          type: string
+          description: |
+            Short error code (e.g. `service_unavailable`). Stable across
+            releases so clients can switch on it.
 
     ApproveRequest:
       type: object

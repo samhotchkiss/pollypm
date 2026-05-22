@@ -228,3 +228,114 @@ def test_list_tasks_requires_auth(client) -> None:
     response = client.get("/api/v1/tasks")
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "unauthorized"
+
+
+# ---------------------------------------------------------------------------
+# PR #2067 Codex round 1 — P0 regressions
+# ---------------------------------------------------------------------------
+
+
+def test_cross_project_list_partial_failure_envelope(
+    api_config, client, auth_headers, project_root, workspace_root, monkeypatch
+) -> None:
+    """P0 #1: one project failing must surface as a `warnings` entry
+    and NOT silently drop. Other projects' data still comes back."""
+    import psycopg
+
+    from pollypm.web_api import service as svc_mod
+
+    second_root = _seed_two_projects(api_config, workspace_root)  # noqa: F841
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        make_task(svc, project="myproj", title="Healthy A")
+        make_task(svc, project="second", title="Healthy B")
+
+    # Stub the readonly work-service open so the *second* project
+    # raises a psycopg error (mirroring a pg outage on one DB),
+    # while ``myproj`` opens normally.
+    real_open = svc_mod._open_work_service_readonly
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def flaky_open(*, config, project_key, project_path):
+        if project_key == "second":
+            raise psycopg.OperationalError("simulated pg outage")
+        with real_open(
+            config=config, project_key=project_key, project_path=project_path
+        ) as svc:
+            yield svc
+
+    monkeypatch.setattr(svc_mod, "_open_work_service_readonly", flaky_open)
+
+    response = client.get("/api/v1/tasks", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Surviving project's row is still present — partial > none.
+    titles = sorted(item["title"] for item in body["items"])
+    assert "Healthy A" in titles
+    # Failed project does NOT appear in items (the read failed).
+    assert "Healthy B" not in titles
+    # ...but the operator sees an explicit warning so they can act.
+    assert body.get("warnings"), "partial failure must surface in warnings"
+    failed = [w for w in body["warnings"] if w["project"] == "second"]
+    assert failed, f"expected `second` in warnings, got {body['warnings']!r}"
+    assert failed[0]["error"] == "service_unavailable"
+
+
+def test_cross_project_list_rejects_naive_since(
+    api_config, client, auth_headers
+) -> None:
+    """P0 #2: a syntactically-valid naive ISO `since` used to crash
+    with TypeError (offset-naive vs offset-aware) → 500. Reject it as
+    a typed 400 instead."""
+    # No `Z` suffix, no `+00:00` — pure naive ISO.
+    response = client.get(
+        "/api/v1/tasks?since=2026-05-22T10:00:00", headers=auth_headers
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "timezone" in body["error"]["message"].lower()
+
+
+def test_cross_project_list_stale_cursor_returns_400(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """P0 #3: when the cursor's anchor item is updated/deleted between
+    page requests, the helper used to silently restart at page one
+    (duplicate rows / infinite pagination). It must now 400 so the
+    client restarts explicitly."""
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    task_ids: list[str] = []
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        for i in range(3):
+            task = make_task(svc, project="myproj", title=f"Task {i}")
+            task_ids.append(task.task_id)
+
+    # Take page one (limit=1) so we get a cursor.
+    first = client.get(
+        "/api/v1/tasks?limit=1", headers=auth_headers
+    ).json()
+    cursor = first.get("next_cursor")
+    assert cursor, "fixture must produce a next_cursor"
+
+    # Mutate the task the cursor refers to. The cursor anchor is the
+    # *last item of the previous page* (per the helper's contract).
+    # Cancelling bumps ``updated_at``, which changes the cursor key —
+    # so the next page request can no longer locate the anchor and
+    # must surface stale-cursor explicitly.
+    tail_id = first["items"][-1]["task_id"]
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        svc.cancel(tail_id, actor="tester", reason="stale-cursor test")
+
+    # The next request must fail explicitly, not silently page-one.
+    response = client.get(
+        f"/api/v1/tasks?limit=1&cursor={cursor}", headers=auth_headers
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "cursor" in body["error"]["message"].lower()

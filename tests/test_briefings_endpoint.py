@@ -32,6 +32,7 @@ from fastapi.testclient import TestClient
 from pollypm.config import (
     AccountConfig,
     MemorySettings,
+    PluginSettings,
     PollyPMConfig,
     PollyPMSettings,
     ProjectSettings,
@@ -674,3 +675,92 @@ def test_briefings_endpoint_available_in_default_create_app(
         "morning provider was not wired by create_app; "
         "render/regenerate would 503 in production"
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex round-3 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_morning_plugin_reports_unavailable(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+) -> None:
+    """`create_app` must honor ``[plugins].disabled`` before wiring.
+
+    Codex round-3 P0: round-2 wired the provider unconditionally, so a
+    config with ``[plugins].disabled = ["morning_briefing"]`` still
+    reported ``morning.available=true`` through the API — bypassing the
+    plugin host's filter-before-register contract. The disablement is
+    the operator rollback/recovery path; the API must not resurrect a
+    disabled plugin.
+
+    Asserts: with ``morning_briefing`` disabled in config,
+    ``GET /api/v1/briefings`` reports ``morning.available=false`` and
+    ``POST /api/v1/briefings/morning/regenerate`` returns 503
+    (service_unavailable).
+    """
+    # Restore the canonical morning adapter — earlier tests in this
+    # file mutate ``_REGISTRY["morning"]`` directly (without monkeypatch
+    # revert), leaving a stub whose ``available`` always returns True.
+    # We need the real ``_morning_available`` so this test exercises
+    # the production availability path.
+    from pollypm.web_api.routes import briefings as br
+    from pollypm.web_api.routes.briefings import (
+        _morning_available,
+        _morning_regenerate,
+        _morning_render_last,
+    )
+
+    br._REGISTRY["morning"] = br._BriefingAdapter(
+        name="morning",
+        description="Daily morning briefing — canonical adapter (test restore)",
+        available=_morning_available,
+        render_last=_morning_render_last,
+        regenerate=_morning_regenerate,
+    )
+
+    # Pre-seed a provider to prove disabled-config app clears it
+    # (the host's filter-before-register semantics — a previously
+    # enabled run's stale registration must not leak through).
+    from pollypm.briefings_registry import (
+        is_briefing_provider_registered,
+        register_briefing_provider,
+    )
+
+    def _stub_provider(_base, *, status="open", limit=None):  # noqa: ARG001
+        return []
+
+    register_briefing_provider(_stub_provider)
+    assert is_briefing_provider_registered()
+
+    api_config.plugins = PluginSettings(disabled=("morning_briefing",))
+
+    app = create_app(config=api_config, token_path=token_path)
+    client = TestClient(app)
+
+    # GET /api/v1/briefings — morning.available must be False
+    response = client.get("/api/v1/briefings", headers=auth_headers)
+    assert response.status_code == 200, response.json()
+    morning = next(
+        entry for entry in response.json()["types"] if entry["name"] == "morning"
+    )
+    assert morning["available"] is False, (
+        "morning provider was wired despite [plugins].disabled containing "
+        "morning_briefing — API bypassed the plugin-disable contract"
+    )
+
+    # POST /api/v1/briefings/morning/regenerate — 503 service_unavailable
+    response = client.post(
+        "/api/v1/briefings/morning/regenerate",
+        json={},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    body = response.json()
+    assert body["error"]["code"] == "service_unavailable"
+
+    # Restore a clean registry for sibling tests that share module state.
+    register_briefing_provider(None)

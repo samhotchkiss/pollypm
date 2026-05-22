@@ -183,11 +183,15 @@ def _morning_available(config: Any) -> bool:  # noqa: ARG001 — registry is mod
 
     The :mod:`pollypm.briefings_registry` seam holds the active provider
     callable; ``None`` means the plugin tree isn't loaded (config didn't
-    enable the plugin) and the type is reported as ``available=false``
-    so clients know not to attempt regenerate.
+    enable the plugin, or ``[plugins].disabled`` includes
+    ``morning_briefing``) and the type is reported as ``available=false``
+    so clients know not to attempt regenerate. Uses the public
+    :func:`is_briefing_provider_registered` helper instead of reaching
+    into the module-private slot (Codex round-3 on PR #2059).
     """
-    from pollypm.briefings_registry import _briefing_provider  # type: ignore[attr-defined]
-    return _briefing_provider is not None
+    from pollypm.briefings_registry import is_briefing_provider_registered
+
+    return is_briefing_provider_registered()
 
 
 def _morning_render_last(config: Any) -> BriefingResponse | None:

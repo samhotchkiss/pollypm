@@ -74,6 +74,20 @@ def register_briefing_provider(provider: BriefingProvider | None) -> None:
     _briefing_provider = provider
 
 
+def is_briefing_provider_registered() -> bool:
+    """Return True iff a briefing-inbox provider is currently registered.
+
+    Public availability probe so surfaces (web API, cockpit) can decide
+    whether to advertise the briefing type without reaching into the
+    module-private ``_briefing_provider`` slot. Mirrors host semantics:
+    when the ``morning_briefing`` plugin is disabled via
+    ``[plugins].disabled`` (or absent), no provider is registered and
+    this returns ``False`` (Codex round-3 on PR #2059: route was reading
+    the private slot to gate availability).
+    """
+    return _briefing_provider is not None
+
+
 def list_briefings(
     base_dir: Path,
     *,
@@ -103,6 +117,7 @@ def list_briefings(
 __all__ = [
     "BriefingEntryLike",
     "BriefingProvider",
+    "is_briefing_provider_registered",
     "list_briefings",
     "register_briefing_provider",
 ]

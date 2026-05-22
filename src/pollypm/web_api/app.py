@@ -339,14 +339,15 @@ def create_app(
     # in the API process (it owns roster + job scheduling + cockpit
     # rail registration — none of which the read/regenerate path
     # needs); the only piece the briefings routes consult is the
-    # registry seam (`pollypm.briefings_registry._briefing_provider`),
-    # which the ``morning_briefing`` plugin populates via
-    # ``register_briefing_provider`` during plugin ``initialize``.
+    # registry seam, which the ``morning_briefing`` plugin populates
+    # via ``register_briefing_provider`` during plugin ``initialize``.
     # Mirror that single call here so the API has the same provider
     # the cockpit + CLI use. The import is local so a future build
     # that disables the built-in plugin doesn't take a hard import
-    # on the plugin tree (Codex round-2 P0 on #2059).
-    _wire_briefings_provider()
+    # on the plugin tree (Codex round-2 P0 on #2059). The helper
+    # honors ``config.plugins.disabled`` before registering — same
+    # contract the plugin host enforces (Codex round-3 on #2059).
+    _wire_briefings_provider(config)
 
     # Health is exempt from auth per spec §3.
     app.include_router(health_routes.router, prefix=API_V1_PREFIX)
@@ -436,7 +437,10 @@ def create_app(
     return app
 
 
-def _wire_briefings_provider() -> None:
+_MORNING_BRIEFING_PLUGIN_NAME = "morning_briefing"
+
+
+def _wire_briefings_provider(config: PollyPMConfig) -> None:
     """Register the built-in morning-briefing provider for the API.
 
     The cockpit + ``pm briefing`` CLI rely on the plugin host running
@@ -448,14 +452,39 @@ def _wire_briefings_provider() -> None:
     ``GET /api/v1/briefings`` reports ``morning.available=false`` and
     render/regenerate return 503 in production.
 
+    Honors ``config.plugins.disabled`` before registering: when the
+    operator has disabled ``morning_briefing`` (the rollback/recovery
+    path), the host's ``filter-before-register`` semantics apply and
+    we must NOT register the provider — otherwise the API would
+    resurrect a disabled plugin from outside the host layer and report
+    ``available=true`` for a type the rest of the system treats as off
+    (Codex round-3 on #2059). We clear any prior registration in that
+    case so a previously-enabled-then-disabled run still reports
+    ``available=false`` for the new app instance.
+
     Re-running this on every ``create_app`` call is a no-op after the
-    first one: ``register_briefing_provider`` just rebinds the module
-    slot to the same callable. Import failures are logged and
-    swallowed — a missing plugin downgrades availability to ``false``
-    (the route's fail-soft posture), it must not crash app startup.
+    first one when enabled: ``register_briefing_provider`` just rebinds
+    the module slot to the same callable. Import failures are logged
+    and swallowed — a missing plugin downgrades availability to
+    ``false`` (the route's fail-soft posture), it must not crash app
+    startup.
     """
+    from pollypm.briefings_registry import register_briefing_provider
+
+    disabled = set(getattr(config.plugins, "disabled", ()) or ())
+    if _MORNING_BRIEFING_PLUGIN_NAME in disabled:
+        # Mirror plugin host's "filter disabled before registering"
+        # contract (see ExtensionHost._disabled_names check at
+        # plugin_host.py:659). Clear so a prior enabled run's
+        # registration doesn't leak into this disabled-config app.
+        register_briefing_provider(None)
+        logger.info(
+            "web_api: morning_briefing disabled via [plugins].disabled; "
+            "GET /api/v1/briefings will report morning.available=false",
+        )
+        return
+
     try:
-        from pollypm.briefings_registry import register_briefing_provider
         from pollypm.plugins_builtin.morning_briefing.inbox import (
             list_briefings as _list_briefings,
         )

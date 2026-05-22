@@ -35,6 +35,7 @@ from pollypm.web_api.routes import chat_messages as chat_messages_routes
 from pollypm.web_api.routes import chat_send as chat_send_routes
 from pollypm.web_api.routes import config as config_routes
 from pollypm.web_api.routes import dashboard as dashboard_routes
+from pollypm.web_api.routes import doctor as doctor_routes
 from pollypm.web_api.routes import events as events_routes
 from pollypm.web_api.routes import health as health_routes
 from pollypm.web_api.routes import heartbeats as heartbeats_routes
@@ -160,6 +161,11 @@ def create_app(
     app.include_router(config_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     # Phase 2 surface §12 — read-only storage report (no prune).
     app.include_router(storage_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
+    # Phase 2 §7 doctor endpoints (list checks, last report, run + fix).
+    # Sits under the same ``/api/v1`` prefix as the other surfaces; the
+    # bearer-auth dependency is reused — there is no read/write split
+    # because every doctor endpoint can side-effect (run + fix).
+    app.include_router(doctor_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(events_routes.router, prefix=API_V1_PREFIX, dependencies=sse_auth_deps)
     # Phase 2 §11 — read-side heartbeats surface. SSE stream endpoint
     # (§11.1 row 4) ships as a separate follow-up; the GET endpoints

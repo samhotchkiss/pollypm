@@ -1,10 +1,11 @@
 openapi: 3.1.0
-# Phase 6 cleanup: removed stale entries for `/doctor`, `POST /projects`,
+# Phase 6 cleanup: removed stale entries for `POST /projects`,
 # `POST /projects/{key}/chat`, `POST /projects/{key}/plan`, and the
 # `/tasks/{project}/{n}/approve` + `/reject` pair. None were wired in
 # `pollypm.web_api.app`. The plan approve/reject flow is tracked
-# separately as Phase 3 work; doctor reads live at `/doctor/checks`
-# and `/doctor/report`.
+# separately as Phase 3 work. Doctor surface (`/doctor`,
+# `/doctor/checks`, `/doctor/report`, `/doctor/run`) is wired in
+# `pollypm.web_api.routes.doctor`.
 info:
   title: PollyPM Web API
   version: 0.1.0
@@ -115,6 +116,122 @@ paths:
                     version: 0.1.0
                     schema_version: 1
                     started_at: "2026-05-07T12:00:00Z"
+
+  /doctor:
+    get:
+      tags: [Health]
+      operationId: getDoctor
+      summary: Structured pm doctor output
+      description: |
+        Mirrors the structured JSON output of `pm doctor` (PR #1347).
+        Returns each check with status (ok / warn / fail), an actor
+        message, and an optional remediation hint.
+      responses:
+        "200":
+          description: Doctor results (200 even when checks fail; consult `overall`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DoctorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /doctor/checks:
+    get:
+      tags: [Doctor]
+      operationId: listDoctorChecks
+      summary: List available doctor checks
+      description: |
+        Returns the catalog of registered checks (name, category,
+        severity). Phase 2 §7.1. The catalog is process-static — restart
+        `pm serve` to pick up plugin-contributed checks.
+      responses:
+        "200":
+          description: List of registered checks.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DoctorChecksResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /doctor/report:
+    get:
+      tags: [Doctor]
+      operationId: getDoctorReport
+      summary: Return the last-run doctor report
+      description: |
+        Returns the most recent in-process doctor report. 404 if no
+        run has happened yet — callers should `POST /doctor/run`
+        first. Phase 2 §7.1.
+      responses:
+        "200":
+          description: Last-run report.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DoctorReportResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /doctor/run:
+    post:
+      tags: [Doctor]
+      operationId: runDoctor
+      summary: Run doctor checks (optionally with --fix)
+      description: |
+        Runs every registered check or one named check, optionally
+        invoking auto-fix afterwards and re-running fixed checks to
+        verify post-fix state. Phase 2 §7.1.
+
+        Spec §2.7 long-running budget: the whole run is capped at
+        `timeout_seconds` (default 25, max 120); overrun returns
+        `504 timeout`.
+      parameters:
+        - in: query
+          name: timeout_seconds
+          schema:
+            type: number
+            minimum: 1
+            maximum: 120
+            default: 25
+          required: false
+          description: Wall-clock budget for the run.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/DoctorRunRequest"
+            examples:
+              run_all:
+                value:
+                  fix: false
+              single_check_with_fix:
+                value:
+                  check: pollypm-home-writable
+                  fix: true
+      responses:
+        "200":
+          description: Run completed (200 even when checks fail; consult `ok` / `errors`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DoctorRunResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "504":
+          description: Run exceeded the timeout budget; retry with a longer `timeout_seconds`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
   /projects:
     get:
@@ -1829,6 +1946,117 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DoctorCheck"
+
+    # Phase 2 §7 doctor surface schemas. Distinct from the legacy
+    # ``DoctorCheck`` / ``DoctorResponse`` shapes above because Phase 2
+    # mirrors the canonical ``pollypm.doctor.Check`` / ``CheckResult``
+    # dataclasses field-for-field (severity, why, fix, fixable, etc.)
+    # rather than collapsing to the ok/warn/fail summary the V1 endpoint
+    # uses.
+    DoctorCheckInfo:
+      type: object
+      required: [name, category, severity]
+      properties:
+        name: { type: string }
+        category: { type: string }
+        severity:
+          type: string
+          enum: [info, warning, error]
+        description:
+          type: string
+          default: ""
+        has_auto_fix:
+          type: boolean
+          default: false
+    DoctorChecksResponse:
+      type: object
+      required: [checks]
+      properties:
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DoctorCheckInfo"
+    DoctorCheckResult:
+      type: object
+      required: [name, category, passed, skipped, severity]
+      properties:
+        name: { type: string }
+        category: { type: string }
+        passed: { type: boolean }
+        skipped: { type: boolean }
+        severity:
+          type: string
+          enum: [info, warning, error]
+        status:
+          type: string
+          default: ""
+        why:
+          type: string
+          default: ""
+        fix:
+          type: string
+          default: ""
+        fixable:
+          type: boolean
+          default: false
+        has_auto_fix:
+          type: boolean
+          default: false
+        data:
+          type: object
+          additionalProperties: true
+    DoctorReportResponse:
+      type: object
+      required: [generated_at, duration_seconds, ok, passed, errors, warnings, skipped, checks]
+      properties:
+        generated_at:
+          type: number
+          description: Unix epoch seconds when the report was recorded.
+        duration_seconds:
+          type: number
+        ok:
+          type: boolean
+          description: True iff the run produced no error-severity failures.
+        passed:
+          type: integer
+        errors:
+          type: integer
+        warnings:
+          type: integer
+        skipped:
+          type: integer
+        checks:
+          type: array
+          items:
+            $ref: "#/components/schemas/DoctorCheckResult"
+    DoctorRunRequest:
+      type: object
+      properties:
+        check:
+          type: string
+          nullable: true
+          description: Single check name to run. Omit / null to run every registered check.
+        fix:
+          type: boolean
+          default: false
+          description: When true, runs auto-fixes for failing checks and re-runs each fixed check to verify post-fix state.
+    DoctorRunResponse:
+      allOf:
+        - $ref: "#/components/schemas/DoctorReportResponse"
+        - type: object
+          properties:
+            fixes_applied:
+              type: array
+              description: One entry per attempted auto-fix; ``ok=true`` only when the fix handler succeeded (the post-fix re-run is reflected in the ``checks`` array).
+              items:
+                type: object
+                required: [name, ok]
+                properties:
+                  name: { type: string }
+                  ok: { type: boolean }
+                  message:
+                    type: string
+                    default: ""
 
     # ---- Projects ---------------------------------------------------
     ProjectKind:

@@ -38,6 +38,7 @@ from pollypm.web_api.errors import (
     handle_validation_error,
 )
 from pollypm.web_api.routes import audit as audit_routes
+from pollypm.web_api.routes import briefings as briefings_routes
 from pollypm.web_api.routes import chat_messages as chat_messages_routes
 from pollypm.web_api.routes import chat_send as chat_send_routes
 from pollypm.web_api.routes import config as config_routes
@@ -356,6 +357,10 @@ def create_app(
     # bearer-auth dependency is reused — there is no read/write split
     # because every doctor endpoint can side-effect (run + fix).
     app.include_router(doctor_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
+    # Phase 2 surface §9 — briefings list/render/regenerate.
+    app.include_router(
+        briefings_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps,
+    )
     app.include_router(events_routes.router, prefix=API_V1_PREFIX, dependencies=sse_auth_deps)
     # Phase 2 §11 — read-side heartbeats surface. SSE stream endpoint
     # (§11.1 row 4) ships as a separate follow-up; the GET endpoints

@@ -98,6 +98,12 @@ tags:
       through the canonical `pg_heartbeats` facade — same source the
       cockpit and `pm sessions` consume. The SSE stream endpoint
       (Phase 2 §11.1) ships separately.
+  - name: Briefings
+    description: |
+      Briefing types (morning / weekly / plugin-contributed). List
+      registered types, render the most recent cached briefing, and
+      force-regenerate. Regenerate is sync with a configurable timeout;
+      slow providers surface as `504 timeout` per spec §2.7.
 
 paths:
   /health:
@@ -2104,8 +2110,6 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/AuditGrepResponse"
-        "400":
-          $ref: "#/components/responses/InvalidRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
 
@@ -2171,6 +2175,116 @@ paths:
           $ref: "#/components/responses/InvalidRequest"
         "401":
           $ref: "#/components/responses/Unauthorized"
+
+  /briefings:
+    get:
+      tags: [Briefings]
+      operationId: listBriefingTypes
+      summary: List available briefing types
+      description: |
+        Returns every briefing type registered with the local registry.
+        Each entry includes an `available` flag — false when the type
+        is wired in but its provider plugin (e.g. `morning_briefing`)
+        is not loaded in this `pm serve` instance.
+      responses:
+        "200":
+          description: Briefing-type registry snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BriefingTypesResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /briefings/{type_name}:
+    parameters:
+      - in: path
+        name: type_name
+        required: true
+        schema: { type: string }
+        description: |
+          Briefing type identifier from `GET /briefings`. Built-in
+          types: `morning`.
+    get:
+      tags: [Briefings]
+      operationId: renderBriefing
+      summary: Render the most recently generated briefing of this type
+      description: |
+        Returns the cached briefing body (markdown + metadata) for the
+        latest run. 404 when nothing has been generated yet; 503 when
+        the provider plugin is not loaded.
+      responses:
+        "200":
+          description: Cached briefing body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BriefingResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Provider plugin not loaded for this briefing type.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /briefings/{type_name}/regenerate:
+    parameters:
+      - in: path
+        name: type_name
+        required: true
+        schema: { type: string }
+        description: Briefing type identifier from `GET /briefings`.
+      - in: query
+        name: timeout_seconds
+        required: false
+        schema: { type: number, minimum: 1, maximum: 600, default: 30 }
+        description: |
+          Sync regenerate budget in seconds. On overrun the request
+          returns `504 timeout` (spec §2.7); the in-flight regenerate
+          runs to completion in the background.
+    post:
+      tags: [Briefings]
+      operationId: regenerateBriefing
+      summary: Force regenerate a briefing (sync)
+      description: |
+        Runs the regenerate pipeline (gather → synthesize → emit) and
+        returns the freshly produced body. Sync only in Phase 2;
+        `?async=true` + a job registry is deferred to Phase 2.5.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegenerateBriefingRequest"
+      responses:
+        "200":
+          description: Freshly regenerated briefing.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BriefingResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: Provider plugin not loaded or regenerate failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "504":
+          description: Sync regenerate exceeded `timeout_seconds`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 
 components:
   securitySchemes:
@@ -4180,3 +4294,73 @@ components:
             clean aggregation from one where archived rows were
             silently dropped without having to cross-check via
             `/audit/grep`. (Codex round-9 finding, PR #2062.)
+
+    # ---- Briefings --------------------------------------------------
+    BriefingTypeInfo:
+      type: object
+      required: [name, description, available]
+      properties:
+        name:
+          type: string
+          description: |
+            Stable identifier. Built-in: `morning`. Plugin-contributed
+            types register additional names at startup.
+        description:
+          type: string
+        available:
+          type: boolean
+          description: |
+            True when the provider plugin is loaded. False means the
+            type is wired in but cannot be rendered or regenerated.
+
+    BriefingTypesResponse:
+      type: object
+      required: [types]
+      properties:
+        types:
+          type: array
+          items:
+            $ref: "#/components/schemas/BriefingTypeInfo"
+
+    BriefingResponse:
+      type: object
+      required: [type, markdown, metadata]
+      properties:
+        type:
+          type: string
+          description: Briefing-type identifier.
+        generated_at:
+          type: string
+          format: date-time
+          nullable: true
+        date_local:
+          type: string
+          nullable: true
+          description: Local date the briefing refers to (`YYYY-MM-DD`).
+        mode:
+          type: string
+          nullable: true
+          description: |
+            Provider-specific render mode (e.g. `synthesized`, `fallback`,
+            `quiet-mode` for the morning briefing).
+        markdown:
+          type: string
+          description: The briefing body in Markdown.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: |
+            Provider-specific structured metadata: priorities, watch
+            items, pinned flag, etc. Shape varies by briefing type.
+
+    RegenerateBriefingRequest:
+      type: object
+      properties:
+        project:
+          type: string
+          nullable: true
+          description: |
+            Optional project key narrowing the regenerate scope. The
+            built-in `morning` type rejects this field with `400` —
+            morning briefings are workspace-wide only. Plugin-contributed
+            types may honour it; check the type's docs.

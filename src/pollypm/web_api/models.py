@@ -303,7 +303,18 @@ class TaskClaimRequest(BaseModel):
     work-service derives the resulting ``assignee`` from the task's
     flow + roles. A separate ``/reassign`` endpoint covers "change
     owner" semantics.
+
+    ``extra="forbid"`` (Codex round-12, #2064): without it Pydantic
+    silently drops unsupported keys (e.g. an ``assignee`` field a
+    client sends thinking ``/claim`` accepts the spec §5.3 shape),
+    and the request is processed as if the field were never sent.
+    Forbidding extras turns those typos / unsupported fields into a
+    ``422 Unprocessable Entity`` from FastAPI's request validator so
+    the client sees the contract mismatch immediately. Mirrors
+    ``TaskPatchRequest`` below.
     """
+
+    model_config = {"extra": "forbid"}
 
     actor: str = Field(min_length=1)
 
@@ -313,7 +324,13 @@ class TaskCancelRequest(BaseModel):
 
     ``reason`` is optional per spec §5.3; absent reasons resolve to
     ``"cancelled via API"`` in the audit row so grep stays meaningful.
+
+    ``extra="forbid"`` (Codex round-12, #2064): see ``TaskClaimRequest``
+    above — keep the request surface tight so misspelled / unsupported
+    fields surface as 422 instead of being silently dropped.
     """
+
+    model_config = {"extra": "forbid"}
 
     reason: str | None = None
 
@@ -324,7 +341,13 @@ class TaskReassignRequest(BaseModel):
     Sets the task's ``assignee`` to ``actor``. ``null`` is not yet
     supported (spec leaves "null ⇒ unassign" open; we'd need a second
     column setter for that and the use-case is rare today).
+
+    ``extra="forbid"`` (Codex round-12, #2064): see ``TaskClaimRequest``
+    above — keep the request surface tight so misspelled / unsupported
+    fields surface as 422 instead of being silently dropped.
     """
+
+    model_config = {"extra": "forbid"}
 
     actor: str = Field(min_length=1)
 

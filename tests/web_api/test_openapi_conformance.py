@@ -598,6 +598,102 @@ def test_task_patch_request_schema_forbids_extras() -> None:
     )
 
 
+def test_task_claim_request_schema_forbids_extras() -> None:
+    """Pin ``TaskClaimRequest`` extras=forbid in runtime + static YAML.
+
+    Round 12 (Codex) on #2064: the round-6 fix locked down
+    ``TaskPatchRequest`` but the sibling request models
+    (``TaskClaimRequest`` / ``TaskCancelRequest`` /
+    ``TaskReassignRequest``) still defaulted to Pydantic
+    ``extra='ignore'``. A client following spec §5.3 and
+    POSTing ``{"actor": "alice", "assignee": "bob"}`` to
+    ``/claim`` would get a silent 200 with the ``assignee``
+    field dropped on the floor — the work-service derives
+    assignee from the flow + roles. Forbidding extras turns
+    that into a 422 instead.
+
+    Mirrors ``test_task_patch_request_schema_forbids_extras``
+    above; runtime + static parity so neither side can drift
+    back without tripping CI.
+    """
+    from pollypm.web_api.models import TaskClaimRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskClaimRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskClaimRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys (e.g. ``assignee`` from spec "
+        "§5.3, which the work-service derives instead) as valid "
+        "even though the server returns 422 (#2064 round-12)."
+    )
+
+    runtime_schema = TaskClaimRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskClaimRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )
+
+
+def test_task_cancel_request_schema_forbids_extras() -> None:
+    """Pin ``TaskCancelRequest`` extras=forbid in runtime + static YAML.
+
+    Round 12 (Codex) on #2064. See
+    ``test_task_claim_request_schema_forbids_extras`` for the
+    framing.
+    """
+    from pollypm.web_api.models import TaskCancelRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskCancelRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskCancelRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys as valid even though the "
+        "server returns 422 (#2064 round-12)."
+    )
+
+    runtime_schema = TaskCancelRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskCancelRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )
+
+
+def test_task_reassign_request_schema_forbids_extras() -> None:
+    """Pin ``TaskReassignRequest`` extras=forbid in runtime + static YAML.
+
+    Round 12 (Codex) on #2064. See
+    ``test_task_claim_request_schema_forbids_extras`` for the
+    framing.
+    """
+    from pollypm.web_api.models import TaskReassignRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskReassignRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskReassignRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys as valid even though the "
+        "server returns 422 (#2064 round-12)."
+    )
+
+    runtime_schema = TaskReassignRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskReassignRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

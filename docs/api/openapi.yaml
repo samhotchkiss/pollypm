@@ -2933,6 +2933,7 @@ components:
 
     TaskClaimRequest:
       type: object
+      additionalProperties: false
       required: [actor]
       properties:
         actor:
@@ -2942,18 +2943,34 @@ components:
             Identity to record on the claim audit row. The
             work-service derives the resulting `assignee` from the
             task's flow + roles when applicable.
+      description: |
+        `additionalProperties: false` mirrors the runtime
+        `TaskClaimRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys — including
+        `assignee` (spec §5.3 mentions it, but this endpoint derives
+        the assignee from the work-service; use `/reassign` instead)
+        — surface as a `422 validation_error` from the request
+        validator instead of being silently dropped (#2064 round-12).
 
     TaskCancelRequest:
       type: object
+      additionalProperties: false
       properties:
         reason:
           type: string
           description: |
             Optional explanation; absent reasons collapse to
             "cancelled via API" in the audit row.
+      description: |
+        `additionalProperties: false` mirrors the runtime
+        `TaskCancelRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys surface as a
+        `422 validation_error` instead of being silently dropped
+        (#2064 round-12).
 
     TaskReassignRequest:
       type: object
+      additionalProperties: false
       required: [actor]
       properties:
         actor:
@@ -2966,6 +2983,12 @@ components:
             transaction; concurrent reassigns serialize via
             `SELECT ... FOR UPDATE`. No state-machine transition
             fires (`work_status` unchanged).
+      description: |
+        `additionalProperties: false` mirrors the runtime
+        `TaskReassignRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys surface as a
+        `422 validation_error` instead of being silently dropped
+        (#2064 round-12).
 
     TaskPatchRequest:
       type: object

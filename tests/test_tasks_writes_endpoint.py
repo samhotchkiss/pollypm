@@ -451,6 +451,29 @@ def test_claim_happy_path(client, auth_headers, task_store) -> None:
     assert "myproj/1" in body["message"]
 
 
+def test_claim_rejects_unknown_field(client, auth_headers, task_store) -> None:
+    """#2064 round-12: ``/claim`` body forbids extras → 422.
+
+    Spec §5.3 documents ``{assignee, actor}``; this endpoint keeps the
+    surface tight to ``actor`` and derives ``assignee`` from the flow
+    + roles. A client following the spec verbatim would POST
+    ``{"actor": "alice", "assignee": "bob"}`` — without
+    ``extra="forbid"`` on ``TaskClaimRequest`` the ``assignee`` field
+    is silently dropped and the request claims successfully, hiding
+    the contract mismatch. The forbid config turns it into a 422.
+    """
+    seeded = _seed(task_store, n=50, work_status=WorkStatus.QUEUED)
+    response = client.post(
+        "/api/v1/tasks/myproj/50/claim",
+        headers=auth_headers,
+        json={"actor": "alice", "assignee": "bob"},
+    )
+    assert response.status_code == 422, response.text
+    # No state change — the request was rejected by the validator.
+    assert seeded.work_status == WorkStatus.QUEUED
+    assert seeded.assignee != "alice"
+
+
 def test_claim_already_claimed_returns_409(client, auth_headers, task_store) -> None:
     _seed(
         task_store, n=2,
@@ -873,6 +896,24 @@ def test_cancel_already_cancelled_returns_409(client, auth_headers, task_store) 
     assert body["error"]["code"] == "invalid_state"
 
 
+def test_cancel_rejects_unknown_field(client, auth_headers, task_store) -> None:
+    """#2064 round-12: ``/cancel`` body forbids extras → 422.
+
+    Without ``extra="forbid"`` on ``TaskCancelRequest`` the extra key
+    is silently dropped and the cancel completes — masking the
+    client's contract bug. The forbid config turns it into a 422.
+    """
+    seeded = _seed(task_store, n=51, work_status=WorkStatus.IN_PROGRESS, assignee="bob")
+    response = client.post(
+        "/api/v1/tasks/myproj/51/cancel",
+        headers=auth_headers,
+        json={"reason": "x", "bogus": "y"},
+    )
+    assert response.status_code == 422, response.text
+    # No state change — the request was rejected by the validator.
+    assert seeded.work_status == WorkStatus.IN_PROGRESS
+
+
 # ---------------------------------------------------------------------------
 # Reassign
 # ---------------------------------------------------------------------------
@@ -905,6 +946,33 @@ def test_reassign_nonexistent_returns_404(client, auth_headers) -> None:
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
+
+
+def test_reassign_rejects_unknown_field(client, auth_headers, task_store) -> None:
+    """#2064 round-12: ``/reassign`` body forbids extras → 422.
+
+    Without ``extra="forbid"`` on ``TaskReassignRequest`` the extra
+    key is silently dropped and the reassignment completes — masking
+    the client's contract bug (e.g. a client mistakenly passing
+    ``reason`` along with ``actor``). The forbid config turns it
+    into a 422.
+    """
+    seeded = _seed(
+        task_store, n=52,
+        work_status=WorkStatus.IN_PROGRESS, assignee="bob",
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/52/reassign",
+        headers=auth_headers,
+        json={"actor": "bob", "extra": "nope"},
+    )
+    assert response.status_code == 422, response.text
+    # No state change — the request was rejected by the validator.
+    assert seeded.assignee == "bob"
+    assert seeded.context == [], (
+        f"reassign with unknown field must NOT record a breadcrumb; "
+        f"got {seeded.context!r}"
+    )
 
 
 def test_reassign_records_context_log_breadcrumb(

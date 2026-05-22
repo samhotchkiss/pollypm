@@ -31,10 +31,12 @@ from pollypm.config import (
 )
 from pollypm.models import (
     KnownProject,
+    PgStorageSettings,
     ProjectKind,
     ProviderKind,
     RuntimeKind,
     SessionConfig,
+    StorageSettings,
 )
 from pollypm.web_api import create_app, ensure_token
 from pollypm.web_api.routes.config import REDACTED
@@ -390,6 +392,147 @@ def test_known_project_credentials_redacted_in_per_project_view(
     for key, value in body["project"].items():
         if any(needle in key.lower() for needle in ("token", "secret", "api_key")):
             assert value == REDACTED, f"unredacted credential-shaped field: {key}"
+
+
+# ---------------------------------------------------------------------------
+# DSN / URL value-shape redaction (Codex P0 on PR #2056)
+# ---------------------------------------------------------------------------
+
+
+def test_storage_url_with_userinfo_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """``[storage].url`` carrying userinfo must be redacted.
+
+    The key ``url`` doesn't match the secret-name heuristic, so this
+    pins the value-shape check: anything that parses as
+    ``scheme://user:password@host/...`` is treated as a live
+    credential regardless of the key it sits under.
+    """
+    _ = token
+    config = _build_config(workspace_root=workspace_root, project_root=project_root)
+    config.storage = StorageSettings(
+        backend="postgres",
+        url="postgresql://user:urlpass@example.com/db",
+    )
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    assert body["config"]["storage"]["url"] == REDACTED
+    assert "urlpass" not in response_text(body)
+
+
+def test_storage_pg_dsn_with_userinfo_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """``[storage.pg].dsn`` carrying userinfo must be redacted."""
+    _ = token
+    config = _build_config(workspace_root=workspace_root, project_root=project_root)
+    config.storage = StorageSettings(
+        backend="postgres",
+        url="",
+        pg=PgStorageSettings(
+            dsn="postgresql://user:dsnpass@example.com/db",
+        ),
+    )
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    assert body["config"]["storage"]["pg"]["dsn"] == REDACTED
+    assert "dsnpass" not in response_text(body)
+
+
+def test_account_env_dsn_carriers_are_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """Env entries with DSN/URL-shaped values must be redacted.
+
+    Codex's P0 called out ``DATABASE_URL``, ``POSTGRES_DSN``, and
+    ``SENTRY_DSN`` specifically — none of those keys match the
+    secret-name heuristic, so the value-shape check (URL with
+    userinfo) is what protects them.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "DATABASE_URL": "postgresql://user:dbpass@example.com/db",
+        "POSTGRES_DSN": "postgresql://user:pgdsnpass@example.com/db",
+        "SENTRY_DSN": "https://user:sentrypass@sentry.example.com/123",
+        "PUBLIC_FLAG": "ok",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["DATABASE_URL"] == REDACTED
+    assert env["POSTGRES_DSN"] == REDACTED
+    assert env["SENTRY_DSN"] == REDACTED
+    assert env["PUBLIC_FLAG"] == "ok"  # non-URL string untouched
+    raw = response_text(body)
+    assert "dbpass" not in raw
+    assert "pgdsnpass" not in raw
+    assert "sentrypass" not in raw
+
+
+def test_bare_url_without_userinfo_is_not_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """Public URLs (no userinfo) pass through unchanged.
+
+    Over-redaction would hurt observability — a webhook callback URL
+    or a public docs link has no userinfo and should not be replaced
+    with ``"***"``.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "DOCS_URL": "https://example.com/api",
+        "API_BASE": "https://api.example.com/v1",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["DOCS_URL"] == "https://example.com/api"
+    assert env["API_BASE"] == "https://api.example.com/v1"
+
+
+def test_non_url_string_in_safe_field_is_not_redacted(
+    client: TestClient, auth_headers: dict[str, str],
+) -> None:
+    """Plain string values in non-secret fields remain visible.
+
+    The value-shape check only fires for URL-with-userinfo. Ordinary
+    string fields (project name, tmux session name, …) must round-trip
+    untouched so the operator can read their config back from the API.
+    """
+    body = client.get("/api/v1/config", headers=auth_headers).json()
+    assert body["config"]["project"]["tmux_session"] == "pollypm-test"
+    assert body["config"]["project"]["name"] == "PollyPM"
 
 
 # ---------------------------------------------------------------------------

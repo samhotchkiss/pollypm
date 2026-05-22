@@ -25,6 +25,7 @@ import dataclasses
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -80,6 +81,42 @@ def _looks_secret(field_name: str) -> bool:
     return any(needle in lower for needle in _SECRET_NAME_SUBSTRINGS)
 
 
+def _value_has_url_userinfo(value: Any) -> bool:
+    """Return True iff ``value`` parses as a URL carrying userinfo.
+
+    Catches credential-bearing connection strings whose *keys* don't
+    match the secret-name heuristic — e.g. ``[storage].url``,
+    ``[storage.pg].dsn``, or env entries like ``DATABASE_URL`` /
+    ``POSTGRES_DSN`` / ``SENTRY_DSN`` shaped as
+    ``scheme://user:password@host/...``. Uses
+    :func:`urllib.parse.urlsplit` so the check is robust against
+    odd schemes (``postgresql+psycopg``, ``redis``, ``amqps``, ...).
+
+    Only flags strings; non-string values fall through. We treat the
+    whole value as tainted (rather than masking just the userinfo
+    portion) so we never accidentally leave fragments of the password
+    in the response.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        # Malformed URL — better to redact below if it *looked* like a
+        # URL, but ``urlsplit`` is permissive, so a raise here means
+        # the value definitely isn't a URL.
+        return False
+    if not parts.scheme:
+        return False
+    try:
+        return bool(parts.username or parts.password)
+    except ValueError:
+        # ``parts.username`` / ``.password`` can raise on malformed
+        # percent-encoding in the netloc. If the netloc contains an
+        # ``@``, that's still very likely userinfo — redact to be safe.
+        return "@" in (parts.netloc or "")
+
+
 def _coerce_value(value: Any) -> Any:
     """Coerce a single config value into a JSON-friendly shape.
 
@@ -103,6 +140,13 @@ def _coerce_value(value: Any) -> Any:
         return _redact_dict(value)
     if isinstance(value, (list, tuple)):
         return [_coerce_value(item) for item in value]
+    # Value-shape redaction: any string that parses as a URL with
+    # userinfo (``scheme://user:pass@host/...``) is treated as a live
+    # credential regardless of the key name it sits under. Catches
+    # ``[storage].url`` / ``[storage.pg].dsn`` and env entries like
+    # ``DATABASE_URL`` whose keys don't trigger ``_looks_secret``.
+    if _value_has_url_userinfo(value):
+        return REDACTED
     return value
 
 

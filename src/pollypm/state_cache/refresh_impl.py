@@ -66,14 +66,13 @@ def build_refresh_fn(
     a config reload during a long-running cockpit picks up the new
     paths automatically.
 
-    PR #2026 re-review: heartbeat prefetch now routes through the
-    pg facade (``pollypm.storage.pg_heartbeats.latest_heartbeat``)
-    instead of opening a legacy sqlite state store. The previous
-    memoised-store shim conflicted with the no-sqlite runtime
-    direction (#1737 / #2039) and returned the wrong rows when the
-    active backend was Postgres. The pg facade owns its own pool, so
-    there's nothing to memoise in this closure anymore — the refresh
-    function is a thin config-provider wrapper.
+    PR #2026 v3 (Codex re-review): heartbeat prefetch removed entirely.
+    The two rail consumers (``cockpit_rail._latest_heartbeat_cached``)
+    were converted to direct pg-facade reads because the refresher had
+    no ``heartbeat.*`` audit-event subscription and so could only ever
+    serve a stale snapshot. Until that invalidation lands (filed as
+    #2050 follow-up) there's nothing for the refresher to prefetch —
+    the closure is a thin config-provider wrapper.
     """
 
     def _refresh(project_key: str) -> ProjectStateCacheEntry | None:
@@ -115,23 +114,22 @@ def compute_entry_for_project(
     tracked = bool(getattr(project, "tracked", True)) if project else False
 
     awaits_user_items = _awaits_user_items_for(project_key, config)
-    state, glyph, detail, rail_rollup, live_workers = _categorize_and_rollup(
+    state, glyph, detail, rail_rollup = _categorize_and_rollup(
         project_key=project_key,
         config=config,
         tracked=tracked,
         awaits_user_items=list(awaits_user_items),
     )
 
-    # PR 3: populate live worker sessions + latest_heartbeat_by_session
-    # so cockpit_rail can short-circuit its per-project ``latest_heartbeat()``
-    # calls. Best-effort: failures degrade silently to an empty mapping
-    # (the rail's fall-through path re-fetches direct).
-    # PR #2026 re-review: routes through the pg heartbeats facade —
-    # no more legacy sqlite state-store dependency in state_cache.
-    latest_heartbeat_by_session = _heartbeats_for_sessions(
-        live_workers, config=config,
-    )
-
+    # PR #2026 v3 (Codex re-review blocker 2): the heartbeat prefetch
+    # path was dead code. ``cockpit_rail._latest_heartbeat_cached``
+    # bypasses ``entry.latest_heartbeat_by_session`` and reads
+    # ``pollypm.storage.pg_heartbeats`` directly because the refresher
+    # has no ``heartbeat.*`` audit-event subscription and can only
+    # serve stale snapshots. Populating the field meant N pg reads
+    # per project per refresh with zero consumers. The entry field is
+    # retained (defaults to ``{}``) so callers don't crash on
+    # attribute access; the bulk-prefetch wiring lands with #2050.
     entry = ProjectStateCacheEntry(
         project_key=project_key,
         project_path=project_path,
@@ -146,8 +144,6 @@ def compute_entry_for_project(
         approvals_pending=rail_rollup[4] if rail_rollup else 0,
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
-        live_worker_sessions=tuple(live_workers),
-        latest_heartbeat_by_session=latest_heartbeat_by_session,
         computed_at=time.monotonic(),
     )
     return entry
@@ -226,17 +222,20 @@ def _categorize_and_rollup(
 ) -> tuple[
     Any, str, str,
     tuple[Any, Any, int, str, int] | None,
-    list[Any],
 ]:
     """Run ``categorize_project`` + ``rollup_project_state`` for one project.
 
-    Returns ``(state, glyph, detail, rollup_tuple_or_None, live_workers)``.
-    The rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
+    Returns ``(state, glyph, detail, rollup_tuple_or_None)``. The
+    rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
     approvals_pending)`` — kept positional so the caller can ``zip``
     it into the entry fields without a second import of the rollup
-    types here. ``live_workers`` is the list of active worker session
-    records for the project, used by PR 3 to populate
-    ``latest_heartbeat_by_session``.
+    types here.
+
+    PR #2026 v3 (Codex re-review blocker 2): no longer returns
+    ``live_workers``. The heartbeat prefetch that consumed that list
+    was dead code (cockpit_rail bypasses the cache for heartbeats);
+    keeping the slice-svc roster query alive cost N pg reads per
+    refresh with zero readers.
 
     Failures degrade silently — a broken work-service drops the
     project to IDLE (or PAUSED when not tracked) with no rollup.
@@ -264,7 +263,7 @@ def _categorize_and_rollup(
             project_key,
             exc_info=True,
         )
-        return None, "", "", None, []
+        return None, "", "", None
 
     shared_svc = _open_shared_work_service(config)
     try:
@@ -280,7 +279,7 @@ def _categorize_and_rollup(
                 detail = "Paused"
             else:
                 detail = "Quiet"
-            return state, glyph, detail, None, []
+            return state, glyph, detail, None
 
         tasks_by_alias, workers_by_alias = _prefetch_project_state(
             config, shared_svc,
@@ -338,111 +337,10 @@ def _categorize_and_rollup(
             )
             rollup_tuple = None
 
-        # PR 3: gather live workers so the per-project heartbeat
-        # lookup can short-circuit in cockpit_rail. ``slice_svc``
-        # already filters by this project's aliases.
-        try:
-            live_workers = list(slice_svc.list_worker_sessions(
-                project=project_key, active_only=True,
-            ))
-        except Exception:  # noqa: BLE001
-            live_workers = []
-
-        return state, glyph, detail, rollup_tuple, live_workers
+        return state, glyph, detail, rollup_tuple
     finally:
         if shared_svc is not None:
             _safe_close(shared_svc)
-
-
-def _heartbeats_for_sessions(
-    live_workers: list[Any],
-    *,
-    config: Any | None = None,
-) -> dict[str, Any]:
-    """Return ``{session_name: HeartbeatRecord}`` for ``live_workers``.
-
-    PR 3 (§5 row 9): the rail's ``latest_heartbeat()`` is called once
-    per project per refresh. Folding it into the cache refresh means
-    the rail can short-circuit on the cache snapshot instead of
-    issuing N pg queries. Best-effort — a failed lookup degrades to
-    a missing key (the rail's fall-through then re-queries direct).
-
-    The mapping is keyed by ``session.name`` (matching the rail's
-    ``_session_name_for_item`` resolution path) — NOT by task identity.
-
-    PR #2026 re-review: routes strictly through
-    :func:`pollypm.storage.pg_heartbeats.latest_heartbeat`. The
-    previous implementation opened a legacy sqlite state store
-    against the per-project sqlite db, which (a) reintroduced a
-    sqlite dependency the no-sqlite runtime track (#1737, #2039)
-    had just removed, and (b) returned stale rows when the active
-    backend was Postgres (the unified ``heartbeats`` table lives in
-    pg post-cutover).
-
-    Any pg failure — import error, connection failure, per-session
-    query error — is swallowed and surfaces as a missing key in the
-    returned mapping. Downstream consumers already treat a missing
-    heartbeat as ``None`` (the rail's direct fall-through then
-    re-queries). On total facade unavailability we return ``{}``,
-    matching the previous early-return shape.
-
-    Note: ``pg_heartbeats`` exposes only a per-session reader. This
-    function issues N individual ``latest_heartbeat(name)`` calls.
-    A bulk ``latest_heartbeats(names)`` facade would let us collapse
-    these into one SELECT and is worth adding once another caller
-    needs it — flagged in the commit message but out of scope here.
-    """
-
-    if not live_workers:
-        return {}
-
-    try:
-        from pollypm.storage.pg_heartbeats import latest_heartbeat
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "state_cache: pg_heartbeats import failed; "
-            "heartbeat prefetch disabled",
-            exc_info=True,
-        )
-        return {}
-
-    out: dict[str, Any] = {}
-    for session in live_workers:
-        # Look up the session_name from the worker record. The session
-        # naming convention is ``worker_<project>/<task_number>``; the
-        # supervisor.store.latest_heartbeat call sites in cockpit_rail
-        # take the resolved session name from launches, which match
-        # the worker session bindings.
-        session_name = _session_name_for_worker(session)
-        if not session_name:
-            continue
-        try:
-            heartbeat = latest_heartbeat(session_name, config=config)
-        except Exception:  # noqa: BLE001
-            heartbeat = None
-        if heartbeat is not None:
-            out[session_name] = heartbeat
-    return out
-
-
-def _session_name_for_worker(session: Any) -> str:
-    """Resolve the session_name string for a worker-session record.
-
-    Workers may surface their session name as ``session_name`` (the
-    canonical tmux session) or be derivable from
-    ``(task_project, task_number)`` via the standard
-    ``worker_<project>/<number>`` convention. Returns ``""`` when no
-    name can be inferred.
-    """
-
-    direct = getattr(session, "session_name", None)
-    if direct:
-        return str(direct)
-    project = str(getattr(session, "task_project", "") or "")
-    number = getattr(session, "task_number", None)
-    if project and number is not None:
-        return f"worker_{project}/{number}"
-    return ""
 
 
 # ── refresher integration ─────────────────────────────────────────

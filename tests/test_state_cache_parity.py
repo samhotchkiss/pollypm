@@ -1110,7 +1110,6 @@ class TestPr2026ReviewBlocker1ActionableAlertFallthrough:
         """
 
         from pollypm.cockpit_project_state import ProjectRailState
-        from pollypm.cockpit_rail import CockpitRouter
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         router = self._router(tmp_path)
@@ -1371,3 +1370,183 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         result = cockpit_inbox.pm_inbox_awaits_user_list(config)
         assert direct_called["n"] == 0
         assert len(result) == 1
+
+
+class TestPr2026V3WorkspaceRootProbeUnbounded:
+    """PR #2026 v3 (Codex blocker 1): the workspace-root probe must NOT
+    depend on row recency. The old implementation called
+    ``open_messages(limit=50)`` and Python-scanned for ``scope IN ('',
+    'inbox')``; with 50+ newer project-scoped rows + 1 older
+    workspace-root row, the probe returned False and the cache silently
+    dropped the workspace work.
+
+    The fix adds a dedicated SQL existence query
+    (``cockpit_pg_aggregates.has_workspace_root_open_messages``) with
+    a workspace-root predicate + ``LIMIT 1`` — independent of how many
+    newer non-workspace rows exist.
+
+    This test calls the REAL ``_workspace_root_inbox_has_open`` (no
+    monkeypatch on that function) against a fake pg_pool that simulates
+    the bug scenario.
+    """
+
+    def test_workspace_root_row_under_50_newer_rows_is_still_seen(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Seed pg with 50 newer project-scoped rows + 1 older
+        workspace-root row; the SQL existence query MUST return True.
+        """
+
+        config = _make_config(["alpha"], tmp_path)
+
+        # Track which SQL was executed so the assertion proves the
+        # workspace-root existence query (not the legacy newest-50
+        # scan) is what gave the True answer.
+        executed: list[tuple[str, tuple[Any, ...]]] = []
+
+        class _FakeCursor:
+            def __init__(self) -> None:
+                self._result: list[tuple[Any, ...]] = []
+
+            def __enter__(self) -> "_FakeCursor":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def execute(self, sql: str, params: Any) -> None:
+                executed.append((sql, tuple(params)))
+                # Workspace-root probe: predicate includes the
+                # ``scope = '' OR scope IS NULL OR scope = 'inbox'``
+                # branch + a ``LIMIT 1``. Return one row.
+                if "scope = 'inbox'" in sql and "LIMIT 1" in sql:
+                    self._result = [(1,)]
+                    return
+                # Anything else (e.g. the legacy newest-N scan) —
+                # return 50 project-scoped rows so the OLD code
+                # would have missed the workspace-root row entirely.
+                self._result = [
+                    (i, "alpha", "notify", "info", "user", "sender",
+                     "open", "subj", "body", {}, [], "kind",
+                     None, None, None)
+                    for i in range(50)
+                ]
+
+            def fetchone(self) -> Any:
+                return self._result[0] if self._result else None
+
+            def fetchall(self) -> list[tuple[Any, ...]]:
+                return list(self._result)
+
+            @property
+            def description(self) -> list[Any]:
+                return [SimpleNamespace(name=n) for n in (
+                    "id", "scope", "type", "tier", "recipient",
+                    "sender", "state", "subject", "body",
+                    "payload_json", "labels", "kind",
+                    "created_at", "updated_at", "closed_at",
+                )]
+
+        class _FakeConn:
+            def __enter__(self) -> "_FakeConn":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def cursor(self) -> _FakeCursor:
+                return _FakeCursor()
+
+        class _FakePool:
+            def connection(self) -> _FakeConn:
+                return _FakeConn()
+
+        def _fake_get_ro_pool(_cfg: Any) -> _FakePool:
+            return _FakePool()
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_ro_pool", _fake_get_ro_pool,
+        )
+
+        # Call the REAL function (no monkeypatch on _workspace_root_inbox_has_open).
+        assert cockpit_inbox._workspace_root_inbox_has_open(config) is True
+
+        # Prove the SQL the function executed was the bounded-1
+        # existence query, not the legacy newest-N scan.
+        assert executed, "fake pg pool was never queried"
+        executed_sqls = [sql for sql, _params in executed]
+        assert any(
+            "scope = 'inbox'" in sql and "LIMIT 1" in sql
+            for sql in executed_sqls
+        ), (
+            f"workspace-root probe should issue a LIMIT-1 existence "
+            f"query; saw {executed_sqls!r}"
+        )
+
+    def test_real_probe_drives_cache_fall_through(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """The probe's True answer MUST flip
+        ``_maybe_cache_route_awaits_user`` to fall through to direct.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+
+        class _FakeCursor:
+            def __init__(self) -> None:
+                self._result: list[tuple[Any, ...]] = []
+
+            def __enter__(self) -> "_FakeCursor":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def execute(self, sql: str, params: Any) -> None:
+                if "LIMIT 1" in sql:
+                    self._result = [(1,)]
+                else:
+                    self._result = []
+
+            def fetchone(self) -> Any:
+                return self._result[0] if self._result else None
+
+            def fetchall(self) -> list[tuple[Any, ...]]:
+                return list(self._result)
+
+            @property
+            def description(self) -> list[Any]:
+                return [SimpleNamespace(name="x")]
+
+        class _FakeConn:
+            def __enter__(self) -> "_FakeConn":
+                return self
+
+            def __exit__(self, *_a: Any) -> None:
+                pass
+
+            def cursor(self) -> _FakeCursor:
+                return _FakeCursor()
+
+        class _FakePool:
+            def connection(self) -> _FakeConn:
+                return _FakeConn()
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
+        )
+
+        # Seed a populated cache for alpha. No monkeypatch on
+        # _workspace_root_inbox_has_open — it executes the REAL pg
+        # path against the fake pool above and returns True.
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.IDLE, items=[],
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        # The fast-path MUST decline so the direct sweep can carry
+        # the workspace-root row.
+        assert cockpit_inbox._maybe_cache_route_awaits_user(config) is None

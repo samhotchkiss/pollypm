@@ -86,9 +86,13 @@ Added, Changed, and Removed.
   `cockpit_rail._project_tasks_for_rollup` is folded into the
   refresher (no longer called from `build_items` when cache is
   authoritative); and `cockpit_rail`'s two `latest_heartbeat()`
-  per-project sites read from `entry.latest_heartbeat_by_session`.
-  Each call site keeps a flag-off fall-through, so behaviour is
-  unchanged until PR 4 flips the default. Flag still defaults OFF.
+  per-project sites read directly from the pg facade
+  (`pollypm.storage.pg_heartbeats.latest_heartbeat`) — the cache had
+  no `heartbeat.*` invalidation, so any prefetch could only serve a
+  stale snapshot. Bulk heartbeat prefetch is deferred to #2050 (once
+  the refresher subscribes to heartbeat audit events). Each call
+  site keeps a flag-off fall-through, so behaviour is unchanged
+  until PR 4 flips the default. Flag still defaults OFF.
 
 ### Removed
 - Rail-side 2s TTL on `CockpitRouter._project_categorizations`

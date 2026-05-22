@@ -495,7 +495,7 @@ wheels = [
 
 [[package]]
 name = "pollypm"
-version = "1.0.0rc2"
+version = "1.0.0rc3.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },

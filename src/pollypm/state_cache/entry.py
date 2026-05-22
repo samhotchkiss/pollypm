@@ -73,6 +73,7 @@ class ProjectStateCacheEntry:
 
     # ── heartbeats / live workers ──────────────────────────────────
     live_worker_sessions: tuple[Any, ...] = ()
+    # Populated when #2050 lands a heartbeat invalidation contract.
     latest_heartbeat_by_session: dict[str, Any] = field(default_factory=dict)
 
     # ── task statuses (recompute rail glyphs without re-opening) ───

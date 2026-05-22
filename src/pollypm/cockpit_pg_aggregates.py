@@ -364,6 +364,76 @@ def open_messages(
     return rows
 
 
+def has_workspace_root_open_messages(
+    config: "PollyPMConfig | None",
+) -> bool:
+    """Return True iff any open workspace-root inbox row exists.
+
+    "Workspace-root" = messages with ``scope IN ('', 'inbox')``. The
+    state-cache refresher's per-project filter
+    (``state_cache/refresh_impl.py::_awaits_user_items_for``) drops
+    these on the floor because they aren't keyed to any tracked
+    project, so any cache-routed read MUST fall through whenever this
+    returns True.
+
+    PR #2026 v3 (Codex re-review blocker 1): the previous
+    implementation re-used :func:`open_messages` with ``limit=50`` and
+    scanned the newest 50 rows in Python for ``scope == "" / "inbox"``.
+    On a busy workspace with 50+ newer project-scoped rows + 1 older
+    workspace-root row, the probe returned False and the cache
+    silently dropped the workspace work. This helper pushes the
+    existence check into SQL (``LIMIT 1`` on a workspace-root
+    predicate) so the answer is independent of how many newer
+    project-scoped rows exist.
+
+    Best-effort: pool import / query failure returns ``False`` so the
+    fast-path still wins on the common "no workspace-root noise" case.
+    """
+
+    try:
+        from pollypm.storage.pg_pool import get_ro_pool, get_rw_pool
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "pg aggregates: pg_pool import failed (workspace-root probe)",
+            exc_info=True,
+        )
+        return False
+
+    try:
+        pool = get_ro_pool(config)
+    except Exception:  # noqa: BLE001
+        try:
+            pool = get_rw_pool(config)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "pg aggregates: pg pool open failed (workspace-root probe)",
+                exc_info=True,
+            )
+            return False
+
+    sql = (
+        "SELECT 1 "
+        "  FROM messages "
+        " WHERE recipient = %s "
+        "   AND state = %s "
+        "   AND type IN ('notify', 'inbox_task', 'alert') "
+        "   AND (scope = '' OR scope IS NULL OR scope = 'inbox') "
+        " LIMIT 1"
+    )
+    params: list[object] = ["user", "open"]
+    try:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            row = cur.fetchone()
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "pg aggregates: workspace-root probe query failed",
+            exc_info=True,
+        )
+        return False
+    return row is not None
+
+
 # --------------------------------------------------------------------------- #
 # Public API surface
 # --------------------------------------------------------------------------- #
@@ -372,6 +442,7 @@ def open_messages(
 __all__ = [
     "all_tasks_for_project",
     "all_tasks_grouped",
+    "has_workspace_root_open_messages",
     "inbox_tasks_for_project",
     "inbox_tasks_grouped",
     "open_messages",

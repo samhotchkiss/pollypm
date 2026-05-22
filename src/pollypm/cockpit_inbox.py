@@ -237,6 +237,14 @@ def _workspace_root_inbox_has_open(config) -> bool:
     Filed as a follow-up issue (PR #2026 review blocker 3): teach the
     cache to carry a workspace-root entry so this gate can go away.
 
+    PR #2026 v3 (Codex re-review): delegates to the dedicated SQL
+    existence query :func:`pollypm.cockpit_pg_aggregates.has_workspace_root_open_messages`
+    so the answer no longer depends on whether the newest N rows happen
+    to include a workspace-root row. The old ``open_messages(limit=50)``
+    + Python-side scan path silently dropped workspace work whenever 50+
+    newer project-scoped rows pushed the workspace-root row out of the
+    window.
+
     Best-effort: a pg outage / import failure returns ``False`` so the
     fast-path still wins on the common "no workspace-root noise" case.
     A false negative here would mis-attribute the divergence to the
@@ -244,21 +252,15 @@ def _workspace_root_inbox_has_open(config) -> bool:
     """
 
     try:
-        from pollypm.cockpit_pg_aggregates import open_messages
+        from pollypm.cockpit_pg_aggregates import (
+            has_workspace_root_open_messages,
+        )
     except Exception:  # noqa: BLE001
         return False
-    known_projects = set(getattr(config, "projects", {}).keys())
     try:
-        rows = open_messages(config, known_projects=known_projects, limit=50)
+        return bool(has_workspace_root_open_messages(config))
     except Exception:  # noqa: BLE001
         return False
-    if not rows:
-        return False
-    for row in rows:
-        scope = (row.get("scope") or "").strip()
-        if scope == "" or scope == "inbox":
-            return True
-    return False
 
 
 def _maybe_cache_route_awaits_user(config) -> list[object] | None:

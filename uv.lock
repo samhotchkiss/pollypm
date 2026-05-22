@@ -499,6 +499,7 @@ version = "1.0.0rc3.dev0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "packaging" },
     { name = "pgvector" },
     { name = "psycopg", extra = ["binary"] },
@@ -512,7 +513,6 @@ dependencies = [
 
 [package.optional-dependencies]
 dev = [
-    { name = "httpx" },
     { name = "openapi-spec-validator" },
     { name = "pytest" },
     { name = "ruff" },
@@ -526,7 +526,7 @@ test = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.115.0" },
-    { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "httpx", marker = "extra == 'test'", specifier = ">=0.27.0" },
     { name = "openapi-spec-validator", marker = "extra == 'dev'", specifier = ">=0.7.0" },
     { name = "packaging", specifier = ">=23.0" },

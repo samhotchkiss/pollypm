@@ -127,17 +127,23 @@ def get_project_plan_endpoint(
 class _ReasonBody(BaseModel):
     """Optional `{reason?}` body shared by pause / archive routes.
 
-    ``reason`` is currently accepted for audit symmetry with the
-    cockpit's Pause/Archive UX; it isn't stored on
-    :class:`KnownProject`. When audit emission lands (spec §2.10) the
-    string will be threaded into the ``api.mutation`` audit row's
-    ``metadata.reason`` so operators can grep for "why".
+    ``reason`` is persisted to the per-project audit log as part of
+    the ``projects.tracked.set`` (pause/resume) and ``projects.archive``
+    events emitted by the service layer, alongside the actor and
+    timestamp. Clamped to 500 chars by ``max_length`` here and re-
+    clamped in :func:`pollypm.web_api.service._emit_project_audit` as
+    belt-and-suspenders.
     """
 
     reason: str | None = Field(
         default=None,
         max_length=500,
-        description="Optional operator-supplied note. Currently not persisted.",
+        description=(
+            "Optional operator-supplied note. Persisted to the per-"
+            "project audit log (`projects.tracked.set` / "
+            "`projects.archive` events) along with the actor and "
+            "timestamp. Clamped to 500 chars."
+        ),
     )
 
 
@@ -184,18 +190,11 @@ def pause_project_endpoint(
     body: _ReasonBody | None = None,
 ) -> Project:
     reason = body.reason if body is not None else None
-    # Idempotent per spec §6.3 ("Pause a paused project ... returns
-    # 200 with current state, no audit churn"). Skip the disk write
-    # when already paused so we don't churn the TOML mtime — still
-    # return the canonical post-state so clients see consistent JSON
-    # whether they raced an earlier call or not.
-    project = config.projects.get(key)
-    if project is None:
-        raise not_found(f"Project not registered: {key}")
-    if project.tracked is False:
-        from pollypm.web_api.service import _project_to_api  # local import: private helper
-
-        return _project_to_api(config, key, project)
+    # Idempotency lives in ``set_project_tracked`` (Codex round 2 on
+    # #2063): deciding "already paused" against the long-lived
+    # ``ConfigDep`` snapshot was returning 200 with a stale value when
+    # disk had been edited externally. The service helper reloads disk
+    # first and short-circuits there.
     return set_project_tracked(config, key, tracked=False, reason=reason)
 
 
@@ -214,13 +213,11 @@ def resume_project_endpoint(
     key: str,
     config: ConfigDep,
 ) -> Project:
-    project = config.projects.get(key)
-    if project is None:
-        raise not_found(f"Project not registered: {key}")
-    if project.tracked is True:
-        from pollypm.web_api.service import _project_to_api  # local import: private helper
-
-        return _project_to_api(config, key, project)
+    # Idempotency lives in ``set_project_tracked`` (Codex round 2 on
+    # #2063): deciding "already tracked" against the long-lived
+    # ``ConfigDep`` snapshot was returning 200 with a stale value when
+    # disk had been edited externally. The service helper reloads disk
+    # first and short-circuits there.
     return set_project_tracked(config, key, tracked=True)
 
 

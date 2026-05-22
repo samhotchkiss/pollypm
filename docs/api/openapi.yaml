@@ -204,8 +204,9 @@ paths:
         Flips `KnownProject.tracked=false` and re-renders the global
         TOML. Idempotent — a second call against an already-paused
         project returns 200 with the same snapshot and skips the disk
-        write. `reason` is currently accepted for audit symmetry but
-        not persisted.
+        write. `reason` is persisted to the per-project audit log
+        (`projects.tracked.set` event) along with the actor and
+        timestamp. Clamped to 500 chars.
       requestBody:
         required: false
         content:
@@ -264,8 +265,9 @@ paths:
         TOML. Source data on disk (the repo itself, audit JSONLs) is
         untouched. Archive is irreversible from the API — subsequent
         `pause`/`resume`/`init-guide` calls 404. Re-onboarding uses
-        the CLI's `pm add-project`. `reason` is currently accepted
-        for audit symmetry but not persisted.
+        the CLI's `pm add-project`. `reason` is persisted to the per-
+        project audit log (`projects.archive` event) along with the
+        actor and timestamp. Clamped to 500 chars.
       requestBody:
         required: false
         content:
@@ -1725,13 +1727,19 @@ components:
       type: object
       description: |
         Body for `POST /projects/{key}/pause` and
-        `POST /projects/{key}/archive`. `reason` is currently
-        accepted for audit symmetry but not persisted.
+        `POST /projects/{key}/archive`. `reason` is persisted to the
+        per-project audit log (`projects.tracked.set` /
+        `projects.archive` events) along with the actor and timestamp.
+        Clamped to 500 chars.
       properties:
         reason:
           type: string
           maxLength: 500
-          description: Optional operator-supplied note.
+          description: |
+            Optional operator-supplied note. Persisted to the per-
+            project audit log (`projects.tracked.set` /
+            `projects.archive` events) along with the actor and
+            timestamp. Clamped to 500 chars.
 
     InitGuideRequest:
       type: object

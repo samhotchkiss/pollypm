@@ -672,3 +672,139 @@ def test_pause_emits_audit_event_with_reason(
         "Expected projects.tracked.set audit event with "
         "reason='testing-audit-emit' — Codex P1 regression"
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex round 2 on PR #2063 — stale-snapshot idempotency.
+#
+# The route-level "already at target" short-circuit decided idempotency
+# against the long-lived ConfigDep snapshot. When disk has been edited
+# externally to the opposite value, the route returned 200 with the live
+# (stale) state and never wrote — disk stayed out of sync.
+#
+# Fix: idempotency lives in ``set_project_tracked`` after the fresh
+# ``load_config(config_path)``. Routes delegate unconditionally.
+# ---------------------------------------------------------------------------
+
+
+def test_resume_with_live_true_but_disk_false_reflects_disk(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
+) -> None:
+    """Codex round 2: stale live=True vs disk=False on /resume.
+
+    Reproduces the route-bypass bug: server boots with ``tracked=True``
+    in memory, an external editor flips disk to ``tracked=False``, then
+    ``POST /resume`` lands. Pre-fix the route returned 200 with the
+    stale live value and disk stayed ``tracked=False``. Post-fix the
+    service helper reloads disk, sees ``False`` != target ``True``,
+    writes ``True``, and both surfaces agree.
+    """
+    # Sanity: live thinks tracked.
+    assert config.projects["myproj"].tracked is True
+
+    # External editor flips disk to tracked=False without touching the
+    # live in-memory snapshot.
+    fresh = load_config(config_path)
+    fresh.projects["myproj"].tracked = False
+    write_config(fresh, config_path, force=True)
+    # Live snapshot is still stale on purpose.
+    assert config.projects["myproj"].tracked is True
+
+    response = client.post(
+        "/api/v1/projects/myproj/resume", headers=auth_headers, json={}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["tracked"] is True
+
+    # Disk MUST reflect the resume — pre-fix this stayed False because
+    # the route short-circuited on the stale live value and never wrote.
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is True, (
+        "Disk did not reflect /resume target — Codex round-2 regression "
+        "(stale-snapshot idempotency on the route bypassed the durable "
+        "write path)."
+    )
+    # Live snapshot is now in sync too.
+    assert config.projects["myproj"].tracked is True
+
+
+def test_pause_with_live_false_but_disk_true_reflects_disk(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
+) -> None:
+    """Codex round 2: stale live=False vs disk=True on /pause (mirror case).
+
+    Boot live as ``tracked=False`` (already-paused snapshot), have an
+    external editor flip disk to ``tracked=True``, then ``POST /pause``.
+    Pre-fix the route short-circuited on live=False and returned 200
+    without writing; disk stayed ``True``. Post-fix the service helper
+    reloads, sees ``True`` != target ``False``, writes ``False``, and
+    both surfaces agree.
+    """
+    # Flip live to False so the pre-fix route would short-circuit.
+    config.projects["myproj"].tracked = False
+
+    # External editor flips disk back to tracked=True.
+    fresh = load_config(config_path)
+    fresh.projects["myproj"].tracked = True
+    write_config(fresh, config_path, force=True)
+    # Live snapshot is intentionally stale (False vs disk True).
+    assert config.projects["myproj"].tracked is False
+
+    response = client.post(
+        "/api/v1/projects/myproj/pause",
+        headers=auth_headers,
+        json={"reason": "stale-snapshot regression"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["tracked"] is False
+
+    # Disk MUST reflect the pause — pre-fix this stayed True.
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is False, (
+        "Disk did not reflect /pause target — Codex round-2 regression "
+        "(stale-snapshot idempotency on the route bypassed the durable "
+        "write path)."
+    )
+    assert config.projects["myproj"].tracked is False
+
+
+def test_resume_idempotent_when_disk_already_true_syncs_live(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
+) -> None:
+    """Codex round 2: when disk already matches target, sync the live snapshot.
+
+    Live boots as ``tracked=False`` (stale); disk is actually
+    ``tracked=True``. /resume's target equals disk so the helper takes
+    the no-write idempotent branch but MUST still sync live so a
+    subsequent GET doesn't keep lying.
+    """
+    # Disk = True (already at /resume's target).
+    fresh = load_config(config_path)
+    fresh.projects["myproj"].tracked = True
+    write_config(fresh, config_path, force=True)
+    # Live is stale (False).
+    config.projects["myproj"].tracked = False
+
+    response = client.post(
+        "/api/v1/projects/myproj/resume", headers=auth_headers, json={}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["tracked"] is True
+
+    # Live snapshot must have been synced from disk even though no write
+    # happened — otherwise GET keeps returning the stale value.
+    assert config.projects["myproj"].tracked is True
+    get_response = client.get(
+        "/api/v1/projects/myproj", headers=auth_headers
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["tracked"] is True

@@ -400,6 +400,13 @@ def set_project_tracked(
       we never write back the long-lived ``ConfigDep`` snapshot with
       ``force=True`` (that would silently drop e.g. a project added
       via ``pm add-project`` after the server started).
+    * Idempotency is decided AGAINST the freshly-loaded disk state
+      (Codex round 2 on #2063): if disk already matches ``tracked``
+      we skip the write AND sync the live snapshot from disk so a
+      stale in-memory value can't keep lying. Deciding against the
+      long-lived ``ConfigDep`` here would let a server that booted
+      with ``tracked=True`` short-circuit a ``/resume`` call even
+      after an external edit flipped disk to ``False``.
     * Mutate the freshly-loaded copy, NOT the live ``config``.
     * Only after the disk write succeeds do we sync the change back
       into the live ``config`` so subsequent in-process reads see it.
@@ -435,6 +442,20 @@ def set_project_tracked(
         # Disk-side delete raced us. Treat as 404 — the in-memory state
         # is stale and the next GET will agree.
         raise not_found(f"Project not registered: {project_key}")
+
+    # Idempotency decided against DISK, not against the long-lived
+    # in-memory snapshot. If disk already matches the request we still
+    # sync the live ``config`` from disk so a stale in-process value
+    # can't continue lying to subsequent GETs.
+    if fresh_project.tracked == tracked:
+        live_project.tracked = fresh_project.tracked
+        live_project.path = fresh_project.path
+        live_project.name = fresh_project.name
+        config.projects[project_key] = live_project
+        for key, value in fresh.projects.items():
+            if key not in config.projects:
+                config.projects[key] = value
+        return _project_to_api(config, project_key, live_project)
 
     fresh_project.tracked = tracked
     fresh.projects[project_key] = fresh_project

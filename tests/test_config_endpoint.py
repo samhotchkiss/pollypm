@@ -731,6 +731,164 @@ def test_env_dsn_with_query_password_is_redacted(
 
 
 # ---------------------------------------------------------------------------
+# libpq keyword DSN redaction (Codex round-3 P0 on PR #2056)
+# ---------------------------------------------------------------------------
+
+
+def test_libpq_dsn_with_password_token_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """libpq keyword DSN with ``password=`` token must be redacted.
+
+    Codex round-3 P0 exact probe: ``PG_CONN = "host=db.example
+    dbname=pollypm user=alice password=secretpw"``. Carrier key
+    ``PG_CONN`` lacks every credential keyword, value isn't URL-shape,
+    and no vendor prefix matches — only the libpq value-shape catches
+    this.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "PG_CONN": "host=db.example dbname=pollypm user=alice password=secretpw",
+        "PUBLIC_FLAG": "ok",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["PG_CONN"] == REDACTED
+    assert env["PUBLIC_FLAG"] == "ok"
+    assert "secretpw" not in response_text(body)
+
+
+def test_libpq_dsn_without_password_token_not_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """libpq DSN with no credential token passes through unchanged.
+
+    Over-redaction would hurt observability — a DSN like
+    ``host=db dbname=x user=alice sslmode=require`` carries no
+    password and should remain visible so operators can read their
+    connection config back.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    safe_dsn = "host=db dbname=x user=alice sslmode=require"
+    config.accounts["codex_primary"].env = {
+        "PG_HOST_CONFIG": safe_dsn,
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["PG_HOST_CONFIG"] == safe_dsn
+
+
+def test_single_key_value_not_treated_as_dsn(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """A single ``key=value`` pair isn't a DSN — must not be redacted.
+
+    The 2-token minimum in ``_value_looks_libpq_dsn`` exists to keep
+    trivial config like ``mode=production`` out of scope. Even though
+    a hypothetical ``password=foo`` *would* match the secret keyword,
+    one token alone shouldn't be treated as a DSN value-shape.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "MODE": "mode=production",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["MODE"] == "mode=production"
+
+
+def test_libpq_dsn_with_quoted_password(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """Quoted-value form (whitespace inside ``password='...'``) redacts.
+
+    libpq allows single-quoted values with embedded whitespace; the
+    tokenizer must still see ``password`` as one of the keyword tokens
+    even when its value contains spaces.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "PG_CONN": "host=db password='se cret pw'",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["PG_CONN"] == REDACTED
+    assert "se cret pw" not in response_text(body)
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI documents the value-shape redaction contract
+# ---------------------------------------------------------------------------
+
+
+def test_openapi_describes_value_shape_redaction() -> None:
+    """``docs/api/openapi.yaml`` /config description mentions
+    value-shape redaction (libpq DSN, URL userinfo) not just the
+    keyword heuristic.
+
+    The redaction contract is security-critical and operator-visible;
+    clients shouldn't have to read the route source to know which
+    shapes get masked.
+    """
+    import yaml
+
+    contract_path = (
+        Path(__file__).resolve().parent.parent
+        / "docs"
+        / "api"
+        / "openapi.yaml"
+    )
+    contract = yaml.safe_load(contract_path.read_text(encoding="utf-8"))
+    description = contract["paths"]["/config"]["get"]["description"].lower()
+    assert "libpq" in description, description
+    assert "userinfo" in description, description
+
+
+# ---------------------------------------------------------------------------
 # Reload-on-edit (Codex round-2 P0 on PR #2056)
 # ---------------------------------------------------------------------------
 

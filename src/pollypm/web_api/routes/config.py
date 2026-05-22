@@ -202,6 +202,51 @@ def _value_looks_credential(value: Any) -> bool:
     return any(pattern.match(value) for pattern in _CREDENTIAL_VALUE_PATTERNS)
 
 
+# libpq keyword DSN credential-bearing field names (lowercase). The
+# libpq docs (https://www.postgresql.org/docs/current/libpq-connect.html)
+# list ``password`` and ``passfile`` as the auth-carrying keywords;
+# common short aliases (``passwd``, ``pwd``) are accepted by some
+# wrappers and tools, so we treat them as DSN secrets too.
+_LIBPQ_SECRET_KEYS: frozenset[str] = frozenset(
+    {"password", "passwd", "pwd", "passfile"},
+)
+
+
+# Matches whitespace-delimited libpq keyword=value tokens. libpq's
+# format is ``<keyword>=<value>`` with the value either bare (no
+# whitespace) or single-quoted (backslash escapes allowed inside). We
+# only need the keyword (group 1) for the secret-name check.
+_LIBPQ_TOKEN_RE = re.compile(
+    r"(?:^|\s)([a-zA-Z_][a-zA-Z_0-9]*)\s*=\s*"
+    r"(?:'(?:[^'\\]|\\.)*'|[^\s'][^\s]*)"
+)
+
+
+def _value_looks_libpq_dsn(value: Any) -> bool:
+    """Return True iff ``value`` parses as a libpq keyword DSN that
+    carries a credential-bearing field (``password`` / ``passwd`` /
+    ``pwd`` / ``passfile``).
+
+    Codex round-3 P0 on PR #2056: ``PG_CONN = "host=db.example
+    dbname=pollypm user=alice password=secretpw"`` is a real libpq
+    connection string but the carrier key ``PG_CONN`` doesn't match
+    ``_looks_secret`` and the value isn't URL-shaped, so the prior
+    redactor leaked the raw password.
+
+    The 2-token minimum prevents false positives on trivial
+    ``key=value`` config (e.g. ``mode=production``). The key-name
+    allowlist keeps the check narrow — DSNs that don't carry password
+    fields (``host=db dbname=x user=alice sslmode=require``) pass
+    through unchanged so observability isn't hurt.
+    """
+    if not isinstance(value, str) or not value or "=" not in value:
+        return False
+    tokens = _LIBPQ_TOKEN_RE.findall(value)
+    if len(tokens) < 2:
+        return False
+    return any(token.lower() in _LIBPQ_SECRET_KEYS for token in tokens)
+
+
 def _coerce_value(value: Any) -> Any:
     """Coerce a single config value into a JSON-friendly shape.
 
@@ -236,6 +281,12 @@ def _coerce_value(value: Any) -> Any:
     # PATs, Slack tokens, …). Backstops env entries whose key names
     # don't include any credential keyword (Codex round-2 P0 on PR #2056).
     if _value_looks_credential(value):
+        return REDACTED
+    # libpq keyword DSNs (whitespace-delimited ``host=… password=…``).
+    # The carrier key (e.g. ``PG_CONN``) need not match ``_looks_secret``
+    # and the value isn't URL-shape, so this is the only check that
+    # catches the format. Codex round-3 P0 on PR #2056.
+    if _value_looks_libpq_dsn(value):
         return REDACTED
     return value
 

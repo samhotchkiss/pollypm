@@ -909,13 +909,32 @@ paths:
       operationId: getConfig
       summary: Read the operator config (secrets redacted)
       description: |
-        Returns the full loaded `PollyPMConfig` as a JSON-safe dict.
-        Every credential-shaped field — anything matching `auth`,
-        `token`, `secret`, `password`, `api_key`, `credential`,
-        `private_key` substrings in its name — is replaced with
-        `"***"` before the response leaves the process. Empty /
-        unset credential fields stay empty (so the operator can
-        distinguish "unset" from "hidden").
+        Returns the loaded `PollyPMConfig` with credential-bearing
+        values redacted to `"***"` before the response leaves the
+        process. Redaction applies on three layers:
+
+        - **Name-substring match (case-insensitive):** any field whose
+          key contains `api_key`, `apikey`, `token`, `secret`,
+          `password`, `passwd`, `pwd`, `auth`, `private_key`,
+          `credential`, `credentials`, `access_key`, `pat`, `dsn`, or
+          `database_url`.
+        - **Value-shape — URL credentials:** values that parse as a
+          URL with userinfo (`scheme://user:pass@host/...`) **or** with
+          credential-bearing query params (`?password=...`,
+          `?token=...`, `?api_key=...`, `?auth=...`, etc.).
+        - **Value-shape — vendor credential prefixes:** AWS access
+          keys (`AKIA…` / `ASIA…`), GitHub personal/OAuth/user/server/
+          refresh tokens (`ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` /
+          `github_pat_…`), and Slack tokens (`xox[abprs]-…`).
+        - **Value-shape — libpq keyword DSNs:** whitespace-delimited
+          connection strings carrying `password=` / `passwd=` / `pwd=`
+          / `passfile=` tokens (e.g.
+          `host=db.example dbname=pollypm user=alice password=secretpw`).
+
+        Empty / unset credential fields stay empty (so the operator
+        can distinguish "unset" from "hidden"). Keep this description
+        in sync with `web_api/routes/config.py` if new shapes are
+        added.
       responses:
         "200":
           description: Redacted config snapshot.

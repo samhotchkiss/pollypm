@@ -464,6 +464,108 @@ def test_apply_fixes_hang_returns_504_within_budget(
     )
 
 
+def test_fix_retry_after_504_returns_busy_while_first_still_running(
+    client, auth_headers, patch_registry, monkeypatch,
+):
+    """After a 504 from a hung fix, an immediate retry must 409, not start a second fix.
+
+    Codex round-4 (PR #2058) flagged: the prior single-flight lock was
+    released in a ``finally`` block, which runs when the HTTP request
+    times out and raises 504 — even though the worker thread is still
+    inside ``apply_fixes`` mutating shared state. A retry within seconds
+    of the 504 would acquire the freshly-released lock and start a
+    *second* concurrent fix on the same filesystem/session/storage.
+
+    Contract: the lock must be held until the worker thread truly
+    terminates. The fix uses ``Future.add_done_callback`` to release the
+    lock when the worker completes; the request's 504 path does not
+    release it.
+
+    This test:
+      1. Stubs ``apply_fixes`` to block on an event well past the request
+         budget so the first POST times out with 504.
+      2. Asserts the first request returns 504 within budget + slack.
+      3. Fires a second POST while the worker is still blocked, asserts
+         it returns 409 ``conflict`` (NOT 504 from a second hang, which
+         is what round-3 would have produced).
+      4. Releases the worker so the suite shuts down cleanly.
+    """
+    import threading
+    import time as _time
+
+    patch_registry([_check("alpha", _fail("alpha", fixable=True))])
+
+    release = threading.Event()
+    in_flight = threading.Event()
+
+    def hanging_apply_fixes(report):  # type: ignore[no-untyped-def]
+        in_flight.set()
+        # Block well past the request budget; the executor abandons this
+        # thread on timeout, but the lock-release callback only fires
+        # when ``release`` is set (after assertions).
+        release.wait(timeout=30.0)
+        return []
+
+    monkeypatch.setattr(doctor_routes, "apply_fixes", hanging_apply_fixes)
+
+    # First request: hangs in apply_fixes past the 1s budget → 504.
+    t0 = _time.monotonic()
+    first = client.post(
+        "/api/v1/doctor/run",
+        headers=auth_headers,
+        json={"check": "alpha", "fix": True},
+        params={"timeout_seconds": 1},
+    )
+    elapsed = _time.monotonic() - t0
+
+    assert first.status_code == 504, (
+        f"expected first request to time out, got {first.status_code}: {first.json()}"
+    )
+    assert elapsed < 5.0, f"504 took {elapsed:.1f}s; should be near 1s budget"
+
+    # Confirm the worker is still inside ``apply_fixes`` — the
+    # in_flight event was set when we entered, and we haven't released
+    # yet. This is the racy window the fix protects.
+    assert in_flight.is_set(), "test setup bug: worker never entered apply_fixes"
+
+    # Second request fired immediately: the worker is still alive
+    # holding shared state, so the route MUST refuse with 409 busy
+    # rather than start a second concurrent fix (which would either
+    # interleave mutations or — pre-fix — also hang for another 1s and
+    # return a second 504).
+    second = client.post(
+        "/api/v1/doctor/run",
+        headers=auth_headers,
+        json={"check": "alpha", "fix": True},
+        params={"timeout_seconds": 1},
+    )
+
+    # Release the leaked worker so the lock-release callback fires
+    # before the next test runs.
+    release.set()
+
+    assert second.status_code == 409, (
+        f"expected 409 busy while first worker still running, "
+        f"got {second.status_code}: {second.json()}. "
+        "This is the round-4 bug: lock was released on 504, allowing "
+        "a second concurrent fix while the first worker was still alive."
+    )
+    body = second.json()
+    assert body["error"]["code"] == "conflict"
+    assert "in progress" in body["error"]["message"].lower()
+
+    # Wait for the worker's done callback to release the lock before the
+    # next test runs (otherwise we leak across the suite).
+    deadline = _time.monotonic() + 5.0
+    while _time.monotonic() < deadline:
+        if doctor_routes._FIX_OPERATION_LOCK.acquire(blocking=False):
+            doctor_routes._FIX_OPERATION_LOCK.release()
+            break
+        _time.sleep(0.05)
+    else:
+        pytest.fail("fix lock not released by done callback within 5s")
+
+
 def test_run_fix_serialized_under_concurrency(
     client, auth_headers, patch_registry, monkeypatch,
 ):

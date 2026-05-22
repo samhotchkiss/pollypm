@@ -161,7 +161,35 @@ _LAST_REPORT: tuple[DoctorReport, float] | None = None
 # interleave the post-fix verify writes (Codex round-1 P0 on PR #2058).
 # Acquired non-blocking — a second concurrent ``fix=true`` returns a
 # typed 409 ``busy`` rather than queueing behind the first.
+#
+# Round-4 (Codex on PR #2058): the lock is released by a
+# :meth:`concurrent.futures.Future.add_done_callback` registered when
+# the fix work is submitted (see :func:`_release_fix_lock_on_done`), not
+# by the HTTP request's ``finally`` block. If the request times out (504)
+# the worker thread is still alive inside ``apply_fixes``; releasing the
+# lock at HTTP-return time would let an immediate retry start a second
+# concurrent fix on shared state.
 _FIX_OPERATION_LOCK = threading.Lock()
+
+
+def _release_fix_lock_on_done(_future: concurrent.futures.Future[Any]) -> None:
+    """Release :data:`_FIX_OPERATION_LOCK` when the fix worker terminates.
+
+    Registered via :meth:`concurrent.futures.Future.add_done_callback`
+    on the fix future. Runs synchronously in whichever thread sets the
+    future's result (the worker thread on normal completion / exception).
+    The lock release MUST NOT raise — if it did, the future's result
+    would be silently corrupted; we defensively swallow + log instead.
+    """
+    try:
+        _FIX_OPERATION_LOCK.release()
+    except RuntimeError:
+        # Lock wasn't held (e.g. test harness already released it). Log
+        # but don't propagate — the done-callback contract forbids
+        # raising.
+        logger.warning(
+            "doctor: _FIX_OPERATION_LOCK already released when fix worker terminated"
+        )
 
 
 def _record_last_report(report: DoctorReport) -> float:
@@ -396,14 +424,28 @@ _DOCTOR_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 _T = TypeVar("_T")
 
 
-def _run_with_budget(
+def _submit_doctor_work(
     fn: Callable[..., _T],
     *args: Any,
+    **kwargs: Any,
+) -> concurrent.futures.Future[_T]:
+    """Submit ``fn`` to the shared doctor executor.
+
+    Factored out of :func:`_run_with_budget` so the ``fix=true`` path
+    in :func:`run_doctor_endpoint` can own the future lifecycle (it
+    needs to attach a lock-release callback that fires when the worker
+    *really* terminates, not when the HTTP request times out).
+    """
+    return _DOCTOR_EXECUTOR.submit(fn, *args, **kwargs)
+
+
+def _await_with_budget(
+    future: concurrent.futures.Future[_T],
+    *,
     budget_s: float,
     name: str | None = None,
-    **kwargs: Any,
 ) -> _T:
-    """Run ``fn(*args, **kwargs)`` under a real wall-clock budget.
+    """Wait on ``future`` for at most ``budget_s`` seconds.
 
     Doctor work (``run_checks`` itself, ``apply_fixes``, the post-fix
     verify rerun) doesn't honor a Python-level timeout — individual
@@ -412,24 +454,18 @@ def _run_with_budget(
     fix on a flaky filesystem) would otherwise hold the request worker
     forever.
 
-    To bound the HTTP request, the callable is dispatched to a shared
-    bounded :class:`concurrent.futures.ThreadPoolExecutor`
-    (:data:`_DOCTOR_EXECUTOR`) and we wait at most ``budget_s`` seconds
-    for the result. On overrun we raise a typed 504 ``timeout``
-    immediately — the worker thread is *not* cancelled (Python stdlib
-    has no safe way to interrupt arbitrary blocking code) and is
-    allowed to finish in the background, eating its slot in the pool
-    until it returns. The HTTP caller sees the 504 within the budget;
-    the leaked thread is the accepted v1 RC tradeoff (Codex round-1 P0
-    on PR #2058). The shared pool bounds the total number of leaks
-    (Codex round-3 P0 on PR #2058).
+    On overrun we raise a typed 504 ``timeout`` immediately — the worker
+    thread is *not* cancelled (Python stdlib has no safe way to interrupt
+    arbitrary blocking code) and is allowed to finish in the background,
+    eating its slot in :data:`_DOCTOR_EXECUTOR` until it returns. The
+    HTTP caller sees the 504 within the budget; the leaked thread is the
+    accepted v1 RC tradeoff (Codex round-1 P0 on PR #2058). The shared
+    pool bounds the total number of leaks (Codex round-3 P0 on PR #2058).
 
-    ``name`` is used purely for the 504 message; the caller (the
-    endpoint) supplies the user-facing check name (or ``None`` for
-    "all checks").
+    ``name`` is used purely for the 504 message; the caller supplies the
+    user-facing check name (or ``None`` for "all checks").
     """
     t0 = time.monotonic()
-    future = _DOCTOR_EXECUTOR.submit(fn, *args, **kwargs)
     try:
         result = future.result(timeout=budget_s)
     except concurrent.futures.TimeoutError:
@@ -447,6 +483,23 @@ def _run_with_budget(
         # surface 504 so the caller sees a consistent contract.
         raise _check_timeout(name, elapsed)
     return result
+
+
+def _run_with_budget(
+    fn: Callable[..., _T],
+    *args: Any,
+    budget_s: float,
+    name: str | None = None,
+    **kwargs: Any,
+) -> _T:
+    """Submit ``fn`` to the doctor pool and await it under ``budget_s``.
+
+    Convenience wrapper for callers that don't need to own the future
+    (the ``fix=false`` path). The ``fix=true`` path submits + awaits
+    explicitly so it can attach a lock-release callback to the future.
+    """
+    future = _submit_doctor_work(fn, *args, **kwargs)
+    return _await_with_budget(future, budget_s=budget_s, name=name)
 
 
 def _run_full_fix_under_budget(
@@ -614,44 +667,55 @@ def run_doctor_endpoint(
 
     selected = _select_checks(payload.check)
 
-    # Single-flight gate for ``fix=true``. Acquire non-blocking so a
-    # second concurrent caller returns 409 immediately rather than
-    # queueing behind the in-flight fix. ``fix=false`` is read-only
-    # for our purposes (each check has its own internal locks) and
-    # is allowed to overlap.
-    fix_lock_held = False
+    fixes_applied: list[dict[str, Any]] = []
     if payload.fix:
-        fix_lock_held = _FIX_OPERATION_LOCK.acquire(blocking=False)
-        if not fix_lock_held:
+        # Single-flight gate for ``fix=true``. Acquire non-blocking so a
+        # second concurrent caller returns 409 immediately rather than
+        # queueing behind the in-flight fix. ``fix=false`` is read-only
+        # for our purposes (each check has its own internal locks) and
+        # is allowed to overlap.
+        if not _FIX_OPERATION_LOCK.acquire(blocking=False):
             raise _fix_busy_error()
 
-    fixes_applied: list[dict[str, Any]] = []
-    try:
-        if payload.fix:
-            # Round-3 (Codex on PR #2058): the entire run+apply+verify
-            # sequence is wrapped in one budget so a hanging
-            # ``apply_fixes`` can't escape the timeout contract. The
-            # post-fix verify rerun shares the same wall-clock budget;
-            # if apply_fixes itself consumes the budget, the future
-            # times out before verify even starts and we surface 504.
-            report, fixes_applied = _run_with_budget(
-                _run_full_fix_under_budget,
-                selected,
-                budget_s=timeout_seconds,
-                name=payload.check,
-            )
-        else:
-            report = _run_with_budget(
-                run_checks,
-                selected,
-                budget_s=timeout_seconds,
-                name=payload.check,
-            )
+        # Round-4 (Codex on PR #2058): the lock MUST be held until the
+        # worker thread truly terminates, not just until the HTTP request
+        # returns. The prior implementation released in a ``finally``
+        # block, which ran on the 504 timeout path even though the worker
+        # thread was still alive inside ``apply_fixes`` mutating shared
+        # state. A retry within seconds of the 504 would acquire the lock
+        # and start a *second* concurrent fix.
+        #
+        # The fix: submit the work ourselves, attach an
+        # ``add_done_callback`` that releases the lock when the worker
+        # really finishes, and DO NOT release the lock on any code path
+        # in this function — the callback owns the release.
+        #
+        # ``add_done_callback`` runs synchronously if the future is
+        # already done at registration time; otherwise it runs in the
+        # worker thread once the result is set. Either way, the lock is
+        # released exactly once when the work is truly complete.
+        future = _submit_doctor_work(_run_full_fix_under_budget, selected)
+        future.add_done_callback(_release_fix_lock_on_done)
+        # Round-3 (Codex on PR #2058): the entire run+apply+verify
+        # sequence is wrapped in one budget so a hanging
+        # ``apply_fixes`` can't escape the timeout contract. The
+        # post-fix verify rerun shares the same wall-clock budget;
+        # if apply_fixes itself consumes the budget, the future
+        # times out before verify even starts and we surface 504.
+        report, fixes_applied = _await_with_budget(
+            future,
+            budget_s=timeout_seconds,
+            name=payload.check,
+        )
+    else:
+        report = _run_with_budget(
+            run_checks,
+            selected,
+            budget_s=timeout_seconds,
+            name=payload.check,
+        )
 
-        generated_at = _record_last_report(report)
-    finally:
-        if fix_lock_held:
-            _FIX_OPERATION_LOCK.release()
+    generated_at = _record_last_report(report)
     base = _build_report_response(report, generated_at=generated_at)
     return DoctorRunResponse(
         generated_at=base.generated_at,

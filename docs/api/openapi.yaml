@@ -1062,10 +1062,10 @@ paths:
         transition fires). Spec §5.3 leaves `null ⇒ unassign` open;
         this endpoint requires a non-empty `actor`. The breadcrumb is
         attributed to `"api"` (the HTTP layer is the operator). Use
-        this endpoint for real worker handoffs so the new owner can
-        recover context via `pm task get`; the low-level
-        `PATCH /tasks/{project}/{n}` with `assignee` writes the column
-        without the breadcrumb and is for operator bookkeeping only.
+        this endpoint to change a task's assignee. PATCH
+        /tasks/{p}/{n} does NOT accept the assignee field — for
+        low-level updates without a handoff breadcrumb, use the work
+        service directly via the CLI.
 
         `Idempotency-Key` and `If-Match` are intentionally NOT
         accepted — no replay cache or version-token enforcement
@@ -1078,7 +1078,12 @@ paths:
               $ref: "#/components/schemas/TaskReassignRequest"
       responses:
         "200":
-          description: Assignee updated; rest of the task unchanged.
+          description: |
+            200 OK with hydrated TaskDetail including the new context
+            entry (entry_type='reassignment') with body like
+            `worker reassigned from <old> to <new>`. The assignee
+            column is updated and the breadcrumb is appended in a
+            single atomic transaction.
           content:
             application/json:
               schema:

@@ -399,6 +399,43 @@ def test_archive_documents_409_session_reference_conflict() -> None:
     )
 
 
+def test_reassign_docs_dont_suggest_patch_assignee() -> None:
+    """Pin out the stale PATCH-assignee guidance on the reassign endpoint.
+
+    Round 7 (Codex) on #2064 flagged that the reassign endpoint
+    description in ``docs/api/openapi.yaml`` told clients to use
+    ``PATCH /tasks/{project}/{n}`` with ``assignee`` for low-level
+    bookkeeping. ``TaskPatchRequest`` only accepts ``labels``,
+    ``status``, and ``metadata`` (and now forbids extras), so a client
+    following that prose would get a 422 instead of an assignee
+    update. The description was rewritten to make clear that PATCH
+    does NOT accept ``assignee`` and that low-level updates must go
+    through the work service directly via the CLI.
+
+    This test fails if anyone re-introduces the PATCH-assignee
+    suggestion into the reassign description.
+    """
+    contract = _load_contract()
+    reassign_op = (
+        contract["paths"]["/tasks/{project}/{n}/reassign"]["post"]
+    )
+    description = reassign_op["description"]
+    lowered = description.lower()
+    assert "does not accept the assignee" in lowered, (
+        "Reassign description must explicitly tell clients that "
+        "PATCH /tasks/{p}/{n} does NOT accept ``assignee`` "
+        "(#2064 round-7). Got: " + description
+    )
+    # The old guidance variant — pin it out so a doc-sync regression
+    # surfaces here instead of in a generated-client bug report.
+    assert "operator bookkeeping" not in lowered, (
+        "Reassign description reverted to the old PATCH-assignee "
+        "guidance (``... is for operator bookkeeping only``). PATCH "
+        "/tasks/{p}/{n} rejects ``assignee`` with 422 — see "
+        "TaskPatchRequest in src/pollypm/web_api/models.py."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

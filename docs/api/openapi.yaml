@@ -2234,7 +2234,10 @@ components:
           type: string
           description: |
             Optional operator-supplied reason for archiving; recorded
-            as a context note before the state transition.
+            as a best-effort context note AFTER the strict archive
+            transition succeeds. If the transition fails (e.g.
+            concurrent archive, invalid state, backing-store outage),
+            no note is persisted.
 
     InboxSnoozeRequest:
       type: object

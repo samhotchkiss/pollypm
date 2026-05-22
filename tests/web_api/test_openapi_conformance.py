@@ -223,6 +223,45 @@ def test_static_yaml_declares_503_on_inbox_write_paths() -> None:
         )
 
 
+def test_inbox_archive_reason_documented_as_post_transition() -> None:
+    """Pin the reason-note ordering contract.
+
+    Round 4 of #2060 reordered ``archive_inbox_item`` to write the
+    reason note ONLY after ``archive_task(strict=True)`` succeeds, so
+    a losing concurrent archiver no longer leaves a stray
+    ``archive reason:`` note on a task it never archived. Round 7
+    (Codex) caught that ``docs/api/openapi.yaml`` still described the
+    old pre-transition order in the ``InboxArchiveRequest.reason``
+    schema, advertising a contract the implementation no longer
+    honors.
+
+    This test fails if anyone rewrites the schema description back to
+    a pre-transition contract.
+    """
+    contract = _load_contract()
+    description = (
+        contract["components"]["schemas"]["InboxArchiveRequest"]
+        ["properties"]["reason"]["description"]
+    )
+    lowered = description.lower()
+    assert "after" in lowered, (
+        "InboxArchiveRequest.reason description must say the note is "
+        "recorded AFTER the archive transition (#2060 round-4 / "
+        "round-7). Got: " + description
+    )
+    assert "transition" in lowered, (
+        "InboxArchiveRequest.reason description must reference the "
+        "archive transition explicitly so the ordering contract is "
+        "unambiguous. Got: " + description
+    )
+    assert "before the state transition" not in lowered, (
+        "InboxArchiveRequest.reason description reverted to the old "
+        "pre-transition contract. The implementation writes the note "
+        "AFTER archive_task(strict=True) succeeds — see "
+        "src/pollypm/web_api/service.py archive_inbox_item."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

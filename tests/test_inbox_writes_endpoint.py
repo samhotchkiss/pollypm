@@ -756,6 +756,11 @@ def test_snooze_writer_persists_structured_until_iso_marker(
         task_number = 1
         title = "Inbox item"
         description = "body"
+        # Membership guard (#2060 round-3) requires chat-flow OR
+        # plan-review label; the snooze writer rejects with 404
+        # otherwise.
+        flow_template_id = "chat"
+        labels: list[str] = []
 
     captured: dict[str, object] = {}
 
@@ -947,3 +952,202 @@ def test_shared_snooze_predicate_lives_in_work_module() -> None:
     assert inbox_snooze.parse_snooze_until(
         f"until_iso={future}"
     ) is not None
+
+
+# ---------------------------------------------------------------------------
+# Inbox membership guard (#2060 round-3, blocker 1)
+#
+# Round-2 left every write helper probing ``svc.get(...)`` alone before
+# mutating. That returns ANY task with the id, not just inbox rows —
+# so a caller could POST /inbox/<id>/{archive,snooze,reply,mark-read,
+# promote-to-task} against a plain-task flow row and close / mutate
+# it via this endpoint even though GET /inbox would 404 the same id.
+# The fix is a small ``_is_inbox_member`` predicate (chat-flow OR
+# plan-review label / flow, matching ``_task_to_inbox_item``) that
+# every write helper consults right after the existence probe and
+# raises ``not_found`` for non-members. These tests pin the gate so
+# a refactor can't drop it silently. Codex round-3 explicitly named
+# archive + snooze; we cover all five for symmetry.
+# ---------------------------------------------------------------------------
+
+
+class _NonInboxStubTask:
+    """Pretends to be a regular work task (not chat / not plan_review)."""
+
+    task_id = "myproj/1"
+    project = "myproj"
+    task_number = 1
+    title = "Regular work task"
+    description = "not an inbox row"
+    flow_template_id = "standard"  # NOT 'chat'
+    labels: list[str] = []  # NO plan_review label
+
+    @property
+    def work_status(self):  # noqa: D401
+        from pollypm.work.models import WorkStatus
+        return WorkStatus.IN_PROGRESS
+
+
+class _MembershipRecordingSvc:
+    """Records whether any mutating method was called.
+
+    Membership guard must reject the request BEFORE any of these run.
+    Each ``raise AssertionError`` would surface in pytest if the
+    write helper slipped past the guard.
+    """
+
+    def __init__(self) -> None:
+        self.archive_calls = 0
+        self.add_context_calls = 0
+        self.add_reply_calls = 0
+        self.mark_read_calls = 0
+        self.create_calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, item_id):
+        return _NonInboxStubTask()
+
+    def archive_task(self, *a, **kw):
+        self.archive_calls += 1
+        raise AssertionError(
+            "membership guard must block archive_task on a non-inbox row"
+        )
+
+    def add_context(self, *a, **kw):
+        self.add_context_calls += 1
+        raise AssertionError(
+            "membership guard must block add_context on a non-inbox row"
+        )
+
+    def add_reply(self, *a, **kw):
+        self.add_reply_calls += 1
+        raise AssertionError(
+            "membership guard must block add_reply on a non-inbox row"
+        )
+
+    def mark_read(self, *a, **kw):
+        self.mark_read_calls += 1
+        raise AssertionError(
+            "membership guard must block mark_read on a non-inbox row"
+        )
+
+    def create(self, *a, **kw):
+        self.create_calls += 1
+        raise AssertionError(
+            "membership guard must block create on a non-inbox row"
+        )
+
+
+def _install_membership_stub(monkeypatch) -> _MembershipRecordingSvc:
+    """Patch ``create_work_service`` to return the recording stub."""
+    svc = _MembershipRecordingSvc()
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+    return svc
+
+
+def test_archive_rejects_non_inbox_task(config, monkeypatch) -> None:
+    """``POST /inbox/<id>/archive`` on a non-inbox row must 404 cleanly."""
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    svc = _install_membership_stub(monkeypatch)
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(config, "myproj/1", reason="oops")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    # Critical: NEITHER the canonical archive transition NOR the
+    # archive-reason context note ran. The stub asserts on either.
+    assert svc.archive_calls == 0
+    assert svc.add_context_calls == 0
+
+
+def test_snooze_rejects_non_inbox_task(config, monkeypatch) -> None:
+    """``POST /inbox/<id>/snooze`` on a non-inbox row must 404 cleanly."""
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    svc = _install_membership_stub(monkeypatch)
+    with pytest.raises(APIError) as excinfo:
+        web_service.snooze_inbox_item(
+            config, "myproj/1", duration_seconds=3600,
+        )
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    # Snooze-row write (entry_type='snooze') must not be persisted.
+    assert svc.add_context_calls == 0
+
+
+def test_mark_read_rejects_non_inbox_task(config, monkeypatch) -> None:
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    svc = _install_membership_stub(monkeypatch)
+    with pytest.raises(APIError) as excinfo:
+        web_service.mark_read_inbox_item(config, "myproj/1")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.mark_read_calls == 0
+
+
+def test_reply_rejects_non_inbox_task(config, monkeypatch) -> None:
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    svc = _install_membership_stub(monkeypatch)
+    with pytest.raises(APIError) as excinfo:
+        web_service.reply_inbox_item(config, "myproj/1", body="ping")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.add_reply_calls == 0
+
+
+def test_promote_rejects_non_inbox_task(config, monkeypatch) -> None:
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    svc = _install_membership_stub(monkeypatch)
+    with pytest.raises(APIError) as excinfo:
+        web_service.promote_inbox_to_task(config, "myproj/1")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    # Most damaging side effect: a derived task gets created.
+    assert svc.create_calls == 0
+
+
+def test_membership_helper_accepts_chat_and_plan_review() -> None:
+    """Sanity-check the predicate's positive cases so the guard
+    can't silently reject everything (which would also "pass" the
+    rejection tests above)."""
+    from pollypm.web_api.service import _is_inbox_member
+
+    class _Chat:
+        flow_template_id = "chat"
+        labels: list[str] = []
+
+    class _PlanReviewLabel:
+        flow_template_id = "standard"
+        labels = ["plan_review"]
+
+    class _PlanReviewFlow:
+        flow_template_id = "plan_review_flow"
+        labels: list[str] = []
+
+    class _NonInbox:
+        flow_template_id = "standard"
+        labels: list[str] = []
+
+    assert _is_inbox_member(_Chat()) is True
+    assert _is_inbox_member(_PlanReviewLabel()) is True
+    assert _is_inbox_member(_PlanReviewFlow()) is True
+    assert _is_inbox_member(_NonInbox()) is False

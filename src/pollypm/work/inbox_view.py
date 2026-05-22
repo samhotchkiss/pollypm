@@ -20,8 +20,10 @@ autoreview), then by priority descending, then by ``updated_at`` descending.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Iterable, Protocol
 
+from pollypm.work.inbox_snooze import is_snooze_active
 from pollypm.work.models import (
     ActorType,
     FlowTemplate,
@@ -182,15 +184,82 @@ def is_inbox_task(
 # ---------------------------------------------------------------------------
 
 
+def _filter_active_snoozes(
+    service, tasks: list[Task], *, now: datetime | None = None,
+) -> list[Task]:
+    """Drop tasks whose latest snooze marker is still in the future.
+
+    The HTTP ``GET /api/v1/inbox`` surface already filters snoozed
+    items via :func:`pollypm.web_api.service._active_snoozed_ids` (uses
+    :meth:`PgWorkService.latest_snoozes_bulk` + the shared
+    :func:`pollypm.work.inbox_snooze.is_snooze_active` predicate). The
+    cockpit / dashboard / rail path went through
+    :func:`inbox_tasks` and never consulted snooze state, so a row
+    snoozed via the API would vanish from ``/api/v1/inbox`` while
+    still showing up in the cockpit inbox panel and dashboard count.
+    Codex round-3 blocker #2 on #2060 — fix is to share the same
+    membership + snooze predicate here so every surface agrees.
+
+    Pg path uses the bulk SQL when available; degrades gracefully
+    (no filter) when neither the bulk helper nor ``get_context`` is
+    on the service. Callers using a mock ``_FakeService`` without
+    snooze state see no behavioural change.
+    """
+    if not tasks:
+        return tasks
+    reference = now if now is not None else datetime.now(timezone.utc)
+    bulk = getattr(service, "latest_snoozes_bulk", None)
+    snoozed: set[str] = set()
+    if callable(bulk):
+        try:
+            keys = [(t.project, t.task_number) for t in tasks]
+            latest = bulk(keys)
+        except Exception:  # noqa: BLE001 — readonly view degrades open
+            latest = None
+        if latest is not None:
+            for task in tasks:
+                entry = latest.get((task.project, task.task_number))
+                if entry is None:
+                    continue
+                if is_snooze_active(getattr(entry, "text", "") or "", now=reference):
+                    snoozed.add(task.task_id)
+            if snoozed:
+                return [t for t in tasks if t.task_id not in snoozed]
+            return tasks
+    # Fallback: per-task ``get_context`` loop. Kept for mock services
+    # (test fakes) and backends without the bulk helper. Pg always has
+    # the bulk helper so this branch should not run in production.
+    get_context = getattr(service, "get_context", None)
+    if not callable(get_context):
+        return tasks
+    for task in tasks:
+        try:
+            entries = get_context(task.task_id, entry_type="snooze", limit=1)
+        except Exception:  # noqa: BLE001 — readonly view degrades open
+            continue
+        if not entries:
+            continue
+        text = getattr(entries[0], "text", "") or ""
+        if is_snooze_active(text, now=reference):
+            snoozed.add(task.task_id)
+    if snoozed:
+        return [t for t in tasks if t.task_id not in snoozed]
+    return tasks
+
+
 def inbox_tasks(
     service,
     *,
     project: str | None = None,
+    now: datetime | None = None,
 ) -> list[Task]:
     """Return all inbox tasks, sorted user-review first within review rows.
 
     ``service`` must satisfy the WorkService protocol. In particular it must
     provide ``list_tasks(project=...)`` and ``get_flow(name, project=...)``.
+    Snoozed rows (latest ``entry_type='snooze'`` context whose wake
+    time is still in the future) are filtered out so the cockpit
+    inbox panel agrees with ``GET /api/v1/inbox`` (#2060 round-3).
     """
     list_nonterminal = getattr(service, "list_nonterminal_tasks", None)
     if callable(list_nonterminal):
@@ -213,6 +282,7 @@ def inbox_tasks(
         task for task in candidates
         if is_inbox_task(task, service, flow_cache=flow_cache)
     ]
+    matches = _filter_active_snoozes(service, matches, now=now)
     # Stable-sort twice so both keys descend: updated_at first (least
     # significant), priority second, then review owner split for rows in review.
     matches.sort(key=_updated_at_key, reverse=True)

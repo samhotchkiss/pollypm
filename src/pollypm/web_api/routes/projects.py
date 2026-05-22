@@ -229,6 +229,14 @@ def resume_project_endpoint(
     responses={
         "401": {"description": "Missing or invalid bearer token."},
         "404": {"description": "Project not registered."},
+        "409": {
+            "description": (
+                "Project is still referenced by one or more enabled "
+                "sessions; the response body names the blocking sessions "
+                "in ``error.message``. Disable or remove those sessions "
+                "before retrying."
+            )
+        },
         "503": {"description": "Backing store unreachable (failed to persist)."},
     },
 )

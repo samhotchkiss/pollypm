@@ -998,3 +998,267 @@ def test_archive_surfaces_concurrent_external_project_addition(
         "archive — Codex round-3 regression."
     )
     assert "myproj" not in keys
+
+
+# ---------------------------------------------------------------------------
+# Codex round 4 on PR #2063 — rollback on the cached load_config path.
+#
+# Round 1 added a rollback regression but constructed the live config by hand
+# (i.e. NOT via ``load_config``) so the cached-singleton aliasing never came
+# into play. Codex round 4 reproduced the bug against the production path:
+# ``pm serve`` builds ``ConfigDep`` via ``load_config(config_path)``, and
+# ``set_project_tracked`` then calls ``load_config(config_path)`` AGAIN — but
+# ``load_config`` memoises by path, so the "fresh" snapshot is literally the
+# same Python object as the live ``ConfigDep``. Mutating
+# ``fresh.projects[key].tracked`` before ``write_config`` therefore flipped
+# the live snapshot too; if the write then raised, the API returned 503 but
+# subsequent GETs returned the flipped (stale-lie) value.
+#
+# Fix: deep-copy the loaded snapshot before mutating it; live ``ConfigDep``
+# is only touched via ``_refresh_live_projects`` AFTER the write succeeds.
+# Archive has the analogous bug through the ``remove_project`` facade
+# (``del config.projects[key]`` on the cached object before ``write_config``);
+# the service-level fix snapshots the live entry and restores it on OSError.
+# ---------------------------------------------------------------------------
+
+
+def test_pause_rolls_back_with_real_load_config_cache(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 4: rollback must hold when live config came via load_config.
+
+    Reproduce the production path exactly:
+
+    * write a seed config to disk,
+    * call ``load_config(config_path)`` to get the LIVE snapshot (which
+      enters the module-level cache),
+    * build the FastAPI app on that live snapshot,
+    * monkeypatch ``pollypm.config.write_config`` to raise OSError,
+    * POST ``/pause``.
+
+    Expect 503, AND the live snapshot's ``tracked`` MUST stay True, AND
+    a follow-up ``load_config(config_path)`` (cache hit — same object)
+    MUST also stay True. Pre-fix the live snapshot flipped to False
+    because ``fresh = load_config(...)`` returned the very same object
+    we'd handed to FastAPI.
+    """
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+        load_config,
+        write_config,
+    )
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "myproj": KnownProject(
+                key="myproj",
+                path=project_root,
+                name="My Project",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    # CRITICAL: build the live snapshot via load_config so the API and the
+    # service helper share the SAME cached object (production path).
+    live = load_config(config_path)
+    assert live.projects["myproj"].tracked is True
+
+    token_path = tmp_path / "api-token"
+    value, _ = ensure_token(token_path)
+    app = create_app(config=live, token_path=token_path)
+    client_ = TestClient(app)
+    headers = {"Authorization": f"Bearer {value}"}
+
+    # Sanity: a second load_config returns the EXACT same object (cache
+    # hit). This is what would have made the original mutate-then-write
+    # bug undetectable in the hand-built-config rollback test.
+    assert load_config(config_path) is live, (
+        "load_config did not return the cached object; this test's "
+        "assumptions about the cached-singleton path are invalid."
+    )
+
+    def _fail_write_config(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise OSError("simulated disk-full during config persist")
+
+    monkeypatch.setattr("pollypm.config.write_config", _fail_write_config)
+
+    response = client_.post(
+        "/api/v1/projects/myproj/pause",
+        headers=headers,
+        json={"reason": "round-4 cached-config rollback"},
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "service_unavailable"
+
+    # Live snapshot MUST stay True — this is the round-4 invariant.
+    assert live.projects["myproj"].tracked is True, (
+        "Live ConfigDep flipped to False on a failed write — Codex "
+        "round-4 regression (deep-copy of the cached load_config "
+        "snapshot is missing)."
+    )
+
+    # Cache-hit reload MUST also stay True (same object as ``live``).
+    cached_again = load_config(config_path)
+    assert cached_again.projects["myproj"].tracked is True
+
+    # And a subsequent GET reflects the unchanged value (no stale lie).
+    get_response = client_.get("/api/v1/projects/myproj", headers=headers)
+    assert get_response.status_code == 200
+    assert get_response.json()["tracked"] is True
+
+
+def test_archive_rolls_back_with_real_load_config_cache(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 4 mirror: archive's rollback on the cached path.
+
+    The ``archive_project`` service helper delegates to
+    ``pollypm.projects.remove_project``, which does
+    ``config = load_config(config_path); del config.projects[key];
+    write_config(...)``. On the cached path the ``del`` mutates the live
+    snapshot BEFORE the write — so a failed write would leave the live
+    config missing the project even though disk still has it. The
+    service-level fix snapshots the live entry and restores it on
+    OSError.
+    """
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+        load_config,
+        write_config,
+    )
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "myproj": KnownProject(
+                key="myproj",
+                path=project_root,
+                name="My Project",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    live = load_config(config_path)
+    assert "myproj" in live.projects
+
+    token_path = tmp_path / "api-token"
+    value, _ = ensure_token(token_path)
+    app = create_app(config=live, token_path=token_path)
+    client_ = TestClient(app)
+    headers = {"Authorization": f"Bearer {value}"}
+
+    def _fail_write_config(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise OSError("simulated disk-full during config persist")
+
+    # Archive routes through ``pollypm.projects.remove_project`` which
+    # does ``from pollypm.config import write_config`` at module load,
+    # so the patched name MUST be the one bound inside
+    # ``pollypm.projects`` — patching ``pollypm.config.write_config``
+    # alone leaves the facade's binding pointing at the real impl.
+    monkeypatch.setattr("pollypm.projects.write_config", _fail_write_config)
+
+    response = client_.post(
+        "/api/v1/projects/myproj/archive",
+        headers=headers,
+        json={"reason": "round-4 archive rollback"},
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "service_unavailable"
+
+    # Live snapshot MUST still hold ``myproj`` — pre-fix it was del'd
+    # by the facade before the write failed.
+    assert "myproj" in live.projects, (
+        "Live ConfigDep lost ``myproj`` on a failed archive write — "
+        "Codex round-4 regression (cached-load_config path: facade's "
+        "in-place del leaked into the live snapshot)."
+    )
+
+    # And a subsequent GET still surfaces the project.
+    get_response = client_.get("/api/v1/projects/myproj", headers=headers)
+    assert get_response.status_code == 200
+    assert get_response.json()["key"] == "myproj"

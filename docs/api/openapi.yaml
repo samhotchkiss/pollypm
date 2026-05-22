@@ -268,6 +268,12 @@ paths:
         the CLI's `pm add-project`. `reason` is persisted to the per-
         project audit log (`projects.archive` event) along with the
         actor and timestamp. Clamped to 500 chars.
+
+        Enforces the session→project invariant: if any enabled session
+        in `config.sessions` still references this project key the
+        request fails with `409 conflict` and `error.message` lists the
+        blocking session names. Disable or remove those sessions
+        (`pm sessions disable <name>`) and retry.
       requestBody:
         required: false
         content:
@@ -285,6 +291,16 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            Project is still referenced by one or more enabled sessions.
+            `error.message` names the blocking sessions; disable or
+            remove them before retrying. Mirrors the CLI guard in
+            `pm projects remove`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 

@@ -450,6 +450,8 @@ def set_project_tracked(
     client can refresh without a follow-up GET (same idiom as the
     task transitions in Phase 2).
     """
+    import copy
+
     from pollypm.config import load_config, write_config
 
     # Bind to the original (in-memory) project up-front so the 404 path
@@ -463,12 +465,25 @@ def set_project_tracked(
     # (e.g. an external ``pm add-project`` that added a new project key
     # the in-memory server hasn't seen yet).
     try:
-        fresh = load_config(config_path)
+        fresh_cached = load_config(config_path)
     except OSError as exc:
         raise service_unavailable(
             f"Failed to reload config for {project_key}: {exc}",
             hint="Check read permissions on the PollyPM config file.",
         ) from exc
+    # ``load_config`` is memoised by ``config_path`` (see
+    # ``pollypm.config._config_cache``) so ``fresh_cached`` IS the same
+    # object as the live ``ConfigDep`` whenever the server was bootstrapped
+    # via ``load_config(config_path)`` — which is exactly what
+    # ``pm serve`` / ``load_api_config`` do in production. Mutating
+    # ``fresh_cached.projects[key].tracked`` would therefore mutate the
+    # live snapshot BEFORE the durable write completes. If write_config
+    # then raises OSError, the API returns 503 but the live config has
+    # already flipped — a rollback violation Codex reproduced on round 4
+    # of #2063. Take a deep copy here so all mutation happens on a
+    # detached graph; the live snapshot is only touched via
+    # ``_refresh_live_projects`` AFTER the disk write succeeds.
+    fresh = copy.deepcopy(fresh_cached)
     fresh_project = fresh.projects.get(project_key)
     if fresh_project is None:
         # Disk-side delete raced us. Treat as 404 — the in-memory state
@@ -489,7 +504,12 @@ def set_project_tracked(
     try:
         write_config(fresh, config_path, force=True)
     except OSError as exc:
-        # Live config untouched — Codex P0 #1 (rollback guarantee).
+        # Live config untouched — Codex P0 #1 (rollback guarantee). The
+        # deep-copy above is what makes this rollback real on the
+        # cached-load_config path: ``fresh`` is a detached graph, so
+        # mutating ``fresh_project.tracked`` never reached the live
+        # ``ConfigDep`` shared with FastAPI request handlers. Codex
+        # round 4 on #2063.
         raise service_unavailable(
             f"Failed to persist project state for {project_key}: {exc}",
             hint="Check write permissions on the PollyPM config file.",
@@ -561,11 +581,23 @@ def archive_project(
     label = live_project.display_label()
     project_path = live_project.path
     config_path = _resolve_config_write_path(config)
+    # Snapshot the live project entry so we can roll back the in-memory
+    # state if ``remove_project`` raises OSError after mutation. The
+    # facade does ``config = load_config(...); del config.projects[key];
+    # write_config(...)`` — and ``load_config`` is memoised by path, so
+    # the dict it mutates IS the live ``ConfigDep`` dict on the
+    # production cached path. A write failure after ``del`` would
+    # otherwise leave the live snapshot missing the project even though
+    # disk still has it (Codex round 4 on #2063, mirror of the
+    # set_project_tracked deep-copy fix above).
+    _live_project_snapshot = config.projects.get(project_key)
     try:
         # ``remove_project`` reloads from disk, enforces the session-ref
         # guard, then writes back — same concurrent-safe pattern as the
         # tracked-toggle path above. Live ``config`` is untouched if the
-        # facade raises.
+        # facade raises ``BadParameter`` (it raises before mutating);
+        # OSError can fire after the in-place delete, so we restore the
+        # snapshot below.
         _remove_project_facade(config_path, project_key)
     except typer.BadParameter as exc:
         msg = str(exc)
@@ -584,6 +616,14 @@ def archive_project(
         # error code.
         raise not_found(msg) from exc
     except OSError as exc:
+        # Roll the live snapshot back if the facade already del'd the
+        # cached entry before the write failed — Codex round 4 on
+        # #2063 (durable-write rollback on the cached config path).
+        if (
+            _live_project_snapshot is not None
+            and project_key not in config.projects
+        ):
+            config.projects[project_key] = _live_project_snapshot
         raise service_unavailable(
             f"Failed to persist archive for {project_key}: {exc}",
             hint="Check write permissions on the PollyPM config file.",

@@ -9,15 +9,38 @@ session-services, tmux, supervisor — without creating import cycles.
 
 from __future__ import annotations
 
+import gzip
 import json
 import logging
 import os
+import shutil
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 logger = logging.getLogger(__name__)
+
+# Rotation defaults — mirrored by :class:`pollypm.models.AuditSettings`.
+# These constants are the fallback when config loading fails so a
+# broken config never turns rotation off by stealth. Operators who
+# want a different policy set ``[audit] rotate_size_mb`` /
+# ``retention_count`` in pollypm.toml; see ``_resolve_rotation_policy``.
+_DEFAULT_ROTATE_SIZE_MB = 50
+_DEFAULT_RETENTION_COUNT = 4
+# Env-var escape hatch for tests + ops debugging. When set to ``"1"``
+# / ``"true"`` rotation is short-circuited even if the config says to
+# rotate. The config ``disable_rotation`` knob is the supported user
+# surface; this env var exists so tests in CI don't have to mutate
+# ``~/.pollypm/pollypm.toml`` to assert non-rotating behaviour.
+_DISABLE_ENV = "POLLYPM_AUDIT_DISABLE_ROTATION"
+# Tests override these via monkeypatch to drive rotation without
+# building 50 MB log files. The resolver below honours
+# ``_test_rotate_size_bytes`` / ``_test_retention_count`` before
+# falling through to config / defaults.
+_test_rotate_size_bytes: int | None = None
+_test_retention_count: int | None = None
 
 # Override for tests + central tail relocation. When set, the central
 # tail goes under ``$POLLYPM_AUDIT_HOME/<project>.jsonl``. The
@@ -388,8 +411,231 @@ def _assert_no_doubled_pollypm(path: Path) -> None:
         )
 
 
+def _resolve_rotation_policy() -> tuple[int, int, bool]:
+    """Return ``(max_bytes, retention_count, disabled)`` for rotation.
+
+    Resolution order:
+
+    1. Test overrides (``_test_rotate_size_bytes`` /
+       ``_test_retention_count``) win so unit tests can drive rotation
+       on tiny files without rewriting ``pollypm.toml``.
+    2. Env var ``POLLYPM_AUDIT_DISABLE_ROTATION`` (``"1"`` / ``"true"``)
+       forces ``disabled=True``. This is the ops-debugging escape hatch
+       that doesn't require editing config.
+    3. Live config ``[audit]`` section — lazy-imported so this module
+       stays import-cycle-safe.
+    4. Module defaults (50 MB / 4 retentions).
+
+    Config-loading failures fall back to defaults rather than crashing
+    the audit write — rotation is hygiene, never load-bearing.
+    """
+    # Test overrides take precedence so a unit test can pin a 1 KB
+    # threshold without disturbing the user's real config.
+    if _test_rotate_size_bytes is not None or _test_retention_count is not None:
+        max_bytes = (
+            int(_test_rotate_size_bytes)
+            if _test_rotate_size_bytes is not None
+            else _DEFAULT_ROTATE_SIZE_MB * 1024 * 1024
+        )
+        retention = (
+            int(_test_retention_count)
+            if _test_retention_count is not None
+            else _DEFAULT_RETENTION_COUNT
+        )
+        env_disabled = os.environ.get(_DISABLE_ENV, "").strip().lower() in ("1", "true", "yes")
+        return max(1, max_bytes), max(0, retention), env_disabled
+
+    env_disabled = os.environ.get(_DISABLE_ENV, "").strip().lower() in ("1", "true", "yes")
+    cfg_size_mb: int | None = None
+    cfg_retention: int | None = None
+    cfg_disabled: bool = False
+    try:
+        from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+
+        config = load_config(Path(DEFAULT_CONFIG_PATH))
+    except Exception:  # noqa: BLE001 — never break audit on config errors
+        config = None
+    if config is not None:
+        try:
+            cfg_size_mb = int(config.audit.rotate_size_mb)
+            cfg_retention = int(config.audit.retention_count)
+            cfg_disabled = bool(config.audit.disable_rotation)
+        except Exception:  # noqa: BLE001
+            cfg_size_mb = None
+            cfg_retention = None
+            cfg_disabled = False
+    size_mb = cfg_size_mb if cfg_size_mb and cfg_size_mb > 0 else _DEFAULT_ROTATE_SIZE_MB
+    retention = (
+        cfg_retention
+        if cfg_retention is not None and cfg_retention >= 0
+        else _DEFAULT_RETENTION_COUNT
+    )
+    return max(1, size_mb * 1024 * 1024), retention, (env_disabled or cfg_disabled)
+
+
+def _prune_old_audit_archives(path: Path, retention_count: int) -> None:
+    """Delete archived ``<path>.<ts>[.bump].gz`` siblings beyond cap.
+
+    Sorts surviving archives by mtime descending so the newest are
+    kept even if a timestamp collision tripped the parser. Errors
+    are silently logged at DEBUG — pruning is hygiene, not critical.
+    """
+    if retention_count < 0:
+        return
+    parent = path.parent
+    prefix = path.name + "."
+    candidates: list[tuple[float, Path]] = []
+    try:
+        for sibling in parent.iterdir():
+            if not sibling.is_file():
+                continue
+            if not sibling.name.startswith(prefix):
+                continue
+            if not sibling.name.endswith(".gz"):
+                continue
+            try:
+                mtime = sibling.stat().st_mtime
+            except OSError:
+                continue
+            candidates.append((mtime, sibling))
+    except OSError:
+        return
+    candidates.sort(key=lambda item: item[0], reverse=True)
+    for _mtime, stale in candidates[retention_count:]:
+        try:
+            stale.unlink()
+        except OSError:
+            logger.debug(
+                "audit.log: prune failed for %s", stale, exc_info=True,
+            )
+
+
+def _maybe_rotate(path: Path) -> None:
+    """Rotate ``path`` if it exceeds the configured size threshold.
+
+    Atomicity strategy:
+
+    1. ``os.rename(audit.jsonl, audit.jsonl.<ts>.rotating)`` — POSIX
+       rename is atomic, so concurrent readers either see the live
+       file at its old name (pre-rename) or no file there (post-
+       rename; ``_append_line`` will recreate on the next call).
+       They never see a half-state.
+    2. Gzip the renamed file into ``audit.jsonl.<ts>.gz.partial``
+       (writing to a sibling tempfile keeps the final ``.gz`` name
+       invisible until the compression finishes).
+    3. Atomic rename ``.gz.partial`` -> ``.gz`` so readers that walk
+       the directory for archived rotations only see complete files.
+    4. Unlink the uncompressed ``.rotating`` rename.
+    5. Prune old ``.gz`` siblings beyond the retention count.
+
+    Best-effort: any OSError is logged at WARNING and rotation skips;
+    the caller still proceeds to ``_append_line`` so the audit write
+    never fails because of housekeeping. If step 1 succeeded but a
+    later step failed we leave the ``.rotating`` rename in place
+    rather than losing the data — a follow-up rotation will find and
+    process it (filename collisions are handled by a bump suffix).
+    """
+    max_bytes, retention, disabled = _resolve_rotation_policy()
+    if disabled:
+        return
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.debug(
+            "audit.log: stat failed for %s during rotation check: %s",
+            path, exc,
+        )
+        return
+    if st.st_size <= max_bytes:
+        return
+
+    # Pick a name that is free for BOTH the in-flight ``.rotating``
+    # rename target AND the final ``.gz`` archive. A second rotation
+    # in the same wall-clock second would otherwise collide on the
+    # ``.gz`` name and ``os.rename(gz_partial, gz_final)`` would
+    # silently overwrite the previous archive (POSIX rename
+    # semantics) — losing the older chunk of events. The bump
+    # suffix keeps the names unique within the second.
+    ts = int(time.time())
+    bump = 0
+    while True:
+        if bump == 0:
+            stem = f".{ts}"
+        else:
+            stem = f".{ts}.{bump}"
+        rotating = path.with_suffix(path.suffix + stem + ".rotating")
+        gz_final = path.with_suffix(path.suffix + stem + ".gz")
+        if not rotating.exists() and not gz_final.exists():
+            break
+        bump += 1
+        if bump > 10_000:
+            # Defensive cap: if we somehow can't find a free name in
+            # 10K bumps within the same second, abort the rotation
+            # rather than spin forever. The append below still fires.
+            logger.warning(
+                "audit.log: rotation name-collision loop exhausted for %s",
+                path,
+            )
+            return
+
+    # Step 1: atomic rename moves the live file out of the way.
+    try:
+        os.rename(path, rotating)
+    except OSError as exc:
+        logger.warning(
+            "audit.log: rotation rename failed for %s: %s", path, exc,
+        )
+        return
+
+    # Steps 2-4: gzip + atomic rename. If anything fails we still
+    # return cleanly so the caller's append fires against a fresh
+    # empty file (the rename above already created that condition).
+    gz_partial = Path(str(gz_final) + ".partial")
+    try:
+        with open(rotating, "rb") as src, gzip.open(gz_partial, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+        os.rename(gz_partial, gz_final)
+        try:
+            rotating.unlink()
+        except OSError:
+            logger.debug(
+                "audit.log: post-gzip unlink failed for %s",
+                rotating, exc_info=True,
+            )
+    except OSError as exc:
+        logger.warning(
+            "audit.log: gzip failed for %s: %s", rotating, exc,
+        )
+        # Clean up the partial gz so a future rotation isn't tripped
+        # by half-written archives. Leave the ``.rotating`` rename in
+        # place — it still holds the data and a future rotation will
+        # find + retry it.
+        try:
+            if gz_partial.exists():
+                gz_partial.unlink()
+        except OSError:
+            pass
+
+    # Step 5: prune old archives. Best-effort, isolated from rotation.
+    try:
+        _prune_old_audit_archives(path, retention)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.log: prune sweep failed for %s",
+            path, exc_info=True,
+        )
+
+
 def _append_line(path: Path, line: str) -> None:
     """Append a single line to ``path``, creating parents as needed.
+
+    Fires rotation (``_maybe_rotate``) *before* the append so the
+    append always lands in a file that is under the size threshold.
+    Rotation failures are swallowed inside ``_maybe_rotate`` — the
+    append fires unconditionally so a housekeeping bug can never
+    cause audit data loss.
 
     Uses POSIX append-mode (``"a"``) so concurrent writers from
     multiple processes interleave at the line level — provided the
@@ -400,6 +646,17 @@ def _append_line(path: Path, line: str) -> None:
     """
     _assert_no_doubled_pollypm(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    # Rotate first so the impending append starts a fresh file when
+    # we cross the threshold. Wrap in a broad try because nothing
+    # about rotation should ever prevent an audit write — that is
+    # the central guarantee of this module.
+    try:
+        _maybe_rotate(path)
+    except Exception:  # noqa: BLE001 — never block audit on housekeeping
+        logger.debug(
+            "audit.log: _maybe_rotate raised unexpectedly for %s",
+            path, exc_info=True,
+        )
     # Newline added here so the encoded record stays a single
     # JSON object on its own line.
     with open(path, "a", encoding="utf-8") as fh:
@@ -521,27 +778,99 @@ def _iter_log_lines(path: Path) -> Iterable[dict[str, Any]]:
     mid-write) can leave a truncated final line. Skip those rather
     than crashing the reader — the heartbeat must keep working
     even when the log has a junk tail.
+
+    Routes ``.gz`` archives through :func:`gzip.open` in text mode so
+    callers walking a rotation chain (live ``.jsonl`` + ``.gz``
+    siblings) get the same line-iteration shape regardless of file
+    format. See :func:`_walk_log_chain` for the chain producer.
     """
     if not path.exists():
         return
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                stripped = line.strip()
-                if not stripped:
-                    continue
-                try:
-                    obj = json.loads(stripped)
-                except json.JSONDecodeError:
-                    # Truncated / corrupt line — skip silently. We
-                    # do not log here because a single bad tail line
-                    # would otherwise spam the error log on every
-                    # heartbeat tick.
-                    continue
-                if isinstance(obj, dict):
-                    yield obj
+        if path.suffix == ".gz":
+            fh = gzip.open(path, "rt", encoding="utf-8")
+        else:
+            fh = open(path, "r", encoding="utf-8")
     except OSError as exc:
         logger.warning("audit.read: open failed for %s: %s", path, exc)
+        return
+    try:
+        for line in fh:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                obj = json.loads(stripped)
+            except json.JSONDecodeError:
+                # Truncated / corrupt line — skip silently. We
+                # do not log here because a single bad tail line
+                # would otherwise spam the error log on every
+                # heartbeat tick.
+                continue
+            if isinstance(obj, dict):
+                yield obj
+    except OSError as exc:
+        logger.warning("audit.read: read failed for %s: %s", path, exc)
+    finally:
+        try:
+            fh.close()
+        except Exception:  # noqa: BLE001 — close-time errors are noise
+            pass
+
+
+def _archive_sort_key(path: Path) -> tuple[float, str]:
+    """Sort key for ``audit.jsonl.<ts>[.bump].gz`` archives.
+
+    We want newest-first iteration. Use mtime as primary because the
+    rotation timestamp is embedded in the filename but tests + edge
+    cases can leave clock-skew; fall back to filename for stable
+    ordering within the same mtime second.
+
+    Mirrors the helper in ``pollypm.cli_features.audit`` (PR #2036).
+    Duplicated rather than imported because that module pulls in
+    typer and would create an import cycle from this stdlib-only
+    audit primitive.
+    """
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    return (mtime, path.name)
+
+
+def _walk_log_chain(live: Path) -> Iterable[Path]:
+    """Yield ``live`` first, then ``live.<ts>[.bump].gz`` archives newest-first.
+
+    Yields only paths that exist. Used by :func:`read_events` so
+    rotation never hides events from consumers (#2032 codex blocker):
+    once ``_maybe_rotate`` moves ``audit.jsonl`` into ``audit.jsonl.<ts>.gz``
+    the rotated chunk must remain visible to the watchdog dedupe
+    window, SSE, morning briefing, and doctor checks — otherwise a
+    rotation would silently allow duplicate escalation dispatches.
+
+    Mirrors the helper in ``pollypm.cli_features.audit`` (PR #2036).
+    """
+    if live.exists():
+        yield live
+    parent = live.parent
+    if not parent.exists():
+        return
+    prefix = live.name + "."
+    archives: list[Path] = []
+    try:
+        for sibling in parent.iterdir():
+            if not sibling.is_file():
+                continue
+            if not sibling.name.startswith(prefix):
+                continue
+            if not sibling.name.endswith(".gz"):
+                continue
+            archives.append(sibling)
+    except OSError:
+        return
+    archives.sort(key=_archive_sort_key, reverse=True)
+    for archive in archives:
+        yield archive
 
 
 def read_events(
@@ -557,10 +886,20 @@ def read_events(
     Source preference:
 
     1. If ``project_path`` is provided AND the per-project log
-       exists, read from there. This is the source of truth and
-       carries events from before any central-tail rotation.
+       exists, read from there + walk its rotated ``.gz`` siblings.
+       This is the source of truth and carries events from before
+       any central-tail rotation.
     2. Otherwise read from the central tail at
-       ``~/.pollypm/audit/<project>.jsonl``.
+       ``~/.pollypm/audit/<project>.jsonl`` + its rotated ``.gz``
+       siblings.
+
+    Rotation visibility (#2032 codex blocker): each source above is a
+    *chain* — live ``.jsonl`` first, then ``.gz`` archives newest-
+    first. Once a rotation moves recent events into a ``.gz``, those
+    rows must still satisfy ``read_events(..., since=..., event=...)``
+    queries. The watchdog dedupe window depends on this: if the prior
+    ``watchdog.escalation_dispatched`` row disappears after rotation
+    the next tick would dispatch a duplicate.
 
     Filters apply in order:
 
@@ -575,15 +914,22 @@ def read_events(
     chatty project lands in the low thousands per day — so loading
     fully into memory is fine.
     """
-    paths_to_try: list[Path] = []
     per_project = project_log_path(project_path)
     if per_project is not None and per_project.exists():
-        paths_to_try.append(per_project)
+        live = per_project
     else:
-        paths_to_try.append(central_log_path(project))
+        live = central_log_path(project)
 
-    events: list[AuditEvent] = []
-    for path in paths_to_try:
+    # ``_walk_log_chain`` yields live first then archives newest-first.
+    # Each file is a chronological run of records (older-first within
+    # the file), so the cross-file order is:
+    #   live (oldest→newest in live), then archive_N (newest archive),
+    #   then archive_N-1, ... archive_1 (oldest archive).
+    # We collect per-file then reverse the inter-file order so the
+    # final list is globally chronological (oldest→newest).
+    per_file: list[list[AuditEvent]] = []
+    for path in _walk_log_chain(live):
+        bucket: list[AuditEvent] = []
         for obj in _iter_log_lines(path):
             if event is not None and obj.get("event") != event:
                 continue
@@ -597,10 +943,21 @@ def read_events(
             # mutation hooks).
             if obj.get("project") and obj.get("project") != project:
                 continue
-            events.append(AuditEvent.from_dict(obj))
-        # Once we've found a real source, don't fall through.
-        if events:
-            break
+            bucket.append(AuditEvent.from_dict(obj))
+        per_file.append(bucket)
+
+    # Inter-file order from walker: [live, newest_gz, ..., oldest_gz].
+    # Chronological (oldest→newest) is the reverse: [oldest_gz, ...,
+    # newest_gz, live]. Within each file, records are already in
+    # write-order (oldest→newest).
+    events: list[AuditEvent] = []
+    for bucket in reversed(per_file):
+        events.extend(bucket)
+
+    # Re-sort by ts to defend against clock-skew between rotations
+    # (the walker uses mtime which is approximate, but ts is the
+    # actual write time). ISO-8601 UTC sorts lexicographically.
+    events.sort(key=lambda e: e.ts)
 
     if limit is not None and limit >= 0:
         return events[-limit:]

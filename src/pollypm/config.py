@@ -7,6 +7,7 @@ from pathlib import Path
 
 from pollypm.models import (
     AccountConfig,
+    AuditSettings,
     EmbeddingScoreWeights,
     EmbeddingSettings,
     EventsRetentionSettings,
@@ -505,6 +506,53 @@ def _parse_logging_settings(raw: dict[str, object]) -> LoggingSettings:
     return LoggingSettings(rotate_size_mb=size_mb, rotate_keep=keep)
 
 
+def _parse_audit_settings(raw: dict[str, object]) -> AuditSettings:
+    """Parse the ``[audit]`` TOML section for audit-log rotation tuning.
+
+    Recognised keys:
+
+    * ``rotate_size_mb`` (int, default 50) — live ``audit.jsonl`` is
+      rotated when it exceeds this many megabytes. Values below 1 are
+      coerced to the default so a fat-fingered config can never
+      disable rotation by stealth (use ``disable_rotation`` for that).
+    * ``retention_count`` (int, default 4) — number of gzipped
+      rotations to retain per audit file. ``0`` is allowed (rotate +
+      immediately delete all archives), negative values fall back.
+    * ``disable_rotation`` (bool, default false) — operator escape
+      hatch; when true the rotation check short-circuits.
+
+    Fat-fingered values (non-int, negative) fall back to defaults so a
+    malformed config never silently breaks rotation. Missing section
+    yields defaults. See :class:`pollypm.models.AuditSettings`.
+    """
+    audit_raw = raw.get("audit", {})
+    if not isinstance(audit_raw, dict):
+        return AuditSettings()
+    defaults = AuditSettings()
+    size_raw = audit_raw.get("rotate_size_mb", defaults.rotate_size_mb)
+    try:
+        size_mb = int(size_raw)
+    except (TypeError, ValueError):
+        size_mb = defaults.rotate_size_mb
+    if isinstance(size_raw, bool) or size_mb < 1:
+        # ``bool`` is a subclass of ``int`` so reject it explicitly.
+        size_mb = defaults.rotate_size_mb
+    keep_raw = audit_raw.get("retention_count", defaults.retention_count)
+    try:
+        keep = int(keep_raw)
+    except (TypeError, ValueError):
+        keep = defaults.retention_count
+    if isinstance(keep_raw, bool) or keep < 0:
+        keep = defaults.retention_count
+    disable_raw = audit_raw.get("disable_rotation", defaults.disable_rotation)
+    disable = bool(disable_raw) if isinstance(disable_raw, bool) else defaults.disable_rotation
+    return AuditSettings(
+        rotate_size_mb=size_mb,
+        retention_count=keep,
+        disable_rotation=disable,
+    )
+
+
 def _parse_events_retention_settings(
     raw: dict[str, object],
 ) -> EventsRetentionSettings:
@@ -903,6 +951,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     rail = _parse_rail_settings(raw)
     planner = _parse_planner_settings(raw)
     logging_settings = _parse_logging_settings(raw)
+    audit_settings = _parse_audit_settings(raw)
     events = _parse_events_retention_settings(raw)
     storage = _parse_storage_settings(raw, project=project)
     projects = _parse_known_projects(raw, base=base)
@@ -920,6 +969,7 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
         rail=rail,
         planner=planner,
         logging=logging_settings,
+        audit=audit_settings,
         events=events,
         storage=storage,
     )
@@ -1079,6 +1129,23 @@ def _render_global_config(config: PollyPMConfig) -> str:
     if logging_overrides:
         lines.append("[logging]")
         lines.extend(logging_overrides)
+        lines.append("")
+
+    # Emit [audit] only when the user has deviated from defaults so
+    # existing configs don't churn on rewrite (matches the [logging]
+    # convention above).
+    audit_defaults = AuditSettings()
+    audit_overrides: list[str] = []
+    if config.audit.rotate_size_mb != audit_defaults.rotate_size_mb:
+        audit_overrides.append(f"rotate_size_mb = {config.audit.rotate_size_mb}")
+    if config.audit.retention_count != audit_defaults.retention_count:
+        audit_overrides.append(f"retention_count = {config.audit.retention_count}")
+    if config.audit.disable_rotation != audit_defaults.disable_rotation:
+        flag = "true" if config.audit.disable_rotation else "false"
+        audit_overrides.append(f"disable_rotation = {flag}")
+    if audit_overrides:
+        lines.append("[audit]")
+        lines.extend(audit_overrides)
         lines.append("")
 
     for account_name, account in config.accounts.items():

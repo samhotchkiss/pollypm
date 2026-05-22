@@ -1,6 +1,6 @@
 # Chat HTTP API reference
 
-> **Status:** Reference doc for the chat API. P1 (#2044), P2 (#2045 GET), and P3 (#2043 POST send) are merged to main. The pm chat CLI in #2047 is the final PR in the stack; this doc lands once it merges.
+> **Status:** Reference doc for the chat API. P1 (#2044), P2 (#2045 GET), P3 (#2043 POST send), and P4 (#2047 pm chat CLI) are all merged to main. This doc is the published reference.
 
 Reference for the `/api/v1/chat/*` endpoints — the HTTP surface for
 reading transcripts from, and sending messages into, the four live
@@ -56,8 +56,10 @@ The chat API reuses PollyPM's existing daemon-wide bearer-token auth.
 
 - Token lives at `~/.pollypm/api-token` (created on first `pm up`).
 - Pass it via `Authorization: Bearer <token>` on every request.
-- The daemon listens on `127.0.0.1:8765` by default. Remote access
-  requires `pm serve --host 0.0.0.0` (and is your problem to firewall).
+- The daemon listens on `127.0.0.1:8765` by default. For remote access,
+  use `pm serve --allow-remote --host 0.0.0.0`. Without `--allow-remote`,
+  non-loopback binds are rejected. Defense in depth: even on Tailscale,
+  authenticated devices must still present the bearer token.
 
 The chat API does **not** use the per-session `auth_token` field on
 `SessionConfig`. That token is for outbound PollyPM → agent control
@@ -227,6 +229,11 @@ when `has_more=true`.
 |---|---|---|
 | 404 | `session_unknown` | `session_name` is not in `config.sessions` and not a live worker. |
 | 404 | `archive_missing` | `source=jsonl` forced, but no `events.jsonl` archive exists for this session. |
+| 503 | `archive_unreadable` | The events.jsonl archive exists but cannot be read (permissions, partial write). Only emitted when `source=jsonl` is explicit. |
+| 503 | `window_missing` | Only emitted when `source=capture` is explicit AND the configured tmux window doesn't exist. |
+| 503 | `capture_unavailable` | Only emitted when `source=capture` is explicit AND TmuxClient is unavailable. |
+| 503 | `capture_failed` | Only emitted when `source=capture` is explicit AND the capture-pane command raised. |
+| 503 | `service_unavailable` | Worker session lookup failed (work-service outage). Only emitted for worker `session_name`s. |
 | 400 | `invalid_request` | `since` is not ISO-8601 parseable. (Other request-shape errors share this code; see the message body for the offending field.) |
 | 422 | `validation_error` | FastAPI's standard Pydantic rejection envelope — returned for out-of-range `limit`, unknown `source`, unknown `direction`, etc. Shape is FastAPI's default `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}`, NOT the chat router's `{code, message, hint}` envelope. |
 
@@ -297,8 +304,23 @@ respond. Poll `GET /messages` for the reply.
   for messages over 100 characters (see issue #808 for why
   paste-buffer is the default for long text).
 - `press_enter_at` is `null` when `press_enter=false`.
-- When `safety=loose` and the agent appeared streaming, the response
-  includes header `X-PollyPM-Warning: agent-may-be-streaming`.
+- Under `safety=loose`, the response may include an `X-PollyPM-Warning`
+  header describing which best-effort signal was unavailable:
+  - `agent-may-be-streaming` — heartbeat shows the session streamed
+    within the last 2s.
+  - `heartbeat-unavailable` — pg heartbeat lookup failed; mid-stream
+    gate was best-effort.
+  - `transcript-unavailable` — transcript file unreadable; mid-tool
+    detection was best-effort.
+
+  Under `safety=force`, all gates are bypassed silently (no warning
+  header is emitted for ignored signals).
+
+`safety=force` precisely bypasses the mid-tool, mid-stream,
+missing-transcript, missing-heartbeat, and unavailable-signal gates.
+It does **not** bypass pane/window validation: `409 pane_invalid`,
+`409 pane_dead`, `503 window_missing`, `503 tmux_unavailable`, and
+`503 send_failed` are still fail-closed.
 
 **Error codes:**
 
@@ -310,6 +332,11 @@ respond. Poll `GET /messages` for the reply.
 | 409 | `pane_invalid` | Explicit `pane` index doesn't exist in the target window's `list_panes` output. See §5.4. |
 | 409 | `unsafe_mid_tool` | Latest assistant turn has an open `tool_use` with no matching `tool_result`. Override with `safety=force`. See §5.1. |
 | 409 | `unsafe_mid_stream` | Heartbeat shows the session streamed within the last 2s. Override with `safety=loose` (warn-and-send) or `safety=force` (bypass). See §5.3. |
+| 409 | `unsafe_unavailable_transcript` | Strict mode + the transcript file is unreadable. Caller can override with `safety=force`. |
+| 409 | `unsafe_unavailable_heartbeat` | Strict mode + heartbeat lookup failed (pg outage). Override with `safety=force`. |
+| 503 | `tmux_unavailable` | tmux binary not found or unresponsive (`FileNotFoundError`, `TimeoutExpired`, `CalledProcessError`). |
+| 503 | `send_failed` | tmux `send_keys` raised a generic error (paste-buffer fail, `OSError` post-validation). |
+| 503 | `service_unavailable` | Worker session lookup failed (work-service outage). Only emitted for worker `session_name`s. |
 | 400 | `answer_to_missing` | `answer_to` id was not found in the session's recent transcript. |
 | 400 | `selections_no_question` | `answer_to` references a message that isn't an `ask_user` envelope. |
 | 400 | `selections_invalid` | One or more selections don't match the question's option labels. Response message includes the valid options. |
@@ -535,10 +562,21 @@ turn as if the agent typed them).
 
 **Behavior:**
 
-- `safety=strict` (default) — reject with `409 unsafe_mid_stream`.
-- `safety=loose` — allow, with response header
-  `X-PollyPM-Warning: agent-may-be-streaming`.
-- `safety=force` — bypass all safety gates.
+- `safety=strict` (default) — reject with `409 unsafe_mid_stream`. If
+  the signal source itself is unavailable, strict mode also rejects
+  with `409 unsafe_unavailable_transcript` (transcript unreadable) or
+  `409 unsafe_unavailable_heartbeat` (pg outage).
+- `safety=loose` — allow, with one of these response headers
+  describing which signal was best-effort:
+  - `X-PollyPM-Warning: agent-may-be-streaming` — heartbeat fresh <2s.
+  - `X-PollyPM-Warning: heartbeat-unavailable` — pg heartbeat lookup
+    failed.
+  - `X-PollyPM-Warning: transcript-unavailable` — transcript
+    unreadable.
+- `safety=force` — bypass mid-tool, mid-stream, missing-transcript,
+  missing-heartbeat, and unavailable-signal gates. Does NOT bypass
+  pane/window validation (`409 pane_invalid`, `409 pane_dead`,
+  `503 window_missing`, `503 tmux_unavailable`, `503 send_failed`).
 
 **When to override:** stop-the-world messages (`STOP`, a correction,
 mid-stream context-update). Reach for `loose` first; use `force` only
@@ -616,9 +654,15 @@ live — usually means Claude Code hasn't flushed mid-stream.
 envelope with `type=text` and `metadata.from_capture=true`. Ids are
 synthetic (`cap_<hash>`), stable across reads.
 
-Force pure JSONL with `?source=jsonl` (accept the possibility of a
-`404 archive_missing` response). Force pure capture with
-`?source=capture`.
+Source-mode behavior:
+
+- `source=auto` (default): JSONL archive first, capture-pane fallback
+  on stale/missing. Fail-soft — returns empty `messages` if both fail.
+- `source=jsonl` (explicit): JSONL only. Returns `404 archive_missing`
+  if absent, `503 archive_unreadable` on read failure.
+- `source=capture` (explicit): tmux capture only. Returns
+  `503 window_missing` / `503 capture_unavailable` / `503 capture_failed`
+  on the respective failures.
 
 ### 5.8 New session, no transcript yet
 
@@ -664,9 +708,6 @@ you need structured tool data, use a Claude session.
 ---
 
 ## 6. CLI alternative — `pm chat`
-
-> The `pm chat` CLI lands in PR #2047 — these commands work once that
-> merges. The HTTP endpoints (§3) are usable directly today via `curl`.
 
 The `pm chat` CLI is a thin client over these endpoints. It exists
 because typing curl with bearer-token plumbing every time gets old.

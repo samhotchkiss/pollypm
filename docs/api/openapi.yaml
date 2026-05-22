@@ -1033,13 +1033,33 @@ paths:
     post:
       tags: [Sessions]
       operationId: restartSession
-      summary: Destroy + relaunch the tmux window for one session
+      summary: Facade-driven relaunch (Supervisor.restart_session) for one session
       description: |
-        Kills the session's tmux window (no-op if absent) and
-        re-creates it from the `[sessions]` config row. Refuses with
-        `409 unsafe_mid_turn` when the agent is mid-turn unless
-        `?safety=force`. Returns `503 daemon_unavailable` when the
-        tmux session service can't be constructed.
+        Routes through `pollypm.supervisor.Supervisor.restart_session`
+        — the same canonical facade `pm switch-session-account`, the
+        cockpit account-switch button, and the upgrade flow already
+        use. The facade tears down the existing window and re-launches
+        via the launch planner so the relaunched pane runs the
+        configured provider command (NOT an ad-hoc `echo`
+        placeholder).
+
+        The account the facade restarts under is the runtime's
+        `effective_account` if set (so a session that previously
+        failed over keeps using the recovered account), otherwise the
+        session's configured `account`.
+
+        Safety gate. `strict` (default) refuses with:
+        * `409 unsafe_mid_turn` when the agent is mid-turn.
+        * `503 unsafe_mid_turn_unknown` when the mid-turn probe
+          itself fails (transient tmux/parse errors must NOT be
+          treated as "agent is idle" — fail-closed).
+
+        `?safety=force` bypasses BOTH the mid-turn check and the
+        probe-unknown check.
+
+        Returns `503 daemon_unavailable` when the supervisor or tmux
+        session service can't be constructed, when no account can be
+        resolved for the session, or when `restart_session` raises.
       parameters:
         - in: query
           name: safety
@@ -1074,8 +1094,15 @@ paths:
                 $ref: "#/components/schemas/ErrorResponse"
         "503":
           description: |
-            Tmux session service unavailable (`code=daemon_unavailable`).
-            Confirm the daemon / cockpit is running, then retry.
+            One of:
+            * `code=unsafe_mid_turn_unknown` — strict-mode safety
+              probe failed and could not confirm the agent is idle
+              (fail-closed). Retry once tmux is healthy or pass
+              `?safety=force` to override.
+            * `code=daemon_unavailable` — supervisor / tmux session
+              service unavailable, no account resolvable, or
+              `restart_session` raised. Confirm the daemon / cockpit
+              is running, then retry.
           content:
             application/json:
               schema:
@@ -1087,12 +1114,21 @@ paths:
     post:
       tags: [Sessions]
       operationId: pauseSession
-      summary: Mark a session paused (skip heartbeat dispatch / recovery)
+      summary: Tag a session paused (INFORMATIONAL marker only)
       description: |
+        **Informational marker only.** The supervisor / recovery /
+        dispatch loops do NOT consume `<base_dir>/paused-sessions.json`
+        today — they will still act on the session even after a
+        successful pause. The response `message` calls this out so
+        operators know they have tagged the session, not quiesced the
+        daemon. Daemon-side enforcement is tracked as a follow-up.
+
         Idempotent. Writes the session name into the project's pause
-        marker (`<base_dir>/paused-sessions.json`) so other readers
-        (recovery loop, `GET /api/v1/sessions`) can skip / surface the
-        quiesced state. The tmux window itself is left alone.
+        marker (`<base_dir>/paused-sessions.json`) using atomic
+        tmp+rename, with `fcntl.flock` serialising concurrent
+        pause/resume callers. `GET /api/v1/sessions` surfaces
+        `status="paused"` for tagged sessions; the tmux window itself
+        is left alone.
       responses:
         "200":
           description: Pause recorded (or already paused).
@@ -1120,11 +1156,16 @@ paths:
     post:
       tags: [Sessions]
       operationId: resumeSession
-      summary: Clear the paused flag for a session (inverse of pause)
+      summary: Clear the informational pause tag for a session (inverse of pause)
       description: |
-        Idempotent. Removes the session name from the project's pause
-        marker. Returns 200 with no state change if the session wasn't
-        paused.
+        Idempotent inverse of `pauseSession`. Same daemon-control
+        caveat applies — the marker is informational, so "resuming" a
+        session the supervisor never stopped acting on is a no-op
+        from the runtime's perspective.
+
+        Removes the session name from the project's pause marker.
+        Returns 200 with no state change if the session wasn't
+        tagged.
       responses:
         "200":
           description: Resume recorded (or already running).

@@ -11,13 +11,20 @@ Endpoints
   sessions with live health (heartbeat age + tmux window presence).
 - ``GET    /api/v1/sessions/{name}``           — one session's detail
   payload (config row + health snapshot + last heartbeat).
-- ``POST   /api/v1/sessions/{name}/restart``   — kill the tmux window
-  and re-create it. Refuses with ``409 unsafe_mid_turn`` when the agent
-  is mid-turn unless ``?safety=force``.
-- ``POST   /api/v1/sessions/{name}/pause``     — write a pause marker
-  so the recovery / dispatch loops skip this session. Idempotent.
-- ``POST   /api/v1/sessions/{name}/resume``    — remove the pause
-  marker. Idempotent.
+- ``POST   /api/v1/sessions/{name}/restart``   — destroy + relaunch
+  via the canonical :meth:`pollypm.supervisor.Supervisor.restart_session`
+  facade so the relaunched pane runs the configured provider command
+  (not an ad-hoc ``echo`` placeholder). Refuses with
+  ``409 unsafe_mid_turn`` when the agent is mid-turn (or 503
+  ``unsafe_mid_turn_unknown`` when the safety probe itself fails)
+  unless ``?safety=force``.
+- ``POST   /api/v1/sessions/{name}/pause``     — write an
+  **informational** pause marker (consumers can observe it via
+  ``GET /api/v1/sessions`` but the supervisor / recovery / dispatch
+  loops do NOT yet consume it; see ``ActionResult.message``).
+  Idempotent.
+- ``POST   /api/v1/sessions/{name}/resume``    — remove the marker.
+  Idempotent.
 
 Design notes
 ------------
@@ -31,19 +38,37 @@ Design notes
   read failures collapse to ``unknown`` / ``missing`` rather than
   500-ing.
 
-* **Restart.** Uses :class:`pollypm.session_services.tmux.TmuxSessionService`
-  to ``destroy`` then ``create``. The CLI is the only other caller that
-  performs that pair, and we deliberately re-use that helper so any
-  future change to launch automation lands in both surfaces at once.
-  Restart is intentionally synchronous (spec §10.4) — typical restart
-  time is < 5s and the spec defers ``?async`` to Phase 2.5.
+* **Restart.** Routes through :meth:`pollypm.supervisor.Supervisor.restart_session`
+  — the **same facade** ``pm switch-session-account``, the cockpit
+  account-switch action (``cockpit_ui.restart_session``), and the
+  upgrade flow already use. That facade owns the canonical kill +
+  launch-spec relaunch pair: it tears down the existing window, calls
+  :meth:`Supervisor.launch_session` (which consults the launch planner
+  for the full provider/account/cwd/command), and injects the recovery
+  prompt. The previous incarnation of this route called
+  :class:`TmuxSessionService` ``destroy`` + ``create`` directly with no
+  command spec, so ``create()`` fell back to its
+  ``echo 'No command for {name}'`` placeholder — destroying live
+  agents and replacing them with non-agent panes. See PR #2061 Codex
+  P0 #1.
 
-* **Pause / resume.** No existing helper does this; we use a small
-  on-disk JSON marker at ``<base_dir>/paused-sessions.json`` so the
-  state survives daemon restarts and is visible to any other reader
-  (the supervisor will learn to consume this in a follow-up; for now
-  the marker is informational + the API surfaces ``status="paused"``).
-  Both operations are idempotent and return 200.
+  The account passed to ``restart_session`` is the runtime's
+  ``effective_account`` if set (so a session that previously failed
+  over stays on the recovered account), otherwise the session's
+  configured ``account``. Restart is intentionally synchronous (spec
+  §10.4) — typical restart time is < 5s and the spec defers
+  ``?async`` to Phase 2.5.
+
+* **Pause / resume — informational only.** No existing supervisor /
+  recovery / dispatch loop consumes the pause marker today, so this
+  surface is documented as **informational** (the cockpit + this API's
+  ``GET /sessions`` surface ``status="paused"``, but background loops
+  still act on the session). The response ``message`` and OpenAPI
+  description both call this out so operators are not misled into
+  thinking the marker quiesces the daemon. Daemon-side enforcement is
+  a follow-up (issue filed in the PR). Both operations are idempotent
+  and return 200, and concurrent writes are serialised by an
+  ``fcntl.flock`` on the marker file.
 
 * **pg outages → 503.** ``GET`` endpoints downgrade pg outages to a
   best-effort response (``status="unknown"`` on the affected row).
@@ -59,6 +84,7 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -193,6 +219,30 @@ def _unsafe_mid_turn(name: str) -> APIError:
             "Re-issue with ?safety=force to override."
         ),
         hint="Wait for the agent to finish or pass ?safety=force to restart anyway.",
+    )
+
+
+def _unsafe_mid_turn_unknown(name: str, detail: str) -> APIError:
+    """Strict-mode safety probe could not evaluate ``is_turn_active``.
+
+    Fail-closed counterpart to :func:`_unsafe_mid_turn` (Codex PR #2061
+    P0 #2). The previous incarnation of ``_is_turn_active`` swallowed
+    every exception and returned ``False`` — a transient tmux / parse
+    failure therefore looked like a green-light to restart an actively
+    working agent. Strict mode now surfaces probe failures as 503 so
+    the caller knows to retry or escalate to ``?safety=force``.
+    """
+    return APIError(
+        status_code=503,
+        code="unsafe_mid_turn_unknown",
+        message=(
+            f"Refusing to restart {name!r}: mid-turn safety probe "
+            f"failed ({detail}). Cannot confirm whether the agent is idle."
+        ),
+        hint=(
+            "Retry once the tmux service is healthy, or pass "
+            "?safety=force to override the probe (destructive)."
+        ),
     )
 
 
@@ -355,6 +405,59 @@ def _write_paused_names(config: Any, names: set[str]) -> None:
     tmp.replace(path)
 
 
+# Operator-facing message appended to pause/resume responses so a CLI
+# user or automation script knows the marker is *informational only*
+# (Codex PR #2061 P0 #3). The supervisor / recovery / dispatch loops
+# do NOT yet consult this marker — making this clear in the response
+# stops operators from believing they have quiesced the daemon when
+# they have only tagged the session.
+_PAUSE_INFORMATIONAL_NOTE = (
+    "informational marker only — supervisor / recovery / dispatch "
+    "loops do NOT yet consult it; daemon-side enforcement is a "
+    "follow-up. The marker is visible via GET /api/v1/sessions."
+)
+
+
+@contextmanager
+def _pause_marker_lock(config: Any):
+    """Serialise pause/resume read-modify-write across concurrent callers.
+
+    Codex PR #2061 P0 #3 flagged the unguarded ``_load_paused_names``
+    → mutate → ``_write_paused_names`` sequence as racy: two
+    near-simultaneous pause + resume calls could clobber each other's
+    writes. We take an ``fcntl.flock`` on a sibling ``.lock`` file
+    that lives in the same directory as the marker — best-effort on
+    platforms without ``fcntl`` (Windows), which is fine for the v1
+    RC where the API runs on macOS/Linux only.
+    """
+    path = _pause_marker_path(config)
+    if path is None:
+        # No base_dir → no lock to take; caller will hit the same 503
+        # in ``_write_paused_names`` anyway.
+        yield
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    try:
+        import fcntl  # type: ignore[import-not-found]
+    except ImportError:
+        # No fcntl (e.g. Windows): degrade to no-op lock. The marker
+        # write is still atomic via tmp+rename; only the
+        # read-modify-write window is unprotected, which matches the
+        # pre-#2061 behaviour.
+        yield
+        return
+    fh = open(lock_path, "a+")  # noqa: SIM115 — closed in finally
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
 # ---------------------------------------------------------------------------
 # Builders — SessionInfo / SessionDetail / SessionConfigView
 # ---------------------------------------------------------------------------
@@ -475,14 +578,85 @@ def _session_health(svc: Any | None, name: str) -> SessionHealthSnapshot:
     )
 
 
-def _is_turn_active(svc: Any | None, name: str) -> bool:
+class _TurnProbeUnavailable(RuntimeError):
+    """Raised by :func:`_is_turn_active` in strict mode on probe failure.
+
+    The route maps this to a 503 ``unsafe_mid_turn_unknown`` so strict
+    mode fails *closed* — a transient tmux / parse / service failure
+    must not look like a green-light to restart an actively-working
+    agent (Codex PR #2061 P0 #2).
+    """
+
+
+def _is_turn_active(svc: Any | None, name: str, *, strict: bool = False) -> bool:
+    """Return True iff the agent appears mid-turn.
+
+    ``strict=False`` (read-only / detail surface): exceptions degrade
+    to ``False`` — the read path must not 500 on a transient probe
+    failure.
+
+    ``strict=True`` (destructive restart): exceptions raise
+    :class:`_TurnProbeUnavailable` so the route maps to 503. Strict
+    mode must fail *closed*; otherwise a flaky probe can clobber a
+    working agent.
+    """
     if svc is None:
+        if strict:
+            raise _TurnProbeUnavailable("tmux service unavailable")
         return False
     try:
         return bool(svc.is_turn_active(name))
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.debug("svc.is_turn_active(%s) failed", name, exc_info=True)
+        if strict:
+            raise _TurnProbeUnavailable(str(exc) or exc.__class__.__name__) from exc
         return False
+
+
+def _build_supervisor(config: Any) -> Any | None:
+    """Construct a :class:`pollypm.supervisor.Supervisor` or ``None``.
+
+    Used by :func:`restart_session_endpoint` (Codex PR #2061 P0 #1) so
+    the restart goes through the canonical
+    :meth:`Supervisor.restart_session` facade — the same code path the
+    cockpit account-switch button, ``pm switch-session-account``, and
+    the upgrade flow already use.
+
+    Returns ``None`` on any construction failure (no store available,
+    plugin host failure, etc.); the caller translates that into a
+    503 ``daemon_unavailable`` so clients can retry.
+    """
+    try:
+        from pollypm.supervisor import Supervisor
+    except Exception:  # noqa: BLE001
+        logger.debug("Supervisor import failed", exc_info=True)
+        return None
+    try:
+        return Supervisor(config)
+    except Exception:  # noqa: BLE001
+        logger.debug("Supervisor construction failed", exc_info=True)
+        return None
+
+
+def _resolve_restart_account(supervisor: Any, session: Any) -> str | None:
+    """Pick the account to relaunch under for an API-driven restart.
+
+    Mirrors the precedence the recovery path uses: prefer the
+    runtime's ``effective_account`` if set (so a session that
+    previously failed over stays on the recovered account); otherwise
+    fall back to the session's configured ``account``. Returns
+    ``None`` if neither is available (caller maps to 503).
+    """
+    try:
+        runtime = supervisor._get_session_runtime(session.name)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        runtime = None
+    if runtime is not None:
+        eff = getattr(runtime, "effective_account", None)
+        if eff:
+            return str(eff)
+    configured = getattr(session, "account", None)
+    return str(configured) if configured else None
 
 
 def _find_session(config: Any, name: str) -> Any:
@@ -585,50 +759,77 @@ def restart_session_endpoint(
         ),
     )] = "strict",
 ) -> ActionResult:
-    """POST /api/v1/sessions/{name}/restart — destroy + re-create the window.
+    """POST /api/v1/sessions/{name}/restart — facade-driven relaunch.
 
-    Returns 200 on success. 404 if the session isn't configured. 409
-    ``unsafe_mid_turn`` if strict-mode and the agent is actively
-    streaming a turn. 503 ``daemon_unavailable`` if the tmux service
-    can't be constructed (no tmux, store unavailable, etc).
+    Routes through :meth:`pollypm.supervisor.Supervisor.restart_session`
+    so the relaunched pane runs the configured provider command (the
+    launch planner reconstructs cwd / provider / account / args /
+    initial input / markers) instead of an ``echo`` placeholder.
+
+    Responses:
+
+    * **200** on success.
+    * **404** ``not_found`` if the session isn't configured.
+    * **409** ``unsafe_mid_turn`` if strict-mode and the agent is
+      actively streaming a turn.
+    * **503** ``unsafe_mid_turn_unknown`` if strict-mode and the
+      mid-turn safety probe itself failed (fail-closed — Codex PR
+      #2061 P0 #2).
+    * **503** ``daemon_unavailable`` if the supervisor / tmux service
+      can't be constructed, or if ``restart_session`` raises.
     """
     session = _find_session(config, name)
     svc = _build_tmux_service(config)
     if svc is None:
         raise _daemon_unavailable(name, "tmux session service unavailable")
-    if safety != "force" and _is_turn_active(svc, name):
-        raise _unsafe_mid_turn(name)
 
-    # Destroy first; the helper is a no-op when the window isn't
-    # present, so it works for an "already stopped" session too — the
-    # spec defers between 200 and 409 here, and the cockpit-friendly
-    # choice is 200 (idempotent) so a client can always issue "restart"
-    # without first probing the live state.
-    try:
-        svc.destroy(name)
-    except Exception as exc:  # noqa: BLE001
-        logger.debug("svc.destroy(%s) failed", name, exc_info=True)
-        raise _daemon_unavailable(name, f"destroy raised: {exc!s}") from exc
+    # Safety gate (Codex PR #2061 P0 #2). Strict mode (the default)
+    # fails *closed* — a probe that cannot answer "is this agent
+    # currently working?" must not be treated as "agent is idle".
+    if safety != "force":
+        try:
+            mid_turn = _is_turn_active(svc, name, strict=True)
+        except _TurnProbeUnavailable as exc:
+            raise _unsafe_mid_turn_unknown(name, str(exc)) from exc
+        if mid_turn:
+            raise _unsafe_mid_turn(name)
 
-    # Re-create the window. The session config carries cwd / provider /
-    # account / window_name; the create() call accepts a partial set —
-    # missing prompts / accounts mean the launcher just opens a blank
-    # pane, which is the right answer for "restart". A full restart
-    # with bootstrap is a separate operation the cockpit "Launch"
-    # button performs (Phase 3 surface).
-    try:
-        cwd = getattr(session, "cwd", None)
-        svc.create(
-            name=name,
-            provider=str(getattr(session, "provider", "") or ""),
-            account=getattr(session, "account", "") or "",
-            cwd=Path(cwd) if cwd else Path.cwd(),
-            window_name=session.window_name or name,
-            stabilize=False,
+    # Route through the canonical supervisor restart facade (Codex PR
+    # #2061 P0 #1). ``Supervisor.restart_session`` owns the
+    # kill+relaunch pair: it kills the window, switches runtime status
+    # to ``recovering``, then calls ``launch_session`` which consults
+    # the launch planner for the full provider command (NOT an ad-hoc
+    # ``echo`` placeholder). The cockpit account-switch button,
+    # ``pm switch-session-account``, and the upgrade flow already use
+    # the same facade — a future launch-automation change therefore
+    # lands in every surface at once.
+    supervisor = _build_supervisor(config)
+    if supervisor is None:
+        raise _daemon_unavailable(name, "supervisor unavailable")
+    account_name = _resolve_restart_account(supervisor, session)
+    if not account_name:
+        raise _daemon_unavailable(
+            name, "no effective or configured account on session",
         )
+
+    try:
+        supervisor.restart_session(
+            name, account_name, failure_type="api_restart",
+        )
+    except KeyError as exc:
+        # ``Supervisor.restart_session`` raises ``KeyError`` for an
+        # unknown account; surface as 503 because the API contract is
+        # "the daemon couldn't honor the request" rather than a client
+        # validation error (the account was resolved from runtime/config).
+        logger.debug("restart_session unknown account for %s", name, exc_info=True)
+        raise _daemon_unavailable(
+            name, f"unknown restart account: {exc!s}",
+        ) from exc
     except Exception as exc:  # noqa: BLE001
-        logger.debug("svc.create(%s) failed", name, exc_info=True)
-        raise _daemon_unavailable(name, f"create raised: {exc!s}") from exc
+        logger.debug("supervisor.restart_session(%s) failed", name, exc_info=True)
+        raise _daemon_unavailable(
+            name, f"restart_session raised: {exc!s}",
+        ) from exc
 
     return ActionResult(ok=True, message=f"restarted {name}")
 
@@ -636,24 +837,43 @@ def restart_session_endpoint(
 @router.post(
     "/sessions/{name}/pause",
     response_model=ActionResult,
-    summary="Pause heartbeat dispatch / recovery for one session",
+    summary=(
+        "Tag a session as paused (INFORMATIONAL marker; supervisor "
+        "loops do not yet consume it)"
+    ),
     operation_id="pauseSession",
 )
 def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
-    """POST /api/v1/sessions/{name}/pause — mark the session paused.
+    """POST /api/v1/sessions/{name}/pause — write an informational marker.
 
-    Writes ``<base_dir>/paused-sessions.json`` so other readers (the
-    recovery loop, ``GET /api/v1/sessions``) can skip / surface the
-    quiesced state. Idempotent: pausing an already-paused session
-    returns 200 with no state change.
+    **This is an informational marker only.** Codex PR #2061 P0 #3
+    flagged that the supervisor / recovery / dispatch loops do NOT
+    consume ``<base_dir>/paused-sessions.json`` today — they will
+    still act on the session even after a successful pause. The
+    response ``message`` calls this out so operators know they have
+    tagged the session, not quiesced the daemon. Daemon-side
+    enforcement is tracked as a follow-up.
+
+    Writes ``<base_dir>/paused-sessions.json`` (atomic tmp+rename,
+    serialised via ``fcntl.flock`` against concurrent pause/resume
+    callers) so ``GET /api/v1/sessions`` can surface
+    ``status="paused"``. Idempotent: pausing an already-paused
+    session returns 200 with no state change.
     """
     _find_session(config, name)  # 404 if unknown
     try:
-        names = _load_paused_names(config)
-        if name in names:
-            return ActionResult(ok=True, message=f"{name} already paused")
-        names.add(name)
-        _write_paused_names(config, names)
+        with _pause_marker_lock(config):
+            names = _load_paused_names(config)
+            if name in names:
+                return ActionResult(
+                    ok=True,
+                    message=(
+                        f"{name} already tagged paused — "
+                        f"{_PAUSE_INFORMATIONAL_NOTE}"
+                    ),
+                )
+            names.add(name)
+            _write_paused_names(config, names)
     except APIError:
         raise
     except OSError as exc:
@@ -662,28 +882,43 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
             f"Cannot write pause marker for {name!r}: {exc!s}",
             hint="Check filesystem permissions on ~/.pollypm.",
         ) from exc
-    return ActionResult(ok=True, message=f"paused {name}")
+    return ActionResult(
+        ok=True,
+        message=f"tagged {name} paused — {_PAUSE_INFORMATIONAL_NOTE}",
+    )
 
 
 @router.post(
     "/sessions/{name}/resume",
     response_model=ActionResult,
-    summary="Resume heartbeat dispatch / recovery for one session",
+    summary=(
+        "Clear the informational pause marker for a session (see "
+        "pauseSession for the daemon-control caveat)"
+    ),
     operation_id="resumeSession",
 )
 def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
-    """POST /api/v1/sessions/{name}/resume — inverse of pause.
+    """POST /api/v1/sessions/{name}/resume — clear the informational marker.
 
-    Idempotent: resuming a non-paused session returns 200 with no
-    state change.
+    Idempotent inverse of :func:`pause_session_endpoint`. Same
+    daemon-control caveat applies: the marker is informational, so
+    "resuming" a session that the supervisor never stopped acting on
+    is a no-op from the runtime's perspective.
     """
     _find_session(config, name)  # 404 if unknown
     try:
-        names = _load_paused_names(config)
-        if name not in names:
-            return ActionResult(ok=True, message=f"{name} already running")
-        names.discard(name)
-        _write_paused_names(config, names)
+        with _pause_marker_lock(config):
+            names = _load_paused_names(config)
+            if name not in names:
+                return ActionResult(
+                    ok=True,
+                    message=(
+                        f"{name} already untagged — "
+                        f"{_PAUSE_INFORMATIONAL_NOTE}"
+                    ),
+                )
+            names.discard(name)
+            _write_paused_names(config, names)
     except APIError:
         raise
     except OSError as exc:
@@ -692,7 +927,10 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
             f"Cannot write pause marker for {name!r}: {exc!s}",
             hint="Check filesystem permissions on ~/.pollypm.",
         ) from exc
-    return ActionResult(ok=True, message=f"resumed {name}")
+    return ActionResult(
+        ok=True,
+        message=f"cleared pause tag on {name} — {_PAUSE_INFORMATIONAL_NOTE}",
+    )
 
 
 __all__ = [

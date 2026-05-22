@@ -170,17 +170,26 @@ class _FakeTmuxService:
 
     Tracks calls to ``destroy`` / ``create`` and lets tests pre-program
     ``is_turn_active`` + ``health`` return values.
+
+    Post-#2061: the destructive restart path no longer talks to
+    ``_FakeTmuxService.destroy`` / ``create`` directly — those calls
+    happen inside the ``Supervisor.restart_session`` facade (covered by
+    :class:`_FakeSupervisor`). This stub still drives the mid-turn
+    safety probe (``is_turn_active``) and the detail-endpoint health
+    snapshot.
     """
 
     def __init__(
         self,
         *,
         turn_active: bool = False,
+        turn_active_raises: Exception | None = None,
         destroy_raises: Exception | None = None,
         create_raises: Exception | None = None,
         window_present: bool = True,
     ) -> None:
         self.turn_active = turn_active
+        self.turn_active_raises = turn_active_raises
         self.destroy_raises = destroy_raises
         self.create_raises = create_raises
         self.window_present = window_present
@@ -198,6 +207,8 @@ class _FakeTmuxService:
         return SimpleNamespace(name=kwargs["name"], window_name=kwargs.get("window_name"))
 
     def is_turn_active(self, name: str) -> bool:  # noqa: ARG002
+        if self.turn_active_raises is not None:
+            raise self.turn_active_raises
         return self.turn_active
 
     def health(self, name: str, *, capture_lines: int = 200) -> Any:  # noqa: ARG002
@@ -208,6 +219,43 @@ class _FakeTmuxService:
             pane_command="claude" if self.window_present else None,
             pane_text="",
         )
+
+
+class _FakeSupervisor:
+    """Stand-in for :class:`pollypm.supervisor.Supervisor` for restart tests.
+
+    Records every ``restart_session`` invocation so the test can assert
+    the route invoked the **canonical facade** (Codex PR #2061 P0 #1)
+    rather than reaching past it to the raw ``destroy``+``create``
+    helpers. Optionally raises to exercise the
+    ``daemon_unavailable`` recovery branch.
+    """
+
+    def __init__(
+        self,
+        *,
+        restart_raises: Exception | None = None,
+        effective_account: str | None = None,
+    ) -> None:
+        self.restart_raises = restart_raises
+        self.effective_account = effective_account
+        self.restart_calls: list[dict[str, Any]] = []
+
+    def _get_session_runtime(self, name: str) -> Any:  # noqa: ARG002
+        if self.effective_account is None:
+            return None
+        return SimpleNamespace(effective_account=self.effective_account)
+
+    def restart_session(
+        self, session_name: str, account_name: str, *, failure_type: str,
+    ) -> None:
+        self.restart_calls.append({
+            "session_name": session_name,
+            "account_name": account_name,
+            "failure_type": failure_type,
+        })
+        if self.restart_raises is not None:
+            raise self.restart_raises
 
 
 @pytest.fixture
@@ -246,6 +294,25 @@ def patch_tmux_service(monkeypatch: pytest.MonkeyPatch):
             lambda _config: service,
         )
         return service
+    return install
+
+
+@pytest.fixture
+def patch_supervisor(monkeypatch: pytest.MonkeyPatch):
+    """Install a stub for ``_build_supervisor`` on the route module.
+
+    Post-#2061 the restart endpoint routes through
+    :meth:`Supervisor.restart_session` (the canonical facade) instead
+    of poking ``TmuxSessionService.create()`` directly. Tests use this
+    fixture to assert the facade was called with the right
+    ``(session_name, account_name, failure_type)``.
+    """
+    def install(supervisor: _FakeSupervisor | None) -> _FakeSupervisor | None:
+        monkeypatch.setattr(
+            sessions_admin_routes, "_build_supervisor",
+            lambda _config: supervisor,
+        )
+        return supervisor
     return install
 
 
@@ -396,13 +463,23 @@ def test_get_session_404_unknown(
 # ---------------------------------------------------------------------------
 
 
-def test_restart_happy_path(
+def test_restart_routes_through_supervisor_facade(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service,
+    patch_tmux_service, patch_supervisor,
 ):
+    """Restart goes through ``Supervisor.restart_session`` (PR #2061 P0 #1).
+
+    Regression: the previous restart implementation called
+    ``TmuxSessionService.create()`` with no command, which falls back
+    to ``echo 'No command for {name}'`` and destroys live agents.
+    The route must hand off to the same facade ``pm
+    switch-session-account`` / the cockpit account-switch button use,
+    which consults the launch planner for the real provider command.
+    """
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
     svc = patch_tmux_service(_FakeTmuxService(turn_active=False))
+    sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
     )
@@ -410,78 +487,159 @@ def test_restart_happy_path(
     body = response.json()
     assert body["ok"] is True
     assert "operator" in (body.get("message") or "")
-    # destroy + create were both called, in that order.
-    kinds = [call[0] for call in svc.calls]
-    assert kinds == ["destroy", "create"]
-    assert svc.calls[1][1]["name"] == "operator"
-    assert svc.calls[1][1]["window_name"] == "operator"
+    # The route did NOT poke the raw destroy/create helpers — the
+    # facade owns that pair.
+    assert svc.calls == []
+    # The facade was called once with the session, the configured
+    # account (effective_account is None in this stub), and the
+    # api_restart failure_type so the recovery audit chain attributes
+    # the relaunch correctly.
+    assert len(sup.restart_calls) == 1
+    call = sup.restart_calls[0]
+    assert call["session_name"] == "operator"
+    assert call["account_name"] == "claude_primary"
+    assert call["failure_type"] == "api_restart"
 
 
-def test_restart_already_stopped_returns_200(
+def test_restart_prefers_effective_account_over_configured(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service,
+    patch_tmux_service, patch_supervisor,
 ):
-    """Restart against an already-stopped session is idempotent → 200.
+    """When the runtime carries an ``effective_account`` it wins.
 
-    Spec §10.4 leaves the choice between 200 and 409 to the
-    implementer; we pick 200 so clients can issue a blind ``restart``
-    without first probing live state. ``destroy`` is a no-op when the
-    window isn't present (it's structured that way in
-    :meth:`TmuxSessionService.destroy`), and ``create`` then brings it
-    up fresh.
+    A session that previously failed over to a recovery account
+    should keep using that account on operator-driven restart —
+    otherwise the relaunch slams the original (failed) account and
+    immediately re-triggers the same recovery loop.
     """
-    patch_heartbeat({})
-    patch_tmux_windows([])  # not present in tmux
-    svc = patch_tmux_service(_FakeTmuxService(window_present=False))
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_tmux_service(_FakeTmuxService(turn_active=False))
+    sup = patch_supervisor(
+        _FakeSupervisor(effective_account="recovery_account"),
+    )
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
     )
     assert response.status_code == 200, response.text
-    # destroy + create still both fire — destroy is the no-op safety net.
-    kinds = [call[0] for call in svc.calls]
-    assert kinds == ["destroy", "create"]
+    assert sup.restart_calls[0]["account_name"] == "recovery_account"
+
+
+def test_restart_facade_failure_503_daemon_unavailable(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_tmux_service, patch_supervisor,
+):
+    """``Supervisor.restart_session`` raising → 503, not 500."""
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_tmux_service(_FakeTmuxService(turn_active=False))
+    patch_supervisor(
+        _FakeSupervisor(restart_raises=RuntimeError("tmux server down")),
+    )
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "daemon_unavailable"
 
 
 def test_restart_refuses_mid_turn(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service,
+    patch_tmux_service, patch_supervisor,
 ):
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
     svc = patch_tmux_service(_FakeTmuxService(turn_active=True))
+    sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
     )
     assert response.status_code == 409
     body = response.json()
     assert body["error"]["code"] == "unsafe_mid_turn"
-    # no destroy / create was attempted
+    # neither the raw service nor the facade was touched
     assert svc.calls == []
+    assert sup.restart_calls == []
 
 
-def test_restart_force_overrides_mid_turn(
+def test_restart_strict_fail_closed_when_probe_raises(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service,
+    patch_tmux_service, patch_supervisor,
 ):
+    """Strict-mode probe failure → 503 ``unsafe_mid_turn_unknown``.
+
+    PR #2061 P0 #2 regression: the previous ``_is_turn_active``
+    swallowed every exception and returned ``False``, so a transient
+    tmux/parse failure looked like "agent is idle" and the route
+    happily destroyed an actively-working agent. Strict mode (the
+    default) must fail *closed* — the safety gate refuses the restart
+    when it cannot evaluate the mid-turn signal.
+    """
     patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
     patch_tmux_windows(["operator"])
-    svc = patch_tmux_service(_FakeTmuxService(turn_active=True))
+    svc = patch_tmux_service(
+        _FakeTmuxService(turn_active_raises=RuntimeError("tmux probe timeout")),
+    )
+    sup = patch_supervisor(_FakeSupervisor())
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "unsafe_mid_turn_unknown"
+    # The destructive path was NEVER reached.
+    assert svc.calls == []
+    assert sup.restart_calls == []
+
+
+def test_restart_force_bypasses_safety_probe_entirely(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_tmux_service, patch_supervisor,
+):
+    """``?safety=force`` skips the probe even when it would raise.
+
+    Operator-escalation override: force is destructive *by design*,
+    so a flaky probe must not block it.
+    """
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_tmux_service(
+        _FakeTmuxService(turn_active_raises=RuntimeError("tmux probe timeout")),
+    )
+    sup = patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/operator/restart?safety=force",
         headers=auth_headers,
     )
     assert response.status_code == 200, response.text
-    kinds = [call[0] for call in svc.calls]
-    assert kinds == ["destroy", "create"]
+    assert len(sup.restart_calls) == 1
+
+
+def test_restart_force_overrides_mid_turn(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_tmux_service, patch_supervisor,
+):
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_tmux_service(_FakeTmuxService(turn_active=True))
+    sup = patch_supervisor(_FakeSupervisor())
+    response = client.post(
+        "/api/v1/sessions/operator/restart?safety=force",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert len(sup.restart_calls) == 1
+    assert sup.restart_calls[0]["session_name"] == "operator"
 
 
 def test_restart_404_unknown_session(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service,
+    patch_tmux_service, patch_supervisor,
 ):
     patch_heartbeat({})
     patch_tmux_windows([])
     patch_tmux_service(_FakeTmuxService())
+    patch_supervisor(_FakeSupervisor())
     response = client.post(
         "/api/v1/sessions/nope/restart", headers=auth_headers,
     )
@@ -489,13 +647,30 @@ def test_restart_404_unknown_session(
     assert response.json()["error"]["code"] == "not_found"
 
 
-def test_restart_503_when_service_unavailable(
+def test_restart_503_when_tmux_service_unavailable(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
-    patch_tmux_service,
+    patch_tmux_service, patch_supervisor,
 ):
     patch_heartbeat({})
     patch_tmux_windows([])
-    patch_tmux_service(None)  # service construction failed
+    patch_tmux_service(None)  # tmux service construction failed
+    patch_supervisor(_FakeSupervisor())
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "daemon_unavailable"
+
+
+def test_restart_503_when_supervisor_unavailable(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_tmux_service, patch_supervisor,
+):
+    """Supervisor construction failure → 503 ``daemon_unavailable``."""
+    patch_heartbeat({})
+    patch_tmux_windows([])
+    patch_tmux_service(_FakeTmuxService(turn_active=False))
+    patch_supervisor(None)  # Supervisor() failed
     response = client.post(
         "/api/v1/sessions/operator/restart", headers=auth_headers,
     )
@@ -543,7 +718,47 @@ def test_pause_is_idempotent(
     assert second.status_code == 200
     body = second.json()
     assert body["ok"] is True
-    assert "already" in (body.get("message") or "").lower()
+    msg = (body.get("message") or "").lower()
+    assert "already" in msg
+
+
+def test_pause_response_labels_marker_informational(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+):
+    """PR #2061 P0 #3: pause must NOT imply daemon-side enforcement.
+
+    The supervisor / recovery / dispatch loops don't consume the
+    pause marker yet. The response body must surface that fact so an
+    operator knows they have *tagged* the session, not quiesced the
+    daemon. Until the loops learn to consult the marker, this is the
+    contract we keep — narrow the API rather than mislead.
+    """
+    patch_heartbeat({})
+    patch_tmux_windows(["operator"])
+    response = client.post(
+        "/api/v1/sessions/operator/pause", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    msg = (body.get("message") or "").lower()
+    assert "informational" in msg, msg
+    assert "do not" in msg or "does not" in msg or "not yet" in msg, msg
+
+
+def test_resume_response_labels_marker_informational(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+):
+    """Same P0 #3 contract on the resume side."""
+    patch_heartbeat({})
+    patch_tmux_windows(["operator"])
+    # Pause then resume to hit the "clear" branch.
+    client.post("/api/v1/sessions/operator/pause", headers=auth_headers)
+    response = client.post(
+        "/api/v1/sessions/operator/resume", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    msg = (response.json().get("message") or "").lower()
+    assert "informational" in msg, msg
 
 
 def test_resume_happy_path(

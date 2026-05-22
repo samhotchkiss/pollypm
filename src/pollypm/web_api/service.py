@@ -392,11 +392,24 @@ def _emit_project_audit(
 # snapshot (the exact reproduction Codex documented on round 7).
 #
 # The API helpers below import ``config_rmw_lock`` from ``pollypm.config``
-# and wrap their full read-modify-write under it. All in-tree CLI /
-# cockpit writers do the same — see ``pollypm.projects``,
-# ``pollypm.accounts``, ``pollypm.workers``, ``pollypm.onboarding``,
-# ``pollypm.cockpit_ui``, ``pollypm.cockpit_project_settings``, and
-# ``pollypm.plugins_builtin.project_planning.cli.project``.
+# and wrap their full read-modify-write under it. Every in-tree config
+# writer that does a ``load_config → mutate → write_config`` sequence
+# wraps it under the shared lock — see ``pollypm.projects`` (including
+# ``scan_projects`` post round 9), ``pollypm.accounts``,
+# ``pollypm.workers``, ``pollypm.onboarding``, ``pollypm.cockpit_ui``,
+# ``pollypm.cockpit_project_settings``, and
+# ``pollypm.plugins_builtin.project_planning.cli.project``. The
+# ``write_example_config`` initialiser in ``pollypm.config`` also wraps
+# its write so two concurrent ``pm init`` callers serialise on the same
+# lock. Two writes are intentionally OUTSIDE a full RMW wrap and rely
+# on :func:`pollypm.config.write_config`'s internal lock (Pattern A)
+# for torn-write protection:
+#
+# 1. ``pollypm.onboarding_tui`` first-run build+write — no prior
+#    snapshot to merge against; the API/CLI is not running yet.
+# 2. ``pollypm.config.load_config`` auth-token mint — re-reads under
+#    the lock before the write so concurrent edits still survive
+#    (round 9 audit fix).
 
 
 def _refresh_live_projects(

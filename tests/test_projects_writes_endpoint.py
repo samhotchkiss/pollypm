@@ -2015,3 +2015,227 @@ def test_first_write_race_serialized_by_lock(
         f"loser must raise FileExistsError, got {type(failures[0][1]).__name__}: "
         f"{failures[0][1]!r}"
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex round 9 regressions: scan_projects + write_example_config races
+# ---------------------------------------------------------------------------
+
+
+def test_scan_projects_race_with_set_project_tracked_preserves_both(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 9: ``scan_projects`` must not clobber a concurrent API pause.
+
+    Pre-fix (round 8 head ``faa37303e``): ``scan_projects`` did
+    ``load_config → mutate → write_config`` without wrapping in
+    ``config_rmw_lock``. A concurrent API pause that landed between the
+    scan's load and write was silently overwritten with the scan's older
+    snapshot (``project_a.tracked`` reverted to True).
+
+    Post-fix: discovery happens outside the critical section; the
+    load+merge+write block runs under ``config_rmw_lock(config_path)``
+    so both mutations land on disk.
+    """
+    import threading
+
+    from pollypm import projects as projects_module
+    from pollypm.projects import scan_projects
+    from pollypm.web_api.service import set_project_tracked
+
+    project_a_root = tmp_path / "project_a"
+    project_a_root.mkdir()
+    (project_a_root / ".pollypm").mkdir()
+    # A separate "discovery" candidate dir the scan will pretend to find
+    # via the monkeypatched discoverer.
+    new_project_root = tmp_path / "newly_discovered"
+    new_project_root.mkdir()
+    (new_project_root / ".pollypm").mkdir()
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "project_a": KnownProject(
+                key="project_a",
+                path=project_a_root,
+                name="Project A",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    live_a = load_config(config_path)
+
+    # Stub discovery so we don't depend on a real git tree, and so we
+    # control exactly which path the scan tries to add.
+    monkeypatch.setattr(
+        projects_module,
+        "discover_recent_git_repositories",
+        lambda root, known_paths, recent_days: [new_project_root],
+    )
+    # Pin scaffold to a no-op — we don't need to materialise a real
+    # project tree on disk for the race assertion.
+    monkeypatch.setattr(
+        projects_module,
+        "ensure_project_scaffold",
+        lambda path: path,
+    )
+
+    barrier = threading.Barrier(2)
+    errors: list[BaseException | None] = [None, None]
+
+    def _api_pause_worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            set_project_tracked(
+                live_a,
+                "project_a",
+                tracked=False,
+                reason="round-9 scan race",
+                actor="api",
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors[0] = exc
+
+    def _cli_scan_worker() -> None:
+        try:
+            barrier.wait(timeout=10)
+            scan_projects(
+                config_path,
+                scan_root=tmp_path,
+                interactive=False,
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors[1] = exc
+
+    t1 = threading.Thread(target=_api_pause_worker)
+    t2 = threading.Thread(target=_cli_scan_worker)
+    t1.start()
+    t2.start()
+    t1.join(timeout=20)
+    t2.join(timeout=20)
+
+    assert errors == [None, None], f"workers raised: {errors!r}"
+
+    final = load_config(config_path)
+    # BOTH mutations must survive.
+    assert "project_a" in final.projects, (
+        "project_a vanished — scan_projects clobbered the API pause's "
+        "project list. Codex round-9 cross-writer invariant violated."
+    )
+    assert final.projects["project_a"].tracked is False, (
+        "project_a's API pause was reverted by the scan's write — "
+        "Codex round-9 lost-update through scan_projects."
+    )
+    # The scan must have actually merged its new project into the
+    # post-API-write snapshot.
+    new_paths = {
+        str(project.path) for project in final.projects.values()
+    }
+    assert str(new_project_root) in new_paths or any(
+        project.path.samefile(new_project_root)
+        for project in final.projects.values()
+    ), (
+        "scan_projects' new entry did not land on disk after the race — "
+        "either the scan saw the API's snapshot and skipped, or the API "
+        "write clobbered the scan's addition."
+    )
+
+
+def test_write_example_config_race_serialized_by_lock(
+    tmp_path: Path,
+) -> None:
+    """Codex round 9: two ``write_example_config`` calls on a missing path serialise.
+
+    Pre-fix: ``write_example_config`` checked ``path.exists()`` OUTSIDE
+    the lock and then called ``write_config(..., force=True)``, bypassing
+    the locked existence guard. Two concurrent ``pm init`` callers could
+    both observe ``False`` and the second silently clobbered the first.
+
+    Post-fix: the existence decision lives inside ``config_rmw_lock`` —
+    delegated to the locked guard inside ``write_config(force=False)``.
+    Exactly one caller wins; the other raises ``FileExistsError``.
+    """
+    import threading
+
+    from pollypm.config import write_example_config
+
+    missing_path = tmp_path / "fresh" / ".pollypm" / "pollypm.toml"
+    missing_path.parent.mkdir(parents=True, exist_ok=True)
+
+    barrier = threading.Barrier(2)
+    results: list[tuple[str, BaseException | None]] = []
+    results_lock = threading.Lock()
+
+    def _writer(persona: str) -> None:
+        barrier.wait()
+        try:
+            write_example_config(missing_path, force=False)
+            with results_lock:
+                results.append((persona, None))
+        except BaseException as exc:  # noqa: BLE001 — captured for assert
+            with results_lock:
+                results.append((persona, exc))
+
+    t1 = threading.Thread(target=_writer, args=("alpha",), daemon=True)
+    t2 = threading.Thread(target=_writer, args=("bravo",), daemon=True)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15.0)
+    t2.join(timeout=15.0)
+    assert not t1.is_alive() and not t2.is_alive(), "writers deadlocked"
+
+    successes = [r for r in results if r[1] is None]
+    failures = [r for r in results if r[1] is not None]
+
+    assert len(successes) == 1, (
+        f"expected exactly one write_example_config to succeed, got "
+        f"successes={[r[0] for r in successes]}, "
+        f"failures={[(p, type(e).__name__) for p, e in failures]}"
+    )
+    assert len(failures) == 1, (
+        f"expected exactly one write_example_config to raise FileExistsError, "
+        f"got failures={[(p, type(e).__name__) for p, e in failures]}"
+    )
+    assert isinstance(failures[0][1], FileExistsError), (
+        f"loser must raise FileExistsError, got "
+        f"{type(failures[0][1]).__name__}: {failures[0][1]!r}"
+    )
+    assert missing_path.exists(), "winner did not persist the example config"

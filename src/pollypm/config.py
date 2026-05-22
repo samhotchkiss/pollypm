@@ -929,19 +929,14 @@ def _project_local_mtimes(
     return snapshot
 
 
-def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
-    config_path = path.resolve()
-    try:
-        mtime = config_path.stat().st_mtime
-        cached = _config_cache.get(config_path)
-        if (
-            cached is not None
-            and cached[0] == mtime
-            and _project_local_mtimes(cached[1]) == cached[2]
-        ):
-            return cached[1]
-    except OSError:
-        pass
+def _parse_config(config_path: Path) -> PollyPMConfig:
+    """Parse the TOML at ``config_path`` into a :class:`PollyPMConfig`.
+
+    Pure parsing — no caching, no auth-token minting, no disk writes.
+    Factored out of :func:`load_config` so the post-load persistence path
+    can re-read under ``config_rmw_lock`` without recursing back into the
+    persistence/caching code (#2063 round 9).
+    """
     base = config_path.parent
     raw = _load_raw_toml(config_path)
     project = _parse_project_settings(raw, base=base)
@@ -983,17 +978,58 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     # to distinct identities, or the cache singleton can serve
     # cross-config data.
     config.config_path = config_path
+    return config
+
+
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
+    config_path = path.resolve()
+    try:
+        mtime = config_path.stat().st_mtime
+        cached = _config_cache.get(config_path)
+        if (
+            cached is not None
+            and cached[0] == mtime
+            and _project_local_mtimes(cached[1]) == cached[2]
+        ):
+            return cached[1]
+    except OSError:
+        pass
+
+    config = _parse_config(config_path)
     # PR #2018 review fix (id 4502598240): mint auth tokens for any
     # session that lacks one, then persist back to disk. Without this,
     # legacy sessions stay at auth_token="" and watchdog/recovery
     # dispatch silently emits unsigned briefs (the advertised Lever 2
     # signing is inactive). Idempotent — write_config only fires when
     # ensure_session_auth_tokens actually minted a token.
+    #
+    # #2063 round 9 audit: this is a load → mutate → write inside
+    # ``load_config`` itself. Wrap with ``config_rmw_lock(config_path)``
+    # AND re-read the config under the lock via :func:`_parse_config`
+    # so the token-mint write participates in the shared RMW invariant.
+    # Otherwise a concurrent CLI/API writer that landed between this
+    # function's parse and the auth-token write would be silently
+    # overwritten by our possibly-stale snapshot (which has fresh fields
+    # only for ``sessions[*].auth_token``).
     try:
         from pollypm.session_auth import ensure_session_auth_tokens
         if ensure_session_auth_tokens(config):
             try:
-                write_config(config, config_path, force=True)
+                with config_rmw_lock(config_path):
+                    # Re-parse under the lock so the persisted write
+                    # merges our token additions onto the freshest disk
+                    # snapshot, never clobbering a concurrent edit.
+                    fresh = _parse_config(config_path)
+                    if ensure_session_auth_tokens(fresh):
+                        write_config(fresh, config_path, force=True)
+                    # Reflect any tokens minted on disk into the live
+                    # snapshot the caller receives, so subsequent reads
+                    # of ``config.sessions[*].auth_token`` see the same
+                    # value as the on-disk TOML.
+                    for name, fresh_session in fresh.sessions.items():
+                        live_session = config.sessions.get(name)
+                        if live_session is not None:
+                            live_session.auth_token = fresh_session.auth_token
             except Exception:  # noqa: BLE001
                 # Persistence failure is non-fatal — tokens stay in
                 # memory for the rest of this process; next load_config
@@ -1428,14 +1464,21 @@ def _build_example_config(root: Path, *, tmux_session: str = "pollypm") -> Polly
 
 
 def write_example_config(path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
-    if path.exists() and not force:
-        raise FileExistsError(f"Config already exists: {path}")
+    # #2063 round 9: the existence check + the write MUST live under the
+    # same ``config_rmw_lock`` or two concurrent ``pm init`` callers race
+    # — both observe ``path.exists() == False`` before either takes the
+    # lock, both pass the outer guard, and the second clobbers the first.
+    #
+    # Strategy: when ``force=False`` we delegate the existence check to
+    # the locked guard inside :func:`write_config` (which raises
+    # ``FileExistsError`` atomically under the flock). When ``force=True``
+    # we still take the lock so the example-config build + write is
+    # serialised against other writers, then call ``write_config`` with
+    # ``force=True`` to allow the overwrite.
     root = path.resolve().parent
-    return write_config(
-        _build_example_config(root, tmux_session=_default_init_tmux_session(root)),
-        path,
-        force=True,
-    )
+    example = _build_example_config(root, tmux_session=_default_init_tmux_session(root))
+    with config_rmw_lock(path):
+        return write_config(example, path, force=force)
 
 
 # ---------------------------------------------------------------------------
@@ -1451,9 +1494,18 @@ def write_example_config(path: Path = DEFAULT_CONFIG_PATH, force: bool = False) 
 #
 # Fix: move the lock primitive HERE and have every read-modify-write
 # call site wrap the whole RMW with :func:`config_rmw_lock`. The lock
-# is re-entrant per thread (thread-local depth counter), so nested
-# acquisitions inside ``write_config`` itself don't deadlock when a
-# caller already holds it for the full RMW.
+# is re-entrant per thread (per-path thread-local depth tracking added
+# in round 8), so nested acquisitions inside ``write_config`` itself
+# don't deadlock when a caller already holds it for the full RMW.
+#
+# Exceptions (intentionally not wrapped in a full RMW; they rely on
+# ``write_config``'s internal lock for torn-write protection only):
+# 1. :func:`pollypm.onboarding_tui.OnboardingApp` first-run build+write
+#    has no prior snapshot to merge against and runs before the API/CLI
+#    is up.
+# 2. The auth-token mint inside :func:`load_config` re-reads under the
+#    lock before persisting so concurrent edits still survive
+#    (round 9 audit fix).
 #
 # POSIX-only. PollyPM ships as a personal-use Mac/Linux deployment;
 # Windows isn't a supported target.

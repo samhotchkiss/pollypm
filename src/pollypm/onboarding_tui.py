@@ -1074,6 +1074,16 @@ class OnboardingApp(App[OnboardingResult | None]):
             if self.project_selection is not None:
                 self.state.selected_project_paths = list(self.project_selection.selected)
             config = self._build_config()
+            # #2063 round 9 audit: this is a fresh-config build + write
+            # during initial onboarding, NOT a load → mutate → write.
+            # There is no prior snapshot to merge against, so wrapping
+            # with ``config_rmw_lock`` would only serialise against
+            # concurrent writers — and during first-run onboarding
+            # there shouldn't BE any concurrent writers (the API/CLI
+            # hasn't been started yet). Pattern A inside
+            # :func:`write_config` still serialises the multi-file write
+            # itself, so a torn write across global + per-project files
+            # cannot happen. Intentionally outside the RMW wrap.
             write_config(config, path=self.config_path, force=True)
             self.step = "tour"
             self._render_current_step()

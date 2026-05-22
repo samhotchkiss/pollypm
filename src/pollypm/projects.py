@@ -867,14 +867,38 @@ def scan_projects(
     scan_root: Path | None = None,
     interactive: bool = True,
 ) -> list[KnownProject]:
-    config = load_config(config_path)
+    # #2063 round 9: discovery (filesystem walk) and interactive
+    # confirmation happen OUTSIDE the shared config_rmw_lock. Holding the
+    # lock across ``typer.confirm`` would block every other config writer
+    # for the duration of user thinking time. Codex's prescription is
+    # "do discovery outside the critical section" then enter the lock to
+    # reload + recompute + merge + write so concurrent additions by other
+    # writers (API pause, CLI remove) are visible and survive.
+    #
+    # Pre-lock snapshot is best-effort: by the time we reload inside the
+    # lock the on-disk config may differ. We re-derive ``known_paths`` /
+    # ``known_keys`` against the FRESH snapshot so candidates added by a
+    # concurrent writer between the prompt and the lock acquire are
+    # skipped (rather than overwritten).
+    initial_config = load_config(config_path)
     root = normalize_project_path(scan_root or DEFAULT_SCAN_ROOT)
-    known_paths = {normalize_project_path(project.path) for project in config.projects.values()}
-    discovered = discover_recent_git_repositories(root, known_paths=known_paths, recent_days=14)
-    added: list[KnownProject] = []
+    pre_known_paths = {
+        normalize_project_path(project.path)
+        for project in initial_config.projects.values()
+    }
+    discovered = discover_recent_git_repositories(
+        root, known_paths=pre_known_paths, recent_days=14
+    )
 
+    # Confirm with the operator BEFORE taking the lock. The confirmation
+    # default is computed against the pre-lock snapshot's workspace_root;
+    # an external mutation that flips workspace_root between here and the
+    # lock acquire is acceptable — the operator's intent is captured.
+    candidates: list[Path] = []
     for repo_path in discovered:
-        default_choice = _default_add_choice(repo_path, config.project.workspace_root)
+        default_choice = _default_add_choice(
+            repo_path, initial_config.project.workspace_root
+        )
         if interactive:
             add = typer.confirm(
                 f"Add project {repo_path.name} at {repo_path}?",
@@ -882,19 +906,48 @@ def scan_projects(
             )
             if not add:
                 continue
-        project = KnownProject(
-            key=make_project_key(repo_path, set(config.projects) | {item.key for item in added}),
-            path=repo_path,
-            name=repo_path.name,
-            persona_name=default_persona_name(repo_path.name),
-            kind=ProjectKind.GIT,
-        )
-        config.projects[project.key] = project
-        ensure_project_scaffold(repo_path)
-        added.append(project)
+        candidates.append(repo_path)
 
-    if added:
-        write_config(config, config_path, force=True)
+    if not candidates:
+        return []
+
+    added: list[KnownProject] = []
+    with config_rmw_lock(config_path):
+        fresh = load_config(config_path)
+        # Recompute known sets against the fresh snapshot so a
+        # concurrent register/scan that landed between our discovery and
+        # this lock acquire is visible.
+        known_paths = {
+            normalize_project_path(project.path)
+            for project in fresh.projects.values()
+        }
+        known_keys = set(fresh.projects)
+        for repo_path in candidates:
+            if normalize_project_path(repo_path) in known_paths:
+                # A concurrent writer added this project between our
+                # pre-lock discovery and the lock acquire. Skip rather
+                # than clobber.
+                continue
+            key = make_project_key(repo_path, known_keys)
+            known_keys.add(key)
+            project = KnownProject(
+                key=key,
+                path=repo_path,
+                name=repo_path.name,
+                persona_name=default_persona_name(repo_path.name),
+                kind=ProjectKind.GIT,
+            )
+            fresh.projects[key] = project
+            added.append(project)
+
+        if added:
+            write_config(fresh, config_path, force=True)
+
+    # Filesystem scaffolding is idempotent (``mkdir(exist_ok=True)``) and
+    # touches each project's own ``.pollypm/`` dir, not the shared
+    # global TOML — safe to run outside the critical section.
+    for project in added:
+        ensure_project_scaffold(project.path)
 
     return added
 

@@ -560,3 +560,98 @@ def test_styles_have_mobile_media_query(client: TestClient) -> None:
     assert "@media (max-width: 768px)" in body, (
         "expected mobile/tablet media query for phone Tailscale users"
     )
+
+
+# -------- Round-4: renderDashboard ↔ real /dashboard schema -------------
+
+
+def test_ui_app_js_reads_real_dashboard_fields(client: TestClient) -> None:
+    """``app.js`` reads the real ``DashboardResponse`` schema.
+
+    Round-3 Codex blocker: the v0 right rail was looking for top-level
+    counters like ``attention_count`` / ``workers.active`` that don't
+    exist on ``GET /api/v1/dashboard``. The real envelope groups
+    operator counters under ``rollups`` (see
+    ``src/pollypm/web_api/routes/dashboard.py:DashboardRollups``). Pin
+    the rename so a future refactor that drops the ``rollups.`` prefix
+    or stops reading ``daemon_status`` fails this assertion before it
+    ships an empty rail again.
+    """
+    body = client.get("/ui/app.js").text
+    assert "rollups." in body, (
+        "app.js must read counters off the ``rollups`` envelope, not "
+        "from phantom top-level fields"
+    )
+    real_fields = [
+        "open_inbox_count",
+        "pending_plan_reviews",
+        "alert_count",
+        "daemon_status",
+        "sweep_count_24h",
+        "message_count_24h",
+        "active_sessions",
+        "tracked_count",
+    ]
+    hits = [name for name in real_fields if name in body]
+    assert len(hits) >= 3, (
+        f"app.js should reference at least 3 real DashboardResponse "
+        f"fields; only found: {hits}"
+    )
+
+
+def test_ui_app_js_no_phantom_dashboard_fields(client: TestClient) -> None:
+    """``app.js`` must not look for the pre-round-4 phantom field names.
+
+    The fallback ``Object.keys(data).slice(0, 6)`` branch in the old
+    ``renderDashboard`` rendered top-level envelope keys like
+    ``"projects"`` and ``"rollups"`` as ``"N keys"`` cards whenever the
+    candidate paths missed — which they always did against the real
+    API. Pin both the phantom candidate paths AND the dead fallback
+    branch so a regression re-introducing either fails loudly.
+    """
+    body = client.get("/ui/app.js").text
+    phantom_paths = [
+        "attention_count",
+        "blocked_count",
+        '"workers", "active"',
+        '"tasks", "open"',
+        '"projects", "tracked"',
+    ]
+    leaks = [name for name in phantom_paths if name in body]
+    assert not leaks, (
+        f"app.js still references phantom dashboard fields: {leaks}. "
+        f"Real schema is documented on DashboardRollups in "
+        f"src/pollypm/web_api/routes/dashboard.py."
+    )
+    # The old fallback ("N keys" cards from arbitrary top-level keys)
+    # was the symptom Codex flagged in round 3. Make sure the rewrite
+    # removed it.
+    assert "N keys" not in body
+    assert "+ \" keys\"" not in body
+    assert '" keys"' not in body, (
+        "app.js still contains the dead ``N keys`` fallback that "
+        "rendered envelope keys as cards when the candidate paths "
+        "missed"
+    )
+
+
+def test_ui_app_js_renderdashboard_uses_buildcard_helper(
+    client: TestClient,
+) -> None:
+    """The rewrite centralizes card creation in a single helper.
+
+    Codex round-3 asked for the mapping to live in ``one small adapter
+    in app.js``. Pin that structure so future edits don't fan out
+    inline card-building logic across the function and re-grow the
+    schema drift surface.
+    """
+    body = client.get("/ui/app.js").text
+    assert "function buildCard(" in body, (
+        "renderDashboard must route card construction through a single "
+        "``buildCard`` helper so the schema mapping stays centralized"
+    )
+    # And ``scoped_fields`` is consumed so project-filtered counters
+    # are visibly tagged ("(filtered)") rather than presented as
+    # workspace-wide.
+    assert "scoped_fields" in body
+    assert "(filtered)" in body

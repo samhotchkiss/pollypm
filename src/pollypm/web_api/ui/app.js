@@ -269,13 +269,25 @@
     }
   }
 
-  function pickNumber(obj /*, ...path */) {
-    let cur = obj;
-    for (let i = 1; i < arguments.length; i++) {
-      if (cur == null) return null;
-      cur = cur[arguments[i]];
-    }
-    return typeof cur === "number" ? cur : null;
+  // Map a server-side ``scoped_fields`` entry (e.g. ``rollups.open_inbox_count``)
+  // to a small ``(filtered)`` tag on the corresponding card. ``scoped_fields``
+  // is set by the dashboard route whenever ``?project=`` narrows the
+  // response so the client can distinguish a workspace counter from a
+  // project-scoped one without having to know the gather pipeline's rules.
+  // We currently never poll with ``?project=`` from the v0 UI, but reading
+  // the field keeps the rail honest if the URL is ever crafted by hand
+  // and makes the contract self-documenting in the DOM.
+  function isScoped(scopedFields, key) {
+    if (!Array.isArray(scopedFields)) return false;
+    return scopedFields.indexOf(key) !== -1;
+  }
+
+  function buildCard(label, value, cls, scoped) {
+    const labelText = scoped ? label + " (filtered)" : label;
+    return el("div", { class: "rollup-card " + (cls || "") }, [
+      el("div", { class: "rollup-label", text: labelText }),
+      el("div", { class: "rollup-value", text: String(value) }),
+    ]);
   }
 
   function renderDashboard(data) {
@@ -285,41 +297,95 @@
       box.appendChild(el("div", { class: "rollup-empty", text: "no data" }));
       return;
     }
+    // The dashboard envelope matches ``DashboardResponse`` in
+    // ``src/pollypm/web_api/routes/dashboard.py`` — counters live under
+    // ``rollups``, list fields (``active_sessions``, ``recent_messages``,
+    // ``projects``) sit at the top level, and ``daemon_status`` is a
+    // string ("up" | "down"). ``scoped_fields`` enumerates which
+    // sub-fields got narrowed by a ``?project=`` filter so the UI can
+    // mark them as filtered rather than mis-presenting them as global.
+    const rollups = (data && typeof data.rollups === "object" && data.rollups)
+      || {};
+    const scopedFields = Array.isArray(data.scoped_fields)
+      ? data.scoped_fields : [];
     const cards = [];
-    const candidates = [
-      { label: "attention", path: ["attention_count"], cls: "rollup-attention" },
-      { label: "inbox unread", path: ["inbox", "unread"], cls: "rollup-attention" },
-      { label: "blocked", path: ["blocked_count"], cls: "rollup-blocked" },
-      { label: "active workers", path: ["workers", "active"], cls: "rollup-working" },
-      { label: "tasks open", path: ["tasks", "open"], cls: "" },
-      { label: "projects", path: ["projects", "tracked"], cls: "" },
-    ];
-    for (const c of candidates) {
-      const val = pickNumber.apply(null, [data].concat(c.path));
-      if (val === null) continue;
-      cards.push(
-        el("div", { class: "rollup-card " + c.cls }, [
-          el("div", { class: "rollup-label", text: c.label }),
-          el("div", { class: "rollup-value", text: String(val) }),
-        ]),
-      );
+
+    // --- counters from rollups ------------------------------------------
+    if (typeof rollups.open_inbox_count === "number") {
+      cards.push(buildCard(
+        "inbox",
+        rollups.open_inbox_count + " items",
+        "rollup-attention",
+        isScoped(scopedFields, "rollups.open_inbox_count"),
+      ));
     }
-    if (cards.length === 0) {
-      // Surface whatever top-level keys exist so the rail is not dead.
-      const keys = Object.keys(data).slice(0, 6);
-      for (const k of keys) {
-        const raw = data[k];
-        const display = (raw && typeof raw === "object")
-          ? Object.keys(raw).length + " keys"
-          : String(raw);
-        cards.push(
-          el("div", { class: "rollup-card" }, [
-            el("div", { class: "rollup-label", text: k }),
-            el("div", { class: "rollup-value", text: display }),
-          ]),
-        );
-      }
+    if (typeof rollups.pending_plan_reviews === "number") {
+      cards.push(buildCard(
+        "plan reviews",
+        rollups.pending_plan_reviews + " waiting",
+        "rollup-attention",
+        isScoped(scopedFields, "rollups.pending_plan_reviews"),
+      ));
     }
+    if (typeof rollups.alert_count === "number") {
+      cards.push(buildCard(
+        "alerts",
+        rollups.alert_count,
+        rollups.alert_count > 0 ? "rollup-blocked" : "",
+        // alert_count is intentionally global per DashboardRollups
+        // docstring — never appears in scoped_fields, so no tag.
+        false,
+      ));
+    }
+
+    // --- activity (24h) -------------------------------------------------
+    if (
+      typeof rollups.sweep_count_24h === "number"
+      || typeof rollups.message_count_24h === "number"
+    ) {
+      const sweeps = typeof rollups.sweep_count_24h === "number"
+        ? rollups.sweep_count_24h : 0;
+      const msgs = typeof rollups.message_count_24h === "number"
+        ? rollups.message_count_24h : 0;
+      cards.push(buildCard(
+        "activity (24h)",
+        sweeps + " sweeps / " + msgs + " msgs",
+        "rollup-working",
+        false,
+      ));
+    }
+
+    // --- daemon health --------------------------------------------------
+    if (typeof data.daemon_status === "string") {
+      const up = data.daemon_status === "up";
+      cards.push(buildCard(
+        "daemon",
+        data.daemon_status,
+        up ? "rollup-working" : "rollup-blocked",
+        false,
+      ));
+    }
+
+    // --- active sessions (list length) ----------------------------------
+    if (Array.isArray(data.active_sessions)) {
+      cards.push(buildCard(
+        "active sessions",
+        data.active_sessions.length,
+        "",
+        isScoped(scopedFields, "active_sessions"),
+      ));
+    }
+
+    // --- tracked projects ----------------------------------------------
+    if (typeof rollups.tracked_count === "number") {
+      cards.push(buildCard(
+        "projects tracked",
+        rollups.tracked_count,
+        "",
+        isScoped(scopedFields, "rollups.tracked_count"),
+      ));
+    }
+
     if (cards.length === 0) {
       box.appendChild(el("div", { class: "rollup-empty", text: "no rollups" }));
       return;

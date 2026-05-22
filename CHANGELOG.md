@@ -76,13 +76,12 @@ Added, Changed, and Removed.
 - State-cache routing (Move A PR 4, closes #1664) flips the
   `POLLYPM_STATE_CACHE` env-flag default from OFF to **ON**. The
   cache is now the authoritative source for the 7 hot-path call
-  sites routed in PRs 2 and 3. The env var stays as a kill-switch
-  for one release: `POLLYPM_STATE_CACHE=0` (or `false` / `no` /
-  `off`) falls back to the direct DB paths the routed call sites
-  preserved. Per design §6.4, the parity-debugging window closed
-  with this flip — the divergence sampler is now a no-op when the
-  cache is authoritative (it only runs when an operator explicitly
-  sets the kill-switch).
+  sites routed in PRs 2 and 3. After PR4 lands, there is no
+  runtime parity sampler. The cache is authoritative by default.
+  Rollback path is `POLLYPM_STATE_CACHE=0` which makes every
+  routed call site fall through to the direct facade. Parity is
+  covered by tests; runtime divergence telemetry is deferred to
+  future observability work.
 - State-cache routing (Move A PR 3, refs #1664) extends the
   `POLLYPM_STATE_CACHE=1` fast path to the remaining 5 hot-path call
   sites from `docs/design/move-a-state-cache.md` §5. With the flag

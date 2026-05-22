@@ -1,13 +1,15 @@
 """Tests for the :envvar:`POLLYPM_STATE_CACHE` env flag.
 
-PR 1 ships the cache OFF by default. When off, :func:`get_cache`
-returns a shim whose ``snapshot()`` is ``{}`` and ``get()`` returns
-``None`` — so call sites that opt in later (PR 2+) can hold a
-``StateCacheLike`` reference unconditionally without checking the flag.
+Post-PR4: cache defaults ON. These tests pin the kill-switch
+(``POLLYPM_STATE_CACHE=0``) fall-through path and the env-flag parser.
+When the kill-switch is set, :func:`get_cache` returns a shim whose
+``snapshot()`` is ``{}`` and ``get()`` returns ``None`` — so call sites
+can hold a ``StateCacheLike`` reference unconditionally without checking
+the flag.
 
 Importing :mod:`pollypm.state_cache` MUST be side-effect-free in
 either mode; the refresher only starts on the first :func:`get_cache`
-call when the flag is on.
+call when the cache is active.
 """
 
 from __future__ import annotations

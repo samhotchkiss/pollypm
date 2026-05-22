@@ -9,7 +9,7 @@ The shipped Move A behavior diverges from the original design in three places. T
 - `_maybe_cache_route_awaits_user` / `_maybe_cache_count_awaits_user` decline when the workspace-root inbox has any open message (via `has_workspace_root_open_messages` probe). Workspace-root inbox isn't yet represented in cache entries. Tracked in [#2051](https://github.com/samhotchkiss/pollypm/issues/2051).
 
 Design document for issue [#1664](https://github.com/samhotchkiss/pollypm/issues/1664).
-Status: **implemented** (2026-05-20) — PR 1 #2000, PR 2 #2016, PR 3 #2026, PR 4 #2027.
+Status: **implemented** (2026-05-20) — PR 1 #2000, PR 2 #2016, PR 3 #2026, PR 4 #2029.
 Authors: Sam, with research from the 2026-05-18 rail-perf review on [#1634](https://github.com/samhotchkiss/pollypm/issues/1634).
 
 > **Implementation note (2026-05-20):** The four-PR rollout from §6
@@ -429,14 +429,16 @@ Effort: ~0.5d.
 
 Effort: ~0.5d.
 
-- `POLLYPM_STATE_CACHE` default flips to **on**. ✅ Shipped #2027.
+- `POLLYPM_STATE_CACHE` default flips to **on**. ✅ Shipped #2029.
 - Leave the env var as a kill-switch for one release. ✅ Kept.
 - After two weeks of green production telemetry, remove the shim path and
   the direct-DB fallbacks in the routed call sites. ⏳ Deferred — tracked
   as a follow-up after 14-day production observation.
-- Divergence sampler from PR 2 is no-op when cache is authoritative
-  (kill-switch not set). The sampler only emits parity warnings if an
-  operator explicitly flips the kill-switch. ✅ Shipped #2027.
+- After PR4 lands, there is no runtime parity sampler. The cache is
+  authoritative by default. Rollback path is `POLLYPM_STATE_CACHE=0`
+  which makes every routed call site fall through to the direct facade.
+  Parity is covered by tests; runtime divergence telemetry is deferred
+  to future observability work. ✅ Shipped #2029.
 
 ### 6.5 Rollback
 
@@ -448,6 +450,8 @@ Effort: ~0.5d.
 ---
 
 ## 7. Risks
+
+> Superseded by PR #2029 (PR4): runtime divergence sampler removed; rollback is the kill-switch.
 
 | Risk | Detection | Mitigation |
 |---|---|---|

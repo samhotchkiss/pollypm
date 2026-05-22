@@ -544,21 +544,20 @@ def _scan_to_state(
     )
 
 
-# Move A PR 2 — divergence sampler for the cache-routed fast path
-# (``docs/design/move-a-state-cache.md`` §6.2 last bullet). Per-call-site
-# counter so a busy site doesn't borrow samples from a quiet one.
+# Move A PR 4 — cache-routed fast path for the dashboard state map
+# (``docs/design/move-a-state-cache.md`` §6.2). Cache is authoritative
+# by default; ``POLLYPM_STATE_CACHE=0`` forces fall-through. Per-call-site
+# counter retained for the kill-switch path so a busy site doesn't borrow
+# samples from a quiet one.
 _STATE_MAP_DIVERGENCE_COUNTER = _DivergenceCounter()
 
 
 def _maybe_cache_route_state_map(config) -> dict[str, ProjectState] | None:
     """Return the cache-routed state map, or ``None`` to fall through.
 
-    Returns ``None`` when the env flag is off, when the cache is cold
-    (no entries yet — letting the direct path warm it via the
-    refresher), when the cache lacks a state for any tracked project
-    (the direct path is needed to fill the gap), or on any
-    unexpected exception. The 1-in-N divergence sampler then runs
-    both paths and logs a WARN on mismatch.
+    Cache lookup; fall through to direct path on cache miss / cache
+    disabled / config-identity mismatch / partial coverage (cache
+    lacks a state for any tracked project).
     """
 
     try:

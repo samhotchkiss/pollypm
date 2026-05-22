@@ -85,10 +85,6 @@ __all__ = [
 # ── flag plumbing ──────────────────────────────────────────────────
 
 
-def _flag_truthy(raw: str | None) -> bool:
-    return raw.strip().lower() in {"1", "true", "yes", "on"}
-
-
 def _flag_falsy(raw: str | None) -> bool:
     if raw is None:
         return False

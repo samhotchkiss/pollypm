@@ -191,13 +191,12 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     instead of each running their own (~2 pg queries + the plan-review
     filter). Callers receive a fresh ``list`` copy so mutation is safe.
 
-    Move A PR 2 (#1664): when ``POLLYPM_STATE_CACHE=1`` is set AND the
+    Move A PR 2 (#1664): when ``POLLYPM_STATE_CACHE`` is enabled AND the
     in-process cache has at least one populated entry, this function
     short-circuits to concatenating each entry's ``awaits_user_items``
-    and skips the workspace-wide pg sweep entirely. The flag is OFF
-    by default; PR 4 will flip it after divergence-sampler telemetry
-    is green. A 1-in-N sampler runs both paths and logs a WARN on
-    mismatch (see :mod:`pollypm.state_cache.divergence`).
+    and skips the workspace-wide pg sweep entirely. Cache is authoritative
+    by default. ``POLLYPM_STATE_CACHE=0`` forces fall-through. No runtime
+    sampler.
     """
     cached_result = _maybe_cache_route_awaits_user(config)
     if cached_result is not None:
@@ -296,9 +295,8 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     * Any unexpected exception (defensive — broken cache must never
       crash the rail badge).
 
-    On a hit the divergence sampler MAY also run the direct path and
-    log a WARN if the two disagree. The sampler runs at most 1-in-N
-    so the cache fast-path stays a single dict scan in the common case.
+    Cache lookup; fall through to direct path on cache miss / cache
+    disabled / config-identity mismatch / workspace-root inbox row.
     """
 
     try:

@@ -1,7 +1,12 @@
-"""Inbox read endpoints (Phase 1).
+"""Inbox endpoints (Phase 1 reads + Phase 2 writes).
 
-Implements ``GET /api/v1/inbox`` and ``GET /api/v1/inbox/{id}``.
-Reply / archive ship in Phase 2 (#1548).
+Phase 1 (#1547) shipped ``GET /api/v1/inbox`` and
+``GET /api/v1/inbox/{id}``. Phase 2 (#1548) layers in the write
+surface — archive / snooze / promote-to-task / mark-read / reply —
+all routed through the same canonical work-service writers the
+cockpit uses (#1389). The Web API is never a second writer surface;
+these handlers are thin adapters that translate work-service
+exceptions into the typed error envelope (§6).
 """
 
 from __future__ import annotations
@@ -11,9 +16,26 @@ from typing import Annotated
 from fastapi import APIRouter, Query
 
 from pollypm.web_api.errors import not_found
-from pollypm.web_api.models import InboxItemDetail, InboxListResponse
+from pollypm.web_api.models import (
+    InboxArchiveRequest,
+    InboxItemDetail,
+    InboxListResponse,
+    InboxMarkReadRequest,
+    InboxPromoteRequest,
+    InboxReplyRequest,
+    InboxSnoozeRequest,
+    TaskDetail,
+)
 from pollypm.web_api.routes._deps import ConfigDep
-from pollypm.web_api.service import get_inbox_item, list_inbox
+from pollypm.web_api.service import (
+    archive_inbox_item,
+    get_inbox_item,
+    list_inbox,
+    mark_read_inbox_item,
+    promote_inbox_to_task,
+    reply_inbox_item,
+    snooze_inbox_item,
+)
 
 router = APIRouter(tags=["Inbox"])
 
@@ -58,3 +80,143 @@ def get_inbox_item_endpoint(id: str, config: ConfigDep) -> InboxItemDetail:
     if detail is None:
         raise not_found(f"Inbox item not found: {id}")
     return detail
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 — inbox write endpoints
+#
+# Each POST handler:
+#   * routes through a service-layer helper that opens
+#     :func:`create_work_service` once per call (mirrors how queue_task
+#     wedge works — same canonical writer the cockpit uses).
+#   * returns the post-mutation task envelope so the client refreshes
+#     UI without a follow-up GET.
+#
+# Idempotency: an earlier draft of these handlers advertised an
+# optional ``Idempotency-Key`` request header on every POST. There is
+# no idempotency store wired into the API today (grep for
+# ``idempotency`` returns only docs/comments), so the header would
+# have been silently ignored — a retry after a network drop could
+# create duplicate promoted tasks, replies, and snooze rows while the
+# client reasonably believed the header protected it. The header is
+# intentionally NOT declared here; a real idempotency cache is
+# deferred until a future PR can wire it through every non-idempotent
+# verb (see #2060 review for context).
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/inbox/{id:path}/archive",
+    response_model=TaskDetail,
+    summary="Archive (close) an inbox item",
+    operation_id="archiveInboxItem",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or inbox item not found."},
+        "409": {"description": "Item is already in a terminal state."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def archive_inbox_item_endpoint(
+    id: str,
+    config: ConfigDep,
+    body: InboxArchiveRequest | None = None,
+) -> TaskDetail:
+    reason = body.reason if body is not None else None
+    return archive_inbox_item(config, id, reason=reason)
+
+
+@router.post(
+    "/inbox/{id:path}/snooze",
+    response_model=TaskDetail,
+    summary="Snooze an inbox item until a future time",
+    operation_id="snoozeInboxItem",
+    responses={
+        "400": {"description": "Snooze window invalid (missing / past / >30d)."},
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or inbox item not found."},
+        "409": {"description": "Item is in a terminal state and cannot be snoozed."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def snooze_inbox_item_endpoint(
+    id: str,
+    body: InboxSnoozeRequest,
+    config: ConfigDep,
+) -> TaskDetail:
+    return snooze_inbox_item(
+        config,
+        id,
+        duration_seconds=body.duration_seconds,
+        until=body.until,
+        reason=body.reason,
+    )
+
+
+@router.post(
+    "/inbox/{id:path}/promote-to-task",
+    response_model=TaskDetail,
+    summary="Promote an inbox item into a new actionable task",
+    operation_id="promoteInboxItem",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Source or destination project not found."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def promote_inbox_item_endpoint(
+    id: str,
+    config: ConfigDep,
+    body: InboxPromoteRequest | None = None,
+) -> TaskDetail:
+    if body is None:
+        body = InboxPromoteRequest()
+    return promote_inbox_to_task(
+        config,
+        id,
+        target_project=body.project,
+        prompt=body.prompt,
+        title=body.title,
+    )
+
+
+@router.post(
+    "/inbox/{id:path}/mark-read",
+    response_model=TaskDetail,
+    summary="Record a read-marker on an inbox item",
+    operation_id="markInboxItemRead",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or inbox item not found."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def mark_read_inbox_item_endpoint(
+    id: str,
+    config: ConfigDep,
+    body: InboxMarkReadRequest | None = None,
+) -> TaskDetail:
+    actor = (body.actor if body is not None else None) or "api"
+    return mark_read_inbox_item(config, id, actor=actor)
+
+
+@router.post(
+    "/inbox/{id:path}/reply",
+    response_model=TaskDetail,
+    summary="Append a reply to an inbox thread",
+    operation_id="replyInboxItem",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or inbox item not found."},
+        "422": {"description": "Reply body failed validation."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def reply_inbox_item_endpoint(
+    id: str,
+    body: InboxReplyRequest,
+    config: ConfigDep,
+) -> TaskDetail:
+    return reply_inbox_item(
+        config, id, body=body.body, owner=body.owner,
+    )

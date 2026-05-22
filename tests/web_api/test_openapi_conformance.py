@@ -122,6 +122,146 @@ def test_chat_message_type_enum_matches_runtime() -> None:
     )
 
 
+def test_static_yaml_does_not_advertise_idempotency_on_inbox_writes() -> None:
+    """Static contract must match the implementation: no Idempotency-Key
+    on inbox-write paths.
+
+    Round 1 of #2060 stripped the header from the FastAPI handlers
+    because no replay cache exists; round 2 (Codex blocker #1) caught
+    that the static YAML still advertised it on every inbox-write
+    path AND that the shared component description still claimed
+    "server caches/replays responses for 24h". This test pins both
+    fixes:
+
+    - None of the 5 inbox-write paths reference
+      ``#/components/parameters/IdempotencyKey``.
+    - If the ``IdempotencyKey`` component still exists (the task
+      endpoints — ``/approve``, ``/reject``, ``/queue`` — still
+      accept the header for forward-compat with a future store) its
+      description must be honest about NOT replaying responses
+      today. The old "Server caches the response for 24h" string is
+      the smoking gun and is forbidden.
+    """
+    contract = _load_contract()
+    inbox_write_paths = [
+        "/inbox/{id}/reply",
+        "/inbox/{id}/archive",
+        "/inbox/{id}/snooze",
+        "/inbox/{id}/promote-to-task",
+        "/inbox/{id}/mark-read",
+    ]
+    paths = contract.get("paths", {})
+    for path in inbox_write_paths:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        params = post.get("parameters", []) or []
+        refs = [
+            p.get("$ref", "") for p in params if isinstance(p, dict)
+        ]
+        assert not any(
+            "IdempotencyKey" in ref for ref in refs
+        ), (
+            f"{path} static contract still advertises Idempotency-Key "
+            "but the handler does not implement it (#2060). Strip the "
+            "$ref or wire a real replay cache first."
+        )
+
+    # If the component still exists, its description must NOT claim
+    # caching/replay (that promise was the actual contract bug).
+    component = (
+        contract.get("components", {}).get("parameters", {}).get(
+            "IdempotencyKey"
+        )
+    )
+    if component is not None:
+        description = (component.get("description") or "").lower()
+        assert "caches the response" not in description, (
+            "IdempotencyKey component still promises a 24h replay "
+            "cache that the server does not implement (#2060)."
+        )
+        assert "replays it on retry" not in description, (
+            "IdempotencyKey component still promises retry replay "
+            "that the server does not implement (#2060)."
+        )
+
+
+def test_static_yaml_declares_503_on_inbox_write_paths() -> None:
+    """Static contract must declare 503 on every inbox-write path.
+
+    Round 4 of #2060: the FastAPI route decorators in
+    ``src/pollypm/web_api/routes/inbox.py`` list ``503`` for archive /
+    snooze / promote-to-task / mark-read / reply, and the service
+    helpers map ``_BACKING_STORE_ERRORS`` to the
+    ``service_unavailable`` typed error envelope. The static
+    ``docs/api/openapi.yaml`` was missing 503 entries on those paths,
+    so a generated client would not know to handle a backing-store
+    outage with the same error shape it sees from the live server.
+
+    This test pins the contract: every inbox-write path must declare
+    503 under its ``responses:`` block (either inline or via a shared
+    ``$ref`` to ``#/components/responses/ServiceUnavailable``).
+    """
+    contract = _load_contract()
+    inbox_write_paths = [
+        "/inbox/{id}/reply",
+        "/inbox/{id}/archive",
+        "/inbox/{id}/snooze",
+        "/inbox/{id}/promote-to-task",
+        "/inbox/{id}/mark-read",
+    ]
+    paths = contract.get("paths", {})
+    for path in inbox_write_paths:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        responses = post.get("responses", {}) or {}
+        # OpenAPI status codes are stringly-typed in YAML.
+        assert "503" in responses, (
+            f"{path} POST missing 503 response in static contract "
+            "(#2060 round-4). The FastAPI handler maps backing-store "
+            "errors to a 503 with the service_unavailable envelope; "
+            "the YAML must say so too."
+        )
+
+
+def test_inbox_archive_reason_documented_as_post_transition() -> None:
+    """Pin the reason-note ordering contract.
+
+    Round 4 of #2060 reordered ``archive_inbox_item`` to write the
+    reason note ONLY after ``archive_task(strict=True)`` succeeds, so
+    a losing concurrent archiver no longer leaves a stray
+    ``archive reason:`` note on a task it never archived. Round 7
+    (Codex) caught that ``docs/api/openapi.yaml`` still described the
+    old pre-transition order in the ``InboxArchiveRequest.reason``
+    schema, advertising a contract the implementation no longer
+    honors.
+
+    This test fails if anyone rewrites the schema description back to
+    a pre-transition contract.
+    """
+    contract = _load_contract()
+    description = (
+        contract["components"]["schemas"]["InboxArchiveRequest"]
+        ["properties"]["reason"]["description"]
+    )
+    lowered = description.lower()
+    assert "after" in lowered, (
+        "InboxArchiveRequest.reason description must say the note is "
+        "recorded AFTER the archive transition (#2060 round-4 / "
+        "round-7). Got: " + description
+    )
+    assert "transition" in lowered, (
+        "InboxArchiveRequest.reason description must reference the "
+        "archive transition explicitly so the ordering contract is "
+        "unambiguous. Got: " + description
+    )
+    assert "before the state transition" not in lowered, (
+        "InboxArchiveRequest.reason description reverted to the old "
+        "pre-transition contract. The implementation writes the note "
+        "AFTER archive_task(strict=True) succeeds — see "
+        "src/pollypm/web_api/service.py archive_inbox_item."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

@@ -280,6 +280,23 @@ class WorkService(Protocol):
         """
         ...
 
+    def latest_snoozes_bulk(
+        self, task_keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], ContextEntry]:
+        """Return ``{(project, task_number): latest_snooze_entry}`` (#2060).
+
+        Single-query bulk fetch of the most-recent ``entry_type='snooze'``
+        row per task. Replaces the per-task
+        ``get_context(entry_type='snooze', limit=1)`` loop the inbox
+        list path was running on a user-facing scan. Tasks with no
+        snooze rows are absent from the returned mapping. An empty
+        ``task_keys`` short-circuits without a query.
+
+        Pinned on the protocol so the bulk path is part of the
+        contract (not a backend-specific optimisation that drifts).
+        """
+        ...
+
     # ------------------------------------------------------------------
     # Relationships
     # ------------------------------------------------------------------

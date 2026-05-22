@@ -26,6 +26,7 @@ import pytest
 
 from pollypm.work.models import WorkStatus
 from pollypm.work.service_support import (
+    InvalidTransitionError,
     TaskNotFoundError,
     ValidationError,
 )
@@ -209,3 +210,175 @@ class TestArchiveTask:
         svc = pg_work_service
         with pytest.raises(TaskNotFoundError):
             svc.archive_task("demo/777", actor="user")
+
+    # ------------------------------------------------------------------
+    # strict=True (#2060) — atomic concurrent-archive contract
+    # ------------------------------------------------------------------
+
+    def test_archive_strict_flips_status(self, pg_work_service):
+        svc = pg_work_service
+        task_id = _inbox_task(svc)
+        archived = svc.archive_task(task_id, actor="user", strict=True)
+        assert archived.work_status == WorkStatus.DONE
+
+    def test_archive_strict_raises_when_already_terminal(
+        self, pg_work_service,
+    ):
+        svc = pg_work_service
+        task_id = _inbox_task(svc)
+        svc.archive_task(task_id, actor="user")
+        # Second archiver under strict mode must NOT silently succeed
+        # — that was the race surfaced by #2060 (Codex P0 #3).
+        with pytest.raises(InvalidTransitionError):
+            svc.archive_task(task_id, actor="user", strict=True)
+
+    def test_archive_strict_concurrent_only_one_winner(self, pg_work_service):
+        """Two threads race the same archive; exactly one wins.
+
+        Regression test for the #2060 race: under the old pre-check
+        version both threads observed the row in ``in_progress``, both
+        called the idempotent ``archive_task``, and both returned 200
+        — losing the documented ``invalid_state`` contract. With
+        ``strict=True`` the conditional UPDATE serialises the writers
+        so the loser sees rowcount==0 and raises
+        ``InvalidTransitionError``.
+        """
+        import threading
+
+        svc = pg_work_service
+        task_id = _inbox_task(svc)
+        barrier = threading.Barrier(2)
+        results: list[object] = []
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def attempt() -> None:
+            try:
+                barrier.wait(timeout=5)
+                outcome = svc.archive_task(task_id, actor="racer", strict=True)
+                with lock:
+                    results.append(outcome)
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        # Exactly one winner, one InvalidTransitionError loser.
+        assert len(results) == 1, (results, errors)
+        assert len(errors) == 1, (results, errors)
+        assert isinstance(errors[0], InvalidTransitionError)
+
+        # And the canonical writer only appended ONE archive
+        # transition row, matching the contract for idempotent /
+        # serialised archivers.
+        task = svc.get(task_id)
+        archive_transitions = [
+            tr for tr in task.transitions
+            if tr.to_state == WorkStatus.DONE.value
+            and (tr.reason or "").startswith("inbox.archive")
+        ]
+        assert len(archive_transitions) == 1
+
+
+# ---------------------------------------------------------------------------
+# latest_snoozes_bulk (#2060 round-2) — single-query snooze lookup for the
+# inbox-list scan path. Replaces the per-task
+# ``get_context(entry_type='snooze', limit=1)`` loop in
+# ``_active_snoozed_ids`` (Codex round-2 blocker #2 on PR #2060).
+# ---------------------------------------------------------------------------
+
+
+class TestLatestSnoozesBulk:
+    """Bulk snooze fetch — one SQL for N tasks, latest row per task.
+
+    The helper's docstring promises a single statement; verifying the
+    actual statement count would require monkeypatching the pool, but
+    we can lock the contract behaviour (correct latest row per task,
+    absent when no snooze, no leakage of other entry_types) so a
+    regression that splits into N queries still ships obviously
+    correct data while the bulk-path test in
+    ``tests/test_inbox_writes_endpoint.py`` pins the call-count
+    behaviour at the API integration layer.
+    """
+
+    def test_empty_input_short_circuits(self, pg_work_service):
+        # ``[]`` returns ``{}`` without hitting the DB (the helper
+        # branches early). Asserting the result shape is enough — a
+        # regression that hits the DB with an empty IN-list would
+        # raise on the bind, not silently misbehave.
+        assert pg_work_service.latest_snoozes_bulk([]) == {}
+
+    def test_returns_latest_snooze_per_task(self, pg_work_service):
+        svc = pg_work_service
+        t1 = _inbox_task(svc, title="task one")
+        t2 = _inbox_task(svc, title="task two")
+        # t1: two snoozes — bulk must return the SECOND (latest by id).
+        svc.add_context(t1, "api", "until_iso=2026-06-01T00:00:00+00:00",
+                        entry_type="snooze")
+        svc.add_context(t1, "api", "until_iso=2026-07-01T00:00:00+00:00",
+                        entry_type="snooze")
+        # t2: one snooze.
+        svc.add_context(t2, "api", "until_iso=2026-08-01T00:00:00+00:00",
+                        entry_type="snooze")
+        keys = [
+            (t1.split("/")[0], int(t1.split("/")[1])),
+            (t2.split("/")[0], int(t2.split("/")[1])),
+        ]
+        out = svc.latest_snoozes_bulk(keys)
+        assert set(out.keys()) == set(keys)
+        # t1's latest is the July snooze.
+        assert "2026-07-01" in out[keys[0]].text
+        assert "2026-08-01" in out[keys[1]].text
+
+    def test_absent_when_task_has_no_snooze(self, pg_work_service):
+        svc = pg_work_service
+        t1 = _inbox_task(svc, title="snoozed")
+        t2 = _inbox_task(svc, title="not snoozed")
+        svc.add_context(t1, "api", "until_iso=2026-06-01T00:00:00+00:00",
+                        entry_type="snooze")
+        keys = [
+            (t1.split("/")[0], int(t1.split("/")[1])),
+            (t2.split("/")[0], int(t2.split("/")[1])),
+        ]
+        out = svc.latest_snoozes_bulk(keys)
+        # Only t1 appears; t2 has no snooze row so it's absent.
+        assert (t1.split("/")[0], int(t1.split("/")[1])) in out
+        assert (t2.split("/")[0], int(t2.split("/")[1])) not in out
+
+    def test_ignores_non_snooze_entry_types(self, pg_work_service):
+        """A ``reply`` or ``read`` row must not leak into the result."""
+        svc = pg_work_service
+        t1 = _inbox_task(svc, title="mixed")
+        svc.add_reply(t1, "hi", actor="user")
+        svc.add_context(t1, "api", "read", entry_type="read")
+        keys = [(t1.split("/")[0], int(t1.split("/")[1]))]
+        out = svc.latest_snoozes_bulk(keys)
+        # No snooze row exists, so the helper returns ``{}`` — proving
+        # the WHERE filter is on entry_type='snooze', not "any context
+        # row".
+        assert out == {}
+
+    def test_legacy_snoozed_until_text_round_trips(self, pg_work_service):
+        """Rows written before the structured marker landed still load.
+
+        The bulk helper returns the raw ``ContextEntry``; the snooze
+        text parser (``pollypm.work.inbox_snooze.parse_snooze_until``)
+        accepts both shapes. This test just confirms the bulk path
+        doesn't filter or mangle the legacy text.
+        """
+        svc = pg_work_service
+        t1 = _inbox_task(svc, title="legacy")
+        svc.add_context(
+            t1, "api",
+            "snoozed until 2026-06-01T12:00:00+00:00",
+            entry_type="snooze",
+        )
+        keys = [(t1.split("/")[0], int(t1.split("/")[1]))]
+        out = svc.latest_snoozes_bulk(keys)
+        assert keys[0] in out
+        assert "snoozed until 2026-06-01" in out[keys[0]].text

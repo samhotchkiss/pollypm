@@ -20,8 +20,10 @@ autoreview), then by priority descending, then by ``updated_at`` descending.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from typing import Iterable, Protocol
 
+from pollypm.work.inbox_snooze import is_snooze_active
 from pollypm.work.models import (
     ActorType,
     FlowTemplate,
@@ -125,8 +127,11 @@ def _roles_match_user(task: Task) -> bool:
     """True if the task has a 'user' role assignment.
 
     Matches both ``roles["user"] = <anything>`` and ``roles[<key>] = "user"``.
+    Uses ``getattr`` so duck-typed test stubs without a ``roles``
+    attribute degrade to "no user role" instead of ``AttributeError``
+    — real ``Task`` instances always carry the field.
     """
-    roles = task.roles or {}
+    roles = getattr(task, "roles", None) or {}
     if "user" in roles:
         return True
     return any(value == "user" for value in roles.values())
@@ -135,8 +140,14 @@ def _roles_match_user(task: Task) -> bool:
 def _current_node_is_human(
     task: Task, service: _FlowLookup, *, flow_cache: dict[tuple[str, int], FlowTemplate]
 ) -> bool:
-    """True if the task's current flow node has actor_type == HUMAN."""
-    if task.current_node_id is None:
+    """True if the task's current flow node has actor_type == HUMAN.
+
+    ``getattr`` on ``current_node_id`` so duck-typed test stubs that
+    only carry ``flow_template_id`` + ``labels`` (the chat-flow /
+    plan-review write tests) degrade to "no current node" cleanly.
+    Real ``Task`` instances always carry the field.
+    """
+    if getattr(task, "current_node_id", None) is None:
         return False
     flow = _flow_for_task(task, service, flow_cache=flow_cache)
     if flow is None:
@@ -155,8 +166,12 @@ def _is_plan_review_label(task: Task) -> bool:
     test above would drop them. They still need to appear in the
     shared cockpit inbox (reviewed by Sam or by Polly on Sam's
     behalf), so we accept the label itself as a membership signal.
+
+    Exact-match check on ``plan_review`` (not substring) so labels
+    like ``not_plan_review`` / ``planning`` cannot widen the inbox
+    write surface by accident — Codex round-5 blocker on PR #2060.
     """
-    labels = task.labels or []
+    labels = getattr(task, "labels", None) or []
     return any(label == "plan_review" for label in labels)
 
 
@@ -166,8 +181,17 @@ def is_inbox_task(
     *,
     flow_cache: dict[tuple[str, int], FlowTemplate] | None = None,
 ) -> bool:
-    """Return True if ``task`` belongs in the user's inbox."""
-    if task.work_status in TERMINAL_STATUSES:
+    """Return True if ``task`` belongs in the user's inbox.
+
+    Canonical predicate shared by the cockpit inbox panel, the
+    dashboard inbox count, the rail badge, AND (since #2060 round-5)
+    the API ``GET /inbox`` + write resolution helpers. Centralising
+    here prevents write-side drift past the read surface: a chat-flow
+    task lacking a user role / human current node cannot be archived,
+    snoozed, mark-read, replied to, or promoted via the API if it
+    would not have appeared in the cockpit inbox.
+    """
+    if getattr(task, "work_status", None) in TERMINAL_STATUSES:
         return False
     if _roles_match_user(task):
         return True
@@ -182,15 +206,82 @@ def is_inbox_task(
 # ---------------------------------------------------------------------------
 
 
+def _filter_active_snoozes(
+    service, tasks: list[Task], *, now: datetime | None = None,
+) -> list[Task]:
+    """Drop tasks whose latest snooze marker is still in the future.
+
+    The HTTP ``GET /api/v1/inbox`` surface already filters snoozed
+    items via :func:`pollypm.web_api.service._active_snoozed_ids` (uses
+    :meth:`PgWorkService.latest_snoozes_bulk` + the shared
+    :func:`pollypm.work.inbox_snooze.is_snooze_active` predicate). The
+    cockpit / dashboard / rail path went through
+    :func:`inbox_tasks` and never consulted snooze state, so a row
+    snoozed via the API would vanish from ``/api/v1/inbox`` while
+    still showing up in the cockpit inbox panel and dashboard count.
+    Codex round-3 blocker #2 on #2060 — fix is to share the same
+    membership + snooze predicate here so every surface agrees.
+
+    Pg path uses the bulk SQL when available; degrades gracefully
+    (no filter) when neither the bulk helper nor ``get_context`` is
+    on the service. Callers using a mock ``_FakeService`` without
+    snooze state see no behavioural change.
+    """
+    if not tasks:
+        return tasks
+    reference = now if now is not None else datetime.now(timezone.utc)
+    bulk = getattr(service, "latest_snoozes_bulk", None)
+    snoozed: set[str] = set()
+    if callable(bulk):
+        try:
+            keys = [(t.project, t.task_number) for t in tasks]
+            latest = bulk(keys)
+        except Exception:  # noqa: BLE001 — readonly view degrades open
+            latest = None
+        if latest is not None:
+            for task in tasks:
+                entry = latest.get((task.project, task.task_number))
+                if entry is None:
+                    continue
+                if is_snooze_active(getattr(entry, "text", "") or "", now=reference):
+                    snoozed.add(task.task_id)
+            if snoozed:
+                return [t for t in tasks if t.task_id not in snoozed]
+            return tasks
+    # Fallback: per-task ``get_context`` loop. Kept for mock services
+    # (test fakes) and backends without the bulk helper. Pg always has
+    # the bulk helper so this branch should not run in production.
+    get_context = getattr(service, "get_context", None)
+    if not callable(get_context):
+        return tasks
+    for task in tasks:
+        try:
+            entries = get_context(task.task_id, entry_type="snooze", limit=1)
+        except Exception:  # noqa: BLE001 — readonly view degrades open
+            continue
+        if not entries:
+            continue
+        text = getattr(entries[0], "text", "") or ""
+        if is_snooze_active(text, now=reference):
+            snoozed.add(task.task_id)
+    if snoozed:
+        return [t for t in tasks if t.task_id not in snoozed]
+    return tasks
+
+
 def inbox_tasks(
     service,
     *,
     project: str | None = None,
+    now: datetime | None = None,
 ) -> list[Task]:
     """Return all inbox tasks, sorted user-review first within review rows.
 
     ``service`` must satisfy the WorkService protocol. In particular it must
     provide ``list_tasks(project=...)`` and ``get_flow(name, project=...)``.
+    Snoozed rows (latest ``entry_type='snooze'`` context whose wake
+    time is still in the future) are filtered out so the cockpit
+    inbox panel agrees with ``GET /api/v1/inbox`` (#2060 round-3).
     """
     list_nonterminal = getattr(service, "list_nonterminal_tasks", None)
     if callable(list_nonterminal):
@@ -213,6 +304,7 @@ def inbox_tasks(
         task for task in candidates
         if is_inbox_task(task, service, flow_cache=flow_cache)
     ]
+    matches = _filter_active_snoozes(service, matches, now=now)
     # Stable-sort twice so both keys descend: updated_at first (least
     # significant), priority second, then review owner split for rows in review.
     matches.sort(key=_updated_at_key, reverse=True)

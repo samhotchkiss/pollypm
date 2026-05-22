@@ -2796,24 +2796,75 @@ class PgWorkService:
             conn.commit()
         return True
 
-    def archive_task(self, task_id: str, actor: str = "user") -> Task:
+    def archive_task(
+        self, task_id: str, actor: str = "user", *, strict: bool = False,
+    ) -> Task:
         """Flip an inbox task to the chat-flow terminal state.
 
-        Idempotent: archiving an already-terminal task is a no-op and
-        returns the current record unchanged. Uses the same underlying
-        transition shape as :meth:`mark_done` (audit row + auto-unblock
-        cascade) so dashboard counts and dependency unblocking stay
-        consistent.
+        By default this is idempotent: archiving an already-terminal
+        task is a no-op and returns the current record unchanged. Uses
+        the same underlying transition shape as :meth:`mark_done`
+        (audit row + auto-unblock cascade) so dashboard counts and
+        dependency unblocking stay consistent.
+
+        When ``strict=True`` is passed, the state transition is
+        performed atomically (single conditional UPDATE that asserts
+        the row is still non-terminal) and the method raises
+        :class:`InvalidTransitionError` if the row was already
+        terminal when the write executed. This closes the
+        concurrent-archive race the Web API exposes — two simultaneous
+        ``POST /inbox/{id}/archive`` calls now produce exactly one 200
+        and one 409 ``invalid_state`` (see #2060 Codex review).
         """
         task = self.get(task_id)
-        if task.work_status in TERMINAL_STATUSES:
+        if not strict and task.work_status in TERMINAL_STATUSES:
             return task
         project, task_number = task.project, task.task_number
         now = _now_iso()
         from_status = task.work_status
+        terminal_values = sorted(s.value for s in TERMINAL_STATUSES)
+        # Inline the terminal-status placeholders — psycopg binds
+        # tuples positionally to %s and NOT IN expects an explicit
+        # list expression. The values come from the WorkStatus enum
+        # so there's no injection surface.
+        placeholders = ",".join(["%s"] * len(terminal_values))
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                # Atomically claim the transition: the WHERE guard
+                # asserts the row is still non-terminal at write time,
+                # so concurrent archivers race on this single UPDATE
+                # rather than on a stale read. Postgres serialises
+                # row-level writes, so exactly one caller sees
+                # rowcount==1; the loser sees rowcount==0 and (under
+                # ``strict``) raises InvalidTransitionError instead of
+                # silently returning the terminal record.
+                cur.execute(
+                    "UPDATE work_tasks SET work_status = %s, updated_at = %s "
+                    "WHERE project = %s AND task_number = %s "
+                    f"AND work_status NOT IN ({placeholders}) "
+                    "RETURNING work_status",
+                    (
+                        WorkStatus.DONE.value,
+                        now,
+                        project,
+                        task_number,
+                        *terminal_values,
+                    ),
+                )
+                claimed = cur.fetchone() is not None
+                if not claimed:
+                    conn.rollback()
+                    if strict:
+                        current = self.get(task_id)
+                        raise InvalidTransitionError(
+                            f"Task {task_id} is already "
+                            f"{current.work_status.value}; cannot archive."
+                        )
+                    # Non-strict fallthrough: row raced to terminal
+                    # between the pre-read and the UPDATE. Return the
+                    # current record (idempotent contract).
+                    return self.get(task_id)
                 cur.execute(
                     "INSERT INTO work_transitions ("
                     "task_project, task_number, from_state, to_state, "
@@ -2828,11 +2879,6 @@ class PgWorkService:
                         "inbox.archive",
                         now,
                     ),
-                )
-                cur.execute(
-                    "UPDATE work_tasks SET work_status = %s, updated_at = %s "
-                    "WHERE project = %s AND task_number = %s",
-                    (WorkStatus.DONE.value, now, project, task_number),
                 )
             conn.commit()
         # #1787: audit emit after commit so the JSONL trail tracks this
@@ -2902,6 +2948,62 @@ class PgWorkService:
                 entry_type=str(r[4] or "reply"),
             )
             out.setdefault(int(r[0]), []).append(entry)
+        return out
+
+    def latest_snoozes_bulk(
+        self, task_keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], ContextEntry]:
+        """Return ``{(project, task_number): latest_snooze_entry}`` (#2060).
+
+        SINGLE SQL query — replaces the per-task
+        ``get_context(entry_type='snooze', limit=1)`` loop the inbox
+        list path was running for every visible task (Codex round-2
+        blocker on PR #2060). The inbox-list helper uses this to
+        decide which items are still snoozed (wake time in the
+        future) without paying for N round-trips on a user-facing
+        scan path.
+
+        Mirrors the existing :meth:`bulk_list_replies` /
+        :meth:`task_numbers_with_context_entry` pattern: one
+        statement, bucketed in Python, the "latest" row per task is
+        picked via ``DISTINCT ON`` + ``ORDER BY id DESC`` so it
+        matches what ``get_context(..., limit=1)`` returns per-row.
+
+        ``task_keys`` is the list of ``(project, task_number)`` pairs
+        the caller wants snooze state for; an empty list short-
+        circuits to ``{}`` without hitting the DB. Tasks with no
+        snooze rows are simply absent from the result mapping.
+        """
+        if not task_keys:
+            return {}
+        # ``task_key`` ANY-array filter keeps the statement to one
+        # bind regardless of N — psycopg adapts the list of tuples
+        # into a row-comparison array. DISTINCT ON (project, num) +
+        # ORDER (project, num, id DESC) picks the most-recent row per
+        # task, matching ``get_context(..., limit=1)`` semantics.
+        projects = [k[0] for k in task_keys]
+        numbers = [k[1] for k in task_keys]
+        sql = (
+            "SELECT DISTINCT ON (task_project, task_number) "
+            "task_project, task_number, actor, created_at, text, entry_type "
+            "FROM work_context_entries "
+            "WHERE entry_type = 'snooze' "
+            "AND (task_project, task_number) IN ("
+            "SELECT UNNEST(%s::text[]), UNNEST(%s::int[])) "
+            "ORDER BY task_project, task_number, id DESC"
+        )
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, (projects, numbers))
+            rows = cur.fetchall()
+        out: dict[tuple[str, int], ContextEntry] = {}
+        for r in rows:
+            entry = ContextEntry(
+                actor=str(r[2]),
+                timestamp=r[3],
+                text=str(r[4]),
+                entry_type=str(r[5] or "snooze"),
+            )
+            out[(str(r[0]), int(r[1]))] = entry
         return out
 
     # ------------------------------------------------------------------

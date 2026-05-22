@@ -300,8 +300,13 @@ codes on top of the standard set above:
 | 503 | `tmux_unavailable` | tmux binary missing or the tmux server timed out / is unreachable |
 | 503 | `send_failed` | Generic `send-keys` failure (subprocess error, paste-buffer load failure) |
 
-`safety=force` bypasses every 409 above. `safety=loose` keeps the
-mid-tool gate but allows mid-stream sends with a response header.
+`safety=force` bypasses the mid-tool / mid-stream / missing-transcript
+safety gates only. Pane and window existence + liveness errors
+(`409 pane_invalid`, `409 pane_dead`, `503 window_missing`,
+`503 tmux_unavailable`) are NOT bypassed and will still fail-closed
+— sending into a dead pane or a vanished window is never safe.
+`safety=loose` keeps the mid-tool gate but allows mid-stream sends
+with a response header.
 
 Explicit `pane` (including `pane=0`) always validates via
 `list_panes()` and routes to the indexed target (`session:window.N`);

@@ -434,7 +434,12 @@ paths:
         the requested surface. `safety=loose` keeps the mid-tool
         gate but allows mid-stream sends, emitting an
         `X-PollyPM-Warning: agent-may-be-streaming` response header.
-        `safety=force` bypasses everything.
+        `safety=force` bypasses the mid-tool / mid-stream /
+        missing-transcript safety gates only. Pane and window
+        existence + liveness errors (`409 pane_invalid`,
+        `409 pane_dead`, `503 window_missing`,
+        `503 tmux_unavailable`) are NOT bypassed and will still
+        fail-closed.
 
         AskUserQuestion replies: when `answer_to` references an
         `ask_user` envelope, `selections[]` must match one of the

@@ -36,7 +36,11 @@ Safety gates per spec §4.1 / §4.3:
 
 ``safety=strict`` (default) enforces both. ``safety=loose`` keeps the
 mid-tool check but allows mid-stream sends with a warning header.
-``safety=force`` bypasses everything.
+``safety=force`` bypasses the mid-tool / mid-stream /
+missing-transcript safety gates only. Pane and window existence +
+liveness errors (``409 pane_invalid``, ``409 pane_dead``,
+``503 window_missing``, ``503 tmux_unavailable``) are NOT bypassed
+and will still fail-closed.
 
 Pane validation: explicit ``pane`` (including ``pane=0``) always goes
 through ``list_panes(target)`` to verify the requested index exists
@@ -488,7 +492,11 @@ def _resolve_session_events(
     return None, "absent_clean"
 
 
-def _last_assistant_open_tool_ids(events: list[dict[str, Any]]) -> set[str]:
+def _last_assistant_open_tool_ids(
+    events: list[dict[str, Any]],
+    *,
+    exempt_tool_ids: set[str] | None = None,
+) -> set[str]:
     """Return ``tool_use_id``s in the *current* assistant turn lacking a result.
 
     The intuition is "is the agent right now waiting on a tool result
@@ -504,6 +512,14 @@ def _last_assistant_open_tool_ids(events: list[dict[str, Any]]) -> set[str]:
     ``tool_call`` events without a preceding ``assistant_turn`` —
     anchoring on ``user_turn`` instead means the mid-tool gate still
     fires for that case (Codex #2043 review block 4).
+
+    ``exempt_tool_ids`` carves out tool_use ids that the *caller* is
+    answering. A real AskUserQuestion stays "open" (no tool_result
+    until the user types) so without this carveout the strict gate
+    409s every ``answer_to`` send. The carveout is intentionally
+    narrow — only the specific id the caller addresses is exempted;
+    any *other* open tool still blocks the send (Codex #2043 review
+    v4 block 1).
     """
     # Find the most-recent boundary (user_turn or assistant_turn).
     # Everything after that belongs to the current in-flight response.
@@ -530,19 +546,32 @@ def _last_assistant_open_tool_ids(events: list[dict[str, Any]]) -> set[str]:
             tid = payload.get("tool_use_id")
             if isinstance(tid, str) and tid:
                 seen_results.add(tid)
-    return open_ids - seen_results
+    unmatched = open_ids - seen_results
+    if exempt_tool_ids:
+        unmatched -= exempt_tool_ids
+    return unmatched
 
 
 def _is_mid_tool(
     events_path: Path | None,
+    *,
+    exempt_tool_ids: set[str] | None = None,
 ) -> bool:
-    """True when ``events_path``'s tail shows an unmatched tool_use."""
+    """True when ``events_path``'s tail shows an unmatched tool_use.
+
+    ``exempt_tool_ids`` lets the caller exclude specific tool_use ids
+    from the gate — used to allow the ``answer_to`` ask_user reply
+    path through (the AskUserQuestion stays "open" until the user
+    types a response, see :func:`_last_assistant_open_tool_ids`).
+    """
     if events_path is None:
         return False
     events = _read_events_tail(events_path)
     if not events:
         return False
-    return bool(_last_assistant_open_tool_ids(events))
+    return bool(
+        _last_assistant_open_tool_ids(events, exempt_tool_ids=exempt_tool_ids),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -600,12 +629,33 @@ def _find_ask_user_envelope(
     Returns the parsed event dict or ``None`` if the id isn't in the
     tail. The lookup is restricted to the events tail — the spec
     only supports answering the most-recent open question.
+
+    Message id contract: P1's :func:`pollypm.web_api.chat.transcripts.
+    _envelope_id` returns ``msg_<tool_use_id>`` for tool_call envelopes
+    (see ``transcripts.py:398-415`` and ``_envelope_ask_user`` at
+    ``transcripts.py:690-720``). A client reading GET ``/messages``
+    therefore sees the envelope id as ``msg_toolu_ask`` and POSTs
+    ``answer_to=msg_toolu_ask``. The raw events.jsonl payload carries
+    only ``toolu_ask`` in ``payload.id`` though, so we normalise the
+    incoming ``answer_to`` by stripping the ``msg_`` prefix before the
+    lookup — and also try the literal value so callers that pass the
+    raw id (CLI tooling, integration tests) still resolve.
+    (Codex #2043 review v4 block 2.)
     """
     if events_path is None:
         return None
     events = _read_events_tail(events_path)
+    # P1's envelope id is ``msg_<tool_use_id>``; the raw events.jsonl
+    # only carries the bare id. Try both forms so the route accepts
+    # the envelope id the GET endpoints hand out AND the raw id.
+    candidates = {answer_to}
+    if answer_to.startswith("msg_"):
+        candidates.add(answer_to[len("msg_"):])
     for event in events:
-        if _event_message_id(event) == answer_to:
+        event_id = _event_message_id(event)
+        if event_id is None:
+            continue
+        if event_id in candidates:
             return event
     return None
 
@@ -771,14 +821,40 @@ def _resolve_pane_target(
 
     Raises ``409 pane_invalid`` for out-of-range / missing panes,
     ``409 pane_dead`` for dead panes (Codex #2043 review block 5).
+    Distinguishes "tmux itself is down" (``503 tmux_unavailable``)
+    from "the window/pane doesn't exist" (``503 window_missing`` /
+    ``409 pane_invalid``) so the operator gets actionable typed
+    errors instead of generic 500s (Codex #2043 review v4 block 3).
     """
     try:
         windows = tmux.list_windows(storage_session)
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError as exc:
+        # tmux binary not on PATH — deployment failure, not a
+        # per-request bug.
+        raise _tmux_unavailable(f"tmux binary not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        # tmux server wedged (see ``TmuxClient.run`` 15s default).
+        raise _tmux_unavailable(
+            f"tmux command timed out after {exc.timeout}s",
+        ) from exc
+    except subprocess.CalledProcessError:
+        # ``list-windows`` exits non-zero when the target session
+        # doesn't exist (e.g. storage-closet was torn down). That's
+        # the documented ``window_missing`` envelope — surface it
+        # as "absent" rather than tmux-down so the operator restarts
+        # the right thing.
         logger.debug(
-            "chat_send: list_windows(%r) failed", storage_session, exc_info=True,
+            "chat_send: list_windows(%r) CalledProcessError",
+            storage_session,
+            exc_info=True,
         )
         return f"{storage_session}:{window_name}", False
+    except OSError as exc:
+        # Other subprocess plumbing errors (permission denied on
+        # ``tmux`` binary, etc.) — treat as tmux_unavailable so the
+        # operator looks at the deployment, not at this specific
+        # window.
+        raise _tmux_unavailable(str(exc)) from exc
     matching = [w for w in windows if w.name == window_name]
     if not matching:
         return f"{storage_session}:{window_name}", False
@@ -802,13 +878,33 @@ def _resolve_pane_target(
         raise _pane_invalid(pane_index, window_target)
     try:
         panes = tmux.list_panes(window_target)
-    except Exception:  # noqa: BLE001
+    except FileNotFoundError as exc:
+        raise _tmux_unavailable(f"tmux binary not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise _tmux_unavailable(
+            f"tmux command timed out after {exc.timeout}s",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        # ``list-panes`` exits non-zero when the *target* (window) no
+        # longer exists. That's an "actionable for the operator"
+        # state — surface as pane_invalid so they pick a different
+        # pane / surface, rather than blaming tmux.
+        logger.debug(
+            "chat_send: list_panes(%r) CalledProcessError",
+            window_target,
+            exc_info=True,
+        )
+        raise _pane_invalid(pane_index, window_target) from exc
+    except OSError as exc:
+        raise _tmux_unavailable(str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        # Fake clients / unforeseen errors — preserve the original
+        # pane_invalid mapping to avoid a 500 leak. The narrow
+        # subprocess branches above cover the production cases.
         logger.debug(
             "chat_send: list_panes(%r) failed", window_target, exc_info=True,
         )
-        # Without pane visibility we can't validate; refuse rather
-        # than leak the raw subprocess error.
-        raise _pane_invalid(pane_index, window_target) from None
+        raise _pane_invalid(pane_index, window_target) from exc
     match = next((p for p in panes if p.pane_index == pane_index), None)
     if match is None:
         raise _pane_invalid(pane_index, window_target)
@@ -863,9 +959,28 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
 
     project_root = _resolve_project_root(config, project_key)
 
-    # 2. Safety gates (§4.1, §4.3) — use the exact session transcript
-    # (Codex review block 3).
+    # 2. AskUserQuestion answer lookup runs BEFORE the safety gates so
+    # we can exempt the specific ask_user tool_use_id from the
+    # mid-tool check (Codex #2043 review v4 block 1). A real
+    # AskUserQuestion has no matching tool_result until the user
+    # types a response — without this carveout the strict gate 409s
+    # every legitimate ``answer_to`` send.
     events_path, resolution = _resolve_session_events(surface, project_root)
+    ask_envelope: dict[str, Any] | None = None
+    ask_exempt_ids: set[str] = set()
+    if body.answer_to is not None:
+        ask_envelope = _find_ask_user_envelope(events_path, body.answer_to)
+        if ask_envelope is not None:
+            # The exempted id is the raw ``payload.id`` because the
+            # mid-tool gate matches on that field; the envelope id
+            # comparison was already normalised inside
+            # ``_find_ask_user_envelope``.
+            raw_id = _event_message_id(ask_envelope)
+            if isinstance(raw_id, str) and raw_id:
+                ask_exempt_ids.add(raw_id)
+
+    # 3. Safety gates (§4.1, §4.3) — use the exact session transcript
+    # (Codex review block 3).
     if body.safety != "force":
         if resolution == "absent_but_others_exist":
             # Strict and loose both require an exact transcript
@@ -874,7 +989,7 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
             # almost certainly addressing the wrong session_name.
             # Fail closed; safety=force bypasses.
             raise _unsafe_mid_tool()
-        if _is_mid_tool(events_path):
+        if _is_mid_tool(events_path, exempt_tool_ids=ask_exempt_ids):
             raise _unsafe_mid_tool()
         age = _heartbeat_age_seconds(config, session_name)
         streaming = age is not None and age < _MID_STREAM_WINDOW_SECONDS
@@ -883,13 +998,12 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
         if body.safety == "loose" and streaming:
             response.headers["X-PollyPM-Warning"] = "agent-may-be-streaming"
 
-    # 3. AskUserQuestion answer handling (§4.5).
+    # 4. AskUserQuestion answer handling (§4.5).
     text_to_send: str | None
     if body.answer_to is not None:
-        envelope = _find_ask_user_envelope(events_path, body.answer_to)
-        if envelope is None:
+        if ask_envelope is None:
             raise _answer_to_missing(body.answer_to)
-        options = _ask_user_options(envelope)
+        options = _ask_user_options(ask_envelope)
         if options is None:
             raise _selections_no_question(body.answer_to)
         invalid = [s for s in body.selections if s not in options]
@@ -918,7 +1032,7 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
 
     assert text_to_send is not None  # noqa: S101 — narrowed above
 
-    # 4. Send via tmux.
+    # 5. Send via tmux.
     method: Literal["send_keys", "paste_buffer"] = (
         "paste_buffer" if len(text_to_send) > 100 else "send_keys"
     )

@@ -77,8 +77,11 @@ class FakeTmuxClient:
     send_side_effect: Exception | None = None
     send_calls: list[tuple[str, str, bool]] = []
     list_panes_side_effect: Exception | None = None
+    list_windows_side_effect: Exception | None = None
 
     def list_windows(self, session: str) -> list[FakeWindow]:
+        if self.list_windows_side_effect is not None:
+            raise self.list_windows_side_effect
         return list(self.windows_by_session.get(session, []))
 
     def list_panes(self, target: str) -> list[FakePane]:
@@ -101,6 +104,7 @@ def _reset_fake_tmux():
     FakeTmuxClient.send_side_effect = None
     FakeTmuxClient.send_calls = []
     FakeTmuxClient.list_panes_side_effect = None
+    FakeTmuxClient.list_windows_side_effect = None
     yield
 
 
@@ -1430,6 +1434,258 @@ def test_unknown_task_session_404s(
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "session_unknown"
+
+
+# ---------------------------------------------------------------------------
+# Codex #2043 review v4 — AskUserQuestion gate carveout
+# ---------------------------------------------------------------------------
+
+
+def test_answer_to_unmatched_ask_user_does_not_409_mid_tool(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """Codex #2043 review v4 block 1 — real AskUserQuestion is unmatched.
+
+    Pre-fix the mid-tool gate counted every unmatched ``tool_call``,
+    including AskUserQuestion. A real ask_user has NO ``tool_result``
+    until the user answers it, so strict/loose ``answer_to`` requests
+    would 409 ``unsafe_mid_tool`` before they could submit the
+    selection. The fix exempts the specific tool_use_id being answered
+    from the mid-tool count.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    # Note: NO matching tool_result for the AskUserQuestion — this is
+    # the real-world shape (the user hasn't answered yet).
+    _write_events_jsonl(project_root, "session-real-ask", [
+        {"event_type": "user_turn", "payload": {"text": "pick"}},
+        _ask_user_event(message_id="toolu_ask", options=["alpha", "bravo"]),
+    ], cwd=workspace_root)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"answer_to": "toolu_ask", "selections": ["alpha"]},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+    assert patched_tmux.send_calls == [
+        ("pollypm-test-storage-closet:pm-operator", "alpha", True),
+    ]
+
+
+def test_answer_to_does_not_exempt_unrelated_open_tool(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """The carveout is narrow — only the answered ask_user id is exempt.
+
+    If the assistant has an open AskUserQuestion AND a separate open
+    Bash call (e.g. running in parallel), answering the ask_user must
+    still 409 because there's still an unmatched tool. Otherwise a
+    user could ack the question while the assistant is mid-Bash and
+    corrupt the conversation.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(project_root, "session-mixed-open", [
+        {"event_type": "user_turn", "payload": {"text": "pick"}},
+        _ask_user_event(message_id="toolu_ask", options=["alpha"]),
+        # A separate Bash call is also mid-flight; the gate must
+        # still trip even though the caller is answering the ask_user.
+        {
+            "event_type": "tool_call",
+            "payload": {
+                "type": "tool_use",
+                "id": "toolu_bash_open",
+                "name": "Bash",
+                "input": {"command": "sleep 5"},
+            },
+        },
+    ], cwd=workspace_root)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"answer_to": "toolu_ask", "selections": ["alpha"]},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409, response.json()
+    assert response.json()["error"]["code"] == "unsafe_mid_tool"
+
+
+def test_answer_to_msg_envelope_id_resolves(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    """Codex #2043 review v4 block 2 — accept the P1 envelope id form.
+
+    P1's ``parse_events_jsonl`` (transcripts.py:398-415) returns the
+    envelope id as ``msg_<tool_use_id>``. A client that read
+    ``GET /chat/{session}/messages`` will POST
+    ``answer_to=msg_toolu_ask``; pre-fix the route searched the raw
+    ``toolu_ask`` value and returned 400 ``answer_to_missing``. The
+    fix normalises by stripping the ``msg_`` prefix before lookup.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    _write_events_jsonl(project_root, "session-envelope-id", [
+        {"event_type": "user_turn", "payload": {"text": "pick"}},
+        _ask_user_event(message_id="toolu_ask", options=["alpha"]),
+    ], cwd=workspace_root)
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        # The frontend hands ``msg_toolu_ask`` (the P1 envelope id),
+        # NOT the raw ``toolu_ask``.
+        json={"answer_to": "msg_toolu_ask", "selections": ["alpha"]},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.json()
+
+
+# ---------------------------------------------------------------------------
+# Codex #2043 review v4 — narrow tmux validation errors
+# ---------------------------------------------------------------------------
+
+
+def test_list_windows_filenotfound_maps_to_503_tmux_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review v4 block 3 — tmux binary missing on probe.
+
+    Pre-fix every ``list_windows`` exception collapsed to
+    ``window_missing``. A missing tmux binary is a deployment issue —
+    telling the operator the window doesn't exist would send them
+    chasing the wrong thing.
+    """
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.list_windows_side_effect = FileNotFoundError(
+        "[Errno 2] No such file or directory: 'tmux'",
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    assert response.json()["error"]["code"] == "tmux_unavailable"
+
+
+def test_list_windows_timeout_maps_to_503_tmux_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wedged tmux server on the validation probe → ``tmux_unavailable``."""
+    import subprocess as _subprocess
+
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.list_windows_side_effect = _subprocess.TimeoutExpired(
+        cmd=["tmux", "list-windows"], timeout=15,
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    assert response.json()["error"]["code"] == "tmux_unavailable"
+
+
+def test_list_panes_filenotfound_maps_to_503_tmux_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex #2043 review v4 block 3 — tmux missing during pane probe.
+
+    Pre-fix every ``list_panes`` exception collapsed to
+    ``pane_invalid``. ``FileNotFoundError`` is "tmux is gone" — the
+    operator should restart tmux, not pick a different pane.
+    """
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.list_panes_side_effect = FileNotFoundError(
+        "[Errno 2] No such file or directory: 'tmux'",
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi", "pane": 1},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    assert response.json()["error"]["code"] == "tmux_unavailable"
+
+
+def test_list_panes_timeout_maps_to_503_tmux_unavailable(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Wedged tmux during pane probe → ``tmux_unavailable`` (not pane_invalid)."""
+    import subprocess as _subprocess
+
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, None)
+    patched_tmux.list_panes_side_effect = _subprocess.TimeoutExpired(
+        cmd=["tmux", "list-panes"], timeout=15,
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send",
+        json={"text": "hi", "pane": 1},
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.json()
+    assert response.json()["error"]["code"] == "tmux_unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Codex #2043 review v4 — CORS exposes X-PollyPM-Warning
+# ---------------------------------------------------------------------------
+
+
+def test_cors_exposes_x_pollypm_warning_header(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001
+) -> None:
+    """Codex #2043 review v4 block 4 — ``X-PollyPM-Warning`` must be CORS-exposed.
+
+    The send endpoint returns ``X-PollyPM-Warning: agent-may-be-
+    streaming`` for ``safety=loose`` sends, but the frontend can't
+    read it from JS unless ``Access-Control-Expose-Headers`` lists
+    it. The pre-fix CORS config only exposed ``Last-Event-ID``.
+    """
+    from pollypm.web_api import create_app
+
+    app = create_app(config=api_config, token_path=token_path)
+    client = TestClient(app)
+    # A CORS preflight against any endpoint surfaces the
+    # Access-Control-Expose-Headers value the middleware will emit
+    # on the actual request.
+    response = client.get(
+        "/api/v1/health",
+        headers={"Origin": "http://localhost:5173"},
+    )
+    expose = response.headers.get("access-control-expose-headers", "")
+    assert "X-PollyPM-Warning" in expose, (
+        f"X-PollyPM-Warning must be CORS-exposed; got {expose!r}"
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -87,7 +87,12 @@ def create_app(
         allow_credentials=True,
         allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
         allow_headers=["Authorization", "Content-Type", "Last-Event-ID"],
-        expose_headers=["Last-Event-ID"],
+        # ``X-PollyPM-Warning`` is set by ``POST /chat/{session}/send``
+        # with ``safety=loose`` when the heartbeat suggests the agent
+        # may still be streaming (see ``chat_send.py``). Without
+        # exposing it here, browsers strip the header before the
+        # frontend can read it, defeating the documented contract.
+        expose_headers=["Last-Event-ID", "X-PollyPM-Warning"],
     )
 
     # Wire the config provider so every endpoint shares the same

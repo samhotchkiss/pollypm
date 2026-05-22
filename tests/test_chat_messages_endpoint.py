@@ -561,8 +561,13 @@ def test_messages_endpoint_excludes_thinking_by_default(
 ):
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
+    # NOTE: main's MessageType intentionally omits THINKING (see envelope.py
+    # docstring — upstream ingestor doesn't preserve thinking blocks yet).
+    # The router still filters by string match (``str(envelope.type) ==
+    # "thinking"``), so the include_thinking switch is exercised via a raw
+    # string injected through the slots dataclass — no enum needed.
     envelopes = [
-        _env("t", type_=MessageType.THINKING, text="(thinking)"),
+        _env("t", type_="thinking", text="(thinking)"),
         _env("text", type_=MessageType.TEXT, text="visible"),
     ]
     patch_registry([_surface(
@@ -584,8 +589,9 @@ def test_messages_endpoint_includes_thinking_when_requested(
 ):
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
+    # See note in the sibling test about raw-string thinking injection.
     envelopes = [
-        _env("t", type_=MessageType.THINKING, text="(thinking)"),
+        _env("t", type_="thinking", text="(thinking)"),
         _env("text", type_=MessageType.TEXT, text="visible"),
     ]
     patch_registry([_surface(

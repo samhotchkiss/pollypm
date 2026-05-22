@@ -1249,6 +1249,14 @@ components:
 
     DashboardRollups:
       type: object
+      description: |
+        Aggregate counters mirrored from the cockpit rail. Under
+        `?project=<key>` only the project-derived counters
+        (`tracked_count`, `open_inbox_count`, `pending_plan_reviews`)
+        are narrowed; `alert_count` and the three `*_24h` activity
+        counters remain whole-system. The response envelope's
+        `scoped_fields` list enumerates which fields the filter
+        actually narrowed.
       required:
         - tracked_count
         - open_inbox_count
@@ -1291,15 +1299,29 @@ components:
         daemon_status:
           type: string
           description: |
-            `up` (active sessions present) or `down` (no active
-            sessions / supervisor unreachable). Per spec §3.3, a down
-            daemon is a normal operating mode, not a 503.
+            `up` (active sessions present anywhere in the system) or
+            `down` (no active sessions / supervisor unreachable).
+            Always derived from the unfiltered gather result —
+            `?project=` does NOT influence this field, so callers
+            polling per-project still see the true daemon health. Per
+            spec §3.3, a down daemon is a normal operating mode, not a
+            503.
         projects:
           type: array
           items:
             $ref: "#/components/schemas/Project"
         rollups:
           $ref: "#/components/schemas/DashboardRollups"
+        scoped_fields:
+          type: array
+          description: |
+            Names of response fields actually narrowed by `?project=`.
+            Empty when no filter is in effect. Lets clients tell which
+            counters reflect the requested project vs which remain
+            whole-system (see `DashboardRollups` for why the four
+            activity counters stay global).
+          items:
+            type: string
         active_sessions:
           type: array
           items:

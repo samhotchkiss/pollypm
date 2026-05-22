@@ -522,6 +522,119 @@ def test_dashboard_503_when_list_projects_raises(
 # ---------------------------------------------------------------------------
 
 
+def test_dashboard_project_filter_keeps_global_activity_rollups(
+    client, auth_headers, patch_gather, patch_list_projects,
+):
+    """Regression for Codex PR #2057 P0 #1.
+
+    Under ``?project=myproj`` the response must NOT silently inherit
+    cross-project alert / sweep / message / recovery counts as if they
+    were narrowed to ``myproj``. The gather pipeline aggregates these
+    four counters globally (sessions for other projects contribute),
+    so for the v1 RC minimal-diff window we surface them unchanged and
+    enumerate the actually-narrowed fields in ``scoped_fields`` so
+    clients can tell the difference.
+    """
+    patch_list_projects([
+        _api_project("myproj", open_inbox_count=3, pending_plan_review=True),
+        _api_project("otherproj", tracked=False, open_inbox_count=10),
+    ])
+    # The dashboard data here represents the WHOLE system; sessions /
+    # commits / inbox previews for "otherproj" are part of the global
+    # picture, and the four rollups below were computed across both
+    # projects.
+    patch_gather(_make_data(
+        active_sessions=[
+            SessionActivity(
+                name="otherproj-worker", role="worker", project="otherproj",
+                project_label="Other Project", status="running",
+                description="other work", age_seconds=5.0,
+            ),
+        ],
+        recent_commits=[
+            CommitInfo(hash="a", message="m1", author="s",
+                       age_seconds=1, project="otherproj"),
+        ],
+        alert_count=6,
+        sweep_count_24h=12,
+        message_count_24h=4,
+        recovery_count_24h=2,
+    ))
+
+    body = client.get(
+        "/api/v1/dashboard?project=myproj", headers=auth_headers,
+    ).json()
+
+    # Project-derived rollups follow the narrowed projects view.
+    rollups = body["rollups"]
+    assert rollups["tracked_count"] == 1
+    assert rollups["open_inbox_count"] == 3
+    assert rollups["pending_plan_reviews"] == 1
+    # Global activity rollups are surfaced unchanged (documented as
+    # not-narrowed via the ``scoped_fields`` contract below).
+    assert rollups["alert_count"] == 6
+    assert rollups["sweep_count_24h"] == 12
+    assert rollups["message_count_24h"] == 4
+    assert rollups["recovery_count_24h"] == 2
+
+    # Contract — the response enumerates exactly which fields the
+    # filter narrowed. The four global activity counters MUST NOT
+    # appear here; the project-derived rollups MUST.
+    scoped = set(body["scoped_fields"])
+    assert "rollups.tracked_count" in scoped
+    assert "rollups.open_inbox_count" in scoped
+    assert "rollups.pending_plan_reviews" in scoped
+    assert "rollups.alert_count" not in scoped
+    assert "rollups.sweep_count_24h" not in scoped
+    assert "rollups.message_count_24h" not in scoped
+    assert "rollups.recovery_count_24h" not in scoped
+
+
+def test_dashboard_scoped_fields_empty_without_filter(
+    client, auth_headers, patch_gather, patch_list_projects,
+):
+    """Without ``?project=``, ``scoped_fields`` must be empty."""
+    patch_list_projects([_api_project("myproj")])
+    patch_gather(_make_data())
+    body = client.get("/api/v1/dashboard", headers=auth_headers).json()
+    assert body["scoped_fields"] == []
+
+
+def test_dashboard_daemon_status_reflects_unfiltered_sessions(
+    client, auth_headers, patch_gather, patch_list_projects,
+):
+    """Regression for Codex PR #2057 P0 #2.
+
+    ``daemon_status`` is a system-wide health signal — it must be
+    derived from the UNFILTERED gather result. A caller polling
+    ``?project=foo`` (which has no live sessions) must still see
+    ``daemon_status="up"`` when the supervisor is healthy and another
+    project (``bar``) has active sessions.
+    """
+    patch_list_projects([
+        _api_project("myproj"),
+        _api_project("otherproj"),
+    ])
+    patch_gather(_make_data(
+        active_sessions=[
+            SessionActivity(
+                name="otherproj-worker", role="worker", project="otherproj",
+                project_label="Other Project", status="running",
+                description="busy", age_seconds=3.0,
+            ),
+        ],
+    ))
+
+    body = client.get(
+        "/api/v1/dashboard?project=myproj", headers=auth_headers,
+    ).json()
+    # Filtered active_sessions is empty because the only live session
+    # is for otherproj…
+    assert body["active_sessions"] == []
+    # …but daemon_status must still reflect the unfiltered truth.
+    assert body["daemon_status"] == "up"
+
+
 def test_dashboard_account_usages_passthrough(
     client, auth_headers, patch_gather, patch_list_projects,
 ):

@@ -99,7 +99,17 @@ class AccountQuotaUsageModel(BaseModel):
 
 
 class DashboardRollups(BaseModel):
-    """Aggregate counters mirrored from the cockpit rail."""
+    """Aggregate counters mirrored from the cockpit rail.
+
+    Under ``?project=<key>``, only the project-derived counters
+    (``tracked_count``, ``open_inbox_count``, ``pending_plan_reviews``)
+    are narrowed to that project. ``alert_count`` and the three
+    ``*_24h`` activity counters remain whole-system because the
+    underlying ``gather`` pipeline aggregates them globally before
+    returning (see :func:`pollypm.dashboard_data.gather`). The set of
+    fields actually narrowed for a given response is enumerated on the
+    envelope's ``scoped_fields`` list so clients don't have to guess.
+    """
 
     tracked_count: int
     open_inbox_count: int
@@ -123,13 +133,27 @@ class DashboardResponse(BaseModel):
     generated_at: datetime
     daemon_status: str = Field(
         description=(
-            "One of 'up' (active sessions present) or 'down' "
-            "(no active sessions / supervisor unreachable). Per spec "
-            "§3.3, a down daemon is a normal operating mode — not a 503."
+            "One of 'up' (active sessions present anywhere in the "
+            "system) or 'down' (no active sessions / supervisor "
+            "unreachable). Always derived from the unfiltered gather "
+            "result — ``?project=`` does NOT influence this field, so "
+            "callers polling per-project still see the true daemon "
+            "health. Per spec §3.3, a down daemon is a normal "
+            "operating mode — not a 503."
         ),
     )
     projects: list[Project]
     rollups: DashboardRollups
+    scoped_fields: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Names of response fields actually narrowed by "
+            "``?project=``. Empty when no filter is in effect. Lets "
+            "clients tell which counters reflect the requested project "
+            "vs which remain whole-system (see ``DashboardRollups`` "
+            "docstring for why a subset of rollups stay global)."
+        ),
+    )
     active_sessions: list[SessionActivityModel]
     recent_commits: list[CommitInfoModel]
     completed_items: list[CompletedItemModel]
@@ -245,7 +269,17 @@ def get_dashboard_endpoint(
     config: ConfigDep,
     project: Annotated[
         str | None,
-        Query(description="Narrow projects + rollups to one project key."),
+        Query(
+            description=(
+                "Narrow the per-project lists (projects, sessions, "
+                "commits, completed items, recent messages) and the "
+                "three project-derived rollup counters to one project "
+                "key. The response's ``scoped_fields`` enumerates the "
+                "exact fields narrowed; the four global activity "
+                "rollups (alert / sweep / message / recovery 24h) and "
+                "``daemon_status`` remain whole-system."
+            ),
+        ),
     ] = None,
     include_token_history: Annotated[
         bool,
@@ -312,6 +346,14 @@ def get_dashboard_endpoint(
             hint="Retry shortly; check `pm doctor` for pg pool health.",
         ) from exc
 
+    # Derive daemon health from the UNFILTERED gather result. This is a
+    # system-wide signal — a caller polling ``?project=foo`` must still
+    # see ``daemon_status="up"`` when the supervisor is healthy and the
+    # only live sessions happen to be on ``bar``. Reordered above the
+    # per-project list slice below so the filter cannot mask supervisor
+    # state.
+    daemon_status = "up" if data.active_sessions else "down"
+
     # Narrow per-project lists when ?project= is set so the response is
     # self-consistent (a caller filtering to one project shouldn't see
     # other projects' commits / inbox previews).
@@ -319,14 +361,35 @@ def get_dashboard_endpoint(
     recent_commits = list(data.recent_commits)
     completed_items = list(data.completed_items)
     recent_messages = list(data.recent_messages)
+    scoped_fields: list[str] = []
     if project is not None:
         active_sessions = [s for s in active_sessions if s.project == project]
         recent_commits = [c for c in recent_commits if c.project == project]
         completed_items = [c for c in completed_items if c.project == project]
         recent_messages = [m for m in recent_messages if m.project == project]
+        # Enumerate the fields that are actually project-scoped under
+        # ``?project=`` so clients don't have to guess which rollups
+        # were narrowed. The four ``rollups.*`` activity counters
+        # (alert_count, sweep_count_24h, message_count_24h,
+        # recovery_count_24h) are intentionally NOT listed — they are
+        # aggregated globally inside ``gather`` and re-scoping them
+        # would require new pg queries we deferred for the v1 RC
+        # minimal-diff window.
+        scoped_fields = [
+            "projects",
+            "active_sessions",
+            "recent_commits",
+            "completed_items",
+            "recent_messages",
+            "rollups.tracked_count",
+            "rollups.open_inbox_count",
+            "rollups.pending_plan_reviews",
+        ]
 
-    # Rollups — derive from the (possibly project-narrowed) projects
-    # view so the counts match what the cockpit rail renders.
+    # Rollups — project-derived counters narrow with ``?project=``;
+    # the four ``gather``-computed activity counters stay global and
+    # are documented as such on the response (see ``scoped_fields``
+    # above and the ``DashboardRollups`` docstring).
     tracked_count = sum(1 for p in projects_view if p.tracked)
     open_inbox_count = sum(p.open_inbox_count for p in projects_view)
     pending_plan_reviews = sum(
@@ -342,8 +405,6 @@ def get_dashboard_endpoint(
         message_count_24h=int(getattr(data, "message_count_24h", 0) or 0),
         recovery_count_24h=int(getattr(data, "recovery_count_24h", 0) or 0),
     )
-
-    daemon_status = "up" if active_sessions else "down"
 
     daily_tokens: list[list[Any]] | None = None
     if include_token_history:
@@ -361,6 +422,7 @@ def get_dashboard_endpoint(
         daemon_status=daemon_status,
         projects=projects_view,
         rollups=rollups,
+        scoped_fields=scoped_fields,
         active_sessions=[
             _session_activity_to_wire(s) for s in active_sessions
         ],

@@ -1342,8 +1342,21 @@ class PgWorkService:
         "acceptance_criteria": "acceptance_criteria",
         "constraints": "constraints",
         "relevant_files": "relevant_files",
+        # ``assignee`` is admitted so the API ``POST /reassign`` (issue
+        # #1548 spec §5.3) and PATCH variants have a single writer. The
+        # column is plain text — no JSON encoding — so it doesn't join
+        # ``_UPDATE_JSON_COLUMNS``. ``svc.claim`` is still the canonical
+        # path for the queued→in_progress transition; ``update`` only
+        # touches the column without firing a state-machine transition.
+        "assignee": "assignee",
+        # ``external_refs`` carries the API's free-form ``metadata``
+        # surface (spec §5.4 PATCH ``metadata?: {...}``). Stored as
+        # ``jsonb`` so it joins the JSON-encoded column set below.
+        "external_refs": "external_refs",
     }
-    _UPDATE_JSON_COLUMNS = frozenset({"labels", "relevant_files", "roles"})
+    _UPDATE_JSON_COLUMNS = frozenset(
+        {"labels", "relevant_files", "roles", "external_refs"}
+    )
 
     def update(self, task_id: str, **fields: object) -> Task:
         """Update mutable fields on a task.

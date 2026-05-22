@@ -290,6 +290,74 @@ class TaskListResponse(BaseModel):
     warnings: list[TaskListWarning] | None = None
 
 
+# ---------------------------------------------------------------------------
+# Task transition / edit request + response shapes (Phase 2 — #1548)
+# ---------------------------------------------------------------------------
+
+
+class TaskClaimRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/claim``.
+
+    Spec §5.3 documents ``{assignee, actor}``; this PR keeps the
+    surface tight to ``actor`` (the assigning user) — the
+    work-service derives the resulting ``assignee`` from the task's
+    flow + roles. A separate ``/reassign`` endpoint covers "change
+    owner" semantics.
+    """
+
+    actor: str = Field(min_length=1)
+
+
+class TaskCancelRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/cancel``.
+
+    ``reason`` is optional per spec §5.3; absent reasons resolve to
+    ``"cancelled via API"`` in the audit row so grep stays meaningful.
+    """
+
+    reason: str | None = None
+
+
+class TaskReassignRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/reassign``.
+
+    Sets the task's ``assignee`` to ``actor``. ``null`` is not yet
+    supported (spec leaves "null ⇒ unassign" open; we'd need a second
+    column setter for that and the use-case is rare today).
+    """
+
+    actor: str = Field(min_length=1)
+
+
+class TaskPatchRequest(BaseModel):
+    """Body for ``PATCH /tasks/{project}/{n}``.
+
+    Per spec §5.4 — selective field updates. Lists replace (not
+    merge). Unrecognised statuses raise 422; statuses that aren't
+    reachable via the work-service's direct setters (e.g.
+    ``in_progress``, ``review``) also raise 422 with a hint pointing
+    to the dedicated transition endpoint.
+    """
+
+    labels: list[str] | None = None
+    status: str | None = None
+    metadata: dict[str, str] | None = None
+
+
+class TaskActionResult(BaseModel):
+    """Wrapper envelope for task mutations — ``{ok, message, task}``.
+
+    Spec §5.3 specifies this exact shape so the client can refresh
+    its UI without a follow-up ``GET``. ``message`` is informational
+    only (operator-facing); clients should route on ``task.work_status``
+    instead of parsing the string.
+    """
+
+    ok: bool
+    message: str | None = None
+    task: TaskDetail
+
+
 class ProjectDrilldown(Project):
     recent_activity: list[ProjectActivityEntry]
     top_tasks: list[TaskSummary]
@@ -495,9 +563,14 @@ __all__ = [
     "StorageConfigFiles",
     "StorageEntry",
     "StorageReport",
+    "TaskActionResult",
+    "TaskCancelRequest",
+    "TaskClaimRequest",
     "TaskDetail",
     "TaskListResponse",
     "TaskListWarning",
+    "TaskPatchRequest",
+    "TaskReassignRequest",
     "TaskRelationships",
     "TaskSummary",
     "Transition",

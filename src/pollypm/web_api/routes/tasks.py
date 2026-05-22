@@ -9,6 +9,12 @@ Phase 2 scaffolding (work-service factory, typed errors, ActionResult
 envelope, Idempotency-Key plumbing) without dragging in the
 plan/code-review state machine. ``approve`` / ``reject`` follow once
 the wedge is in.
+
+Phase 2 surface #3 (#1548 spec §5.3 + §5.4) adds the remaining
+task-state-mutation verbs: ``/claim``, ``/cancel``, ``/reassign``
+and the ``PATCH`` edit surface. Each new handler returns
+``TaskActionResult = {ok, message, task: TaskDetail}`` so clients
+refresh state in one round-trip (spec §5.3 wrapper).
 """
 
 from __future__ import annotations
@@ -21,16 +27,25 @@ from fastapi import APIRouter, Header, Query
 from pollypm.web_api.errors import APIError, not_found
 from pollypm.web_api.models import (
     ActionResult,
+    TaskActionResult,
+    TaskCancelRequest,
+    TaskClaimRequest,
     TaskDetail,
     TaskListResponse,
     TaskListWarning,
+    TaskPatchRequest,
+    TaskReassignRequest,
 )
 from pollypm.web_api.routes._deps import ConfigDep
 from pollypm.web_api.service import (
     StaleCursorError,
+    cancel_task,
+    claim_task,
     get_task_detail,
     list_all_tasks,
+    patch_task,
     queue_task,
+    reassign_task,
 )
 
 router = APIRouter(tags=["Tasks"])
@@ -168,3 +183,146 @@ def queue_task_endpoint(
         raise not_found(f"Project not registered: {project}")
     task = queue_task(config, project, n)
     return ActionResult(ok=True, message=f"queued {task.task_id}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 surface #3 — claim / cancel / reassign / PATCH
+#
+# Each handler short-circuits on an unregistered project so the 404
+# message is project-specific (consistent with the GET / queue
+# handlers). The ``If-Match`` header is accepted but not yet
+# enforced — spec §2.6 / cross-cutting Q11 leaves enforcement to a
+# follow-up; default is last-writer-wins per §5.6.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tasks/{project}/{n}/claim",
+    response_model=TaskActionResult,
+    summary="Atomically claim a queued task",
+    operation_id="claimTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Task is not in a claimable state."},
+        "422": {"description": "Claim gate failure."},
+    },
+)
+def claim_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskClaimRequest,
+    config: ConfigDep,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key")
+    ] = None,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> TaskActionResult:
+    del idempotency_key, if_match  # Phase 2 plumbing only
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = claim_task(config, project, n, actor=body.actor)
+    return TaskActionResult(
+        ok=True, message=f"claimed {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/cancel",
+    response_model=TaskActionResult,
+    summary="Cancel a non-terminal task",
+    operation_id="cancelTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Task is already in a terminal state."},
+    },
+)
+def cancel_task_endpoint(
+    project: str,
+    n: int,
+    config: ConfigDep,
+    body: TaskCancelRequest | None = None,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key")
+    ] = None,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> TaskActionResult:
+    del idempotency_key, if_match
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    reason = body.reason if body is not None else None
+    task = cancel_task(config, project, n, reason=reason)
+    return TaskActionResult(
+        ok=True, message=f"cancelled {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/reassign",
+    response_model=TaskActionResult,
+    summary="Change the task's assignee",
+    operation_id="reassignTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "422": {"description": "Assignee value rejected."},
+    },
+)
+def reassign_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskReassignRequest,
+    config: ConfigDep,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key")
+    ] = None,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> TaskActionResult:
+    del idempotency_key, if_match
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = reassign_task(config, project, n, actor=body.actor)
+    return TaskActionResult(
+        ok=True,
+        message=f"reassigned {task.task_id} to {body.actor}",
+        task=task,
+    )
+
+
+@router.patch(
+    "/tasks/{project}/{n}",
+    response_model=TaskActionResult,
+    summary="Selective task edits (labels, status, metadata)",
+    operation_id="patchTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Status transition refused by the state machine."},
+        "422": {"description": "Body validation / unsupported status."},
+    },
+)
+def patch_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskPatchRequest,
+    config: ConfigDep,
+    idempotency_key: Annotated[
+        str | None, Header(alias="Idempotency-Key")
+    ] = None,
+    if_match: Annotated[str | None, Header(alias="If-Match")] = None,
+) -> TaskActionResult:
+    del idempotency_key, if_match
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = patch_task(
+        config,
+        project,
+        n,
+        labels=body.labels,
+        status=body.status,
+        metadata=body.metadata,
+    )
+    return TaskActionResult(
+        ok=True, message=f"patched {task.task_id}", task=task
+    )

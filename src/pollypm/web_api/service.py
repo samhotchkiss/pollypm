@@ -1299,6 +1299,337 @@ def queue_task(
         ) from exc
 
 
+def claim_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+) -> APITaskDetail:
+    """Atomically claim a queued task via the work-service.
+
+    Mirrors ``pm work claim``. The work-service handles the
+    queued-and-unblocked check, sets ``assignee``, advances to the
+    flow's start node, and writes the transition row. We translate
+    work-service exceptions into the API's typed error envelope.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                svc.claim(task_id, actor)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc) or f"Task {task_id} cannot be claimed.",
+                    hint="Only queued+unblocked tasks can be claimed.",
+                ) from exc
+            task = svc.get(task_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "claim_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while claiming {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def cancel_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str = "api",
+    reason: str | None = None,
+) -> APITaskDetail:
+    """Cancel a non-terminal task via the work-service.
+
+    Mirrors ``pm work cancel``. ``reason`` is optional at the API
+    surface (spec §5.3 body ``{reason?: str}``); the work-service's
+    ``cancel`` requires a string, so we fall back to a generic message
+    when the caller doesn't supply one — preserving the audit row's
+    ``reason`` slot regardless.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    cancel_reason = reason or "cancelled via API"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                svc.cancel(task_id, actor, cancel_reason)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                # Cancelling a terminal task is the most common path
+                # here; spec §5.5 maps that to 409 ``invalid_state``.
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc) or f"Task {task_id} cannot be cancelled.",
+                    hint="Tasks in terminal state (done/cancelled) cannot be cancelled again.",
+                ) from exc
+            task = svc.get(task_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "cancel_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while cancelling {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def reassign_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+) -> APITaskDetail:
+    """Change the task's ``assignee`` via the work-service ``update``.
+
+    PgWorkService has no dedicated ``reassign`` lifecycle method —
+    spec §5.3 names ``svc.reassign`` but the actual writer surface
+    keeps ``assignee`` as a plain column. We thread it through
+    ``svc.update(assignee=...)`` (admitted to
+    ``_UPDATE_ALLOWED_COLUMNS`` in this same PR) so the audit
+    ``work.task.updated`` row mirrors any other column edit. State-
+    machine transitions (``claim``, ``cancel`` …) remain the canonical
+    path for status changes.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                svc.update(task_id, assignee=actor)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except WorkValidationError as exc:
+                raise APIError(
+                    status_code=422,
+                    code="validation_error",
+                    message=str(exc) or "Reassignment failed validation.",
+                ) from exc
+            task = svc.get(task_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "reassign_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while reassigning {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+# Labels supported on PATCH ``status`` — we route the request through the
+# work-service lifecycle method that maps to each value. Statuses without
+# a direct setter (e.g. ``in_progress``, ``review``) raise 422 with a
+# pointer to the dedicated transition endpoint. Spec §5.4 frames PATCH as
+# "selective field updates"; status-as-transition is the safe interpretation.
+_PATCH_STATUS_TO_METHOD: dict[str, str] = {
+    "queued": "queue",
+    "cancelled": "cancel",
+}
+
+
+def patch_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str = "api",
+    labels: list[str] | None = None,
+    status: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> APITaskDetail:
+    """Selective edits — labels / status / metadata.
+
+    Each provided field is applied in turn against the same
+    work-service handle. ``status`` is mapped to the matching
+    lifecycle method (``queue``, ``cancel``) when supported; everything
+    else (in_progress / review / on_hold / etc.) returns 422 with a
+    hint to the dedicated transition endpoint. ``metadata`` is stored
+    as ``external_refs`` (the existing free-form per-task key/value
+    surface). All edits within one call land in the same response
+    snapshot.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    valid_statuses = {
+        "draft", "queued", "in_progress", "rework", "blocked",
+        "on_hold", "review", "done", "cancelled",
+    }
+    if status is not None and status not in valid_statuses:
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=f"Unknown status: {status!r}",
+            hint=(
+                "Valid statuses: " + ", ".join(sorted(valid_statuses))
+            ),
+        )
+
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            # Confirm task exists up-front so empty-PATCH still 404s.
+            try:
+                svc.get(task_id)
+            except _BACKING_STORE_ERRORS:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                raise not_found(f"Task not found: {task_id}") from exc
+
+            # Labels: replace-set semantics (spec §5.4 PATCH ``labels``
+            # field is a list; lists replace, not merge — same as
+            # ``relationships``).
+            if labels is not None:
+                try:
+                    svc.update(task_id, labels=labels)
+                except TaskNotFoundError as exc:
+                    raise not_found(f"Task not found: {task_id}") from exc
+                except WorkValidationError as exc:
+                    raise APIError(
+                        status_code=422,
+                        code="validation_error",
+                        message=str(exc) or "labels update failed validation.",
+                    ) from exc
+
+            # Metadata: stored as ``external_refs`` (jsonb). The
+            # work-service column is JSON-encoded; we replace the
+            # whole map per the documented PATCH semantics.
+            if metadata is not None:
+                try:
+                    svc.update(task_id, external_refs=metadata)
+                except TaskNotFoundError as exc:
+                    raise not_found(f"Task not found: {task_id}") from exc
+                except WorkValidationError as exc:
+                    raise APIError(
+                        status_code=422,
+                        code="validation_error",
+                        message=str(exc) or "metadata update failed validation.",
+                    ) from exc
+
+            # Status: route to the matching lifecycle method. Spec §5.4
+            # leaves transitions un-fully-enumerated; the conservative
+            # path is to refuse unsupported statuses so callers don't
+            # get a misleading 200 with an unchanged status field.
+            if status is not None:
+                method_name = _PATCH_STATUS_TO_METHOD.get(status)
+                if method_name is None:
+                    raise APIError(
+                        status_code=422,
+                        code="validation_error",
+                        message=(
+                            f"PATCH cannot set status={status!r}; this state "
+                            "is only reachable via a flow transition."
+                        ),
+                        hint=(
+                            "Use the dedicated endpoint (e.g. /claim, "
+                            "/approve-plan) or POST a context-aware "
+                            "transition instead of PATCH."
+                        ),
+                    )
+                try:
+                    if method_name == "queue":
+                        svc.queue(task_id, actor)
+                    elif method_name == "cancel":
+                        svc.cancel(task_id, actor, "patched via API")
+                except TaskNotFoundError as exc:
+                    raise not_found(f"Task not found: {task_id}") from exc
+                except InvalidTransitionError as exc:
+                    raise APIError(
+                        status_code=409,
+                        code="invalid_state",
+                        message=(
+                            str(exc)
+                            or f"Status transition to {status!r} refused."
+                        ),
+                    ) from exc
+                except WorkValidationError as exc:
+                    raise APIError(
+                        status_code=422,
+                        code="validation_error",
+                        message=str(exc) or "status transition gate failed.",
+                    ) from exc
+
+            task = svc.get(task_id)
+            return _task_to_detail(task)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "patch_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while patching {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
 # ---------------------------------------------------------------------------
 # Inbox write helpers (Phase 2 — spec §4.1)
 #
@@ -2522,6 +2853,8 @@ __all__ = [
     "archive_inbox_item",
     "archive_project",
     "audit_event_to_api",
+    "cancel_task",
+    "claim_task",
     "get_active_plan",
     "get_inbox_item",
     "get_project",
@@ -2533,9 +2866,11 @@ __all__ = [
     "list_projects",
     "load_api_config",
     "mark_read_inbox_item",
+    "patch_task",
     "project_drilldown",
     "promote_inbox_to_task",
     "queue_task",
+    "reassign_task",
     "reply_inbox_item",
     "set_project_tracked",
     "snooze_inbox_item",

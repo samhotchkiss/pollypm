@@ -887,6 +887,42 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Tasks]
+      operationId: patchTask
+      summary: Selective task edits (labels, status, metadata)
+      description: |
+        Partial update — every field is optional. Lists replace, not
+        merge (spec §5.4). `status` is mapped to the matching
+        lifecycle method (`queued` → `svc.queue`, `cancelled` →
+        `svc.cancel`); other statuses raise `422 validation_error`
+        with a hint pointing to the dedicated transition endpoint.
+        `metadata` is stored as the task's `external_refs` map.
+        `If-Match` is accepted but not yet enforced.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskPatchRequest"
+      responses:
+        "200":
+          description: Edit applied; response carries the post-edit
+            task snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
 
   /tasks/{project}/{n}/queue:
     parameters:
@@ -911,6 +947,114 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+
+  /tasks/{project}/{n}/claim:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: claimTask
+      summary: Atomically claim a queued task
+      description: |
+        Sets the task's `assignee` and advances the flow to the start
+        (or current) node. Refuses non-queued tasks with `409
+        invalid_state`. `If-Match` is accepted but not yet enforced
+        (cross-cutting Q11); default = last-writer-wins.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskClaimRequest"
+      responses:
+        "200":
+          description: Claim recorded; task is now `in_progress` (or
+            `review` for a review-start node).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
+  /tasks/{project}/{n}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: cancelTask
+      summary: Cancel a non-terminal task
+      description: |
+        Moves any non-terminal task to `cancelled` and emits the
+        cancel-cascade (dependents get an `_on_cancelled` breadcrumb).
+        Cancelling a terminal (done/cancelled) task returns `409
+        invalid_state`.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskCancelRequest"
+      responses:
+        "200":
+          description: Task transitioned to `cancelled`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+
+  /tasks/{project}/{n}/reassign:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: reassignTask
+      summary: Change the task's assignee
+      description: |
+        Sets the `assignee` column to the new actor without firing a
+        state-machine transition. The task's `work_status` is
+        unchanged. Spec §5.3 leaves `null ⇒ unassign` open; this
+        endpoint requires a non-empty `actor`.
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskReassignRequest"
+      responses:
+        "200":
+          description: Assignee updated; rest of the task unchanged.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/ValidationError"
 
   /inbox:
     get:
@@ -2694,6 +2838,81 @@ components:
         reason:
           type: string
           minLength: 1
+
+    TaskClaimRequest:
+      type: object
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: |
+            Identity to record on the claim audit row. The
+            work-service derives the resulting `assignee` from the
+            task's flow + roles when applicable.
+
+    TaskCancelRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          description: |
+            Optional explanation; absent reasons collapse to
+            "cancelled via API" in the audit row.
+
+    TaskReassignRequest:
+      type: object
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: |
+            New assignee. Sets the `assignee` column directly —
+            no state-machine transition fires.
+
+    TaskPatchRequest:
+      type: object
+      description: |
+        Partial-update body. Every field is optional; only fields
+        present in the body are written. Lists replace, not merge
+        (spec §5.4).
+      properties:
+        labels:
+          type: array
+          items: { type: string }
+          description: |
+            Replacement label set. Pass `[]` to clear. Pass `null`
+            (i.e. omit the key) to leave labels untouched.
+        status:
+          type: string
+          description: |
+            Target work-status. Only `queued` and `cancelled` are
+            routed via PATCH (mapped to `svc.queue` / `svc.cancel`);
+            other statuses raise `422 validation_error` with a hint
+            pointing to the dedicated transition endpoint.
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Free-form per-task key/value map. Stored as the task's
+            `external_refs` column.
+
+    TaskActionResult:
+      type: object
+      required: [ok, task]
+      description: |
+        Mutation envelope for the task transition / edit endpoints
+        (spec §5.3). Carries the post-mutation `TaskDetail` so the
+        client refreshes its UI without a follow-up `GET`.
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+          description: Operator-facing summary; clients should not parse it.
+        task:
+          $ref: "#/components/schemas/TaskDetail"
 
     # ---- Plan -------------------------------------------------------
     PlanJudgmentCall:

@@ -127,8 +127,11 @@ def _roles_match_user(task: Task) -> bool:
     """True if the task has a 'user' role assignment.
 
     Matches both ``roles["user"] = <anything>`` and ``roles[<key>] = "user"``.
+    Uses ``getattr`` so duck-typed test stubs without a ``roles``
+    attribute degrade to "no user role" instead of ``AttributeError``
+    — real ``Task`` instances always carry the field.
     """
-    roles = task.roles or {}
+    roles = getattr(task, "roles", None) or {}
     if "user" in roles:
         return True
     return any(value == "user" for value in roles.values())
@@ -137,8 +140,14 @@ def _roles_match_user(task: Task) -> bool:
 def _current_node_is_human(
     task: Task, service: _FlowLookup, *, flow_cache: dict[tuple[str, int], FlowTemplate]
 ) -> bool:
-    """True if the task's current flow node has actor_type == HUMAN."""
-    if task.current_node_id is None:
+    """True if the task's current flow node has actor_type == HUMAN.
+
+    ``getattr`` on ``current_node_id`` so duck-typed test stubs that
+    only carry ``flow_template_id`` + ``labels`` (the chat-flow /
+    plan-review write tests) degrade to "no current node" cleanly.
+    Real ``Task`` instances always carry the field.
+    """
+    if getattr(task, "current_node_id", None) is None:
         return False
     flow = _flow_for_task(task, service, flow_cache=flow_cache)
     if flow is None:
@@ -157,8 +166,12 @@ def _is_plan_review_label(task: Task) -> bool:
     test above would drop them. They still need to appear in the
     shared cockpit inbox (reviewed by Sam or by Polly on Sam's
     behalf), so we accept the label itself as a membership signal.
+
+    Exact-match check on ``plan_review`` (not substring) so labels
+    like ``not_plan_review`` / ``planning`` cannot widen the inbox
+    write surface by accident — Codex round-5 blocker on PR #2060.
     """
-    labels = task.labels or []
+    labels = getattr(task, "labels", None) or []
     return any(label == "plan_review" for label in labels)
 
 
@@ -168,8 +181,17 @@ def is_inbox_task(
     *,
     flow_cache: dict[tuple[str, int], FlowTemplate] | None = None,
 ) -> bool:
-    """Return True if ``task`` belongs in the user's inbox."""
-    if task.work_status in TERMINAL_STATUSES:
+    """Return True if ``task`` belongs in the user's inbox.
+
+    Canonical predicate shared by the cockpit inbox panel, the
+    dashboard inbox count, the rail badge, AND (since #2060 round-5)
+    the API ``GET /inbox`` + write resolution helpers. Centralising
+    here prevents write-side drift past the read surface: a chat-flow
+    task lacking a user role / human current node cannot be archived,
+    snoozed, mark-read, replied to, or promoted via the API if it
+    would not have appeared in the cockpit inbox.
+    """
+    if getattr(task, "work_status", None) in TERMINAL_STATUSES:
         return False
     if _roles_match_user(task):
         return True

@@ -756,11 +756,14 @@ def test_snooze_writer_persists_structured_until_iso_marker(
         task_number = 1
         title = "Inbox item"
         description = "body"
-        # Membership guard (#2060 round-3) requires chat-flow OR
-        # plan-review label; the snooze writer rejects with 404
-        # otherwise.
+        # Canonical inbox predicate (#2060 round-5) requires a user
+        # role / plan_review label / current human node — chat-flow
+        # alone is not sufficient. Give this stub a ``requester=user``
+        # so ``_roles_match_user`` accepts it as an inbox member.
         flow_template_id = "chat"
         labels: list[str] = []
+        roles: dict = {"requester": "user"}
+        current_node_id = None
 
     captured: dict[str, object] = {}
 
@@ -972,7 +975,14 @@ def test_shared_snooze_predicate_lives_in_work_module() -> None:
 
 
 class _NonInboxStubTask:
-    """Pretends to be a regular work task (not chat / not plan_review)."""
+    """Pretends to be a regular work task (not an inbox row).
+
+    Post-#2060 round-5 the membership predicate is the canonical
+    :func:`pollypm.work.inbox_view.is_inbox_task` (cockpit / rail /
+    dashboard). That requires a ``user`` role, exact ``plan_review``
+    label, or a current human flow node — none of which this stub
+    carries — so the write helpers must reject it.
+    """
 
     task_id = "myproj/1"
     project = "myproj"
@@ -981,6 +991,8 @@ class _NonInboxStubTask:
     description = "not an inbox row"
     flow_template_id = "standard"  # NOT 'chat'
     labels: list[str] = []  # NO plan_review label
+    roles: dict = {}  # NO user role
+    current_node_id = None  # NO current human node
 
     @property
     def work_status(self):  # noqa: D401
@@ -1125,32 +1137,306 @@ def test_promote_rejects_non_inbox_task(config, monkeypatch) -> None:
     assert svc.create_calls == 0
 
 
-def test_membership_helper_accepts_chat_and_plan_review() -> None:
-    """Sanity-check the predicate's positive cases so the guard
-    can't silently reject everything (which would also "pass" the
-    rejection tests above)."""
+def test_membership_helper_matches_canonical_inbox_predicate() -> None:
+    """The API membership helper must mirror the canonical predicate.
+
+    Post-#2060 round-5 the web layer routes through
+    :func:`pollypm.work.inbox_view.is_inbox_task` — the same predicate
+    cockpit, the rail, and the dashboard use. The contract is:
+
+    * Chat-flow with a ``user`` role -> inbox member.
+    * Exact ``plan_review`` label -> inbox member.
+    * Plain task with no user role / no exact plan_review label /
+      no current human node -> NOT a member, even if the flow_id
+      contains the substring ``plan``.
+
+    Substring matches on ``plan_review`` (e.g. ``not_plan_review``,
+    ``planning``) MUST be rejected — the round-3 web helper's
+    ``"plan_review" in lbl`` widening is what Codex round-5 caught.
+    """
     from pollypm.web_api.service import _is_inbox_member
 
-    class _Chat:
+    class _ChatWithUserRole:
         flow_template_id = "chat"
         labels: list[str] = []
+        roles = {"requester": "user"}
+        current_node_id = None
 
     class _PlanReviewLabel:
         flow_template_id = "standard"
         labels = ["plan_review"]
+        roles: dict = {}
+        current_node_id = None
 
-    class _PlanReviewFlow:
-        flow_template_id = "plan_review_flow"
+    class _ChatNoUserRole:
+        # Chat-flow but no user role + no current node — would have
+        # been accepted by the old web-layer predicate, must now be
+        # rejected (canonical contract).
+        flow_template_id = "chat"
         labels: list[str] = []
+        roles: dict = {}
+        current_node_id = None
+
+    class _NearMissPlanLabel:
+        # Substring would have matched the old helper; canonical
+        # predicate requires exact ``plan_review``.
+        flow_template_id = "standard"
+        labels = ["not_plan_review"]
+        roles: dict = {}
+        current_node_id = None
 
     class _NonInbox:
         flow_template_id = "standard"
         labels: list[str] = []
+        roles: dict = {}
+        current_node_id = None
 
-    assert _is_inbox_member(_Chat()) is True
+    assert _is_inbox_member(_ChatWithUserRole()) is True
     assert _is_inbox_member(_PlanReviewLabel()) is True
-    assert _is_inbox_member(_PlanReviewFlow()) is True
+    assert _is_inbox_member(_ChatNoUserRole()) is False
+    assert _is_inbox_member(_NearMissPlanLabel()) is False
     assert _is_inbox_member(_NonInbox()) is False
+
+
+# ---------------------------------------------------------------------------
+# Round-5 canonical-predicate negative coverage (#2060, Codex 15:41 UTC).
+#
+# Round-3 added a web-layer ``_is_inbox_member`` that accepted any
+# chat-flow task plus substring plan labels. Codex round-5 caught the
+# drift: cockpit / rail / dashboard use the stricter
+# ``pollypm.work.inbox_view.is_inbox_task`` (user role / exact
+# plan_review / human current node), so a chat task that the read
+# surface 404s could still be mutated through the write endpoints.
+#
+# Codex's ask, verbatim:
+#   "at minimum, add negative tests for a chat-flow task with no user
+#    role/current human node and for near-miss plan labels so the
+#    write surface cannot widen by substring accident."
+#
+# These tests are designed to FAIL on the round-3 predicate (chat
+# alone passes; ``not_plan_review`` substring-matches) and PASS once
+# the write helpers route through ``is_inbox_task``.
+# ---------------------------------------------------------------------------
+
+
+class _ChatNoUserRoleStubTask:
+    """Chat-flow task with no user role / no human current node.
+
+    Old (round-3) predicate: ``flow_template_id == 'chat'`` -> accept.
+    Canonical predicate: chat alone is insufficient; needs a ``user``
+    role / exact ``plan_review`` label / current human node.
+    """
+
+    task_id = "myproj/1"
+    project = "myproj"
+    task_number = 1
+    title = "Headless chat-flow row"
+    description = "should not be mutable via /inbox writes"
+    flow_template_id = "chat"
+    labels: list[str] = []
+    roles: dict = {}  # no user role
+    current_node_id = None  # no current human node
+
+    @property
+    def work_status(self):
+        from pollypm.work.models import WorkStatus
+        return WorkStatus.IN_PROGRESS
+
+
+class _NearMissPlanLabelStubTask:
+    """Task whose only ``plan``-flavoured label substring-matches
+    ``plan_review`` but is not exactly that label.
+
+    Old (round-3) predicate: ``"plan_review" in lbl`` -> accept on
+    ``not_plan_review``. Canonical predicate: exact match only.
+    """
+
+    task_id = "myproj/1"
+    project = "myproj"
+    task_number = 1
+    title = "Near-miss plan label"
+    description = "label is not_plan_review, not plan_review"
+    flow_template_id = "standard"
+    labels = ["not_plan_review", "planning"]
+    roles: dict = {}
+    current_node_id = None
+
+    @property
+    def work_status(self):
+        from pollypm.work.models import WorkStatus
+        return WorkStatus.IN_PROGRESS
+
+
+class _CanonicalRejectingSvc:
+    """Recording stub whose ``get`` returns a configurable task.
+
+    Like ``_MembershipRecordingSvc`` but parameterised on which fake
+    task to return, so the round-5 negative tests can exercise the
+    two specific shapes Codex called out without duplicating the
+    fake-factory wiring.
+    """
+
+    def __init__(self, task) -> None:
+        self._task = task
+        self.archive_calls = 0
+        self.add_context_calls = 0
+        self.add_reply_calls = 0
+        self.mark_read_calls = 0
+        self.create_calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, item_id):
+        return self._task
+
+    def archive_task(self, *a, **kw):
+        self.archive_calls += 1
+        raise AssertionError(
+            "canonical predicate must block archive on non-inbox row"
+        )
+
+    def add_context(self, *a, **kw):
+        self.add_context_calls += 1
+        raise AssertionError(
+            "canonical predicate must block add_context on non-inbox row"
+        )
+
+    def add_reply(self, *a, **kw):
+        self.add_reply_calls += 1
+        raise AssertionError(
+            "canonical predicate must block add_reply on non-inbox row"
+        )
+
+    def mark_read(self, *a, **kw):
+        self.mark_read_calls += 1
+        raise AssertionError(
+            "canonical predicate must block mark_read on non-inbox row"
+        )
+
+    def create(self, *a, **kw):
+        self.create_calls += 1
+        raise AssertionError(
+            "canonical predicate must block create on non-inbox row"
+        )
+
+
+def _install_canonical_stub(monkeypatch, task) -> _CanonicalRejectingSvc:
+    svc = _CanonicalRejectingSvc(task)
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+    return svc
+
+
+def test_archive_rejects_chat_flow_task_with_no_user_role(
+    config, monkeypatch,
+) -> None:
+    """Chat-flow without a user role is NOT an inbox member.
+
+    The old round-3 predicate accepted any ``flow_template_id ==
+    'chat'`` and would have allowed this archive to proceed —
+    write-side drift past the cockpit / rail / dashboard inbox
+    surface. The canonical :func:`is_inbox_task` requires a user
+    role / exact plan_review label / current human node.
+    """
+    from pollypm.web_api import service as web_service
+
+    svc = _install_canonical_stub(monkeypatch, _ChatNoUserRoleStubTask())
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(config, "myproj/1", reason="oops")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.archive_calls == 0
+    assert svc.add_context_calls == 0
+
+
+def test_archive_rejects_near_miss_plan_label(
+    config, monkeypatch,
+) -> None:
+    """Labels like ``not_plan_review`` / ``planning`` MUST NOT widen
+    the write surface. Round-3 used ``"plan_review" in lbl`` which
+    matched both; canonical predicate is exact equality."""
+    from pollypm.web_api import service as web_service
+
+    svc = _install_canonical_stub(monkeypatch, _NearMissPlanLabelStubTask())
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(config, "myproj/1", reason="oops")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.archive_calls == 0
+    assert svc.add_context_calls == 0
+
+
+def test_snooze_rejects_chat_flow_task_with_no_user_role(
+    config, monkeypatch,
+) -> None:
+    """Snooze must agree with archive's canonical predicate.
+
+    Otherwise a caller could snooze a row the cockpit never surfaces
+    — the row gets a future ``until_iso`` marker that nothing reads.
+    """
+    from pollypm.web_api import service as web_service
+
+    svc = _install_canonical_stub(monkeypatch, _ChatNoUserRoleStubTask())
+    with pytest.raises(APIError) as excinfo:
+        web_service.snooze_inbox_item(
+            config, "myproj/1", duration_seconds=3600,
+        )
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.add_context_calls == 0
+
+
+def test_snooze_rejects_near_miss_plan_label(
+    config, monkeypatch,
+) -> None:
+    from pollypm.web_api import service as web_service
+
+    svc = _install_canonical_stub(monkeypatch, _NearMissPlanLabelStubTask())
+    with pytest.raises(APIError) as excinfo:
+        web_service.snooze_inbox_item(
+            config, "myproj/1", duration_seconds=3600,
+        )
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.add_context_calls == 0
+
+
+def test_promote_rejects_chat_flow_task_with_no_user_role(
+    config, monkeypatch,
+) -> None:
+    """Promote is the most damaging widening surface: it derives a
+    new task from the source. Canonical predicate must reject so
+    the API cannot mint tasks from rows cockpit never surfaced."""
+    from pollypm.web_api import service as web_service
+
+    svc = _install_canonical_stub(monkeypatch, _ChatNoUserRoleStubTask())
+    with pytest.raises(APIError) as excinfo:
+        web_service.promote_inbox_to_task(config, "myproj/1")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.create_calls == 0
+
+
+def test_promote_rejects_near_miss_plan_label(
+    config, monkeypatch,
+) -> None:
+    from pollypm.web_api import service as web_service
+
+    svc = _install_canonical_stub(monkeypatch, _NearMissPlanLabelStubTask())
+    with pytest.raises(APIError) as excinfo:
+        web_service.promote_inbox_to_task(config, "myproj/1")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.create_calls == 0
 
 
 # ---------------------------------------------------------------------------
@@ -1168,17 +1454,23 @@ def test_membership_helper_accepts_chat_and_plan_review() -> None:
 
 
 class _ConcurrentLoserStubTask:
-    """Looks like an inbox item (chat-flow) so the membership guard
-    accepts it; the conflict is raised by ``archive_task``, not by
-    the predicate."""
+    """Looks like an inbox item so the membership guard accepts it;
+    the conflict is raised by ``archive_task``, not by the predicate.
+
+    Canonical inbox predicate (#2060 round-5) requires a user role
+    in addition to chat-flow, so include ``requester=user`` to mimic
+    a real chat thread surfaced via cockpit / GET /inbox.
+    """
 
     task_id = "myproj/1"
     project = "myproj"
     task_number = 1
     title = "Inbox item"
     description = "ping"
-    flow_template_id = "chat"  # Passes _is_inbox_member.
+    flow_template_id = "chat"
     labels: list[str] = []
+    roles: dict = {"requester": "user"}
+    current_node_id = None
 
     @property
     def work_status(self):  # noqa: D401

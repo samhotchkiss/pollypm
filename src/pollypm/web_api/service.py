@@ -27,6 +27,7 @@ import sqlite3
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
+from pollypm.work.inbox_view import is_inbox_task
 from pollypm.web_api.errors import (
     APIError,
     not_found,
@@ -743,13 +744,15 @@ def archive_inbox_item(
                 src_task = svc.get(item_id)
             except TaskNotFoundError as exc:
                 raise not_found(f"Inbox item not found: {item_id}") from exc
-            # Membership guard (#2060 round-3): the bare ``svc.get`` above
-            # returns ANY task with that id, including non-inbox work
-            # rows that the GET /inbox surface would never expose. A
-            # caller could otherwise POST /inbox/<id>/archive against a
-            # plain-task flow row and close it via this endpoint. We
-            # short-circuit with the same 404 the read surface returns.
-            if not _is_inbox_member(src_task):
+            # Membership guard (#2060 round-3/round-5): the bare
+            # ``svc.get`` above returns ANY task with that id,
+            # including non-inbox work rows that the GET /inbox
+            # surface would never expose. We route resolution through
+            # the canonical :func:`pollypm.work.inbox_view.is_inbox_task`
+            # used by cockpit / rail / dashboard so the write surface
+            # cannot drift open relative to the read surface (Codex
+            # round-5 blocker on #2060).
+            if not is_inbox_task(src_task, svc):
                 raise not_found(f"Inbox item not found: {item_id}")
             # Run the strict transition FIRST so the reason note is
             # only persisted on a successful archive (#2060 round-4
@@ -870,10 +873,11 @@ def snooze_inbox_item(
                 current = svc.get(item_id)
             except TaskNotFoundError as exc:
                 raise not_found(f"Inbox item not found: {item_id}") from exc
-            # Membership guard (#2060 round-3): see archive_inbox_item.
-            # A caller could otherwise snooze a non-inbox work task that
-            # the read surface would 404.
-            if not _is_inbox_member(current):
+            # Membership guard (#2060 round-3/round-5): canonical
+            # predicate (see archive_inbox_item). A caller could
+            # otherwise snooze a non-inbox work task that GET /inbox
+            # would 404.
+            if not is_inbox_task(current, svc):
                 raise not_found(f"Inbox item not found: {item_id}")
             status = getattr(current.work_status, "value", str(current.work_status))
             if status in _ALREADY_ARCHIVED_STATUSES:
@@ -933,16 +937,18 @@ def mark_read_inbox_item(
         with create_work_service(
             config=config, project_key=key, project_path=project.path
         ) as svc:
-            # Membership guard (#2060 round-3): fetch the task first so
-            # a non-inbox work row can't be silently mark-read'd through
-            # this endpoint. Without this, ``svc.mark_read`` only checks
-            # existence and would happily write a ``read`` context row
-            # against any task id.
+            # Membership guard (#2060 round-3/round-5): fetch the
+            # task first so a non-inbox work row can't be silently
+            # mark-read'd through this endpoint. Without this,
+            # ``svc.mark_read`` only checks existence and would
+            # happily write a ``read`` context row against any task
+            # id. Canonical inbox predicate so writes can't drift
+            # past what cockpit / rail / dashboard surface.
             try:
                 src_task = svc.get(item_id)
             except TaskNotFoundError as exc:
                 raise not_found(f"Inbox item not found: {item_id}") from exc
-            if not _is_inbox_member(src_task):
+            if not is_inbox_task(src_task, svc):
                 raise not_found(f"Inbox item not found: {item_id}")
             try:
                 svc.mark_read(item_id, actor=actor)
@@ -987,14 +993,15 @@ def reply_inbox_item(
         with create_work_service(
             config=config, project_key=key, project_path=project.path
         ) as svc:
-            # Membership guard (#2060 round-3): without this a reply to
-            # a non-inbox work task would be persisted as a reply row
-            # the GET /inbox surface would never expose.
+            # Membership guard (#2060 round-3/round-5): canonical
+            # inbox predicate; without this a reply to a non-inbox
+            # work task would be persisted as a reply row the GET
+            # /inbox surface would never expose.
             try:
                 src_task = svc.get(item_id)
             except TaskNotFoundError as exc:
                 raise not_found(f"Inbox item not found: {item_id}") from exc
-            if not _is_inbox_member(src_task):
+            if not is_inbox_task(src_task, svc):
                 raise not_found(f"Inbox item not found: {item_id}")
             try:
                 svc.add_reply(item_id, body, actor=actor_name)
@@ -1053,11 +1060,13 @@ def promote_inbox_to_task(
                 src_task = src_svc.get(item_id)
             except TaskNotFoundError as exc:
                 raise not_found(f"Inbox item not found: {item_id}") from exc
-            # Membership guard (#2060 round-3): the GET /inbox surface
-            # would 404 a non-inbox task id, so promote-to-task must
-            # too — otherwise a caller can derive a new task from an
-            # arbitrary work row by addressing it through this verb.
-            if not _is_inbox_member(src_task):
+            # Membership guard (#2060 round-3/round-5): the GET
+            # /inbox surface would 404 a non-inbox task id, so
+            # promote-to-task must too — otherwise a caller can
+            # derive a new task from an arbitrary work row by
+            # addressing it through this verb. Canonical predicate
+            # so writes don't widen past cockpit / rail / dashboard.
+            if not is_inbox_task(src_task, src_svc):
                 raise not_found(f"Inbox item not found: {item_id}")
             src_title = title or f"From inbox: {src_task.title}"
             src_description = (
@@ -1538,6 +1547,16 @@ def _collect_inbox_items(
                 # readonly service handle stays open so we don't
                 # double-pay for connection setup.
                 snoozed_ids = _active_snoozed_ids(svc, tasks, now=now)
+                # Iterate inside the ``with`` block so the canonical
+                # inbox predicate (Codex round-5 on #2060) can call
+                # ``svc.get_flow(...)`` for its current-node-human
+                # branch while the readonly handle is still open.
+                for task in tasks:
+                    if task.task_id in snoozed_ids:
+                        continue
+                    entry = _task_to_inbox_item(task, svc)
+                    if entry is not None:
+                        out.append(entry)
         except _BACKING_STORE_ERRORS as exc:
             # Backing-store failure on a single project: log loudly,
             # skip that project but keep building the aggregate. We
@@ -1552,12 +1571,6 @@ def _collect_inbox_items(
                 exc_info=True,
             )
             continue
-        for task in tasks:
-            if task.task_id in snoozed_ids:
-                continue
-            entry = _task_to_inbox_item(task)
-            if entry is not None:
-                out.append(entry)
     return out
 
 
@@ -1659,36 +1672,46 @@ def _active_snoozed_ids(
     return snoozed
 
 
-def _is_inbox_member(task) -> bool:
+def _is_inbox_member(task, svc=None) -> bool:
     """Return True iff ``task`` belongs to the API inbox surface.
 
-    Canonical predicate shared by the read (``GET /inbox`` via
-    :func:`_collect_inbox_items` / :func:`_task_to_inbox_item`) and
-    write (archive / snooze / mark-read / reply / promote) paths so a
-    POST cannot mutate a non-inbox work task — Codex round-3 blocker
-    #1 on #2060 (the old write helpers only probed ``svc.get()``,
-    which returns ANY task with that id and let a caller close a
-    plain "task" flow row via ``POST /inbox/<id>/archive``).
+    Thin delegate to :func:`pollypm.work.inbox_view.is_inbox_task` —
+    the canonical predicate used by the cockpit inbox panel, the
+    dashboard inbox count, and the rail badge. Routing the API
+    write resolution through the same predicate closes Codex round-5
+    blocker on #2060: the previous web-layer predicate accepted any
+    ``flow_template_id == 'chat'`` plus substring plan labels (so
+    ``not_plan_review`` / ``planning`` matched), widening the write
+    surface beyond what GET /inbox / cockpit ever surfaces.
 
-    Mirrors :func:`_task_to_inbox_item` exactly: chat-flow rows OR
-    plan-review rows (label ``plan_review`` or
-    :func:`_is_plan_task`). The terminal-state check stays on the
-    read side because mutating write helpers each have their own
-    typed conflict path (archive's strict UPDATE, snooze's
-    pre-check) — including ``state == 'closed'`` here would
-    incorrectly 404 a request that should 409.
+    ``svc`` is optional only so legacy callers without a flow-lookup
+    handle (e.g. unit tests that construct stubs by hand) can still
+    reach the helper; production callers always pass the live work
+    service so the canonical predicate can resolve the current node
+    when it falls back to the human-actor check. When ``svc`` is
+    omitted we hand the predicate a no-flow shim so it degrades to
+    the role / label branches only.
     """
-    flow = (getattr(task, "flow_template_id", "") or "").lower()
-    labels = [str(lbl) for lbl in (getattr(task, "labels", []) or [])]
-    is_plan_review = (
-        any("plan_review" in lbl for lbl in labels) or _is_plan_task(task)
-    )
-    is_chat = flow == "chat"
-    return bool(is_chat or is_plan_review)
+    flow_lookup = svc if svc is not None else _NoFlowLookup()
+    return bool(is_inbox_task(task, flow_lookup))
 
 
-def _task_to_inbox_item(task) -> APIInboxItem | None:
-    if not _is_inbox_member(task):
+class _NoFlowLookup:
+    """Flow-lookup shim used when no work service handle is on hand.
+
+    ``is_inbox_task`` falls back to ``service.get_flow(...)`` for its
+    "current node is human" branch. When the caller has no service
+    (rare; legacy tests) we return ``None`` so the canonical
+    predicate's existing ``try/except`` short-circuits that branch
+    cleanly. Roles and exact ``plan_review`` label checks still run.
+    """
+
+    def get_flow(self, name, project=None):  # noqa: D401 - protocol shim
+        return None
+
+
+def _task_to_inbox_item(task, svc=None) -> APIInboxItem | None:
+    if not _is_inbox_member(task, svc):
         return None
     flow = (getattr(task, "flow_template_id", "") or "").lower()
     labels = [str(lbl) for lbl in (getattr(task, "labels", []) or [])]

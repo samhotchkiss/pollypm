@@ -20,7 +20,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from pollypm.config import PollyPMConfig
+from pollypm.config import PollyPMConfig, load_config
 from pollypm.web_api.auth import (
     make_bearer_auth_dependency,
     make_sse_auth_dependency,
@@ -33,6 +33,7 @@ from pollypm.web_api.errors import (
 )
 from pollypm.web_api.routes import chat_messages as chat_messages_routes
 from pollypm.web_api.routes import chat_send as chat_send_routes
+from pollypm.web_api.routes import config as config_routes
 from pollypm.web_api.routes import dashboard as dashboard_routes
 from pollypm.web_api.routes import events as events_routes
 from pollypm.web_api.routes import health as health_routes
@@ -96,9 +97,40 @@ def create_app(
         expose_headers=["Last-Event-ID", "X-PollyPM-Warning"],
     )
 
-    # Wire the config provider so every endpoint shares the same
-    # in-memory config rather than each route reloading from disk.
-    app.dependency_overrides[_config_provider] = lambda: config
+    # Wire the config provider. When the loaded config carries the
+    # on-disk ``config_path`` (always true for ``pm serve``), re-invoke
+    # :func:`load_config` on each request so TOML edits propagate
+    # without a server restart. ``load_config`` has an mtime-keyed
+    # cache, so an unchanged file is a single ``stat`` call — no
+    # re-parse cost (Codex round-2 P0 on PR #2056: the old
+    # ``lambda: config`` returned a startup-frozen snapshot).
+    #
+    # The fallback (no ``config_path``) keeps the in-memory snapshot —
+    # tests build :class:`PollyPMConfig` directly and never set
+    # ``config_path``, and we don't want them to depend on a real
+    # TOML on disk.
+    config_path = getattr(config, "config_path", None)
+    if config_path is not None:
+
+        def _reload_config() -> PollyPMConfig:
+            try:
+                return load_config(config_path)
+            except Exception:
+                # Disk read failure (file deleted between requests,
+                # transient permission glitch, malformed TOML mid-edit).
+                # Fall back to the startup snapshot rather than 500ing
+                # the endpoint — the operator can still see what
+                # ``pm serve`` booted with.
+                logger.warning(
+                    "load_config(%s) failed; serving startup snapshot",
+                    config_path,
+                    exc_info=True,
+                )
+                return config
+
+        app.dependency_overrides[_config_provider] = _reload_config
+    else:
+        app.dependency_overrides[_config_provider] = lambda: config
 
     # Exception handlers — turn all error paths into the spec's body
     # shape.
@@ -120,6 +152,9 @@ def create_app(
     app.include_router(tasks_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(inbox_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(dashboard_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
+    # Phase 2 surface §13 — read-only config endpoints. Mutation is
+    # deferred to Phase 3 per the spec; config edits stay TOML-first.
+    app.include_router(config_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     app.include_router(events_routes.router, prefix=API_V1_PREFIX, dependencies=sse_auth_deps)
     # P2 of the chat-endpoints spec — GET /api/v1/chat/sessions and
     # GET /api/v1/chat/{session_name}/messages. Sits under the same

@@ -59,6 +59,13 @@ tags:
       recent messages, token usage, and account quotas. SSE streaming
       variant (`/dashboard/stream`) ships in a follow-up PR per Phase 2
       §3.2.
+  - name: Config
+    description: |
+      Read-only view of the loaded `PollyPMConfig`. Credential-shaped
+      fields (auth tokens, API keys, webhook secrets, anything matching
+      the redaction heuristic in `web_api/routes/config.py`) are replaced
+      with `"***"` before serialisation. Mutation is deferred to Phase 3
+      so config edits stay TOML-first and reviewable.
 
 paths:
   /health:
@@ -895,6 +902,76 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+
+  /config:
+    get:
+      tags: [Config]
+      operationId: getConfig
+      summary: Read the operator config (secrets redacted)
+      description: |
+        Returns the loaded `PollyPMConfig` with credential-bearing
+        values redacted to `"***"` before the response leaves the
+        process. Redaction applies on three layers:
+
+        - **Name-substring match (case-insensitive):** any field whose
+          key contains `api_key`, `apikey`, `token`, `secret`,
+          `password`, `passwd`, `pwd`, `auth`, `private_key`,
+          `credential`, `credentials`, `access_key`, `dsn`, or
+          `database_url`.
+        - **Name — exact / suffix match (case-insensitive):** keys
+          ending in `_PAT` (e.g. `GITHUB_PAT`, `GITLAB_PAT`), plus the
+          specific names `GITHUB_PAT` and `GITHUB_TOKEN`. The boundary
+          check keeps ordinary path keys (`path`, `project_path`,
+          `config_path`) visible.
+        - **Value-shape — URL credentials:** values that parse as a
+          URL with userinfo (`scheme://user:pass@host/...`) **or** with
+          credential-bearing query params (`?password=...`,
+          `?token=...`, `?api_key=...`, `?auth=...`, etc.).
+        - **Value-shape — vendor credential prefixes:** AWS access
+          keys (`AKIA…` / `ASIA…`), GitHub personal/OAuth/user/server/
+          refresh tokens (`ghp_` / `gho_` / `ghu_` / `ghs_` / `ghr_` /
+          `github_pat_…`), and Slack tokens (`xox[abprs]-…`).
+        - **Value-shape — libpq keyword DSNs:** whitespace-delimited
+          connection strings carrying `password=` / `passwd=` / `pwd=`
+          / `passfile=` tokens (e.g.
+          `host=db.example dbname=pollypm user=alice password=secretpw`).
+
+        Empty / unset credential fields stay empty (so the operator
+        can distinguish "unset" from "hidden"). Keep this description
+        in sync with `web_api/routes/config.py` if new shapes are
+        added.
+      responses:
+        "200":
+          description: Redacted config snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ConfigView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /config/projects/{key}:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    get:
+      tags: [Config]
+      operationId: getProjectConfig
+      summary: Read one project's config block (secrets redacted)
+      description: |
+        Returns the `[projects.<key>]` config block as a flat dict.
+        Path-typed fields coerce to strings; enum fields to their
+        `.value`. Same redaction heuristic as `GET /config`.
+      responses:
+        "200":
+          description: Redacted per-project config block.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ProjectConfigView"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
 
   /events:
     get:
@@ -2075,3 +2152,29 @@ components:
         actor: pm
         status: done
         metadata: {}
+
+    # ---- Config (Phase 2 §13, read-only) ----------------------------
+    ConfigView:
+      type: object
+      required: [config]
+      properties:
+        config:
+          type: object
+          additionalProperties: true
+          description: |
+            Redacted snapshot of the loaded `PollyPMConfig`. Shape is
+            open-ended (the underlying dataclass grows over time);
+            credential-shaped fields are replaced with `"***"`, paths
+            are strings, enums are their `.value`.
+    ProjectConfigView:
+      type: object
+      required: [key, project]
+      properties:
+        key:
+          type: string
+          description: Project key (slug) the config block belongs to.
+        project:
+          type: object
+          additionalProperties: true
+          description: |
+            Redacted snapshot of the `[projects.<key>]` config block.

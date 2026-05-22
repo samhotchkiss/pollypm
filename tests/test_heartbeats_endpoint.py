@@ -446,6 +446,51 @@ def test_list_heartbeats_missing_sessions_show_initializing(
         assert row["age_seconds"] is None
 
 
+def test_heartbeat_status_uses_shared_classify(
+    client, auth_headers, monkeypatch,
+):
+    """Regression: heartbeats endpoint delegates to ``session_health.classify_status``.
+
+    Codex PR #2055 round 2 caught that the route had reimplemented the
+    ``healthy`` / ``stale`` / ``unknown`` predicate locally, drifting
+    from the canonical :mod:`pollypm.session_health` source of truth.
+    Patch the shared classifier to return a sentinel string and confirm
+    the endpoint surfaces it verbatim — proving the route reads through
+    the shared helper rather than a private copy. If a future refactor
+    reintroduces a local predicate, this test fails immediately.
+
+    The "no ledger row" override (``initializing``) remains endpoint-
+    specific (see :func:`_classify_status` in
+    :mod:`pollypm.web_api.routes.heartbeats`); the sentinel here covers
+    only the rows-present path that delegates to the shared helper.
+    """
+    from pollypm import session_health as _session_health
+
+    captured: list[dict] = []
+
+    def fake_classify(*, window_present: bool, age_seconds):
+        captured.append(
+            {"window_present": window_present, "age_seconds": age_seconds},
+        )
+        return "sentinel-status"
+
+    monkeypatch.setattr(_session_health, "classify_status", fake_classify)
+    _install_latest_bulk(monkeypatch, by_session={
+        "operator": _record("operator", age_seconds=15),
+    })
+    body = client.get("/api/v1/heartbeats", headers=auth_headers).json()
+    statuses = {row["session_name"]: row["status"] for row in body["heartbeats"]}
+    # Row-present session goes through the patched classifier.
+    assert statuses["operator"] == "sentinel-status"
+    # The endpoint-specific override still wins for rows-absent.
+    assert statuses["architect_myproj"] == "initializing"
+    # The route called the shared classifier with the storage-only
+    # contract: window_present=True (no tmux probe), age_seconds=int.
+    assert captured, "classify_status was not invoked"
+    assert captured[0]["window_present"] is True
+    assert isinstance(captured[0]["age_seconds"], int)
+
+
 def test_list_heartbeats_requires_bearer_auth(client):
     response = client.get("/api/v1/heartbeats")
     assert response.status_code == 401

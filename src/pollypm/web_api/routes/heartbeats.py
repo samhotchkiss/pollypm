@@ -23,12 +23,12 @@ agrees with the CLI summary verbatim.
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel
 
+from pollypm import session_health
 from pollypm.web_api.errors import not_found, service_unavailable
 from pollypm.web_api.routes._deps import ConfigDep
 
@@ -38,15 +38,13 @@ router = APIRouter(tags=["Heartbeats"])
 
 
 # ---------------------------------------------------------------------------
-# Classification thresholds (kept in sync with sessions_health.py — picked
-# once, used everywhere)
+# Classification — delegated to the shared :mod:`pollypm.session_health`
+# helper layer (Codex PR #2055 round 2). The heartbeat staleness threshold
+# and the ``healthy`` / ``stale`` / ``unknown`` predicate are owned there
+# so the API and ``pm sessions`` CLI cannot drift. We keep ONLY the
+# endpoint-specific ``initializing`` override here — when no ledger row
+# exists at all, that's a brand-new session, not a stale one.
 # ---------------------------------------------------------------------------
-
-
-# Heartbeats older than this are classified ``stale``. Five minutes
-# matches the cockpit-inbox "stuck pane" threshold and the watchdog's
-# escalation cadence.
-_STALE_HEARTBEAT_SECONDS = 5 * 60
 
 
 # Default + max for the per-session ``?limit`` query on the detail
@@ -124,24 +122,6 @@ class HeartbeatDetailResponse(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _age_seconds(iso_timestamp: str | None) -> int | None:
-    """Return integer seconds since ``iso_timestamp`` or ``None``.
-
-    Returns ``None`` when the timestamp is missing or unparseable —
-    callers treat that as ``unknown`` (or ``initializing`` when no row
-    exists at all, see :func:`_classify_status`).
-    """
-    if not iso_timestamp:
-        return None
-    try:
-        when = datetime.fromisoformat(iso_timestamp)
-    except (TypeError, ValueError):
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return int(max(0, (datetime.now(UTC) - when).total_seconds()))
-
-
 def _classify_status(
     *,
     has_record: bool,
@@ -149,19 +129,27 @@ def _classify_status(
 ) -> str:
     """Map ``(record-exists?, age)`` to one of the spec's status strings.
 
-    Mirrors :func:`pollypm.cli_features.sessions_health._classify_status`
-    minus the ``missing`` (no tmux window) branch — heartbeats endpoint
-    doesn't probe tmux, only the ledger. The supervisor-side health
-    cascade adds the window-present check; the API surface stays
-    storage-only so a tmux outage doesn't 500 the read.
+    Single-source delegation to
+    :func:`pollypm.session_health.classify_status` (Codex PR #2055 round
+    2) — the ``healthy`` / ``stale`` / ``unknown`` threshold is owned
+    there. We layer ONE endpoint-specific override on top: when no
+    ledger row exists at all, return ``"initializing"`` so the caller
+    doesn't conflate a brand-new session with a stale one (spec §11.3
+    edge case). Heartbeats endpoint doesn't probe tmux, so we always
+    pass ``window_present=True`` — the supervisor-side health cascade
+    adds the window-present check; the API stays storage-only so a tmux
+    outage doesn't 500 a read.
+
+    Resolved through the ``session_health`` module attribute (not a
+    bound name) so test patches on
+    ``pollypm.session_health.classify_status`` flow through verbatim.
     """
     if not has_record:
         return "initializing"
-    if age_seconds is None:
-        return "unknown"
-    if age_seconds > _STALE_HEARTBEAT_SECONDS:
-        return "stale"
-    return "healthy"
+    return session_health.classify_status(
+        window_present=True,
+        age_seconds=age_seconds,
+    )
 
 
 def _session_meta(config, session_name: str) -> tuple[str | None, str | None]:
@@ -197,7 +185,7 @@ def _row_to_latest(
             status=_classify_status(has_record=False, age_seconds=None),
         )
     created_at = getattr(row, "created_at", None)
-    age = _age_seconds(created_at)
+    age = session_health.age_seconds(created_at)
     return HeartbeatLatest(
         session_name=session_name,
         role=role,

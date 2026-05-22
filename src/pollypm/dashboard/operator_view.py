@@ -575,6 +575,29 @@ def _maybe_cache_route_state_map(config) -> dict[str, ProjectState] | None:
     if not snapshot:
         return None
 
+    # Config-identity guard (PR #2026 v8 — Codex r8 blocker): the
+    # cache is a process-wide singleton. If any snapshot entry was
+    # computed against a different ``config`` (different config_path /
+    # workspace_root) than the one the caller passed in, serving it
+    # would leak cross-config data — most acutely when the two configs
+    # share project keys. Decline and let the direct path run.
+    #
+    # Mirrors the v7 guards on the other 4 routed sites
+    # (cockpit_inbox._maybe_cache_{route,count}_awaits_user,
+    # operator_view._maybe_cache_route_operator_view, and
+    # cockpit_rail._maybe_cache_route_rollups). Entries with an empty
+    # ``config_identity`` (legacy / unstamped — test fixtures only)
+    # skip the check so the existing parity tests still serve.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+
     projects = getattr(config, "projects", {}) or {}
     known_keys = set(projects.keys())
     if not known_keys:

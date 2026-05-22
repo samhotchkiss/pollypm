@@ -1,4 +1,4 @@
-"""Move A PR 3 — config-identity guard (PR #2026 v7 / Codex r7 blocker).
+"""Move A PR 3 — config-identity guard (PR #2026 v7+v8 / Codex r7+r8 blocker).
 
 The cache singleton can serve cross-config data when two
 ``PollyPMConfig`` objects share project keys but were loaded from
@@ -9,13 +9,17 @@ lookup. When the live config's identity disagrees with a stamped
 entry, the lookup MUST decline (return ``None``) and fall through to
 the direct DB path.
 
-This file pins the cross-config invariant for all four routed call
+This file pins the cross-config invariant for all five routed call
 sites:
 
 * ``_maybe_cache_route_awaits_user`` (cockpit_inbox)
 * ``_maybe_cache_count_awaits_user`` (cockpit_inbox)
 * ``_maybe_cache_route_operator_view`` (dashboard/operator_view)
 * ``CockpitRailRenderer._maybe_cache_route_rollups`` (cockpit_rail)
+* ``_maybe_cache_route_state_map`` /
+  ``project_state_map_from_config`` (dashboard/operator_view) —
+  added in PR #2026 v8 (Codex r8 follow-up: the 5th routed site
+  was missed in v7).
 """
 
 from __future__ import annotations
@@ -232,6 +236,39 @@ class TestConfigIdentityGuard:
         router = CockpitRouter.__new__(CockpitRouter)
         result = router._maybe_cache_route_rollups(config_b, [])
         assert result is None
+
+    def test_state_map_route_declines_cross_config(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """``_maybe_cache_route_state_map`` declines on cross-config lookup.
+
+        PR #2026 v8 (Codex r8 blocker): the v7 fix added the identity
+        guard to 4 routed sites but missed
+        ``_maybe_cache_route_state_map`` (the engine behind
+        ``project_state_map_from_config``). With cache stamped for
+        config_A and a lookup from config_B (overlapping keys, distinct
+        workspace_root), the route MUST return ``None`` so the direct
+        path runs.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config_a, config_b = self._config_pair(tmp_path)
+
+        # Seed the cache with stamped entries against config_A. The
+        # state-map fast path needs every tracked project's ``state``
+        # populated, so stamp WAITING (any non-None state will do).
+        entries = {
+            key: _stamped_entry(key, config=config_a, state=ProjectState.WAITING)
+            for key in config_a.projects.keys()
+        }
+        _seed_cache(monkeypatch, entries)
+
+        # Cross-config lookup (config_B against config_A's snapshot)
+        # MUST decline. Sanity-check the matching-identity path serves.
+        assert operator_view._maybe_cache_route_state_map(config_b) is None
+        served = operator_view._maybe_cache_route_state_map(config_a)
+        assert served is not None
+        assert set(served.keys()) == set(config_a.projects.keys())
 
     def test_unstamped_entries_skip_identity_check(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,

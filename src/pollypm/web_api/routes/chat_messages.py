@@ -27,7 +27,6 @@ opening a read-only work-service handle (matches the pattern used by
 from __future__ import annotations
 
 import logging
-import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -48,6 +47,7 @@ from pollypm.web_api.chat import (
 )
 from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.routes._deps import ConfigDep
+from pollypm.work.task_state import parse_task_window_name
 
 logger = logging.getLogger(__name__)
 
@@ -68,18 +68,18 @@ SourceMode = Literal["auto", "jsonl", "capture"]
 Direction = Literal["asc", "desc"]
 
 
-# Worker session names are ``task-{project_key}-{N}`` (registry.py:320 /
-# spec §1). The chat-messages endpoint uses this pattern to short-circuit
-# the work-service open for operator/architect/advisor lookups (blocker
-# 3): those surfaces are always discoverable from ``config`` alone, so
-# probing the per-task work-service is pure overhead and turns a pg-pool
-# outage into a misleading 404 ``session_unknown``.
-_WORKER_SESSION_PATTERN = re.compile(r"^task-[A-Za-z0-9][A-Za-z0-9_.-]*-\d+$")
-
-
 def _is_worker_session(session_name: str) -> bool:
-    """Return True iff ``session_name`` matches the worker naming pattern."""
-    return bool(_WORKER_SESSION_PATTERN.match(session_name))
+    """Return True iff ``session_name`` matches the worker naming pattern.
+
+    Delegates to the canonical
+    :func:`pollypm.work.task_state.parse_task_window_name` so the
+    chat-messages router stays in sync with the launcher / recovery
+    sweep / worker-marker reaper. The canonical parser accepts
+    ``task-<project>-<N>`` (with arbitrary characters in the project
+    slug as long as the trailing ``-N`` digits exist) and returns
+    ``None`` for everything else.
+    """
+    return parse_task_window_name(session_name) is not None
 
 
 class _WorkerFacadeUnavailable(Exception):
@@ -309,49 +309,37 @@ def _build_work_service_stub(config: Any) -> Any | None:
 
 
 def _build_work_service_stub_strict(config: Any) -> Any | None:
-    """Strict variant: bypass the public facade for explicit worker lookups.
+    """Strict variant: surfaces facade outages instead of swallowing them.
 
-    The public :func:`list_active_worker_sessions` facade in
-    :mod:`pollypm.web_api.service` swallows pg-pool outages and returns
-    ``[]`` (fail-open posture for discovery). Strict callers — the
-    per-session worker resolver in :func:`_find_surface` — need to tell
+    Consumes the public
+    :func:`pollypm.web_api.service.list_active_worker_sessions_strict`
+    facade — the fail-soft sibling :func:`list_active_worker_sessions`
+    collapses pg-pool outages to ``[]`` (fail-open posture for
+    discovery), but explicit per-session worker lookups need to tell
     "no workers right now" apart from "the work-service can't be
     opened" so the route can map the outage to a typed 503
     ``service_unavailable`` instead of a misleading 404
-    ``session_unknown`` (round-5 blocker; same pattern as PR #2043 v6).
+    ``session_unknown`` (round-6 blocker — moves the previously-inline
+    ``_open_work_service_readonly`` call behind the public service
+    boundary so the route layer doesn't reach into private helpers).
 
-    We open the work-service directly via the private
-    ``_open_work_service_readonly`` context manager and let exceptions
-    propagate as :class:`_WorkerFacadeUnavailable`. An empty result
-    list still collapses to ``None`` (matches the non-strict contract:
-    the registry skips worker enumeration when the stub is ``None``).
+    Facade errors propagate as :class:`_WorkerFacadeUnavailable`. An
+    empty result list still collapses to ``None`` (matches the
+    non-strict contract: the registry skips worker enumeration when
+    the stub is ``None``).
     """
     try:
-        from pollypm.web_api.service import _open_work_service_readonly
+        from pollypm.web_api.service import (
+            WorkServiceFacadeUnavailable,
+            list_active_worker_sessions_strict,
+        )
     except Exception as exc:  # noqa: BLE001
         raise _WorkerFacadeUnavailable(
-            "_open_work_service_readonly import failed"
+            "list_active_worker_sessions_strict import failed"
         ) from exc
-    project = getattr(config, "project", None)
-    if project is None:
-        # No default project — there can't be any per-task workers.
-        # Treat this as "no workers", not an outage.
-        return None
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
-    if not project_key or project_path is None:
-        return None
     try:
-        with _open_work_service_readonly(
-            config=config,
-            project_key=project_key,
-            project_path=project_path,
-        ) as work_service:
-            list_fn = getattr(work_service, "list_worker_sessions", None)
-            if not callable(list_fn):
-                return None
-            records = list(list_fn(active_only=True) or [])
-    except Exception as exc:  # noqa: BLE001
+        records = list_active_worker_sessions_strict(config)
+    except WorkServiceFacadeUnavailable as exc:
         raise _WorkerFacadeUnavailable(str(exc)) from exc
     if not records:
         return None
@@ -575,11 +563,37 @@ def _load_envelopes(
             archive,
             actor_fallback=actor_fallback,
         )
-        return envelopes, "jsonl", archive
+        if envelopes:
+            return envelopes, "jsonl", archive
+        # Empty result on a fresh (non-stale) archive could be a
+        # legitimately empty transcript OR an unreadable archive whose
+        # ``OSError`` the fail-soft parser swallowed (round-6 blocker 5
+        # — ``source=auto`` previously returned an empty 200 in that
+        # case, with no signal to retry). Re-parse with ``strict=True``
+        # to see if the file is actually unreadable; if so, fall
+        # through to capture (auto's job). If strict re-parse also
+        # returns empty, the archive is genuinely empty and we return
+        # the empty page.
+        try:
+            strict_envelopes = parse_events_jsonl(
+                archive,
+                actor_fallback=actor_fallback,
+                strict=True,
+            )
+        except OSError:
+            logger.debug(
+                "chat_messages: auto-mode jsonl unreadable for %s; "
+                "falling back to capture",
+                surface.session_name,
+                exc_info=True,
+            )
+        else:
+            return strict_envelopes, "jsonl", archive
 
-    # Stale or missing archive — try capture, fall back to whatever
-    # JSONL we have (better stale data than no data, per spec §4.8
-    # which prefers empty over erroring).
+    # Stale or missing archive (or unreadable archive in the auto
+    # branch above) — try capture, fall back to whatever JSONL we have
+    # (better stale data than no data, per spec §4.8 which prefers
+    # empty over erroring).
     captured = _capture_for_surface(surface, actor_fallback=actor_fallback)
     if captured:
         return captured, "capture", None

@@ -344,12 +344,21 @@ paths:
             enum: [asc, desc]
             default: desc
           description: Ordering — `desc` (newest first, default) or `asc`.
-        # NOTE: `include_subagents` is deferred — the v3 implementation
-        # called `parse_events_jsonl` on `metadata.output_file`, but
-        # `output_file` is the raw Claude task-notification subagent
-        # JSONL (different shape than the normalized archive the parser
-        # consumes). Re-implementation tracked in #2052. Requests that
-        # pass `include_subagents=true` are rejected as `422`.
+        - in: query
+          name: include_subagents
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: |
+            DEFERRED (#2052). The runtime accepts this parameter for
+            forward-compat with the v3 inliner, but currently returns
+            `422 validation_error` when set to `true`. The v3
+            implementation called `parse_events_jsonl` on the raw
+            Claude task-notification `metadata.output_file`, which is
+            a different JSONL shape than the normalized archive the
+            parser consumes; re-implementation is tracked in #2052.
+            Pass `false` (or omit) until the resolver lands.
         - in: query
           name: source
           schema:

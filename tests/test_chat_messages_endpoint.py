@@ -242,7 +242,12 @@ def patch_parser(monkeypatch: pytest.MonkeyPatch):
     a JSONL fixture instead of installing this stub.
     """
     def install(envelopes_by_path: dict[Path, list[MessageEnvelope]]) -> None:
-        def fake(path, *, actor_fallback="agent"):
+        def fake(path, *, actor_fallback="agent", strict=False):
+            # ``strict`` is accepted for forward-compat with the
+            # ``source=auto`` unreadable-archive fallback added in the
+            # round-6 fix; this stub treats it as a no-op (returns the
+            # same envelopes regardless of strict mode).
+            del strict
             return list(envelopes_by_path.get(Path(path), []))
         monkeypatch.setattr(
             chat_messages_routes, "parse_events_jsonl", fake,
@@ -1285,7 +1290,7 @@ def test_messages_endpoint_operator_lookup_skips_work_service(
     )
     monkeypatch.setattr(
         chat_messages_routes, "parse_events_jsonl",
-        lambda path, *, actor_fallback="agent": [],
+        lambda path, *, actor_fallback="agent", strict=False: [],
     )
     response = client.get(
         "/api/v1/chat/operator/messages",
@@ -1328,7 +1333,7 @@ def test_messages_endpoint_architect_lookup_skips_work_service(
     )
     monkeypatch.setattr(
         chat_messages_routes, "parse_events_jsonl",
-        lambda path, *, actor_fallback="agent": [],
+        lambda path, *, actor_fallback="agent", strict=False: [],
     )
     response = client.get(
         "/api/v1/chat/architect_myproj/messages",
@@ -1351,12 +1356,21 @@ def test_messages_endpoint_worker_lookup_opens_work_service(
 
     open_count = {"n": 0}
 
-    def counting_stub(config, *, strict=False):
+    def counting_stub(config):
         open_count["n"] += 1
         return None
 
+    # Worker lookups go through the strict facade variant — that's the
+    # one whose call we need to count (the fail-soft variant is only
+    # invoked from the discovery endpoint).
     monkeypatch.setattr(
-        chat_messages_routes, "_build_work_service_stub", counting_stub,
+        chat_messages_routes,
+        "_build_work_service_stub_strict",
+        counting_stub,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_work_service_stub",
+        lambda config: None,
     )
     monkeypatch.setattr(
         chat_messages_routes, "_build_tmux_client", lambda: None,
@@ -1373,7 +1387,7 @@ def test_messages_endpoint_worker_lookup_opens_work_service(
     )
     monkeypatch.setattr(
         chat_messages_routes, "parse_events_jsonl",
-        lambda path, *, actor_fallback="agent": [],
+        lambda path, *, actor_fallback="agent", strict=False: [],
     )
     response = client.get(
         "/api/v1/chat/task-myproj-7/messages",
@@ -1394,17 +1408,19 @@ def test_messages_endpoint_worker_lookup_503s_when_facade_unavailable(
     lookup then fell through to 404 ``session_unknown`` — the client
     was told "this surface doesn't exist" when really pg was down.
     """
-    # Simulate the strict-mode failure: the stub builder raises
-    # _WorkerFacadeUnavailable when the public facade can't be opened.
-    def boom(config, *, strict=False):
-        if strict:
-            raise chat_messages_routes._WorkerFacadeUnavailable(
-                "pg pool drained"
-            )
-        return None
+    # Simulate the strict-mode failure: the strict stub builder
+    # raises _WorkerFacadeUnavailable when the facade can't be opened.
+    def boom(config):
+        raise chat_messages_routes._WorkerFacadeUnavailable(
+            "pg pool drained"
+        )
 
     monkeypatch.setattr(
-        chat_messages_routes, "_build_work_service_stub", boom,
+        chat_messages_routes, "_build_work_service_stub_strict", boom,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_work_service_stub",
+        lambda config: None,
     )
     monkeypatch.setattr(
         chat_messages_routes, "_build_tmux_client", lambda: None,

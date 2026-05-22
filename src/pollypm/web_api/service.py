@@ -119,6 +119,56 @@ def _open_work_service_readonly(
 # ---------------------------------------------------------------------------
 
 
+class WorkServiceFacadeUnavailable(RuntimeError):
+    """Raised by :func:`list_active_worker_sessions_strict` on facade outage.
+
+    Distinct from "no active workers" (which collapses to ``[]``):
+    lets callers distinguish a genuinely empty per-task worker registry
+    from a pg-pool outage / failed work-service open. Callers that need
+    to map facade failures to a typed 503 ``service_unavailable``
+    (instead of swallowing them like the fail-soft sibling) import
+    this exception and the strict variant together.
+    """
+
+
+def list_active_worker_sessions_strict(config: PollyPMConfig) -> list[Any]:
+    """Strict variant of :func:`list_active_worker_sessions`.
+
+    Same return shape, but raises :class:`WorkServiceFacadeUnavailable`
+    when the work-service can't be opened or
+    ``list_worker_sessions(active_only=True)`` raises — instead of
+    swallowing those errors and returning ``[]``. The chat-messages
+    route uses this so a pg-pool outage on a worker lookup surfaces as
+    a typed 503 ``service_unavailable`` instead of a misleading 404
+    ``session_unknown`` (round-6 blocker).
+
+    "No active workers" still collapses to ``[]`` (it's not an
+    outage), and "no default project configured" likewise returns
+    ``[]`` — there can't be any per-task workers without a project,
+    so the caller treats that as a legitimate empty registry.
+    """
+    project = getattr(config, "project", None)
+    if project is None:
+        return []
+    project_key = getattr(project, "name", "")
+    project_path = getattr(project, "root_dir", None)
+    if not project_key or project_path is None:
+        return []
+    try:
+        with _open_work_service_readonly(
+            config=config,
+            project_key=project_key,
+            project_path=project_path,
+        ) as svc:
+            list_fn = getattr(svc, "list_worker_sessions", None)
+            if not callable(list_fn):
+                return []
+            records = list_fn(active_only=True)
+            return list(records or [])
+    except Exception as exc:  # noqa: BLE001
+        raise WorkServiceFacadeUnavailable(str(exc)) from exc
+
+
 def list_active_worker_sessions(config: PollyPMConfig) -> list[Any]:
     """Return active ``WorkerSessionRecord``s for chat surface discovery.
 

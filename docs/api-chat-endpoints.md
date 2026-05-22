@@ -1,10 +1,9 @@
 # Chat HTTP API reference
 
-> **Status:** Reference doc for endpoints landing in PRs #2043, #2044,
-> #2045, #2047. Will be cross-checked against final implementation
-> before merge. Treat the contracts here as the *intended* shape — the
-> P3 send endpoint in particular (#2043) is still in fix-loop, so
-> field names and error codes may shift before merge.
+> **Status:** Reference doc for the chat API. This PR is stacked behind
+> #2043/#2045/#2047 and will land once those merge. The contracts below
+> match the merged P1 #2044 and the open implementation branches; if
+> either drifts pre-merge, this doc updates first.
 
 Reference for the `/api/v1/chat/*` endpoints — the HTTP surface for
 reading transcripts from, and sending messages into, the four live
@@ -200,8 +199,9 @@ Pull a window of messages from a single session's transcript.
 | `limit` | `100` | Max messages, must be `1..500`. Values outside that range return `422 validation_error` (FastAPI Pydantic-level rejection). |
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
 | `include_subagents` | `false` | When `true`, inline subagent transcripts inside their `subagent_result` parent's `metadata.subagent_transcript[]`. See §5.2. |
-| `include_thinking` | `false` | Include `type=thinking` blocks. Default off — usually noisy. |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
+
+> Note: A `type="thinking"` envelope is planned but not yet implemented — tracked in [#2048](https://github.com/samhotchkiss/pollypm/issues/2048).
 
 **Response:**
 
@@ -351,7 +351,7 @@ which variant the envelope represents and what shape `metadata` takes.
   "ts": "2026-05-21T20:53:12.123Z",
   "role": "user" | "assistant" | "tool" | "system",
   "actor": "Sam" | "Polly" | "Archie" | "Codex" | "system",
-  "type": "text" | "tool_use" | "tool_result" | "thinking" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event",
+  "type": "text" | "tool_use" | "tool_result" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event",
   "text": "...display-ready string...",
   "metadata": { "...": "type-specific" }
 }
@@ -369,7 +369,6 @@ structured original lives in `metadata`.
 | `text` | user / assistant | Plain turn text | The 80% case. `metadata: {}`. |
 | `tool_use` | assistant | Tool call | `metadata`: `tool_use_id`, `tool_name`, `tool_input`. |
 | `tool_result` | tool | Tool return | `metadata`: `tool_use_id`, `is_error`, `content[]`. |
-| `thinking` | assistant | Extended-thinking block | Opt-in via `?include_thinking=true`. |
 | `ask_user` | assistant | `AskUserQuestion` tool | `metadata`: `questions[]`, `answered`, `answers`. See §5.5. |
 | `file` | assistant | `SendUserFile` tool | `metadata`: `files[]` (local paths), `caption`, `status`. |
 | `subagent_spawn` | assistant | `Task` tool call | `metadata`: `subagent_id`, `subagent_type`, `description`, `prompt`, `isolation`. |

@@ -115,6 +115,62 @@ def _open_work_service_readonly(
 
 
 # ---------------------------------------------------------------------------
+# Public chat-surface helpers (used by routes/chat_messages.py)
+# ---------------------------------------------------------------------------
+
+
+def list_active_worker_sessions(config: PollyPMConfig) -> list[Any]:
+    """Return active ``WorkerSessionRecord``s for chat surface discovery.
+
+    Public facade so the chat-messages route doesn't need to reach
+    into ``_open_work_service_readonly``. Returns ``[]`` when the
+    work-service can't be opened (no DB yet, pg pool down, no default
+    project configured) — the chat-surface enumerator treats an empty
+    list as "no per-task workers right now" and the discovery endpoint
+    still returns configured surfaces. Matches the fail-open posture
+    of the other read endpoints.
+
+    The records are the same ``WorkerSessionRecord`` type returned by
+    :meth:`pollypm.work.service.WorkService.list_worker_sessions`; we
+    type the return as ``list[Any]`` because importing the dataclass
+    here would pull the entire work-package into the web-api service
+    module at import time (and the consumer only needs duck-typed
+    attribute access).
+    """
+    project = getattr(config, "project", None)
+    if project is None:
+        return []
+    project_key = getattr(project, "name", "")
+    project_path = getattr(project, "root_dir", None)
+    if not project_key or project_path is None:
+        return []
+    try:
+        with _open_work_service_readonly(
+            config=config,
+            project_key=project_key,
+            project_path=project_path,
+        ) as svc:
+            list_fn = getattr(svc, "list_worker_sessions", None)
+            if not callable(list_fn):
+                return []
+            try:
+                records = list_fn(active_only=True)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "list_active_worker_sessions: list_worker_sessions failed",
+                    exc_info=True,
+                )
+                return []
+            return list(records or [])
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "list_active_worker_sessions: work-service open failed",
+            exc_info=True,
+        )
+        return []
+
+
+# ---------------------------------------------------------------------------
 # Project helpers
 # ---------------------------------------------------------------------------
 

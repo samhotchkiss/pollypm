@@ -354,10 +354,6 @@ paths:
             (project + workspace `.pollypm/transcripts/`) — paths
             outside the allowlist are dropped silently.
         - in: query
-          name: include_thinking
-          schema: { type: boolean, default: false }
-          description: Include `type=thinking` envelopes (default false).
-        - in: query
           name: source
           schema:
             type: string
@@ -1107,11 +1103,13 @@ components:
     ChatMessageType:
       type: string
       description: |
-        Envelope type per spec §3. `thinking` is excluded by default
-        and only emitted when `include_thinking=true` on the request.
+        Envelope type per spec §3. `thinking` is reserved — the
+        transcript ingestor does not currently preserve thinking
+        blocks, so the API never emits them. The `include_thinking`
+        query param + `thinking` enum value will return once the
+        ingestor learns to round-trip them (follow-up #2048).
       enum:
         - text
-        - thinking
         - tool_call
         - tool_result
         - subagent_result

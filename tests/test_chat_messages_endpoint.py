@@ -211,11 +211,13 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
             chat_messages_routes, "enumerate_chat_surfaces", fake,
         )
-        # Also stub the work-service handle factory so we never try to
-        # open Postgres during these tests.
+        # Also stub the work-service stub factory so we never try to
+        # open Postgres during these tests. (The route uses the
+        # public ``list_active_worker_sessions`` facade in
+        # ``pollypm.web_api.service`` — Blocker 3 fix.)
         monkeypatch.setattr(
             chat_messages_routes,
-            "_open_work_service_for_discovery",
+            "_build_work_service_stub",
             lambda _config: None,
         )
         # Stop the route from constructing a real TmuxClient (spawning
@@ -228,13 +230,18 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def patch_parser(monkeypatch: pytest.MonkeyPatch):
-    """Factory installing a stub for ``parse_events_jsonl``."""
+    """Factory installing a stub for ``parse_events_jsonl``.
+
+    Signature mirrors the real parser on main
+    (:func:`pollypm.web_api.chat.transcripts.parse_events_jsonl`) — the
+    ``include_thinking`` knob was removed when thinking-block
+    round-tripping was parked (follow-up #2048). Tests that need real
+    parser behavior (Blocker 1) drive the on-disk parser directly via
+    a JSONL fixture instead of installing this stub.
+    """
     def install(envelopes_by_path: dict[Path, list[MessageEnvelope]]) -> None:
-        def fake(path, *, include_thinking=False, actor_fallback="agent"):
-            result = envelopes_by_path.get(Path(path), [])
-            if not include_thinking:
-                result = [e for e in result if str(e.type) != "thinking"]
-            return list(result)
+        def fake(path, *, actor_fallback="agent"):
+            return list(envelopes_by_path.get(Path(path), []))
         monkeypatch.setattr(
             chat_messages_routes, "parse_events_jsonl", fake,
         )
@@ -243,12 +250,19 @@ def patch_parser(monkeypatch: pytest.MonkeyPatch):
 
 @pytest.fixture
 def patch_capture(monkeypatch: pytest.MonkeyPatch):
-    """Factory installing a stub for ``capture_envelopes``."""
+    """Factory installing a stub for ``capture_envelopes``.
+
+    Signature mirrors the real helper on main — including the
+    ``strict`` knob added in this PR (Blocker 2 fix). Tests that need
+    the production strict-mode behavior (capture_pane raising →
+    capture_failed) drive the real helper via a fake tmux client with
+    a raising ``capture_pane`` instead of installing this stub.
+    """
     def install(envelopes: list[MessageEnvelope]) -> None:
         def fake(
             tmux_client, *, session_name, target,
             actor_fallback="agent", lines=3000, timestamp=None,
-            role=MessageRole.ASSISTANT,
+            role=MessageRole.ASSISTANT, strict=False,
         ):
             return list(envelopes)
         monkeypatch.setattr(
@@ -556,16 +570,19 @@ def test_messages_endpoint_accepts_limit_500(
 # ---------------------------------------------------------------------------
 
 
-def test_messages_endpoint_excludes_thinking_by_default(
+def test_messages_endpoint_drops_thinking_envelopes(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
+    """Thinking blocks are filtered out — the parser on main never
+    surfaces them, but the router keeps a defensive filter so any
+    future capture-mode emitter can't smuggle them through.
+
+    The ``include_thinking`` query param + thinking round-tripping is
+    parked until follow-up #2048 wires the ingestor side; until then
+    the API never emits ``type=thinking`` envelopes.
+    """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
-    # NOTE: main's MessageType intentionally omits THINKING (see envelope.py
-    # docstring — upstream ingestor doesn't preserve thinking blocks yet).
-    # The router still filters by string match (``str(envelope.type) ==
-    # "thinking"``), so the include_thinking switch is exercised via a raw
-    # string injected through the slots dataclass — no enum needed.
     envelopes = [
         _env("t", type_="thinking", text="(thinking)"),
         _env("text", type_=MessageType.TEXT, text="visible"),
@@ -584,12 +601,17 @@ def test_messages_endpoint_excludes_thinking_by_default(
     assert "text" in types
 
 
-def test_messages_endpoint_includes_thinking_when_requested(
+def test_messages_endpoint_rejects_include_thinking_query_param(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
+    """``include_thinking`` was removed from the endpoint signature
+    (follow-up #2048 will reinstate it once the ingestor preserves
+    thinking blocks). FastAPI ignores unknown query params by default,
+    so we just confirm the param is no longer wired — passing it has
+    no effect on the response.
+    """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
-    # See note in the sibling test about raw-string thinking injection.
     envelopes = [
         _env("t", type_="thinking", text="(thinking)"),
         _env("text", type_=MessageType.TEXT, text="visible"),
@@ -604,7 +626,8 @@ def test_messages_endpoint_includes_thinking_when_requested(
         headers=auth_headers,
     ).json()
     types = [m["type"] for m in body["messages"]]
-    assert "thinking" in types
+    # include_thinking has no effect — thinking is still filtered out.
+    assert "thinking" not in types
 
 
 def test_messages_endpoint_inlines_subagent_transcript_when_requested(
@@ -639,7 +662,7 @@ def test_messages_endpoint_inlines_subagent_transcript_when_requested(
         transcript_path=archive,
     )])
 
-    def fake_parser(path, *, include_thinking=False, actor_fallback="agent"):
+    def fake_parser(path, *, actor_fallback="agent"):
         if Path(path) == archive:
             return [parent]
         if Path(path) == sub_archive:
@@ -929,7 +952,7 @@ def test_messages_endpoint_rejects_absolute_path_traversal_in_subagent(
 
     calls: list[Path] = []
 
-    def fake_parser(path, *, include_thinking=False, actor_fallback="agent"):
+    def fake_parser(path, *, actor_fallback="agent"):
         # Track every disk access — must NOT include /etc/passwd.
         calls.append(Path(path))
         if Path(path) == archive:
@@ -976,7 +999,7 @@ def test_messages_endpoint_rejects_relative_path_traversal_in_subagent(
         transcript_path=archive,
     )])
 
-    def fake_parser(path, *, include_thinking=False, actor_fallback="agent"):
+    def fake_parser(path, *, actor_fallback="agent"):
         if Path(path) == archive:
             return [parent]
         # Any access for a non-archive path means the allowlist
@@ -1107,3 +1130,113 @@ def test_messages_endpoint_source_auto_still_fail_soft_on_capture_error(
     # Falls back to whatever JSONL holds.
     assert body["transcript_source"] == "jsonl"
     assert [m["id"] for m in body["messages"]] == ["from_jsonl"]
+
+
+# ---------------------------------------------------------------------------
+# REAL-helper regression tests (PR #2045 v3 blockers)
+#
+# The fixtures above monkeypatch ``parse_events_jsonl`` /
+# ``capture_envelopes`` for speed and isolation. The two tests below
+# pin the production wiring by driving the REAL helpers — a
+# monkeypatch that accepted the now-removed ``include_thinking`` kwarg
+# (or a fake capture that raised instead of the real fail-soft helper)
+# previously hid two TypeError / silent-empty bugs in production.
+# ---------------------------------------------------------------------------
+
+
+def test_messages_endpoint_jsonl_uses_real_parser_no_typeerror(
+    client, auth_headers, patch_registry, tmp_path,
+):
+    """REAL ``parse_events_jsonl`` call — Blocker 1 regression.
+
+    Previously the route passed ``include_thinking=...`` to
+    ``parse_events_jsonl``, but the authoritative parser on main no
+    longer accepts that kwarg (it was removed in #2044). Tests passed
+    because the fixture stub accepted the kwarg; in production every
+    ``source=jsonl`` request raised ``TypeError``. This test drives the
+    real parser via an on-disk JSONL fixture so the wiring is exercised
+    end-to-end.
+    """
+    import json as _json
+
+    archive = tmp_path / "events.jsonl"
+    # One Claude-shaped user_turn event — same shape the real ingestor
+    # writes (mirrors tests/test_chat_transcripts.py::_claude_event).
+    event = {
+        "timestamp": "2026-05-21T10:00:00Z",
+        "event_type": "user_turn",
+        "session_id": "session-real",
+        "account_name": "claude_main",
+        "provider": "claude",
+        "project_key": "myproj",
+        "source_path": "/tmp/raw.jsonl",
+        "source_offset": 0,
+        "cwd": "/tmp/repo",
+        "model_name": "claude-opus-4-7",
+        "payload": {"text": "hello from real parser"},
+    }
+    archive.write_text(_json.dumps(event) + "\n")
+
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    # NOTE: deliberately NOT installing patch_parser — we want the real
+    # parser to fire. patch_registry already stubs the registry +
+    # work-service so we never hit Postgres.
+    response = client.get(
+        "/api/v1/chat/operator/messages?source=jsonl&direction=asc",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["transcript_source"] == "jsonl"
+    assert body["transcript_path"] == str(archive)
+    assert len(body["messages"]) == 1
+    assert body["messages"][0]["text"] == "hello from real parser"
+    assert body["messages"][0]["type"] == "text"
+
+
+def test_messages_endpoint_capture_uses_real_helper_with_raising_pane(
+    client, auth_headers, patch_registry, monkeypatch, tmp_path,
+):
+    """REAL ``capture_envelopes`` call — Blocker 2 regression.
+
+    Previously ``capture_envelopes`` swallowed every ``capture_pane``
+    exception and returned ``[]``; the strict-mode 503 contract was
+    bypassed in production because nothing ever raised back to the
+    route. Tests passed because they monkeypatched
+    ``chat_messages_routes.capture_envelopes`` itself to raise.
+
+    This test drives the real helper end-to-end with a fake tmux
+    client whose ``capture_pane`` raises. The real strict-mode path
+    (added in this PR) propagates the exception so the route maps it
+    to ``503 capture_failed``.
+    """
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive, present=True,
+    )])
+
+    class _RaisingTmuxClient:
+        def capture_pane(self, target, lines=3000):  # noqa: ARG002
+            raise RuntimeError("tmux pipe closed")
+
+    # Install a fake TmuxClient — but DO NOT stub capture_envelopes;
+    # the real helper must run so the strict-mode propagation is
+    # exercised end-to-end.
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client",
+        lambda: _RaisingTmuxClient(),
+    )
+
+    response = client.get(
+        "/api/v1/chat/operator/messages?source=capture",
+        headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "capture_failed"
+    assert "tmux pipe closed" in body["error"]["message"]

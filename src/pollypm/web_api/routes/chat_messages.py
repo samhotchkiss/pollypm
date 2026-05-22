@@ -224,63 +224,57 @@ def _invalid_query(field: str, message: str) -> APIError:
 # ---------------------------------------------------------------------------
 
 
-def _open_work_service_for_discovery(config: Any) -> Any | None:
-    """Best-effort handle for enumerating per-task workers.
+def _build_work_service_stub(config: Any) -> Any | None:
+    """Return a duck-typed stub the registry can call for workers.
 
-    Returns ``None`` if the work-service can't be opened (no DB yet,
-    pg pool down, etc.). The discovery endpoint then falls back to
-    configured surfaces only — never 500s. Matches the fail-open
-    posture of the other read endpoints.
+    The chat registry only needs ``list_worker_sessions(active_only=...)``
+    on the work-service. Rather than reach into a private context
+    manager, we call the public
+    :func:`pollypm.web_api.service.list_active_worker_sessions` facade
+    once and hand the registry a tiny adapter that re-emits those
+    records. Returns ``None`` when the facade yields no records — the
+    registry then skips worker enumeration entirely.
+
+    Fail-open posture: any unexpected import/runtime error collapses
+    to ``None`` so the discovery endpoint still returns configured
+    surfaces and never 500s.
     """
     try:
-        from pollypm.web_api.service import _open_work_service_readonly
+        from pollypm.web_api.service import list_active_worker_sessions
     except Exception:  # noqa: BLE001
         return None
-    # ``_open_work_service_readonly`` is a context manager that wants
-    # a project_key + path; for chat discovery we need a single handle
-    # that covers every project. We use the operator's default project
-    # because the work-service is workspace-wide in pg mode (the
-    # project_key arg is informational only).
-    project = getattr(config, "project", None)
-    if project is None:
+    try:
+        records = list_active_worker_sessions(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "chat_messages: list_active_worker_sessions failed; "
+            "skipping worker surfaces",
+            exc_info=True,
+        )
         return None
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
-    if not project_key or project_path is None:
+    if not records:
         return None
-    return _WorkServiceHandle(_open_work_service_readonly,
-                              config=config,
-                              project_key=project_key,
-                              project_path=project_path)
+    return _WorkerSessionStub(records)
 
 
-class _WorkServiceHandle:
-    """Tiny wrapper that defers entering the contextmanager until use.
+class _WorkerSessionStub:
+    """Minimal stand-in exposing ``list_worker_sessions`` for the registry.
 
-    ``enumerate_chat_surfaces`` only calls ``list_worker_sessions`` so
-    we can stage the contextmanager exit until after the call. This
-    keeps the route function readable (one ``with`` block in
-    :func:`list_chat_sessions_endpoint`).
+    ``enumerate_worker_surfaces`` in
+    :mod:`pollypm.web_api.chat.registry` only calls
+    ``list_worker_sessions(active_only=True)`` on the work-service it
+    receives, so we expose exactly that method and ignore the
+    ``active_only`` flag (the public facade always filters to active
+    records).
     """
 
-    def __init__(self, factory: Any, **kwargs: Any) -> None:
-        self._factory = factory
-        self._kwargs = kwargs
-        self._cm: Any = None
-        self._svc: Any = None
+    def __init__(self, records: list[Any]) -> None:
+        self._records = list(records)
 
-    def __enter__(self) -> Any:
-        self._cm = self._factory(**self._kwargs)
-        self._svc = self._cm.__enter__()
-        return self._svc
-
-    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
-        if self._cm is not None:
-            try:
-                self._cm.__exit__(exc_type, exc, tb)
-            finally:
-                self._cm = None
-                self._svc = None
+    def list_worker_sessions(
+        self, *, active_only: bool = True,  # noqa: ARG002 — registry-API compat
+    ) -> list[Any]:
+        return list(self._records)
 
 
 def _build_tmux_client() -> TmuxClient | None:
@@ -305,20 +299,12 @@ def _find_surface(
 ) -> ChatSurface:
     """Resolve ``session_name`` to a :class:`ChatSurface` or 404."""
     tmux_client = _build_tmux_client()
-    work_handle = _open_work_service_for_discovery(config) if include_workers else None
-    if work_handle is not None:
-        with work_handle as work_service:
-            surfaces = enumerate_chat_surfaces(
-                config,
-                work_service=work_service,
-                tmux_client=tmux_client,
-            )
-    else:
-        surfaces = enumerate_chat_surfaces(
-            config,
-            work_service=None,
-            tmux_client=tmux_client,
-        )
+    work_service = _build_work_service_stub(config) if include_workers else None
+    surfaces = enumerate_chat_surfaces(
+        config,
+        work_service=work_service,
+        tmux_client=tmux_client,
+    )
     for surface in surfaces:
         if surface.session_name == session_name:
             return surface
@@ -386,12 +372,18 @@ def _load_envelopes(
     surface: ChatSurface,
     *,
     source: SourceMode,
-    include_thinking: bool,
 ) -> tuple[list[MessageEnvelope], str | None, Path | None]:
     """Return ``(envelopes, transcript_source, transcript_path)``.
 
     ``transcript_source`` is one of ``"jsonl"`` / ``"capture"`` /
     ``None`` (no transcript yet, spec §4.8).
+
+    NOTE: thinking-block filtering is no longer plumbed through this
+    helper. The authoritative ``parse_events_jsonl`` on main does not
+    surface thinking envelopes (transcript ingestor does not preserve
+    them), so there's nothing to gate. The ``include_thinking`` query
+    param is parked until the ingestor + parser learn how to round-trip
+    thinking blocks (follow-up #2048).
     """
     archive = surface.transcript_path
     actor_fallback = surface.persona or "agent"
@@ -401,7 +393,6 @@ def _load_envelopes(
             raise _archive_missing(surface.session_name)
         envelopes = parse_events_jsonl(
             archive,
-            include_thinking=include_thinking,
             actor_fallback=actor_fallback,
         )
         return envelopes, "jsonl", archive
@@ -423,7 +414,6 @@ def _load_envelopes(
     if archive is not None and not is_archive_stale(archive):
         envelopes = parse_events_jsonl(
             archive,
-            include_thinking=include_thinking,
             actor_fallback=actor_fallback,
         )
         return envelopes, "jsonl", archive
@@ -437,7 +427,6 @@ def _load_envelopes(
     if archive is not None and archive.exists():
         envelopes = parse_events_jsonl(
             archive,
-            include_thinking=include_thinking,
             actor_fallback=actor_fallback,
         )
         return envelopes, "jsonl", archive
@@ -481,6 +470,7 @@ def _capture_for_surface(
             session_name=surface.session_name,
             target=target,
             actor_fallback=actor_fallback,
+            strict=strict,
         )
     except APIError:
         # Already a typed error — propagate without wrapping.
@@ -502,7 +492,6 @@ def _apply_filters_and_paginate(
     since_id: str | None,
     direction: Direction,
     limit: int,
-    include_thinking: bool,
     include_subagents: bool,
     subagent_loader: Any,
     allowed_subagent_roots: list[Path] | None = None,
@@ -514,10 +503,12 @@ def _apply_filters_and_paginate(
     direction — applying ``since_id`` in source order would slice the
     wrong half for ``direction=desc``, duplicating page 1 on page 2):
 
-    1. Drop ``thinking`` envelopes when ``include_thinking`` is false
-       (defensive — the P1 parser already drops these by default, but
-       a custom ``parse_events_jsonl(..., include_thinking=True)``
-       caller could feed them through here).
+    1. Drop ``thinking`` envelopes — the authoritative parser does not
+       surface them today (transcript ingestor does not preserve
+       thinking blocks); this defensive filter keeps capture-mode
+       output consistent if a future capture path ever emits one.
+       ``include_thinking`` is parked until follow-up #2048 wires the
+       full thinking round-trip.
     2. ``since`` lower-bound on envelope ``ts``.
     3. Sort by timestamp + position. JSONL ordering is already
        chronological; we re-sort defensively so the response is
@@ -533,7 +524,7 @@ def _apply_filters_and_paginate(
     """
     filtered: list[MessageEnvelope] = []
     for envelope in envelopes:
-        if not include_thinking and str(envelope.type) == "thinking":
+        if str(envelope.type) == "thinking":
             continue
         if since is not None:
             ts = _parse_envelope_ts(envelope.ts)
@@ -586,7 +577,6 @@ def _apply_filters_and_paginate(
             _inline_subagent(
                 env,
                 subagent_loader,
-                include_thinking,
                 allowed_roots=allowed_subagent_roots,
             )
             for env in page
@@ -680,7 +670,6 @@ def _allowed_transcript_roots(config: Any, work_service: Any = None) -> list[Pat
 def _inline_subagent(
     envelope: MessageEnvelope,
     subagent_loader: Any,
-    include_thinking: bool,
     allowed_roots: list[Path] | None = None,
 ) -> MessageEnvelope:
     """When the envelope is a ``subagent_result``, inline the sub-transcript.
@@ -725,10 +714,7 @@ def _inline_subagent(
     try:
         if not sub_path.exists():
             return envelope
-        sub_envelopes = subagent_loader(
-            sub_path,
-            include_thinking=include_thinking,
-        )
+        sub_envelopes = subagent_loader(sub_path)
     except Exception:  # noqa: BLE001
         logger.debug(
             "chat_messages: subagent transcript load failed for %s",
@@ -777,20 +763,12 @@ def list_chat_sessions_endpoint(config: ConfigDep) -> ChatSessionsResponse:
     sidebar bootstrap.
     """
     tmux_client = _build_tmux_client()
-    work_handle = _open_work_service_for_discovery(config)
-    if work_handle is not None:
-        with work_handle as work_service:
-            surfaces = enumerate_chat_surfaces(
-                config,
-                work_service=work_service,
-                tmux_client=tmux_client,
-            )
-    else:
-        surfaces = enumerate_chat_surfaces(
-            config,
-            work_service=None,
-            tmux_client=tmux_client,
-        )
+    work_service = _build_work_service_stub(config)
+    surfaces = enumerate_chat_surfaces(
+        config,
+        work_service=work_service,
+        tmux_client=tmux_client,
+    )
     return ChatSessionsResponse(
         sessions=[_surface_to_wire(surface) for surface in surfaces],
     )
@@ -827,12 +805,6 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
             "subagent_result.metadata.subagent_transcript (spec §3.7)."
         ),
     )] = False,
-    include_thinking: Annotated[bool, Query(
-        description=(
-            "Include type=thinking envelopes (spec §3.4). Default false "
-            "because thinking blocks are usually noisy."
-        ),
-    )] = False,
     source: Annotated[SourceMode, Query(
         description=(
             "Transcript source: 'auto' (jsonl with capture fallback when "
@@ -846,7 +818,7 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
     since_dt = _parse_since(since)
 
     envelopes, transcript_source, transcript_path = _load_envelopes(
-        surface, source=source, include_thinking=include_thinking,
+        surface, source=source,
     )
 
     # Compute path-traversal allowlist once per request — the
@@ -862,7 +834,6 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         since_id=since_id,
         direction=direction,
         limit=limit,
-        include_thinking=include_thinking,
         include_subagents=include_subagents,
         subagent_loader=parse_events_jsonl,
         allowed_subagent_roots=allowed_roots,

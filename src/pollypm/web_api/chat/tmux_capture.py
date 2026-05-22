@@ -63,6 +63,7 @@ def capture_envelopes(
     lines: int = DEFAULT_CAPTURE_LINES,
     timestamp: str | None = None,
     role: MessageRole = MessageRole.ASSISTANT,
+    strict: bool = False,
 ) -> list[MessageEnvelope]:
     """Capture a tmux pane and translate each line into an envelope.
 
@@ -84,8 +85,12 @@ def capture_envelopes(
     capture wall-clock. (Pane captures don't carry per-line timestamps
     — the whole capture happened at the same instant from our PoV.)
 
-    Returns ``[]`` on any tmux failure; the caller decides whether to
-    surface an error or fall through to "no transcript available".
+    ``strict`` — when ``False`` (default) every tmux failure mode
+    collapses to ``[]`` so the caller can fall back to the JSONL
+    archive (spec §4.7 / §4.8 / ``source=auto``). When ``True`` the
+    underlying ``capture_pane`` exception is re-raised so the caller
+    (explicit ``source=capture``) can map it to a typed 503 instead of
+    silently returning ``200`` + empty messages.
     """
     if tmux_client is None:
         return []
@@ -99,6 +104,8 @@ def capture_envelopes(
             "chat.tmux_capture: capture_pane failed for %s (target=%s): %s",
             session_name, target, exc,
         )
+        if strict:
+            raise
         return []
     if not isinstance(raw, str) or not raw:
         return []

@@ -54,6 +54,11 @@ tags:
     description: Inbox items and threads.
   - name: Events
     description: Realtime audit-log stream.
+  - name: Audit
+    description: |
+      Historical audit-log queries (grep + stats). The streaming
+      counterpart lives under the ``Events`` tag at
+      ``GET /api/v1/events``.
   - name: Chat
     description: |
       Chat-surface discovery and message history. The discovery endpoint
@@ -1986,6 +1991,98 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /audit/grep:
+    get:
+      tags: [Audit]
+      operationId: grepAudit
+      summary: Search audit-log events (rotation-aware)
+      description: |
+        Returns audit events that match the supplied filters. Mirrors
+        the `pm audit grep` CLI command (PR #2036) and reuses its
+        rotation-aware file walker so live `.jsonl` + gzipped
+        `.gz` archives are searched together.
+
+        Filters apply in cheap→expensive order: regex first against
+        the raw JSONL line, then exact `event_type` match, then
+        `since` cutoff. The response is capped at `limit` matches
+        (default 100, max 1000 per spec §8.3).
+
+        `next_cursor` is reserved for a future cursor-paginated
+        variant; today the endpoint always returns `null`.
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+          description: Scope to one project (per-project log + central tail).
+        - in: query
+          name: since
+          schema: { type: string }
+          description: |
+            ISO-8601 timestamp (e.g. `2026-05-21T03:14:15Z`) or a
+            shortcut of the form `<N><unit>` where unit is one of
+            `s` / `m` / `h` / `d` / `w` (seconds / minutes / hours /
+            days / weeks). Result is `now - delta` in UTC.
+        - in: query
+          name: event_type
+          schema: { type: string }
+          description: Exact match on the `.event` field (not a regex).
+        - in: query
+          name: pattern
+          schema: { type: string }
+          description: |
+            Python `re.search` regex applied to the raw JSONL line.
+            Omit to match every record.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          description: Cap matches returned. Max 1000 per spec §8.3.
+      responses:
+        "200":
+          description: Matching events, capped at `limit`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditGrepResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /audit/stats:
+    get:
+      tags: [Audit]
+      operationId: statsAudit
+      summary: Aggregate counts of audit events by type and severity
+      description: |
+        Aggregates over the same target-file set the grep endpoint
+        uses, so totals + per-event / per-severity counts match what
+        a manual grep would produce. `severity` maps to the audit
+        record's `status` field (`ok` / `warn` / `error`).
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+        - in: query
+          name: since
+          schema: { type: string }
+          description: |
+            ISO-8601 or shortcut (`1h` / `24h` / `7d`).
+      responses:
+        "200":
+          description: Aggregate counts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditStatsResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3863,3 +3960,43 @@ components:
           description: |
             True when the caller's `?limit` exceeded the route's 200-row
             cap and was silently clamped (Phase 2 §11.3).
+
+    # ---- Audit query (grep + stats) --------------------------------
+    AuditGrepResponse:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/Event"
+        next_cursor:
+          type: string
+          description: |
+            Reserved for cursor-paginated variants. Always `null`
+            today; clients should accept and ignore the field.
+
+    AuditStatsResponse:
+      type: object
+      required: [total, by_event, by_severity]
+      properties:
+        total:
+          type: integer
+          description: Total events matching the project / since filters.
+        by_event:
+          type: object
+          additionalProperties: { type: integer }
+          description: Per-event-name counts.
+        by_severity:
+          type: object
+          additionalProperties: { type: integer }
+          description: |
+            Per-severity counts. Severity values track the audit
+            writer's `status` field (`ok` / `warn` / `error`).
+        since:
+          type: string
+          format: date-time
+          description: |
+            Normalized cutoff the server applied — echoes whatever
+            shortcut the client passed so it can confirm the
+            interpretation.

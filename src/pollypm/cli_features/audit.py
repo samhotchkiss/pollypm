@@ -205,7 +205,8 @@ def _open_log_lines(path: Path) -> Iterator[str]:
 def _resolve_target_files(
     *,
     project_filter: str | None,
-    config_path: Path,
+    config_path: Path | None = None,
+    config: "object | None" = None,
 ) -> list[Path]:
     """Return the live audit-log paths to walk for this query.
 
@@ -218,6 +219,11 @@ def _resolve_target_files(
     exist — :func:`_walk_log_chain` filters those out, but we still
     include them so a project whose ``.pollypm`` was archived has a
     chance to surface via its central tail (which is added separately).
+
+    Callers pass either ``config_path`` (CLI — loads from disk) or
+    ``config`` (web API — already in memory). When both are supplied
+    the in-memory ``config`` wins; the CLI never sets ``config`` so
+    behaviour is unchanged for the existing ``pm audit grep`` path.
     """
     targets: list[Path] = []
     seen: set[Path] = set()
@@ -233,10 +239,11 @@ def _resolve_target_files(
         seen.add(key)
         targets.append(path)
 
-    try:
-        config = load_config(config_path)
-    except Exception:  # noqa: BLE001
-        config = None
+    if config is None and config_path is not None:
+        try:
+            config = load_config(config_path)
+        except Exception:  # noqa: BLE001
+            config = None
 
     if project_filter is not None:
         # Per-project log (best path: live config). When config can't

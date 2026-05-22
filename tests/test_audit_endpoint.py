@@ -1,0 +1,538 @@
+"""Integration tests for ``GET /api/v1/audit/{grep,stats}``.
+
+Phase 2 surface #6 (audit query). These tests drive the FastAPI app
+end-to-end against a synthesized audit-log tree so the rotation-aware
+file walker, ``since`` shortcut parsing, and filter chaining are all
+exercised through the HTTP surface.
+
+The harness mirrors ``tests/web_api/conftest.py`` but stays
+``--noconftest``-friendly so the spec's pytest invocation
+(``pytest --noconftest tests/test_audit_endpoint.py``) runs in
+isolation without pulling shared fixtures. Each fixture is declared
+locally; the cost is a bit of duplication, the win is that one
+unrelated failing fixture upstream can't mask regressions in this
+endpoint.
+"""
+
+from __future__ import annotations
+
+import gzip
+import json
+import os
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+
+from pollypm.config import (
+    AccountConfig,
+    MemorySettings,
+    PollyPMConfig,
+    PollyPMSettings,
+    ProjectSettings,
+)
+from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
+from pollypm.web_api import create_app, ensure_token
+
+
+# ---------------------------------------------------------------------------
+# Fixtures (self-contained — no shared conftest dependency)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def project_root(tmp_path: Path) -> Path:
+    root = tmp_path / "myproj"
+    root.mkdir()
+    (root / ".pollypm").mkdir()
+    return root
+
+
+@pytest.fixture
+def workspace_root(tmp_path: Path) -> Path:
+    root = tmp_path / "workspace"
+    root.mkdir()
+    (root / ".pollypm").mkdir()
+    return root
+
+
+@pytest.fixture
+def audit_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Redirect ``POLLYPM_AUDIT_HOME`` so test logs don't bleed into ``~``."""
+    audit = tmp_path / "audit"
+    audit.mkdir()
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit))
+    return audit
+
+
+@pytest.fixture
+def api_config(
+    tmp_path: Path, project_root: Path, workspace_root: Path
+) -> PollyPMConfig:
+    base_dir = workspace_root / ".pollypm"
+    state_db = base_dir / "state.db"
+    return PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace_root,
+            tmux_session="pollypm-test",
+            workspace_root=workspace_root,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=state_db,
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={
+            "myproj": KnownProject(
+                key="myproj",
+                path=project_root,
+                name="My Project",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+    )
+
+
+@pytest.fixture
+def token_path(tmp_path: Path) -> Path:
+    return tmp_path / "api-token"
+
+
+@pytest.fixture
+def token(token_path: Path) -> str:
+    value, _generated = ensure_token(token_path)
+    return value
+
+
+@pytest.fixture
+def app(api_config, token_path, token):  # noqa: ARG001 — token fixture must run
+    return create_app(config=api_config, token_path=token_path)
+
+
+@pytest.fixture
+def client(app) -> TestClient:
+    return TestClient(app)
+
+
+@pytest.fixture
+def auth_headers(token: str) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+# ---------------------------------------------------------------------------
+# Log-writing helpers — drive the rotation-aware walker without going
+# through ``audit.log.emit`` (we want deterministic timestamps + the
+# ability to pre-place ``.gz`` archives).
+# ---------------------------------------------------------------------------
+
+
+def _make_event(
+    *,
+    project: str = "myproj",
+    event: str = "task.created",
+    subject: str = "",
+    ts: str | None = None,
+    status: str = "ok",
+    actor: str = "polly",
+    metadata: dict | None = None,
+) -> dict:
+    return {
+        "schema": 1,
+        "ts": ts or "2026-05-21T00:00:00+00:00",
+        "project": project,
+        "event": event,
+        "subject": subject,
+        "actor": actor,
+        "status": status,
+        "metadata": metadata or {},
+    }
+
+
+def _write_jsonl(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record, separators=(",", ":")))
+            fh.write("\n")
+
+
+def _write_jsonl_gz(path: Path, records: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with gzip.open(path, "wt", encoding="utf-8") as fh:
+        for record in records:
+            fh.write(json.dumps(record, separators=(",", ":")))
+            fh.write("\n")
+
+
+def _per_project_log(project_root: Path) -> Path:
+    return project_root / ".pollypm" / "audit.jsonl"
+
+
+def _central_log(audit_home: Path, project: str) -> Path:
+    return audit_home / f"{project}.jsonl"
+
+
+# ---------------------------------------------------------------------------
+# Auth
+# ---------------------------------------------------------------------------
+
+
+def test_grep_requires_auth(client: TestClient, audit_home: Path) -> None:
+    """No bearer → ``401 unauthorized`` (spec §6 / Phase 1 §3)."""
+    response = client.get("/api/v1/audit/grep")
+    assert response.status_code == 401
+    body = response.json()
+    assert body["error"]["code"] in {"unauthorized", "invalid_token"}
+
+
+def test_stats_requires_auth(client: TestClient, audit_home: Path) -> None:
+    response = client.get("/api/v1/audit/stats")
+    assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Grep happy paths
+# ---------------------------------------------------------------------------
+
+
+def test_grep_happy_path_returns_matching_events(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Filter chain (project + event_type + pattern) returns hits."""
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(event="task.created", subject="myproj/1"),
+            _make_event(event="task.created", subject="myproj/2"),
+            _make_event(event="task.status_changed", subject="myproj/1"),
+        ],
+    )
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "event_type": "task.created", "pattern": "myproj/"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["next_cursor"] is None
+    subjects = [e["subject"] for e in body["events"]]
+    assert subjects == ["myproj/1", "myproj/2"]
+    # Sanity: every event carries the canonical Event shape.
+    assert all("event" in e and "actor" in e for e in body["events"])
+
+
+def test_grep_regex_pattern_filters_lines(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Pattern is a Python regex (``re.search``) over the raw JSONL line."""
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(subject="myproj/1"),
+            _make_event(subject="myproj/12"),
+            _make_event(subject="myproj/abc"),
+        ],
+    )
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "pattern": r"myproj/\d+"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    subjects = [e["subject"] for e in response.json()["events"]]
+    # ``myproj/abc`` doesn't match the digit-only suffix regex.
+    assert subjects == ["myproj/1", "myproj/12"]
+
+
+def test_grep_since_shortcut_drops_old_events(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``since=1h`` shortcut keeps only the recent event."""
+    now = datetime.now(timezone.utc)
+    old_ts = (now - timedelta(hours=3)).isoformat()
+    fresh_ts = (now - timedelta(minutes=10)).isoformat()
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(subject="myproj/old", ts=old_ts),
+            _make_event(subject="myproj/fresh", ts=fresh_ts),
+        ],
+    )
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "since": "1h"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    subjects = [e["subject"] for e in response.json()["events"]]
+    assert subjects == ["myproj/fresh"]
+
+
+def test_grep_walks_rotated_gz_archives(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Rotation-awareness: events in a ``.gz`` sibling surface in results."""
+    live = _per_project_log(project_root)
+    archive = live.with_name(live.name + ".1700000000.gz")
+    _write_jsonl(live, [_make_event(subject="myproj/live")])
+    _write_jsonl_gz(archive, [_make_event(subject="myproj/archived")])
+    # Pin mtime so the walker's newest-first sort is deterministic.
+    os.utime(archive, (1_700_000_000, 1_700_000_000))
+
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "pattern": "myproj/"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    subjects = [e["subject"] for e in response.json()["events"]]
+    # Live first, then the rotated archive (matches the CLI ordering).
+    assert subjects == ["myproj/live", "myproj/archived"]
+
+
+def test_grep_limit_caps_result_count(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``limit`` short-circuits the iteration."""
+    _write_jsonl(
+        _per_project_log(project_root),
+        [_make_event(subject=f"myproj/{i}") for i in range(50)],
+    )
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "limit": 5},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert len(response.json()["events"]) == 5
+
+
+def test_grep_default_limit_is_100(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """No explicit ``limit`` → default 100 (spec §8.1)."""
+    _write_jsonl(
+        _per_project_log(project_root),
+        [_make_event(subject=f"myproj/{i}") for i in range(250)],
+    )
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    assert len(response.json()["events"]) == 100
+
+
+# ---------------------------------------------------------------------------
+# Grep error paths
+# ---------------------------------------------------------------------------
+
+
+def test_grep_invalid_since_returns_400_invalid_request(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """Free-text 'yesterday' is not ISO-8601 → ``400 invalid_request``."""
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"since": "yesterday"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "since" in body["error"]["message"]
+
+
+def test_grep_invalid_regex_returns_400_invalid_request(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """Unbalanced group → ``400 invalid_request`` (not a 500)."""
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"pattern": "(unbalanced"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "pattern" in body["error"]["message"]
+
+
+def test_grep_limit_above_max_rejected_by_validation(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """``limit=5000`` exceeds the 1000 cap (spec §8.3)."""
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"limit": 5000},
+        headers=auth_headers,
+    )
+    # Pydantic-driven query validation returns ``422 validation_error``
+    # via the spec's reshape handler.
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+# ---------------------------------------------------------------------------
+# Stats
+# ---------------------------------------------------------------------------
+
+
+def test_stats_counts_by_event_and_severity(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Stats aggregates across event names + severity (status)."""
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(event="task.created", status="ok"),
+            _make_event(event="task.created", status="ok"),
+            _make_event(event="task.status_changed", status="warn"),
+            _make_event(event="watchdog.escalation_dispatched", status="error"),
+        ],
+    )
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 4
+    assert body["by_event"] == {
+        "task.created": 2,
+        "task.status_changed": 1,
+        "watchdog.escalation_dispatched": 1,
+    }
+    assert body["by_severity"] == {"ok": 2, "warn": 1, "error": 1}
+
+
+def test_stats_with_project_filter_isolates_one_project(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``project=myproj`` ignores events sitting in another project's tail."""
+    # myproj's per-project log carries one event.
+    _write_jsonl(
+        _per_project_log(project_root),
+        [_make_event(project="myproj", event="task.created")],
+    )
+    # Central tail for a different project — must NOT show up under
+    # ``project=myproj``. The CLI helper's ``_resolve_target_files``
+    # branch with a project filter scopes to that project's tail only.
+    _write_jsonl(
+        _central_log(audit_home, "otherproj"),
+        [
+            _make_event(project="otherproj", event="task.created"),
+            _make_event(project="otherproj", event="task.created"),
+        ],
+    )
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 1
+    assert body["by_event"] == {"task.created": 1}
+
+
+def test_stats_with_since_excludes_old_events(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``since=1h`` cuts off events older than the cutoff."""
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(event="a", ts=(now - timedelta(hours=3)).isoformat()),
+            _make_event(event="b", ts=(now - timedelta(minutes=5)).isoformat()),
+            _make_event(event="c", ts=(now - timedelta(minutes=1)).isoformat()),
+        ],
+    )
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "1h"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 2
+    assert body["by_event"] == {"b": 1, "c": 1}
+    # ``since`` echoes back the parsed cutoff so the client can
+    # confirm the server's interpretation.
+    assert body["since"] is not None
+
+
+def test_stats_empty_log_returns_zero_total(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+) -> None:
+    """No files at all → ``total=0`` (not a 500)."""
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["total"] == 0
+    assert body["by_event"] == {}
+    assert body["by_severity"] == {}

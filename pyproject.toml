@@ -6,6 +6,12 @@ readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "fastapi>=0.115.0",
+  # ``pm chat`` and ``pm sessions`` are first-class CLI surfaces that
+  # talk to the local Web API over HTTP, so the HTTP client has to be a
+  # runtime dependency — not a dev extra. Without this, ``pm --help``
+  # crashes on a no-dev install because ``cli.py`` imports
+  # ``chat_app`` unconditionally (#2047 packaging regression).
+  "httpx>=0.27.0",
   "packaging>=23.0",
   "pyyaml>=6.0",
   "sqlalchemy>=2.0",
@@ -25,7 +31,8 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
-  "httpx>=0.27.0",
+  # httpx promoted to runtime dependency above (#2047) — it is no
+  # longer dev-only now that ``pm chat`` ships in the base CLI.
   "openapi-spec-validator>=0.7.0",
   "pytest>=8.4.0",
   "ruff>=0.15.12",

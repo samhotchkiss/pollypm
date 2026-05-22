@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
 from pollypm.web_api.errors import not_found
 from pollypm.web_api.models import (
@@ -89,10 +89,19 @@ def get_inbox_item_endpoint(id: str, config: ConfigDep) -> InboxItemDetail:
 #   * routes through a service-layer helper that opens
 #     :func:`create_work_service` once per call (mirrors how queue_task
 #     wedge works — same canonical writer the cockpit uses).
-#   * declares the optional ``Idempotency-Key`` header so OpenAPI
-#     consumers see it (the dedup cache itself ships in Phase 3).
 #   * returns the post-mutation task envelope so the client refreshes
 #     UI without a follow-up GET.
+#
+# Idempotency: an earlier draft of these handlers advertised an
+# optional ``Idempotency-Key`` request header on every POST. There is
+# no idempotency store wired into the API today (grep for
+# ``idempotency`` returns only docs/comments), so the header would
+# have been silently ignored — a retry after a network drop could
+# create duplicate promoted tasks, replies, and snooze rows while the
+# client reasonably believed the header protected it. The header is
+# intentionally NOT declared here; a real idempotency cache is
+# deferred until a future PR can wire it through every non-idempotent
+# verb (see #2060 review for context).
 # ---------------------------------------------------------------------------
 
 
@@ -112,7 +121,6 @@ def archive_inbox_item_endpoint(
     id: str,
     config: ConfigDep,
     body: InboxArchiveRequest | None = None,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskDetail:
     reason = body.reason if body is not None else None
     return archive_inbox_item(config, id, reason=reason)
@@ -135,7 +143,6 @@ def snooze_inbox_item_endpoint(
     id: str,
     body: InboxSnoozeRequest,
     config: ConfigDep,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskDetail:
     return snooze_inbox_item(
         config,
@@ -161,7 +168,6 @@ def promote_inbox_item_endpoint(
     id: str,
     config: ConfigDep,
     body: InboxPromoteRequest | None = None,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskDetail:
     if body is None:
         body = InboxPromoteRequest()
@@ -189,7 +195,6 @@ def mark_read_inbox_item_endpoint(
     id: str,
     config: ConfigDep,
     body: InboxMarkReadRequest | None = None,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskDetail:
     actor = (body.actor if body is not None else None) or "api"
     return mark_read_inbox_item(config, id, actor=actor)
@@ -211,7 +216,6 @@ def reply_inbox_item_endpoint(
     id: str,
     body: InboxReplyRequest,
     config: ConfigDep,
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> TaskDetail:
     return reply_inbox_item(
         config, id, body=body.body, owner=body.owner,

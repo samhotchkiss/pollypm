@@ -26,6 +26,7 @@ import pytest
 
 from pollypm.work.models import WorkStatus
 from pollypm.work.service_support import (
+    InvalidTransitionError,
     TaskNotFoundError,
     ValidationError,
 )
@@ -209,3 +210,76 @@ class TestArchiveTask:
         svc = pg_work_service
         with pytest.raises(TaskNotFoundError):
             svc.archive_task("demo/777", actor="user")
+
+    # ------------------------------------------------------------------
+    # strict=True (#2060) — atomic concurrent-archive contract
+    # ------------------------------------------------------------------
+
+    def test_archive_strict_flips_status(self, pg_work_service):
+        svc = pg_work_service
+        task_id = _inbox_task(svc)
+        archived = svc.archive_task(task_id, actor="user", strict=True)
+        assert archived.work_status == WorkStatus.DONE
+
+    def test_archive_strict_raises_when_already_terminal(
+        self, pg_work_service,
+    ):
+        svc = pg_work_service
+        task_id = _inbox_task(svc)
+        svc.archive_task(task_id, actor="user")
+        # Second archiver under strict mode must NOT silently succeed
+        # — that was the race surfaced by #2060 (Codex P0 #3).
+        with pytest.raises(InvalidTransitionError):
+            svc.archive_task(task_id, actor="user", strict=True)
+
+    def test_archive_strict_concurrent_only_one_winner(self, pg_work_service):
+        """Two threads race the same archive; exactly one wins.
+
+        Regression test for the #2060 race: under the old pre-check
+        version both threads observed the row in ``in_progress``, both
+        called the idempotent ``archive_task``, and both returned 200
+        — losing the documented ``invalid_state`` contract. With
+        ``strict=True`` the conditional UPDATE serialises the writers
+        so the loser sees rowcount==0 and raises
+        ``InvalidTransitionError``.
+        """
+        import threading
+
+        svc = pg_work_service
+        task_id = _inbox_task(svc)
+        barrier = threading.Barrier(2)
+        results: list[object] = []
+        errors: list[Exception] = []
+        lock = threading.Lock()
+
+        def attempt() -> None:
+            try:
+                barrier.wait(timeout=5)
+                outcome = svc.archive_task(task_id, actor="racer", strict=True)
+                with lock:
+                    results.append(outcome)
+            except Exception as exc:  # noqa: BLE001
+                with lock:
+                    errors.append(exc)
+
+        threads = [threading.Thread(target=attempt) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        # Exactly one winner, one InvalidTransitionError loser.
+        assert len(results) == 1, (results, errors)
+        assert len(errors) == 1, (results, errors)
+        assert isinstance(errors[0], InvalidTransitionError)
+
+        # And the canonical writer only appended ONE archive
+        # transition row, matching the contract for idempotent /
+        # serialised archivers.
+        task = svc.get(task_id)
+        archive_transitions = [
+            tr for tr in task.transitions
+            if tr.to_state == WorkStatus.DONE.value
+            and (tr.reason or "").startswith("inbox.archive")
+        ]
+        assert len(archive_transitions) == 1

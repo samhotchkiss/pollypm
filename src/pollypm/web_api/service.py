@@ -18,7 +18,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -722,28 +722,32 @@ def archive_inbox_item(
     "archive a resolved item → invalid_state").
     """
     from pollypm.work.factory import create_work_service
-    from pollypm.work.service_support import TaskNotFoundError
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+    )
 
     key, project = _resolve_inbox_project(config, item_id)
     try:
         with create_work_service(
             config=config, project_key=key, project_path=project.path
         ) as svc:
+            # Quick existence/auth probe so unknown ids surface as 404
+            # before we attempt the (atomic) transition. The terminal
+            # check is intentionally NOT here: ``archive_task`` with
+            # ``strict=True`` performs that check atomically inside
+            # the canonical transition, so two concurrent archivers
+            # see exactly one 200 and one 409 (closes the race the
+            # earlier pre-check version exposed — #2060).
             try:
-                current = svc.get(item_id)
+                svc.get(item_id)
             except TaskNotFoundError as exc:
                 raise not_found(f"Inbox item not found: {item_id}") from exc
-            status = getattr(current.work_status, "value", str(current.work_status))
-            if status in _ALREADY_ARCHIVED_STATUSES:
-                raise APIError(
-                    status_code=409,
-                    code="invalid_state",
-                    message=f"Inbox item {item_id} is already {status}.",
-                    hint="Items in a terminal state cannot be re-archived.",
-                )
             if reason:
                 # Record the operator-supplied reason before flipping
                 # so the audit trail captures both "why" and "how".
+                # Best-effort: a failed note must not block the
+                # archive (and must not race the strict transition).
                 try:
                     svc.add_context(
                         item_id, actor, f"archive reason: {reason}",
@@ -755,9 +759,20 @@ def archive_inbox_item(
                         item_id, exc_info=True,
                     )
             try:
-                svc.archive_task(item_id, actor=actor)
+                svc.archive_task(item_id, actor=actor, strict=True)
             except TaskNotFoundError as exc:
                 raise not_found(f"Inbox item not found: {item_id}") from exc
+            except InvalidTransitionError as exc:
+                # The atomic UPDATE asserted the row was non-terminal;
+                # losing the race means another caller archived first.
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc) or (
+                        f"Inbox item {item_id} is already terminal."
+                    ),
+                    hint="Items in a terminal state cannot be re-archived.",
+                ) from exc
             task = svc.get(item_id)
             return _task_to_detail(task)
     except _BACKING_STORE_ERRORS as exc:
@@ -844,7 +859,15 @@ def snooze_inbox_item(
                     code="invalid_state",
                     message=f"Inbox item {item_id} is {status}; cannot snooze.",
                 )
-            payload_parts = [f"snoozed until {until.isoformat()}"]
+            # Persist the wake time as a structured ``until_iso=...``
+            # marker so the inbox-list predicate (_snoozed_until_for)
+            # can parse it back without regex-guessing on free-form
+            # text. Older entries that only carried "snoozed until
+            # <iso>" still parse via the fallback path in the reader.
+            payload_parts = [
+                f"until_iso={until.isoformat()}",
+                f"snoozed until {until.isoformat()}",
+            ]
             if reason:
                 payload_parts.append(f"reason: {reason}")
             try:
@@ -1448,6 +1471,7 @@ def _collect_inbox_items(
     else:
         keys = config.projects.keys()
 
+    now = datetime.now(timezone.utc)
     for key in keys:
         proj = config.projects[key]
         try:
@@ -1455,6 +1479,16 @@ def _collect_inbox_items(
                 config=config, project_key=key, project_path=proj.path
             ) as svc:
                 tasks = svc.list_tasks(project=key)
+                # Snooze visibility (#2060): the snooze write helper
+                # persists ``entry_type='snooze'`` rows whose text
+                # encodes the wake-up time. Items whose latest snooze
+                # is still in the future must NOT appear in the
+                # default inbox view (otherwise the endpoint returns
+                # 200 while the row stays actionable). We compute the
+                # active-snooze set once per project — the same
+                # readonly service handle stays open so we don't
+                # double-pay for connection setup.
+                snoozed_ids = _active_snoozed_ids(svc, tasks, now=now)
         except _BACKING_STORE_ERRORS as exc:
             # Backing-store failure on a single project: log loudly,
             # skip that project but keep building the aggregate. We
@@ -1470,10 +1504,86 @@ def _collect_inbox_items(
             )
             continue
         for task in tasks:
+            if task.task_id in snoozed_ids:
+                continue
             entry = _task_to_inbox_item(task)
             if entry is not None:
                 out.append(entry)
     return out
+
+
+# ---------------------------------------------------------------------------
+# Snooze visibility helpers (#2060)
+#
+# The POST /inbox/{id}/snooze endpoint persists an ``entry_type='snooze'``
+# row whose text starts with ``until_iso=<ISO>; snoozed until <ISO>``.
+# These helpers parse that wake-time back so the inbox list filters
+# out items whose snooze hasn't expired.  Kept private to this module
+# because the cockpit-side inbox panel has its own (unrelated) curation
+# predicate — wiring snooze through that surface is out of scope for
+# this PR and tracked separately.
+# ---------------------------------------------------------------------------
+
+
+def _parse_snooze_until(text: str) -> datetime | None:
+    """Pull a tz-aware wake-time out of a snooze context-entry text.
+
+    Accepts both the canonical ``until_iso=<ISO>`` marker the snooze
+    writer emits and the older ``snoozed until <ISO>`` shape so rows
+    written before the structured marker landed still parse. Returns
+    ``None`` when no recognisable timestamp is present.
+    """
+    if not text:
+        return None
+    candidates: list[str] = []
+    for part in text.split(";"):
+        chunk = part.strip()
+        if chunk.startswith("until_iso="):
+            candidates.append(chunk[len("until_iso="):].strip())
+        elif chunk.lower().startswith("snoozed until "):
+            candidates.append(chunk[len("snoozed until "):].strip())
+    for raw in candidates:
+        try:
+            parsed = datetime.fromisoformat(raw)
+        except ValueError:
+            continue
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def _active_snoozed_ids(
+    svc, tasks, *, now: datetime,
+) -> set[str]:
+    """Return task_ids whose latest snooze entry is still in the future.
+
+    Per-task ``get_context(entry_type='snooze', limit=1)`` query; the
+    work-service returns rows ``ORDER BY id DESC`` so the first row is
+    the most recent snooze. Items without a snooze row, or whose latest
+    snooze has expired, are NOT in the returned set (the inbox shows
+    them as actionable, matching cockpit semantics).
+    """
+    snoozed: set[str] = set()
+    for task in tasks:
+        try:
+            entries = svc.get_context(
+                task.task_id, entry_type="snooze", limit=1,
+            )
+        except Exception:  # noqa: BLE001 — readonly view degrades open
+            logger.debug(
+                "inbox: snooze lookup failed for %s",
+                task.task_id, exc_info=True,
+            )
+            continue
+        if not entries:
+            continue
+        wake = _parse_snooze_until(entries[0].text)
+        if wake is None:
+            continue
+        if wake > now:
+            snoozed.add(task.task_id)
+    return snoozed
 
 
 def _task_to_inbox_item(task) -> APIInboxItem | None:

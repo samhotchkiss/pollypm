@@ -575,3 +575,227 @@ def test_all_write_endpoints_require_auth(client) -> None:
         r = client.post(f"/api/v1/inbox/myproj/1/{verb}", json=payload)
         assert r.status_code == 401, verb
         assert r.json()["error"]["code"] in {"unauthorized", "invalid_token"}, verb
+
+
+# ---------------------------------------------------------------------------
+# OpenAPI contract — Idempotency-Key header is NOT advertised (#2060 P0 #1)
+#
+# An earlier draft of these handlers declared an ``Idempotency-Key``
+# request header on every POST. There is no idempotency store wired
+# into the API today, so retries duplicated promoted tasks / replies
+# / snooze rows while the client reasonably believed the header
+# protected it. The header was stripped from the contract; this test
+# locks that decision so a future refactor can't silently re-introduce
+# it without also implementing the dedup cache.
+# ---------------------------------------------------------------------------
+
+
+def test_openapi_does_not_advertise_idempotency_key_header(app) -> None:
+    schema = app.openapi()
+    write_paths = [
+        "/api/v1/inbox/{id}/archive",
+        "/api/v1/inbox/{id}/snooze",
+        "/api/v1/inbox/{id}/promote-to-task",
+        "/api/v1/inbox/{id}/mark-read",
+        "/api/v1/inbox/{id}/reply",
+    ]
+    for path in write_paths:
+        op = schema["paths"][path]["post"]
+        header_params = [
+            p for p in op.get("parameters", [])
+            if p.get("in") == "header"
+        ]
+        names = [p.get("name") for p in header_params]
+        assert "Idempotency-Key" not in names, (
+            f"{path} re-introduced the Idempotency-Key header "
+            "without an idempotency store — strip it or wire the "
+            "real dedup cache first (#2060)."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Snooze visibility regression (#2060 P0 #2)
+#
+# The snooze write helper persists ``entry_type='snooze'`` rows whose
+# text starts with the structured marker ``until_iso=<ISO>``. The
+# inbox-list predicate (``_active_snoozed_ids`` /
+# ``_parse_snooze_until``) reads that marker and filters out items
+# whose snooze hasn't expired. Without this, the endpoint returned
+# 200 while the row stayed visible — a pure broken feature.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_snooze_until_reads_structured_marker() -> None:
+    from pollypm.web_api.service import _parse_snooze_until
+
+    text = "until_iso=2026-06-01T12:00:00+00:00; snoozed until 2026-06-01T12:00:00+00:00; reason: later"
+    parsed = _parse_snooze_until(text)
+    assert parsed is not None
+    assert parsed == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_snooze_until_falls_back_to_legacy_shape() -> None:
+    """Rows written before the structured marker landed still parse."""
+    from pollypm.web_api.service import _parse_snooze_until
+
+    text = "snoozed until 2026-06-01T12:00:00+00:00"
+    parsed = _parse_snooze_until(text)
+    assert parsed == datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+
+def test_parse_snooze_until_returns_none_when_no_timestamp() -> None:
+    from pollypm.web_api.service import _parse_snooze_until
+
+    assert _parse_snooze_until("reason: later") is None
+    assert _parse_snooze_until("") is None
+    assert _parse_snooze_until("until_iso=not-a-date") is None
+
+
+class _StubContextEntry:
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.actor = "api"
+        self.entry_type = "snooze"
+
+
+class _StubTask:
+    def __init__(self, task_id: str) -> None:
+        self.task_id = task_id
+
+
+class _StubSvc:
+    """Minimal stand-in for ``PgWorkService.get_context`` semantics."""
+
+    def __init__(self, entries_by_id: dict[str, list[str]]) -> None:
+        self._entries = entries_by_id
+
+    def get_context(self, task_id, *, entry_type=None, limit=None):
+        assert entry_type == "snooze"
+        texts = self._entries.get(task_id, [])
+        # Real svc returns DESC (most recent first); ``limit=1`` picks
+        # the latest. Mirror that ordering so the helper sees the same
+        # shape it does in production.
+        rows = [_StubContextEntry(t) for t in reversed(texts)]
+        if limit is not None:
+            rows = rows[: int(limit)]
+        return rows
+
+
+def test_active_snoozed_ids_excludes_expired_snooze() -> None:
+    from pollypm.web_api.service import _active_snoozed_ids
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    past = (now - timedelta(hours=1)).isoformat()
+    svc = _StubSvc({"myproj/1": [f"until_iso={past}"]})
+    snoozed = _active_snoozed_ids(svc, [_StubTask("myproj/1")], now=now)
+    assert snoozed == set()
+
+
+def test_active_snoozed_ids_hides_future_snooze() -> None:
+    """Regression for the original bug: the row stayed visible."""
+    from pollypm.web_api.service import _active_snoozed_ids
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    future = (now + timedelta(hours=2)).isoformat()
+    svc = _StubSvc({"myproj/1": [f"until_iso={future}"]})
+    snoozed = _active_snoozed_ids(svc, [_StubTask("myproj/1")], now=now)
+    assert snoozed == {"myproj/1"}
+
+
+def test_active_snoozed_ids_uses_latest_snooze_entry() -> None:
+    """When an item is snoozed multiple times, the latest one wins.
+
+    The reader sorts by ``id DESC`` (most-recent first) and takes
+    ``limit=1``; so an item snoozed for an hour and then re-snoozed
+    for ten seconds (now expired) must NOT be hidden.
+    """
+    from pollypm.web_api.service import _active_snoozed_ids
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    old_future = (now + timedelta(hours=2)).isoformat()
+    new_past = (now - timedelta(minutes=5)).isoformat()
+    svc = _StubSvc({
+        # Order = insertion order; the stub reverses it to mimic
+        # ``ORDER BY id DESC``. So the second entry is "newer".
+        "myproj/1": [
+            f"until_iso={old_future}",
+            f"until_iso={new_past}",
+        ],
+    })
+    snoozed = _active_snoozed_ids(svc, [_StubTask("myproj/1")], now=now)
+    assert snoozed == set(), (
+        "An item whose latest snooze has expired must be visible "
+        "again — the older still-future snooze should not mask it."
+    )
+
+
+def test_active_snoozed_ids_skips_items_with_no_snooze() -> None:
+    from pollypm.web_api.service import _active_snoozed_ids
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    svc = _StubSvc({})
+    snoozed = _active_snoozed_ids(svc, [_StubTask("myproj/1")], now=now)
+    assert snoozed == set()
+
+
+def test_snooze_writer_persists_structured_until_iso_marker(
+    config, monkeypatch,
+) -> None:
+    """The snooze helper must persist ``until_iso=...`` so the reader
+    can parse the wake-time back without regex-guessing on free-form
+    text. Regression for the original P0: the writer encoded the wake
+    time only inside the human ``snoozed until <iso>`` blob, which
+    the reader never honored."""
+    from pollypm.web_api import service as web_service
+    from pollypm.work.models import WorkStatus
+
+    class _StubInboxTask:
+        task_id = "myproj/1"
+        work_status = WorkStatus.IN_PROGRESS
+        project = "myproj"
+        task_number = 1
+        title = "Inbox item"
+        description = "body"
+
+    captured: dict[str, object] = {}
+
+    class _RecordingSvc:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def get(self, item_id):
+            return _StubInboxTask()
+
+        def add_context(self, item_id, actor, text, *, entry_type):
+            captured["text"] = text
+            captured["entry_type"] = entry_type
+
+    def fake_factory(*, config, project_key, project_path):
+        return _RecordingSvc()
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+    # The service-layer helper calls ``_task_to_detail(svc.get(...))``
+    # at the tail; the StubInboxTask isn't a full Task so short-circuit
+    # by patching the detail builder too.
+    monkeypatch.setattr(
+        web_service, "_task_to_detail",
+        lambda task: _make_task_detail(task_id="myproj/1"),
+    )
+
+    web_service.snooze_inbox_item(
+        config, "myproj/1", duration_seconds=3600, reason="later",
+    )
+    text = str(captured.get("text", ""))
+    assert captured.get("entry_type") == "snooze"
+    assert text.startswith("until_iso="), (
+        f"snooze row must lead with the parseable marker; got {text!r}"
+    )
+    # And the reader is happy with it round-trip.
+    parsed = web_service._parse_snooze_until(text)
+    assert parsed is not None
+    assert parsed > datetime.now(timezone.utc)

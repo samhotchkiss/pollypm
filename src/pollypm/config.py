@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
+import threading
 import tomllib
 from pathlib import Path
 
@@ -927,19 +929,14 @@ def _project_local_mtimes(
     return snapshot
 
 
-def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
-    config_path = path.resolve()
-    try:
-        mtime = config_path.stat().st_mtime
-        cached = _config_cache.get(config_path)
-        if (
-            cached is not None
-            and cached[0] == mtime
-            and _project_local_mtimes(cached[1]) == cached[2]
-        ):
-            return cached[1]
-    except OSError:
-        pass
+def _parse_config(config_path: Path) -> PollyPMConfig:
+    """Parse the TOML at ``config_path`` into a :class:`PollyPMConfig`.
+
+    Pure parsing — no caching, no auth-token minting, no disk writes.
+    Factored out of :func:`load_config` so the post-load persistence path
+    can re-read under ``config_rmw_lock`` without recursing back into the
+    persistence/caching code (#2063 round 9).
+    """
     base = config_path.parent
     raw = _load_raw_toml(config_path)
     project = _parse_project_settings(raw, base=base)
@@ -981,17 +978,65 @@ def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
     # to distinct identities, or the cache singleton can serve
     # cross-config data.
     config.config_path = config_path
+    return config
+
+
+def load_config(path: Path = DEFAULT_CONFIG_PATH) -> PollyPMConfig:
+    config_path = path.resolve()
+    try:
+        mtime = config_path.stat().st_mtime
+        cached = _config_cache.get(config_path)
+        if (
+            cached is not None
+            and cached[0] == mtime
+            and _project_local_mtimes(cached[1]) == cached[2]
+        ):
+            return cached[1]
+    except OSError:
+        pass
+
+    config = _parse_config(config_path)
     # PR #2018 review fix (id 4502598240): mint auth tokens for any
     # session that lacks one, then persist back to disk. Without this,
     # legacy sessions stay at auth_token="" and watchdog/recovery
     # dispatch silently emits unsigned briefs (the advertised Lever 2
     # signing is inactive). Idempotent — write_config only fires when
     # ensure_session_auth_tokens actually minted a token.
+    #
+    # #2063 round 9 audit: this is a load → mutate → write inside
+    # ``load_config`` itself. Wrap with ``config_rmw_lock(config_path)``
+    # AND re-read the config under the lock via :func:`_parse_config`
+    # so the token-mint write participates in the shared RMW invariant.
+    # Otherwise a concurrent CLI/API writer that landed between this
+    # function's parse and the auth-token write would be silently
+    # overwritten by our possibly-stale snapshot (which has fresh fields
+    # only for ``sessions[*].auth_token``).
     try:
         from pollypm.session_auth import ensure_session_auth_tokens
         if ensure_session_auth_tokens(config):
             try:
-                write_config(config, config_path, force=True)
+                with config_rmw_lock(config_path):
+                    # Re-parse under the lock so the persisted write
+                    # merges our token additions onto the freshest disk
+                    # snapshot, never clobbering a concurrent edit.
+                    fresh = _parse_config(config_path)
+                    if ensure_session_auth_tokens(fresh):
+                        write_config(fresh, config_path, force=True)
+                    # #2063 round 10 (Codex blocker): swap the live
+                    # snapshot for the post-lock ``fresh`` object.
+                    # Round 9 only copied ``sessions[*].auth_token`` back
+                    # into the pre-lock ``config``, then cached that
+                    # pre-lock snapshot under the post-write mtime. Any
+                    # concurrent edit to a non-token field that landed
+                    # between the initial parse and the locked re-parse
+                    # would be on disk but invisible to every subsequent
+                    # ``load_config`` call until the file mtime changed
+                    # again — a stale-cache trap on the same path the
+                    # rest of this PR is tightening. ``fresh`` already
+                    # has the freshly-minted tokens AND any concurrent
+                    # disk edits, so it is the canonical post-write
+                    # state for both the return value and the cache.
+                    config = fresh
             except Exception:  # noqa: BLE001
                 # Persistence failure is non-fatal — tokens stay in
                 # memory for the rest of this process; next load_config
@@ -1426,30 +1471,214 @@ def _build_example_config(root: Path, *, tmux_session: str = "pollypm") -> Polly
 
 
 def write_example_config(path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
-    if path.exists() and not force:
-        raise FileExistsError(f"Config already exists: {path}")
+    # #2063 round 9: the existence check + the write MUST live under the
+    # same ``config_rmw_lock`` or two concurrent ``pm init`` callers race
+    # — both observe ``path.exists() == False`` before either takes the
+    # lock, both pass the outer guard, and the second clobbers the first.
+    #
+    # Strategy: when ``force=False`` we delegate the existence check to
+    # the locked guard inside :func:`write_config` (which raises
+    # ``FileExistsError`` atomically under the flock). When ``force=True``
+    # we still take the lock so the example-config build + write is
+    # serialised against other writers, then call ``write_config`` with
+    # ``force=True`` to allow the overwrite.
     root = path.resolve().parent
-    return write_config(
-        _build_example_config(root, tmux_session=_default_init_tmux_session(root)),
-        path,
-        force=True,
-    )
+    example = _build_example_config(root, tmux_session=_default_init_tmux_session(root))
+    with config_rmw_lock(path):
+        return write_config(example, path, force=force)
+
+
+# ---------------------------------------------------------------------------
+# Shared read-modify-write lock for the global TOML.
+#
+# Codex round 7 on #2063 caught that the previous lock (lived inside
+# ``pollypm.web_api.service`` as ``_config_write_lock``) only serialised
+# concurrent API writers against each other. CLI / cockpit callers that
+# do their own ``load_config → mutate → write_config`` sequence still
+# raced the API path: a CLI write that lands between the API helper's
+# ``load_config`` and ``write_config`` is silently overwritten when the
+# API later writes its older snapshot.
+#
+# Fix: move the lock primitive HERE and have every read-modify-write
+# call site wrap the whole RMW with :func:`config_rmw_lock`. The lock
+# is re-entrant per thread (per-path thread-local depth tracking added
+# in round 8), so nested acquisitions inside ``write_config`` itself
+# don't deadlock when a caller already holds it for the full RMW.
+#
+# Exceptions (intentionally not wrapped in a full RMW; they rely on
+# ``write_config``'s internal lock for torn-write protection only):
+# 1. :func:`pollypm.onboarding_tui.OnboardingApp` first-run build+write
+#    has no prior snapshot to merge against and runs before the API/CLI
+#    is up.
+# 2. The auth-token mint inside :func:`load_config` re-reads under the
+#    lock before persisting so concurrent edits still survive
+#    (round 9 audit fix).
+#
+# POSIX-only. PollyPM ships as a personal-use Mac/Linux deployment;
+# Windows isn't a supported target.
+# ---------------------------------------------------------------------------
+
+
+_rmw_lock_state = threading.local()
+
+
+def _config_lock_path(config_path: Path) -> Path:
+    """Return the sibling lockfile path for ``config_path``.
+
+    Canonicalises via :func:`os.path.realpath` (which works whether or
+    not the target exists) so two callers that pass equivalent
+    relative / absolute / symlinked paths still hit the same lockfile
+    and serialise against each other. Crucially, fresh-config
+    initialisation (when ``config_path`` does not yet exist on disk)
+    also produces a stable canonical lock path, so the first-write
+    creation guard participates in the same invariant as subsequent
+    writes.
+    """
+    import os
+
+    canonical = Path(os.path.realpath(str(config_path)))
+    return canonical.with_suffix(canonical.suffix + ".lock")
+
+
+def _canonical_lock_key(config_path: Path) -> Path:
+    """Canonical key for thread-local re-entrancy tracking.
+
+    Must match the canonicalisation used by :func:`_config_lock_path`
+    so a nested acquire is recognised as re-entrant only when it
+    targets the same on-disk lockfile.
+    """
+    import os
+
+    return Path(os.path.realpath(str(config_path)))
+
+
+def _held_locks() -> dict:
+    """Thread-local map: canonical config path -> [fh_or_None, depth].
+
+    Tracks every config path this thread currently holds (or has
+    re-entered). The outermost frame for a given path owns the file
+    handle and is responsible for releasing the flock; re-entrant
+    frames store ``None`` for the handle and only bump the depth.
+    """
+    held = getattr(_rmw_lock_state, "held", None)
+    if held is None:
+        held = {}
+        _rmw_lock_state.held = held
+    return held
+
+
+@contextlib.contextmanager
+def config_rmw_lock(config_path: Path):
+    """Serialise the read-modify-write cycle for ``config_path``.
+
+    Use this around the full ``load_config → mutate → write_config``
+    sequence whenever a caller might race other config writers
+    (API, CLI, cockpit, onboarding). Holding the lock across the entire
+    RMW — not just the write — closes the lost-update window where two
+    writers each load the same disk snapshot, mutate disjoint fields,
+    and both write back, with the second writer clobbering the first.
+
+    The lock is implemented as an exclusive ``fcntl.flock`` on a sibling
+    lockfile (``<config_path>.lock``). Re-entrancy is tracked **per
+    canonical config path**: a nested ``with config_rmw_lock(path):``
+    against the SAME path is a cheap no-op (so ``write_config``'s
+    internal acquire doesn't deadlock its outer caller), but a nested
+    acquire against a DIFFERENT path takes that path's flock normally.
+
+    Cross-thread contention is handled by ``flock`` itself — the second
+    thread blocks until the first releases. Cross-process contention
+    works the same way (the lockfile path is process-shared).
+
+    POSIX-only. The lockfile is created on first use; release is best-
+    effort in the ``finally`` so a propagating exception still unlocks.
+
+    Codex round 6 on #2063 first introduced this primitive inside the
+    web_api module; round 7 moved it here so CLI / cockpit writers
+    participate in the same invariant; round 8 (this revision) replaced
+    the path-blind depth counter with per-path tracking so nested
+    acquires against a different config never silently bypass that
+    config's flock.
+    """
+    import fcntl
+
+    key = _canonical_lock_key(config_path)
+    held = _held_locks()
+
+    if key in held:
+        # Re-entrant for THIS specific path — bump depth, don't touch
+        # flock. The outermost frame still owns the file handle and
+        # will release it when its own depth decrements back to zero.
+        entry = held[key]
+        entry[1] += 1
+        try:
+            yield
+        finally:
+            entry[1] -= 1
+            # Re-entrant frames never own the flock so they never
+            # release it; only the outermost frame (where ``fh`` is
+            # non-None) does the unlock + close below.
+        return
+
+    lock_path = _config_lock_path(config_path)
+    # Ensure parent exists — config_path may not have been created yet
+    # on the very first write after a fresh install, but the parent
+    # ``.pollypm/`` always exists by the time any caller reaches here.
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    # "a+" creates if missing without truncating; we never read or write
+    # the lockfile itself, only flock its fd.
+    lock_fh = open(lock_path, "a+")
+    try:
+        fcntl.flock(lock_fh.fileno(), fcntl.LOCK_EX)
+        entry = [lock_fh, 1]
+        held[key] = entry
+        try:
+            yield
+        finally:
+            # The outermost frame is the only one that releases the
+            # flock. Any nested re-entrant frames decremented inside
+            # the ``yield`` and left the entry in ``held`` with
+            # ``depth == 1`` — i.e. matching our own outer acquire.
+            try:
+                del held[key]
+            finally:
+                try:
+                    fcntl.flock(lock_fh.fileno(), fcntl.LOCK_UN)
+                except OSError:
+                    pass
+    finally:
+        try:
+            lock_fh.close()
+        except OSError:
+            pass
 
 
 def write_config(config: PollyPMConfig, path: Path = DEFAULT_CONFIG_PATH, force: bool = False) -> Path:
-    if path.exists() and not force:
-        raise FileExistsError(f"Config already exists: {path}")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Always UTF-8 — TOML is UTF-8 by spec, and a non-UTF-8 default
-    # locale (Windows CP-1252, ``LC_ALL=C``) would mangle non-ASCII
-    # project names or personas (``café``, ``プロジェクト``) that
-    # round-trip through the cockpit settings UI.
-    path.write_text(_render_global_config(config), encoding="utf-8")
-    for project_key, project in config.projects.items():
-        local_path = project_config_path(project.path)
-        local_path.parent.mkdir(parents=True, exist_ok=True)
-        local_path.write_text(
-            _render_project_local_config(config, project_key),
-            encoding="utf-8",
-        )
+    # Defence in depth: even if a caller forgets to wrap the full RMW
+    # with :func:`config_rmw_lock`, the WRITE itself is still serialised
+    # so two writers can't interleave their multi-file (global + per-
+    # project local) write sequence and produce a torn config on disk.
+    # The lock is re-entrant per thread, so the common case where the
+    # caller already holds it for the full RMW is a cheap no-op here.
+    #
+    # The ``force=False`` existence guard MUST run INSIDE the lock —
+    # otherwise two writers initialising a fresh config can both observe
+    # ``path.exists() == False`` before either takes the lock, both pass
+    # the guard, and the second writer silently clobbers the first
+    # (Codex round 8 on #2063).
+    with config_rmw_lock(path):
+        if path.exists() and not force:
+            raise FileExistsError(f"Config already exists: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # Always UTF-8 — TOML is UTF-8 by spec, and a non-UTF-8 default
+        # locale (Windows CP-1252, ``LC_ALL=C``) would mangle non-ASCII
+        # project names or personas (``café``, ``プロジェクト``) that
+        # round-trip through the cockpit settings UI.
+        path.write_text(_render_global_config(config), encoding="utf-8")
+        for project_key, project in config.projects.items():
+            local_path = project_config_path(project.path)
+            local_path.parent.mkdir(parents=True, exist_ok=True)
+            local_path.write_text(
+                _render_project_local_config(config, project_key),
+                encoding="utf-8",
+            )
     return path

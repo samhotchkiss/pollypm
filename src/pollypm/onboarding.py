@@ -14,7 +14,7 @@ from pathlib import Path
 import typer
 
 from pollypm.agent_profiles.defaults import heartbeat_prompt, polly_prompt
-from pollypm.config import load_config, write_config
+from pollypm.config import config_rmw_lock, load_config, write_config
 from pollypm.models import (
     AccountConfig,
     KnownProject,
@@ -701,34 +701,38 @@ def provision_demo_project_fallback(config_path: Path) -> Path:
 def add_selected_projects(config_path: Path, selected_paths: list[Path]) -> list[KnownProject]:
     if not selected_paths:
         return []
-    config = load_config(config_path)
-    added: list[KnownProject] = []
-    for repo_path in selected_paths:
-        normalized = repo_path.resolve()
-        if any(project.path.resolve() == normalized for project in config.projects.values()):
-            continue
-        project = KnownProject(
-            key=make_project_key(normalized, set(config.projects) | {item.key for item in added}),
-            path=normalized,
-            name=normalized.name,
-            kind=ProjectKind.GIT,
-        )
-        config.projects[project.key] = project
-        ensure_project_scaffold(normalized)
-        # Commit the freshly written .gitignore/docs/issues so the
-        # project root is clean before the user runs their first task
-        # (#926). Best-effort: a failure here is logged and the
-        # registration still succeeds.
-        try:
-            commit_initial_scaffold(normalized)
-        except Exception:  # noqa: BLE001
-            logger.warning(
-                "onboarding: initial scaffold commit failed for %s",
-                normalized, exc_info=True,
+    # #2063 round 7: hold the shared RMW lock across the full
+    # load → mutate → write so a concurrent API / cockpit write
+    # can't slot in and lose its edit.
+    with config_rmw_lock(config_path):
+        config = load_config(config_path)
+        added: list[KnownProject] = []
+        for repo_path in selected_paths:
+            normalized = repo_path.resolve()
+            if any(project.path.resolve() == normalized for project in config.projects.values()):
+                continue
+            project = KnownProject(
+                key=make_project_key(normalized, set(config.projects) | {item.key for item in added}),
+                path=normalized,
+                name=normalized.name,
+                kind=ProjectKind.GIT,
             )
-        added.append(project)
-    if added:
-        write_config(config, path=config_path, force=True)
+            config.projects[project.key] = project
+            ensure_project_scaffold(normalized)
+            # Commit the freshly written .gitignore/docs/issues so the
+            # project root is clean before the user runs their first task
+            # (#926). Best-effort: a failure here is logged and the
+            # registration still succeeds.
+            try:
+                commit_initial_scaffold(normalized)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "onboarding: initial scaffold commit failed for %s",
+                    normalized, exc_info=True,
+                )
+            added.append(project)
+        if added:
+            write_config(config, path=config_path, force=True)
     return added
 
 
@@ -1345,8 +1349,18 @@ def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:
         account.home,
     )
     if detected_email and detected_email != (account.email or "").lower():
-        config.accounts[account_name].email = detected_email
-        write_config(config, path=config_path, force=True)
+        # #2063 round 7: re-load INSIDE the shared RMW lock so any
+        # disk edits during the tmux login merge forward.
+        with config_rmw_lock(config_path):
+            fresh = load_config(config_path)
+            account_entry = fresh.accounts.get(account_name)
+            if account_entry is None:
+                # Account was removed during login; surface upward.
+                raise typer.BadParameter(
+                    f"Account {account_name} was removed during login."
+                )
+            account_entry.email = detected_email
+            write_config(fresh, path=config_path, force=True)
         return account_name, detected_email
 
     return account_name, account.email or detected_email or account_name

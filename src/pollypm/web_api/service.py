@@ -319,6 +319,507 @@ def project_drilldown(config: PollyPMConfig, key: str) -> APIProjectDrilldown | 
     )
 
 
+# ---------------------------------------------------------------------------
+# Project write helpers (Phase 2 — projects pause/resume/archive/init-guide)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_config_write_path(config: PollyPMConfig) -> Path:
+    """Pick the TOML path mutations should write back to.
+
+    Prefers ``config.config_path`` (stamped by :func:`load_config` post
+    PR #2026) and falls back to ``DEFAULT_CONFIG_PATH``. Tests that
+    construct a :class:`PollyPMConfig` by hand must set
+    ``config_path`` to a tmp file or the helper writes to the user's
+    real ``~/.pollypm/pollypm.toml`` — same constraint as
+    ``pollypm.projects.enable_tracked_project``.
+    """
+    if config.config_path is not None:
+        return Path(config.config_path)
+    from pollypm.config import DEFAULT_CONFIG_PATH
+
+    return Path(DEFAULT_CONFIG_PATH)
+
+
+def _emit_project_audit(
+    *,
+    event: str,
+    config: PollyPMConfig,
+    project_key: str,
+    project_path: Path | None,
+    actor: str,
+    reason: str | None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort audit emit for project lifecycle mutations.
+
+    Mirrors :func:`pollypm.cockpit_pane_reaper._emit_audit`: a failure
+    in the audit subsystem must NOT block (or roll back) the API
+    mutation, so this swallows every exception. ``reason`` is bounded
+    at 500 chars upstream by ``_ReasonBody`` but we clamp again here
+    as belt-and-suspenders in case a future caller bypasses the
+    Pydantic model.
+    """
+    try:
+        from pollypm.audit import emit as _audit_emit
+    except Exception:  # noqa: BLE001
+        return
+    metadata: dict[str, Any] = {"source": "web_api"}
+    if reason is not None:
+        metadata["reason"] = reason[:500]
+    if extra:
+        metadata.update(extra)
+    try:
+        _audit_emit(
+            event=event,
+            project=project_key,
+            subject=f"projects/{project_key}",
+            actor=actor or "api",
+            status="ok",
+            metadata=metadata,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
+# Codex round 7 on #2063 moved the config-write lock primitive into
+# :mod:`pollypm.config` (``config_rmw_lock``) so CLI / cockpit / onboarding
+# writers participate in the same serialisation invariant. Round 6's
+# local ``_config_write_lock`` only serialised API-vs-API; a CLI write
+# that landed between an API helper's ``load_config`` and
+# ``write_config`` was still silently overwritten by the API's older
+# snapshot (the exact reproduction Codex documented on round 7).
+#
+# The API helpers below import ``config_rmw_lock`` from ``pollypm.config``
+# and wrap their full read-modify-write under it. Every in-tree config
+# writer that does a ``load_config → mutate → write_config`` sequence
+# wraps it under the shared lock — see ``pollypm.projects`` (including
+# ``scan_projects`` post round 9), ``pollypm.accounts``,
+# ``pollypm.workers``, ``pollypm.onboarding``, ``pollypm.cockpit_ui``,
+# ``pollypm.cockpit_project_settings``, and
+# ``pollypm.plugins_builtin.project_planning.cli.project``. The
+# ``write_example_config`` initialiser in ``pollypm.config`` also wraps
+# its write so two concurrent ``pm init`` callers serialise on the same
+# lock. Two writes are intentionally OUTSIDE a full RMW wrap and rely
+# on :func:`pollypm.config.write_config`'s internal lock (Pattern A)
+# for torn-write protection:
+#
+# 1. ``pollypm.onboarding_tui`` first-run build+write — no prior
+#    snapshot to merge against; the API/CLI is not running yet.
+# 2. ``pollypm.config.load_config`` auth-token mint — re-reads under
+#    the lock before the write so concurrent edits still survive
+#    (round 9 audit fix).
+
+
+def _refresh_live_projects(
+    live_config: PollyPMConfig, fresh_config: PollyPMConfig
+) -> None:
+    """Replace ``live_config.projects`` in place with ``fresh_config.projects``.
+
+    Used after every config-mutation path so the in-request
+    :class:`ConfigDep` snapshot reflects disk state in full — both the
+    mutated project AND any concurrent external edits / additions /
+    removals — before we build the response body off it.
+
+    Post-#2056 the ``ConfigDep`` provider reloads via
+    ``load_config(config_path)`` per request, so cross-request
+    consistency is already guaranteed by the reload. This refresh is
+    therefore load-bearing only for:
+
+    * the IN-REQUEST response (we serialize from
+      ``config.projects[key]`` after the refresh, so it picks up the
+      post-write disk state without an extra ``_project_to_api`` arg
+      rewrite), AND
+    * the in-memory fallback path (``config_path is None``), where
+      tests construct :class:`PollyPMConfig` directly and the app
+      factory wires a startup-frozen ``lambda: config`` provider with
+      no per-request reload.
+
+    Codex round 3 on #2063: a previous field-by-field copy
+    (``tracked`` / ``path`` / ``name``) left other ``KnownProject``
+    fields (``persona_name``, ``kind``, role assignments, worker caps,
+    plan enforcement, etc.) stale when an external edit changed them on
+    the same project before the API call landed. Full ``clear() +
+    update()`` propagates every field plus external add/remove on other
+    keys.
+
+    Mutates ``live_config.projects`` in place so any external object
+    holding a reference to the dict sees the new contents.
+    """
+    live_config.projects.clear()
+    live_config.projects.update(fresh_config.projects)
+
+
+def set_project_tracked(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    tracked: bool,
+    reason: str | None = None,
+    actor: str = "api",
+) -> APIProject:
+    """Flip ``KnownProject.tracked`` and re-render the global TOML.
+
+    Concurrent-safe write semantics (Codex review on #2063):
+
+    * The entire read-modify-write section is serialised by the
+      SHARED :func:`pollypm.config.config_rmw_lock` (Codex round 7 on
+      #2063 promoted the round-6 API-local flock to a project-wide
+      invariant). Every other in-tree config writer — ``pm
+      add-project`` / ``pm rename-project`` / ``pm remove-project``,
+      the cockpit role-assignment editor, accounts, workers, the
+      project-planning plugin's session-purge — wraps its full
+      load → mutate → write under the same lock, so a CLI write that
+      lands while we're inside this block blocks on the flock instead
+      of clobbering our snapshot (or being clobbered by us). The
+      lockfile is a sibling of ``config_path`` (``<path>.lock``); the
+      lock is per-path so two unrelated configs (multi-tenant dev
+      setups) don't serialise against each other.
+    * Re-load the on-disk TOML so any external CLI / cockpit edits
+      that landed between server boot and this call are preserved —
+      we never write back the long-lived ``ConfigDep`` snapshot with
+      ``force=True`` (that would silently drop e.g. a project added
+      via ``pm add-project`` after the server started). Post-#2056
+      the request's ``config`` is itself a per-request
+      ``load_config(config_path)`` reload, so the extra
+      ``load_config`` here is a cheap cache hit on the production
+      path AND still required for the in-memory fallback path
+      (``config_path is None``) where ``config`` is a startup-frozen
+      object.
+    * Idempotency is decided AGAINST the freshly-loaded disk state
+      (Codex round 2 on #2063): if disk already matches ``tracked``
+      we skip the write AND refresh the request's snapshot from disk
+      so the response body is built from disk state, not from any
+      stale field.
+    * Mutate the freshly-loaded copy via DEEP COPY, NOT the live
+      ``config`` — ``load_config`` is memoised by path, so the
+      ``fresh_cached`` snapshot IS the same object as the request's
+      ``config`` whenever the server was bootstrapped via
+      ``load_config(config_path)``. Without the deep copy, a write
+      failure after mutating ``fresh.tracked`` would leak a stale
+      lie into the cache (Codex round 4 on #2063).
+    * After every successful disk write we re-load disk and FULLY
+      refresh ``config.projects`` via :func:`_refresh_live_projects`
+      so the in-request response reflects the post-write state plus
+      any concurrent external edits (Codex round 3 on #2063). Post-
+      #2056 the NEXT request reloads from disk anyway, so this is
+      mainly load-bearing for the current response and for the
+      in-memory fallback path.
+    * If ``write_config`` raises ``OSError`` the live ``config``
+      stays untouched and a subsequent GET reflects the unchanged
+      disk state — no stale in-memory lie that flips back on restart.
+
+    Returns the post-mutation :class:`APIProject` snapshot so the
+    client can refresh without a follow-up GET (same idiom as the
+    task transitions in Phase 2).
+    """
+    import copy
+
+    from pollypm.config import config_rmw_lock, load_config, write_config
+
+    # Bind to the original (in-memory) project up-front so the 404 path
+    # doesn't pay for a disk reload or take the lock.
+    live_project = config.projects.get(project_key)
+    if live_project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    config_path = _resolve_config_write_path(config)
+    # Hold the SHARED per-config RMW lock across the entire
+    # load → mutate → write → reload. Two concurrent API requests on
+    # different projects can't lose each other's writes (Codex round
+    # 6), AND a concurrent CLI/cockpit ``load_config → mutate →
+    # write_config`` sequence on the same config can't slot in between
+    # our load and our write to lose its edit (Codex round 7). The
+    # lock is released BEFORE we return; subsequent callers'
+    # load_config sees the updated mtime and reloads fresh.
+    with config_rmw_lock(config_path):
+        # Reload from disk so we don't lose concurrent CLI / cockpit
+        # edits (e.g. an external ``pm add-project`` that added a new
+        # project key the in-memory server hasn't seen yet). Under the
+        # flock this also picks up any sibling-API-request mutation
+        # that committed while we were waiting on the lock.
+        try:
+            fresh_cached = load_config(config_path)
+        except OSError as exc:
+            raise service_unavailable(
+                f"Failed to reload config for {project_key}: {exc}",
+                hint="Check read permissions on the PollyPM config file.",
+            ) from exc
+        # ``load_config`` is memoised by ``config_path`` (see
+        # ``pollypm.config._config_cache``) so ``fresh_cached`` IS the
+        # same object as the live ``ConfigDep`` whenever the server was
+        # bootstrapped via ``load_config(config_path)`` — which is
+        # exactly what ``pm serve`` / ``load_api_config`` do in
+        # production. Mutating ``fresh_cached.projects[key].tracked``
+        # would therefore mutate the live snapshot BEFORE the durable
+        # write completes. If write_config then raises OSError, the API
+        # returns 503 but the live config has already flipped — a
+        # rollback violation Codex reproduced on round 4 of #2063. Take
+        # a deep copy here so all mutation happens on a detached graph;
+        # the live snapshot is only touched via
+        # ``_refresh_live_projects`` AFTER the disk write succeeds.
+        fresh = copy.deepcopy(fresh_cached)
+        fresh_project = fresh.projects.get(project_key)
+        if fresh_project is None:
+            # Disk-side delete raced us. Treat as 404 — the in-memory
+            # state is stale and the next GET will agree.
+            raise not_found(f"Project not registered: {project_key}")
+
+        # Idempotency decided against DISK, not against the long-lived
+        # in-memory snapshot. If disk already matches the request we
+        # still FULLY refresh the live ``config.projects`` from disk so
+        # any external metadata edits (persona_name, kind, role
+        # assignments, worker caps, etc.) propagate — Codex round 3 on
+        # #2063.
+        if fresh_project.tracked == tracked:
+            _refresh_live_projects(config, fresh)
+            return _project_to_api(
+                config, project_key, config.projects[project_key]
+            )
+
+        fresh_project.tracked = tracked
+        fresh.projects[project_key] = fresh_project
+        try:
+            write_config(fresh, config_path, force=True)
+        except OSError as exc:
+            # Live config untouched — Codex P0 #1 (rollback guarantee).
+            # The deep-copy above is what makes this rollback real on
+            # the cached-load_config path: ``fresh`` is a detached
+            # graph, so mutating ``fresh_project.tracked`` never
+            # reached the live ``ConfigDep`` shared with FastAPI
+            # request handlers. Codex round 4 on #2063.
+            raise service_unavailable(
+                f"Failed to persist project state for {project_key}: {exc}",
+                hint="Check write permissions on the PollyPM config file.",
+            ) from exc
+
+        # Disk write succeeded — re-load disk and FULLY refresh the
+        # live ``config.projects`` so in-process callers see (a) the
+        # new ``tracked`` we just wrote AND (b) any concurrent external
+        # edits to other fields / other projects that landed between
+        # our load and our write — Codex round 3 on #2063. The extra
+        # load_config() is cheap relative to the durable write we just
+        # did. The flock guarantees no other API writer is between our
+        # write and this reload.
+        try:
+            post_write = load_config(config_path)
+        except OSError as exc:
+            # Live config still reflects pre-write state. Surface as
+            # 503 so the client can retry; subsequent GETs stay
+            # consistent.
+            raise service_unavailable(
+                f"Failed to reload config after writing {project_key}: {exc}",
+                hint="Check read permissions on the PollyPM config file.",
+            ) from exc
+        _refresh_live_projects(config, post_write)
+
+        refreshed_project = config.projects[project_key]
+
+    # Audit emit outside the lock — it does its own I/O and we don't
+    # want it serialising with other API writers.
+    _emit_project_audit(
+        event="projects.tracked.set",
+        config=config,
+        project_key=project_key,
+        project_path=refreshed_project.path,
+        actor=actor,
+        reason=reason,
+        extra={"tracked": tracked},
+    )
+    return _project_to_api(config, project_key, refreshed_project)
+
+
+def archive_project(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    reason: str | None = None,
+    actor: str = "api",
+) -> str:
+    """Remove ``project_key`` from ``config.projects`` and persist.
+
+    Per spec §6.2 "Archive ... Removes from config; Source data on
+    disk untouched." Returns the removed project's display label so
+    the route can populate an :class:`ActionResult` message.
+
+    Archive is irreversible from the API: subsequent ``resume`` /
+    ``pause`` / ``init-guide`` calls 404 because the project key is
+    gone. Re-registering uses ``pm add-project`` (CLI-only).
+
+    Codex review on #2063 (P0 #3): routes through
+    :func:`pollypm.projects.remove_project` so the session→project
+    invariant (no enabled session may reference a missing project) is
+    enforced uniformly with the CLI's ``pm projects remove``. Enabled-
+    session references map to ``409 conflict`` with the blocking
+    session names in the body.
+
+    Codex round 7 on #2063: the entire ``remove_project`` call + the
+    post-write reload runs under the SHARED
+    :func:`pollypm.config.config_rmw_lock`. The facade itself also
+    acquires the lock (re-entrant per thread, so the nested acquire
+    is a no-op). Without this shared invariant, an archive on project
+    A and a CLI ``pm projects remove`` on project B could each load
+    the same cached config, mutate their own key, and write — losing
+    one mutation. The shared lock serialises the read-modify-write
+    across BOTH API and CLI entry points (round 6's API-local flock
+    only protected API-vs-API).
+    """
+    import typer
+
+    from pollypm.config import config_rmw_lock
+    from pollypm.projects import remove_project as _remove_project_facade
+
+    live_project = config.projects.get(project_key)
+    if live_project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    label = live_project.display_label()
+    project_path = live_project.path
+    config_path = _resolve_config_write_path(config)
+    # Hold the SHARED per-config RMW lock across the facade call AND
+    # the post-archive reload so we serialise with any concurrent
+    # API ``set_project_tracked`` / sibling ``archive_project`` call
+    # AND with concurrent CLI / cockpit writers (Codex round 7 on
+    # #2063). The lock is released BEFORE the audit emit; subsequent
+    # writers' load_config sees our committed mtime and reloads fresh.
+    with config_rmw_lock(config_path):
+        # Snapshot the live project entry so we can roll back the in-
+        # memory state if ``remove_project`` raises OSError after
+        # mutation. The facade does ``config = load_config(...);
+        # del config.projects[key]; write_config(...)`` — and
+        # ``load_config`` is memoised by path, so the dict it mutates
+        # IS the live ``ConfigDep`` dict on the production cached path.
+        # A write failure after ``del`` would otherwise leave the live
+        # snapshot missing the project even though disk still has it
+        # (Codex round 4 on #2063, mirror of the set_project_tracked
+        # deep-copy fix above).
+        _live_project_snapshot = config.projects.get(project_key)
+        try:
+            # ``remove_project`` reloads from disk, enforces the
+            # session-ref guard, then writes back. Live ``config`` is
+            # untouched if the facade raises ``BadParameter`` (it
+            # raises before mutating); OSError can fire after the in-
+            # place delete, so we restore the snapshot below.
+            _remove_project_facade(config_path, project_key)
+        except typer.BadParameter as exc:
+            msg = str(exc)
+            if "still used by" in msg:
+                raise APIError(
+                    status_code=409,
+                    code="conflict",
+                    message=msg,
+                    hint=(
+                        "Disable or remove the listed sessions before "
+                        "archiving this project."
+                    ),
+                ) from exc
+            # Disk-side race (project gone between our 404 check and
+            # the facade's reload). Treat as 404 so the client sees a
+            # stable error code.
+            raise not_found(msg) from exc
+        except OSError as exc:
+            # Roll the live snapshot back if the facade already del'd
+            # the cached entry before the write failed — Codex round 4
+            # on #2063 (durable-write rollback on the cached config
+            # path).
+            if (
+                _live_project_snapshot is not None
+                and project_key not in config.projects
+            ):
+                config.projects[project_key] = _live_project_snapshot
+            raise service_unavailable(
+                f"Failed to persist archive for {project_key}: {exc}",
+                hint="Check write permissions on the PollyPM config file.",
+            ) from exc
+
+        # Disk write succeeded — re-load disk and FULLY refresh the
+        # live ``config.projects`` (Codex round 3 on #2063). The
+        # previous pop()-only sync left any concurrent external
+        # project ADDITIONS invisible to subsequent in-process
+        # ``GET /projects`` calls until the server restarted. Full
+        # refresh both drops the archived key and surfaces any
+        # external additions / metadata edits.
+        try:
+            post_archive = load_config(config_path)
+        except OSError as exc:
+            # Archive landed on disk but we can't see the post-state.
+            # Best-effort: drop the archived key from the live snapshot
+            # so the immediate response is at least internally
+            # consistent.
+            config.projects.pop(project_key, None)
+            raise service_unavailable(
+                f"Failed to reload config after archiving {project_key}: {exc}",
+                hint="Check read permissions on the PollyPM config file.",
+            ) from exc
+        _refresh_live_projects(config, post_archive)
+
+    # Audit emit outside the lock — independent I/O.
+    _emit_project_audit(
+        event="projects.archive",
+        config=config,
+        project_key=project_key,
+        project_path=project_path,
+        actor=actor,
+        reason=reason,
+        extra={"label": label},
+    )
+    return label
+
+
+def init_project_guide_for_role(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    role: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Wrap :func:`pollypm.project_guides.init_project_guide`.
+
+    Returns ``{role, path, forked_from, body}`` so clients can preview
+    the seeded markdown without a follow-up GET. Role validation maps
+    to ``422 validation_error`` (matches the spec §6 matrix —
+    unsupported enum value); existing-without-force maps to ``409
+    conflict`` mirroring the cockpit's ``--force`` UX.
+    """
+    from pollypm.project_guides import init_project_guide
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    try:
+        info = init_project_guide(project.path, role, force=force)
+    except ValueError as exc:
+        # ``validate_project_guide_role`` raises ``ValueError`` for
+        # unknown roles. Spec §6 maps that to 422 (body validates as
+        # JSON but the enum value is wrong).
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=str(exc),
+            hint="Supported roles: architect, reviewer, worker.",
+        ) from exc
+    except FileExistsError as exc:
+        raise APIError(
+            status_code=409,
+            code="conflict",
+            message=str(exc),
+            hint="Re-send with `force=true` to overwrite the existing guide.",
+        ) from exc
+    except OSError as exc:
+        raise service_unavailable(
+            f"Failed to write project guide for {project_key}: {exc}",
+        ) from exc
+
+    return {
+        "role": info.role,
+        "path": str(info.path),
+        "forked_from": info.forked_from,
+        "body": info.body,
+    }
+
+
 def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> APIProject:
     counts: dict[str, int] = {}
     pending_plan_review = False
@@ -1880,11 +2381,13 @@ def load_api_config(config_path: Path | None) -> PollyPMConfig:
 
 __all__ = [
     "archive_inbox_item",
+    "archive_project",
     "audit_event_to_api",
     "get_active_plan",
     "get_inbox_item",
     "get_project",
     "get_task_detail",
+    "init_project_guide_for_role",
     "list_inbox",
     "list_project_tasks",
     "list_projects",
@@ -1894,5 +2397,6 @@ __all__ = [
     "promote_inbox_to_task",
     "queue_task",
     "reply_inbox_item",
+    "set_project_tracked",
     "snooze_inbox_item",
 ]

@@ -262,6 +262,76 @@ def test_inbox_archive_reason_documented_as_post_transition() -> None:
     )
 
 
+def test_archive_documents_409_session_reference_conflict() -> None:
+    """Codex round 4 on #2063: archive's 409 must be pinned in BOTH surfaces.
+
+    ``archive_project`` maps an enabled-session reference to ``409
+    conflict`` (mirrors the CLI's ``pm projects remove`` guard) but the
+    static contract and the implementation's auto-generated OpenAPI
+    initially only documented 401/404/503. Generated clients would
+    therefore branch on an unexpected response and crash on the
+    user-visible "still referenced by ..." path.
+
+    Pin coverage so future drift trips CI:
+
+    * ``docs/api/openapi.yaml`` — ``POST /projects/{key}/archive``
+      must list a ``409`` response.
+    * The auto-generated FastAPI OpenAPI doc must also list ``409``
+      under ``/api/v1/projects/{key}/archive``.
+    """
+    # Static contract.
+    contract = _load_contract()
+    archive_post = contract["paths"]["/projects/{key}/archive"]["post"]
+    assert "409" in archive_post["responses"], (
+        "docs/api/openapi.yaml POST /projects/{key}/archive is missing a "
+        "409 response — enabled-session reference conflicts are user-visible "
+        "and must be documented (Codex round 4 on #2063)."
+    )
+
+    # Implementation-side doc.
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+    )
+    from pollypm.models import ProviderKind, RuntimeKind
+    from pollypm.web_api import create_app
+
+    base = Path(__file__).resolve().parent
+    config = PollyPMConfig(
+        project=ProjectSettings(name="P", root_dir=base, tmux_session="t",
+                                workspace_root=base, base_dir=base / ".pollypm",
+                                logs_dir=base / ".pollypm/logs",
+                                snapshots_dir=base / ".pollypm/snapshots",
+                                state_db=base / ".pollypm/state.db"),
+        pollypm=PollyPMSettings(controller_account="codex_primary",
+                                open_permissions_by_default=False,
+                                failover_enabled=False,
+                                failover_accounts=[],
+                                heartbeat_backend="local",
+                                scheduler_backend="inline",
+                                lease_timeout_minutes=30),
+        accounts={"codex_primary": AccountConfig(
+            name="codex_primary", provider=ProviderKind.CODEX,
+            email="codex@example.com", runtime=RuntimeKind.LOCAL,
+            home=base / ".pollypm/homes/codex_primary",
+        )},
+        sessions={},
+        projects={},
+        memory=MemorySettings(backend="file"),
+    )
+    app = create_app(config=config, token_path=base / "tmp-token")
+    raw = app.openapi()
+    impl_archive = raw["paths"]["/api/v1/projects/{key}/archive"]["post"]
+    assert "409" in impl_archive["responses"], (
+        "Implementation OpenAPI for POST /api/v1/projects/{key}/archive is "
+        "missing a 409 response — keep the route's ``responses=`` map in "
+        "sync with the static contract (Codex round 4 on #2063)."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

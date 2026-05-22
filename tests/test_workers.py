@@ -1,6 +1,9 @@
+import threading
 from pathlib import Path
 
-from pollypm.config import write_config
+import typer
+
+from pollypm.config import load_config, write_config
 from pollypm.models import (
     AccountConfig,
     ProjectKind,
@@ -291,6 +294,202 @@ def test_create_worker_session_keeps_legacy_selection_when_fallback_provider_has
 
     assert session.provider is ProviderKind.CLAUDE
     assert session.args == ["--dangerously-skip-permissions"]
+
+
+def test_concurrent_create_worker_session_for_same_role_no_orphans(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Two concurrent ``pm worker-start`` calls for the same project/role
+    must NOT both succeed with the same session_key (round-11 race; #2063).
+
+    Reproduction modelled on Codex's: a ``threading.Barrier(2)`` is wired
+    into a patched ``ensure_worktree`` so on the buggy code path (where
+    the duplicate check happens BEFORE the lock) both threads reach the
+    commit window simultaneously after passing the check, race the
+    write, and the second writer clobbers the first — yielding two
+    "successes" with the same session_key but only one session in the
+    persisted config (the other worktree orphaned).
+
+    With the fix, the uniqueness check happens INSIDE the lock, so the
+    loser sees the winner's session and raises ``typer.BadParameter``
+    before calling ``ensure_worktree``. Only the winner's thread ever
+    enters the patched ``ensure_worktree``; the barrier therefore
+    short-circuits via timeout, the winner proceeds, and the loser
+    surfaces a clear duplicate error.
+
+    Accept either outcome that preserves the invariant:
+      (a) one success + one clear duplicate error; or
+      (b) two distinct session keys (no overwrite).
+    Reject: two successes with the same key, or any orphan.
+    """
+    _config_data, config_path = _config(tmp_path)
+    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
+
+    barrier = threading.Barrier(2, timeout=5.0)
+    worktree_counter = {"n": 0}
+    worktree_lock = threading.Lock()
+
+    def fake_ensure_worktree(*args, **kwargs):
+        # Best-effort barrier: on the buggy code (check outside lock)
+        # both threads reach here and race the commit. On the fixed
+        # code only the winner enters this function; the loser is
+        # already raising under the lock. A timeout-on-broken-barrier
+        # lets the single thread keep going.
+        try:
+            barrier.wait()
+        except threading.BrokenBarrierError:
+            pass
+        with worktree_lock:
+            worktree_counter["n"] += 1
+            idx = worktree_counter["n"]
+        session = kwargs.get("session_name") or args[0] if args else "wt"
+        path = tmp_path / f"worktree-{session}-{idx}"
+        path.mkdir(parents=True, exist_ok=True)
+        return type("Worktree", (), {"path": str(path)})()
+
+    monkeypatch.setattr("pollypm.workers.ensure_worktree", fake_ensure_worktree)
+
+    results: list[str] = []
+    errors: list[BaseException] = []
+    results_lock = threading.Lock()
+
+    def run() -> None:
+        try:
+            session = create_worker_session(
+                config_path,
+                project_key="pollypm",
+                prompt=None,
+                role="worker",
+            )
+            with results_lock:
+                results.append(session.name)
+        except typer.BadParameter as exc:
+            with results_lock:
+                errors.append(exc)
+
+    t1 = threading.Thread(target=run)
+    t2 = threading.Thread(target=run)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+    assert not t1.is_alive() and not t2.is_alive(), "worker-start threads deadlocked"
+
+    # Together the two threads must produce exactly two outcomes.
+    assert len(results) + len(errors) == 2, (
+        f"Expected exactly 2 outcomes, got results={results} errors={errors}"
+    )
+
+    # No-orphan invariant: either two distinct keys, or one success + one
+    # clear duplicate error. NEVER two successes with the same key.
+    if len(results) == 2:
+        assert results[0] != results[1], (
+            f"Both threads returned the same session_key {results[0]!r} — "
+            "round-11 race regression (orphan worktree)."
+        )
+    else:
+        assert len(results) == 1 and len(errors) == 1, (
+            f"Expected 1 success + 1 duplicate error, got results={results} "
+            f"errors={[str(e) for e in errors]}"
+        )
+
+    # Every successful session_key MUST be present in the persisted
+    # config (no orphan: a worker that the caller was told succeeded but
+    # that the next ``load_config`` doesn't know about).
+    final = load_config(config_path)
+    final_sessions = set(final.sessions)
+    for key in results:
+        assert key in final_sessions, (
+            f"session_key {key!r} returned successfully but missing from "
+            f"persisted config sessions {sorted(final_sessions)} — orphan."
+        )
+
+
+def test_create_worker_session_revalidates_account_under_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Account removed between pre-lock validation and locked commit must
+    fail safely without persisting an invalid session (#2063 round 12).
+
+    Codex round-12 reproduction: the pre-lock path resolved the worker
+    ``account`` from the pre-lock config snapshot and committed it
+    inside the lock without re-validating against ``fresh``. An account
+    edit landing between pre-lock and commit produced a persisted
+    session whose ``account`` was missing from ``fresh.accounts`` —
+    ``load_config`` then raised ``ValueError: Session ... references
+    unknown account ...`` on the next read.
+
+    Repro shape: patch ``suggest_worker_prompt`` (the legacy pre-lock
+    helper) to remove the auto-selected worker account from disk before
+    returning, then call ``create_worker_session``. Pre-fix the call
+    succeeds and ``load_config`` raises on the next read. Post-fix the
+    locked block re-validates the account against ``fresh`` and raises
+    ``typer.BadParameter`` BEFORE writing, so the persisted config
+    stays valid.
+    """
+    config, config_path = _config(tmp_path)
+    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
+    monkeypatch.setattr(
+        "pollypm.workers.ensure_worktree",
+        lambda *args, **kwargs: type(
+            "Worktree",
+            (),
+            {"path": str(tmp_path / "revalidate-worktree")},
+        )(),
+    )
+
+    real_suggest = suggest_worker_prompt
+    removed = {"done": False}
+
+    def removing_suggest(config_path_arg, *, project_key):
+        # Drop the explicitly-requested worker account between pre-lock
+        # validation and the locked commit (Codex's exact reproduction
+        # shape). The pre-lock path historically resolved the account
+        # against the pre-lock snapshot and committed inside the lock;
+        # once we drop the account from disk, the locked block's
+        # ``fresh = load_config(...)`` MUST observe the absence and
+        # refuse to persist an invalid session.
+        if not removed["done"]:
+            current = load_config(config_path_arg)
+            current.accounts.pop("claude_worker", None)
+            write_config(current, config_path_arg, force=True)
+            removed["done"] = True
+        return real_suggest(config_path_arg, project_key=project_key)
+
+    monkeypatch.setattr("pollypm.workers.suggest_worker_prompt", removing_suggest)
+
+    raised: BaseException | None = None
+    try:
+        create_worker_session(
+            config_path,
+            project_key="pollypm",
+            prompt=None,
+            account_name="claude_worker",
+            role="worker",
+        )
+    except typer.BadParameter as exc:
+        raised = exc
+
+    assert raised is not None, (
+        "create_worker_session should have raised typer.BadParameter when "
+        "the requested account was removed between pre-lock validation "
+        "and the locked commit — #2063 round-12 regression."
+    )
+    assert "claude_worker" in str(raised) or "Unknown account" in str(raised), (
+        f"BadParameter should name the missing account, got: {raised!r}"
+    )
+
+    # Critical: load_config MUST succeed (no invalid session persisted).
+    # Pre-fix this raised ``ValueError: Session 'worker_pollypm' references
+    # unknown account 'claude_worker'``.
+    final = load_config(config_path)
+    for session in final.sessions.values():
+        assert session.account in final.accounts, (
+            f"persisted session {session.name!r} references unknown account "
+            f"{session.account!r} — #2063 round-12 regression (the locked "
+            f"commit wrote a SessionConfig whose account was missing from "
+            f"the locked snapshot)."
+        )
 
 
 def test_worker_prompt_requires_core_identity() -> None:

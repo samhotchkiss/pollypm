@@ -22,6 +22,7 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
+from pollypm import storage_report as storage_scanner
 from pollypm.cli_features import storage as storage_cli
 from pollypm.config import (
     AccountConfig,
@@ -202,10 +203,13 @@ def test_storage_report_cap_hit_annotation(
     fake_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """When ``snapshots/`` exceeds ``_SCAN_FILE_CAP``, the row sets
+    """When ``snapshots/`` exceeds ``SCAN_FILE_CAP``, the row sets
     ``cap_hit=true`` and emits the unbounded-growth NOTES badge."""
     # Lower the cap so the test materializes only a handful of files.
-    monkeypatch.setattr(storage_cli, "_SCAN_FILE_CAP", 4)
+    # Patch the canonical module (``storage_report``) — the cap is
+    # read by ``scan_pollypm_home`` from there, not from the CLI
+    # re-export.
+    monkeypatch.setattr(storage_scanner, "SCAN_FILE_CAP", 4)
 
     snapshots = fake_home / "snapshots"
     snapshots.mkdir()
@@ -284,3 +288,60 @@ def test_storage_subdir_unknown_returns_404(
     # The hint should mention at least one canonical subdir so the
     # caller can self-correct without reading source.
     assert "snapshots" in body["error"].get("hint", "")
+
+
+def test_storage_subdir_returns_empty_when_home_missing(
+    client: TestClient, auth_headers: dict[str, str], fake_home: Path
+) -> None:
+    """Codex P0 (PR #2054 round 1): a canonical subdir + missing
+    home directory must return ``200`` with an empty
+    :class:`StorageEntry` — mirroring the top-level endpoint's
+    fresh-install semantics — not a misleading 404 that claims a
+    bug in ``scan_pollypm_home``.
+
+    Run for every canonical subdir so a future addition to
+    ``HOME_SUBDIRS`` is automatically covered.
+    """
+    import shutil
+
+    shutil.rmtree(fake_home)
+    assert not fake_home.exists()
+
+    for subdir in storage_cli._HOME_SUBDIRS:
+        resp = client.get(f"/api/v1/storage/{subdir}", headers=auth_headers)
+        assert resp.status_code == 200, f"{subdir}: {resp.text}"
+        body = resp.json()
+        assert body["name"] == subdir
+        assert body["files"] == 0, f"{subdir}: {body}"
+        assert body["bytes"] == 0, f"{subdir}: {body}"
+        assert body["cap_hit"] is False
+        assert body["note"] == ""
+        assert body["oldest_mtime"] is None
+        assert body["newest_mtime"] is None
+
+
+def test_storage_route_does_not_import_cli_features() -> None:
+    """Module-boundary regression (Codex P1 on PR #2054 round 1).
+
+    ``web_api/routes/storage.py`` must NOT import from
+    ``pollypm.cli_features.*`` — pulling the Typer / bootstrap-pg /
+    migrate-to-pg / prune CLI surface into ``pm serve`` couples the
+    web API to presentation-layer code and inflates the route's
+    import graph. Canonical scanner + types live in the neutral
+    :mod:`pollypm.storage_report` module; both surfaces depend on it.
+    """
+    from pathlib import Path as _Path
+
+    import pollypm.web_api.routes.storage as storage_route
+
+    source = _Path(storage_route.__file__).read_text(encoding="utf-8")
+    # Grep both the ``from`` and ``import`` forms so a future caller
+    # can't sneak the boundary violation back in either way.
+    assert "from pollypm.cli_features" not in source, (
+        "web_api/routes/storage.py imports from pollypm.cli_features — "
+        "use pollypm.storage_report (the neutral helper) instead."
+    )
+    assert "import pollypm.cli_features" not in source, (
+        "web_api/routes/storage.py imports pollypm.cli_features — "
+        "use pollypm.storage_report (the neutral helper) instead."
+    )

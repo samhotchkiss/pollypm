@@ -1,8 +1,8 @@
 """``GET /api/v1/storage`` endpoints — Phase 2 storage report.
 
 Mirrors the JSON shape that ``pm storage report --json`` (PR #2040)
-emits, without re-deriving the scan. The CLI's
-:func:`pollypm.cli_features.storage.scan_pollypm_home` is the single
+emits, without re-deriving the scan. The neutral
+:func:`pollypm.storage_report.scan_pollypm_home` is the single
 source of truth: it knows which subdirs of ``~/.pollypm/`` to walk,
 which to cap (``snapshots/`` is unbounded), and how to annotate the
 NOTES column (cap-hit, orphan worktrees, audit rotation).
@@ -19,6 +19,15 @@ This router is a thin adapter:
 
 Per the Phase 2 spec §12.2, the API never deletes. ``pm storage
 prune`` is CLI-only.
+
+Module boundary
+---------------
+
+Imports come from :mod:`pollypm.storage_report` (neutral scanner
+helper extracted in PR #2054 round 2 per Codex review). We deliberately
+do NOT import :mod:`pollypm.cli_features.storage` — that would pull
+the whole Typer / bootstrap-pg / migrate-to-pg / prune CLI surface
+into ``pm serve`` just to satisfy a read-only adapter.
 """
 
 from __future__ import annotations
@@ -30,8 +39,8 @@ from typing import Any
 
 from fastapi import APIRouter
 
-from pollypm.cli_features.storage import (
-    _HOME_SUBDIRS,
+from pollypm.storage_report import (
+    HOME_SUBDIRS,
     DirScan,
     HomeReport,
     scan_pollypm_home,
@@ -157,16 +166,30 @@ def get_storage_subdir(subdir: str, config: ConfigDep) -> StorageEntry:
     """Return one row of the storage report by subdir name.
 
     Restricted to the canonical subdir list defined in
-    ``cli_features/storage.py::_HOME_SUBDIRS``. Arbitrary user paths
+    :data:`pollypm.storage_report.HOME_SUBDIRS`. Arbitrary user paths
     are intentionally not accepted — the report is for visibility,
     not arbitrary tree walks (spec §12.3 keeps that under a future
     ``/storage/breakdown?path=…`` design that's out of scope here).
+
+    Edge cases:
+
+    - **Unknown subdir** → ``404 not_found`` with a hint listing the
+      canonical names. The hint helps the caller self-correct without
+      reading source.
+    - **Missing home dir, canonical subdir** → ``200`` with an empty
+      :class:`StorageEntry` (zero files, zero bytes), mirroring the
+      top-level endpoint's missing-home semantics. The top-level report
+      treats a non-existent ``~/.pollypm/`` as a normal operating mode
+      (fresh install, alternate ``base_dir`` not yet provisioned) and
+      returns 200 with an empty payload — the subdir endpoint MUST
+      match that invariant or the frontend gets a misleading 404 every
+      time it polls a fresh install (Codex P0 on PR #2054).
     """
-    if subdir not in _HOME_SUBDIRS:
+    if subdir not in HOME_SUBDIRS:
         raise not_found(
             f"Unknown storage subdir: {subdir!r}",
             hint=(
-                "Valid subdirs: " + ", ".join(_HOME_SUBDIRS) + ". "
+                "Valid subdirs: " + ", ".join(HOME_SUBDIRS) + ". "
                 "Use GET /api/v1/storage for the whole-home report."
             ),
         )
@@ -181,14 +204,15 @@ def get_storage_subdir(subdir: str, config: ConfigDep) -> StorageEntry:
     for row in report.rows:
         if row.name == subdir:
             return _entry_from_scan(row)
-    # ``scan_pollypm_home`` always emits a row per ``_HOME_SUBDIRS``
-    # entry (empty DirScan when the dir doesn't exist on disk), so
-    # this branch is only reached if the canonical list and the scan
-    # diverge — that's a programming error worth surfacing.
-    raise not_found(
-        f"subdir {subdir!r} not present in scan output",
-        hint="This indicates a bug in scan_pollypm_home; file an issue.",
-    )
+    # Fell through — subdir is canonical (we validated above) but the
+    # scan produced no row for it. The expected cause is a missing /
+    # not-yet-provisioned home directory: ``scan_pollypm_home`` returns
+    # an empty :class:`HomeReport` (no rows) in that case rather than
+    # emitting empty placeholders. Mirror the top-level endpoint's
+    # missing-home semantics here — return ``200`` with a zeroed
+    # :class:`StorageEntry` instead of a misleading 404 (Codex P0 on
+    # PR #2054 round 1).
+    return _entry_from_scan(DirScan(name=subdir))
 
 
 __all__ = ["router"]

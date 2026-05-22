@@ -633,6 +633,23 @@ def _maybe_cache_route_operator_view(config) -> "OperatorDashboardView | None": 
     if not snapshot:
         return None
 
+    # Config-identity guard (PR #2026 v7 — Codex r7 blocker): decline
+    # if any snapshot entry was computed against a different config
+    # than the live one (different config_path / workspace_root).
+    # Without this, the dashboard view can mix cached state from one
+    # workspace into another whenever project keys overlap. Unstamped
+    # entries (``""``) skip the check — only test fixtures construct
+    # those.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
+        return None
+
     scans = _collect_project_scans(config)
     if not scans:
         return OperatorDashboardView(

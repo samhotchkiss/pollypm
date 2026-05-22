@@ -38,7 +38,11 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
-from pollypm.state_cache.entry import ProjectStateCacheEntry, empty_entry
+from pollypm.state_cache.entry import (
+    ProjectStateCacheEntry,
+    config_identity,
+    empty_entry,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +149,12 @@ def compute_entry_for_project(
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
         computed_at=time.monotonic(),
+        # PR #2026 v7 (Codex r7 blocker): stamp the config identity so
+        # every cache lookup can verify the snapshot was computed
+        # against the same config the caller holds. Without this the
+        # singleton cache can serve cross-config data whenever two
+        # configs share project keys.
+        config_identity=config_identity(config),
     )
     return entry
 

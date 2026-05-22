@@ -2053,6 +2053,23 @@ class CockpitRouter:
         if not snapshot:
             return None
 
+        # Config-identity guard (PR #2026 v7 — Codex r7 blocker):
+        # decline if any snapshot entry was computed against a
+        # different config than the live one (different config_path /
+        # workspace_root). Without this, the rail rollup map serves
+        # cached state from a different workspace whenever project
+        # keys overlap. Unstamped entries (``""``) skip the check —
+        # only test fixtures construct those.
+        try:
+            from pollypm.state_cache.entry import config_identity
+            live_identity = config_identity(config)
+            for entry in snapshot.values():
+                entry_identity = getattr(entry, "config_identity", "") or ""
+                if entry_identity and entry_identity != live_identity:
+                    return None
+        except Exception:  # noqa: BLE001
+            return None
+
         projects = getattr(config, "projects", {}) or {}
         known_keys = [str(key) for key in projects.keys()]
         snapshot_keys = set(snapshot.keys())

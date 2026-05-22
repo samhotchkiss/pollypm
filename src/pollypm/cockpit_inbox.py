@@ -283,6 +283,10 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     * The cache has no entries yet (cold start — the refresher hasn't
       populated anything; falling through avoids serving an empty list
       while the cache warms up).
+    * Any snapshot entry was stamped with a different config identity
+      than the live ``config`` (PR #2026 v7 — the singleton cache can
+      serve cross-config data when project keys overlap; the
+      config-identity stamp catches this).
     * Any tracked project is missing from the snapshot (partial cache).
     * Any workspace-root awaits-user message exists live (PR #2026
       review blocker 3) — the refresher does not project workspace-root
@@ -312,6 +316,27 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
         # Cold cache — let the direct path populate the legacy TTL
         # cache; the refresher will fill the state cache on the next
         # audit-log event.
+        return None
+
+    # Config-identity guard (PR #2026 v7 — Codex r7 blocker): the
+    # cache is a process-wide singleton. If any snapshot entry was
+    # computed against a different ``config`` (different config_path /
+    # workspace_root) than the one the caller passed in, serving it
+    # would leak cross-config data — most acutely when the two configs
+    # share project keys. Decline and let the direct path run.
+    #
+    # Entries with an empty ``config_identity`` (legacy / unstamped —
+    # only test fixtures today) skip the check: the real refresher
+    # always stamps a non-empty identity, so a stamped-vs-unstamped
+    # mismatch can only happen in synthetic test setups.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
         return None
 
     known_projects = set(getattr(config, "projects", {}).keys())
@@ -540,6 +565,21 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     except Exception:  # noqa: BLE001
         return None
     if not snapshot:
+        return None
+    # Config-identity guard (PR #2026 v7 — Codex r7 blocker): same
+    # rationale as ``_maybe_cache_route_awaits_user``. Without this,
+    # the count sums entries that were computed against a different
+    # ``config``, double-counting work between two configs that
+    # share project keys. Unstamped entries (``""``) skip the check —
+    # only test fixtures construct those.
+    try:
+        from pollypm.state_cache.entry import config_identity
+        live_identity = config_identity(config)
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                return None
+    except Exception:  # noqa: BLE001
         return None
     known_projects = set(getattr(config, "projects", {}).keys())
     # Partial-cache guard: a tracked project not yet refreshed into the

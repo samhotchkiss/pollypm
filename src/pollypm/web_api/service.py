@@ -319,6 +319,154 @@ def project_drilldown(config: PollyPMConfig, key: str) -> APIProjectDrilldown | 
     )
 
 
+# ---------------------------------------------------------------------------
+# Project write helpers (Phase 2 — projects pause/resume/archive/init-guide)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_config_write_path(config: PollyPMConfig) -> Path:
+    """Pick the TOML path mutations should write back to.
+
+    Prefers ``config.config_path`` (stamped by :func:`load_config` post
+    PR #2026) and falls back to ``DEFAULT_CONFIG_PATH``. Tests that
+    construct a :class:`PollyPMConfig` by hand must set
+    ``config_path`` to a tmp file or the helper writes to the user's
+    real ``~/.pollypm/pollypm.toml`` — same constraint as
+    ``pollypm.projects.enable_tracked_project``.
+    """
+    if config.config_path is not None:
+        return Path(config.config_path)
+    from pollypm.config import DEFAULT_CONFIG_PATH
+
+    return Path(DEFAULT_CONFIG_PATH)
+
+
+def set_project_tracked(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    tracked: bool,
+    reason: str | None = None,  # noqa: ARG001 — accepted for audit symmetry, not stored
+) -> APIProject:
+    """Flip ``KnownProject.tracked`` and re-render the global TOML.
+
+    Mirrors what the cockpit's ``set_project_tracked`` service does —
+    mutate ``config.projects[key].tracked`` then ``write_config`` so
+    the change survives across processes. Idempotent: setting the same
+    value re-writes the same TOML (no-op effectively).
+
+    Returns the post-mutation :class:`APIProject` snapshot so the
+    client can refresh without a follow-up GET (same idiom as the
+    task transitions in Phase 2).
+    """
+    from pollypm.config import write_config
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    project.tracked = tracked
+    config.projects[project_key] = project
+    try:
+        write_config(config, _resolve_config_write_path(config), force=True)
+    except OSError as exc:
+        raise service_unavailable(
+            f"Failed to persist project state for {project_key}: {exc}",
+            hint="Check write permissions on the PollyPM config file.",
+        ) from exc
+    return _project_to_api(config, project_key, project)
+
+
+def archive_project(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    reason: str | None = None,  # noqa: ARG001 — accepted for audit symmetry, not stored
+) -> str:
+    """Remove ``project_key`` from ``config.projects`` and persist.
+
+    Per spec §6.2 "Archive ... Removes from config; Source data on
+    disk untouched." Returns the removed project's display label so
+    the route can populate an :class:`ActionResult` message.
+
+    Archive is irreversible from the API: subsequent ``resume`` /
+    ``pause`` / ``init-guide`` calls 404 because the project key is
+    gone. Re-registering uses ``pm add-project`` (CLI-only).
+    """
+    from pollypm.config import write_config
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    label = project.display_label()
+    del config.projects[project_key]
+    try:
+        write_config(config, _resolve_config_write_path(config), force=True)
+    except OSError as exc:
+        # Roll back in-memory if the disk write fails so we don't
+        # silently desync the running server from disk.
+        config.projects[project_key] = project
+        raise service_unavailable(
+            f"Failed to persist archive for {project_key}: {exc}",
+            hint="Check write permissions on the PollyPM config file.",
+        ) from exc
+    return label
+
+
+def init_project_guide_for_role(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    role: str,
+    force: bool = False,
+) -> dict[str, Any]:
+    """Wrap :func:`pollypm.project_guides.init_project_guide`.
+
+    Returns ``{role, path, forked_from, body}`` so clients can preview
+    the seeded markdown without a follow-up GET. Role validation maps
+    to ``422 validation_error`` (matches the spec §6 matrix —
+    unsupported enum value); existing-without-force maps to ``409
+    conflict`` mirroring the cockpit's ``--force`` UX.
+    """
+    from pollypm.project_guides import init_project_guide
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    try:
+        info = init_project_guide(project.path, role, force=force)
+    except ValueError as exc:
+        # ``validate_project_guide_role`` raises ``ValueError`` for
+        # unknown roles. Spec §6 maps that to 422 (body validates as
+        # JSON but the enum value is wrong).
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=str(exc),
+            hint="Supported roles: architect, reviewer, worker.",
+        ) from exc
+    except FileExistsError as exc:
+        raise APIError(
+            status_code=409,
+            code="conflict",
+            message=str(exc),
+            hint="Re-send with `force=true` to overwrite the existing guide.",
+        ) from exc
+    except OSError as exc:
+        raise service_unavailable(
+            f"Failed to write project guide for {project_key}: {exc}",
+        ) from exc
+
+    return {
+        "role": info.role,
+        "path": str(info.path),
+        "forked_from": info.forked_from,
+        "body": info.body,
+    }
+
+
 def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> APIProject:
     counts: dict[str, int] = {}
     pending_plan_review = False
@@ -1880,11 +2028,13 @@ def load_api_config(config_path: Path | None) -> PollyPMConfig:
 
 __all__ = [
     "archive_inbox_item",
+    "archive_project",
     "audit_event_to_api",
     "get_active_plan",
     "get_inbox_item",
     "get_project",
     "get_task_detail",
+    "init_project_guide_for_role",
     "list_inbox",
     "list_project_tasks",
     "list_projects",
@@ -1894,5 +2044,6 @@ __all__ = [
     "promote_inbox_to_task",
     "queue_task",
     "reply_inbox_item",
+    "set_project_tracked",
     "snooze_inbox_item",
 ]

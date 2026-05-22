@@ -193,6 +193,133 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /projects/{key}/pause:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Projects]
+      operationId: pauseProject
+      summary: Pause a project (set tracked=false)
+      description: |
+        Flips `KnownProject.tracked=false` and re-renders the global
+        TOML. Idempotent — a second call against an already-paused
+        project returns 200 with the same snapshot and skips the disk
+        write. `reason` is currently accepted for audit symmetry but
+        not persisted.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectReasonRequest"
+      responses:
+        "200":
+          description: Project paused (or already was).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /projects/{key}/resume:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Projects]
+      operationId: resumeProject
+      summary: Resume a project (set tracked=true)
+      description: |
+        Flips `KnownProject.tracked=true` and re-renders the global
+        TOML. Idempotent — a second call against an already-tracked
+        project returns 200 with the same snapshot and skips the disk
+        write.
+      responses:
+        "200":
+          description: Project resumed (or already was).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /projects/{key}/archive:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Projects]
+      operationId: archiveProject
+      summary: Archive a project (remove from config)
+      description: |
+        Removes the project from `config.projects` and re-renders the
+        TOML. Source data on disk (the repo itself, audit JSONLs) is
+        untouched. Archive is irreversible from the API — subsequent
+        `pause`/`resume`/`init-guide` calls 404. Re-onboarding uses
+        the CLI's `pm add-project`. `reason` is currently accepted
+        for audit symmetry but not persisted.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ProjectReasonRequest"
+      responses:
+        "200":
+          description: Project archived; response carries the operator-facing message.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /projects/{key}/init-guide:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Projects]
+      operationId: initProjectGuide
+      summary: Seed a project-local role guide
+      description: |
+        Wraps `pollypm.project_guides.init_project_guide` — writes
+        `<project>/.pollypm/project-guides/<role>.md` seeded from the
+        built-in template for that role. Without `force=true`, an
+        existing guide returns `409 conflict`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InitGuideRequest"
+      responses:
+        "200":
+          description: Guide written; response carries the rendered body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InitGuideResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+
   /projects/{key}/plan:
     parameters:
       - $ref: "#/components/parameters/ProjectKey"
@@ -1233,9 +1360,10 @@ components:
             $ref: "#/components/schemas/ErrorResponse"
     ServiceUnavailable:
       description: |
-        Backing store (work-service / pg) unavailable.
-        Returned with error code `service_unavailable`. Retry shortly;
-        check `pm doctor` if the failure persists.
+        Backing store unavailable (work-service / pg for inbox + task
+        writes, or state.db / pollypm.toml for project + config writes).
+        Returned with error code `service_unavailable`. Clients should
+        retry shortly; persistent failures point at `pm doctor`.
       content:
         application/json:
           schema:
@@ -1592,6 +1720,59 @@ components:
         tracked:
           type: boolean
           default: true
+
+    ProjectReasonRequest:
+      type: object
+      description: |
+        Body for `POST /projects/{key}/pause` and
+        `POST /projects/{key}/archive`. `reason` is currently
+        accepted for audit symmetry but not persisted.
+      properties:
+        reason:
+          type: string
+          maxLength: 500
+          description: Optional operator-supplied note.
+
+    InitGuideRequest:
+      type: object
+      required: [role]
+      properties:
+        role:
+          type: string
+          enum: [architect, reviewer, worker]
+          description: |
+            Which role-specific guide to seed. The `operator_pm` role
+            is intentionally excluded — Polly always uses the built-in
+            operator guide.
+        force:
+          type: boolean
+          default: false
+          description: |
+            Overwrite an existing guide. Without this, existing
+            guides return `409 conflict`.
+
+    InitGuideResponse:
+      type: object
+      required: [role, path, body]
+      properties:
+        role:
+          type: string
+          description: Normalized role name (matches `role` in the request).
+        path:
+          type: string
+          description: |
+            Filesystem path of the written guide (server-local).
+        forked_from:
+          type: string
+          description: |
+            Fork-reference for the built-in template the guide was
+            seeded from. Used by the drift detector to flag when the
+            upstream template has moved.
+        body:
+          type: string
+          description: |
+            The rendered guide body (without front-matter). Clients
+            can preview the seeded text without a follow-up GET.
 
     PlanRequest:
       type: object

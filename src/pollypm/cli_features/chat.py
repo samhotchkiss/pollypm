@@ -322,6 +322,14 @@ def chat_history(
         "--since",
         help="ISO-8601 lower bound on message timestamp.",
     ),
+    since_id: str | None = typer.Option(
+        None,
+        "--since-id",
+        help=(
+            "Cursor pagination: return only messages strictly after this "
+            "message id. Forwarded to the server as `since_id`."
+        ),
+    ),
     direction: str | None = typer.Option(
         None,
         "--direction",
@@ -330,7 +338,10 @@ def chat_history(
     include_subagents: bool = typer.Option(
         False,
         "--include-subagents",
-        help="Inline subagent transcripts inside their parent message.",
+        help=(
+            "DEFERRED — see issue #2052. Currently the server returns "
+            "422 if this is true."
+        ),
     ),
     source: str | None = typer.Option(
         None,
@@ -346,6 +357,8 @@ def chat_history(
         params["limit"] = limit
     if since:
         params["since"] = since
+    if since_id:
+        params["since_id"] = since_id
     if direction:
         params["direction"] = direction
     if include_subagents:
@@ -434,6 +447,15 @@ def chat_send(
         "--notes",
         help="Free-text addition appended after --selection values.",
     ),
+    pane: int | None = typer.Option(
+        None,
+        "--pane",
+        help=(
+            "Explicit tmux pane index inside the target window. "
+            "Forwarded to the server as the `pane` body field; omit to "
+            "let the server pick its default pane."
+        ),
+    ),
     json_output: bool = typer.Option(
         False, "--json", help="Emit the raw JSON response body."
     ),
@@ -452,6 +474,8 @@ def chat_send(
         body["selections"] = list(selection)
     if notes is not None:
         body["notes"] = notes
+    if pane is not None:
+        body["pane"] = pane
 
     payload = _request(
         "POST",

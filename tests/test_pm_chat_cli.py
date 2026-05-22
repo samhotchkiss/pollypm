@@ -317,6 +317,20 @@ class TestChatHistory:
         assert result.exit_code == 0, result.output
         assert (capture.params or {}).get("include_subagents") == "true"
 
+    def test_chat_history_passes_since_id(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _install_token(monkeypatch, tmp_path)
+        capture = _install_response(
+            monkeypatch, json_payload={"messages": []}
+        )
+        result = runner.invoke(
+            _build_cli_app(),
+            ["chat", "history", "sess1", "--since-id", "msg_abc"],
+        )
+        assert result.exit_code == 0, result.output
+        assert (capture.params or {}).get("since_id") == "msg_abc"
+
     def test_direction_and_source_forwarded(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -507,6 +521,18 @@ class TestChatSend:
         body = capture.json_body or {}
         assert body.get("selections") == ["A", "B"]
         assert body.get("notes") == "fine either way"
+
+    def test_chat_send_passes_pane(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _install_token(monkeypatch, tmp_path)
+        capture = _install_response(monkeypatch, json_payload=_send_payload())
+        result = runner.invoke(
+            _build_cli_app(),
+            ["chat", "send", "sess1", "hello", "--pane", "1"],
+        )
+        assert result.exit_code == 0, result.output
+        assert (capture.json_body or {}).get("pane") == 1
 
     def test_safety_force_forwarded(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path

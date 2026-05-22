@@ -47,6 +47,7 @@ from pollypm.config import (
 from pollypm.cli_help import help_with_examples
 from pollypm.cli_features.alerts import alert_app, heartbeat_app, session_app
 from pollypm.cli_features.audit import audit_app
+from pollypm.cli_features.chat import chat_app
 from pollypm.launch_executor import LaunchPlanExecutor
 from pollypm.launch_state import (
     LaunchProbe,
@@ -169,6 +170,7 @@ _NOTIFY_HELP = help_with_examples(
 app = typer.Typer(help=_APP_HELP, invoke_without_command=True, no_args_is_help=False)
 app.add_typer(alert_app, name="alert")
 app.add_typer(audit_app, name="audit")
+app.add_typer(chat_app, name="chat")
 app.add_typer(session_app, name="session")
 app.add_typer(heartbeat_app, name="heartbeat")
 app.add_typer(issue_app, name="issue")

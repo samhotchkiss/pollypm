@@ -235,15 +235,23 @@ def _json_loads(raw: Any, default: Any) -> Any:
     return default
 
 
-# #2064 round-9 blocker #4: states a task can be in and still receive a
-# mid-flight reassign. Defined as the inverse of the "no live worker"
-# set (``draft``/``done``/``cancelled``); everything else — including
-# ``blocked`` / ``on_hold`` / ``rework`` — is a live lane with a
-# recoverable worker context. Keep this list in sync with
-# :class:`pollypm.work.models.WorkStatus`; the assignment is asserted
-# in ``tests/test_pg_work_service_full.py``.
+# #2064 round-9 blocker #4 / round-11 blocker #3: states a task can be
+# in and still receive a mid-flight reassign. Defined as the inverse of
+# the "no live worker" set (``draft``/``done``/``cancelled``) PLUS
+# ``queued`` (round-11): queued dispatch does not use the ``assignee``
+# column as the routing source of truth — :meth:`PgWorkService.next`
+# filters by ``task.roles["worker"]`` at ``pg_service.py:2059-2060``,
+# and :meth:`claim` resolves the assignee from the node role
+# (``_resolve_node_assignee`` at ``:4254-4256``), so a reassign on a
+# queued task would set ``assignee`` to the new owner but the next
+# ``claim()`` would still route to the original ``roles["worker"]``.
+# Reassign is a mid-flight worker SWAP, not a queue-time routing
+# change — the operator should cancel + re-queue with role assignment
+# instead. Everything else (``blocked`` / ``on_hold`` / ``rework`` /
+# ``review``) is a live lane with a recoverable worker context. Keep
+# this list in sync with :class:`pollypm.work.models.WorkStatus`; the
+# assignment is asserted in ``tests/test_pg_work_service_full.py``.
 _REASSIGN_ALLOWED_STATUSES: frozenset[str] = frozenset({
-    WorkStatus.QUEUED.value,
     WorkStatus.IN_PROGRESS.value,
     WorkStatus.REWORK.value,
     WorkStatus.BLOCKED.value,
@@ -1518,6 +1526,32 @@ class PgWorkService:
                     raise TaskNotFoundError(f"Task '{task_id}' not found.")
                 old_assignee, locked_status = row[0], row[1]
                 if locked_status not in _REASSIGN_ALLOWED_STATUSES:
+                    if locked_status == WorkStatus.QUEUED.value:
+                        # #2064 round-11 blocker #3: queued
+                        # reassign breaks routing. Queued
+                        # dispatch routes by ``task.roles["worker"]``,
+                        # not ``assignee`` — setting ``assignee``
+                        # on a queued task leaves the next
+                        # ``claim()`` routing to the original role
+                        # owner. Operators who want to redirect a
+                        # queued task should cancel + re-queue
+                        # with the new role assignment.
+                        raise InvalidTransitionError(
+                            f"Cannot reassign task in 'queued' "
+                            f"state.\n"
+                            f"\n"
+                            f"Why: queued dispatch routes by "
+                            f"`task.roles['worker']`, not the "
+                            f"`assignee` column. Setting `assignee` "
+                            f"on a queued task does NOT change "
+                            f"which worker claims it next.\n"
+                            f"\n"
+                            f"Fix: queued tasks can't be reassigned; "
+                            f"cancel + re-queue with role assignment "
+                            f"(`pm task cancel {task_id} --reason "
+                            f"'reassigning'` then re-create with the "
+                            f"new `roles.worker`)."
+                        )
                     raise InvalidTransitionError(
                         f"Cannot reassign task in '{locked_status}' "
                         f"state.\n"

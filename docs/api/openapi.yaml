@@ -985,9 +985,19 @@ paths:
       description: |
         Sets the task's `assignee` and advances the flow to the start
         (or current) node. Refuses non-queued tasks with `409
-        invalid_state`. `Idempotency-Key` and `If-Match` are
-        intentionally NOT accepted — no replay cache or version-token
-        enforcement exists yet (#2064 round-1, mirrors #2060).
+        invalid_state`. Refuses claims that would exceed the
+        project's `max_parallel_workers` ceiling with `429
+        worker_cap_exceeded` (#2064 round-11) — normal back-pressure
+        the client should retry once an existing worker finishes.
+        `Idempotency-Key` and `If-Match` are intentionally NOT
+        accepted — no replay cache or version-token enforcement
+        exists yet (#2064 round-1, mirrors #2060).
+
+        The response message reflects the actual post-claim state:
+        if a post-commit worker-cap race rolls the DB transition
+        back to `queued`, the envelope's `message` says "rolled
+        back" and `warnings` describes the recovery path (#2064
+        round-11 blocker #2).
       requestBody:
         required: true
         content:
@@ -997,7 +1007,10 @@ paths:
       responses:
         "200":
           description: Claim recorded; task is now `in_progress` (or
-            `review` for a review-start node).
+            `review` for a review-start node). Status may instead
+            read `queued` if a post-commit cap-race rolled the
+            transition back — clients route on `task.work_status`
+            and surface `warnings[]`.
           content:
             application/json:
               schema:
@@ -1010,6 +1023,16 @@ paths:
           $ref: "#/components/responses/Conflict"
         "422":
           $ref: "#/components/responses/ValidationError"
+        "429":
+          description: |
+            Worker cap exceeded — the project already has
+            `max_parallel_workers` active worker sessions. Body
+            uses error code `worker_cap_exceeded`. Retry after a
+            worker finishes, or raise the cap in `pollypm.toml`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
@@ -1082,9 +1105,16 @@ paths:
         records a `reassignment` context entry so the new owner
         can recover via `pm task get`.
 
-        Refuses non-live tasks (`draft`, `done`, `cancelled`) with
-        `409 invalid_state` — reassign is a mid-flight worker swap
-        (spec §P-9), not a generic owner-relabel.
+        Refuses non-live tasks (`draft`, `queued`, `done`,
+        `cancelled`) with `409 invalid_state` — reassign is a
+        mid-flight worker swap (spec §P-9), not a generic
+        owner-relabel. Queued tasks cannot be reassigned (#2064
+        round-11 blocker #3): queued dispatch routes by
+        `task.roles["worker"]`, not the `assignee` column, so a
+        queued reassign would set `assignee` to the new owner but
+        the next `claim()` would still route to the original role
+        owner. To redirect a queued task: cancel + re-queue with
+        the new `roles.worker`.
 
         `Idempotency-Key` and `If-Match` are intentionally NOT
         accepted — no replay cache or version-token enforcement

@@ -93,6 +93,29 @@ def conflict(message: str, *, hint: str | None = None) -> APIError:
     return APIError(status_code=409, code="conflict", message=message, hint=hint)
 
 
+def too_many_requests(
+    message: str,
+    *,
+    code: str = "too_many_requests",
+    hint: str | None = None,
+) -> APIError:
+    """Spec §6 ``429`` — back-pressure / rate-limit response.
+
+    Used by the claim path (#2064 round-11) to surface
+    :class:`pollypm.work.session_manager.WorkerCapExceededError` —
+    normal worker-cap back-pressure that the CLI handles cleanly and
+    the API was previously leaking as ``500 internal_error``.
+    Distinct from ``conflict`` (409) so clients can retry with
+    back-off semantics rather than treating the failure as a state
+    mismatch. The ``code`` parameter lets callers attach a more
+    specific machine-readable label (``worker_cap_exceeded`` for the
+    claim path) while keeping the HTTP status canonical.
+    """
+    return APIError(
+        status_code=429, code=code, message=message, hint=hint,
+    )
+
+
 def validation_error(
     message: str,
     *,
@@ -188,6 +211,7 @@ __all__ = [
     "invalid_token",
     "not_found",
     "service_unavailable",
+    "too_many_requests",
     "unauthorized",
     "validation_error",
 ]

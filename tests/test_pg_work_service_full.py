@@ -362,6 +362,49 @@ def test_reassign_task_rejects_done(pg_service):
     assert entries == []
 
 
+def test_reassign_task_rejects_queued(pg_service):
+    """#2064 round-11 blocker #3: reassign refuses queued (no routing source).
+
+    Queued dispatch uses ``task.roles["worker"]`` (see
+    ``PgWorkService.next`` at ``pg_service.py:2059-2060``) and
+    ``claim()`` resolves the next assignee from the node role
+    (``_resolve_node_assignee`` at ``:4254-4256``). A queued
+    reassign would update ``assignee`` but the next ``claim()``
+    would still route to the original role owner — a silent
+    drift between ``GET`` reads and ``claim()`` routing. The
+    contract is to reject queued reassigns and point the
+    operator at cancel + re-queue with the new role.
+
+    Round-9 blocker #4 only rejected ``draft`` / terminal; this
+    test pins the round-11 extension to ``queued``.
+    """
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(
+        pg_service, roles={"worker": "alice", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    assert pg_service.get(task.task_id).work_status.value == "queued"
+
+    with pytest.raises(InvalidTransitionError) as excinfo:
+        pg_service.reassign_task(
+            task.task_id, new_assignee="nora", actor="api"
+        )
+    msg = str(excinfo.value).lower()
+    assert "queued" in msg
+    # Hint must point at the cancel + re-queue workaround.
+    assert "cancel" in msg and "re-queue" in msg, msg
+    # No breadcrumb should have been recorded.
+    entries = pg_service.get_context(
+        task.task_id, entry_type="reassignment"
+    )
+    assert entries == [], (
+        f"reassign on queued must NOT record a breadcrumb; got {entries!r}"
+    )
+    # Roles untouched — operator's source-of-truth is preserved.
+    assert pg_service.get(task.task_id).roles.get("worker") == "alice"
+
+
 def test_concurrent_reassign_serializes_breadcrumbs(pg_service):
     """Spec §P-9 + concurrency safety (#2064 round-4 blocker #2).
 

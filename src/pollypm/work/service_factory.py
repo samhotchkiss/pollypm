@@ -60,7 +60,19 @@ def attach_session_manager(
     except OSError:
         return
 
+    # #2064 round-11 blocker #4: stamping ``_session_attach_error``
+    # on SessionService construction failure was a false positive
+    # whenever the subsequent SessionManager wire-up still succeeded
+    # (SessionManager accepts ``session_service=None`` and falls
+    # back to a degraded raw-tmux mode). Track the SessionService
+    # failure locally and only stamp when the FINAL outcome is "no
+    # SessionManager attached" — that is the condition the warning
+    # actually describes ("no per-task tmux lane was provisioned"
+    # at ``web_api/service.py``). A successful fallback attach
+    # silently records nothing, matching the pre-round-10 behaviour
+    # the operator saw before we added the surfacing.
     session_service = None
+    session_service_error: str | None = None
     storage_closet_name = "pollypm-storage-closet"
     try:
         from pollypm.session_services.tmux import TmuxSessionService
@@ -77,12 +89,11 @@ def attach_session_manager(
         session_service = TmuxSessionService(config=config, store=store)
     except Exception as exc:  # noqa: BLE001
         logger.debug(
-            "attach_session_manager: SessionService construction failed",
+            "attach_session_manager: SessionService construction failed; "
+            "will attempt SessionManager fallback without a session service",
             exc_info=True,
         )
-        _record_attach_error(
-            svc, f"SessionService construction failed: {exc}"
-        )
+        session_service_error = f"SessionService construction failed: {exc}"
     try:
         session_mgr = SessionManager(
             tmux_client=create_tmux_client(),
@@ -93,14 +104,28 @@ def attach_session_manager(
             storage_closet_name=storage_closet_name,
         )
         svc.set_session_manager(session_mgr)
+        # Success — even if SessionService construction failed, we
+        # have a working SessionManager (the fallback raw-tmux
+        # path). DO NOT stamp ``_session_attach_error``; the
+        # warning at ``_collect_claim_warnings`` would otherwise
+        # falsely claim "no per-task tmux lane was provisioned".
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "attach_session_manager: SessionManager wire-up failed",
             exc_info=True,
         )
-        _record_attach_error(
-            svc, f"SessionManager wire-up failed: {exc}"
-        )
+        if session_service_error is not None:
+            # Surface both failures so the operator sees the full
+            # chain; the SessionService failure is the root cause.
+            _record_attach_error(
+                svc,
+                f"SessionManager wire-up failed: {exc} "
+                f"(after {session_service_error})",
+            )
+        else:
+            _record_attach_error(
+                svc, f"SessionManager wire-up failed: {exc}"
+            )
 
 
 def _record_attach_error(svc: Any, message: str) -> None:

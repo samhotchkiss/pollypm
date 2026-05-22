@@ -250,12 +250,19 @@ class FakeWorkService:
         """
         with self._lock:
             task = self.get(task_id)
-            # #2064 round-9 blocker #4: live-worker-swap invariant.
-            # Mirror the pg + mock backends — refuse draft and
-            # terminal states so route-level tests can assert the 409
-            # mapping. Without this, FakeWorkService would silently
-            # append a breadcrumb to a cancelled task and the route
-            # regression below would never trip.
+            # #2064 round-9 blocker #4 / round-11 blocker #3: live-
+            # worker-swap invariant. Mirror the pg + mock backends —
+            # refuse draft, terminal AND queued states so route-level
+            # tests can assert the 409 mapping. Without this,
+            # FakeWorkService would silently append a breadcrumb to
+            # a cancelled or queued task and the route regression
+            # below would never trip.
+            if task.work_status is WorkStatus.QUEUED:
+                raise InvalidTransitionError(
+                    f"Cannot reassign task in 'queued' state. "
+                    f"Queued tasks can't be reassigned; cancel + "
+                    f"re-queue with role assignment."
+                )
             if task.work_status in (
                 WorkStatus.DRAFT, WorkStatus.DONE, WorkStatus.CANCELLED,
             ):
@@ -693,6 +700,139 @@ def test_create_work_service_with_session_captures_attach_exception(
     assert "simulated attach failure" in captured
 
 
+def test_claim_worker_cap_exceeded_returns_429(
+    api_config, token_path, token, task_store, monkeypatch  # noqa: ARG001
+) -> None:
+    """#2064 round-11 blocker #1: WorkerCapExceededError → 429 envelope.
+
+    The shared claim facade calls
+    :meth:`SessionManager.check_parallel_cap` before the DB
+    transition (``pg_service.py:1759-1763``); a project already at
+    its ``max_parallel_workers`` ceiling raises
+    :class:`WorkerCapExceededError`. Prior to round-11 the API
+    helper only mapped ``TaskNotFoundError`` / ``InvalidTransitionError``,
+    so cap pressure leaked as ``500 internal_error``. The fix maps
+    it to a typed ``429 worker_cap_exceeded`` envelope so clients
+    can apply back-off.
+    """
+    from pollypm.work.session_manager import WorkerCapExceededError
+
+    _seed(task_store, n=301, work_status=WorkStatus.QUEUED)
+
+    class _CapExceededWorkService(FakeWorkService):
+        def claim(self, task_id: str, actor: str) -> FakeTask:  # noqa: ARG002
+            # Mimic the pg pre-claim cap probe at
+            # ``pg_service.py:1759-1763`` — raises BEFORE the DB
+            # transition fires so no state change is visible.
+            raise WorkerCapExceededError(
+                f"Cannot spawn worker for myproj/301: project 'myproj' "
+                f"already has 4 active worker sessions (cap=4)."
+            )
+
+    def _factory(**_kwargs: object) -> _CapExceededWorkService:
+        return _CapExceededWorkService(task_store)
+
+    from pollypm.web_api.app import create_app
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(work_factory, "create_work_service", _factory)
+    monkeypatch.setattr(
+        work_service_factory, "create_work_service_with_session", _factory
+    )
+    app = create_app(config=api_config, token_path=token_path)
+    local_client = TestClient(app)
+    response = local_client.post(
+        "/api/v1/tasks/myproj/301/claim",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"actor": "alice"},
+    )
+    # MUST be 429 (back-pressure) NOT 500 (server bug) or 409
+    # (state conflict). The HTTP status carries the back-off
+    # semantics; the body code carries the machine-readable label.
+    assert response.status_code == 429, response.text
+    body = response.json()
+    assert body["error"]["code"] == "worker_cap_exceeded", body
+    assert "worker cap exceeded" in body["error"]["message"].lower()
+    # Hint MUST point at the recovery workflow.
+    hint = (body["error"].get("hint") or "").lower()
+    assert "max_parallel_workers" in hint or "retry" in hint
+
+
+def test_claim_post_commit_rollback_message_reflects_queued_state(
+    api_config, token_path, token, task_store, monkeypatch  # noqa: ARG001
+) -> None:
+    """#2064 round-11 blocker #2: rolled-back claim says so.
+
+    ``PgWorkService.claim`` at ``pg_service.py:1917-1939`` rolls
+    the task back to ``queued`` when a post-commit cap race fires.
+    Prior to round-11 the route still returned ``message="claimed
+    myproj/N"`` and ``warnings`` said "the DB claim is in effect",
+    even though the row was queued again. This test pins the
+    truthful contract: when ``task.work_status == 'queued'`` after
+    the claim call, the message says "rolled back" and the warning
+    matches.
+    """
+    _seed(task_store, n=302, work_status=WorkStatus.QUEUED)
+
+    class _RolledBackClaimWorkService(FakeWorkService):
+        def claim(self, task_id: str, actor: str) -> FakeTask:
+            # Get the task but DON'T transition — emulate the
+            # post-rollback state: row stays queued, but the post-
+            # commit cap race did happen and stamped
+            # ``last_provision_error``. This matches
+            # ``pg_service.py:1939`` where ``result = self.get(...)``
+            # refetches a now-queued row after the rollback.
+            task = self.get(task_id)
+            # Round-11 simulates the rollback path explicitly.
+            self.last_provision_error = (
+                "cap exceeded post-commit; claim rolled back"
+            )
+            return task
+
+    def _factory(**_kwargs: object) -> _RolledBackClaimWorkService:
+        return _RolledBackClaimWorkService(task_store)
+
+    from pollypm.web_api.app import create_app
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(work_factory, "create_work_service", _factory)
+    monkeypatch.setattr(
+        work_service_factory, "create_work_service_with_session", _factory
+    )
+    app = create_app(config=api_config, token_path=token_path)
+    local_client = TestClient(app)
+    response = local_client.post(
+        "/api/v1/tasks/myproj/302/claim",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"actor": "alice"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Envelope still reports ``ok: true`` — the request itself
+    # didn't fail, the operator just needs to know the row is
+    # queued again. ``task.work_status`` is the routing source.
+    assert body["ok"] is True
+    assert body["task"]["work_status"] == "queued"
+    # MESSAGE: must NOT say "claimed myproj/302" — the row is
+    # queued. The truthful wording says "rolled back; ... remains
+    # queued".
+    message = body["message"]
+    assert "rolled back" in message.lower(), message
+    assert "queued" in message.lower(), message
+    assert "myproj/302" in message
+    # WARNING: must reflect "rolled back", NOT "DB claim is in
+    # effect" (the pre-round-11 wording).
+    warnings = body["warnings"]
+    assert len(warnings) == 1, warnings
+    warning = warnings[0]
+    assert "rolled back" in warning.lower(), warning
+    assert "queued" in warning.lower(), warning
+    # The pre-round-11 false wording MUST be gone.
+    assert "DB claim is in effect" not in warning, warning
+
+
 # ---------------------------------------------------------------------------
 # Cancel
 # ---------------------------------------------------------------------------
@@ -868,6 +1008,133 @@ def test_reassign_done_returns_409(client, auth_headers, task_store) -> None:
     assert response.status_code == 409, response.text
     assert response.json()["error"]["code"] == "invalid_state"
     assert seeded.assignee == "pete"
+
+
+def test_reassign_queued_returns_409(client, auth_headers, task_store) -> None:
+    """#2064 round-11 blocker #3: reassign refuses queued tasks.
+
+    Queued dispatch routes by ``task.roles["worker"]``, not the
+    ``assignee`` column (``pg_service.py:2059-2060``), and the
+    claim path resolves assignee from the node role first
+    (``_resolve_node_assignee`` at ``:4254-4256``). Setting
+    ``assignee`` on a queued task would create a silent drift:
+    ``GET`` reads the new assignee, but ``claim()`` routes to the
+    original role owner. The contract is "reject + point operator
+    at cancel + re-queue" instead.
+    """
+    seeded = _seed(
+        task_store, n=73,
+        work_status=WorkStatus.QUEUED, assignee=None,
+        roles={"worker": "alice", "reviewer": "bob"},
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/73/reassign",
+        headers=auth_headers,
+        json={"actor": "nora"},
+    )
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_state"
+    # The error message MUST mention that queued tasks can't be
+    # reassigned + point at the cancel + re-queue workaround.
+    message = body["error"]["message"].lower()
+    assert "queued" in message
+    # No state change — assignee column and roles untouched.
+    assert seeded.assignee is None, (
+        "assignee must NOT change when queued reassign is refused"
+    )
+    assert seeded.roles == {"worker": "alice", "reviewer": "bob"}
+    # No breadcrumb was recorded.
+    assert seeded.context == [], (
+        f"reassign on queued must NOT record a breadcrumb; got "
+        f"{seeded.context!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Fallback SessionManager warning quality (#2064 round-11 blocker #4)
+# ---------------------------------------------------------------------------
+
+
+def test_attach_session_manager_no_false_positive_when_fallback_succeeds(
+    monkeypatch,
+) -> None:
+    """#2064 round-11 blocker #4: SessionService fail + SessionManager OK = no warning.
+
+    ``attach_session_manager`` previously stamped
+    ``_session_attach_error`` the moment ``SessionService``
+    construction raised at ``service_factory.py:78-85`` — even
+    when the subsequent ``SessionManager`` wire-up at
+    ``:86-95`` still succeeded (SessionManager accepts
+    ``session_service=None`` as a fallback). The claim warning
+    "no per-task tmux lane was provisioned" would then lie
+    because the fallback manager IS provisioning lanes.
+
+    This test exercises the real
+    :func:`attach_session_manager` helper with a stubbed
+    ``TmuxSessionService`` (raises on construction) and a
+    successful ``SessionManager`` constructor (records the
+    attach), then asserts the svc carries NO
+    ``_session_attach_error``.
+    """
+    from pollypm.work import service_factory as work_service_factory
+
+    class _StubService:
+        def set_session_manager(self, mgr: object) -> None:
+            self._session_mgr = mgr
+
+    stub = _StubService()
+    attach_calls: list[dict[str, object]] = []
+
+    # Replace TmuxSessionService import target so construction
+    # raises (simulating tmux/state-store failure on a host where
+    # SessionService can't initialise).
+    import pollypm.session_services.tmux as tmux_module
+
+    class _BrokenTmuxSessionService:
+        def __init__(self, *args: object, **kwargs: object) -> None:  # noqa: ARG002
+            raise RuntimeError("simulated SessionService failure")
+
+    monkeypatch.setattr(
+        tmux_module, "TmuxSessionService", _BrokenTmuxSessionService
+    )
+
+    # Replace SessionManager so its constructor records the call
+    # and returns without raising — that's the "fallback success"
+    # path the blocker calls out.
+    import pollypm.work.session_manager as sm_module
+
+    class _OkSessionManager:
+        def __init__(self, **kwargs: object) -> None:
+            attach_calls.append(kwargs)
+
+    monkeypatch.setattr(sm_module, "SessionManager", _OkSessionManager)
+
+    # Real project_path with a .git so the early gate doesn't bail.
+    import tempfile
+    from pathlib import Path
+
+    with tempfile.TemporaryDirectory() as td:
+        proj = Path(td)
+        (proj / ".git").mkdir()
+        work_service_factory.attach_session_manager(
+            stub, project_path=proj, config=None
+        )
+
+    # SessionManager DID get constructed (fallback path lived).
+    assert len(attach_calls) == 1, attach_calls
+    # ``session_service`` was None because TmuxSessionService raised
+    # — that is the fallback condition we are pinning.
+    assert attach_calls[0]["session_service"] is None
+    # The set_session_manager hook fired — the svc has a manager.
+    assert getattr(stub, "_session_mgr", None) is not None
+    # Critical contract: NO ``_session_attach_error`` despite the
+    # SessionService construction failure, because the SessionManager
+    # fallback succeeded.
+    assert getattr(stub, "_session_attach_error", None) is None, (
+        f"false-positive attach error: "
+        f"{stub._session_attach_error!r}"  # type: ignore[attr-defined]
+    )
 
 
 # ---------------------------------------------------------------------------

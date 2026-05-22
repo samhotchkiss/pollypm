@@ -35,6 +35,7 @@ from pollypm.web_api.errors import (
     APIError,
     not_found,
     service_unavailable,
+    too_many_requests,
 )
 from pollypm.web_api.models import (
     ContextEntry as APIContextEntry,
@@ -1332,6 +1333,13 @@ def claim_task(
         InvalidTransitionError,
         TaskNotFoundError,
     )
+    # #2064 round-11 blocker #1 — map cap back-pressure to a typed
+    # 429 envelope instead of leaking ``WorkerCapExceededError`` as
+    # 500 ``internal_error``. The exception lives in the session
+    # manager module; lazy import keeps the web_api package free of
+    # tmux/state-store imports at startup (same pattern the work-
+    # service factory uses above).
+    from pollypm.work.session_manager import WorkerCapExceededError
 
     project = config.projects.get(project_key)
     if project is None:
@@ -1355,8 +1363,31 @@ def claim_task(
                     message=str(exc) or f"Task {task_id} cannot be claimed.",
                     hint="Only queued+unblocked tasks can be claimed.",
                 ) from exc
+            except WorkerCapExceededError as exc:
+                # #2064 round-11 blocker #1: pre-claim cap probe at
+                # ``PgWorkService.claim`` (``pg_service.py:1759-1763``)
+                # raises ``WorkerCapExceededError`` from
+                # ``SessionManager.check_parallel_cap`` (``session_manager.py:418/473``).
+                # That is normal back-pressure — the project is at its
+                # ``max_parallel_workers`` ceiling — not a server bug.
+                # Surface it as ``429`` with a stable
+                # ``worker_cap_exceeded`` code so clients can apply
+                # back-off and operators see the same recovery story
+                # the CLI emits.
+                raise too_many_requests(
+                    f"Worker cap exceeded for project "
+                    f"{project_key}: {exc}",
+                    code="worker_cap_exceeded",
+                    hint=(
+                        "Wait for an in-progress task on this "
+                        "project to finish, raise "
+                        "`max_parallel_workers` under "
+                        f"`[projects.{project_key}]` in pollypm.toml, "
+                        "or retry the claim once a slot frees up."
+                    ),
+                ) from exc
             task = svc.get(task_id)
-            warnings = _collect_claim_warnings(svc, task_id)
+            warnings = _collect_claim_warnings(svc, task, task_id)
             return _task_to_detail_with_plan(task, svc=svc), warnings
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
@@ -1371,16 +1402,22 @@ def claim_task(
         ) from exc
 
 
-def _collect_claim_warnings(svc: object, task_id: str) -> list[str]:
+def _collect_claim_warnings(
+    svc: object, task: object, task_id: str
+) -> list[str]:
     """Build the ``TaskActionResult.warnings`` list for a successful claim.
 
-    Two sources combine into one operator-facing list (#2064 round-10):
+    Three sources combine into one operator-facing list (#2064 round-10 + 11):
 
     - ``svc.last_provision_error`` — set by
       ``PgWorkService.claim`` (``pg_service.py:1905-1910``) when the
       DB transition committed but the per-task worker session
       failed to provision (tmux blew up, parallel-cap, worktree
-      checkout, prompt write, etc).
+      checkout, prompt write, etc). Round-11 refinement: that path
+      can ALSO roll the task back to ``queued`` (cap-exceeded race;
+      ``pg_service.py:1917-1939``). When the rollback fired the
+      warning wording must say "rolled back" — saying "the DB claim
+      is in effect" lies because the row is back to ``queued``.
     - ``svc._session_attach_error`` — set by
       :func:`pollypm.work.service_factory.attach_session_manager` when
       the SessionManager itself could not be wired (missing imports,
@@ -1398,16 +1435,40 @@ def _collect_claim_warnings(svc: object, task_id: str) -> list[str]:
     warnings: list[str] = []
     last_provision_error = getattr(svc, "last_provision_error", None)
     session_attach_error = getattr(svc, "_session_attach_error", None)
+    # Round-11 blocker #2: the claim path's post-commit rollback
+    # (``pg_service.py:1917-1939``) sets ``last_provision_error`` AND
+    # flips the row back to ``queued``. Inspect the post-claim
+    # task to tell the operator the truth. ``work_status`` may be a
+    # :class:`WorkStatus` enum or a string depending on whether the
+    # caller passed a real pg ``Task`` or the FakeWorkService in
+    # tests; normalise to the underlying value.
+    status_attr = getattr(task, "work_status", None)
+    status_value = getattr(status_attr, "value", status_attr)
+    rolled_back = (
+        bool(last_provision_error) and status_value == "queued"
+    )
     if last_provision_error:
-        warnings.append(
-            f"Worker session provisioning failed for {task_id}: "
-            f"{last_provision_error}. The DB claim is in effect, but "
-            f"no live agent lane was created. To recover: either "
-            f"continue work from an existing worker session for this "
-            f"project, or hold + resume to retry provisioning "
-            f"(`pm task hold {task_id} --reason 'provision failed'` "
-            f"then `pm task resume {task_id}`)."
-        )
+        if rolled_back:
+            warnings.append(
+                f"Worker session provisioning failed for {task_id}: "
+                f"{last_provision_error}. The DB claim was rolled "
+                f"back; the task is queued again so auto-claim can "
+                f"retry. To recover: wait for the next claim sweep, "
+                f"or raise `max_parallel_workers` under "
+                f"`[projects.{_project_of(task_id)}]` in pollypm.toml "
+                f"if back-pressure caused the rollback."
+            )
+        else:
+            warnings.append(
+                f"Worker session provisioning failed for {task_id}: "
+                f"{last_provision_error}. The DB claim is in effect, "
+                f"but no live agent lane was created. To recover: "
+                f"either continue work from an existing worker "
+                f"session for this project, or hold + resume to "
+                f"retry provisioning "
+                f"(`pm task hold {task_id} --reason 'provision "
+                f"failed'` then `pm task resume {task_id}`)."
+            )
     if session_attach_error:
         warnings.append(
             f"SessionManager wire-up failed for {task_id}: "
@@ -1421,6 +1482,19 @@ def _collect_claim_warnings(svc: object, task_id: str) -> list[str]:
             f"{task_id}`)."
         )
     return warnings
+
+
+def _project_of(task_id: str) -> str:
+    """Best-effort project-key extraction for warning wording.
+
+    Task IDs are ``"<project>/<n>"`` (see ``_parse_task_id`` in
+    ``pollypm.work.pg_service``). Falls back to ``"<project>"`` if
+    the shape is unexpected — the warning still renders, just with
+    a placeholder. Used only for operator-facing messages, never
+    for routing.
+    """
+    project, sep, _ = task_id.partition("/")
+    return project if sep else "<project>"
 
 
 def cancel_task(

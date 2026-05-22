@@ -210,6 +210,12 @@ def queue_task_endpoint(
         "404": {"description": "Project or task not found."},
         "409": {"description": "Task is not in a claimable state."},
         "422": {"description": "Claim gate failure."},
+        "429": {
+            "description": (
+                "Worker cap exceeded — normal back-pressure from "
+                "`max_parallel_workers`. Retry once a slot frees."
+            ),
+        },
         "503": {"description": "Backing store unavailable."},
     },
 )
@@ -227,9 +233,22 @@ def claim_task_endpoint(
     # fail the request; the envelope's ``warnings`` field lets the
     # client surface a banner alongside the ``in_progress`` task.
     task, warnings = claim_task(config, project, n, actor=body.actor)
+    # #2064 round-11 blocker #2: the message must reflect the actual
+    # post-claim state. The post-commit cap race
+    # (``pg_service.py:1917-1939``) can roll the row back to
+    # ``queued`` after the initial transition — saying "claimed
+    # myproj/3" then would lie. Inspect ``task.work_status`` instead
+    # of assuming success.
+    if task.work_status == "queued":
+        message = (
+            f"claim attempted but rolled back; task "
+            f"{task.task_id} remains queued"
+        )
+    else:
+        message = f"claimed {task.task_id}"
     return TaskActionResult(
         ok=True,
-        message=f"claimed {task.task_id}",
+        message=message,
         task=task,
         warnings=warnings,
     )

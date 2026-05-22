@@ -24,6 +24,9 @@ from typing import Any
 
 import sqlite3
 
+import psycopg
+import psycopg_pool
+
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
@@ -69,10 +72,22 @@ _DISABLE_WORK_DB_OPENED_AUDIT_ENV = "POLLYPM_DISABLE_WORK_DB_OPENED_AUDIT"
 # retry. Anything outside this tuple bubbles up to the FastAPI
 # unhandled-exception handler (500 ``internal_error``) so we don't
 # silently swallow real bugs.
+#
+# Pg-only backend (``pollypm.work.factory`` post #1971): a real pg
+# outage / pool exhaustion raises ``psycopg.OperationalError`` /
+# ``psycopg_pool.PoolTimeout``, neither of which subclasses
+# ``OSError`` — without them in the tuple the documented 503
+# envelope is bypassed and the new inbox write endpoints return 500
+# on a real outage. Codex round-6 blocker 1 on PR #2060.
+# ``sqlite3.*`` entries are kept for the legacy sqlite-flavoured
+# integration tests that still construct fakes raising those types;
+# the production path will never see them.
 _BACKING_STORE_ERRORS: tuple[type[BaseException], ...] = (
     sqlite3.OperationalError,
     sqlite3.DatabaseError,
     OSError,
+    psycopg.OperationalError,
+    psycopg_pool.PoolTimeout,
 )
 
 
@@ -1551,10 +1566,20 @@ def _collect_inbox_items(
                 # inbox predicate (Codex round-5 on #2060) can call
                 # ``svc.get_flow(...)`` for its current-node-human
                 # branch while the readonly handle is still open.
+                #
+                # One shared ``flow_cache`` per project scan: the
+                # canonical predicate falls back to ``svc.get_flow``
+                # for the current-node-human branch, and a page of N
+                # tasks on the same flow would otherwise pay N
+                # lookups. Matches the cockpit / rail / dashboard
+                # path in :func:`pollypm.work.inbox_view.inbox_tasks`
+                # (one cache, threaded through every call). Codex
+                # round-6 blocker 2 on PR #2060.
+                flow_cache: dict = {}
                 for task in tasks:
                     if task.task_id in snoozed_ids:
                         continue
-                    entry = _task_to_inbox_item(task, svc)
+                    entry = _task_to_inbox_item(task, svc, flow_cache=flow_cache)
                     if entry is not None:
                         out.append(entry)
         except _BACKING_STORE_ERRORS as exc:
@@ -1672,7 +1697,7 @@ def _active_snoozed_ids(
     return snoozed
 
 
-def _is_inbox_member(task, svc=None) -> bool:
+def _is_inbox_member(task, svc=None, flow_cache=None) -> bool:
     """Return True iff ``task`` belongs to the API inbox surface.
 
     Thin delegate to :func:`pollypm.work.inbox_view.is_inbox_task` —
@@ -1691,9 +1716,18 @@ def _is_inbox_member(task, svc=None) -> bool:
     when it falls back to the human-actor check. When ``svc`` is
     omitted we hand the predicate a no-flow shim so it degrades to
     the role / label branches only.
+
+    ``flow_cache`` is an optional ``{(name, version): FlowTemplate}``
+    dict — the same shape :mod:`pollypm.work.inbox_view` uses to make
+    sure scanning N tasks on a shared flow runs ``svc.get_flow(...)``
+    once, not N times. ``_collect_inbox_items`` builds one cache per
+    request and threads it through; single-shot callers (write helpers
+    resolving one task) can leave it ``None`` and pay one lookup —
+    that's still an improvement over the per-call fresh cache the
+    previous shape created. Codex round-6 blocker 2 on PR #2060.
     """
     flow_lookup = svc if svc is not None else _NoFlowLookup()
-    return bool(is_inbox_task(task, flow_lookup))
+    return bool(is_inbox_task(task, flow_lookup, flow_cache=flow_cache))
 
 
 class _NoFlowLookup:
@@ -1710,14 +1744,17 @@ class _NoFlowLookup:
         return None
 
 
-def _task_to_inbox_item(task, svc=None) -> APIInboxItem | None:
-    if not _is_inbox_member(task, svc):
+def _task_to_inbox_item(task, svc=None, flow_cache=None) -> APIInboxItem | None:
+    if not _is_inbox_member(task, svc, flow_cache=flow_cache):
         return None
     flow = (getattr(task, "flow_template_id", "") or "").lower()
     labels = [str(lbl) for lbl in (getattr(task, "labels", []) or [])]
-    is_plan_review = (
-        any("plan_review" in lbl for lbl in labels) or _is_plan_task(task)
-    )
+    # Exact-equality on ``plan_review`` (NOT substring) so labels like
+    # ``not_plan_review`` / ``planning`` cannot get classified as
+    # ``type=plan_review`` items. Mirrors the canonical
+    # :func:`pollypm.work.inbox_view._is_plan_review_label` predicate
+    # the write gate uses — Codex round-6 blocker 3 on PR #2060.
+    is_plan_review = any(lbl == "plan_review" for lbl in labels)
     is_chat = flow == "chat"
     item_type = "plan_review" if is_plan_review and not is_chat else "message"
     state = _inbox_state_from_task(task)

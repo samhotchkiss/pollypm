@@ -1626,3 +1626,303 @@ def test_archive_strict_success_persists_reason_note_after_transition(
     # Positional shape: (item_id, actor, text, entry_type=...).
     assert args[0] == "myproj/1"
     assert "archive reason: testing" in args[2]
+
+
+# ---------------------------------------------------------------------------
+# Round-6 backing-store error classification (#2060, Codex 16:07 UTC).
+#
+# pg is the only supported backend post #1971 (``pollypm.work.factory``).
+# Before round-6, ``_BACKING_STORE_ERRORS`` only listed sqlite3 +
+# OSError — neither covers ``psycopg.OperationalError`` nor
+# ``psycopg_pool.PoolTimeout``, so a real pg outage / pool exhaustion
+# raised through the inbox write helpers as an unhandled exception and
+# the route mapped it to 500 ``internal_error`` instead of the
+# documented 503 ``service_unavailable`` envelope. These tests pin the
+# classification so a regression that drops either class trips CI.
+# ---------------------------------------------------------------------------
+
+
+def _install_raising_factory(monkeypatch, exc: BaseException) -> None:
+    """Patch ``create_work_service`` to raise ``exc`` at construction.
+
+    Mirrors the production failure mode for a real pg outage / pool
+    exhaustion: the helper opens a work-service handle inside a
+    ``with`` block, and the pg/pool layer raises before we ever get a
+    chance to ``svc.get(...)``. That raise must hit the central
+    ``_BACKING_STORE_ERRORS`` ``except`` and surface as 503.
+    """
+
+    def fake_factory(*, config, project_key, project_path):
+        raise exc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+
+
+def test_archive_returns_503_on_psycopg_operational_error(
+    config, monkeypatch,
+) -> None:
+    """A real pg outage must surface as ``503 service_unavailable``.
+
+    Before round-6 this fell through ``_BACKING_STORE_ERRORS`` and
+    became an unhandled exception → 500 ``internal_error``. Codex
+    round-6 blocker 1 on PR #2060.
+    """
+    import psycopg
+
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    _install_raising_factory(
+        monkeypatch, psycopg.OperationalError("pg pool dead"),
+    )
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(config, "myproj/1", reason="x")
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "service_unavailable"
+
+
+def test_archive_returns_503_on_pool_timeout(config, monkeypatch) -> None:
+    """Pool exhaustion (``psycopg_pool.PoolTimeout``) must surface 503."""
+    import psycopg_pool
+
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    _install_raising_factory(
+        monkeypatch, psycopg_pool.PoolTimeout("pool exhausted"),
+    )
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(config, "myproj/1", reason="x")
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "service_unavailable"
+
+
+def test_snooze_returns_503_on_psycopg_operational_error(
+    config, monkeypatch,
+) -> None:
+    """Snooze writer shares the central classifier; confirm coverage."""
+    import psycopg
+
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    _install_raising_factory(
+        monkeypatch, psycopg.OperationalError("pg pool dead"),
+    )
+    with pytest.raises(APIError) as excinfo:
+        web_service.snooze_inbox_item(
+            config, "myproj/1", duration_seconds=3600,
+        )
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "service_unavailable"
+
+
+def test_promote_returns_503_on_pool_timeout(config, monkeypatch) -> None:
+    """Promote writer shares the central classifier; confirm coverage."""
+    import psycopg_pool
+
+    from pollypm.web_api import service as web_service
+    from pollypm.web_api.errors import APIError
+
+    _install_raising_factory(
+        monkeypatch, psycopg_pool.PoolTimeout("pool exhausted"),
+    )
+    with pytest.raises(APIError) as excinfo:
+        web_service.promote_inbox_to_task(config, "myproj/1")
+    assert excinfo.value.status_code == 503
+    assert excinfo.value.code == "service_unavailable"
+
+
+def test_backing_store_errors_includes_psycopg_classes() -> None:
+    """The central tuple must list both pg failure classes.
+
+    Direct introspection so a refactor that splits / renames the
+    tuple without re-adding the pg entries trips here even if no
+    integration test exercises the specific exception.
+    """
+    import psycopg
+    import psycopg_pool
+
+    from pollypm.web_api.service import _BACKING_STORE_ERRORS
+
+    assert psycopg.OperationalError in _BACKING_STORE_ERRORS, (
+        "pg outages must map to the typed 503 envelope; add "
+        "psycopg.OperationalError to _BACKING_STORE_ERRORS "
+        "(#2060 round-6 blocker 1)."
+    )
+    assert psycopg_pool.PoolTimeout in _BACKING_STORE_ERRORS, (
+        "Pool exhaustion must map to the typed 503 envelope; add "
+        "psycopg_pool.PoolTimeout to _BACKING_STORE_ERRORS "
+        "(#2060 round-6 blocker 1)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-6 shared flow_cache (#2060, Codex 16:07 UTC).
+#
+# Before round-6, ``_collect_inbox_items`` looped over tasks and called
+# ``_task_to_inbox_item(task, svc)`` per task. ``_task_to_inbox_item``
+# fell through to ``_is_inbox_member`` → ``is_inbox_task`` with a
+# FRESH flow_cache per call, so N tasks on the same flow paid N
+# ``svc.get_flow()`` lookups on a user-facing scan. The shared
+# cockpit / rail / dashboard path in ``pollypm.work.inbox_view``
+# already threads ONE cache through every call. Round-6 fixes the
+# API list to do the same. This test pins the one-lookup behaviour
+# so a refactor that resets the cache per-task trips CI.
+# ---------------------------------------------------------------------------
+
+
+def test_inbox_list_resolves_flow_once_per_unique_flow_id(
+    client, auth_headers, monkeypatch, config,
+) -> None:
+    """N tasks on the same flow must trigger ONE ``get_flow`` call.
+
+    Constructs 5 tasks all on the same flow with no user role and no
+    plan_review label, so the canonical predicate must fall back to
+    the current-human-node branch — the branch that calls
+    ``svc.get_flow``. With the shared cache, that branch runs once
+    and caches the FlowTemplate; without it, it runs N times.
+    """
+    from pollypm.work.models import (
+        ActorType,
+        FlowNode,
+        FlowTemplate,
+        NodeType,
+        WorkStatus,
+    )
+
+    # Build a fake flow whose current node is human, so the canonical
+    # predicate's flow-lookup branch is exercised (and gets a hit).
+    fake_flow = FlowTemplate(
+        name="chat",
+        version=1,
+        description="test flow",
+        nodes={
+            "n0": FlowNode(
+                name="n0",
+                type=NodeType.WORK,
+                actor_type=ActorType.HUMAN,
+                actor_role=None,
+            ),
+        },
+        start_node="n0",
+    )
+
+    class _Task:
+        def __init__(self, n: int) -> None:
+            self.task_id = f"myproj/{n}"
+            self.project = "myproj"
+            self.task_number = n
+            self.title = f"task {n}"
+            self.description = "body"
+            self.flow_template_id = "chat"
+            self.flow_template_version = 1
+            self.labels: list[str] = []  # no plan_review label
+            self.roles: dict = {}  # no user role -> falls through
+            self.current_node_id = "n0"
+            self.work_status = WorkStatus.IN_PROGRESS
+            self.created_at = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+            self.updated_at = self.created_at
+
+    tasks = [_Task(i) for i in range(1, 6)]
+
+    class _CountingSvc:
+        def __init__(self) -> None:
+            self.get_flow_calls = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def list_tasks(self, project=None, work_status=None):
+            return list(tasks)
+
+        def get_flow(self, name, project=None):
+            self.get_flow_calls += 1
+            return fake_flow
+
+        def latest_snoozes_bulk(self, keys):
+            return {}
+
+    svc = _CountingSvc()
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+
+    response = client.get("/api/v1/inbox", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # All 5 tasks should surface (canonical predicate accepts via the
+    # current-human-node branch).
+    assert len(body["items"]) == 5, body
+    # The critical assertion: ONE flow lookup for 5 tasks sharing the
+    # same flow, not 5. Without the shared cache this would be 5.
+    assert svc.get_flow_calls == 1, (
+        f"inbox list path called get_flow {svc.get_flow_calls} times "
+        "for 5 tasks on a shared flow; expected exactly 1 (shared "
+        "flow_cache, #2060 round-6 blocker 2)."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Round-6 exact plan-review classifier (#2060, Codex 16:07 UTC).
+#
+# ``_task_to_inbox_item`` previously used ``"plan_review" in lbl``
+# (substring match), so a task labeled ``not_plan_review`` was
+# classified as ``type="plan_review"`` even though the shared
+# membership predicate treats ``plan_review`` as exact-match. Round-6
+# tightens to exact equality, matching the canonical
+# :func:`pollypm.work.inbox_view._is_plan_review_label`.
+# ---------------------------------------------------------------------------
+
+
+def test_inbox_item_type_uses_exact_plan_review_label() -> None:
+    """A canonical inbox row labeled ``not_plan_review`` is not
+    classified as ``type="plan_review"``.
+
+    The substring ``"plan_review" in lbl`` matched ``not_plan_review``
+    and silently widened the API's type classification past the
+    canonical exact-match predicate. Codex round-6 blocker 3 on
+    PR #2060.
+    """
+    from pollypm.web_api.service import _task_to_inbox_item
+    from pollypm.work.models import WorkStatus
+
+    class _NearMissLabelInboxTask:
+        """Standard-flow task with a user role (so the canonical
+        predicate accepts it as an inbox member) carrying the
+        substring-but-not-equal label ``not_plan_review``."""
+        task_id = "myproj/7"
+        project = "myproj"
+        task_number = 7
+        title = "near-miss label"
+        description = "body"
+        flow_template_id = "standard"  # NOT 'chat'
+        flow_template_version = 1
+        labels = ["not_plan_review", "planning"]
+        roles = {"requester": "user"}  # accepted as inbox member
+        current_node_id = None
+        work_status = WorkStatus.IN_PROGRESS
+        created_at = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+        updated_at = created_at
+
+    entry = _task_to_inbox_item(_NearMissLabelInboxTask())
+    assert entry is not None, (
+        "near-miss labelled task with user role must still be an "
+        "inbox member (canonical predicate accepts via role) — only "
+        "the type classification should change."
+    )
+    assert entry.type != "plan_review", (
+        "type=plan_review classification was triggered by substring "
+        "match on ``not_plan_review`` — round-6 fix requires exact "
+        "equality (#2060)."
+    )
+    assert entry.type == "message"

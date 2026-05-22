@@ -76,6 +76,49 @@ def test_implementations_accept_required_parameters(
     )
 
 
+def test_mock_update_allows_assignee_and_external_refs(tmp_path) -> None:
+    """Mock + pg must accept the same ``update()`` field set (#2064 round-5).
+
+    The pg backend was widened in round 1 to accept ``assignee`` and
+    ``external_refs`` so the API's ``POST /reassign`` and
+    ``PATCH metadata`` could share a single writer. The mock side had
+    not been mirrored, so any test or consumer that swapped in
+    ``MockWorkService`` hit ``ValidationError: Field '<x>' is not
+    updatable`` for a contract pg + the web API both honored. This
+    regression locks the surface so a future drift fails loudly.
+    """
+    svc = MockWorkService(project_path=tmp_path)
+    task = svc.create(
+        title="reassign-target",
+        type="task",
+        project="demo",
+        flow_template="plan_project",
+        roles={"architect": "architect"},
+    )
+
+    # assignee — set, then clear via None.
+    updated = svc.update(task.task_id, assignee="nora")
+    assert updated.assignee == "nora"
+    cleared = svc.update(task.task_id, assignee=None)
+    assert cleared.assignee is None
+
+    # external_refs — replace, then clear via empty dict.
+    refs = {"github": "issue#2064", "jira": "PPM-1"}
+    updated = svc.update(task.task_id, external_refs=refs)
+    assert updated.external_refs == refs
+    cleared = svc.update(task.task_id, external_refs={})
+    assert cleared.external_refs == {}
+
+    # Combined write — same body shape the web API's PATCH path emits.
+    updated = svc.update(
+        task.task_id,
+        assignee="olga",
+        external_refs={"slack": "thread/abc"},
+    )
+    assert updated.assignee == "olga"
+    assert updated.external_refs == {"slack": "thread/abc"}
+
+
 def test_concrete_impls_carry_every_protocol_method() -> None:
     """``PgWorkService`` and ``MockWorkService`` must implement every
     method named on ``WorkService`` — guards regressions where a method

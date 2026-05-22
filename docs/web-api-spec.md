@@ -428,6 +428,10 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | POST   | `/api/v1/tasks/{project}/{n}/approve` | Approve plan or code review |
 | POST   | `/api/v1/tasks/{project}/{n}/reject` | Reject + capture reason |
 | POST   | `/api/v1/tasks/{project}/{n}/queue` | Queue a draft task |
+| POST   | `/api/v1/tasks/{project}/{n}/claim` | Claim a queued task (set assignee + activate first node, fires `queued→in_progress`) |
+| POST   | `/api/v1/tasks/{project}/{n}/cancel` | Cancel a non-terminal task (mapped to `svc.cancel`; required `reason`) |
+| POST   | `/api/v1/tasks/{project}/{n}/reassign` | Reassign mid-flight: updates `assignee` AND appends a `reassignment` context breadcrumb (old→new) in one transaction. Concurrent reassigns serialize via `SELECT ... FOR UPDATE` |
+| PATCH  | `/api/v1/tasks/{project}/{n}` | Partial update of mutable fields. `status` is routed to `svc.queue`/`svc.cancel` (other statuses → 422); other fields (`labels`, `metadata`, `priority`, role assignments…) flow through `svc.update`. Status MUST NOT be combined with other fields in one body (422 if both present — use separate requests) |
 | GET    | `/api/v1/inbox` | List inbox items (`?project=&type=&state=&limit=&cursor=`) |
 | GET    | `/api/v1/inbox/{id}` | Inbox item detail (with full thread messages) |
 | POST   | `/api/v1/inbox/{id}/reply` | Reply to a thread |

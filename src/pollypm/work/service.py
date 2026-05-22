@@ -138,14 +138,28 @@ class WorkService(Protocol):
         ...
 
     def update(self, task_id: str, **fields: object) -> Task:
-        """Update mutable fields (title, description, priority, labels, roles).
+        """Update mutable fields on a task.
 
-        Low-level column writer. Cannot change ``work_status`` directly --
-        use lifecycle methods instead. ``assignee`` is accepted for PATCH
-        callers but does **not** record the handoff context the
-        work-service spec requires for mid-flight reassignment (§P-9). For
-        a live worker swap use :meth:`reassign_task`, which is atomic and
-        leaves a breadcrumb in the context log.
+        Low-level column writer. Accepted fields are ``title``,
+        ``description``, ``priority``, ``labels``, ``roles``,
+        ``acceptance_criteria``, ``constraints``, ``relevant_files``,
+        ``assignee``, and ``external_refs``. Cannot change
+        ``work_status`` or ``flow_template`` directly — use lifecycle
+        methods instead.
+
+        ``assignee`` is accepted so PATCH callers can correct an
+        operator-bookkeeping field, but this method does **not** record
+        the handoff context the work-service spec requires for
+        mid-flight reassignment (§P-9). For a live worker swap call
+        :meth:`reassign_task` instead — it is atomic and leaves a
+        breadcrumb in the context log so the new owner can recover
+        context via ``pm task get``.
+
+        ``external_refs`` replaces the dict wholesale (pass ``{}`` to
+        clear); it carries the API's free-form ``metadata`` surface.
+
+        Both ``PgWorkService`` and ``MockWorkService`` must accept the
+        same field set so backend swaps don't surface a contract gap.
         """
         ...
 

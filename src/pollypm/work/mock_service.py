@@ -368,8 +368,17 @@ class MockWorkService:
         if task is None:
             raise TaskNotFoundError(f"Task '{task_id}' not found.")
 
+        # ``assignee`` and ``external_refs`` mirror the pg surface
+        # widened in #2064 (see ``PgWorkService._UPDATE_ALLOWED_COLUMNS``).
+        # Keeping the mock narrower than pg would let the web API rely on
+        # a contract the in-memory backend rejects, so the protocol stays
+        # one source of truth. ``assignee`` is plain column write (use
+        # ``reassign_task`` for a real handoff so the context-log
+        # breadcrumb lands). ``external_refs`` replaces the dict; passing
+        # ``{}`` clears it.
         allowed = {"title", "description", "priority", "labels", "roles",
-                    "acceptance_criteria", "constraints", "relevant_files"}
+                    "acceptance_criteria", "constraints", "relevant_files",
+                    "assignee", "external_refs"}
         for key, value in fields.items():
             if key not in allowed:
                 raise ValidationError(f"Field '{key}' is not updatable.")

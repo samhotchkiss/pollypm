@@ -1051,13 +1051,25 @@ paths:
       operationId: reassignTask
       summary: Change the task's assignee
       description: |
-        Sets the `assignee` column to the new actor without firing a
-        state-machine transition. The task's `work_status` is
-        unchanged. Spec §5.3 leaves `null ⇒ unassign` open; this
-        endpoint requires a non-empty `actor`. `Idempotency-Key` and
-        `If-Match` are intentionally NOT accepted — no replay cache
-        or version-token enforcement exists yet (#2064 round-1,
-        mirrors #2060).
+        Reassigns the task to a new worker. Updates the `assignee`
+        column AND appends a work-context breadcrumb (entry_type
+        `reassignment`) recording the old→new transition. Both
+        mutations land in a single transaction; concurrent reassigns
+        serialize via `SELECT ... FOR UPDATE` so the breadcrumb chain
+        names the actual previous owner.
+
+        The task's `work_status` is unchanged (no state-machine
+        transition fires). Spec §5.3 leaves `null ⇒ unassign` open;
+        this endpoint requires a non-empty `actor`. The breadcrumb is
+        attributed to `"api"` (the HTTP layer is the operator). Use
+        this endpoint for real worker handoffs so the new owner can
+        recover context via `pm task get`; the low-level
+        `PATCH /tasks/{project}/{n}` with `assignee` writes the column
+        without the breadcrumb and is for operator bookkeeping only.
+
+        `Idempotency-Key` and `If-Match` are intentionally NOT
+        accepted — no replay cache or version-token enforcement
+        exists yet (#2064 round-1, mirrors #2060).
       requestBody:
         required: true
         content:
@@ -2890,8 +2902,12 @@ components:
           type: string
           minLength: 1
           description: |
-            New assignee. Sets the `assignee` column directly —
-            no state-machine transition fires.
+            New assignee. Updates the `assignee` column AND appends a
+            work-context breadcrumb (entry_type `reassignment`) noting
+            the old→new transition. Both mutations land in a single
+            transaction; concurrent reassigns serialize via
+            `SELECT ... FOR UPDATE`. No state-machine transition
+            fires (`work_status` unchanged).
 
     TaskPatchRequest:
       type: object

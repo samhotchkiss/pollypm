@@ -799,3 +799,151 @@ def test_snooze_writer_persists_structured_until_iso_marker(
     parsed = web_service._parse_snooze_until(text)
     assert parsed is not None
     assert parsed > datetime.now(timezone.utc)
+
+
+# ---------------------------------------------------------------------------
+# Inbox list bulk snooze path (#2060 round-2)
+#
+# Round 1 of #2060 shipped ``_active_snoozed_ids`` as a per-task
+# ``svc.get_context(entry_type='snooze', limit=1)`` loop. Codex's
+# round-2 review flagged the N+1: for a 10-task inbox page that
+# means 10 round-trips to the work-service just to decide visibility.
+# Round 2 routes the call through ``svc.latest_snoozes_bulk`` (one
+# SQL on pg) and falls back to the per-task loop only when the
+# backing service lacks the bulk method. These tests pin both
+# behaviours so a refactor can't silently regress to N+1.
+# ---------------------------------------------------------------------------
+
+
+def test_active_snoozed_ids_uses_bulk_helper_when_available() -> None:
+    """A backing service with ``latest_snoozes_bulk`` is called ONCE.
+
+    Mocks both ``latest_snoozes_bulk`` and ``get_context`` on the
+    same stub; the bulk-aware path must call the bulk helper exactly
+    once and must NOT touch ``get_context`` (the per-task fallback).
+    """
+    from pollypm.web_api.service import _active_snoozed_ids
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    future = (now + timedelta(hours=2)).isoformat()
+    past = (now - timedelta(hours=2)).isoformat()
+
+    class _StubEntry:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.actor = "api"
+            self.entry_type = "snooze"
+
+    class _StubTask:
+        def __init__(self, tid: str) -> None:
+            self.task_id = tid
+
+    class _BulkSvc:
+        def __init__(self) -> None:
+            self.bulk_calls = 0
+            self.bulk_keys: list = []
+            self.per_task_calls = 0
+
+        def latest_snoozes_bulk(self, keys):
+            self.bulk_calls += 1
+            self.bulk_keys = list(keys)
+            # Half the tasks are snoozed (future), half expired (past),
+            # rest absent. Mirrors the round-1 unit tests but at the
+            # bulk boundary.
+            return {
+                ("myproj", 1): _StubEntry(f"until_iso={future}"),
+                ("myproj", 2): _StubEntry(f"until_iso={past}"),
+                ("myproj", 3): _StubEntry(f"until_iso={future}"),
+                ("myproj", 4): _StubEntry(f"until_iso={past}"),
+                ("myproj", 5): _StubEntry(f"until_iso={future}"),
+                # ids 6..10 absent (not snoozed).
+            }
+
+        def get_context(self, *a, **kw):  # pragma: no cover
+            self.per_task_calls += 1
+            raise AssertionError(
+                "bulk-aware backend must not fall back to per-task "
+                "get_context (#2060 round-2)"
+            )
+
+    tasks = [_StubTask(f"myproj/{i}") for i in range(1, 11)]
+    svc = _BulkSvc()
+    snoozed = _active_snoozed_ids(svc, tasks, now=now)
+    assert svc.bulk_calls == 1, (
+        "inbox list path must call latest_snoozes_bulk exactly once; "
+        f"saw {svc.bulk_calls}"
+    )
+    assert svc.per_task_calls == 0
+    # Bulk call received all 10 keys so the helper has the full set
+    # to scan in one shot, not N calls of one key each.
+    assert len(svc.bulk_keys) == 10
+    # Active set is the future-wake ids only.
+    assert snoozed == {"myproj/1", "myproj/3", "myproj/5"}
+
+
+def test_active_snoozed_ids_falls_back_to_per_task_when_bulk_missing() -> None:
+    """A backend without the bulk helper still works (legacy path).
+
+    This protects the mock-service / sqlite shape: bulk is a pg
+    optimisation, but the predicate must still return correct data
+    when the method is absent. Falls through to the round-1 loop.
+    """
+    from pollypm.web_api.service import _active_snoozed_ids
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    future = (now + timedelta(hours=2)).isoformat()
+
+    class _StubEntry:
+        def __init__(self, text: str) -> None:
+            self.text = text
+            self.actor = "api"
+            self.entry_type = "snooze"
+
+    class _StubTask:
+        def __init__(self, tid: str) -> None:
+            self.task_id = tid
+
+    class _LegacySvc:
+        # NB: no ``latest_snoozes_bulk`` attribute.
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def get_context(self, task_id, *, entry_type=None, limit=None):
+            self.calls += 1
+            assert entry_type == "snooze"
+            if task_id == "myproj/1":
+                return [_StubEntry(f"until_iso={future}")]
+            return []
+
+    svc = _LegacySvc()
+    tasks = [_StubTask("myproj/1"), _StubTask("myproj/2")]
+    snoozed = _active_snoozed_ids(svc, tasks, now=now)
+    assert snoozed == {"myproj/1"}
+    # One call per task — the documented legacy behaviour.
+    assert svc.calls == 2
+
+
+def test_shared_snooze_predicate_lives_in_work_module() -> None:
+    """The parser + ``is_snooze_active`` predicate live in
+    ``pollypm.work.inbox_snooze`` so cockpit can adopt them without
+    pulling in the web layer (#2060 round-2).
+
+    This test exists to keep the module from being silently moved
+    back into ``pollypm.web_api.service`` — the whole point of the
+    extraction is shareability with cockpit code that must not
+    depend on FastAPI.
+    """
+    from pollypm.work import inbox_snooze
+
+    now = datetime(2026, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
+    future = (now + timedelta(hours=2)).isoformat()
+    past = (now - timedelta(hours=2)).isoformat()
+    assert inbox_snooze.is_snooze_active(
+        f"until_iso={future}", now=now,
+    ) is True
+    assert inbox_snooze.is_snooze_active(
+        f"until_iso={past}", now=now,
+    ) is False
+    assert inbox_snooze.parse_snooze_until(
+        f"until_iso={future}"
+    ) is not None

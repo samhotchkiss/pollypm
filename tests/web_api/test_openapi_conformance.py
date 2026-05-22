@@ -122,6 +122,69 @@ def test_chat_message_type_enum_matches_runtime() -> None:
     )
 
 
+def test_static_yaml_does_not_advertise_idempotency_on_inbox_writes() -> None:
+    """Static contract must match the implementation: no Idempotency-Key
+    on inbox-write paths.
+
+    Round 1 of #2060 stripped the header from the FastAPI handlers
+    because no replay cache exists; round 2 (Codex blocker #1) caught
+    that the static YAML still advertised it on every inbox-write
+    path AND that the shared component description still claimed
+    "server caches/replays responses for 24h". This test pins both
+    fixes:
+
+    - None of the 5 inbox-write paths reference
+      ``#/components/parameters/IdempotencyKey``.
+    - If the ``IdempotencyKey`` component still exists (the task
+      endpoints — ``/approve``, ``/reject``, ``/queue`` — still
+      accept the header for forward-compat with a future store) its
+      description must be honest about NOT replaying responses
+      today. The old "Server caches the response for 24h" string is
+      the smoking gun and is forbidden.
+    """
+    contract = _load_contract()
+    inbox_write_paths = [
+        "/inbox/{id}/reply",
+        "/inbox/{id}/archive",
+        "/inbox/{id}/snooze",
+        "/inbox/{id}/promote-to-task",
+        "/inbox/{id}/mark-read",
+    ]
+    paths = contract.get("paths", {})
+    for path in inbox_write_paths:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        params = post.get("parameters", []) or []
+        refs = [
+            p.get("$ref", "") for p in params if isinstance(p, dict)
+        ]
+        assert not any(
+            "IdempotencyKey" in ref for ref in refs
+        ), (
+            f"{path} static contract still advertises Idempotency-Key "
+            "but the handler does not implement it (#2060). Strip the "
+            "$ref or wire a real replay cache first."
+        )
+
+    # If the component still exists, its description must NOT claim
+    # caching/replay (that promise was the actual contract bug).
+    component = (
+        contract.get("components", {}).get("parameters", {}).get(
+            "IdempotencyKey"
+        )
+    )
+    if component is not None:
+        description = (component.get("description") or "").lower()
+        assert "caches the response" not in description, (
+            "IdempotencyKey component still promises a 24h replay "
+            "cache that the server does not implement (#2060)."
+        )
+        assert "replays it on retry" not in description, (
+            "IdempotencyKey component still promises retry replay "
+            "that the server does not implement (#2060)."
+        )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

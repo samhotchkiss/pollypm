@@ -856,8 +856,6 @@ paths:
       tags: [Inbox]
       operationId: replyInboxItem
       summary: Append a reply to an inbox thread
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -887,8 +885,6 @@ paths:
       tags: [Inbox]
       operationId: archiveInboxItem
       summary: Archive (close) an inbox item
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: false
         content:
@@ -916,8 +912,6 @@ paths:
       tags: [Inbox]
       operationId: snoozeInboxItem
       summary: Snooze an inbox item until a future time
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: true
         content:
@@ -951,8 +945,6 @@ paths:
       tags: [Inbox]
       operationId: promoteInboxItem
       summary: Promote an inbox item into a new actionable task
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: false
         content:
@@ -978,8 +970,6 @@ paths:
       tags: [Inbox]
       operationId: markInboxItemRead
       summary: Record a read-marker on an inbox item
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
       requestBody:
         required: false
         content:
@@ -1185,8 +1175,14 @@ components:
       required: false
       schema: { type: string, maxLength: 128 }
       description: |
-        Optional client-supplied key. Server caches the response for
-        24h and replays it on retry with the same key.
+        Optional client-supplied key. **No server-side replay cache is
+        wired today** — the header is accepted on the
+        task-state endpoints (approve / reject / queue) so clients
+        can start sending it from day one, but retries are NOT
+        deduplicated yet. A real replay store is deferred to a later
+        phase. Inbox-write endpoints intentionally do NOT accept this
+        header (their backing operations are not idempotent — sending
+        the header would imply a guarantee we cannot keep — see #2060).
 
   responses:
     Unauthorized:

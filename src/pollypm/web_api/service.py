@@ -1517,40 +1517,35 @@ def _collect_inbox_items(
 #
 # The POST /inbox/{id}/snooze endpoint persists an ``entry_type='snooze'``
 # row whose text starts with ``until_iso=<ISO>; snoozed until <ISO>``.
-# These helpers parse that wake-time back so the inbox list filters
-# out items whose snooze hasn't expired.  Kept private to this module
-# because the cockpit-side inbox panel has its own (unrelated) curation
-# predicate — wiring snooze through that surface is out of scope for
-# this PR and tracked separately.
+# The wake-time parser + "still snoozed?" predicate live in
+# ``pollypm.work.inbox_snooze`` so cockpit can adopt them WITHOUT
+# duplicating regex logic (Codex round-2 ask on PR #2060). The
+# module-private aliases here keep the existing import sites + tests
+# working unchanged.
+#
+# ``_active_snoozed_ids`` calls ``svc.latest_snoozes_bulk(...)``
+# (single SQL on pg) instead of the original per-task
+# ``svc.get_context(entry_type='snooze', limit=1)`` loop — the
+# inbox-list path is user-facing and a 50-task page was paying N
+# round-trips to the work-service per request.
 # ---------------------------------------------------------------------------
 
+from pollypm.work.inbox_snooze import (
+    is_snooze_active as _is_snooze_active,
+    parse_snooze_until as _parse_snooze_until,
+)
 
-def _parse_snooze_until(text: str) -> datetime | None:
-    """Pull a tz-aware wake-time out of a snooze context-entry text.
 
-    Accepts both the canonical ``until_iso=<ISO>`` marker the snooze
-    writer emits and the older ``snoozed until <ISO>`` shape so rows
-    written before the structured marker landed still parse. Returns
-    ``None`` when no recognisable timestamp is present.
+def _task_key(task_id: str) -> tuple[str, int]:
+    """Split ``project/n`` into a ``(project, number)`` tuple.
+
+    The bulk snooze helper keys by ``(project, task_number)`` (mirrors
+    the underlying ``work_context_entries`` PK shape); this just
+    centralises the parse so the call site doesn't sprout an ad-hoc
+    splitter.
     """
-    if not text:
-        return None
-    candidates: list[str] = []
-    for part in text.split(";"):
-        chunk = part.strip()
-        if chunk.startswith("until_iso="):
-            candidates.append(chunk[len("until_iso="):].strip())
-        elif chunk.lower().startswith("snoozed until "):
-            candidates.append(chunk[len("snoozed until "):].strip())
-    for raw in candidates:
-        try:
-            parsed = datetime.fromisoformat(raw)
-        except ValueError:
-            continue
-        if parsed.tzinfo is None:
-            parsed = parsed.replace(tzinfo=timezone.utc)
-        return parsed
-    return None
+    project, num = task_id.split("/", 1)
+    return project, int(num)
 
 
 def _active_snoozed_ids(
@@ -1558,13 +1553,45 @@ def _active_snoozed_ids(
 ) -> set[str]:
     """Return task_ids whose latest snooze entry is still in the future.
 
-    Per-task ``get_context(entry_type='snooze', limit=1)`` query; the
-    work-service returns rows ``ORDER BY id DESC`` so the first row is
-    the most recent snooze. Items without a snooze row, or whose latest
+    Uses :meth:`WorkService.latest_snoozes_bulk` — one SQL query
+    regardless of task count — instead of the per-task
+    ``get_context(entry_type='snooze', limit=1)`` loop the round-1
+    implementation shipped. Inbox listing is a user-facing scan path;
+    a 50-row page was paying 50 round-trips before this lands
+    (#2060 round-2). Items without a snooze row, or whose latest
     snooze has expired, are NOT in the returned set (the inbox shows
     them as actionable, matching cockpit semantics).
+
+    Falls back to the per-task loop when the backing service lacks
+    the bulk method (older mocks, alternate backends) so this stays
+    safe to land before every implementation grows the helper.
     """
-    snoozed: set[str] = set()
+    if not tasks:
+        return set()
+    bulk = getattr(svc, "latest_snoozes_bulk", None)
+    if bulk is not None:
+        try:
+            keys = [_task_key(t.task_id) for t in tasks]
+            latest = bulk(keys)
+        except Exception:  # noqa: BLE001 — readonly view degrades open
+            logger.debug(
+                "inbox: bulk snooze lookup failed; falling back to per-task",
+                exc_info=True,
+            )
+            latest = None
+        if latest is not None:
+            snoozed: set[str] = set()
+            for task in tasks:
+                key = _task_key(task.task_id)
+                entry = latest.get(key)
+                if entry is None:
+                    continue
+                if _is_snooze_active(entry.text, now=now):
+                    snoozed.add(task.task_id)
+            return snoozed
+    # Fallback: per-task loop (legacy path, kept for backends without
+    # the bulk helper). This branch should not run against pg.
+    snoozed = set()
     for task in tasks:
         try:
             entries = svc.get_context(
@@ -1578,10 +1605,7 @@ def _active_snoozed_ids(
             continue
         if not entries:
             continue
-        wake = _parse_snooze_until(entries[0].text)
-        if wake is None:
-            continue
-        if wake > now:
+        if _is_snooze_active(entries[0].text, now=now):
             snoozed.add(task.task_id)
     return snoozed
 

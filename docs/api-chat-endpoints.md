@@ -1,9 +1,6 @@
 # Chat HTTP API reference
 
-> **Status:** Reference doc for the chat API. This PR is stacked behind
-> #2043/#2045/#2047 and will land once those merge. The contracts below
-> match the merged P1 #2044 and the open implementation branches; if
-> either drifts pre-merge, this doc updates first.
+> **Status:** Reference doc for the chat API. P1 (#2044), P2 (#2045 GET), and P3 (#2043 POST send) are merged to main. The pm chat CLI in #2047 is the final PR in the stack; this doc lands once it merges.
 
 Reference for the `/api/v1/chat/*` endpoints — the HTTP surface for
 reading transcripts from, and sending messages into, the four live
@@ -198,7 +195,7 @@ Pull a window of messages from a single session's transcript.
 | `since_id` | none | Message id (string). Return messages strictly after this id. Both `since` and `since_id` are applied if passed together (the `since` lower-bound is applied first, then the cursor walk). |
 | `limit` | `100` | Max messages, must be `1..500`. Values outside that range return `422 validation_error` (FastAPI Pydantic-level rejection). |
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
-| `include_subagents` | `false` | When `true`, inline subagent transcripts inside their `subagent_result` parent's `metadata.subagent_transcript[]`. See §5.2. |
+| `include_subagents` | `false` | DEFERRED — server returns 422 if true. Re-enabled when #2052 lands ingestor-side subagent normalization. |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
 
 > Note: A `type="thinking"` envelope is planned but not yet implemented — tracked in [#2048](https://github.com/samhotchkiss/pollypm/issues/2048).
@@ -247,10 +244,6 @@ curl -sH "Authorization: Bearer $TOKEN" \
 
 ### 3.3 `POST /api/v1/chat/{session_name}/send`
 
-> **Status:** P3 (#2043) implementation is in fix-loop; contracts
-> below may shift before merge. Cross-check against
-> `src/pollypm/web_api/routes/chat_send.py` at merge time.
-
 Inject a message into the agent's input box via tmux. Returns
 synchronously after the send; does **not** wait for the agent to
 respond. Poll `GET /messages` for the reply.
@@ -277,7 +270,7 @@ respond. Poll `GET /messages` for the reply.
 | `selections` | string[] | `[]` | One or more option labels for an `ask_user` reply. Only meaningful when `answer_to` is set. |
 | `notes` | string \| null | `null` | Free-text addendum after a selection. Also usable as the body of an `answer_to` reply when both `text` and `selections` are absent. |
 | `safety` | enum | `strict` | `strict` (reject mid-stream + mid-tool), `loose` (mid-tool still blocks, mid-stream allowed with warning header), `force` (bypass both gates). |
-| `pane` | int \| null | `null` | 0-based pane index inside the target window. `null` (or `0`) = primary/active pane. See §5.4. |
+| `pane` | int \| null | `null` | 0-based pane index inside the target window. `null` (or omitted) targets the default active pane (server uses the window-level send target). Any explicit integer (including `0`) validates against `list_panes` and targets that exact index; missing panes return `409 pane_invalid`, dead panes return `409 pane_dead`. See §5.4. |
 
 **Response:**
 
@@ -314,6 +307,7 @@ respond. Poll `GET /messages` for the reply.
 | 404 | `session_unknown` | session_name not in config and not a live worker. |
 | 503 | `window_missing` | Window configured but not present in tmux. Restart the session. |
 | 409 | `pane_dead` | tmux flagged the pane as dead. |
+| 409 | `pane_invalid` | Explicit `pane` index doesn't exist in the target window's `list_panes` output. See §5.4. |
 | 409 | `unsafe_mid_tool` | Latest assistant turn has an open `tool_use` with no matching `tool_result`. Override with `safety=force`. See §5.1. |
 | 409 | `unsafe_mid_stream` | Heartbeat shows the session streamed within the last 2s. Override with `safety=loose` (warn-and-send) or `safety=force` (bypass). See §5.3. |
 | 400 | `answer_to_missing` | `answer_to` id was not found in the session's recent transcript. |
@@ -372,7 +366,7 @@ structured original lives in `metadata`.
 | `ask_user` | assistant | `AskUserQuestion` tool | `metadata`: `questions[]`, `answered`, `answers`. See §5.5. |
 | `file` | assistant | `SendUserFile` tool | `metadata`: `files[]` (local paths), `caption`, `status`. |
 | `subagent_spawn` | assistant | `Task` tool call | `metadata`: `subagent_id`, `subagent_type`, `description`, `prompt`, `isolation`. |
-| `subagent_result` | tool | `Task` tool return | `metadata`: `subagent_id`, `summary`, `duration_ms`, `total_tokens`, `worktree_path`, `subagent_transcript` (null unless §5.2). |
+| `subagent_result` | tool | `Task` tool return | `metadata`: `subagent_id`, `summary`, `duration_ms`, `total_tokens`, `worktree_path`. Note: subagent_transcript inlining is deferred — see #2052. |
 | `system_event` | system | Compaction, session-start, error | `metadata.subtype` ∈ `compaction`, `session_start`, `session_resume`, `error`. |
 
 ### Example payloads
@@ -473,15 +467,12 @@ Once answered, the envelope reappears with `answered=true` and
     "duration_ms": 159150,
     "total_tokens": 45533,
     "worktree_path": "/Users/sam/dev/pollypm/.claude/worktrees/agent-a8a0c7ddcd5e43028",
-    "result_body_truncated": false,
-    "subagent_transcript": null
+    "result_body_truncated": false
   }
 }
 ```
 
-When `?include_subagents=true`, `subagent_transcript` becomes a
-`MessageEnvelope[]`. Recursive — a subagent's own subagents nest the
-same way.
+Note: subagent_transcript inlining is deferred — see #2052.
 
 `system_event`:
 
@@ -529,11 +520,7 @@ block.
 `subagent_result` envelopes; the subagent's full transcript is NOT
 inlined.
 
-**Opt-in:** `?include_subagents=true` populates
-`subagent_result.metadata.subagent_transcript[]`. Recursive — a
-subagent's subagents nest the same way. The server resolves the
-transcript path automatically; clients never need to walk
-`task-notification` blocks themselves.
+Note: subagent_transcript inlining is deferred — see #2052.
 
 ### 5.3 Mid-stream sends (`409 unsafe_mid_stream`)
 
@@ -563,9 +550,18 @@ PollyPM doesn't split agent windows itself, but some users do
 manually. The window now has multiple panes, only one of which is the
 Claude process.
 
-**Behavior:** POST accepts `pane=<index>` in the body; default is the
-first pane in window-pane-list order (which is almost always the
-Claude pane). GET never differentiates panes — transcripts are
+**Behavior:** POST accepts `pane=<index>` in the body. There are two
+modes:
+
+- `pane: null` (or the field omitted) — default active pane. The
+  server addresses the window-level send target and lets tmux pick the
+  active pane (almost always the Claude pane).
+- `pane: 0` (or any explicit integer `N`) — explicit pane index. The
+  server validates against `list_panes`; if the index doesn't exist
+  the response is `409 pane_invalid`, and if tmux flags the pane as
+  exited the response is `409 pane_dead`.
+
+GET never differentiates panes — transcripts are
 one-per-Claude-process, not one-per-pane. If you don't know which
 pane, list them via `tmux list-panes -t <window>` on the daemon host.
 
@@ -676,19 +672,40 @@ The `pm chat` CLI is a thin client over these endpoints. It exists
 because typing curl with bearer-token plumbing every time gets old.
 
 ```
-pm chat list
-pm chat history <session_name> [--limit N] [--json] [--include-subagents]
-pm chat send <session_name> <text> [--safety strict|loose|force]
-pm chat send <session_name> --answer-to <msg_id> --selection <label> [--notes "..."]
+pm chat list [--json]
+pm chat history <session_name> [--limit N] [--since ISO]
+                                [--since-id MSG_ID]
+                                [--direction desc|asc]
+                                [--include-subagents]
+                                [--source auto|jsonl|capture]
+                                [--json]
+pm chat send <session_name> <text> [--no-enter]
+                                   [--safety strict|loose|force]
+                                   [--answer-to MSG_ID]
+                                   [--selection LABEL]...
+                                   [--notes TEXT]
+                                   [--pane N]
+                                   [--json]
 ```
 
-- `pm chat list` → `GET /api/v1/chat/sessions`.
-- `pm chat history` → `GET /api/v1/chat/<session>/messages`. Renders
-  envelopes with sensible default formatting; pass `--json` for the
-  raw payload.
-- `pm chat send` → `POST /api/v1/chat/<session>/send`. Default
-  `safety=strict`; prompts to bump to `loose` interactively if the
-  daemon returns `unsafe_mid_stream` and stdin is a tty.
+- `pm chat list` → `GET /api/v1/chat/sessions`. Renders a fixed-column
+  table by default; `--json` emits the raw response envelope.
+- `pm chat history` → `GET /api/v1/chat/<session>/messages`. Forwards
+  every flag as the matching query param. `--since-id` is cursor
+  pagination (pass the previous response's `next_cursor`). `--pane` is
+  not exposed because GET never differentiates panes (§5.4).
+  `--include-subagents` is currently a no-op surface: the help text
+  flags it as deferred and the server returns `422 validation_error`
+  if you pass it until #2052 lands.
+- `pm chat send` → `POST /api/v1/chat/<session>/send`. `--no-enter`
+  maps to `press_enter=false`. `--selection` is repeatable for
+  multi-select `AskUserQuestion` replies. `--pane` forwards the
+  explicit pane index per §5.4 — omit it to let the server target the
+  default active pane.
+
+On any 4xx/5xx, `pm chat` prints the JSON error body to stderr and
+exits non-zero. There is no interactive retry — re-run the command
+yourself with a different `--safety` or `--pane` value.
 
 If you find yourself reaching for `curl | jq` against the chat API,
 check `pm chat --help` first — most ad-hoc cases are already there.
@@ -757,13 +774,9 @@ selection.
    `AskUserQuestion` stdin protocol may have changed (see §5.5 open
    question). File a bug.
 
-### (f) Subagent transcripts come back empty under `?include_subagents=true`
+### (f) `include_subagents=true` returns 422
 
-`subagent_result` is there, but `metadata.subagent_transcript` is
-`null` or `[]`. Either the subagent's `output-file` doesn't exist on
-disk yet (subagent crashed before flushing), or it's a Codex subagent
-(no JSONL) — Codex subagents surface as `subagent_result` with
-`subagent_transcript: null` and nothing structured to inline.
+`include_subagents=true` returns 422 until #2052 lands.
 
 ### (g) Transcript appears truncated or out of order
 

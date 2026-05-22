@@ -617,11 +617,37 @@ def _is_turn_active(svc: Any | None, name: str, *, strict: bool = False) -> bool
     :class:`_TurnProbeUnavailable` so the route maps to 503. Strict
     mode must fail *closed*; otherwise a flaky probe can clobber a
     working agent.
+
+    Strict mode prefers ``svc.is_turn_active_strict(name)`` (Codex PR
+    #2061 round 3): the default ``svc.is_turn_active`` runs through
+    fail-soft helpers (``list`` / ``health`` swallow tmux+store
+    failures and return "agent idle"), so even with the catch below the
+    real :class:`TmuxSessionService` would never raise on an outage and
+    the route would happily destroy a working agent. The strict variant
+    raises :class:`pollypm.session_services.tmux.TmuxProbeUnavailable`
+    on any probe failure; we wrap it as :class:`_TurnProbeUnavailable`
+    so the route's existing 503-mapper handles both. Services that
+    don't implement the strict variant (custom plugins) fall back to
+    the plain method — the wrapping ``except`` still catches anything
+    they raise, but those implementations carry the responsibility of
+    actually raising on probe failure.
     """
     if svc is None:
         if strict:
             raise _TurnProbeUnavailable("tmux service unavailable")
         return False
+    if strict:
+        probe = getattr(svc, "is_turn_active_strict", None)
+        if callable(probe):
+            try:
+                return bool(probe(name))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug(
+                    "svc.is_turn_active_strict(%s) failed", name, exc_info=True,
+                )
+                raise _TurnProbeUnavailable(
+                    str(exc) or exc.__class__.__name__,
+                ) from exc
     try:
         return bool(svc.is_turn_active(name))
     except Exception as exc:  # noqa: BLE001

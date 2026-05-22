@@ -662,6 +662,158 @@ def test_restart_503_when_tmux_service_unavailable(
     assert response.json()["error"]["code"] == "daemon_unavailable"
 
 
+def test_restart_strict_fails_closed_when_real_tmux_probe_fails(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_tmux_windows, patch_supervisor,
+):
+    """Real ``TmuxSessionService`` fail-soft must not bypass the strict gate.
+
+    Codex PR #2061 round 3: the production ``TmuxSessionService.list``
+    swallows ``self._store.list_sessions()`` failures and returns no
+    handles; ``health`` swallows pane / capture failures; and
+    ``is_turn_active`` then returns ``False`` (looks-idle). The
+    round-2 regression used a fake that raised directly from
+    ``is_turn_active`` — so the test passed while a real outage
+    happily skipped the strict gate. This test hits the actual
+    :class:`TmuxSessionService` with a store that raises from
+    ``list_sessions`` (the exact path Codex flagged) and asserts the
+    route returns 503 ``unsafe_mid_turn_unknown`` and NEVER calls the
+    supervisor restart facade.
+    """
+    from pollypm.session_services.tmux import TmuxSessionService
+
+    class _BrokenStore:
+        """Mirrors a real pg / state-store outage on ``list_sessions``."""
+
+        def list_sessions(self):
+            raise RuntimeError("state store unavailable")
+
+    real_svc = TmuxSessionService(
+        config=config,
+        store=_BrokenStore(),
+    )
+    monkeypatch.setattr(
+        sessions_admin_routes,
+        "_build_tmux_service",
+        lambda _config: real_svc,
+    )
+
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "unsafe_mid_turn_unknown"
+    # Destructive facade must not have been touched.
+    assert sup.restart_calls == []
+
+
+def test_restart_force_still_bypasses_strict_probe_failure(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_tmux_windows, patch_supervisor,
+):
+    """``?safety=force`` must still bypass the round-3 strict probe.
+
+    The operator-escalation override is destructive by design and must
+    proceed even when the strict probe can't evaluate the mid-turn
+    signal. This is the round-3 counterpart of
+    :func:`test_restart_force_bypasses_safety_probe_entirely` against
+    the real-svc failure path.
+    """
+    from pollypm.session_services.tmux import TmuxSessionService
+
+    class _BrokenStore:
+        def list_sessions(self):
+            raise RuntimeError("state store unavailable")
+
+    real_svc = TmuxSessionService(
+        config=config,
+        store=_BrokenStore(),
+    )
+    monkeypatch.setattr(
+        sessions_admin_routes,
+        "_build_tmux_service",
+        lambda _config: real_svc,
+    )
+
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart?safety=force",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert len(sup.restart_calls) == 1
+
+
+def test_restart_strict_fails_closed_when_real_capture_pane_fails(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_tmux_windows, patch_supervisor,
+):
+    """``capture_pane`` failure on the real service must fail closed.
+
+    Codex PR #2061 round 3 named ``capture_pane`` as a second fail-soft
+    swallow point inside ``TmuxSessionService.health``. With a healthy
+    store + window the strict probe must still propagate a
+    ``capture_pane`` outage instead of returning "looks idle".
+    """
+    from pollypm.session_services.tmux import TmuxSessionService
+
+    # Configured session record so list_sessions succeeds.
+    session_record = SimpleNamespace(
+        name="operator", window_name="operator",
+        provider="claude", account="claude_primary", cwd="/tmp",
+    )
+
+    class _OkStore:
+        def list_sessions(self):
+            return [session_record]
+
+    real_svc = TmuxSessionService(
+        config=config,
+        store=_OkStore(),
+    )
+
+    # Window present (so the strict probe reaches the pane capture
+    # step), but ``capture_pane`` raises like a tmux outage would.
+    window = SimpleNamespace(
+        session=real_svc.storage_closet_session_name(),
+        name="operator",
+        pane_id="%9",
+        pane_dead=False,
+    )
+    monkeypatch.setattr(real_svc.tmux, "list_all_windows", lambda: [window])
+    monkeypatch.setattr(real_svc.tmux, "is_pane_alive", lambda _pid: True)
+
+    def _boom_capture(_pane_id, *, lines=200):  # noqa: ARG001
+        raise RuntimeError("tmux capture-pane failed")
+
+    monkeypatch.setattr(real_svc.tmux, "capture_pane", _boom_capture)
+    monkeypatch.setattr(
+        sessions_admin_routes,
+        "_build_tmux_service",
+        lambda _config: real_svc,
+    )
+
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    sup = patch_supervisor(_FakeSupervisor())
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "unsafe_mid_turn_unknown"
+    assert sup.restart_calls == []
+
+
 def test_restart_503_when_supervisor_unavailable(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
     patch_tmux_service, patch_supervisor,

@@ -31,6 +31,24 @@ _STORAGE_CLOSET_SUFFIX = "-storage-closet"
 _CONSOLE_WINDOW = "PollyPM"
 
 
+class TmuxProbeUnavailable(RuntimeError):
+    """Raised by strict probes when the underlying tmux/store call fails.
+
+    The default ``list()`` / ``health()`` / ``is_turn_active()`` helpers
+    are deliberately fail-soft (they swallow ``CalledProcessError`` /
+    ``OSError`` / ``FileNotFoundError`` from subprocess and the state
+    store so the cockpit's read paths never crash on a transient tmux
+    hiccup). That fail-soft behaviour is the wrong default for the
+    destructive ``POST /api/v1/sessions/{name}/restart`` safety gate —
+    Codex PR #2061 round 3 caught that a real tmux outage made
+    ``is_turn_active()`` return ``False`` (no handle found → "agent
+    idle"), so strict mode would happily proceed to destroy an
+    actively-working agent. ``is_turn_active_strict()`` raises this
+    typed exception instead so the route can map it to
+    ``503 unsafe_mid_turn_unknown`` and fail closed.
+    """
+
+
 def _project_key_from_marker_path(marker_path: Path) -> tuple[str, Path | None]:
     """Best-effort derivation of (project_key, project_path) from a
     worker-marker path.
@@ -666,6 +684,99 @@ class TmuxSessionService:
         if "⏺" in h.pane_text or "working" in lowered:
             return True
         # Codex: active turn shows "working (" with "esc to interrupt"
+        if "working (" in lowered and "esc to interrupt" in lowered:
+            return True
+        return False
+
+    def is_turn_active_strict(self, name: str) -> bool:
+        """Strict variant: propagate probe failures instead of swallowing them.
+
+        Used by the destructive ``POST /sessions/{name}/restart`` safety
+        gate (Codex PR #2061 round 3). The fail-soft :meth:`is_turn_active`
+        relies on :meth:`health`, which in turn relies on :meth:`list` /
+        :meth:`get` / ``self.tmux.is_pane_alive`` / ``self.tmux.capture_pane``
+        — every one of which catches ``Exception`` and returns a
+        "session looks idle" answer. That is correct for read paths and
+        catastrophic for a destructive restart: a real tmux outage looks
+        the same as "agent is idle" and the route then tears down a
+        working agent.
+
+        This method re-implements the probe with NO ``except`` clauses
+        around the underlying calls. Any failure (subprocess / OSError /
+        store backend / parse) raises :class:`TmuxProbeUnavailable`. The
+        route maps that to ``503 unsafe_mid_turn_unknown`` so strict
+        mode fails *closed*.
+
+        Returns the same ``True`` / ``False`` semantics as
+        :meth:`is_turn_active` when the probe succeeds.
+        """
+        try:
+            sessions = self._store.list_sessions()
+        except Exception as exc:  # noqa: BLE001
+            raise TmuxProbeUnavailable(
+                f"store.list_sessions failed: {exc!s}",
+            ) from exc
+
+        # Find the configured session record (we don't synthesize
+        # per-task worker windows here — the strict probe is for
+        # configured sessions only, which is the universe of restart
+        # targets).
+        session_record = next(
+            (s for s in sessions if getattr(s, "name", None) == name),
+            None,
+        )
+        if session_record is None:
+            # No configured row → strictly there's nothing to be
+            # "mid-turn"; the route's 404 lookup runs before this and
+            # the test surface for the strict probe always has a
+            # configured row, so treat this as "not active" rather
+            # than raising.
+            return False
+
+        try:
+            all_windows = self.tmux.list_all_windows()
+        except Exception as exc:  # noqa: BLE001
+            raise TmuxProbeUnavailable(
+                f"tmux.list_all_windows failed: {exc!s}",
+            ) from exc
+
+        our_sessions = set(self._all_tmux_session_names())
+        window_name = getattr(session_record, "window_name", "") or name
+        window = next(
+            (
+                w for w in all_windows
+                if getattr(w, "session", None) in our_sessions
+                and getattr(w, "name", None) == window_name
+            ),
+            None,
+        )
+        if window is None:
+            # No tmux window for the configured session → not mid-turn
+            # (and the route will likely restart into a fresh window).
+            return False
+        pane_id = getattr(window, "pane_id", None)
+        if pane_id is None:
+            return False
+
+        try:
+            alive = self.tmux.is_pane_alive(pane_id)
+        except Exception as exc:  # noqa: BLE001
+            raise TmuxProbeUnavailable(
+                f"tmux.is_pane_alive failed: {exc!s}",
+            ) from exc
+        if not alive:
+            return False
+
+        try:
+            text = self.tmux.capture_pane(pane_id, lines=200)
+        except Exception as exc:  # noqa: BLE001
+            raise TmuxProbeUnavailable(
+                f"tmux.capture_pane failed: {exc!s}",
+            ) from exc
+
+        lowered = text.lower()
+        if "⏺" in text or "working" in lowered:
+            return True
         if "working (" in lowered and "esc to interrupt" in lowered:
             return True
         return False

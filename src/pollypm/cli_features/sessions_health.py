@@ -15,6 +15,14 @@ Contract:
   ``stale`` = heartbeat older than 5 minutes;
   ``missing`` = the configured ``window_name`` is not present in tmux;
   ``unknown`` = no heartbeat row has ever been recorded.
+
+Pure classification / probe helpers live in
+:mod:`pollypm.session_health` so the Phase 2 sessions-admin API
+endpoint (``GET /api/v1/sessions``) consumes the same contract
+without duplicating thresholds, naming, or probe logic (Codex PR #2061
+round 5 blocker 3). The private ``_classify_status`` / ``_humanize_age``
+/ ``_latest_heartbeat`` / ``_STALE_HEARTBEAT_SECONDS`` symbols remain
+re-exported here for backwards compatibility with the test suite.
 """
 
 from __future__ import annotations
@@ -28,120 +36,48 @@ from typing import Any
 import typer
 
 from pollypm.config import DEFAULT_CONFIG_PATH
+from pollypm.session_health import (
+    STALE_HEARTBEAT_SECONDS as _STALE_HEARTBEAT_SECONDS,
+)
+from pollypm.session_health import (
+    STORAGE_CLOSET_SUFFIX as _STORAGE_CLOSET_SUFFIX,
+)
+from pollypm.session_health import (
+    age_seconds as _age_seconds,
+)
+from pollypm.session_health import (
+    classify_status as _classify_status,
+)
+from pollypm.session_health import (
+    humanize_age as _humanize_age,
+)
+from pollypm.session_health import (
+    latest_heartbeat as _latest_heartbeat,
+)
+from pollypm.session_health import (
+    list_storage_closet_windows as _list_windows,
+)
+from pollypm.session_health import (
+    storage_session_name as _storage_session_name,
+)
 
 logger = logging.getLogger(__name__)
 
 
-# Heartbeats older than this are classified ``stale``. Five minutes
-# matches the cockpit-inbox "stuck pane" threshold and the watchdog's
-# escalation cadence — same number, same semantics, picked once.
-_STALE_HEARTBEAT_SECONDS = 5 * 60
-
-# Suffix appended to ``project.tmux_session`` to derive the storage-
-# closet session name (mirrors
-# :attr:`pollypm.supervisor.Supervisor._STORAGE_CLOSET_SESSION_SUFFIX`).
-# Hard-coded here so the CLI command can resolve windows without
-# spinning up a full Supervisor — heavyweight when all the user wants
-# is a read-only summary.
-_STORAGE_CLOSET_SUFFIX = "-storage-closet"
-
-
-def _storage_session_name(tmux_session: str) -> str:
-    return f"{tmux_session}{_STORAGE_CLOSET_SUFFIX}"
-
-
-def _humanize_age(iso_timestamp: str | None) -> str:
-    """Return a compact relative age (``"22s ago"`` / ``"12m ago"``).
-
-    Returns ``"none"`` when ``iso_timestamp`` is ``None`` or unparseable
-    so the column never flashes a misleading "now" for sessions that
-    have never reported in.
-    """
-    if not iso_timestamp:
-        return "none"
-    try:
-        when = datetime.fromisoformat(iso_timestamp)
-    except (TypeError, ValueError):
-        return "none"
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    total = int(max(0, (datetime.now(UTC) - when).total_seconds()))
-    if total < 60:
-        return f"{total}s ago"
-    if total < 3600:
-        return f"{total // 60}m ago"
-    if total < 86400:
-        return f"{total // 3600}h ago"
-    return f"{total // 86400}d ago"
-
-
-def _age_seconds(iso_timestamp: str | None) -> int | None:
-    if not iso_timestamp:
-        return None
-    try:
-        when = datetime.fromisoformat(iso_timestamp)
-    except (TypeError, ValueError):
-        return None
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=UTC)
-    return int(max(0, (datetime.now(UTC) - when).total_seconds()))
-
-
-def _classify_status(
-    *,
-    window_present: bool,
-    age_seconds: int | None,
-) -> str:
-    """Return one of ``healthy`` / ``missing`` / ``stale`` / ``unknown``.
-
-    ``missing`` wins over ``stale`` — when the tmux window is gone the
-    pane is the more urgent problem; the heartbeat staleness is just a
-    downstream symptom and reporting both would be noisy.
-    """
-    if not window_present:
-        return "missing"
-    if age_seconds is None:
-        return "unknown"
-    if age_seconds > _STALE_HEARTBEAT_SECONDS:
-        return "stale"
-    return "healthy"
-
-
-def _latest_heartbeat(config, session_name: str):
-    """Return the most-recent heartbeat record for ``session_name``.
-
-    Postgres-only: reads through :mod:`pollypm.storage.pg_heartbeats`.
-    Returns ``None`` when no heartbeat row exists OR the lookup fails —
-    a read failure must not crash a read-only CLI summary, and the
-    caller treats ``None`` as ``unknown`` status downstream.
-    """
-    try:
-        from pollypm.storage.pg_heartbeats import latest_heartbeat as _pg
-
-        return _pg(session_name, config=config)
-    except Exception:  # noqa: BLE001 — never crash a read-only summary
-        logger.debug("latest_heartbeat lookup failed", exc_info=True)
-        return None
-
-
-def _list_windows(tmux_session_name: str) -> dict[str, Any]:
-    """Return ``{window_name: TmuxWindow}`` for ``tmux_session_name``.
-
-    Empty dict when the tmux server is unreachable, the session does
-    not exist, or any other tmux probe fails — the caller treats every
-    session as ``missing`` in that state, which is the right answer
-    when tmux itself is down.
-    """
-    from pollypm.tmux.client import TmuxClient
-
-    tmux = TmuxClient()
-    try:
-        if not tmux.has_session(tmux_session_name):
-            return {}
-        return {window.name: window for window in tmux.list_windows(tmux_session_name)}
-    except Exception:  # noqa: BLE001
-        logger.debug("tmux probe failed for %s", tmux_session_name, exc_info=True)
-        return {}
+# Backwards-compat re-imports for callers (and tests) that bound to the
+# private names before the helpers moved to :mod:`pollypm.session_health`.
+# The shared module is the single source of truth — keep these aliased,
+# do NOT re-implement the bodies here.
+__all_shared__ = (
+    "_STALE_HEARTBEAT_SECONDS",
+    "_STORAGE_CLOSET_SUFFIX",
+    "_age_seconds",
+    "_classify_status",
+    "_humanize_age",
+    "_latest_heartbeat",
+    "_list_windows",
+    "_storage_session_name",
+)
 
 
 def _log_mtime_iso(config, session_name: str) -> str | None:

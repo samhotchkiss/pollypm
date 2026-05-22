@@ -126,6 +126,67 @@ class TmuxClient:
         result = self.run("has-session", "-t", self._exact_target(name), check=False)
         return result.returncode == 0
 
+    def has_session_strict(self, name: str) -> bool:
+        """Strict-mode counterpart to :meth:`has_session`.
+
+        Used by the destructive ``POST /api/v1/sessions/{name}/restart``
+        safety gate (via
+        :func:`pollypm.session_health.probe_strict_turn_active`) where
+        the fail-soft :meth:`has_session` is unsafe: it returns
+        ``False`` for **any** non-zero return code, conflating a real
+        "session not found" (rc=1) with a wedged tmux server whose
+        ``has-session`` call timed out (rc=124, synthesised by
+        :meth:`run` when ``subprocess.TimeoutExpired`` fires under
+        ``check=False``). The strict probe needs to distinguish:
+
+        * rc=0 → session exists (return ``True``)
+        * rc=1 → session reliably absent (return ``False``)
+        * rc=124 or any other rc → tmux probe is *unavailable*; raise
+          :class:`pollypm.session_health.TmuxProbeUnavailable` so the
+          route layer maps to ``503 unsafe_mid_turn_unknown``
+          (fail-closed)
+        * ``subprocess.TimeoutExpired`` raised directly (defensive
+          path; the wrapper normally converts it to rc=124 under
+          ``check=False``) → same fail-closed raise.
+
+        Codex PR #2061 round 8 caught the rc=124 fail-open path: with
+        the wedged-tmux server the prior probe saw ``has_session`` ==
+        ``False`` and treated the storage-closet session as
+        "definitively absent" → destructive restart proceeded against
+        an unobservable agent.
+        """
+        # Local import: TmuxProbeUnavailable lives in session_health to
+        # avoid a circular dependency (session_health imports
+        # TmuxClient lazily inside ``list_storage_closet_windows``). The
+        # local import is paid once per call but only on the strict
+        # restart path, not on hot reads.
+        from pollypm.session_health import TmuxProbeUnavailable
+
+        import subprocess as _subprocess
+
+        try:
+            result = self.run(
+                "has-session", "-t", self._exact_target(name), check=False,
+            )
+        except _subprocess.TimeoutExpired as exc:
+            # Defensive: ``run(check=False)`` normally converts
+            # TimeoutExpired into rc=124, but a future signature change
+            # (or a caller that overrides ``timeout``) could re-raise.
+            raise TmuxProbeUnavailable(
+                f"tmux has-session timed out for {name!r}: {exc!s}",
+            ) from exc
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            # Tmux's documented "session does not exist" exit code.
+            return False
+        # rc=124 (run() timeout convention) OR any other unexpected
+        # rc — treat as probe unavailable so strict mode fails closed.
+        raise TmuxProbeUnavailable(
+            f"tmux has-session returned unexpected rc={result.returncode} "
+            f"for {name!r}; stderr={result.stderr!r}",
+        )
+
     def show_environment(self, session_name: str, variable: str) -> str | None:
         """Return one tmux session environment value, if it is visible.
 

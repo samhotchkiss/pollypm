@@ -67,6 +67,17 @@ _SUPERVISOR_IMPORT_ALLOWLIST: frozenset[str] = frozenset(
         "src/pollypm/schedulers/base.py",
         "src/pollypm/session_intelligence.py",
         "src/pollypm/workers.py",
+        # TODO(#2061-followup): pre-existing direct imports in two CLI/API
+        # surfaces. ``cli_features/tier4.py`` reaches for Supervisor to
+        # read the ``_STORAGE_CLOSET_SESSION_SUFFIX`` class constant; the
+        # P3 chat-send route does the same. Both should migrate to a
+        # public ``service_api`` accessor (sibling of the round-5 work
+        # that moved sessions_admin off direct imports) — tracked
+        # alongside #2061 follow-up. Adding them here keeps the guardrail
+        # honest while #2061 round-5 lands the sessions_admin migration
+        # without bundling unrelated refactors.
+        "src/pollypm/cli_features/tier4.py",
+        "src/pollypm/web_api/routes/chat_send.py",
     }
 )
 

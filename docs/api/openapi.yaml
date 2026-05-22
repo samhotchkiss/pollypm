@@ -78,6 +78,14 @@ tags:
       Read-only ~/.pollypm/ disk-usage report. Mirrors
       `pm storage report --json` (#2040). Prune is CLI-only per the
       Phase 2 spec — no DELETE / POST endpoints here.
+  - name: Heartbeats
+    description: |
+      Per-session supervisor-heartbeat ledger reads. The list endpoint
+      returns one latest-tick row per configured session; the detail
+      endpoint adds the recent-tick history for one session. Reads go
+      through the canonical `pg_heartbeats` facade — same source the
+      cockpit and `pm sessions` consume. The SSE stream endpoint
+      (Phase 2 §11.1) ships separately.
 
 paths:
   /health:
@@ -1474,6 +1482,45 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /heartbeats:
+    get:
+      tags: [Heartbeats]
+      operationId: listHeartbeats
+      summary: Latest heartbeat per configured session
+      description: |
+        Returns one `HeartbeatLatest` row per enabled session in the
+        operator's config. Sessions that have never reported in get
+        `status="initializing"` and `last_tick_ts=null`. Disabled
+        sessions are filtered out — their absence from the ledger is
+        correct, not a bug.
+
+        Status classification matches `pm sessions`:
+        - `healthy`  — last tick ≤ 5 minutes old
+        - `stale`    — last tick > 5 minutes old
+        - `initializing` — no ledger row yet
+        - `unknown`  — ledger row exists but the timestamp is
+          unparseable
+
+        Backing-store outages bubble as `503 service_unavailable` so
+        callers can retry. We do **not** paper over a pg-pool outage
+        with an empty list — that would tell the cockpit "every session
+        is initializing" which is dangerously misleading.
+      responses:
+        "200":
+          description: One row per configured session, sorted by name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatsListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "503":
+          description: Heartbeats ledger unreachable.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /storage/{subdir}:
     parameters:
       - in: path
@@ -1506,6 +1553,64 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           description: Storage tree scan failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /heartbeats/{session_name}:
+    parameters:
+      - in: path
+        name: session_name
+        required: true
+        schema: { type: string }
+        description: |
+          Session name to look up. May refer to a configured session
+          (`operator`, `architect_<project>`, …) or any session the
+          heartbeats ledger remembers — e.g. a task-worker that's been
+          reaped but still has rows on disk.
+    get:
+      tags: [Heartbeats]
+      operationId: getHeartbeat
+      summary: Latest heartbeat + recent history for one session
+      description: |
+        Returns the latest tick plus up to `limit` recent ticks (newest
+        first) for `session_name`. Configured-but-silent sessions
+        return 200 with `status="initializing"` and an empty `ticks`
+        list. Genuinely-unknown session names (not in config, not in
+        ledger) return `404 not_found`.
+
+        `limit` clamps silently at 200 (Phase 2 §11.3) — a caller
+        asking for 1000 ticks gets the top 200 plus `clamped=true`
+        rather than a 422.
+      parameters:
+        - in: query
+          name: limit
+          schema: { type: integer, minimum: 1, default: 20 }
+          description: |
+            Max history ticks (newest-first). Default 20, clamped at
+            200. Values > 200 succeed with `clamped: true` in the
+            response body.
+      responses:
+        "200":
+          description: Latest + recent ticks for the session.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HeartbeatDetailResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: |
+            Session is not in config and not in the heartbeats ledger.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          description: Heartbeats ledger unreachable.
           content:
             application/json:
               schema:
@@ -3081,3 +3186,113 @@ components:
             $ref: "#/components/schemas/StorageEntry"
         config_files:
           $ref: "#/components/schemas/StorageConfigFiles"
+
+    # ---- Heartbeats -------------------------------------------------
+    HeartbeatLatest:
+      type: object
+      required: [session_name, status]
+      description: |
+        Latest heartbeat snapshot for one session (Phase 2 §11.2).
+        `last_tick_ts` / `age_seconds` are null when no row exists
+        (status = `initializing`).
+      properties:
+        session_name: { type: string }
+        role:
+          type: string
+          nullable: true
+          description: Session role from config (e.g. `operator`, `architect`).
+        project:
+          type: string
+          nullable: true
+          description: Project key this session is bound to (when applicable).
+        status:
+          type: string
+          enum: [healthy, stale, initializing, unknown]
+          description: |
+            `healthy` (≤5m), `stale` (>5m), `initializing` (no row yet),
+            or `unknown` (row exists but timestamp unparseable).
+        last_tick_ts:
+          type: string
+          format: date-time
+          nullable: true
+        age_seconds:
+          type: integer
+          nullable: true
+        pane_command:
+          type: string
+          nullable: true
+        pane_dead:
+          type: boolean
+          default: false
+        log_bytes:
+          type: integer
+          default: 0
+        snapshot_path:
+          type: string
+          nullable: true
+        snapshot_hash:
+          type: string
+          nullable: true
+        tmux_window:
+          type: string
+          nullable: true
+        pane_id:
+          type: string
+          nullable: true
+
+    HeartbeatTick:
+      type: object
+      required: [ts]
+      description: |
+        One raw heartbeat row from the per-session history table
+        (Phase 2 §11.2). Returned newest-first by the detail endpoint.
+      properties:
+        ts:
+          type: string
+          format: date-time
+        pane_command:
+          type: string
+          nullable: true
+        pane_dead:
+          type: boolean
+          default: false
+        log_bytes:
+          type: integer
+          default: 0
+        snapshot_path:
+          type: string
+          nullable: true
+        snapshot_hash:
+          type: string
+          nullable: true
+        tmux_window:
+          type: string
+          nullable: true
+        pane_id:
+          type: string
+          nullable: true
+
+    HeartbeatsListResponse:
+      type: object
+      required: [heartbeats]
+      properties:
+        heartbeats:
+          type: array
+          items:
+            $ref: "#/components/schemas/HeartbeatLatest"
+
+    HeartbeatDetailResponse:
+      type: object
+      required: [latest, ticks, clamped]
+      properties:
+        latest:
+          $ref: "#/components/schemas/HeartbeatLatest"
+        ticks:
+          type: array
+          items:
+            $ref: "#/components/schemas/HeartbeatTick"
+        clamped:
+          type: boolean
+          description: |
+            True when the caller's `?limit` exceeded the route's 200-row
+            cap and was silently clamped (Phase 2 §11.3).

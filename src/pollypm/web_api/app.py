@@ -39,6 +39,7 @@ from pollypm.web_api.routes import events as events_routes
 from pollypm.web_api.routes import health as health_routes
 from pollypm.web_api.routes import inbox as inbox_routes
 from pollypm.web_api.routes import projects as projects_routes
+from pollypm.web_api.routes import sessions_admin as sessions_admin_routes
 from pollypm.web_api.routes import tasks as tasks_routes
 from pollypm.web_api.routes._deps import _config_provider
 
@@ -173,6 +174,13 @@ def create_app(
     app.include_router(
         chat_send_routes.router,
         prefix=f"{API_V1_PREFIX}/chat",
+        dependencies=auth_deps,
+    )
+    # Phase 2 surface #8 — sessions admin (§10 of the endpoint spec).
+    # Mirrors ``pm sessions`` (#2039) plus restart / pause / resume.
+    app.include_router(
+        sessions_admin_routes.router,
+        prefix=API_V1_PREFIX,
         dependencies=auth_deps,
     )
 

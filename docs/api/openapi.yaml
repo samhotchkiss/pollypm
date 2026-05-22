@@ -66,6 +66,13 @@ tags:
       the redaction heuristic in `web_api/routes/config.py`) are replaced
       with `"***"` before serialisation. Mutation is deferred to Phase 3
       so config edits stay TOML-first and reviewable.
+  - name: Sessions
+    description: |
+      Sessions admin (Phase 2 §10). Lists every configured session with
+      live tmux + heartbeat state (mirror of `pm sessions`), and exposes
+      restart / pause / resume actions for one session at a time.
+      Per-task worker surfaces live under `Chat` — this surface only
+      covers the static launch plan from `[sessions]` config.
 
 paths:
   /health:
@@ -973,6 +980,171 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
 
+  /sessions:
+    get:
+      tags: [Sessions]
+      operationId: listSessions
+      summary: List configured sessions with live tmux + heartbeat state
+      description: |
+        Mirrors `pm sessions` (#2039) — one row per configured (and
+        enabled) session in `[sessions]` config with classification
+        (`healthy` / `stale` / `missing` / `unknown` / `paused`) derived
+        from the latest heartbeat row plus a tmux storage-closet probe.
+        Read-side is fail-soft: a pg-pool outage degrades to
+        `status=unknown` rather than 5xx so the inventory remains
+        visible in degraded environments.
+      responses:
+        "200":
+          description: List of configured sessions.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionsListResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /sessions/{name}:
+    parameters:
+      - $ref: "#/components/parameters/SessionName"
+    get:
+      tags: [Sessions]
+      operationId: getSession
+      summary: One session's config + live health snapshot
+      description: |
+        Returns the `[sessions]` config row + last heartbeat + tmux
+        health (window present, pane alive, pane command). `is_turn_active`
+        reflects whether the agent is mid-turn at request time — clients
+        should treat it as a safety hint, not a contract.
+      responses:
+        "200":
+          description: Single-session detail payload.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionDetail"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+
+  /sessions/{name}/restart:
+    parameters:
+      - $ref: "#/components/parameters/SessionName"
+    post:
+      tags: [Sessions]
+      operationId: restartSession
+      summary: Destroy + relaunch the tmux window for one session
+      description: |
+        Kills the session's tmux window (no-op if absent) and
+        re-creates it from the `[sessions]` config row. Refuses with
+        `409 unsafe_mid_turn` when the agent is mid-turn unless
+        `?safety=force`. Returns `503 daemon_unavailable` when the
+        tmux session service can't be constructed.
+      parameters:
+        - in: query
+          name: safety
+          schema:
+            type: string
+            enum: [strict, loose, force]
+            default: strict
+          description: |
+            Safety gate. `strict` (default) refuses while the agent is
+            mid-turn; `force` bypasses the mid-turn gate. `loose` is
+            treated like `strict` for this verb (no warn-and-proceed
+            semantics defined yet).
+      responses:
+        "200":
+          description: Restart completed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            Refused because the agent is mid-turn
+            (`code=unsafe_mid_turn`). Re-issue with `?safety=force` to
+            override.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: |
+            Tmux session service unavailable (`code=daemon_unavailable`).
+            Confirm the daemon / cockpit is running, then retry.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /sessions/{name}/pause:
+    parameters:
+      - $ref: "#/components/parameters/SessionName"
+    post:
+      tags: [Sessions]
+      operationId: pauseSession
+      summary: Mark a session paused (skip heartbeat dispatch / recovery)
+      description: |
+        Idempotent. Writes the session name into the project's pause
+        marker (`<base_dir>/paused-sessions.json`) so other readers
+        (recovery loop, `GET /api/v1/sessions`) can skip / surface the
+        quiesced state. The tmux window itself is left alone.
+      responses:
+        "200":
+          description: Pause recorded (or already paused).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: |
+            Filesystem error while writing the pause marker
+            (`code=service_unavailable`). Check filesystem permissions
+            on `~/.pollypm`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /sessions/{name}/resume:
+    parameters:
+      - $ref: "#/components/parameters/SessionName"
+    post:
+      tags: [Sessions]
+      operationId: resumeSession
+      summary: Clear the paused flag for a session (inverse of pause)
+      description: |
+        Idempotent. Removes the session name from the project's pause
+        marker. Returns 200 with no state change if the session wasn't
+        paused.
+      responses:
+        "200":
+          description: Resume recorded (or already running).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          description: |
+            Filesystem error while writing the pause marker
+            (`code=service_unavailable`).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /events:
     get:
       tags: [Events]
@@ -1084,6 +1256,16 @@ components:
         Chat surface identifier from `GET /chat/sessions` — e.g.
         `operator`, `architect_<project>`, `advisor_<project>`,
         `task-<project>-<n>`.
+    SessionName:
+      in: path
+      name: name
+      required: true
+      schema: { type: string }
+      description: |
+        Configured session name from `[sessions]` config — e.g.
+        `operator`, `advisor_<project>`, `architect_<project>`. Per-task
+        worker sessions are NOT addressable here; use the chat surface
+        for those.
     IdempotencyKey:
       in: header
       name: Idempotency-Key
@@ -2178,3 +2360,146 @@ components:
           additionalProperties: true
           description: |
             Redacted snapshot of the `[projects.<key>]` config block.
+
+    # ---- Sessions admin (Phase 2 §10) -------------------------------
+    SessionStatus:
+      type: string
+      enum: [healthy, stale, missing, unknown, paused]
+      description: |
+        Live classification mirroring `pm sessions`. `healthy` =
+        heartbeat <=5min old AND tmux window present. `stale` =
+        heartbeat older than 5min. `missing` = tmux window absent
+        (beats `stale` — pane is the more urgent problem). `unknown` =
+        no heartbeat row yet (fresh boot OR pg outage). `paused` =
+        operator-set quiesce flag via POST /sessions/{name}/pause.
+
+    SessionInfo:
+      type: object
+      required:
+        - name
+        - role
+        - project
+        - provider
+        - account
+        - window_name
+        - tmux_session
+        - window_present
+        - status
+        - auth_token_present
+        - enabled
+        - paused
+      properties:
+        name: { type: string }
+        role:
+          type: string
+          description: |
+            Session role from config — e.g. `operator-pm`, `architect`,
+            `advisor`, `heartbeat-supervisor`.
+        project: { type: string }
+        provider:
+          type: string
+          description: Provider name (e.g. `claude`, `codex`).
+        account: { type: string }
+        window_name: { type: string }
+        tmux_session:
+          type: string
+          description: Storage-closet tmux session that owns the window.
+        window_present:
+          type: boolean
+          description: True iff the tmux window is currently visible.
+        status:
+          $ref: "#/components/schemas/SessionStatus"
+        last_heartbeat_iso:
+          type: string
+          nullable: true
+          description: ISO-8601 timestamp of the most-recent heartbeat row, if any.
+        last_heartbeat_age_seconds:
+          type: integer
+          nullable: true
+          description: Age (in whole seconds) of the most-recent heartbeat.
+        auth_token_present:
+          type: boolean
+          description: |
+            Lever-2 (#2012) trust signal — true when this session
+            carries an `auth_token` the watchdog can use to verify its
+            own injections.
+        enabled: { type: boolean }
+        paused:
+          type: boolean
+          description: |
+            True when an operator has paused the session via POST
+            /sessions/{name}/pause.
+
+    SessionsListResponse:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: "#/components/schemas/SessionInfo"
+
+    SessionHealthSnapshot:
+      type: object
+      required: [window_present, pane_alive, pane_dead]
+      properties:
+        window_present: { type: boolean }
+        pane_alive: { type: boolean }
+        pane_dead: { type: boolean }
+        pane_command:
+          type: string
+          nullable: true
+          description: Foreground command of the pane (e.g. `claude`, `bash`).
+
+    SessionConfigView:
+      type: object
+      required:
+        - name
+        - role
+        - provider
+        - account
+        - project
+        - cwd
+        - window_name
+        - enabled
+        - auth_token_present
+      properties:
+        name: { type: string }
+        role: { type: string }
+        provider: { type: string }
+        account: { type: string }
+        project: { type: string }
+        cwd:
+          type: string
+          description: Working directory the session was launched in.
+        window_name: { type: string }
+        enabled: { type: boolean }
+        auth_token_present:
+          type: boolean
+          description: |
+            True when `auth_token` is non-empty on disk. The token
+            itself is never returned over the API.
+        agent_profile:
+          type: string
+          nullable: true
+        args:
+          type: array
+          items: { type: string }
+
+    SessionDetail:
+      type: object
+      required: [info, config, health, is_turn_active]
+      properties:
+        info:
+          $ref: "#/components/schemas/SessionInfo"
+        config:
+          $ref: "#/components/schemas/SessionConfigView"
+        health:
+          $ref: "#/components/schemas/SessionHealthSnapshot"
+        is_turn_active:
+          type: boolean
+          description: |
+            True when the agent appears to be mid-turn (provider-specific
+            heuristic: Claude shows `⏺` / "Working"; Codex shows
+            "working (...) esc to interrupt"). Used by POST
+            /sessions/{name}/restart as the `unsafe_mid_turn` gate.

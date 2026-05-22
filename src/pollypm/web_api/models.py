@@ -355,17 +355,36 @@ class TaskPatchRequest(BaseModel):
 
 
 class TaskActionResult(BaseModel):
-    """Wrapper envelope for task mutations — ``{ok, message, task}``.
+    """Wrapper envelope for task mutations — ``{ok, message, task, warnings}``.
 
     Spec §5.3 specifies this exact shape so the client can refresh
     its UI without a follow-up ``GET``. ``message`` is informational
     only (operator-facing); clients should route on ``task.work_status``
     instead of parsing the string.
+
+    ``warnings`` is a (possibly empty) list of operator-facing strings.
+    Today the claim path uses it to surface ``last_provision_error``
+    when the DB transition committed but the per-task worker session
+    failed to provision — the task is ``in_progress`` with no live
+    agent lane, and the operator needs to recover manually. This
+    mirrors the CLI's stderr warning at
+    ``src/pollypm/work/cli.py:912-929`` so the API and ``pm task
+    claim`` give the same recovery story (#2064 round-10).
     """
 
     ok: bool
     message: str | None = None
     task: TaskDetail
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Operator-facing warnings about side effects of the "
+            "transition that did not fail the request — e.g. the "
+            "claim path surfaces ``last_provision_error`` here when "
+            "the DB claim committed but the worker session did not "
+            "provision."
+        ),
+    )
 
 
 class ProjectDrilldown(Project):

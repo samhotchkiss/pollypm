@@ -46,6 +46,17 @@ from pollypm.work.service_support import (
     ValidationError as WorkValidationError,
 )
 
+# Capture the REAL ``create_work_service_with_session`` reference at
+# module import time, BEFORE the autouse ``patched_work_service``
+# fixture swaps it for a fake. The round-10 direct unit test on
+# ``service_factory.create_work_service_with_session`` needs to call
+# the real helper (with stubbed collaborators) to verify that an
+# ``attach_session_manager`` exception lands on
+# ``svc._session_attach_error``.
+from pollypm.work.service_factory import (  # noqa: E402
+    create_work_service_with_session as _REAL_CREATE_WORK_SERVICE_WITH_SESSION,
+)
+
 
 # ---------------------------------------------------------------------------
 # In-memory fake work-service
@@ -467,6 +478,219 @@ def test_claim_unknown_project_returns_404(client, auth_headers) -> None:
     )
     assert response.status_code == 404
     assert response.json()["error"]["code"] == "not_found"
+
+
+def test_claim_happy_path_warnings_empty(
+    client, auth_headers, task_store
+) -> None:
+    """The happy-path claim response includes an empty ``warnings`` list.
+
+    Pinned separately from the value assertions in
+    ``test_claim_happy_path`` because the envelope's ``warnings``
+    field is the new contract surface for the post-commit operator
+    advisory channel (#2064 round-10). A client SDK regenerated
+    against the OpenAPI document needs to be able to rely on the
+    field being present even when nothing went wrong.
+    """
+    _seed(task_store, n=101, work_status=WorkStatus.QUEUED)
+    response = client.post(
+        "/api/v1/tasks/myproj/101/claim",
+        headers=auth_headers,
+        json={"actor": "alice"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert "warnings" in body, body
+    assert body["warnings"] == []
+
+
+def test_claim_surfaces_last_provision_error_warning(
+    api_config, token_path, token, task_store, monkeypatch  # noqa: ARG001
+) -> None:
+    """Post-commit ``svc.last_provision_error`` surfaces in ``warnings``.
+
+    Round-10 contract: when ``PgWorkService.claim`` records a
+    worker-session provisioning failure in ``last_provision_error``
+    after the DB transition has committed, the API must surface
+    that to the operator instead of silently returning ``ok: true``
+    with no worker lane. Mirrors the CLI surface at
+    ``src/pollypm/work/cli.py:912-929`` so the recovery story is the
+    same across channels.
+    """
+    _seed(task_store, n=201, work_status=WorkStatus.QUEUED)
+
+    class _ProvisionFailingWorkService(FakeWorkService):
+        def claim(self, task_id: str, actor: str) -> FakeTask:
+            task = super().claim(task_id, actor)
+            # Mimic ``PgWorkService.claim``'s post-commit stamp at
+            # ``pg_service.py:1905-1910``: the DB transition is in,
+            # but the per-task worker session blew up.
+            self.last_provision_error = (
+                "tmux client missing: no `tmux` binary on PATH"
+            )
+            return task
+
+    def _factory(**_kwargs: object) -> _ProvisionFailingWorkService:
+        return _ProvisionFailingWorkService(task_store)
+
+    from pollypm.web_api.app import create_app
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(work_factory, "create_work_service", _factory)
+    monkeypatch.setattr(
+        work_service_factory, "create_work_service_with_session", _factory
+    )
+    app = create_app(config=api_config, token_path=token_path)
+    local_client = TestClient(app)
+    response = local_client.post(
+        "/api/v1/tasks/myproj/201/claim",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"actor": "alice"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # The DB claim still went through — the transition committed.
+    assert body["ok"] is True
+    assert body["task"]["work_status"] == "in_progress"
+    assert body["task"]["assignee"] == "alice"
+    # The advisory channel carries the error + recovery steps.
+    warnings = body["warnings"]
+    assert len(warnings) == 1, warnings
+    warning = warnings[0]
+    assert "tmux client missing" in warning
+    assert "myproj/201" in warning
+    # Recovery wording must point at hold + resume — that is the
+    # exact same operator workflow ``pm task claim`` documents.
+    assert "hold" in warning.lower()
+    assert "resume" in warning.lower()
+
+
+def test_claim_attach_session_manager_failure_captured(
+    api_config, token_path, token, task_store, monkeypatch  # noqa: ARG001
+) -> None:
+    """SessionManager attach failures surface as ``warnings`` entries.
+
+    Round-10 second half: if ``attach_session_manager`` cannot wire
+    a SessionManager onto the freshly-constructed work service
+    (tmux import broken, StateStore failure, etc), the API must
+    surface that distinctly from a healthy DB-only claim. Without
+    this, the HTTP layer cannot tell whether ``last_provision_error
+    is None`` because nothing went wrong or because the session
+    manager was never attached in the first place
+    (per Codex round-10 comment).
+    """
+    _seed(task_store, n=202, work_status=WorkStatus.QUEUED)
+
+    class _AttachFailedWorkService(FakeWorkService):
+        """FakeWorkService pre-stamped with a SessionManager attach failure."""
+
+        def __init__(self, store: dict[str, FakeTask]) -> None:
+            super().__init__(store)
+            self._session_attach_error = (
+                "SessionManager wire-up failed: TmuxClient unreachable"
+            )
+
+    def _factory(**_kwargs: object) -> _AttachFailedWorkService:
+        return _AttachFailedWorkService(task_store)
+
+    from pollypm.web_api.app import create_app
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(work_factory, "create_work_service", _factory)
+    monkeypatch.setattr(
+        work_service_factory, "create_work_service_with_session", _factory
+    )
+    app = create_app(config=api_config, token_path=token_path)
+    local_client = TestClient(app)
+    response = local_client.post(
+        "/api/v1/tasks/myproj/202/claim",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"actor": "alice"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Claim still succeeds — attach failures don't fail the request.
+    assert body["ok"] is True
+    assert body["task"]["work_status"] == "in_progress"
+    # Attach error appears in warnings with the SessionManager prefix.
+    warnings = body["warnings"]
+    assert len(warnings) == 1, warnings
+    warning = warnings[0]
+    assert "SessionManager wire-up failed" in warning
+    assert "TmuxClient unreachable" in warning
+    assert "myproj/202" in warning
+
+
+def test_create_work_service_with_session_captures_attach_exception(
+    monkeypatch,
+) -> None:
+    """``create_work_service_with_session`` stamps attach errors on svc.
+
+    Direct unit test on the
+    :mod:`pollypm.work.service_factory` helper covering the round-10
+    capture path: ``attach_session_manager`` is called best-effort,
+    and any exception escaping it must land on
+    ``svc._session_attach_error`` so the API claim path can surface
+    it. Before round-10 the helper logged the failure at ``debug``
+    only — Codex flagged that as indistinguishable from a successful
+    attach to the HTTP layer.
+    """
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    class _StubService:
+        pass
+
+    stub = _StubService()
+
+    def _stub_create_work_service(**_kwargs: object) -> _StubService:
+        return stub
+
+    def _raising_attach(svc: object, **_kwargs: object) -> None:  # noqa: ARG001
+        raise RuntimeError("simulated attach failure: tmux missing")
+
+    # The autouse ``patched_work_service`` fixture has replaced
+    # ``work_service_factory.create_work_service_with_session`` with
+    # a fake to keep route-level tests away from real tmux wiring.
+    # For this direct unit test we need the REAL helper — capture
+    # it from the module's persistent reference at the top of this
+    # file (``_REAL_CREATE_WORK_SERVICE_WITH_SESSION``) and restore
+    # it via monkeypatch so teardown reverts cleanly.
+    monkeypatch.setattr(
+        work_service_factory,
+        "create_work_service_with_session",
+        _REAL_CREATE_WORK_SERVICE_WITH_SESSION,
+    )
+
+    # ``create_work_service_with_session`` does a function-local
+    # ``from pollypm.work.factory import create_work_service`` — patch
+    # the source module so the late binding picks up the stub.
+    monkeypatch.setattr(
+        work_factory, "create_work_service", _stub_create_work_service
+    )
+    # ``attach_session_manager`` resolves via the module globals at
+    # call time, so patching the same module works.
+    monkeypatch.setattr(
+        work_service_factory, "attach_session_manager", _raising_attach
+    )
+
+    # The helper must NOT raise — best-effort attach contract.
+    svc = work_service_factory.create_work_service_with_session(
+        config=None,
+        project_key="x",
+        project_path=Path("/tmp/does-not-matter"),
+    )
+    assert svc is stub
+    # Without the round-10 capture, this attribute would not exist
+    # and the API surface would silently behave as DB-only.
+    captured = getattr(svc, "_session_attach_error", None)
+    assert captured is not None, (
+        "attach_session_manager exception was not captured on svc; "
+        "API claim path cannot surface it"
+    )
+    assert "simulated attach failure" in captured
 
 
 # ---------------------------------------------------------------------------

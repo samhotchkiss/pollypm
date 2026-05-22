@@ -2989,6 +2989,24 @@ components:
           description: Operator-facing summary; clients should not parse it.
         task:
           $ref: "#/components/schemas/TaskDetail"
+        warnings:
+          type: array
+          default: []
+          items:
+            type: string
+          description: |
+            Operator-facing warnings about side effects of the
+            transition that did NOT fail the request (#2064
+            round-10). Today this is populated by the claim path
+            to surface `last_provision_error` when the DB claim
+            committed but the per-task worker session could not
+            be provisioned (tmux/worktree/cap failures), and to
+            surface SessionManager wire-up failures. Each entry
+            includes recovery wording (hold + resume) matching
+            the CLI's `pm task claim` stderr warning. Empty on
+            the happy path; clients can branch on
+            `len(warnings) > 0` to render a banner alongside the
+            now-`in_progress` task.
 
     # ---- Plan -------------------------------------------------------
     PlanJudgmentCall:

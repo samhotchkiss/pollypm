@@ -33,14 +33,25 @@ def attach_session_manager(
     service still functions as a DB-only writer in that case.
     Requires a real git checkout under ``project_path`` (otherwise
     there is no worktree for a per-task session to inhabit).
+
+    Wire-up failures are still captured on
+    ``svc._session_attach_error`` (#2064 round-10) so the API claim
+    path can surface them as a ``TaskActionResult.warnings`` entry —
+    debug-only logging was indistinguishable from a healthy
+    DB-only-by-design claim. A non-git ``project_path`` is treated
+    as a clean no-op (the API may legitimately serve non-git
+    projects) and does NOT populate the error attribute.
     """
     try:
         from pollypm.session_services import create_tmux_client
         from pollypm.work.session_manager import SessionManager
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
             "attach_session_manager: tmux/session imports failed",
             exc_info=True,
+        )
+        _record_attach_error(
+            svc, f"SessionManager imports failed: {exc}"
         )
         return
     try:
@@ -64,10 +75,13 @@ def attach_session_manager(
         )
         store = StateStore(config.project.state_db)
         session_service = TmuxSessionService(config=config, store=store)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
             "attach_session_manager: SessionService construction failed",
             exc_info=True,
+        )
+        _record_attach_error(
+            svc, f"SessionService construction failed: {exc}"
         )
     try:
         session_mgr = SessionManager(
@@ -79,9 +93,34 @@ def attach_session_manager(
             storage_closet_name=storage_closet_name,
         )
         svc.set_session_manager(session_mgr)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
             "attach_session_manager: SessionManager wire-up failed",
+            exc_info=True,
+        )
+        _record_attach_error(
+            svc, f"SessionManager wire-up failed: {exc}"
+        )
+
+
+def _record_attach_error(svc: Any, message: str) -> None:
+    """Stamp ``svc._session_attach_error`` without clobbering prior ones.
+
+    The first failure wins — later failures are typically downstream
+    consequences (e.g. SessionManager wire-up after a swallowed
+    SessionService construction failure). Keeping the first message
+    gives the operator the root cause.
+    """
+    if getattr(svc, "_session_attach_error", None):
+        return
+    try:
+        svc._session_attach_error = message
+    except Exception:  # noqa: BLE001
+        # If the service rejects attribute writes (unlikely — both
+        # PgWorkService and the test fakes accept it) we have no
+        # recovery, but we also must not crash the claim path.
+        logger.debug(
+            "attach_session_manager: could not stamp attach error on svc",
             exc_info=True,
         )
 
@@ -109,6 +148,13 @@ def create_work_service_with_session(
     ``sync_manager`` is plumbed through for callers that want the
     pre-built file-sync adapter; pg ignores it but the legacy
     keyword keeps source-compat with existing call sites.
+
+    Defensively wraps the :func:`attach_session_manager` call
+    (#2064 round-10) so any unexpected exception escaping the
+    best-effort helper still yields a usable ``svc`` — the work
+    service falls back to a DB-only writer and the failure lands
+    on ``svc._session_attach_error`` for the API claim path to
+    surface as a warning.
     """
     from pollypm.work.factory import create_work_service
 
@@ -118,7 +164,17 @@ def create_work_service_with_session(
         project_key=project_key,
         sync_manager=sync_manager,
     )
-    attach_session_manager(svc, project_path=project_path, config=config)
+    try:
+        attach_session_manager(
+            svc, project_path=project_path, config=config
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "create_work_service_with_session: attach_session_manager "
+            "raised unexpectedly",
+            exc_info=True,
+        )
+        _record_attach_error(svc, f"SessionManager attach failed: {exc}")
     return svc
 
 

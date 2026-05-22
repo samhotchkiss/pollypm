@@ -221,9 +221,17 @@ def claim_task_endpoint(
 ) -> TaskActionResult:
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
-    task = claim_task(config, project, n, actor=body.actor)
+    # ``claim_task`` returns ``(task, warnings)`` — warnings carry
+    # post-commit operator advisories like ``last_provision_error``
+    # and SessionManager attach failures (#2064 round-10). They never
+    # fail the request; the envelope's ``warnings`` field lets the
+    # client surface a banner alongside the ``in_progress`` task.
+    task, warnings = claim_task(config, project, n, actor=body.actor)
     return TaskActionResult(
-        ok=True, message=f"claimed {task.task_id}", task=task
+        ok=True,
+        message=f"claimed {task.task_id}",
+        task=task,
+        warnings=warnings,
     )
 
 

@@ -1294,7 +1294,7 @@ def claim_task(
     task_number: int,
     *,
     actor: str,
-) -> APITaskDetail:
+) -> tuple[APITaskDetail, list[str]]:
     """Atomically claim a queued task via the work-service.
 
     Mirrors ``pm work claim``. The work-service handles the
@@ -1312,6 +1312,18 @@ def claim_task(
     a successful API claim would mark the task ``in_progress`` with
     no worker lane and no error feedback, silently breaking the
     operator workflow.
+
+    Returns ``(task_detail, warnings)``. ``warnings`` is a (possibly
+    empty) list of operator-facing strings that the route layer
+    surfaces in ``TaskActionResult.warnings`` (#2064 round-10). The
+    claim path uses it to forward ``svc.last_provision_error`` (post-
+    commit worker-session failures captured by ``PgWorkService.claim``
+    at ``pg_service.py:1905-1910``) AND
+    ``svc._session_attach_error`` (SessionManager wire-up failures
+    captured in ``service_factory.attach_session_manager``). Both
+    surface with the same recovery wording the CLI emits at
+    ``work/cli.py:912-929`` so cockpit operators see the same
+    story regardless of channel.
     """
     from pollypm.work.service_factory import (
         create_work_service_with_session,
@@ -1344,7 +1356,8 @@ def claim_task(
                     hint="Only queued+unblocked tasks can be claimed.",
                 ) from exc
             task = svc.get(task_id)
-            return _task_to_detail_with_plan(task, svc=svc)
+            warnings = _collect_claim_warnings(svc, task_id)
+            return _task_to_detail_with_plan(task, svc=svc), warnings
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "claim_task: backing store error for %s: %s",
@@ -1356,6 +1369,58 @@ def claim_task(
             f"Backing store unavailable while claiming {task_id}",
             hint="Retry shortly; check `pm doctor` if the failure persists.",
         ) from exc
+
+
+def _collect_claim_warnings(svc: object, task_id: str) -> list[str]:
+    """Build the ``TaskActionResult.warnings`` list for a successful claim.
+
+    Two sources combine into one operator-facing list (#2064 round-10):
+
+    - ``svc.last_provision_error`` — set by
+      ``PgWorkService.claim`` (``pg_service.py:1905-1910``) when the
+      DB transition committed but the per-task worker session
+      failed to provision (tmux blew up, parallel-cap, worktree
+      checkout, prompt write, etc).
+    - ``svc._session_attach_error`` — set by
+      :func:`pollypm.work.service_factory.attach_session_manager` when
+      the SessionManager itself could not be wired (missing imports,
+      StateStore failure, tmux client construction, etc). Without
+      this surface the API would silently behave like a DB-only
+      claim even though the operator expects the per-task worker
+      lifecycle.
+
+    Each entry uses the same "what to do" wording as the CLI warning
+    at ``src/pollypm/work/cli.py:912-929`` so the recovery story is
+    identical across surfaces. The list is empty on the happy path —
+    clients can branch on ``len(warnings) > 0`` to decide whether to
+    surface a banner.
+    """
+    warnings: list[str] = []
+    last_provision_error = getattr(svc, "last_provision_error", None)
+    session_attach_error = getattr(svc, "_session_attach_error", None)
+    if last_provision_error:
+        warnings.append(
+            f"Worker session provisioning failed for {task_id}: "
+            f"{last_provision_error}. The DB claim is in effect, but "
+            f"no live agent lane was created. To recover: either "
+            f"continue work from an existing worker session for this "
+            f"project, or hold + resume to retry provisioning "
+            f"(`pm task hold {task_id} --reason 'provision failed'` "
+            f"then `pm task resume {task_id}`)."
+        )
+    if session_attach_error:
+        warnings.append(
+            f"SessionManager wire-up failed for {task_id}: "
+            f"{session_attach_error}. The DB claim is in effect, "
+            f"but the worker-session subsystem could not be "
+            f"initialised for this request — no per-task tmux lane "
+            f"was provisioned. Check tmux availability and the "
+            f"project worktree, then hold + resume the task to "
+            f"retry (`pm task hold {task_id} --reason "
+            f"'session attach failed'` then `pm task resume "
+            f"{task_id}`)."
+        )
+    return warnings
 
 
 def cancel_task(

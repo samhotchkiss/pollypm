@@ -911,6 +911,39 @@ def scan_projects(
     if not candidates:
         return []
 
+    # #2063 round 12: scaffold BEFORE the locked config write. The round-9
+    # restructure wrote the new project entries inside the lock and only
+    # then called ``ensure_project_scaffold`` after releasing it. If
+    # scaffolding raised (permissions, partial checkout, bad path), the
+    # command surfaced the error but the global config already pointed at
+    # a project whose ``.pollypm/`` was never created — an operator-
+    # visible inconsistency.
+    #
+    # Codex reproduction: patch ``ensure_project_scaffold`` to raise
+    # ``PermissionError``; pre-fix ``load_config(config_path).projects``
+    # still contained the new project key after the exception.
+    #
+    # ``ensure_project_scaffold`` is idempotent (it uses
+    # ``mkdir(exist_ok=True)``) and touches only the project's own
+    # ``.pollypm/`` dir, not the shared global TOML — so running it
+    # before the lock is safe: if commit later fails, the worst case is a
+    # ``.pollypm/`` dir on disk that no config references (operators can
+    # ``rm -rf`` it), which is strictly better than a config entry whose
+    # scaffold never landed.
+    scaffolded: list[Path] = []
+    for repo_path in candidates:
+        try:
+            ensure_project_scaffold(repo_path)
+        except OSError as exc:
+            typer.echo(
+                f"Skipping {repo_path}: scaffold failed ({exc})", err=True
+            )
+            continue
+        scaffolded.append(repo_path)
+
+    if not scaffolded:
+        return []
+
     added: list[KnownProject] = []
     with config_rmw_lock(config_path):
         fresh = load_config(config_path)
@@ -922,7 +955,7 @@ def scan_projects(
             for project in fresh.projects.values()
         }
         known_keys = set(fresh.projects)
-        for repo_path in candidates:
+        for repo_path in scaffolded:
             if normalize_project_path(repo_path) in known_paths:
                 # A concurrent writer added this project between our
                 # pre-lock discovery and the lock acquire. Skip rather
@@ -942,12 +975,6 @@ def scan_projects(
 
         if added:
             write_config(fresh, config_path, force=True)
-
-    # Filesystem scaffolding is idempotent (``mkdir(exist_ok=True)``) and
-    # touches each project's own ``.pollypm/`` dir, not the shared
-    # global TOML — safe to run outside the critical section.
-    for project in added:
-        ensure_project_scaffold(project.path)
 
     return added
 

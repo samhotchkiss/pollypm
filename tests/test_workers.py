@@ -405,6 +405,93 @@ def test_concurrent_create_worker_session_for_same_role_no_orphans(
         )
 
 
+def test_create_worker_session_revalidates_account_under_lock(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Account removed between pre-lock validation and locked commit must
+    fail safely without persisting an invalid session (#2063 round 12).
+
+    Codex round-12 reproduction: the pre-lock path resolved the worker
+    ``account`` from the pre-lock config snapshot and committed it
+    inside the lock without re-validating against ``fresh``. An account
+    edit landing between pre-lock and commit produced a persisted
+    session whose ``account`` was missing from ``fresh.accounts`` —
+    ``load_config`` then raised ``ValueError: Session ... references
+    unknown account ...`` on the next read.
+
+    Repro shape: patch ``suggest_worker_prompt`` (the legacy pre-lock
+    helper) to remove the auto-selected worker account from disk before
+    returning, then call ``create_worker_session``. Pre-fix the call
+    succeeds and ``load_config`` raises on the next read. Post-fix the
+    locked block re-validates the account against ``fresh`` and raises
+    ``typer.BadParameter`` BEFORE writing, so the persisted config
+    stays valid.
+    """
+    config, config_path = _config(tmp_path)
+    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
+    monkeypatch.setattr(
+        "pollypm.workers.ensure_worktree",
+        lambda *args, **kwargs: type(
+            "Worktree",
+            (),
+            {"path": str(tmp_path / "revalidate-worktree")},
+        )(),
+    )
+
+    real_suggest = suggest_worker_prompt
+    removed = {"done": False}
+
+    def removing_suggest(config_path_arg, *, project_key):
+        # Drop the explicitly-requested worker account between pre-lock
+        # validation and the locked commit (Codex's exact reproduction
+        # shape). The pre-lock path historically resolved the account
+        # against the pre-lock snapshot and committed inside the lock;
+        # once we drop the account from disk, the locked block's
+        # ``fresh = load_config(...)`` MUST observe the absence and
+        # refuse to persist an invalid session.
+        if not removed["done"]:
+            current = load_config(config_path_arg)
+            current.accounts.pop("claude_worker", None)
+            write_config(current, config_path_arg, force=True)
+            removed["done"] = True
+        return real_suggest(config_path_arg, project_key=project_key)
+
+    monkeypatch.setattr("pollypm.workers.suggest_worker_prompt", removing_suggest)
+
+    raised: BaseException | None = None
+    try:
+        create_worker_session(
+            config_path,
+            project_key="pollypm",
+            prompt=None,
+            account_name="claude_worker",
+            role="worker",
+        )
+    except typer.BadParameter as exc:
+        raised = exc
+
+    assert raised is not None, (
+        "create_worker_session should have raised typer.BadParameter when "
+        "the requested account was removed between pre-lock validation "
+        "and the locked commit — #2063 round-12 regression."
+    )
+    assert "claude_worker" in str(raised) or "Unknown account" in str(raised), (
+        f"BadParameter should name the missing account, got: {raised!r}"
+    )
+
+    # Critical: load_config MUST succeed (no invalid session persisted).
+    # Pre-fix this raised ``ValueError: Session 'worker_pollypm' references
+    # unknown account 'claude_worker'``.
+    final = load_config(config_path)
+    for session in final.sessions.values():
+        assert session.account in final.accounts, (
+            f"persisted session {session.name!r} references unknown account "
+            f"{session.account!r} — #2063 round-12 regression (the locked "
+            f"commit wrote a SessionConfig whose account was missing from "
+            f"the locked snapshot)."
+        )
+
+
 def test_worker_prompt_requires_core_identity() -> None:
     prompt = worker_prompt()
 

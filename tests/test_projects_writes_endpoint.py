@@ -2239,3 +2239,113 @@ def test_write_example_config_race_serialized_by_lock(
         f"{type(failures[0][1]).__name__}: {failures[0][1]!r}"
     )
     assert missing_path.exists(), "winner did not persist the example config"
+
+
+# ---------------------------------------------------------------------------
+# Codex round 12: scan_projects must scaffold BEFORE the locked commit.
+#
+# Round 9 restructured scan_projects to write under the lock and scaffold
+# AFTER releasing it. If ``ensure_project_scaffold`` raised (permissions,
+# partial checkout, bad path), the global config already pointed at a
+# project whose ``.pollypm/`` was never created — operator-visible
+# inconsistency. The round-12 fix scaffolds OUTSIDE the lock BEFORE the
+# write so a scaffold failure can never persist a half-formed entry.
+# ---------------------------------------------------------------------------
+
+
+def test_scan_projects_scaffold_failure_does_not_persist(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 12: ``scan_projects`` must not persist a project whose
+    scaffold raised.
+
+    Repro: stub ``discover_recent_git_repositories`` to return one new
+    candidate, then patch ``ensure_project_scaffold`` to raise
+    ``PermissionError``. Pre-fix (round-9 ordering — scaffold AFTER the
+    locked write) the call raised but ``load_config`` still surfaced
+    the new project key in ``config.projects``. Post-fix the scaffold
+    happens before the locked write, so a scaffold failure short-
+    circuits without touching disk config.
+    """
+    from pollypm import projects as projects_module
+    from pollypm.projects import scan_projects
+
+    new_project_root = tmp_path / "scaffold_will_fail"
+    new_project_root.mkdir()
+
+    base_dir = workspace / ".pollypm"
+    seed = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={},
+        projects={},
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(seed, config_path, force=True)
+
+    monkeypatch.setattr(
+        projects_module,
+        "discover_recent_git_repositories",
+        lambda root, known_paths, recent_days: [new_project_root],
+    )
+
+    def _failing_scaffold(path):
+        raise PermissionError(f"simulated scaffold failure for {path}")
+
+    monkeypatch.setattr(
+        projects_module, "ensure_project_scaffold", _failing_scaffold
+    )
+
+    # scan_projects in non-interactive mode runs to completion without
+    # raising — the fix logs/echoes the per-candidate failure and skips
+    # the entry. The critical assertion is the disk-level invariant.
+    result = scan_projects(
+        config_path,
+        scan_root=tmp_path,
+        interactive=False,
+    )
+
+    # No project should have been added — the scaffold failure must
+    # short-circuit BEFORE the locked write.
+    assert result == [], (
+        f"scan_projects returned added projects despite scaffold failure: "
+        f"{[p.key for p in result]}"
+    )
+
+    final = load_config(config_path)
+    assert final.projects == {}, (
+        f"scan_projects persisted a project despite scaffold failure — "
+        f"#2063 round-12 regression. Persisted keys: "
+        f"{sorted(final.projects.keys())}"
+    )

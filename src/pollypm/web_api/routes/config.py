@@ -22,10 +22,11 @@ JSON-friendly shape and walk it once to redact secrets.
 from __future__ import annotations
 
 import dataclasses
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from fastapi import APIRouter
 from pydantic import BaseModel, Field
@@ -60,11 +61,64 @@ _SECRET_NAME_SUBSTRINGS: tuple[str, ...] = (
     "secret",
     "password",
     "passwd",
+    "pwd",
     "api_key",
     "apikey",
     "credential",
+    "credentials",
     "private_key",
     "auth",  # matches auth_token, basic_auth, oauth_*, etc.
+    # Codex round-2 P0 on PR #2056: real env credentials whose key
+    # names lack "token"/"secret"/"api_key" still need redaction.
+    # ``access_key`` catches ``AWS_ACCESS_KEY_ID`` / ``*_ACCESS_KEY``;
+    # ``pat`` catches ``GITHUB_PAT`` / personal access tokens; ``dsn``
+    # and ``database_url`` cover DSN-style connection strings whose
+    # value-shape check might miss query-only password forms.
+    "access_key",
+    "pat",
+    "dsn",
+    "database_url",
+)
+
+
+# Value-shape regexes for well-known credential prefixes. Catches
+# environment values whose key names slipped through both
+# ``_looks_secret`` and the URL-userinfo check (Codex round-2 P0 on
+# PR #2056: ``AWS_ACCESS_KEY_ID = "AKIA..."``, ``GITHUB_PAT =
+# "ghp_..."``). Anchored so we don't accidentally match ordinary
+# strings that happen to contain "AKIA".
+_CREDENTIAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # AWS access key IDs — always start with AKIA/ASIA + 16 base32-ish chars.
+    re.compile(r"^(?:AKIA|ASIA)[0-9A-Z]{16}$"),
+    # GitHub personal / OAuth / user / server / refresh tokens. The
+    # ``_`` between prefix and body is part of the format; bodies are
+    # 36+ base64url chars in practice (current GitHub format).
+    re.compile(r"^gh[pousr]_[A-Za-z0-9_]{36,}$"),
+    # GitHub fine-grained PATs.
+    re.compile(r"^github_pat_[A-Za-z0-9_]{20,}$"),
+    # Slack bot/user/app tokens.
+    re.compile(r"^xox[abprs]-[A-Za-z0-9-]{10,}$"),
+)
+
+
+# Query-string parameter names (lowercase) whose values mark a URL as
+# carrying credentials outside the userinfo netloc. Catches DSN forms
+# like ``postgresql://host/db?user=alice&password=secret`` and libpq
+# variants that put auth in the query string. Codex round-2 P0 on
+# PR #2056 called out password-in-query explicitly.
+_URL_QUERY_SECRET_KEYS: frozenset[str] = frozenset(
+    {
+        "password",
+        "pwd",
+        "passwd",
+        "secret",
+        "token",
+        "api_key",
+        "apikey",
+        "auth",
+        "access_token",
+        "auth_token",
+    },
 )
 
 
@@ -82,15 +136,18 @@ def _looks_secret(field_name: str) -> bool:
 
 
 def _value_has_url_userinfo(value: Any) -> bool:
-    """Return True iff ``value`` parses as a URL carrying userinfo.
+    """Return True iff ``value`` parses as a URL carrying credentials.
 
     Catches credential-bearing connection strings whose *keys* don't
     match the secret-name heuristic — e.g. ``[storage].url``,
     ``[storage.pg].dsn``, or env entries like ``DATABASE_URL`` /
     ``POSTGRES_DSN`` / ``SENTRY_DSN`` shaped as
-    ``scheme://user:password@host/...``. Uses
-    :func:`urllib.parse.urlsplit` so the check is robust against
-    odd schemes (``postgresql+psycopg``, ``redis``, ``amqps``, ...).
+    ``scheme://user:password@host/...`` **or**
+    ``scheme://host/db?user=...&password=...`` (Codex round-2 P0 on
+    PR #2056 — query-string passwords leaked through the prior
+    userinfo-only check). Uses :func:`urllib.parse.urlsplit` so the
+    check is robust against odd schemes (``postgresql+psycopg``,
+    ``redis``, ``amqps``, ...).
 
     Only flags strings; non-string values fall through. We treat the
     whole value as tainted (rather than masking just the userinfo
@@ -109,12 +166,40 @@ def _value_has_url_userinfo(value: Any) -> bool:
     if not parts.scheme:
         return False
     try:
-        return bool(parts.username or parts.password)
+        if parts.username or parts.password:
+            return True
     except ValueError:
         # ``parts.username`` / ``.password`` can raise on malformed
         # percent-encoding in the netloc. If the netloc contains an
         # ``@``, that's still very likely userinfo — redact to be safe.
-        return "@" in (parts.netloc or "")
+        if "@" in (parts.netloc or ""):
+            return True
+    # Query-string passwords (libpq-style DSN auth, ``?api_key=...``,
+    # ``?token=...``). Some DSN dialects carry credentials only in the
+    # query, so userinfo-only redaction misses them.
+    if parts.query:
+        try:
+            params = parse_qs(parts.query, keep_blank_values=True)
+        except ValueError:
+            return False
+        for raw_key in params:
+            if raw_key.lower() in _URL_QUERY_SECRET_KEYS:
+                return True
+    return False
+
+
+def _value_looks_credential(value: Any) -> bool:
+    """Return True iff ``value`` matches a known credential value-shape.
+
+    Catches env entries whose key names slipped through ``_looks_secret``
+    (Codex round-2 P0 on PR #2056: ``AWS_ACCESS_KEY_ID = "AKIA..."``,
+    ``GITHUB_PAT = "ghp_..."``). The regex set is conservative — anchored
+    prefixes for vendor-specific token formats — so false positives on
+    ordinary strings are unlikely.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    return any(pattern.match(value) for pattern in _CREDENTIAL_VALUE_PATTERNS)
 
 
 def _coerce_value(value: Any) -> Any:
@@ -140,12 +225,17 @@ def _coerce_value(value: Any) -> Any:
         return _redact_dict(value)
     if isinstance(value, (list, tuple)):
         return [_coerce_value(item) for item in value]
-    # Value-shape redaction: any string that parses as a URL with
-    # userinfo (``scheme://user:pass@host/...``) is treated as a live
+    # Value-shape redaction: any string that parses as a URL carrying
+    # credentials (userinfo or password-in-query) is treated as a live
     # credential regardless of the key name it sits under. Catches
     # ``[storage].url`` / ``[storage.pg].dsn`` and env entries like
     # ``DATABASE_URL`` whose keys don't trigger ``_looks_secret``.
     if _value_has_url_userinfo(value):
+        return REDACTED
+    # Vendor-specific credential prefixes (AWS access keys, GitHub
+    # PATs, Slack tokens, …). Backstops env entries whose key names
+    # don't include any credential keyword (Codex round-2 P0 on PR #2056).
+    if _value_looks_credential(value):
         return REDACTED
     return value
 
@@ -252,10 +342,14 @@ class ProjectConfigView(BaseModel):
 def get_config_endpoint(config: ConfigDep) -> ConfigView:
     """GET /api/v1/config — full config with secrets redacted.
 
-    Implementation note (spec §13.2): the loaded :class:`PollyPMConfig`
-    instance is reused from the request's dependency injector — no
-    extra disk read. A config edit between two requests just shows on
-    the next call.
+    Implementation note (spec §13.2): the dependency provider
+    re-invokes :func:`pollypm.config.load_config` on every request so a
+    TOML edit between requests shows up on the next call. The loader
+    has an mtime-keyed cache (see ``_config_cache``), so unchanged
+    files are O(stat) — no extra parse work per request. Codex round-2
+    P0 on PR #2056 fixed the previous stale-snapshot behaviour where
+    ``GET /config`` reflected only what was loaded at ``pm serve``
+    startup.
     """
     return ConfigView(config=_serialise_config(config))
 

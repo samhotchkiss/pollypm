@@ -536,6 +536,286 @@ def test_non_url_string_in_safe_field_is_not_redacted(
 
 
 # ---------------------------------------------------------------------------
+# Env-credential value-shape redaction (Codex round-2 P0 on PR #2056)
+# ---------------------------------------------------------------------------
+
+
+def test_aws_access_key_id_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """``AWS_ACCESS_KEY_ID`` env entries must be redacted.
+
+    The key name lacks ``token``/``secret``/``api_key`` so the
+    original keyword heuristic missed it. Both the expanded keyword
+    set (``access_key``) AND the value-shape regex (``^AKIA…``)
+    cover this — either alone suffices, both together is defence in
+    depth.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "AWS_ACCESS_KEY_ID": "AKIAIOSFODNN7EXAMPLE",
+        "PUBLIC_FLAG": "ok",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["AWS_ACCESS_KEY_ID"] == REDACTED
+    assert env["PUBLIC_FLAG"] == "ok"
+    assert "AKIAIOSFODNN7EXAMPLE" not in response_text(body)
+
+
+def test_github_pat_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """``GITHUB_PAT`` env entries must be redacted.
+
+    Key name lacks the original credential keywords; matched by the
+    new ``pat`` keyword AND by the ``^ghp_…`` value-shape regex.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "GITHUB_PAT": "ghp_" + "a" * 36,
+        "PUBLIC_FLAG": "ok",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["GITHUB_PAT"] == REDACTED
+    assert "ghp_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" not in response_text(body)
+
+
+def test_aws_secret_access_key_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """``AWS_SECRET_ACCESS_KEY`` must be redacted by the secret heuristic."""
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        "AWS_SECRET_ACCESS_KEY": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "PUBLIC_FLAG": "ok",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["AWS_SECRET_ACCESS_KEY"] == REDACTED
+    assert "wJalrXUtnFEMI" not in response_text(body)
+
+
+def test_value_shape_redaction_for_bare_credential_value(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """Credential value-shape catches even fully-innocuous env key names.
+
+    If an operator names their env entry ``MY_KEY`` (no credential
+    keyword anywhere) but the value matches the AWS / GitHub /
+    Slack format, the value-shape backstop still redacts it.
+    """
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    # AWS-shaped value (16 caps after AKIA) and a GitHub PAT shape —
+    # the env key name has no credential keyword, so only the
+    # value-shape backstop fires. Avoid Slack ``xox*`` literals here so
+    # GitHub push-protection's secret scanner doesn't reject the test
+    # for matching its Slack-token rule.
+    config.accounts["codex_primary"].env = {
+        "MY_ID": "AKIA" + "B" * 16,
+        "WEBHOOK": "ghp_" + "z" * 36,
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["MY_ID"] == REDACTED
+    assert env["WEBHOOK"] == REDACTED
+
+
+# ---------------------------------------------------------------------------
+# DSN-with-query-string-password redaction (Codex round-2 P0 on PR #2056)
+# ---------------------------------------------------------------------------
+
+
+def test_storage_pg_dsn_with_query_password_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """DSN with password in query string (not userinfo) must be redacted.
+
+    Codex round-2 P0 example:
+    ``postgresql://db.example/pollypm?user=alice&password=secretpw``.
+    The previous userinfo-only check missed this shape entirely.
+    Belt-and-suspenders: the ``dsn`` keyword now also triggers
+    ``_looks_secret`` so the key-name match also catches it.
+    """
+    _ = token
+    config = _build_config(workspace_root=workspace_root, project_root=project_root)
+    config.storage = StorageSettings(
+        backend="postgres",
+        url="",
+        pg=PgStorageSettings(
+            dsn="postgresql://db.example/pollypm?user=alice&password=secretpw",
+        ),
+    )
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    assert body["config"]["storage"]["pg"]["dsn"] == REDACTED
+    assert "secretpw" not in response_text(body)
+
+
+def test_env_dsn_with_query_password_is_redacted(
+    workspace_root: Path,
+    project_root: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """An env DSN whose key isn't ``dsn`` must redact via value-shape."""
+    _ = token
+    config = _build_config(
+        workspace_root=workspace_root,
+        project_root=project_root,
+        include_account_env_secret=False,
+    )
+    config.accounts["codex_primary"].env = {
+        # No credential keyword in the key, password only in the query.
+        "PG_CONN": "postgresql://db.example/pollypm?user=alice&password=secretpw",
+        "PUBLIC_FLAG": "ok",
+    }
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+    env = body["config"]["accounts"]["codex_primary"]["env"]
+    assert env["PG_CONN"] == REDACTED
+    assert env["PUBLIC_FLAG"] == "ok"
+    assert "secretpw" not in response_text(body)
+
+
+# ---------------------------------------------------------------------------
+# Reload-on-edit (Codex round-2 P0 on PR #2056)
+# ---------------------------------------------------------------------------
+
+
+def test_get_config_reloads_on_disk_edit(
+    tmp_path: Path,
+    token_path: Path,
+    token: str,
+    auth_headers: dict[str, str],
+) -> None:
+    """A TOML edit between two GETs must surface on the next call.
+
+    The previous wiring (``lambda: config``) returned the startup
+    snapshot, so the endpoint was stale until restart. The fix
+    re-invokes ``load_config`` per request; ``load_config`` is
+    mtime-cached so unchanged files are a single ``stat`` call.
+    """
+    _ = token
+    from pollypm.config import load_config
+
+    workspace_root = tmp_path / "ws"
+    workspace_root.mkdir()
+    project_root = tmp_path / "proj"
+    project_root.mkdir()
+    (project_root / ".pollypm").mkdir()
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"""
+[project]
+name = "PollyPM"
+root_dir = "{workspace_root.as_posix()}"
+tmux_session = "pollypm-reload"
+workspace_root = "{workspace_root.as_posix()}"
+
+[pollypm]
+controller_account = "codex_primary"
+
+[accounts.codex_primary]
+provider = "codex"
+email = "codex@example.com"
+
+[projects.alpha]
+path = "{project_root.as_posix()}"
+name = "Alpha"
+kind = "git"
+tracked = true
+""".lstrip(),
+        encoding="utf-8",
+    )
+
+    config = load_config(config_path)
+    app = create_app(config=config, token_path=token_path)
+    with TestClient(app) as client:
+        body = client.get("/api/v1/config", headers=auth_headers).json()
+        assert set(body["config"]["projects"].keys()) == {"alpha"}
+
+        # Edit the TOML on disk: add a second project. The
+        # mtime-keyed cache in ``load_config`` invalidates because the
+        # mtime changes; the dependency provider re-invokes
+        # ``load_config`` on the next request.
+        project_root_b = tmp_path / "proj_b"
+        project_root_b.mkdir()
+        (project_root_b / ".pollypm").mkdir()
+        # Bump mtime explicitly — some filesystems have 1s resolution
+        # and the test writes both files in the same second.
+        import os
+        import time
+
+        new_text = config_path.read_text(encoding="utf-8") + (
+            f"\n[projects.beta]\n"
+            f'path = "{project_root_b.as_posix()}"\n'
+            f'name = "Beta"\n'
+            f'kind = "git"\n'
+            f"tracked = true\n"
+        )
+        config_path.write_text(new_text, encoding="utf-8")
+        future = time.time() + 5
+        os.utime(config_path, (future, future))
+
+        body2 = client.get("/api/v1/config", headers=auth_headers).json()
+        assert set(body2["config"]["projects"].keys()) == {"alpha", "beta"}
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 

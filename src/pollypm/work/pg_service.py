@@ -1712,6 +1712,71 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
+                # #2064 round-8 — single-writer claim. Without the row
+                # lock, two concurrent claim() calls both see
+                # work_status='queued' at the pre-transaction read
+                # above (line 1635), both pass validation, both fire
+                # the UPDATE serially, and both insert a queued ->
+                # in_progress transition + node-execution row. The
+                # second writer overwrites the first's assignee and
+                # the first worker's session is orphaned with no
+                # corresponding task ownership. Same race shape as
+                # the round-4 reassign bug (see ``reassign_task`` at
+                # the ``FOR UPDATE`` block) — fix is the same:
+                # re-read + re-validate inside the transaction so
+                # the loser bails with InvalidTransitionError -> 409.
+                cur.execute(
+                    "SELECT work_status, assignee FROM work_tasks "
+                    "WHERE project = %s AND task_number = %s "
+                    "FOR UPDATE",
+                    (task.project, task.task_number),
+                )
+                locked = cur.fetchone()
+                if locked is None:
+                    # Row was deleted between the pre-transaction
+                    # read and the lock attempt. Vanishingly rare
+                    # (tasks are not hard-deleted in normal flows)
+                    # but still safer than blindly UPDATE-ing a
+                    # ghost row.
+                    raise TaskNotFoundError(
+                        f"Task '{task_id}' not found."
+                    )
+                locked_status, locked_assignee = locked[0], locked[1]
+                if locked_status != WorkStatus.QUEUED.value:
+                    # Another writer won the race and already
+                    # transitioned this task. Surface the same
+                    # InvalidTransitionError shape callers (CLI +
+                    # POST /tasks/{p}/{n}/claim → 409) already
+                    # handle for the pre-transaction validation
+                    # path, so the loser sees a coherent error
+                    # instead of a silent overwrite.
+                    if locked_status == WorkStatus.IN_PROGRESS.value:
+                        claimant = locked_assignee or "another actor"
+                        raise InvalidTransitionError(
+                            f"Task {task_id} is already claimed by "
+                            f"'{claimant}'.\n"
+                            f"\n"
+                            f"Why: a concurrent claim won the race "
+                            f"and moved the task to 'in_progress'.\n"
+                            f"\n"
+                            f"Fix: pick another task with "
+                            f"`pm task next`, or if the winner's "
+                            f"session is stale: "
+                            f"`pm task hold {task_id} --reason "
+                            f"'stale claim'` then "
+                            f"`pm task resume {task_id}`."
+                        )
+                    raise InvalidTransitionError(
+                        f"Cannot claim task in '{locked_status}' "
+                        f"state.\n"
+                        f"\n"
+                        f"Why: a concurrent writer transitioned the "
+                        f"task out of 'queued' before this claim "
+                        f"could acquire the row lock.\n"
+                        f"\n"
+                        f"Fix: re-read with `pm task get {task_id}` "
+                        f"and pick another task with `pm task next`."
+                    )
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, assignee = %s, "
                     "current_node_id = %s, updated_at = %s "

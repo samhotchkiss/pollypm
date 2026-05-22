@@ -2916,10 +2916,20 @@ components:
 
     TaskPatchRequest:
       type: object
+      additionalProperties: false
       description: |
         Partial-update body. Every field is optional; only fields
         present in the body are written. Lists replace, not merge
         (spec §5.4).
+
+        `additionalProperties: false` mirrors the runtime
+        `TaskPatchRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys — typos like
+        `metdata` or unsupported fields like `priority` / `assignee`
+        — surface as a `422 validation_error` from the request
+        validator instead of being silently dropped. Generated
+        clients reading this schema see the same contract the
+        server enforces.
       properties:
         labels:
           type: array

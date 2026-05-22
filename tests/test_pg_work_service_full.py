@@ -456,6 +456,188 @@ def test_concurrent_reassign_serializes_breadcrumbs(pg_service):
     assert final.assignee == destinations[1]
 
 
+def test_concurrent_claim_serializes_one_winner_one_loser(pg_service):
+    """Spec §P-9 + concurrency safety (#2064 round-8 blocker #1).
+
+    The new ``POST /tasks/{p}/{n}/claim`` route advertises an atomic
+    claim. Under the prior implementation ``PgWorkService.claim()``
+    read ``work_status`` outside the write transaction, validated,
+    then UPDATE-d. Two simultaneous claims both saw ``queued``, both
+    passed validation, and both ran the UPDATE + transition insert
+    + node-execution insert serially — the second one overwriting
+    the first assignee and orphaning the first worker's session.
+
+    The fix mirrors the round-4 reassign FOR UPDATE pattern: take
+    the row lock inside the transaction and re-validate
+    ``work_status``. The loser blocks on the lock, re-reads after
+    the winner commits, sees ``in_progress``, and raises
+    ``InvalidTransitionError`` (mapped to 409 by the route).
+
+    Like the reassign test, the scheduler doesn't reliably produce
+    the interleaving in CI, so we force it deterministically by
+    interposing on the first thread's ``commit()``: thread 1 takes
+    the row lock then waits inside ``commit`` until thread 2 has
+    had a chance to attempt its own claim. With FOR UPDATE, thread
+    2's SELECT blocks until thread 1 commits; without it, thread 2
+    races past the validation and corrupts state.
+
+    Regression target: this test fails on the prior head (both
+    threads succeed, second assignee overwrites first). It passes
+    once the SELECT inside the transaction takes ``FOR UPDATE`` and
+    re-validates the status.
+    """
+    import threading
+
+    from pollypm.work.models import WorkStatus
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(
+        pg_service, roles={"worker": "alice", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    assert pg_service.get(task.task_id).work_status is WorkStatus.QUEUED
+
+    t1_acquired_lock = threading.Event()
+    t2_started = threading.Event()
+    results: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+
+    def _t1_claim() -> None:
+        # ``claim()`` calls ``self._pool.connection()`` twice — once
+        # via the pre-transaction ``self.get(task_id)`` read (which
+        # doesn't commit) and once for the write transaction
+        # (which does). We need the delay only on the WRITE-tx
+        # commit, so wrap every connection during this thread's
+        # claim and let the wrapper's commit-hook fire only when
+        # something actually calls commit.
+        original_connection = pg_service._pool.connection
+
+        class _DelayingConn:
+            def __init__(self, real_cm):
+                self._real_cm = real_cm
+                self._real_conn = None
+
+            def __enter__(self):
+                self._real_conn = self._real_cm.__enter__()
+                original_commit = self._real_conn.commit
+
+                def _delayed_commit():
+                    # Row lock is held (FOR UPDATE) and the
+                    # UPDATE/transition/execution writes have
+                    # fired. Let t2 attempt its own claim
+                    # before we commit — with FOR UPDATE its
+                    # SELECT blocks on our lock until commit.
+                    t1_acquired_lock.set()
+                    t2_started.wait(timeout=3)
+                    return original_commit()
+
+                self._real_conn.commit = _delayed_commit
+                return self._real_conn
+
+            def __exit__(self, *a):
+                return self._real_cm.__exit__(*a)
+
+        def _wrapping_connection():
+            return _DelayingConn(original_connection())
+
+        try:
+            pg_service._pool.connection = _wrapping_connection
+            results["t1"] = pg_service.claim(task.task_id, actor="winner")
+        except BaseException as exc:  # noqa: BLE001
+            errors["t1"] = exc
+            t1_acquired_lock.set()
+            t2_started.set()
+        finally:
+            pg_service._pool.connection = original_connection
+
+    def _t2_claim() -> None:
+        try:
+            assert t1_acquired_lock.wait(timeout=5), (
+                "t1 never reached the pre-commit checkpoint"
+            )
+            t2_started.set()
+            results["t2"] = pg_service.claim(task.task_id, actor="loser")
+        except BaseException as exc:  # noqa: BLE001
+            errors["t2"] = exc
+
+    t1 = threading.Thread(target=_t1_claim)
+    t2 = threading.Thread(target=_t2_claim)
+    t1.start()
+    t2.start()
+    t1.join(timeout=15)
+    t2.join(timeout=15)
+    assert not t1.is_alive() and not t2.is_alive(), (
+        "thread deadlocked — claim() FOR UPDATE may have a "
+        "starvation bug"
+    )
+
+    # Exactly one winner, exactly one loser. The loser MUST raise
+    # InvalidTransitionError (mapped to 409 by the route).
+    assert "t1" in results, (
+        f"first claim should have succeeded; t1 errored: "
+        f"{errors.get('t1')!r}"
+    )
+    assert "t2" not in results, (
+        f"second claim should NOT have succeeded — t2 returned "
+        f"{results.get('t2')!r}. Without ``SELECT FOR UPDATE`` + "
+        f"re-validate, both reads see ``queued`` and both UPDATEs "
+        f"land, overwriting the first assignee."
+    )
+    assert isinstance(errors.get("t2"), InvalidTransitionError), (
+        f"loser must raise InvalidTransitionError (→ 409); got: "
+        f"{errors.get('t2')!r}"
+    )
+
+    # Final state: in_progress with exactly one
+    # queued→in_progress transition and exactly one node
+    # execution. Two of either means the loser wrote duplicate
+    # audit rows from its stale pre-transaction snapshot.
+    #
+    # Note: the assignee column resolves via
+    # ``_resolve_node_assignee`` from the task's role map (here
+    # ``roles['worker']='alice'``), so both winner and loser would
+    # write ``assignee='alice'``. The discriminator is the
+    # ``actor`` column on the transition row, which captures the
+    # caller's actor verbatim.
+    final = pg_service.get(task.task_id)
+    assert final.work_status is WorkStatus.IN_PROGRESS, (
+        f"task must be in_progress after the winning claim; got "
+        f"{final.work_status!r}"
+    )
+
+    with pg_service._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT actor FROM work_transitions "
+            "WHERE task_project = %s AND task_number = %s "
+            "AND from_state = %s AND to_state = %s "
+            "ORDER BY id",
+            (
+                task.project,
+                task.task_number,
+                WorkStatus.QUEUED.value,
+                WorkStatus.IN_PROGRESS.value,
+            ),
+        )
+        transition_actors = [row[0] for row in cur.fetchall()]
+        cur.execute(
+            "SELECT COUNT(*) FROM work_node_executions "
+            "WHERE task_project = %s AND task_number = %s",
+            (task.project, task.task_number),
+        )
+        execution_count = cur.fetchone()[0]
+    assert transition_actors == ["winner"], (
+        f"exactly one queued→in_progress transition expected "
+        f"with actor='winner'; got actors={transition_actors!r}. "
+        f"If 'loser' appears, the loser's stale-snapshot UPDATE "
+        f"path also committed — FOR UPDATE didn't take."
+    )
+    assert execution_count == 1, (
+        f"exactly one node execution expected; got "
+        f"{execution_count}. Loser inserted a duplicate visit row "
+        f"from its stale pre-transaction snapshot."
+    )
+
+
 def test_update_combined_assignee_and_external_refs_single_call(pg_service):
     """Combining columns in one update() call — single transaction.
 

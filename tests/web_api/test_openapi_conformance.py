@@ -436,6 +436,50 @@ def test_reassign_docs_dont_suggest_patch_assignee() -> None:
     )
 
 
+def test_task_patch_request_schema_forbids_extras() -> None:
+    """Pin ``TaskPatchRequest`` extras=forbid in the static YAML.
+
+    Round 8 (Codex) on #2064: the runtime model has
+    ``model_config = {"extra": "forbid"}`` (see
+    ``src/pollypm/web_api/models.py:350``), so the FastAPI
+    request validator rejects unknown keys with 422. Without
+    ``additionalProperties: false`` on the static
+    ``TaskPatchRequest`` schema, generated clients reading
+    ``docs/api/openapi.yaml`` treat extras as schema-valid and
+    only discover the rejection at runtime — exactly the
+    drift Codex flagged.
+
+    This test pins the static schema. It also pins the
+    runtime-vs-static parity by re-reading the Pydantic
+    model's generated schema so a future ``extra="allow"``
+    drift on either side trips here.
+    """
+    from pollypm.web_api.models import TaskPatchRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskPatchRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskPatchRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys (typos like ``metdata`` or "
+        "unsupported fields like ``priority`` / ``assignee``) as "
+        "valid even though the server returns 422 (#2064 round-8)."
+    )
+
+    # Runtime-vs-static parity: if the Pydantic model ever
+    # relaxes back to ``extra='allow'``/``ignore``, the
+    # generated schema drops ``additionalProperties: false`` and
+    # this assertion fires before the contract drifts again.
+    runtime_schema = TaskPatchRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskPatchRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

@@ -116,6 +116,58 @@ def test_pg_heartbeats_per_session_isolation(pg_schema_pool):
     assert len(recent_heartbeats("missing", pool=pg_schema_pool)) == 0
 
 
+def test_pg_heartbeats_latest_bulk_returns_one_row_per_session(pg_schema_pool):
+    """latest_heartbeats_bulk: DISTINCT ON one row per session, single query."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_heartbeats import (
+        latest_heartbeats_bulk,
+        record_heartbeat,
+    )
+
+    # Two writes for alpha (latest wins), one for beta, zero for gamma.
+    for log_bytes in (100, 200):
+        record_heartbeat(
+            session_name="worker-alpha",
+            tmux_window="alpha",
+            pane_id="%1",
+            pane_command="claude",
+            pane_dead=False,
+            log_bytes=log_bytes,
+            snapshot_path="/a",
+            snapshot_hash=f"a{log_bytes}",
+            pool=pg_schema_pool,
+        )
+    record_heartbeat(
+        session_name="worker-beta",
+        tmux_window="beta",
+        pane_id="%2",
+        pane_command="codex",
+        pane_dead=False,
+        log_bytes=42,
+        snapshot_path="/b",
+        snapshot_hash="b42",
+        pool=pg_schema_pool,
+    )
+
+    result = latest_heartbeats_bulk(
+        ["worker-alpha", "worker-beta", "worker-gamma"],
+        pool=pg_schema_pool,
+    )
+    # gamma never reported — absent from result, NOT a None key.
+    assert set(result.keys()) == {"worker-alpha", "worker-beta"}
+    assert result["worker-alpha"].log_bytes == 200  # latest
+    assert result["worker-alpha"].snapshot_hash == "a200"
+    assert result["worker-beta"].log_bytes == 42
+
+
+def test_pg_heartbeats_latest_bulk_empty_input_no_query(pg_schema_pool):
+    """latest_heartbeats_bulk([]) returns {} without issuing a query."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_heartbeats import latest_heartbeats_bulk
+
+    assert latest_heartbeats_bulk([], pool=pg_schema_pool) == {}
+
+
 def test_pg_heartbeats_last_heartbeat_at_from_messages(pg_schema_pool):
     """last_heartbeat_at reads from ``messages`` (heartbeat sweep events)."""
     _apply_initial_migrations(pg_schema_pool)

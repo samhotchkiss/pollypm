@@ -341,47 +341,143 @@ def _resolve_config_write_path(config: PollyPMConfig) -> Path:
     return Path(DEFAULT_CONFIG_PATH)
 
 
+def _emit_project_audit(
+    *,
+    event: str,
+    config: PollyPMConfig,
+    project_key: str,
+    project_path: Path | None,
+    actor: str,
+    reason: str | None,
+    extra: dict[str, Any] | None = None,
+) -> None:
+    """Best-effort audit emit for project lifecycle mutations.
+
+    Mirrors :func:`pollypm.cockpit_pane_reaper._emit_audit`: a failure
+    in the audit subsystem must NOT block (or roll back) the API
+    mutation, so this swallows every exception. ``reason`` is bounded
+    at 500 chars upstream by ``_ReasonBody`` but we clamp again here
+    as belt-and-suspenders in case a future caller bypasses the
+    Pydantic model.
+    """
+    try:
+        from pollypm.audit import emit as _audit_emit
+    except Exception:  # noqa: BLE001
+        return
+    metadata: dict[str, Any] = {"source": "web_api"}
+    if reason is not None:
+        metadata["reason"] = reason[:500]
+    if extra:
+        metadata.update(extra)
+    try:
+        _audit_emit(
+            event=event,
+            project=project_key,
+            subject=f"projects/{project_key}",
+            actor=actor or "api",
+            status="ok",
+            metadata=metadata,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def set_project_tracked(
     config: PollyPMConfig,
     project_key: str,
     *,
     tracked: bool,
-    reason: str | None = None,  # noqa: ARG001 — accepted for audit symmetry, not stored
+    reason: str | None = None,
+    actor: str = "api",
 ) -> APIProject:
     """Flip ``KnownProject.tracked`` and re-render the global TOML.
 
-    Mirrors what the cockpit's ``set_project_tracked`` service does —
-    mutate ``config.projects[key].tracked`` then ``write_config`` so
-    the change survives across processes. Idempotent: setting the same
-    value re-writes the same TOML (no-op effectively).
+    Concurrent-safe write semantics (Codex review on #2063):
+
+    * Re-load the on-disk TOML so any external CLI / cockpit edits
+      that landed between server boot and this call are preserved —
+      we never write back the long-lived ``ConfigDep`` snapshot with
+      ``force=True`` (that would silently drop e.g. a project added
+      via ``pm add-project`` after the server started).
+    * Mutate the freshly-loaded copy, NOT the live ``config``.
+    * Only after the disk write succeeds do we sync the change back
+      into the live ``config`` so subsequent in-process reads see it.
+    * If ``write_config`` raises ``OSError`` the live ``config``
+      stays untouched and a subsequent GET reflects the unchanged
+      disk state — no stale in-memory lie that flips back on restart.
 
     Returns the post-mutation :class:`APIProject` snapshot so the
     client can refresh without a follow-up GET (same idiom as the
     task transitions in Phase 2).
     """
-    from pollypm.config import write_config
+    from pollypm.config import load_config, write_config
 
-    project = config.projects.get(project_key)
-    if project is None:
+    # Bind to the original (in-memory) project up-front so the 404 path
+    # doesn't pay for a disk reload.
+    live_project = config.projects.get(project_key)
+    if live_project is None:
         raise not_found(f"Project not registered: {project_key}")
 
-    project.tracked = tracked
-    config.projects[project_key] = project
+    config_path = _resolve_config_write_path(config)
+    # Reload from disk so we don't lose concurrent CLI / cockpit edits
+    # (e.g. an external ``pm add-project`` that added a new project key
+    # the in-memory server hasn't seen yet).
     try:
-        write_config(config, _resolve_config_write_path(config), force=True)
+        fresh = load_config(config_path)
     except OSError as exc:
+        raise service_unavailable(
+            f"Failed to reload config for {project_key}: {exc}",
+            hint="Check read permissions on the PollyPM config file.",
+        ) from exc
+    fresh_project = fresh.projects.get(project_key)
+    if fresh_project is None:
+        # Disk-side delete raced us. Treat as 404 — the in-memory state
+        # is stale and the next GET will agree.
+        raise not_found(f"Project not registered: {project_key}")
+
+    fresh_project.tracked = tracked
+    fresh.projects[project_key] = fresh_project
+    try:
+        write_config(fresh, config_path, force=True)
+    except OSError as exc:
+        # Live config untouched — Codex P0 #1 (rollback guarantee).
         raise service_unavailable(
             f"Failed to persist project state for {project_key}: {exc}",
             hint="Check write permissions on the PollyPM config file.",
         ) from exc
-    return _project_to_api(config, project_key, project)
+
+    # Disk write succeeded — now sync the live config so in-process
+    # callers see the new state without waiting for a load_config()
+    # cache refresh. We update the existing KnownProject in place so
+    # any objects holding a reference to it observe the new value.
+    live_project.tracked = tracked
+    config.projects[project_key] = live_project
+    # Merge any external project additions that landed on disk so a
+    # subsequent in-process GET sees them too (defence-in-depth — the
+    # next load_config() will rediscover them anyway via mtime).
+    for key, value in fresh.projects.items():
+        if key not in config.projects:
+            config.projects[key] = value
+
+    _emit_project_audit(
+        event="projects.tracked.set",
+        config=config,
+        project_key=project_key,
+        project_path=live_project.path,
+        actor=actor,
+        reason=reason,
+        extra={"tracked": tracked},
+    )
+    return _project_to_api(config, project_key, live_project)
 
 
 def archive_project(
     config: PollyPMConfig,
     project_key: str,
     *,
-    reason: str | None = None,  # noqa: ARG001 — accepted for audit symmetry, not stored
+    reason: str | None = None,
+    actor: str = "api",
 ) -> str:
     """Remove ``project_key`` from ``config.projects`` and persist.
 
@@ -392,25 +488,65 @@ def archive_project(
     Archive is irreversible from the API: subsequent ``resume`` /
     ``pause`` / ``init-guide`` calls 404 because the project key is
     gone. Re-registering uses ``pm add-project`` (CLI-only).
-    """
-    from pollypm.config import write_config
 
-    project = config.projects.get(project_key)
-    if project is None:
+    Codex review on #2063 (P0 #3): routes through
+    :func:`pollypm.projects.remove_project` so the session→project
+    invariant (no enabled session may reference a missing project) is
+    enforced uniformly with the CLI's ``pm projects remove``. Enabled-
+    session references map to ``409 conflict`` with the blocking
+    session names in the body.
+    """
+    import typer
+
+    from pollypm.projects import remove_project as _remove_project_facade
+
+    live_project = config.projects.get(project_key)
+    if live_project is None:
         raise not_found(f"Project not registered: {project_key}")
 
-    label = project.display_label()
-    del config.projects[project_key]
+    label = live_project.display_label()
+    project_path = live_project.path
+    config_path = _resolve_config_write_path(config)
     try:
-        write_config(config, _resolve_config_write_path(config), force=True)
+        # ``remove_project`` reloads from disk, enforces the session-ref
+        # guard, then writes back — same concurrent-safe pattern as the
+        # tracked-toggle path above. Live ``config`` is untouched if the
+        # facade raises.
+        _remove_project_facade(config_path, project_key)
+    except typer.BadParameter as exc:
+        msg = str(exc)
+        if "still used by" in msg:
+            raise APIError(
+                status_code=409,
+                code="conflict",
+                message=msg,
+                hint=(
+                    "Disable or remove the listed sessions before "
+                    "archiving this project."
+                ),
+            ) from exc
+        # Disk-side race (project gone between our 404 check and the
+        # facade's reload). Treat as 404 so the client sees a stable
+        # error code.
+        raise not_found(msg) from exc
     except OSError as exc:
-        # Roll back in-memory if the disk write fails so we don't
-        # silently desync the running server from disk.
-        config.projects[project_key] = project
         raise service_unavailable(
             f"Failed to persist archive for {project_key}: {exc}",
             hint="Check write permissions on the PollyPM config file.",
         ) from exc
+
+    # Disk write succeeded — sync the live config.
+    config.projects.pop(project_key, None)
+
+    _emit_project_audit(
+        event="projects.archive",
+        config=config,
+        project_key=project_key,
+        project_path=project_path,
+        actor=actor,
+        reason=reason,
+        extra={"label": label},
+    )
     return label
 
 

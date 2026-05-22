@@ -25,9 +25,16 @@ from pollypm.config import (
     PollyPMConfig,
     PollyPMSettings,
     ProjectSettings,
+    load_config,
     write_config,
 )
-from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
+from pollypm.models import (
+    KnownProject,
+    ProjectKind,
+    ProviderKind,
+    RuntimeKind,
+    SessionConfig,
+)
 from pollypm.web_api import create_app, ensure_token
 
 
@@ -404,3 +411,264 @@ def test_init_guide_unknown_project_returns_404(
         json={"role": "architect"},
     )
     assert response.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Codex review regressions on PR #2063 — config write durability invariants.
+#
+# These four tests pin down behaviour the original Phase 2 patch broke:
+#
+# 1. rollback on disk-write failure (Codex P0 #1 / service.py:352)
+# 2. concurrent-edit preservation (Codex P0 #2 / service.py:355)
+# 3. session→project invariant on archive (Codex P0 #3 / service.py:387)
+# 4. ``reason`` field actually emitted as an audit event (Codex P1 /
+#    routes/projects.py:246)
+# ---------------------------------------------------------------------------
+
+
+def test_pause_rolls_back_in_memory_when_disk_write_fails(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P0 #1: failed write_config MUST NOT flip the live config.
+
+    Reproduces the original bug: patch ``pollypm.config.write_config``
+    to raise ``OSError`` and confirm:
+
+    * the API returns 503 (mapped via ``service_unavailable``),
+    * the in-memory ``cfg.projects['myproj'].tracked`` stays True,
+    * a subsequent GET reflects the unchanged value (no in-memory lie).
+    """
+    assert config.projects["myproj"].tracked is True
+
+    def _fail_write_config(*args, **kwargs):  # noqa: ANN002, ANN003
+        raise OSError("simulated disk-full during config persist")
+
+    monkeypatch.setattr("pollypm.config.write_config", _fail_write_config)
+
+    response = client.post(
+        "/api/v1/projects/myproj/pause",
+        headers=auth_headers,
+        json={"reason": "test rollback"},
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "service_unavailable"
+
+    # Live config was NOT mutated — the in-memory rollback contract.
+    assert config.projects["myproj"].tracked is True
+
+    # And a subsequent GET reflects the unchanged value (no stale lie).
+    get_response = client.get(
+        "/api/v1/projects/myproj", headers=auth_headers
+    )
+    assert get_response.status_code == 200
+    assert get_response.json()["tracked"] is True
+
+
+def test_pause_preserves_concurrent_external_project_addition(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    config_path: Path,
+    workspace: Path,
+    tmp_path: Path,
+) -> None:
+    """Codex P0 #2: concurrent CLI edit must survive an API tracked-toggle.
+
+    Reproduces the original bug: simulate an external ``pm add-project``
+    that lands a new project key ``external`` on disk between server
+    boot and the API call, then call the API ``/pause`` on ``myproj``.
+
+    With the original ``force=True`` write-back the API would silently
+    drop ``external`` from disk. The fix reloads from disk first.
+    """
+    # Simulate an external CLI / cockpit edit adding a second project.
+    external_root = tmp_path / "external"
+    external_root.mkdir()
+    (external_root / ".pollypm").mkdir()
+    fresh = load_config(config_path)
+    fresh.projects["external"] = KnownProject(
+        key="external",
+        path=external_root,
+        name="External Project",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+    write_config(fresh, config_path, force=True)
+
+    # Sanity: in-memory ``config`` (the long-lived server snapshot)
+    # has NOT seen the external addition yet — that's the whole point.
+    assert "external" not in config.projects
+
+    # Now the API call.
+    response = client.post(
+        "/api/v1/projects/myproj/pause",
+        headers=auth_headers,
+        json={"reason": "concurrent edit test"},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["tracked"] is False
+
+    # Re-read TOML from disk and assert BOTH:
+    # * the API mutation landed (myproj.tracked = False), AND
+    # * the externally-added project survives.
+    reloaded = load_config(config_path)
+    assert "myproj" in reloaded.projects
+    assert reloaded.projects["myproj"].tracked is False
+    assert "external" in reloaded.projects, (
+        "external project was clobbered by the API write — "
+        "Codex P0 #2 regression"
+    )
+    assert reloaded.projects["external"].tracked is True
+
+
+def test_archive_blocked_when_enabled_session_references_project(
+    workspace: Path,
+    project_root: Path,
+    config_path: Path,
+    tmp_path: Path,
+) -> None:
+    """Codex P0 #3: archive must enforce the session→project invariant.
+
+    Build a config with an enabled session referencing ``myproj``, then
+    POST ``/archive``. Expect 409 with the session name in the body —
+    matches the guard ``pollypm.projects.remove_project`` already
+    enforces for the CLI.
+    """
+    base_dir = workspace / ".pollypm"
+    cfg = PollyPMConfig(
+        project=ProjectSettings(
+            name="PollyPM",
+            root_dir=workspace,
+            tmux_session="pollypm-test",
+            workspace_root=workspace,
+            base_dir=base_dir,
+            logs_dir=base_dir / "logs",
+            snapshots_dir=base_dir / "snapshots",
+            state_db=base_dir / "state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={
+            "codex_primary": AccountConfig(
+                name="codex_primary",
+                provider=ProviderKind.CODEX,
+                email="codex@example.com",
+                runtime=RuntimeKind.LOCAL,
+                home=base_dir / "homes" / "codex_primary",
+            ),
+        },
+        sessions={
+            "blocker-session": SessionConfig(
+                name="blocker-session",
+                role="worker",
+                provider=ProviderKind.CODEX,
+                account="codex_primary",
+                cwd=project_root,
+                project="myproj",
+                enabled=True,
+            ),
+        },
+        projects={
+            "myproj": KnownProject(
+                key="myproj",
+                path=project_root,
+                name="My Project",
+                tracked=True,
+                kind=ProjectKind.GIT,
+            ),
+        },
+        memory=MemorySettings(backend="file"),
+        config_path=config_path,
+    )
+    write_config(cfg, config_path, force=True)
+
+    token_path = tmp_path / "api-token"
+    value, _ = ensure_token(token_path)
+    app = create_app(config=cfg, token_path=token_path)
+    client = TestClient(app)
+    headers = {"Authorization": f"Bearer {value}"}
+
+    response = client.post(
+        "/api/v1/projects/myproj/archive",
+        headers=headers,
+        json={"reason": "ignored — should 409"},
+    )
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["error"]["code"] == "conflict"
+    assert "blocker-session" in body["error"]["message"], (
+        "409 body should name the blocking session — Codex P0 #3"
+    )
+
+    # Project was NOT removed in-memory.
+    assert "myproj" in cfg.projects
+
+
+def test_pause_emits_audit_event_with_reason(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config: PollyPMConfig,
+    project_root: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex P1: ``reason`` must persist somewhere durable.
+
+    Original bug: the API accepted and echoed ``reason`` but the
+    service silently dropped it. The fix emits a ``projects.tracked.set``
+    audit event with ``reason`` in metadata so operators can grep the
+    audit log for "why".
+
+    Pins ``POLLYPM_AUDIT_HOME`` to a tmp dir so this test stays clean
+    when run with ``--noconftest`` (the global conftest normally
+    redirects audit output, but the file-level docstring instructs
+    callers to run with ``--noconftest`` to skip the postgres harness).
+    """
+    import json
+
+    from pollypm.audit.log import central_log_path, project_log_path
+
+    audit_home = tmp_path / "audit"
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    response = client.post(
+        "/api/v1/projects/myproj/pause",
+        headers=auth_headers,
+        json={"reason": "testing-audit-emit"},
+    )
+    assert response.status_code == 200, response.text
+
+    # Two surfaces accept the event — per-project log + central tail.
+    # Either is sufficient for the contract; check both.
+    found = False
+    for path in (project_log_path(project_root), central_log_path("myproj")):
+        if path is None or not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("event") == "projects.tracked.set" and rec.get(
+                "metadata", {}
+            ).get("reason") == "testing-audit-emit":
+                found = True
+                break
+        if found:
+            break
+
+    assert found, (
+        "Expected projects.tracked.set audit event with "
+        "reason='testing-audit-emit' — Codex P1 regression"
+    )

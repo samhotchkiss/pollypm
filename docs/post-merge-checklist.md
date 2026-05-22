@@ -151,6 +151,13 @@ check. Tonight's wave specifically resolves:
 | `project-guide-drift`       | Bulk-fixable via `pm doctor --fix`. The action now refreshes drifted guides in one shot instead of per-project. | #2028 |
 | `agent-worktree-count`      | The prune handler now actually reaps stale agent worktrees. Pre-#1975 the check fired but the fix was a no-op. | #1975 |
 
+> **Note on output format:** Post-#2038, `pm doctor` clusters human
+> output when a check has 3+ sub-alerts (one summary row with sample
+> subjects and a `(+N more)` tail instead of N near-identical Why/Fix
+> blocks). That's intentional, not truncation — pass `--verbose` for
+> the full per-row detail, or `--alert-type <name>` to drill into one
+> check. `--json` output is unchanged (always full per-row payload).
+
 ### If `doubled-pollypm-path` fires
 
 ```bash

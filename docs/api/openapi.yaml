@@ -405,6 +405,166 @@ paths:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
 
+  /chat/{session_name}/send:
+    parameters:
+      - $ref: "#/components/parameters/ChatSessionName"
+    post:
+      tags: [Chat]
+      operationId: sendChatMessage
+      summary: Send a message to a chat surface
+      description: |
+        Push text into the running CLI agent backing
+        `session_name` via `tmux send-keys`. Resolves the surface
+        through `enumerate_chat_surfaces` — operator / architect /
+        advisor sessions come from `config.sessions`; per-task
+        workers are validated against active
+        `WorkService.list_worker_sessions` rows.
+
+        Safety gates (spec §4.1 / §4.3):
+
+        - **Mid-tool**: rejects when the resolved transcript's tail
+          shows an unmatched `tool_use_id` from the current
+          assistant response. Tool-only assistant turns (no preface
+          text) are caught via the `user_turn` boundary anchor.
+        - **Mid-stream**: rejects when the pg heartbeat for
+          `session_name` is < 2 s old.
+
+        `safety=strict` (default) enforces both gates and fails
+        closed when the resolver cannot fingerprint a transcript to
+        the requested surface. `safety=loose` keeps the mid-tool
+        gate but allows mid-stream sends, emitting an
+        `X-PollyPM-Warning: agent-may-be-streaming` response header.
+        `safety=force` bypasses the mid-tool / mid-stream /
+        missing-transcript safety gates only. Pane and window
+        existence + liveness errors (`409 pane_invalid`,
+        `409 pane_dead`, `503 window_missing`,
+        `503 tmux_unavailable`) are NOT bypassed and will still
+        fail-closed.
+
+        AskUserQuestion replies: when `answer_to` references an
+        `ask_user` envelope, `selections[]` must match one of the
+        question's option labels exactly; `notes` are appended
+        after the selections joined by newlines.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatSendRequest"
+      responses:
+        "200":
+          description: |
+            Message sent. One of the following `X-PollyPM-Warning`
+            values may be present when `safety=loose` allowed the send
+            past a gate whose signal was either confirmed-streaming or
+            unavailable:
+
+            - `agent-may-be-streaming` — heartbeat < 2 s old.
+            - `heartbeat-unavailable` — pg / heartbeat lookup failed
+              (loose-mode best-effort; strict-mode 409s instead).
+            - `transcript-unavailable` — events.jsonl tail read failed
+              (loose-mode best-effort; strict-mode 409s instead).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatSendResponse"
+          headers:
+            X-PollyPM-Warning:
+              description: |
+                Set when `safety=loose` allowed a send past a gate that
+                would otherwise block (strict mode) or that could not be
+                evaluated (best-effort fallback). One of:
+
+                - `agent-may-be-streaming` — heartbeat indicated
+                  mid-stream (< 2 s old); loose bypassed it.
+                - `heartbeat-unavailable` — pg / heartbeat reader
+                  raised; loose continued without the signal. Strict
+                  mode would have returned `409 unsafe_unavailable_heartbeat`.
+                - `transcript-unavailable` — events.jsonl tail couldn't
+                  be read (permissions, IO error, decode failure); loose
+                  continued without the mid-tool signal. Strict mode
+                  would have returned `409 unsafe_unavailable_transcript`.
+
+                Absent on strict sends (those fail closed instead).
+              schema:
+                type: string
+                enum:
+                  - agent-may-be-streaming
+                  - heartbeat-unavailable
+                  - transcript-unavailable
+        "400":
+          description: |
+            Typed `invalid_request`, `answer_to_missing`,
+            `selections_no_question`, or `selections_invalid`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          description: |
+            `session_unknown` — `session_name` is not in
+            `config.sessions` and (for `task-{project}-{N}`) has no
+            active worker-session record. Distinguished from
+            `503 service_unavailable`, which is returned when the
+            worker-service lookup itself fails for a worker-pattern
+            name.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "409":
+          description: |
+            Typed safety-gate or pane failures:
+
+            - `unsafe_mid_tool` — agent's latest assistant response has
+              an unmatched `tool_use_id`, or the transcript resolver
+              couldn't fingerprint an exact archive while other
+              archives exist for the project.
+            - `unsafe_mid_stream` — heartbeat < 2 s old (strict).
+            - `unsafe_unavailable_transcript` — strict mode and the
+              events.jsonl tail read failed (permissions, IO error,
+              decode failure). Loose mode continues with
+              `X-PollyPM-Warning: transcript-unavailable`; force mode
+              ignores.
+            - `unsafe_unavailable_heartbeat` — strict mode and the
+              pg heartbeat lookup raised (import / `latest_heartbeat`
+              failure / malformed timestamp). Loose mode continues
+              with `X-PollyPM-Warning: heartbeat-unavailable`; force
+              mode ignores. A missing heartbeat row (no record yet)
+              is NOT unavailable — that's the genuine "not streaming"
+              signal and the send proceeds.
+            - `pane_dead` — target pane is `pane_dead=1` in tmux.
+            - `pane_invalid` — requested `pane` index is < 0, not
+              present on the window, or the `list-panes` probe failed.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: |
+            Typed backing-store / process failures:
+
+            - `window_missing` — the session is registered but its
+              tmux window is not running (including the race where the
+              window disappears between validation and `send-keys`).
+            - `tmux_unavailable` — tmux binary missing or the tmux
+              server timed out / is unreachable.
+            - `send_failed` — generic `send-keys` failure (subprocess
+              error, paste-buffer load failure).
+            - `service_unavailable` — worker-session lookup failed for
+              a `task-{project}-{N}` send (work-service open or
+              `list_worker_sessions` raised). Distinct from
+              `404 session_unknown`, which means the worker definitely
+              isn't registered. Retry once the work-service backing
+              store is reachable (Codex #2043 review v5 blocker 3 +
+              v6 blocker 1).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
   /projects/{key}/tasks:
     parameters:
       - $ref: "#/components/parameters/ProjectKey"
@@ -1197,6 +1357,104 @@ components:
             Pass back as `since_id` to fetch the next page. Applied
             in the same order as the previous response so `asc` and
             `desc` pagination both walk without duplicates.
+
+    # ---- Chat POST endpoint (P3 — send) -----------------------------
+    ChatSendSafety:
+      type: string
+      enum: [strict, loose, force]
+      description: |
+        Safety gate level.
+
+        * `strict` (default): All safety gates active. Fails closed
+          (409) when signals are unavailable as well as when they
+          report unsafe:
+          - `unsafe_mid_tool` — open tool_use in the latest assistant
+            turn.
+          - `unsafe_mid_stream` — heartbeat <2s old.
+          - `unsafe_unavailable_transcript` — transcript file exists
+            but can't be read (permissions, IO error). Mid-tool gate
+            can't be evaluated; strict fails closed.
+          - `unsafe_unavailable_heartbeat` — pg pool / heartbeat
+            backing-store outage. Mid-stream gate can't be evaluated;
+            strict fails closed.
+        * `loose`: Mid-tool gate active. Mid-stream check is
+          best-effort. Continues on unavailable signals and surfaces
+          one of the following `X-PollyPM-Warning` response headers:
+          `agent-may-be-streaming`, `heartbeat-unavailable`, or
+          `transcript-unavailable`.
+        * `force`: All safety gates bypassed. Pane and window
+          validation (`pane_invalid`, `pane_dead`, `window_missing`,
+          `tmux_unavailable`) is NOT bypassed.
+
+    ChatSendRequest:
+      type: object
+      properties:
+        text:
+          type: string
+          description: |
+            Free-text body to send. Required when `selections` is
+            empty and no `answer_to` is set.
+        press_enter:
+          type: boolean
+          default: true
+          description: Submit the buffer by pressing Enter after the text lands.
+        answer_to:
+          type: string
+          description: |
+            ID of an `ask_user` envelope in the session's transcript
+            that this send answers. When set, `selections` must
+            reference one of the question's option labels (§4.5).
+        selections:
+          type: array
+          items: { type: string }
+          description: |
+            Selected option labels for an AskUserQuestion reply.
+            Each entry must exactly match one of the question's
+            option labels.
+        notes:
+          type: string
+          description: |
+            Optional free-text addition appended after `selections`
+            when answering an `ask_user`. Ignored for plain text
+            sends.
+        safety:
+          $ref: "#/components/schemas/ChatSendSafety"
+        pane:
+          type: integer
+          minimum: 0
+          description: |
+            0-based pane index inside the target window. Defaults
+            to the active pane. Validated against `tmux list-panes`
+            — out-of-range indexes return `409 pane_invalid`; dead
+            panes return `409 pane_dead`.
+
+    ChatSendResponse:
+      type: object
+      required: [ok, message_id, session_name, window_target, characters_sent, method]
+      properties:
+        ok: { type: boolean }
+        message_id:
+          type: string
+          description: Synthetic id for the send request (echoed for tracing).
+        session_name: { type: string }
+        window_target:
+          type: string
+          description: |
+            `tmux` target the send was routed to
+            (`<storage-closet>:<window>[.<pane>]`).
+        characters_sent: { type: integer, minimum: 0 }
+        method:
+          type: string
+          enum: [send_keys, paste_buffer]
+          description: |
+            `paste_buffer` is used automatically for bodies > 100
+            characters; `send_keys` otherwise.
+        press_enter_at:
+          type: string
+          nullable: true
+          description: |
+            ISO-8601 UTC timestamp of the Enter press, or null when
+            `press_enter=false`.
 
     # ---- Tasks ------------------------------------------------------
     TaskStatus:

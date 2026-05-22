@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 import yaml
 from openapi_spec_validator import validate as validate_openapi
 
@@ -42,6 +41,8 @@ PHASE_1_PATHS: set[tuple[str, str]] = {
     # Phase 2 — chat GET endpoints (PR #2045).
     ("GET", "/chat/sessions"),
     ("GET", "/chat/{session_name}/messages"),
+    # Chat-endpoints P3 (#2043) — POST send path.
+    ("POST", "/chat/{session_name}/send"),
 }
 
 
@@ -123,8 +124,6 @@ def test_chat_message_type_enum_matches_runtime() -> None:
 
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
-    from fastapi.testclient import TestClient
-
     # Re-read straight off the FastAPI app so we don't depend on the
     # `client` fixture's auth wiring.
     from pollypm.config import (
@@ -134,7 +133,7 @@ def test_implementation_openapi_validates_as_31() -> None:
         PollyPMSettings,
         ProjectSettings,
     )
-    from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
+    from pollypm.models import ProviderKind, RuntimeKind
     from pollypm.web_api import create_app
 
     base = Path(__file__).resolve().parent

@@ -229,7 +229,7 @@ when `has_more=true`.
 |---|---|---|
 | 404 | `session_unknown` | `session_name` is not in `config.sessions` and not a live worker. |
 | 404 | `archive_missing` | `source=jsonl` forced, but no `events.jsonl` archive exists for this session. |
-| 503 | `archive_unreadable` | The events.jsonl archive exists but cannot be read (permissions, partial write). Only emitted when `source=jsonl` is explicit. |
+| 503 | `archive_unreadable` | Permissions denied, IO error, or other filesystem read failure on the events.jsonl archive. Only emitted with explicit `source=jsonl`. Malformed JSON lines are silently skipped — they do NOT trigger this. |
 | 503 | `window_missing` | Only emitted when `source=capture` is explicit AND the configured tmux window doesn't exist. |
 | 503 | `capture_unavailable` | Only emitted when `source=capture` is explicit AND TmuxClient is unavailable. |
 | 503 | `capture_failed` | Only emitted when `source=capture` is explicit AND the capture-pane command raised. |
@@ -628,11 +628,23 @@ Translation rules:
 If a selection label doesn't exactly match any option, the API returns
 `400 selections_invalid` with the valid labels in the response body.
 
-**OPEN QUESTION (Sam to confirm):** the exact stdin format Claude Code
-expects for AskUserQuestion replies. Phase 1 assumes "type the option
-label verbatim, newline-terminated." If you find a session where this
-doesn't work, fall back to free-text `text` sends and let the agent
-parse the natural-language answer.
+**AskUserQuestion answer format.** The shipped `_build_answer_text`
+(chat_send.py) joins selected option labels with newlines. If `notes`
+is provided, it's appended after another newline. The trailing newline
+is controlled by `press_enter` (default true). Example:
+`selections=["A", "B"]`, `notes="extra context"`, `press_enter=true`
+produces stdin = `"A\nB\nextra context\n"`. If Claude Code's actual
+stdin parser turns out to expect something different (e.g., option
+index instead of label), file a follow-up issue rather than blocking;
+clients can also send freeform `text` instead of structured
+`selections` to test other formats.
+
+```
+# Answer an ask_user message with a selection (positional text="" required):
+pm chat send <session> "" --answer-to msg_abc --selection "Option A"
+# With notes:
+pm chat send <session> "" --answer-to msg_abc --selection "Option A" --notes "context"
+```
 
 ### 5.6 Compaction events
 
@@ -742,7 +754,16 @@ pm chat send <session_name> <text> [--no-enter]
   maps to `press_enter=false`. `--selection` is repeatable for
   multi-select `AskUserQuestion` replies. `--pane` forwards the
   explicit pane index per §5.4 — omit it to let the server target the
-  default active pane.
+  default active pane. When answering an `AskUserQuestion` via
+  `--answer-to`/`--selection`, the positional `<text>` argument is
+  still required — pass an empty string:
+
+  ```
+  # Answer an ask_user message with a selection (positional text="" required):
+  pm chat send <session> "" --answer-to msg_abc --selection "Option A"
+  # With notes:
+  pm chat send <session> "" --answer-to msg_abc --selection "Option A" --notes "context"
+  ```
 
 On any 4xx/5xx, `pm chat` prints the JSON error body to stderr and
 exits non-zero. There is no interactive retry — re-run the command

@@ -788,6 +788,26 @@ class Supervisor:
             self._session_service = TmuxSessionService(config=self.config, store=self.store)
         return self._session_service
 
+    def is_session_turn_active_strict(self, session_name: str) -> bool:
+        """Public strict-mode probe for the destructive restart safety gate.
+
+        Delegates to the configured session service's strict probe
+        (:meth:`pollypm.session_services.tmux.TmuxSessionService.is_turn_active_strict`).
+        Strict mode propagates every probe failure as
+        :class:`pollypm.session_services.tmux.TmuxProbeUnavailable` so
+        callers can fail *closed* — the fail-soft default ``is_turn_active``
+        would swallow tmux / store outages and return "agent idle",
+        which is the wrong default for destructive operations
+        (Codex PR #2061 round 5 blocker 1).
+
+        Added as a public Supervisor method so the web-API
+        ``POST /api/v1/sessions/{name}/restart`` route can route through
+        the supervisor facade (with the correct ``StateStore`` already
+        wired into the session service) instead of constructing a
+        :class:`TmuxSessionService` with the wrong store type.
+        """
+        return self.session_service.is_turn_active_strict(session_name)
+
     @property
     def recovery_policy(self):
         """The recovery policy decides classification + intervention.

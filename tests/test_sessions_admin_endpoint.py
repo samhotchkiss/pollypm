@@ -241,7 +241,11 @@ class _FakeSupervisor:
         self.effective_account = effective_account
         self.restart_calls: list[dict[str, Any]] = []
 
-    def _get_session_runtime(self, name: str) -> Any:  # noqa: ARG002
+    def get_session_runtime(self, name: str) -> Any:  # noqa: ARG002
+        # Public Supervisor method (Codex PR #2061 round 5 blocker 2 —
+        # the route stopped reaching into ``_get_session_runtime`` and
+        # now uses the public wrapper that has been on Supervisor since
+        # the #1830 cluster-A pg facade landed).
         if self.effective_account is None:
             return None
         return SimpleNamespace(effective_account=self.effective_account)
@@ -710,6 +714,146 @@ def test_restart_strict_fails_closed_when_real_tmux_probe_fails(
     assert body["error"]["code"] == "unsafe_mid_turn_unknown"
     # Destructive facade must not have been touched.
     assert sup.restart_calls == []
+
+
+def test_build_tmux_service_routes_through_supervisor_facade_not_get_store(
+    config, monkeypatch,
+):
+    """Production wiring proof — ``_build_tmux_service`` MUST NOT use ``get_store``.
+
+    Codex PR #2061 round 5 blocker 1: the prior wiring was
+    ``_build_tmux_service`` → ``TmuxSessionService(store=get_store(config))``.
+    On a stock pg install ``get_store(config)`` returns the unified
+    :class:`pollypm.store.backends.pg_store.PgStore`, which exposes
+    ``append_event`` / ``query_messages`` / etc. but NO
+    ``list_sessions``. ``TmuxSessionService.list()`` and the round-3
+    strict probe call ``self._store.list_sessions()``, so every
+    production strict-restart raised ``AttributeError`` inside the
+    probe and the route returned ``503 unsafe_mid_turn_unknown`` even
+    for actually-idle agents.
+
+    The round-5 fix routes the service through
+    :func:`pollypm.service_api.build_supervisor` →
+    :attr:`Supervisor.session_service`. The supervisor's own session-
+    service property wires the correct
+    :class:`pollypm.storage.state.StateStore` (which DOES expose
+    ``list_sessions``).
+
+    This regression pins the wiring by:
+
+    1. Patching :func:`pollypm.store.registry.get_store` to raise so
+       any call to it from ``_build_tmux_service`` would propagate.
+    2. Patching :func:`pollypm.service_api.build_supervisor` to return
+       a fake whose ``.session_service`` is a sentinel object.
+    3. Asserting that the sentinel comes back through
+       ``_build_tmux_service`` — i.e. the route consults the
+       supervisor facade, not ``get_store``.
+
+    Without the fix this test fails because ``_build_tmux_service``
+    falls into the ``get_store(config)`` path and either returns a
+    PgStore-backed service (sentinel mismatch) or hits the simulated
+    failure.
+    """
+    from pollypm.web_api.routes import sessions_admin as routes
+    from pollypm.store import registry as store_registry
+
+    sentinel_service = object()
+
+    class _FakeSupervisor:
+        session_service = sentinel_service
+
+    # If the route reaches for get_store(config) we want it to be
+    # obvious in the failure mode.
+    def _boom_get_store(_config):
+        raise AssertionError(
+            "_build_tmux_service must NOT call get_store directly — "
+            "it must route through service_api.build_supervisor so the "
+            "service inherits Supervisor.store (StateStore, not PgStore). "
+            "Codex PR #2061 round 5 blocker 1."
+        )
+
+    monkeypatch.setattr(store_registry, "get_store", _boom_get_store)
+
+    # Patch the facade builder the route consults so we can inject
+    # our sentinel-bearing supervisor without touching the database.
+    monkeypatch.setattr(
+        "pollypm.service_api.build_supervisor",
+        lambda _config, **_kwargs: _FakeSupervisor(),
+    )
+
+    service = routes._build_tmux_service(config)
+    assert service is sentinel_service
+
+
+def test_restart_strict_succeeds_when_supervisor_wires_correct_store(
+    client, config, auth_headers, monkeypatch, patch_heartbeat,
+    patch_tmux_windows,
+):
+    """Strict-mode restart succeeds when supervisor wires a healthy probe.
+
+    Codex PR #2061 round 5 blocker 1 — companion to
+    :func:`test_build_tmux_service_routes_through_supervisor_facade_not_get_store`.
+    The prior wiring would 503 every restart on a pg-backed install
+    because the strict probe blew up on
+    ``PgStore.list_sessions``. The post-round-5 wiring routes through
+    the supervisor whose session-service has the correct StateStore;
+    when that probe says "idle", the restart MUST succeed.
+
+    We monkeypatch ``_build_supervisor`` to return a fake whose
+    ``session_service.is_turn_active_strict`` returns False (idle) —
+    no AttributeError. The route must then call the supervisor's
+    ``restart_session`` exactly once and return 200.
+    """
+    from pollypm.session_services.tmux import TmuxSessionService
+
+    class _HealthyStore:
+        """Mirrors StateStore.list_sessions shape — returns no rows."""
+
+        def list_sessions(self):
+            return []
+
+    real_svc = TmuxSessionService(
+        config=config,
+        store=_HealthyStore(),
+    )
+
+    class _FakeSupervisorWithHealthyProbe:
+        def __init__(self, svc: TmuxSessionService) -> None:
+            self.session_service = svc
+            self.restart_calls: list[dict[str, Any]] = []
+
+        def get_session_runtime(self, name: str) -> Any:  # noqa: ARG002
+            return None
+
+        def restart_session(
+            self, session_name: str, account_name: str, *, failure_type: str,
+        ) -> None:
+            self.restart_calls.append({
+                "session_name": session_name,
+                "account_name": account_name,
+                "failure_type": failure_type,
+            })
+
+    fake_sup = _FakeSupervisorWithHealthyProbe(real_svc)
+    monkeypatch.setattr(
+        sessions_admin_routes,
+        "_build_supervisor",
+        lambda _config: fake_sup,
+    )
+    # Do NOT monkeypatch _build_tmux_service — the production path
+    # must construct it from fake_sup.session_service.
+
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows([])  # no live windows → strict probe returns False (idle)
+
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    # The strict probe must NOT spuriously 503; the route consults
+    # the supervisor's correctly-wired session service.
+    assert response.status_code == 200, response.text
+    assert len(fake_sup.restart_calls) == 1
+    assert fake_sup.restart_calls[0]["session_name"] == "operator"
 
 
 def test_restart_force_still_bypasses_strict_probe_failure(

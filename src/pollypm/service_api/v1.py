@@ -44,7 +44,7 @@ from pollypm.accounts import (
 )
 from pollypm.checkpoints import create_issue_completion_checkpoint, record_checkpoint
 from pollypm.config_patches import apply_preference_patch, detect_preference_patch, list_project_overrides
-from pollypm.config import load_config
+from pollypm.config import PollyPMConfig, load_config
 from pollypm.events.summaries import activity_summary
 from pollypm.itsalive import (
     deploy_site,
@@ -146,6 +146,34 @@ def collect_plugin_load_errors(config_path: Path) -> list[dict[str, str]]:
             }
         )
     return out
+
+
+def build_supervisor(
+    config: PollyPMConfig, *, readonly_state: bool = False,
+) -> Supervisor:
+    """Construct a :class:`Supervisor` from an already-loaded config.
+
+    Public factory for callers that already hold a
+    :class:`PollyPMConfig` (e.g. the FastAPI route layer, which receives
+    the config via :class:`pollypm.web_api.routes._deps.ConfigDep`).
+    Routing through this helper keeps the direct
+    ``from pollypm.supervisor import Supervisor`` import behind the
+    sanctioned service-api facade — the import-boundary test in
+    ``tests/test_import_boundary.py`` allow-lists this module
+    (``src/pollypm/service_api/v1.py``) precisely so the facade can
+    own the construction.
+
+    Use this when the caller needs a short-lived Supervisor for one or
+    two public method calls (``restart_session``,
+    ``get_session_runtime``, ``session_service``). Reach for
+    :class:`PollyPMService` when the higher-level surface (status
+    snapshots, alert wiring, task backends) is the right tool.
+
+    Returns ``None`` on construction failure? No — exceptions propagate.
+    Callers that want fail-soft behaviour should wrap this in their own
+    try/except (the web-API route does so to map errors to typed 503s).
+    """
+    return Supervisor(config, readonly_state=readonly_state)
 
 
 class PollyPMService:

@@ -32,14 +32,15 @@ Endpoints
 Design notes
 ------------
 
-* **Read-side health.** Mirrors :mod:`pollypm.cli_features.sessions_health`
-  classification (``healthy`` / ``stale`` / ``missing`` / ``unknown``) so
-  the API returns the same status field a CLI operator sees in
-  ``pm sessions``. Heartbeats come from the pg facade
-  :func:`pollypm.storage.pg_heartbeats.latest_heartbeat`; tmux probes
-  come from :mod:`pollypm.tmux.client`. Either side may be missing —
-  read failures collapse to ``unknown`` / ``missing`` rather than
-  500-ing.
+* **Read-side health.** Shares the :mod:`pollypm.session_health`
+  classification (``healthy`` / ``stale`` / ``missing`` / ``unknown``)
+  with the ``pm sessions`` CLI so the API returns the same status
+  field an operator sees there (Codex PR #2061 round 5 blocker 3 —
+  single source of truth for the contract). Heartbeats come from the
+  pg facade :func:`pollypm.storage.pg_heartbeats.latest_heartbeat`;
+  tmux probes come from :mod:`pollypm.tmux.client`. Either side may
+  be missing — read failures collapse to ``unknown`` / ``missing``
+  rather than 500-ing.
 
 * **Restart.** Routes through :meth:`pollypm.supervisor.Supervisor.restart_session`
   — the **same facade** ``pm switch-session-account``, the cockpit
@@ -95,13 +96,27 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
-from datetime import UTC, datetime
 from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
+from pollypm.session_health import (
+    age_seconds as _age_seconds,
+)
+from pollypm.session_health import (
+    classify_status as _classify_status,
+)
+from pollypm.session_health import (
+    latest_heartbeat as _latest_heartbeat,
+)
+from pollypm.session_health import (
+    list_storage_closet_windows as _list_storage_closet_windows,
+)
+from pollypm.session_health import (
+    storage_session_name as _shared_storage_session_name,
+)
 from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.models import ActionResult
 from pollypm.web_api.routes._deps import ConfigDep
@@ -115,12 +130,6 @@ router = APIRouter(tags=["Sessions"])
 # Constants
 # ---------------------------------------------------------------------------
 
-
-# Heartbeats older than this seconds are classified ``stale``. Matches
-# :data:`pollypm.cli_features.sessions_health._STALE_HEARTBEAT_SECONDS`
-# (intentionally duplicated so the API does not import a private CLI
-# constant — the comment is the cross-reference).
-_STALE_HEARTBEAT_SECONDS = 5 * 60
 
 # Filename used by :func:`_pause_marker_path`. One JSON file per
 # project; the document is a list of paused session names. Sitting in
@@ -276,114 +285,23 @@ def _daemon_unavailable(name: str, detail: str) -> APIError:
 # Helpers — heartbeat, tmux probe, pause marker
 # ---------------------------------------------------------------------------
 
-
-def _now_utc() -> datetime:
-    return datetime.now(UTC)
-
-
-def _parse_iso(value: str | None) -> datetime | None:
-    if not value:
-        return None
-    try:
-        candidate = value.replace("Z", "+00:00") if value.endswith("Z") else value
-        parsed = datetime.fromisoformat(candidate)
-    except (TypeError, ValueError):
-        return None
-    if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed
-
-
-def _age_seconds(iso_ts: str | None) -> int | None:
-    parsed = _parse_iso(iso_ts)
-    if parsed is None:
-        return None
-    return int(max(0, (_now_utc() - parsed).total_seconds()))
-
-
-def _classify_status(
-    *,
-    window_present: bool,
-    age_seconds: int | None,
-) -> str:
-    """Return one of healthy/stale/missing/unknown.
-
-    Mirrors :func:`pollypm.cli_features.sessions_health._classify_status`
-    exactly: a pure runtime-health classification derived from tmux
-    presence + heartbeat age.
-
-    The pause marker is intentionally NOT consulted here (Codex PR
-    #2061 round 2). Pause is informational only — the supervisor /
-    recovery / dispatch loops do not consume it (#2068) — so folding
-    it into ``status`` would mask the real runtime state and let an
-    operator believe they had quiesced the daemon when in fact a
-    paused-but-missing session was reporting ``status="paused"``
-    instead of ``status="missing"``. Callers consume the separate
-    :attr:`SessionInfo.paused` boolean for the informational signal.
-    """
-    if not window_present:
-        return "missing"
-    if age_seconds is None:
-        return "unknown"
-    if age_seconds > _STALE_HEARTBEAT_SECONDS:
-        return "stale"
-    return "healthy"
-
-
-def _latest_heartbeat(config: Any, session_name: str):
-    """Fetch the most-recent heartbeat record; ``None`` on any failure.
-
-    Mirrors :func:`pollypm.cli_features.sessions_health._latest_heartbeat`
-    — read failures must never crash the endpoint. The caller
-    classifies ``None`` as ``unknown`` (no heartbeat row yet) and
-    ``status="unknown"`` is a legitimate live state for a freshly-booted
-    session.
-    """
-    try:
-        from pollypm.storage.pg_heartbeats import latest_heartbeat
-    except Exception:  # noqa: BLE001
-        logger.debug("pg_heartbeats import failed", exc_info=True)
-        return None
-    try:
-        return latest_heartbeat(session_name, config=config)
-    except Exception:  # noqa: BLE001
-        logger.debug(
-            "latest_heartbeat lookup failed for %s",
-            session_name,
-            exc_info=True,
-        )
-        return None
+# Classification / heartbeat / tmux-probe primitives now live in
+# :mod:`pollypm.session_health` — see Codex PR #2061 round 5 blocker 3.
+# This module imports them at the top of the file so the route and
+# ``pm sessions`` CLI cannot drift on thresholds, naming, or fail-soft
+# semantics. Only the surface-shape helpers (config-aware wrappers,
+# pause-marker IO) remain below.
 
 
 def _storage_session_name(config: Any) -> str:
     """Return the storage-closet tmux session name.
 
-    Hard-coded suffix matches
-    :data:`pollypm.cli_features.sessions_health._STORAGE_CLOSET_SUFFIX`
-    so we resolve windows without spinning up a Supervisor / service.
+    Delegates the naming to
+    :func:`pollypm.session_health.storage_session_name` so the CLI and
+    API agree on the ``-storage-closet`` suffix.
     """
     base = getattr(getattr(config, "project", None), "tmux_session", "") or ""
-    return f"{base}-storage-closet"
-
-
-def _list_storage_closet_windows(tmux_session: str) -> dict[str, Any]:
-    """Return ``{window_name: TmuxWindow}`` for the storage-closet session.
-
-    Empty dict on any failure (tmux missing, server down, session not
-    found). The caller treats every session as ``window_present=False``
-    in that state, which is the right answer when tmux itself is
-    unreachable.
-    """
-    try:
-        from pollypm.tmux.client import TmuxClient
-
-        tmux = TmuxClient()
-        if not tmux.has_session(tmux_session):
-            return {}
-        return {w.name: w for w in tmux.list_windows(tmux_session)}
-    except Exception:  # noqa: BLE001
-        logger.debug("tmux probe failed for %s", tmux_session, exc_info=True)
-        return {}
+    return _shared_storage_session_name(base)
 
 
 def _pause_marker_path(config: Any) -> Path | None:
@@ -492,8 +410,14 @@ def _build_session_info(
 ) -> SessionInfo:
     """Construct a :class:`SessionInfo` row for one configured session.
 
-    Mirrors :func:`pollypm.cli_features.sessions_health._build_row` so
-    the API surface and CLI agree on every field that overlaps.
+    Shares the classification / probe primitives with
+    :mod:`pollypm.session_health` (see :func:`_classify_status`,
+    :func:`_latest_heartbeat`, :func:`_list_storage_closet_windows`)
+    so the API surface and the ``pm sessions`` CLI agree on every
+    field that overlaps. Codex PR #2061 round 5 blocker 3 — the
+    helpers used to be duplicated here verbatim, which is exactly the
+    kind of "looks identical, drifts silently" coupling the round-5
+    review called out.
     """
     window_name = session.window_name or session.name
     window = windows.get(window_name)
@@ -542,34 +466,37 @@ def _build_session_config_view(session: Any) -> SessionConfigView:
 
 
 def _build_tmux_service(config: Any) -> Any | None:
-    """Construct a TmuxSessionService for restart / health, or None on failure.
+    """Return a backend-correct TmuxSessionService for read/probe paths.
 
-    Returns ``None`` when the work-service / tmux client can't be
-    opened. Callers that need the service for a mutation translate
-    ``None`` into a 503 ``daemon_unavailable``; read-only callers can
-    fall back to the raw tmux probe path.
+    Routes through the supervisor facade so the service is constructed
+    with the same :class:`pollypm.storage.state.StateStore` the
+    production rail uses — the only object that exposes the
+    ``list_sessions()`` shape :class:`TmuxSessionService` (and the
+    round-3 strict probe) depend on.
+
+    Codex PR #2061 round 5 blocker 1 caught the prior construction:
+    the route called ``TmuxSessionService(store=get_store(config))``,
+    which passes the unified pg :class:`pollypm.store.protocol.Store`
+    (no ``list_sessions``) into a service that requires
+    ``StateStore.list_sessions``. In production this turned every
+    detail-health probe into a false-dead read and every strict-mode
+    restart safety probe into ``503 unsafe_mid_turn_unknown`` because
+    the missing-method ``AttributeError`` looked like a probe outage.
+
+    The supervisor's ``session_service`` property already wires the
+    correct store in (``TmuxSessionService(config=self.config,
+    store=self.store)``), so going through it is both correct and
+    canonical. Returns ``None`` on any construction failure so the
+    caller can map to ``503 daemon_unavailable`` (mutation paths) or a
+    fail-soft empty health snapshot (read paths).
     """
-    try:
-        from pollypm.session_services.tmux import TmuxSessionService
-        from pollypm.store.registry import get_store
-    except Exception:  # noqa: BLE001
-        logger.debug("session-service imports failed", exc_info=True)
+    supervisor = _build_supervisor(config)
+    if supervisor is None:
         return None
     try:
-        store = get_store(config)
+        return supervisor.session_service
     except Exception:  # noqa: BLE001
-        logger.debug("get_store failed for sessions_admin", exc_info=True)
-        # Some installs don't have a state store yet; fall back to a
-        # tiny stub so TmuxSessionService.list() doesn't blow up — its
-        # only call into the store is ``list_sessions``.
-        class _EmptyStore:
-            def list_sessions(self) -> list[Any]:
-                return []
-        store = _EmptyStore()
-    try:
-        return TmuxSessionService(config=config, store=store)
-    except Exception:  # noqa: BLE001
-        logger.debug("TmuxSessionService init failed", exc_info=True)
+        logger.debug("supervisor.session_service unavailable", exc_info=True)
         return None
 
 
@@ -658,7 +585,7 @@ def _is_turn_active(svc: Any | None, name: str, *, strict: bool = False) -> bool
 
 
 def _build_supervisor(config: Any) -> Any | None:
-    """Construct a :class:`pollypm.supervisor.Supervisor` or ``None``.
+    """Construct a :class:`pollypm.supervisor.Supervisor` via service_api.
 
     Used by :func:`restart_session_endpoint` (Codex PR #2061 P0 #1) so
     the restart goes through the canonical
@@ -666,17 +593,26 @@ def _build_supervisor(config: Any) -> Any | None:
     cockpit account-switch button, ``pm switch-session-account``, and
     the upgrade flow already use.
 
+    Constructs via :func:`pollypm.service_api.build_supervisor` so the
+    direct ``from pollypm.supervisor import Supervisor`` import lives
+    in the sanctioned facade module
+    (``src/pollypm/service_api/v1.py`` — already on the
+    ``_SUPERVISOR_IMPORT_ALLOWLIST`` in
+    :mod:`tests.test_import_boundary`). Codex PR #2061 round 5 blocker
+    2 caught the prior direct import here as a fresh boundary
+    violation.
+
     Returns ``None`` on any construction failure (no store available,
     plugin host failure, etc.); the caller translates that into a
     503 ``daemon_unavailable`` so clients can retry.
     """
     try:
-        from pollypm.supervisor import Supervisor
+        from pollypm.service_api import build_supervisor
     except Exception:  # noqa: BLE001
-        logger.debug("Supervisor import failed", exc_info=True)
+        logger.debug("service_api.build_supervisor import failed", exc_info=True)
         return None
     try:
-        return Supervisor(config)
+        return build_supervisor(config)
     except Exception:  # noqa: BLE001
         logger.debug("Supervisor construction failed", exc_info=True)
         return None
@@ -690,9 +626,15 @@ def _resolve_restart_account(supervisor: Any, session: Any) -> str | None:
     previously failed over stays on the recovered account); otherwise
     fall back to the session's configured ``account``. Returns
     ``None`` if neither is available (caller maps to 503).
+
+    Uses the public :meth:`Supervisor.get_session_runtime` wrapper —
+    the private ``_get_session_runtime`` reach-through was a fresh
+    boundary violation flagged in Codex PR #2061 round 5 blocker 2,
+    and the public method has existed on Supervisor (the #1830
+    cluster-A facade) since well before this route was introduced.
     """
     try:
-        runtime = supervisor._get_session_runtime(session.name)  # type: ignore[attr-defined]
+        runtime = supervisor.get_session_runtime(session.name)
     except Exception:  # noqa: BLE001
         runtime = None
     if runtime is not None:

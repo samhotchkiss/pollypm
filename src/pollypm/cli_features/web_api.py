@@ -2,8 +2,11 @@
 
 Registers two surfaces on the root ``pm`` Typer app:
 
-- ``pm serve [--port N] [--host H] [--allow-remote]`` — run the
-  FastAPI app from :mod:`pollypm.web_api`.
+- ``pm serve [--port N] [--host H] [--allow-remote] [--tailscale]`` —
+  run the FastAPI app from :mod:`pollypm.web_api`. ``--tailscale``
+  shells out to ``tailscale ip -4`` and binds the resulting tailnet
+  address in addition to loopback so the web UI is reachable from any
+  device on the operator's tailnet.
 - ``pm api regen-token`` — rotate the bearer token. Lives under a
   dedicated ``pm api`` sub-app so future admin commands (``pm api
   show-token``, ``pm api status``) can land beside it without
@@ -17,6 +20,8 @@ surface.
 from __future__ import annotations
 
 import logging
+import shutil
+import subprocess
 from pathlib import Path
 
 import typer
@@ -27,14 +32,52 @@ from pollypm.config import DEFAULT_CONFIG_PATH, load_config
 logger = logging.getLogger(__name__)
 
 
+def detect_tailscale_ip() -> str | None:
+    """Return the operator's Tailscale IPv4 or ``None`` if unavailable.
+
+    Shells out to ``tailscale ip -4`` (the same command the spec uses
+    in its access doc). Returns ``None`` for any of:
+
+    - ``tailscale`` binary not on ``$PATH``
+    - command exits non-zero (not logged in, daemon down, no IP yet)
+    - stdout is empty / not a parseable IPv4
+
+    Never raises — the caller decides whether to fall back to localhost
+    with a warning or hard-fail.
+    """
+    binary = shutil.which("tailscale")
+    if binary is None:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "ip", "-4"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if result.returncode != 0:
+        return None
+    # ``tailscale ip -4`` prints one address per line; take the first
+    # non-empty token. We don't validate the dotted-quad shape here —
+    # the auth layer's ``is_tailscale_ip`` does that defensively.
+    for line in result.stdout.splitlines():
+        candidate = line.strip()
+        if candidate:
+            return candidate
+    return None
+
+
 _SERVE_HELP = help_with_examples(
     "Run the PollyPM Web API server (FastAPI) as a peer to the cockpit.",
     [
         ("pm serve", "bind to 127.0.0.1:8765 (default)"),
         ("pm serve --port 9000", "bind to 127.0.0.1:9000"),
         (
-            "pm serve --allow-remote --host 0.0.0.0",
-            "expose to non-loopback (operator must terminate TLS upstream)",
+            "pm serve --tailscale",
+            "auto-detect Tailscale IP + bind alongside loopback for the web UI",
         ),
     ],
     trailing=(
@@ -116,6 +159,17 @@ def register_web_api_commands(app: typer.Typer) -> None:
                 "responsible for terminating TLS upstream (see spec §3)."
             ),
         ),
+        tailscale: bool = typer.Option(
+            False,
+            "--tailscale",
+            help=(
+                "Auto-detect the local Tailscale IPv4 via `tailscale ip -4` "
+                "and bind it alongside 127.0.0.1. Tailscale's network identity "
+                "acts as auth (see web_api/auth.py is_tailscale_ip). Falls "
+                "back to localhost with a warning if the tailscale binary "
+                "is missing."
+            ),
+        ),
         config_path: Path = typer.Option(
             DEFAULT_CONFIG_PATH,
             "--config",
@@ -129,6 +183,34 @@ def register_web_api_commands(app: typer.Typer) -> None:
         ),
     ) -> None:
         from pollypm.web_api import create_app, ensure_token
+
+        # ``--tailscale`` is a sugar wrapper that auto-detects the
+        # tailnet IP and binds 0.0.0.0 (so both loopback + tailnet
+        # work). We treat it as an explicit opt-in to non-loopback
+        # binding, so it implies --allow-remote.
+        tailscale_ip: str | None = None
+        if tailscale:
+            tailscale_ip = detect_tailscale_ip()
+            if tailscale_ip is None:
+                typer.echo(
+                    "Warning: --tailscale passed but `tailscale ip -4` "
+                    "did not return an address (binary missing, not "
+                    "logged in, or no IPv4 yet). Falling back to "
+                    f"localhost-only bind on {host}.",
+                    err=True,
+                )
+            else:
+                # Bind 0.0.0.0 so both 127.0.0.1 and the tailnet IP
+                # accept connections without juggling two uvicorn
+                # processes. Auth still gates non-tailnet/non-loopback
+                # traffic at the middleware layer.
+                host = "0.0.0.0"
+                allow_remote = True
+                typer.echo(
+                    f"[pm serve] --tailscale: tailnet IP {tailscale_ip}; "
+                    f"binding {host}:{port} (UI: http://{tailscale_ip}:{port}/ui/).",
+                    err=True,
+                )
 
         if not allow_remote and host not in {"127.0.0.1", "localhost", "::1"}:
             typer.echo(
@@ -190,4 +272,4 @@ def register_web_api_commands(app: typer.Typer) -> None:
     app.add_typer(api_app, name="api", help=_API_HELP)
 
 
-__all__ = ["register_web_api_commands"]
+__all__ = ["detect_tailscale_ip", "register_web_api_commands"]

@@ -21,16 +21,19 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.web_api.auth import (
+    SESSION_COOKIE_NAME,
     make_bearer_auth_dependency,
     make_sse_auth_dependency,
 )
+from pollypm.web_api.token import DEFAULT_TOKEN_PATH, load_token
 from pollypm.web_api.errors import (
     APIError,
     handle_api_error,
@@ -398,6 +401,13 @@ def create_app(
         dependencies=auth_deps,
     )
 
+    # v0 web UI (Phase 7) — static SPA at ``/ui/`` with a cookie-bridge
+    # entry point that injects the on-disk token as the
+    # ``pollypm-session`` cookie. The static files (app.js, styles.css)
+    # are served raw; the entry route is custom so it can set the
+    # cookie + return the HTML in one round-trip.
+    _mount_web_ui(app, token_path=token_path)
+
     # ``security: bearerAuth`` declared at the document level so
     # generated clients carry the correct Auth scheme.
     _attach_security_scheme(app)
@@ -455,6 +465,81 @@ def _attach_security_scheme(app: FastAPI) -> None:
         return schema
 
     app.openapi = _custom_openapi  # type: ignore[assignment]
+
+
+def _mount_web_ui(app: FastAPI, *, token_path: Path | None) -> None:
+    """Mount the v0 web UI static assets + cookie-bridge entry route.
+
+    Layout:
+
+    - ``GET /ui/`` returns ``index.html`` and sets the
+      ``pollypm-session`` cookie from the on-disk token, so subsequent
+      ``fetch(..., {credentials: 'include'})`` calls authenticate
+      without the user ever seeing the token.
+    - ``GET /ui/{path}`` (e.g. ``app.js``, ``styles.css``) is served by
+      :class:`StaticFiles` from the ``ui/`` directory next to this
+      module. No auth on the static assets themselves — the bytes are
+      not sensitive and gating them behind cookie auth would break the
+      ``GET /ui/`` boot (browser fetches ``app.js`` before the cookie
+      round-trips on slow links). The API endpoints those assets call
+      remain auth-gated.
+    - ``GET /ui`` (no trailing slash) → 307 to ``/ui/`` so the cookie
+      gets set even if the operator types the short form.
+    """
+    ui_dir = Path(__file__).parent / "ui"
+    if not ui_dir.exists():
+        # Defensive: an installed wheel without the ui/ data directory
+        # would 404 on /ui/, which is fine but logging makes the cause
+        # discoverable. The app still boots and the JSON API works.
+        logger.warning(
+            "web UI directory missing at %s; /ui/ will 404", ui_dir,
+        )
+        return
+
+    index_path = ui_dir / "index.html"
+
+    @app.get("/ui", include_in_schema=False)
+    def _ui_root_redirect() -> Response:
+        # 307 preserves method + the spec for "the trailing slash form
+        # is canonical" without altering verbs.
+        return Response(status_code=307, headers={"Location": "/ui/"})
+
+    @app.get("/ui/", include_in_schema=False)
+    def _ui_index() -> Response:
+        # Load the token at request time (not app-build time) so a
+        # ``pm api regen-token`` rotation flows into the cookie on the
+        # next page load without an app restart.
+        resolved_token_path = token_path or DEFAULT_TOKEN_PATH
+        token_value = load_token(resolved_token_path)
+        response = FileResponse(index_path, media_type="text/html")
+        if token_value:
+            # ``HttpOnly`` so JS can't read the token; ``SameSite=Lax``
+            # so cross-tab navigation still carries it; ``Secure=False``
+            # because the v0 deploy is loopback/Tailscale HTTP. When
+            # the operator puts this behind TLS they should set
+            # ``Secure=True`` via a reverse proxy.
+            response.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=token_value,
+                httponly=True,
+                samesite="lax",
+                secure=False,
+                path="/",
+                max_age=60 * 60 * 24 * 7,  # 7 days
+            )
+        # If the token file doesn't exist yet, we still serve the HTML
+        # — the SPA will surface a 401 the first time it hits /api/
+        # and the operator will know to run `pm api regen-token`.
+        return response
+
+    # Static assets served raw. ``html=False`` keeps StaticFiles from
+    # hijacking the bare ``/ui/`` path (we've already taken that route
+    # above with the cookie-setting handler).
+    app.mount(
+        "/ui",
+        StaticFiles(directory=str(ui_dir), html=False),
+        name="ui-static",
+    )
 
 
 __all__ = ["API_V1_PREFIX", "create_app"]

@@ -9,16 +9,59 @@ The dependency reads the token fresh from disk on each request so a
 ``pm api regen-token`` rotation invalidates outstanding sessions
 immediately — there's no in-memory cache to flush. Personal-use volume
 makes that trivially cheap (one ``open + read`` per request).
+
+V0 web UI (Phase 7) extends the auth dependency with two additional
+acceptance modes for browser-driven sessions:
+
+- ``pollypm-session`` cookie — set by ``GET /ui/`` from the on-disk
+  token, so the browser never has to paste / type the token. Same
+  comparison rules as the header (constant-time, rotation invalidates).
+- Tailscale CGNAT trust — request ``client.host`` inside the Tailscale
+  CGNAT range (``100.64.0.0/10``) is allowed without either credential.
+  Tailscale's network identity is itself an auth boundary; on a typical
+  personal-use Tailscale-only deployment, requiring a second secret is
+  redundant friction.
+
+Loopback (``127.0.0.1``, ``::1``) is NOT auto-trusted — local processes
+without the token shouldn't bypass auth on a shared machine, and the
+cookie-from-disk path already covers the local-browser convenience case.
 """
 
 from __future__ import annotations
 
+import ipaddress
 from pathlib import Path
 
-from fastapi import Header, Query
+from fastapi import Cookie, Header, Query, Request
 
 from pollypm.web_api.errors import invalid_token, unauthorized
 from pollypm.web_api.token import load_token
+
+
+# Tailscale's CGNAT range — every node on a tailnet gets a 100.64.0.0/10
+# address. We trust requests originating from this range as already
+# authenticated by Tailscale itself (the operator opted into Tailscale
+# auth when they joined the tailnet).
+_TAILSCALE_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+
+# Cookie name used by ``GET /ui/`` to seed the browser session.
+SESSION_COOKIE_NAME = "pollypm-session"
+
+
+def is_tailscale_ip(host: str | None) -> bool:
+    """Return True iff ``host`` parses as an IP inside the CGNAT range.
+
+    Anything non-IP (hostnames, ``None``, malformed values) returns
+    ``False`` so we never accidentally trust a string that looks
+    plausible but isn't actually a tailnet address.
+    """
+    if not host:
+        return False
+    try:
+        addr = ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return addr in _TAILSCALE_CGNAT_NET
 
 
 def _extract_token(header_value: str | None) -> str | None:
@@ -45,12 +88,41 @@ def make_bearer_auth_dependency(token_path: Path | None = None):
 
     Constructed at app-creation time so tests can swap in a tmp token
     path without monkeypatching module-level state.
+
+    Accepts three credential modes (in order):
+    1. ``Authorization: Bearer <token>`` header.
+    2. ``pollypm-session`` cookie (web UI).
+    3. Tailscale CGNAT client IP (no credential needed).
+
+    Wrong tokens / cookies still produce ``invalid_token``; missing
+    everything (and not from a tailnet IP) produces ``unauthorized``.
     """
 
-    def _dependency(authorization: str | None = Header(default=None)) -> str:
-        provided = _extract_token(authorization)
+    def _dependency(
+        request: Request,
+        authorization: str | None = Header(default=None),
+        session_cookie: str | None = Cookie(
+            default=None, alias=SESSION_COOKIE_NAME,
+        ),
+    ) -> str:
+        # Determine which credential the caller supplied. We compare
+        # against the on-disk token for both header and cookie modes;
+        # only the Tailscale path skips the comparison entirely.
+        provided: str | None = _extract_token(authorization)
+        from_cookie = False
+        if provided is None and session_cookie:
+            provided = session_cookie.strip() or None
+            from_cookie = provided is not None
+
         if provided is None:
+            # No credential at all — check Tailscale fallback before
+            # rejecting. ``request.client`` is ``None`` for ASGI
+            # transports without a peer (rare; treat as unauthenticated).
+            client_host = request.client.host if request.client else None
+            if is_tailscale_ip(client_host):
+                return f"tailscale:{client_host}"
             raise unauthorized()
+
         expected = load_token(token_path)
         if expected is None:
             # Token file doesn't exist — first-run footgun. Treat as
@@ -66,6 +138,14 @@ def make_bearer_auth_dependency(token_path: Path | None = None):
         from secrets import compare_digest
 
         if not compare_digest(provided, expected):
+            # A stale cookie deserves a clearer hint than the raw
+            # ``invalid_token`` message — the operator likely rotated
+            # the token and the browser is still sending the old one.
+            if from_cookie:
+                raise invalid_token(
+                    "Session cookie does not match the current token. "
+                    "Reload /ui/ to refresh the cookie from disk."
+                )
             raise invalid_token()
         return provided
 
@@ -82,22 +162,35 @@ def make_sse_auth_dependency(token_path: Path | None = None):
     a SSE-only escape hatch — do NOT reuse this for read or write
     endpoints, since query strings end up in proxy / browser-history
     logs.
+
+    Also honors the v0 web UI session cookie and the Tailscale CGNAT
+    trust, matching the behavior of :func:`make_bearer_auth_dependency`,
+    so the SPA can subscribe to ``/events`` without paste-box gymnastics.
     """
 
     def _dependency(
+        request: Request,
         authorization: str | None = Header(default=None),
         token: str | None = Query(default=None, description=(
             "Bearer token, SSE-only fallback for browser EventSource which "
             "cannot send Authorization headers. Prefer the Authorization "
             "header for every other endpoint."
         )),
+        session_cookie: str | None = Cookie(
+            default=None, alias=SESSION_COOKIE_NAME,
+        ),
     ) -> str:
         provided = _extract_token(authorization)
         if provided is None:
             # Fall back to the query-string escape hatch.
             if token:
                 provided = token.strip() or None
+        if provided is None and session_cookie:
+            provided = session_cookie.strip() or None
         if provided is None:
+            client_host = request.client.host if request.client else None
+            if is_tailscale_ip(client_host):
+                return f"tailscale:{client_host}"
             raise unauthorized()
         expected = load_token(token_path)
         if expected is None:
@@ -114,4 +207,9 @@ def make_sse_auth_dependency(token_path: Path | None = None):
     return _dependency
 
 
-__all__ = ["make_bearer_auth_dependency", "make_sse_auth_dependency"]
+__all__ = [
+    "SESSION_COOKIE_NAME",
+    "is_tailscale_ip",
+    "make_bearer_auth_dependency",
+    "make_sse_auth_dependency",
+]

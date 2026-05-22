@@ -1,0 +1,356 @@
+// PollyPM v0 web UI — vanilla JS, no build step, no dependencies.
+//
+// Auth model: the cookie ``pollypm-session`` is set by GET /ui/ from
+// the on-disk token, so every request just needs ``credentials:
+// 'include'`` to ride that cookie. We never read or display the token
+// in the browser.
+
+(function () {
+  "use strict";
+
+  const API = "/api/v1";
+  const POLL_DASHBOARD_MS = 15000;
+  const POLL_MESSAGES_MS = 5000;
+  const MAX_MESSAGES = 50;
+
+  const state = {
+    surfaces: [],
+    selectedSurface: null,
+    messageTimer: null,
+  };
+
+  // ----- DOM helpers ------------------------------------------------------
+
+  function $(id) { return document.getElementById(id); }
+
+  function el(tag, attrs, children) {
+    const node = document.createElement(tag);
+    if (attrs) {
+      for (const k of Object.keys(attrs)) {
+        if (k === "class") node.className = attrs[k];
+        else if (k === "text") node.textContent = attrs[k];
+        else node.setAttribute(k, attrs[k]);
+      }
+    }
+    if (children) {
+      for (const child of children) {
+        if (child) node.appendChild(child);
+      }
+    }
+    return node;
+  }
+
+  function setStatus(level, label) {
+    const node = $("conn-status");
+    if (!node) return;
+    node.className = "conn-status conn-" + level;
+    const lbl = node.querySelector(".conn-label");
+    if (lbl) lbl.textContent = label;
+  }
+
+  // ----- fetch wrapper ----------------------------------------------------
+
+  async function apiFetch(path, opts) {
+    const init = Object.assign({ credentials: "include" }, opts || {});
+    init.headers = Object.assign(
+      { "Accept": "application/json" },
+      init.headers || {},
+    );
+    let resp;
+    try {
+      resp = await fetch(path, init);
+    } catch (err) {
+      setStatus("error", "offline");
+      throw err;
+    }
+    if (resp.status === 401) {
+      setStatus("error", "auth (reload /ui/)");
+      throw new Error("unauthorized");
+    }
+    if (!resp.ok) {
+      setStatus("warn", "HTTP " + resp.status);
+      let body = null;
+      try { body = await resp.json(); } catch (e) { /* ignore */ }
+      const detail = body && body.error
+        ? body.error.message || body.error.code
+        : ("HTTP " + resp.status);
+      throw new Error(detail);
+    }
+    setStatus("ok", "online");
+    return resp;
+  }
+
+  async function apiJson(path, opts) {
+    const resp = await apiFetch(path, opts);
+    return resp.json();
+  }
+
+  // ----- surfaces (left rail) --------------------------------------------
+
+  async function loadSurfaces() {
+    try {
+      const data = await apiJson(API + "/chat/sessions");
+      state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
+      renderSurfaces();
+    } catch (err) {
+      renderSurfaceError(err);
+    }
+  }
+
+  function renderSurfaces() {
+    const list = $("surface-list");
+    list.innerHTML = "";
+    if (state.surfaces.length === 0) {
+      list.appendChild(
+        el("li", { class: "surface-empty", text: "no surfaces registered" }),
+      );
+      return;
+    }
+    for (const s of state.surfaces) {
+      const dotClass =
+        s.window && s.window.pane_dead
+          ? "surface-dot dead"
+          : s.window && s.window.present
+            ? "surface-dot present"
+            : "surface-dot";
+      const labelParts = [];
+      if (s.surface_type) labelParts.push(s.surface_type);
+      if (s.persona && s.persona !== s.surface_type) labelParts.push(s.persona);
+      if (s.project) labelParts.push(s.project);
+      const li = el(
+        "li",
+        {
+          "data-session": s.session_name,
+          "class": state.selectedSurface === s.session_name ? "active" : "",
+        },
+        [
+          el("span", { class: "surface-name" }, [
+            el("span", { class: dotClass }),
+            document.createTextNode(s.session_name),
+          ]),
+          el("span", {
+            class: "surface-meta",
+            text: labelParts.join(" · ") || "—",
+          }),
+        ],
+      );
+      li.addEventListener("click", () => selectSurface(s.session_name));
+      list.appendChild(li);
+    }
+  }
+
+  function renderSurfaceError(err) {
+    const list = $("surface-list");
+    list.innerHTML = "";
+    list.appendChild(
+      el("li", { class: "surface-empty", text: "error: " + err.message }),
+    );
+  }
+
+  function selectSurface(name) {
+    state.selectedSurface = name;
+    $("pane-title").textContent = name;
+    $("pane-meta").textContent = "";
+    $("send-input").disabled = false;
+    $("send-button").disabled = false;
+    renderSurfaces();
+    loadHistory(name);
+    schedulePoll();
+  }
+
+  // ----- history (center) ------------------------------------------------
+
+  async function loadHistory(name) {
+    if (!name) return;
+    try {
+      const path =
+        API + "/chat/" + encodeURIComponent(name) + "/messages?limit="
+        + MAX_MESSAGES + "&direction=desc";
+      const data = await apiJson(path);
+      renderHistory(data);
+    } catch (err) {
+      renderHistoryError(err);
+    }
+  }
+
+  function renderHistory(data) {
+    const list = $("message-list");
+    list.innerHTML = "";
+    const meta = [];
+    if (data.surface_type) meta.push(data.surface_type);
+    if (data.transcript_source) meta.push("src=" + data.transcript_source);
+    $("pane-meta").textContent = meta.join(" · ");
+    const msgs = Array.isArray(data.messages) ? data.messages.slice() : [];
+    if (msgs.length === 0) {
+      list.appendChild(
+        el("div", { class: "message-empty", text: "no messages yet" }),
+      );
+      return;
+    }
+    // API returned newest-first; render oldest-first so the latest is
+    // at the bottom (chat convention).
+    msgs.reverse();
+    for (const m of msgs) {
+      const roleClass = "message message-role-" + (m.role || "system");
+      list.appendChild(
+        el("div", { class: roleClass }, [
+          el("div", { class: "message-head" }, [
+            el("span", { class: "message-actor", text: m.actor || m.role || "?" }),
+            el("span", { class: "message-ts", text: m.ts || "" }),
+            el("span", { class: "message-type", text: m.type || "" }),
+          ]),
+          el("div", { class: "message-text", text: m.text || "" }),
+        ]),
+      );
+    }
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function renderHistoryError(err) {
+    const list = $("message-list");
+    list.innerHTML = "";
+    list.appendChild(
+      el("div", { class: "error-banner", text: "history error: " + err.message }),
+    );
+  }
+
+  // ----- send (bottom) ---------------------------------------------------
+
+  async function sendMessage(name, text) {
+    if (!name || !text) return;
+    const path = API + "/chat/" + encodeURIComponent(name) + "/send";
+    await apiFetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ text: text }),
+    });
+    // Refresh after a short delay so the new line shows up.
+    setTimeout(() => loadHistory(name), 400);
+  }
+
+  // ----- dashboard rollups (right rail) ----------------------------------
+
+  async function pollDashboard() {
+    try {
+      const data = await apiJson(API + "/dashboard");
+      renderDashboard(data);
+    } catch (err) {
+      renderDashboardError(err);
+    }
+  }
+
+  function pickNumber(obj /*, ...path */) {
+    let cur = obj;
+    for (let i = 1; i < arguments.length; i++) {
+      if (cur == null) return null;
+      cur = cur[arguments[i]];
+    }
+    return typeof cur === "number" ? cur : null;
+  }
+
+  function renderDashboard(data) {
+    const box = $("dashboard-rollups");
+    box.innerHTML = "";
+    if (!data || typeof data !== "object") {
+      box.appendChild(el("div", { class: "rollup-empty", text: "no data" }));
+      return;
+    }
+    const cards = [];
+    const candidates = [
+      { label: "attention", path: ["attention_count"], cls: "rollup-attention" },
+      { label: "inbox unread", path: ["inbox", "unread"], cls: "rollup-attention" },
+      { label: "blocked", path: ["blocked_count"], cls: "rollup-blocked" },
+      { label: "active workers", path: ["workers", "active"], cls: "rollup-working" },
+      { label: "tasks open", path: ["tasks", "open"], cls: "" },
+      { label: "projects", path: ["projects", "tracked"], cls: "" },
+    ];
+    for (const c of candidates) {
+      const val = pickNumber.apply(null, [data].concat(c.path));
+      if (val === null) continue;
+      cards.push(
+        el("div", { class: "rollup-card " + c.cls }, [
+          el("div", { class: "rollup-label", text: c.label }),
+          el("div", { class: "rollup-value", text: String(val) }),
+        ]),
+      );
+    }
+    if (cards.length === 0) {
+      // Surface whatever top-level keys exist so the rail is not dead.
+      const keys = Object.keys(data).slice(0, 6);
+      for (const k of keys) {
+        const raw = data[k];
+        const display = (raw && typeof raw === "object")
+          ? Object.keys(raw).length + " keys"
+          : String(raw);
+        cards.push(
+          el("div", { class: "rollup-card" }, [
+            el("div", { class: "rollup-label", text: k }),
+            el("div", { class: "rollup-value", text: display }),
+          ]),
+        );
+      }
+    }
+    if (cards.length === 0) {
+      box.appendChild(el("div", { class: "rollup-empty", text: "no rollups" }));
+      return;
+    }
+    for (const c of cards) box.appendChild(c);
+  }
+
+  function renderDashboardError(err) {
+    const box = $("dashboard-rollups");
+    box.innerHTML = "";
+    box.appendChild(
+      el("div", { class: "rollup-empty", text: "error: " + err.message }),
+    );
+  }
+
+  // ----- timers -----------------------------------------------------------
+
+  function schedulePoll() {
+    if (state.messageTimer) clearInterval(state.messageTimer);
+    state.messageTimer = setInterval(() => {
+      if (state.selectedSurface) loadHistory(state.selectedSurface);
+    }, POLL_MESSAGES_MS);
+  }
+
+  // ----- wire-up ----------------------------------------------------------
+
+  function wireSendForm() {
+    const form = $("send-form");
+    const input = $("send-input");
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      const text = input.value.trim();
+      if (!text || !state.selectedSurface) return;
+      input.value = "";
+      sendMessage(state.selectedSurface, text).catch((err) => {
+        renderHistoryError(err);
+      });
+    });
+  }
+
+  function init() {
+    wireSendForm();
+    setStatus("warn", "connecting…");
+    loadSurfaces();
+    pollDashboard();
+    setInterval(loadSurfaces, 30000);
+    setInterval(pollDashboard, POLL_DASHBOARD_MS);
+  }
+
+  // Expose for tests / debugging.
+  window.PollyPM = {
+    loadSurfaces: loadSurfaces,
+    loadHistory: loadHistory,
+    sendMessage: sendMessage,
+    pollDashboard: pollDashboard,
+    state: state,
+  };
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();

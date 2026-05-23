@@ -52,6 +52,8 @@ import logging
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
+from psycopg import errors as pg_errors
+
 from pollypm.storage.records import MemoryEntryRecord, MemorySummaryRecord
 
 if TYPE_CHECKING:
@@ -79,6 +81,12 @@ def _opt_stamp_str(value: object) -> str | None:
     if value is None:
         return None
     return _stamp_str(value)
+
+
+def _is_memory_entries_pkey_violation(exc: pg_errors.UniqueViolation) -> bool:
+    diag = getattr(exc, "diag", None)
+    constraint = getattr(diag, "constraint_name", None)
+    return constraint == "memory_entries_pkey" or "memory_entries_pkey" in str(exc)
 
 
 def _safe_tags(raw: object) -> tuple[str, ...]:
@@ -171,36 +179,59 @@ def record_memory_entry(
         pool = get_rw_pool(config)
     now = _now_iso()
     tags_json = json.dumps([str(tag) for tag in tags], ensure_ascii=True)
-    with pool.connection() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO memory_entries (
-                scope, kind, title, body, tags, source, file_path, summary_path,
-                created_at, updated_at, type, importance, superseded_by, ttl_at, scope_tier
+    def _insert_once() -> int:
+        with pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO memory_entries (
+                    scope, kind, title, body, tags, source, file_path, summary_path,
+                    created_at, updated_at, type, importance, superseded_by, ttl_at, scope_tier
+                )
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+                """,
+                (
+                    scope,
+                    kind,
+                    title,
+                    body,
+                    tags_json,
+                    source,
+                    file_path,
+                    summary_path,
+                    now,
+                    now,
+                    type,
+                    int(importance),
+                    superseded_by,
+                    ttl_at,
+                    scope_tier,
+                ),
             )
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-            """,
-            (
-                scope,
-                kind,
-                title,
-                body,
-                tags_json,
-                source,
-                file_path,
-                summary_path,
-                now,
-                now,
-                type,
-                int(importance),
-                superseded_by,
-                ttl_at,
-                scope_tier,
-            ),
+            row = cur.fetchone()
+            return int(row[0])
+
+    try:
+        entry_id = _insert_once()
+    except pg_errors.UniqueViolation as exc:
+        if not _is_memory_entries_pkey_violation(exc):
+            raise
+        from pollypm.storage.pg_sequence_health import repair_owned_sequences
+
+        repaired = repair_owned_sequences(
+            pool=pool,
+            only={("memory_entries", "id")},
         )
-        row = cur.fetchone()
-        entry_id = int(row[0])
+        if repaired:
+            logger.warning(
+                "memory_entries id sequence was behind table max; repaired %s and retrying insert",
+                repaired[0].qualified_sequence_name,
+            )
+        else:
+            logger.warning(
+                "memory_entries primary-key insert collided; sequence is no longer skewed after nextval, retrying insert"
+            )
+        entry_id = _insert_once()
     return MemoryEntryRecord(
         entry_id=entry_id,
         scope=scope,

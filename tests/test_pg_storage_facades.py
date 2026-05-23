@@ -218,6 +218,43 @@ def test_pg_count_work_tasks(pg_schema_pool, pg_config, tmp_path):
     assert count_work_tasks_ro(tmp_path / "x.db", config=pg_config) == 2
 
 
+def test_pg_sequence_alignment_doctor_check_repairs_skew(
+    pg_schema_pool,
+    monkeypatch,
+):
+    _apply_initial_migrations(pg_schema_pool)
+    with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO memory_entries (
+                id, scope, kind, title, body, tags, source, file_path,
+                summary_path, created_at, updated_at
+            )
+            VALUES
+                (1, 'alpha', 'note', 'dumped-1', '', '[]', 'restore', '', '', now(), now()),
+                (2, 'alpha', 'note', 'dumped-2', '', '[]', 'restore', '', '', now(), now())
+            """
+        )
+
+    from pollypm import doctor
+
+    monkeypatch.setattr(doctor, "_doctor_config_or_none", lambda: pg_config)
+    monkeypatch.setattr(doctor, "_pg_mode_active", lambda config: True)
+
+    result = doctor.check_pg_sequence_alignment()
+    assert not result.passed
+    assert result.fixable
+    assert "memory_entries.id" in result.status
+
+    assert result.fix_fn is not None
+    ok, message = result.fix_fn()
+    assert ok
+    assert "memory_entries.id" in message
+
+    repaired = doctor.check_pg_sequence_alignment()
+    assert repaired.passed
+
+
 def test_pg_has_messages_table(pg_schema_pool, pg_config, tmp_path):
     _apply_initial_migrations(pg_schema_pool)
     from pollypm.storage.doctor_state_probes import has_messages_table_ro

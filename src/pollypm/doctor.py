@@ -764,6 +764,80 @@ def _pg_work_migrations_probe(
     )
 
 
+def _sequence_skew_label(status: object) -> str:
+    return (
+        f"{getattr(status, 'table_name')}.{getattr(status, 'column_name')} "
+        f"next={getattr(status, 'next_value')} max={getattr(status, 'max_value')}"
+    )
+
+
+def check_pg_sequence_alignment() -> CheckResult:
+    """Detect and repair pg serial sequences that lag table data.
+
+    A pg dump/restore or sqlite-to-pg import can load explicit ``id``
+    values without advancing the owned sequence. The next implicit insert
+    then reuses an existing primary key. ``pm doctor --fix`` only advances
+    lagging sequences; it never lowers sequences already ahead of data.
+    """
+    config = _doctor_config_or_none()
+    if not _pg_mode_active(config):
+        return _skip("pg sequence alignment skipped (postgres backend inactive)")
+    try:
+        from pollypm.storage.pg_sequence_health import (
+            collect_owned_sequence_statuses,
+            repair_owned_sequences,
+        )
+
+        statuses = collect_owned_sequence_statuses(config=config)
+    except Exception as exc:  # noqa: BLE001
+        return _skip(f"pg sequence alignment skipped ({exc})")
+    if not statuses:
+        return _skip("pg sequence alignment skipped (no owned sequences found)")
+
+    skewed = [status for status in statuses if status.skewed]
+    if not skewed:
+        return _ok(
+            f"{len(statuses)} pg sequences aligned",
+            data={"sequence_count": len(statuses)},
+        )
+
+    def _fix() -> tuple[bool, str]:
+        try:
+            repaired = repair_owned_sequences(config=config)
+        except Exception as exc:  # noqa: BLE001
+            return (False, f"pg sequence repair failed: {exc}")
+        if not repaired:
+            return (True, "No skewed pg sequences remained.")
+        names = ", ".join(
+            f"{item.table_name}.{item.column_name}" for item in repaired
+        )
+        return (True, f"Advanced {len(repaired)} pg sequence(s): {names}")
+
+    examples = ", ".join(_sequence_skew_label(status) for status in skewed[:3])
+    if len(skewed) > 3:
+        examples += f", +{len(skewed) - 3} more"
+    return _fail(
+        f"{len(skewed)} pg sequence(s) behind table max: {examples}",
+        why=(
+            "A serial sequence that lags behind its table can make normal "
+            "INSERTs reuse existing primary keys. That drops writes behind "
+            "warning logs when callers treat the write as best-effort."
+        ),
+        fix=(
+            "Advance lagging pg sequences with the safe doctor fix:\n"
+            "  pm doctor --fix\n"
+            "This takes a short table lock per affected sequence and only "
+            "moves sequences forward."
+        ),
+        data={
+            "sequence_count": len(statuses),
+            "skewed_sequences": [status.as_dict() for status in skewed],
+        },
+        fixable=True,
+        fix_fn=_fix,
+    )
+
+
 def _doctor_config_or_none() -> "PollyPMConfig | None":
     """Best-effort loader for the operator config inside doctor checks.
 
@@ -4177,6 +4251,7 @@ def _registered_checks() -> list[Check]:
         # Migrations
         Check("state-migrations", check_state_migrations, "migrations"),
         Check("work-migrations", check_work_migrations, "migrations"),
+        Check("pg-sequence-alignment", check_pg_sequence_alignment, "migrations"),
         # #1546 — heartbeat-cascade product-broken flag.
         Check("product-state", check_product_state, "install", severity="warning"),
         # Filesystem

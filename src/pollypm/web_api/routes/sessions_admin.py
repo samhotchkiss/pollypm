@@ -184,10 +184,14 @@ class SessionInfo(BaseModel):
     last_heartbeat_age_seconds: int | None = None
     auth_token_present: bool
     enabled: bool
-    # Informational marker (Codex PR #2061 round 2). Decoupled from
-    # ``status`` so a paused-but-missing or paused-but-stale session
-    # still reports its true runtime health — the daemon does NOT
-    # consume this marker today (see #2068).
+    # Operator-intent marker (Codex PR #2061 round 2). Remains a
+    # separate boolean from ``status`` so a paused-but-missing or
+    # paused-but-stale session still reports its true runtime health.
+    # Partial enforcement today: the recovery loops
+    # (``no_session_spawn.auto_recover_no_session_alerts`` and
+    # ``Supervisor.maybe_recover_session``) honor this marker and skip
+    # respawn when set. The dispatch / cockpit / heartbeat loops do
+    # NOT yet consume it — that wiring is tracked under #2068.
     paused: bool = False
 
 

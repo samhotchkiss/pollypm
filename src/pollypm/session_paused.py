@@ -265,12 +265,17 @@ def load_paused_state(config: Any) -> MarkerState:
 def load_paused_names(config: Any) -> set[str]:
     """Read the pause marker; empty set on missing / malformed file.
 
-    Best-effort variant retained for the sessions-admin GET surface
-    and the route's read-modify-write paths. An unreadable marker
-    collapses to an empty set HERE — recovery callers must use
-    :func:`load_paused_state` / :func:`is_paused` instead so they
-    fail closed (treat unreadable as "everything paused") rather than
-    fail open (restart what the operator wanted paused).
+    Best-effort variant retained for the read-only dashboard surface
+    (``GET /api/v1/sessions`` via ``SessionInfo.paused``) and for
+    tests that still want the legacy ``set[str]`` shape. The route
+    pause/resume endpoints now go through :func:`load_paused_state`
+    for their read-modify-write paths.
+
+    An unreadable marker collapses to an empty set HERE — recovery
+    callers must use :func:`load_paused_state` / :func:`is_paused`
+    instead so they fail closed (treat unreadable as "everything
+    paused") rather than fail open (restart what the operator wanted
+    paused).
     """
     state = load_paused_state(config)
     if state.kind == "ok":

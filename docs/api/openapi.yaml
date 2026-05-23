@@ -4004,13 +4004,20 @@ components:
         paused:
           type: boolean
           description: |
-            Informational marker set via POST
-            /sessions/{name}/pause. The supervisor / recovery /
-            dispatch loops do NOT currently consume this marker (see
-            #2068). The `status` field above remains the source of
+            Operator-intent marker set via POST
+            /sessions/{name}/pause and cleared via POST
+            /sessions/{name}/resume. Remains a separate boolean from
+            `status`: the `status` field above is still the source of
             truth for runtime health — a paused-but-missing session
             reports `status="missing"` AND `paused=true`, not
             `status="paused"`.
+
+            Partial enforcement today: the recovery loops
+            (`no_session_spawn.auto_recover_no_session_alerts` and
+            `Supervisor.maybe_recover_session`) honor this marker and
+            skip respawn when set. The dispatch / cockpit / heartbeat
+            loops do NOT yet consume it — that wiring is tracked under
+            #2068.
 
     SessionsListResponse:
       type: object

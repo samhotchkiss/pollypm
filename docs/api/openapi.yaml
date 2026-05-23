@@ -54,6 +54,11 @@ tags:
     description: Inbox items and threads.
   - name: Events
     description: Realtime audit-log stream.
+  - name: Audit
+    description: |
+      Historical audit-log queries (grep + stats). The streaming
+      counterpart lives under the ``Events`` tag at
+      ``GET /api/v1/events``.
   - name: Chat
     description: |
       Chat-surface discovery and message history. The discovery endpoint
@@ -1986,6 +1991,187 @@ paths:
         "401":
           $ref: "#/components/responses/Unauthorized"
 
+  /audit/grep:
+    get:
+      tags: [Audit]
+      operationId: grepAudit
+      summary: Search audit-log events (rotation-aware)
+      description: |
+        Returns audit events that match the supplied filters. Mirrors
+        the `pm audit grep` CLI command (PR #2036) and reuses its
+        rotation-aware file walker so live `.jsonl` + gzipped
+        `.gz` archives are searched together.
+
+        Filters apply in cheap→expensive order (Codex round-10
+        reorder, PR #2062): JSON decode, then exact `event_type`
+        match, then `ts` parse, then `since` cutoff, then
+        `pattern` substring/regex match on the raw line. The
+        pattern runs LAST so the `safe_regex=true` per-line
+        wall-clock budget is only spent on rows already inside the
+        requested `since` window — this ordering is part of the
+        safety/performance contract for regex mode (paired with the
+        `safe_regex` + `since` requirement and `deadline_seconds`
+        bound). The response is capped at `limit` matches (default
+        100, max 1000 per spec §8.3).
+
+        `pattern` is a LITERAL substring by default; pass
+        `safe_regex=true` to interpret it as a Python `re.search`
+        regex. Both modes cap the pattern at 200 characters to keep
+        ReDoS exposure off the API worker (see PR #2062 round 2 —
+        Codex P0 finding). If you need a more elaborate forensic
+        query, use the CLI (`pm audit grep`) where the operator
+        explicitly trusts the local pattern.
+
+        `next_cursor` is reserved for a future cursor-paginated
+        variant; today the endpoint always returns `null`.
+        `_malformed_rows_skipped` is non-zero when at least one
+        archived row failed `Event` validation (typically a non-ISO
+        `ts` from an old schema) and was dropped rather than 500'ing
+        the response.
+
+        Round-4 (PR #2062) added request-level bounds for the regex
+        path: `safe_regex=true` now REQUIRES `since` (returns
+        `400 invalid_request` without it — `limit` only caps matches,
+        not scanned lines, so the window must be bounded up front),
+        and `deadline_seconds` (default 5.0) imposes a wall-clock
+        budget. When the deadline fires the response sets
+        `_truncated_by_deadline=true` and `_lines_scanned` reports
+        how far the walker got.
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+          description: Scope to one project (per-project log + central tail).
+        - in: query
+          name: since
+          schema: { type: string }
+          description: |
+            ISO-8601 timestamp (e.g. `2026-05-21T03:14:15Z`) or a
+            shortcut of the form `<N><unit>` where unit is one of
+            `s` / `m` / `h` / `d` / `w` (seconds / minutes / hours /
+            days / weeks). Result is `now - delta` in UTC.
+        - in: query
+          name: event_type
+          schema: { type: string }
+          description: Exact match on the `.event` field (not a regex).
+        - in: query
+          name: pattern
+          schema:
+            type: string
+            maxLength: 200
+          description: |
+            Substring matched against the raw JSONL line. Literal by
+            default; pass `safe_regex=true` to interpret as a Python
+            `re.search` pattern. Capped at 200 characters; longer
+            patterns return `400 invalid_request`.
+        - in: query
+          name: safe_regex
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Opt in to regex semantics for `pattern`. Default false
+            (literal substring) keeps ReDoS hazards off the API
+            worker — operators who need a true regex pass this
+            explicitly.
+        - in: query
+          name: limit
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+          description: Cap matches returned. Max 1000 per spec §8.3.
+        - in: query
+          name: deadline_seconds
+          schema:
+            type: number
+            format: float
+            minimum: 0.5
+            maximum: 60.0
+            default: 5.0
+          description: |
+            Request-level wall-clock budget (seconds). When exceeded
+            the walker stops, the response sets
+            `_truncated_by_deadline=true`, and `_lines_scanned`
+            reports how many non-empty lines were examined. Caps
+            no-match pathological regex cost; required because `limit`
+            only caps matches, not scanned lines (PR #2062 round 4).
+      responses:
+        "200":
+          description: Matching events, capped at `limit`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditGrepResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
+  /audit/stats:
+    get:
+      tags: [Audit]
+      operationId: statsAudit
+      summary: Aggregate counts of audit events by type and severity
+      description: |
+        Aggregates over the same target-file set the grep endpoint
+        uses, so totals + per-event / per-severity counts match what
+        a manual grep would produce. `severity` maps to the audit
+        record's `status` field (`ok` / `warn` / `error`).
+
+        `since` is REQUIRED on the HTTP surface — unbounded
+        full-history scans across every rotated `.gz` archive can
+        block the API worker for an arbitrary length of time. Use
+        the CLI (`pm audit grep`) when an operator explicitly wants
+        whole-history aggregation. (Codex P0 finding, PR #2062
+        round 2.)
+
+        `deadline_seconds` (default 10.0) imposes a request-level
+        wall-clock cap on top of the `since` semantic bound, because
+        the walker still reads every target file/line until it parses
+        `ts` and filters. When exceeded, the response sets
+        `_truncated_by_deadline=true` and `_lines_scanned` reports
+        how far the walker got across live + rotated logs. (Codex
+        P0 finding, PR #2062 round 6.)
+      parameters:
+        - in: query
+          name: project
+          schema: { type: string }
+        - in: query
+          name: since
+          required: true
+          schema: { type: string }
+          description: |
+            REQUIRED. ISO-8601 or shortcut (`1h` / `24h` / `7d`).
+        - in: query
+          name: deadline_seconds
+          schema:
+            type: number
+            format: float
+            minimum: 0.5
+            maximum: 120.0
+            default: 10.0
+          description: |
+            Request-level wall-clock budget (seconds). Default 10.0.
+            Stats has a higher default than `/audit/grep` (5.0)
+            because aggregation has no early-exit on match-count.
+            When exceeded the walker stops, the response sets
+            `_truncated_by_deadline=true`, and `_lines_scanned`
+            reports how many non-empty lines were examined
+            (PR #2062 round 6).
+      responses:
+        "200":
+          description: Aggregate counts.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuditStatsResponse"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+
 components:
   securitySchemes:
     bearerAuth:
@@ -3863,3 +4049,134 @@ components:
           description: |
             True when the caller's `?limit` exceeded the route's 200-row
             cap and was silently clamped (Phase 2 §11.3).
+
+    # ---- Audit query (grep + stats) --------------------------------
+    AuditGrepResponse:
+      type: object
+      required: [events]
+      properties:
+        events:
+          type: array
+          items:
+            $ref: "#/components/schemas/Event"
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            Reserved for cursor-paginated variants. Always `null`
+            today; clients should accept and ignore the field.
+        _malformed_rows_skipped:
+          type: integer
+          default: 0
+          description: |
+            Diagnostic counter. Non-zero when at least one archived
+            row failed `Event` validation (typically a non-ISO `ts`
+            from an old schema version) and was skipped rather than
+            failing the response. (Codex P0 finding, PR #2062 round 2.)
+        _pattern_timeouts:
+          type: integer
+          default: 0
+          description: |
+            Diagnostic counter. Non-zero when at least one line's regex
+            search exceeded the per-line timeout (100 ms) and was
+            skipped as a no-match. Always zero when `safe_regex=false`
+            (the default literal-substring mode). Surfaced so operators
+            running a deliberately exploratory regex can tell when the
+            ReDoS guardrail fired vs. there genuinely being no matches.
+            (Codex P0 finding, PR #2062 round 2.)
+        _truncated_by_deadline:
+          type: boolean
+          default: false
+          description: |
+            `true` when the request-level wall-clock deadline
+            (`deadline_seconds`) fired before the walker finished
+            scanning every target file. Lets callers tell a
+            complete-but-empty scan from a bounded-and-truncated one
+            so they can re-run with a tighter filter or larger budget.
+            (Codex P0 finding, PR #2062 round 4.)
+        _lines_scanned:
+          type: integer
+          default: 0
+          description: |
+            How many non-empty lines the walker actually examined.
+            Paired with `_truncated_by_deadline` so a truncated
+            response reports how far it got across live + rotated
+            logs. (Codex P0 finding, PR #2062 round 4.)
+        _corrupt_archives_skipped:
+          type: integer
+          default: 0
+          minimum: 0
+          description: |
+            Count of rotated `.gz` archives skipped during this query
+            due to truncation, corruption, or read errors
+            (`EOFError`, `gzip.BadGzipFile`, `zlib.error`). The query
+            continues over the live log + other archives best-effort
+            instead of letting the exception escape as a 500. Non-zero
+            means at least one archive needs operator attention.
+            (Codex round-7 finding, PR #2062.)
+
+    AuditStatsResponse:
+      type: object
+      required: [total, by_event, by_severity]
+      properties:
+        total:
+          type: integer
+          description: Total events matching the project / since filters.
+        by_event:
+          type: object
+          additionalProperties: { type: integer }
+          description: Per-event-name counts.
+        by_severity:
+          type: object
+          additionalProperties: { type: integer }
+          description: |
+            Per-severity counts. Severity values track the audit
+            writer's `status` field (`ok` / `warn` / `error`).
+        since:
+          type: string
+          format: date-time
+          description: |
+            Normalized cutoff the server applied — echoes whatever
+            shortcut the client passed so it can confirm the
+            interpretation.
+        _truncated_by_deadline:
+          type: boolean
+          default: false
+          description: |
+            `true` when the request-level wall-clock deadline
+            (`deadline_seconds`) fired before the walker finished
+            scanning every target file. Distinguishes a complete
+            aggregation from a bounded one so the caller can re-issue
+            with a tighter project/since. (Codex P0 finding, PR #2062
+            round 6.)
+        _lines_scanned:
+          type: integer
+          default: 0
+          description: |
+            How many non-empty lines the walker actually examined.
+            Paired with `_truncated_by_deadline` so a truncated
+            response reports how far it got across live + rotated
+            logs. (Codex P0 finding, PR #2062 round 6.)
+        _corrupt_archives_skipped:
+          type: integer
+          default: 0
+          minimum: 0
+          description: |
+            Same semantics as in `AuditGrepResponse`: count of rotated
+            `.gz` archives skipped during this aggregation due to
+            truncation, corruption, or read errors. Non-zero means at
+            least one archive needs operator attention. (Codex round-7
+            finding, PR #2062.)
+        _malformed_rows_skipped:
+          type: integer
+          default: 0
+          minimum: 0
+          description: |
+            Diagnostic counter mirroring `AuditGrepResponse`. Non-zero
+            when at least one archived row failed the walker's `ts`
+            parse gate (typically a non-ISO timestamp from an old
+            schema version) and was skipped instead of inflating
+            `total` / `by_event` / `by_severity`. Lets callers tell a
+            clean aggregation from one where archived rows were
+            silently dropped without having to cross-check via
+            `/audit/grep`. (Codex round-9 finding, PR #2062.)

@@ -692,6 +692,33 @@ def test_task_reassign_request_schema_forbids_extras() -> None:
         "``model_config = {'extra': 'forbid'}`` on the Pydantic "
         "model so the static YAML and the request validator agree."
     )
+def test_audit_responses_document_corrupt_archives_skipped() -> None:
+    """Pin the round-7 diagnostic field on both audit response schemas.
+
+    Round 7 of #2062 added ``_corrupt_archives_skipped`` to the runtime
+    ``AuditGrepResponse`` / ``AuditStatsResponse`` Pydantic models so
+    the walker can skip truncated/corrupt ``.gz`` archives best-effort
+    instead of raising a 500. Round 8 (Codex) caught that
+    ``docs/api/openapi.yaml`` did not document the new field, so
+    generated clients had no way to read the diagnostic.
+
+    This test fails if either schema drops the field again.
+    """
+    contract = _load_contract()
+    for schema_name in ("AuditGrepResponse", "AuditStatsResponse"):
+        schema = contract["components"]["schemas"][schema_name]
+        properties = schema.get("properties", {})
+        assert "_corrupt_archives_skipped" in properties, (
+            f"{schema_name} must document `_corrupt_archives_skipped` "
+            "(round-7 best-effort gz skip, PR #2062)."
+        )
+        field = properties["_corrupt_archives_skipped"]
+        assert field.get("type") == "integer", (
+            f"{schema_name}._corrupt_archives_skipped must be an integer."
+        )
+        assert field.get("minimum", 0) >= 0, (
+            f"{schema_name}._corrupt_archives_skipped must be non-negative."
+        )
 
 
 def test_implementation_openapi_validates_as_31() -> None:

@@ -37,6 +37,7 @@ from pollypm.web_api.errors import (
     handle_unhandled_exception,
     handle_validation_error,
 )
+from pollypm.web_api.routes import audit as audit_routes
 from pollypm.web_api.routes import chat_messages as chat_messages_routes
 from pollypm.web_api.routes import chat_send as chat_send_routes
 from pollypm.web_api.routes import config as config_routes
@@ -366,6 +367,10 @@ def create_app(
         prefix=API_V1_PREFIX,
         dependencies=auth_deps,
     )
+    # Phase 2 surface #6 — historical audit query (grep + stats). The
+    # streaming side already ships at ``/api/v1/events`` (Phase 1 SSE);
+    # we deliberately do not re-route that path here.
+    app.include_router(audit_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
     # P2 of the chat-endpoints spec — GET /api/v1/chat/sessions and
     # GET /api/v1/chat/{session_name}/messages. Sits under the same
     # ``/chat`` prefix the P3 send endpoint shares so all

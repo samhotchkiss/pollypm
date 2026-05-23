@@ -47,12 +47,15 @@ body, roughly lines 244–290).
   unsupported in v0.
 - **`--host <addr>` explicit override:** honored verbatim, skipping
   detection. A non-loopback host still requires `--allow-remote` (spec §3).
-  `tailnet_trust` stays `False` *unless* the explicit host string is exactly
-  equal to the value `detect_tailscale_ip()` would have returned — i.e. the
-  operator manually typed the same tailnet IPv4 the detector verified. Any
-  other explicit host (loopback, `0.0.0.0`, a LAN address) leaves
-  `tailnet_trust=False` so CGNAT-source peers do NOT get credential-free
-  access on an unverified bind.
+  `tailnet_trust` is **always** `False` on this path, unconditionally —
+  even if the explicit host string happens to match the IPv4
+  `detect_tailscale_ip()` would have returned. Opting into credential-free
+  CGNAT access is a choice the auto-detect path makes (it ran the verifier
+  itself); the explicit-override path does not inherit it. Operators who
+  want the trust gate must omit `--host` and let the auto path bind the
+  tailnet interface. Every explicit-bind caller (loopback, tailnet IPv4,
+  `0.0.0.0`, or any LAN address) therefore needs a bearer token or session
+  cookie.
 - **`--tailscale` flag:** deprecated no-op kept for back-compat. The
   auto-detection it used to gate is now unconditional.
 

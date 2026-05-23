@@ -176,12 +176,14 @@ into proxy logs / browser history for routine traffic. See `auth.py`
   daemon binds that tailnet interface (tailnet mode,
   `tailnet_trust_enabled=True`); otherwise it falls back to
   `127.0.0.1` (loopback mode, `tailnet_trust_enabled=False`). Pass
-  `--host <addr>` to override the detected bind; the override stays
-  in untrusted mode (`tailnet_trust_enabled=False`, every request
-  needs a bearer token or session cookie) unless the explicit host
-  matches the detected Tailscale IPv4. `--allow-remote` is no longer
-  required for the auto-detected tailnet bind, but is still required
-  for explicit non-loopback overrides such as
+  `--host <addr>` to override the detected bind; an explicit
+  `--host` **always** stays in untrusted mode
+  (`tailnet_trust_enabled=False`, every request needs a bearer token
+  or session cookie), unconditionally — even if the address matches
+  the detected Tailscale IPv4. The auto-detect path is the only way
+  to enable `tailnet_trust_enabled=True`. `--allow-remote` is no
+  longer required for the auto-detected tailnet bind, but is still
+  required for explicit non-loopback overrides such as
   `--host 0.0.0.0`. The legacy `--tailscale` flag is a no-op kept for
   back-compat; auto-detection covers the same path.
 - Out of scope: OAuth, JWT, role-based access, audit logging of API

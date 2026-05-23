@@ -32,7 +32,27 @@ import pytest
 
 @dataclass
 class _FakeProject:
+    """Test double for ``ProjectSettings`` — shape-compatible with the real
+    config slice the pause-marker module reads.
+
+    PR #2081 round 3: ``_emit_marker_diagnostic`` now routes through
+    :func:`pollypm.audit.log.emit`, which keys the per-project log off
+    ``root_dir`` (``<root_dir>/.pollypm/audit.jsonl``) and the central-
+    tail mirror off the project ``name``. So we carry both:
+
+    * ``root_dir`` — the project root the audit facade hangs the
+      per-project log off.
+    * ``base_dir`` — ``<root_dir>/.pollypm`` (real-world convention),
+      where ``paused-sessions.json`` lives.
+    * ``name`` — project key used as the central-tail filename.
+    """
+
     base_dir: Path
+    root_dir: Path
+    name: str = "demo"
+    # Legacy attr the older test fixtures keyed on. Real ProjectSettings
+    # doesn't carry ``key``; retain for any callers reading it as
+    # belt-and-suspenders.
     key: str = "demo"
 
 
@@ -42,10 +62,23 @@ class _FakeConfig:
 
 
 @pytest.fixture
-def config_with_base_dir(tmp_path: Path) -> _FakeConfig:
-    base = tmp_path / "base"
+def config_with_base_dir(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> _FakeConfig:
+    # Mirror production layout: ``base_dir == <root_dir>/.pollypm`` so
+    # the canonical audit writer (which keys the per-project log off
+    # ``<root_dir>/.pollypm/audit.jsonl``) lands the marker diagnostics
+    # next to the marker itself.
+    root = tmp_path / "proj"
+    root.mkdir()
+    base = root / ".pollypm"
     base.mkdir()
-    return _FakeConfig(project=_FakeProject(base_dir=base))
+    # Redirect the central-tail mirror so the test never touches the
+    # user's real ``~/.pollypm/audit/`` tree.
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    return _FakeConfig(
+        project=_FakeProject(base_dir=base, root_dir=root),
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -302,7 +335,16 @@ def test_is_paused_unreadable_emits_audit_event_once(
     failing closed — even when the recovery loop never passes a
     ``store`` handle into ``is_paused``. Repeated reads within the
     throttle window must not duplicate the row (Codex PR #2081 r2
-    finding 1)."""
+    finding 1).
+
+    Codex PR #2081 round 3 — finding 1: the diagnostic must use the
+    canonical audit schema (``schema``, ISO ``ts``, ``event``,
+    ``subject``, ``actor``, ``status``, ``metadata``) so anything
+    grepping audit events by ``event`` sees the diagnostic. The
+    previous ad-hoc ``{ts: float, event_type, subject, payload}``
+    writer is gone.
+    """
+    from pollypm.audit.log import SCHEMA_VERSION
     from pollypm.session_paused import (
         PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
         _reset_skip_throttle_for_tests, is_paused,
@@ -324,10 +366,25 @@ def test_is_paused_unreadable_emits_audit_event_once(
     ]
     unreadable_rows = [
         r for r in rows
-        if r.get("event_type") == PAUSE_MARKER_UNREADABLE_EVENT_TYPE
+        if r.get("event") == PAUSE_MARKER_UNREADABLE_EVENT_TYPE
     ]
     # Exactly one despite 20 reads — throttle held.
     assert len(unreadable_rows) == 1, rows
+    row = unreadable_rows[0]
+    # Canonical schema: schema int, ISO ts, project key, event/subject/
+    # actor/status/metadata keys.
+    assert row["schema"] == SCHEMA_VERSION
+    assert isinstance(row["ts"], str) and "T" in row["ts"], row["ts"]
+    assert row["project"] == "demo"
+    assert row["subject"]  # non-empty, carries the marker path + reason
+    assert row["actor"] == "system"
+    assert row["status"] == "warn"
+    assert isinstance(row["metadata"], dict)
+    assert "reason" in row["metadata"]
+    assert "path" in row["metadata"]
+    # The ad-hoc keys must NOT appear — these were the bypass shape.
+    assert "event_type" not in row
+    assert "payload" not in row
 
 
 def test_is_paused_unreadable_to_readable_emits_restored(
@@ -335,7 +392,12 @@ def test_is_paused_unreadable_to_readable_emits_restored(
 ) -> None:
     """When the operator repairs a corrupt marker the helper must
     emit ``session.pause.marker_restored`` so the audit trail shows
-    the recovery loops returned to their normal gating."""
+    the recovery loops returned to their normal gating.
+
+    Both diagnostics use the canonical audit schema (PR #2081 round
+    3 — finding 1).
+    """
+    from pollypm.audit.log import SCHEMA_VERSION
     from pollypm.session_paused import (
         PAUSE_MARKER_RESTORED_EVENT_TYPE,
         PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
@@ -359,9 +421,18 @@ def test_is_paused_unreadable_to_readable_emits_restored(
         json.loads(line)
         for line in audit_path.read_text().splitlines() if line.strip()
     ]
-    types = [r.get("event_type") for r in rows]
-    assert PAUSE_MARKER_UNREADABLE_EVENT_TYPE in types
-    assert PAUSE_MARKER_RESTORED_EVENT_TYPE in types
+    events = [r.get("event") for r in rows]
+    assert PAUSE_MARKER_UNREADABLE_EVENT_TYPE in events
+    assert PAUSE_MARKER_RESTORED_EVENT_TYPE in events
+    restored = next(
+        r for r in rows
+        if r.get("event") == PAUSE_MARKER_RESTORED_EVENT_TYPE
+    )
+    # Restored transitions ride the same canonical schema.
+    assert restored["schema"] == SCHEMA_VERSION
+    assert restored["status"] == "ok"
+    assert restored["actor"] == "system"
+    assert restored["metadata"]["kind"] in {"ok", "absent"}
 
 
 def test_skip_if_paused_returns_false_for_unpaused_session(

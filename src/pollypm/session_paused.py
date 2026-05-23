@@ -70,7 +70,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import sys
 import threading
 import time
@@ -562,60 +561,87 @@ def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
     if should_emit and kind == "unreadable":
         _emit_marker_diagnostic(
             config,
-            event_type=PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
+            event=PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
             subject=(
                 f"pause marker unreadable at {key} ({state.reason}); "
                 "recovery loops failing closed"
             ),
-            payload={"path": key, "reason": state.reason},
+            status="warn",
+            metadata={"path": key, "reason": state.reason},
         )
     elif should_emit:
         _emit_marker_diagnostic(
             config,
-            event_type=PAUSE_MARKER_RESTORED_EVENT_TYPE,
+            event=PAUSE_MARKER_RESTORED_EVENT_TYPE,
             subject=(
                 f"pause marker readable again at {key} "
                 f"(kind={kind}); recovery loops resumed normal gating"
             ),
-            payload={"path": key, "kind": kind},
+            status="ok",
+            metadata={"path": key, "kind": kind},
         )
 
 
 def _emit_marker_diagnostic(
     config: Any,
     *,
-    event_type: str,
+    event: str,
     subject: str,
-    payload: dict[str, Any],
+    status: str,
+    metadata: dict[str, Any],
 ) -> None:
-    """Append a marker-state diagnostic to the project's audit JSONL.
+    """Route a marker-state diagnostic through the canonical audit facade.
+
+    Codex PR #2081 round 3 — finding 1: the ad-hoc writer used to
+    append a non-canonical ``{ts: float, event_type, subject, payload}``
+    record directly to ``<base_dir>/audit.jsonl``, bypassing
+    :func:`pollypm.audit.log.emit` and its
+    ``{schema, ts (ISO), project, event, subject, actor, status,
+    metadata}`` shape. Anything that grepped audit events by the
+    canonical ``event`` field never saw these diagnostics.
 
     The marker reader is called from many code paths (recovery loops,
     GET surface, supervisor) — most of which don't carry a store
-    handle. We append directly to ``<base_dir>/audit.jsonl`` (the
-    same file ``audit/log.py`` writes to) so the diagnostic lands
-    regardless of caller. Best-effort: any write failure is logged
-    at debug and swallowed.
+    handle, so we go through the audit facade rather than threading
+    one in. The facade writes both the per-project log and the
+    central tail, picking up rotation / path-resolution / central-
+    mirror behaviour for free.
+
+    Best-effort: ``audit.emit`` already swallows its own IO failures,
+    and we belt-and-suspender around an unexpected import / config
+    failure so a broken audit subsystem can't crash the reader.
     """
-    path = _pause_marker_path(config)
-    if path is None:
-        return
-    audit_path = path.parent / "audit.jsonl"
-    record = {
-        "ts": time.time(),
-        "event_type": event_type,
-        "subject": subject,
-        "payload": payload,
-    }
     try:
-        audit_path.parent.mkdir(parents=True, exist_ok=True)
-        with audit_path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(record) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
+        from pollypm.audit import emit as _audit_emit
+    except Exception:  # noqa: BLE001 — never crash the reader on import
+        logger.debug(
+            "pause marker diagnostic %s import failed", event,
+            exc_info=True,
+        )
+        return
+
+    project_key = ""
+    project_path: Path | None = None
+    project_obj = getattr(config, "project", None)
+    if project_obj is not None:
+        project_key = str(getattr(project_obj, "name", "") or "")
+        root = getattr(project_obj, "root_dir", None)
+        if root is not None:
+            project_path = Path(root)
+
+    try:
+        _audit_emit(
+            event=event,
+            project=project_key,
+            subject=subject,
+            actor="system",
+            status=status,
+            metadata=metadata,
+            project_path=project_path,
+        )
     except Exception:  # noqa: BLE001
         logger.debug(
-            "pause marker diagnostic %s emit failed", event_type,
+            "pause marker diagnostic %s emit failed", event,
             exc_info=True,
         )
 

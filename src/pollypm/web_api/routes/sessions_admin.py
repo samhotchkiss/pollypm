@@ -132,6 +132,9 @@ from pollypm.session_paused import (
     load_paused_names as _load_paused_names,
 )
 from pollypm.session_paused import (
+    load_paused_state as _load_paused_state,
+)
+from pollypm.session_paused import (
     pause_marker_lock as _pause_marker_lock,
 )
 from pollypm.session_paused import (
@@ -297,6 +300,40 @@ def _daemon_unavailable(name: str, detail: str) -> APIError:
             f"({detail})."
         ),
         hint="Confirm the daemon / cockpit is running, then retry.",
+    )
+
+
+def _marker_unreadable(name: str, path: str, reason: str) -> APIError:
+    """503 envelope for a pause/resume call against an unreadable marker.
+
+    Codex PR #2081 round 3 — finding 2: the write-side pause/resume
+    endpoints used to call ``load_paused_names`` (which collapses an
+    unreadable marker to ``set()``) inside their read-modify-write
+    path. With a corrupt or permission-broken marker on disk, ``pause``
+    would overwrite the file with just the newly requested name —
+    silently losing every other paused session — and ``resume`` would
+    return a cheerful 200 ``already untagged`` while the recovery loops
+    stayed quiesced (they fail closed on the unreadable state).
+
+    The fix is to refuse the mutation with a typed 503 that names the
+    marker path and the parse failure. The operator can then either
+    delete or repair the marker manually; we deliberately do NOT
+    auto-repair because the operator's intent (which sessions were
+    paused) is exactly the data we'd be making up.
+    """
+    return APIError(
+        status_code=503,
+        code="marker_unreadable",
+        message=(
+            f"Cannot act on session {name!r}: pause marker at {path} is "
+            f"unreadable ({reason}). Recovery loops are quiesced (fail-"
+            f"closed) until an operator repairs or deletes the marker."
+        ),
+        hint=(
+            "Inspect / repair / delete the marker file manually, then "
+            "retry. Auto-overwriting would silently drop other paused "
+            "sessions, so the API refuses."
+        ),
     )
 
 
@@ -974,6 +1011,22 @@ def restart_session_endpoint(
         "dispatch/cockpit/heartbeat loops do not yet — #2068)"
     ),
     operation_id="pauseSession",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Session not found."},
+        # PR #2081 round 3 finding 2: a corrupt / permission-broken
+        # marker fails closed in the recovery loops, so we refuse to
+        # overwrite it from this endpoint. ``marker_unreadable`` is the
+        # specific machine-readable code; ``daemon_unavailable`` covers
+        # the no-base_dir case.
+        "503": {
+            "description": (
+                "Pause marker is unreadable (``marker_unreadable``) or "
+                "the daemon has no base_dir to write to "
+                "(``daemon_unavailable``)."
+            ),
+        },
+    },
 )
 def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     """POST /api/v1/sessions/{name}/pause — write the pause marker.
@@ -1003,7 +1056,28 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     _find_session(config, name)  # 404 if unknown
     try:
         with _pause_marker_lock(config):
-            names = _load_paused_names(config)
+            # PR #2081 round 3 finding 2 — go through the discriminated
+            # state reader instead of the best-effort ``load_paused_names``.
+            # The best-effort reader collapses an unreadable marker to an
+            # empty set; combined with our read-modify-write below, that
+            # would silently overwrite a corrupt-but-existing marker with
+            # just the newly requested name and lose every other paused
+            # session. The discriminated reader lets us fail closed with
+            # a typed 503 instead.
+            state = _load_paused_state(config)
+            if state.kind == "unreadable":
+                marker_path = (
+                    config.project.base_dir / "paused-sessions.json"
+                    if getattr(config.project, "base_dir", None) is not None
+                    else "<unknown>"
+                )
+                raise _marker_unreadable(
+                    name, str(marker_path), state.reason,
+                )
+            # ``absent`` and ``ok`` both have an empty-or-populated
+            # ``names`` we can mutate; convert the frozenset to a
+            # working set.
+            names = set(state.names)
             if name in names:
                 return ActionResult(
                     ok=True,
@@ -1043,6 +1117,21 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
         "dispatch/cockpit/heartbeat loops were never paused — #2068)"
     ),
     operation_id="resumeSession",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Session not found."},
+        # PR #2081 round 3 finding 2: resume cannot silently return
+        # "already untagged" against an unreadable marker — the
+        # recovery loops are failing closed, so the operator needs to
+        # know the resume did NOT take effect.
+        "503": {
+            "description": (
+                "Pause marker is unreadable (``marker_unreadable``) or "
+                "the daemon has no base_dir to write to "
+                "(``daemon_unavailable``)."
+            ),
+        },
+    },
 )
 def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     """POST /api/v1/sessions/{name}/resume — clear the pause marker.
@@ -1056,7 +1145,24 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     _find_session(config, name)  # 404 if unknown
     try:
         with _pause_marker_lock(config):
-            names = _load_paused_names(config)
+            # PR #2081 round 3 finding 2 — same discriminated-reader
+            # gate as the pause endpoint. ``load_paused_names`` would
+            # collapse an unreadable marker to an empty set and the
+            # idempotent branch below would return ``200 already
+            # untagged`` while the recovery loops stayed quiesced.
+            # Refuse with a 503 instead so the operator knows the
+            # resume did NOT take effect.
+            state = _load_paused_state(config)
+            if state.kind == "unreadable":
+                marker_path = (
+                    config.project.base_dir / "paused-sessions.json"
+                    if getattr(config.project, "base_dir", None) is not None
+                    else "<unknown>"
+                )
+                raise _marker_unreadable(
+                    name, str(marker_path), state.reason,
+                )
+            names = set(state.names)
             if name not in names:
                 return ActionResult(
                     ok=True,

@@ -1756,9 +1756,23 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           description: |
-            Filesystem error while writing the pause marker
-            (`code=service_unavailable`). Check filesystem permissions
-            on `~/.pollypm`.
+            One of three transient states:
+
+            * `code=marker_unreadable` — the on-disk pause marker
+              exists but cannot be parsed (corrupt JSON, wrong
+              document shape, or permission denied). The recovery
+              loops are failing closed (treating every session as
+              paused) until an operator repairs or deletes the
+              marker manually. The endpoint refuses to overwrite the
+              file because doing so would silently drop any other
+              paused sessions the marker may have held (PR #2081
+              round 3 finding 2).
+            * `code=daemon_unavailable` — the config carries no
+              `project.base_dir`, so the marker has nowhere to
+              live. Bring the daemon / cockpit up and retry.
+            * `code=service_unavailable` — filesystem error while
+              writing the marker. Check permissions on
+              `~/.pollypm`.
           content:
             application/json:
               schema:
@@ -1795,8 +1809,20 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           description: |
-            Filesystem error while writing the pause marker
-            (`code=service_unavailable`).
+            One of three transient states:
+
+            * `code=marker_unreadable` — the on-disk pause marker
+              exists but cannot be parsed (corrupt JSON, wrong
+              document shape, or permission denied). Recovery loops
+              are failing closed until an operator repairs or
+              deletes the marker; the endpoint deliberately refuses
+              to claim a successful resume in this state because the
+              recovery loops would remain quiesced (PR #2081 round
+              3 finding 2).
+            * `code=daemon_unavailable` — the config carries no
+              `project.base_dir`.
+            * `code=service_unavailable` — filesystem error while
+              writing the marker.
           content:
             application/json:
               schema:

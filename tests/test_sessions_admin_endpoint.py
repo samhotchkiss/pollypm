@@ -1529,3 +1529,160 @@ def test_pause_404_unknown_session(client, auth_headers):
 def test_pause_requires_auth(client):
     response = client.post("/api/v1/sessions/operator/pause")
     assert response.status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# PR #2081 round 3 — finding 2: pause/resume MUST refuse to overwrite an
+# unreadable marker
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def isolate_audit_home(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> Path:
+    """Redirect ``POLLYPM_AUDIT_HOME`` + reset the per-process marker
+    transition state for the unreadable-marker regression tests.
+
+    PR #2081 round 3 — the marker reader now routes diagnostics
+    through :func:`pollypm.audit.log.emit`, which mirrors to a central
+    tail under ``~/.pollypm/audit/`` by default. The unreadable-marker
+    regression tests deliberately drive that path, so we pin the env
+    var to a tmp dir to keep the user's real audit home untouched.
+
+    We also reset the process-global ``_LAST_MARKER_KIND`` /
+    ``_LAST_UNREADABLE_EMITTED`` bookkeeping so the throttle from a
+    prior test in the same session cannot mask the audit-emit path
+    this test relies on.
+    """
+    from pollypm.session_paused import _reset_skip_throttle_for_tests
+
+    audit_home = tmp_path / "audit-home"
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+    _reset_skip_throttle_for_tests()
+    return audit_home
+
+
+def test_pause_unreadable_marker_returns_503_and_preserves_file(
+    client,
+    auth_headers,
+    config: PollyPMConfig,
+    patch_heartbeat,
+    patch_tmux_windows,
+    isolate_audit_home: Path,
+):
+    """An unreadable marker must NOT be silently overwritten.
+
+    Previously the pause endpoint went through ``load_paused_names``
+    which collapses a corrupt marker to ``set()`` — combined with the
+    read-modify-write logic, ``pause`` would write a fresh marker
+    containing only the newly requested name and silently drop every
+    other paused session. The recovery loops fail closed on the
+    unreadable state, so the operator would see a successful 200 while
+    the daemon stayed quiesced (and the original paused-session list
+    was gone). Codex PR #2081 round 3 finding 2: refuse the mutation
+    with a typed 503 and leave the marker untouched so the operator
+    can repair it manually.
+    """
+    patch_heartbeat({})
+    patch_tmux_windows(["operator"])
+
+    # Plant a corrupt marker that ``load_paused_state`` will classify
+    # as ``unreadable``.
+    marker = config.project.base_dir / "paused-sessions.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_bytes = b"{not json - someone else's paused list lives here}"
+    marker.write_bytes(corrupt_bytes)
+
+    response = client.post(
+        "/api/v1/sessions/operator/pause", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "marker_unreadable", body
+    # Message names the marker path + reason so the operator knows
+    # WHERE to look and WHY we refused.
+    assert "paused-sessions.json" in body["error"]["message"]
+    assert "unreadable" in body["error"]["message"].lower()
+    # Hint must tell the operator the recovery loops are still
+    # quiesced and they must repair manually.
+    hint = (body["error"].get("hint") or "").lower()
+    assert "repair" in hint or "delete" in hint
+
+    # CRITICAL: the corrupt marker must be untouched. A regression that
+    # falls back to the empty-set reader would have overwritten this
+    # file with ``["operator"]``.
+    assert marker.read_bytes() == corrupt_bytes
+
+
+def test_resume_unreadable_marker_returns_503_and_preserves_file(
+    client,
+    auth_headers,
+    config: PollyPMConfig,
+    patch_heartbeat,
+    patch_tmux_windows,
+    isolate_audit_home: Path,
+):
+    """Resume against a corrupt marker must NOT return ``200 already untagged``.
+
+    Same finding-2 case on the resume side: the best-effort reader
+    would collapse to an empty set, the ``name not in names`` branch
+    would fire, and the response would be a cheerful 200 while the
+    recovery loops stayed quiesced (failing closed on the unreadable
+    state). The operator would walk away thinking they'd lifted the
+    pause when in fact NOTHING changed.
+
+    The fix: refuse with a typed 503 ``marker_unreadable`` and leave
+    the marker file untouched.
+    """
+    patch_heartbeat({})
+    patch_tmux_windows(["operator"])
+
+    marker = config.project.base_dir / "paused-sessions.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    corrupt_bytes = b"not even close to JSON"
+    marker.write_bytes(corrupt_bytes)
+
+    response = client.post(
+        "/api/v1/sessions/operator/resume", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    body = response.json()
+    assert body["error"]["code"] == "marker_unreadable", body
+    assert "paused-sessions.json" in body["error"]["message"]
+
+    # Marker file must be unchanged.
+    assert marker.read_bytes() == corrupt_bytes
+
+
+def test_pause_wrong_shape_marker_returns_503(
+    client,
+    auth_headers,
+    config: PollyPMConfig,
+    patch_heartbeat,
+    patch_tmux_windows,
+    isolate_audit_home: Path,
+):
+    """A JSON document that parses but is not a list also collapses
+    to ``unreadable`` — the pause endpoint must still refuse with a
+    503 rather than overwrite the operator's intent.
+
+    The original ad-hoc reader treated any non-list as "no sessions
+    paused"; the discriminated state reader now flags it ``unreadable``
+    so the route fails closed alongside corrupt-JSON cases.
+    """
+    patch_heartbeat({})
+    patch_tmux_windows(["operator"])
+
+    marker = config.project.base_dir / "paused-sessions.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    wrong_shape = b'{"paused": ["someone-else"]}'
+    marker.write_bytes(wrong_shape)
+
+    response = client.post(
+        "/api/v1/sessions/operator/pause", headers=auth_headers,
+    )
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == "marker_unreadable"
+    # File preserved — operator can still recover the intent.
+    assert marker.read_bytes() == wrong_shape

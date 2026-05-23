@@ -39,6 +39,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from pollypm.state_cache.entry import (
+    WORKSPACE_ENTRY_TTL_SECONDS,
+    WORKSPACE_PROJECT_KEY,
     ProjectStateCacheEntry,
     config_identity,
     empty_entry,
@@ -46,8 +48,16 @@ from pollypm.state_cache.entry import (
 
 logger = logging.getLogger(__name__)
 
+# #2051 round-6 (Codex review): the workspace sentinel + its TTL live in
+# :mod:`pollypm.state_cache.entry` (a dependency-free leaf) so the
+# refresher, this refresh-impl, ``cockpit_inbox``, and the test suite
+# all share one source of truth. The names are re-exported here purely
+# for back-compat with earlier importers; new code should prefer
+# ``from pollypm.state_cache.entry import WORKSPACE_PROJECT_KEY``.
 __all__ = [
     "ConfigProvider",
+    "WORKSPACE_ENTRY_TTL_SECONDS",
+    "WORKSPACE_PROJECT_KEY",
     "build_refresh_fn",
     "compute_entry_for_project",
 ]
@@ -111,7 +121,20 @@ def compute_entry_for_project(
        :func:`project_state_map_from_config`).
     3. ``rail_*`` — rollup output (PR 3 consumer).
     4. ``project_path`` / ``tracked`` — straight from config.
+
+    #2051: when ``project_key`` is :data:`WORKSPACE_PROJECT_KEY`, the
+    returned entry carries the workspace-root awaits-user items
+    (messages with ``scope IN ('', 'inbox')`` — they map to
+    ``project == "inbox"`` after
+    :func:`message_row_to_inbox_entry`). The synthetic entry skips
+    categorization + rollup (no project to categorize) so the cache
+    fast-path can union it with per-project entries without affecting
+    rail / dashboard consumers (which iterate over tracked project
+    keys and ignore extras).
     """
+
+    if project_key == WORKSPACE_PROJECT_KEY:
+        return _compute_workspace_entry(config)
 
     project = _get_project(config, project_key)
     project_path = _project_path(project)
@@ -225,6 +248,86 @@ def _awaits_user_items_for(project_key: str, config: Any) -> list[Any]:
         if key == project_key:
             out.append(item)
     return out
+
+
+def _workspace_root_items(config: Any) -> list[Any]:
+    """Workspace-wide awaits-user sweep, filtered to workspace-root items.
+
+    #2051: workspace-root messages (``scope IN ('', 'inbox')``) carry
+    ``project == "inbox"`` after :func:`message_row_to_inbox_entry` —
+    they don't match any tracked project key, so the per-project
+    refresh in :func:`_awaits_user_items_for` drops them. This helper
+    collects the slice that belongs in the synthetic workspace entry
+    instead.
+
+    Calls the DIRECT (uncached) helper for the same recursion-guard
+    reason as :func:`_awaits_user_items_for`.
+    """
+
+    try:
+        from pollypm.cockpit_inbox import _pm_inbox_awaits_user_list_uncached
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_cache: cockpit_inbox import failed during workspace refresh",
+            exc_info=True,
+        )
+        return []
+    try:
+        items = _pm_inbox_awaits_user_list_uncached(config)
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_cache: _pm_inbox_awaits_user_list_uncached raised "
+            "for workspace entry",
+            exc_info=True,
+        )
+        return []
+
+    out: list[Any] = []
+    for item in items:
+        project = str(getattr(item, "project", "") or "").strip()
+        scope = str(getattr(item, "scope", "") or "").strip()
+        # Workspace-root rows surface as ``project == "inbox"``
+        # (per ``message_row_to_inbox_entry``'s fallback). The legacy
+        # source enumeration also propagated empty scopes through;
+        # accept those for robustness so a future shape change in
+        # ``message_row_to_inbox_entry`` doesn't silently drop them.
+        if project == "inbox" or (project == "" and scope in ("", "inbox")):
+            out.append(item)
+    return out
+
+
+def _compute_workspace_entry(config: Any) -> ProjectStateCacheEntry:
+    """Build the synthetic ``__workspace__`` cache entry (#2051).
+
+    Workspace-root awaits-user items live on this entry instead of
+    any per-project entry. The rest of the entry shape is "no data":
+    no categorization, no rollup, no project_path — the consumers
+    that iterate per-project entries (rail, dashboard) filter on
+    ``config.projects`` keys so the synthetic entry is naturally
+    ignored by them.
+
+    Failures degrade to an empty entry so a broken pg path never
+    propagates a crash through the refresher.
+    """
+
+    items = _workspace_root_items(config)
+    return ProjectStateCacheEntry(
+        project_key=WORKSPACE_PROJECT_KEY,
+        project_path=Path(""),
+        tracked=False,
+        state=None,
+        glyph="",
+        detail="",
+        rail_state=None,
+        rail_badge=None,
+        rail_sort_rank=0,
+        rail_reason="",
+        approvals_pending=0,
+        awaits_user_count=len(items),
+        awaits_user_items=tuple(items),
+        computed_at=time.monotonic(),
+        config_identity=config_identity(config),
+    )
 
 
 def _categorize_and_rollup(

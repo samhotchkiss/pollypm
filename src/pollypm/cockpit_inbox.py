@@ -230,54 +230,6 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     return result
 
 
-def _workspace_root_inbox_has_open(config) -> bool:
-    """True iff there is at least one open workspace-root inbox row.
-
-    "Workspace-root" = messages with ``scope IN ('', 'inbox')`` —
-    these are NOT keyed to any tracked project, so the refresher's
-    per-project filter in
-    ``state_cache/refresh_impl.py::_awaits_user_items_for`` drops them
-    on the floor. The cache's per-project entries can never represent
-    them, so any cache-routed read MUST fall through whenever the
-    workspace-root inbox is non-empty.
-
-    Filed as a follow-up issue (PR #2026 review blocker 3): teach the
-    cache to carry a workspace-root entry so this gate can go away.
-
-    PR #2026 v3 (Codex re-review): delegates to the dedicated SQL
-    existence query :func:`pollypm.cockpit_pg_aggregates.has_workspace_root_open_messages`
-    so the answer no longer depends on whether the newest N rows happen
-    to include a workspace-root row. The old ``open_messages(limit=50)``
-    + Python-side scan path silently dropped workspace work whenever 50+
-    newer project-scoped rows pushed the workspace-root row out of the
-    window.
-
-    Returns True on any failure (import or probe). Conservative — forces
-    cache fall-through. A false positive here is safe (the direct sweep
-    just runs); a false negative would silently drop workspace-root work,
-    violating the cache-authoritative invariant.
-    """
-
-    try:
-        from pollypm.cockpit_pg_aggregates import (
-            has_workspace_root_open_messages,
-        )
-    except Exception:  # noqa: BLE001
-        logger.warning(
-            "workspace-root inbox probe import failed; assuming inbox is non-empty to force conservative cache decline",
-            exc_info=True,
-        )
-        return True
-    try:
-        return bool(has_workspace_root_open_messages(config))
-    except Exception:
-        logger.warning(
-            "workspace-root inbox probe failed; assuming inbox is non-empty to force cache fall-through",
-            exc_info=True,
-        )
-        return True  # conservative: force cache decline
-
-
 def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     """Return the cache-routed result, or ``None`` to fall through.
 
@@ -292,16 +244,24 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
       serve cross-config data when project keys overlap; the
       config-identity stamp catches this).
     * Any tracked project is missing from the snapshot (partial cache).
-    * Any workspace-root awaits-user message exists live (PR #2026
-      review blocker 3) — the refresher does not project workspace-root
-      messages into any per-project entry, so the cache cannot
-      represent them and a partial answer would silently drop them
-      from the rail badge / inbox count.
+    * The synthetic ``__workspace__`` entry is absent (#2051 — missing
+      sentinel is an incomplete cache, not a proven-empty workspace
+      inbox; Codex review of #2051).
     * Any unexpected exception (defensive — broken cache must never
       crash the rail badge).
 
+    #2051: workspace-root awaits-user messages (``scope IN ('',
+    'inbox')``) now live on a synthetic ``__workspace__`` cache entry
+    emitted by the refresher (see
+    :data:`pollypm.state_cache.entry.WORKSPACE_PROJECT_KEY`).
+    This helper unions those items with the per-project ones so the
+    rail badge / inbox count include them. The earlier
+    ``_workspace_root_inbox_has_open`` probe + its forced
+    fall-through were removed — the cache is now authoritative for
+    workspace-root rows too.
+
     Cache lookup; fall through to direct path on cache miss / cache
-    disabled / config-identity mismatch / workspace-root inbox row.
+    disabled / config-identity mismatch.
     """
 
     try:
@@ -350,14 +310,66 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     # project's items are included.
     if not known_projects.issubset(snapshot.keys()):
         return None
-    # Workspace-root guard (PR #2026 review blocker 3): the refresher
-    # only projects per-project messages, so any open workspace-root
-    # inbox row would be missing from the cache. Defer to the direct
-    # path whenever one exists.
-    if _workspace_root_inbox_has_open(config):
+    # #2051 (Codex review): the synthetic ``__workspace__`` entry is now
+    # authoritative for workspace-root awaits-user rows (scope IN ('',
+    # 'inbox')). If it's absent from the snapshot we MUST treat that as
+    # an incomplete cache, not a proven-empty workspace inbox — message-
+    # store writes (alerts, notifications) and `pm notify` rows can land
+    # before the refresher's initial full-refresh stamps the sentinel,
+    # and not every workspace-root producer emits an invalidating audit
+    # event. Falling through to the direct sweep is the safety net.
+    from pollypm.state_cache.entry import (
+        WORKSPACE_ENTRY_TTL_SECONDS,
+        WORKSPACE_PROJECT_KEY,
+    )
+    if WORKSPACE_PROJECT_KEY not in snapshot:
+        return None
+    # #2051 round-4 (Codex review): bounded-staleness guard via TTL.
+    # ``PgStore.close_message`` / ``PgStore.clear_alert`` /
+    # ``service_api.v1.clear_alert`` can close workspace-root rows
+    # AFTER the refresher computed the entry — those paths write a
+    # ``messages``-table event, not a state-cache audit event, so the
+    # refresher never sees the close and the cached items / count stay
+    # stale until the next full refresh. The TTL below caps that
+    # staleness window. Workspaces with stable workspace-root rows
+    # (empty or non-empty) hit the direct sweep at most once per TTL
+    # window. Per-project entries still benefit from the full cache.
+    # Full audit-event wiring for the message-store close/clear paths
+    # is deferred past v1 RC.
+    #
+    # #2051 round-5 (Codex review): the round-3 empty-sentinel
+    # always-fall-through was removed. The TTL guard alone covers the
+    # staleness invariant — a fresh empty sentinel serves zero
+    # workspace items as the fast path (which is the steady state for
+    # most workspaces); a stale empty sentinel falls through below.
+    import time as _ws_time
+    workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
+    workspace_items = (
+        getattr(workspace_entry, "awaits_user_items", ()) or ()
+        if workspace_entry is not None
+        else ()
+    )
+    workspace_refreshed_at = float(
+        getattr(workspace_entry, "computed_at", 0.0) or 0.0
+        if workspace_entry is not None
+        else 0.0
+    )
+    if (
+        _ws_time.monotonic() - workspace_refreshed_at
+        >= WORKSPACE_ENTRY_TTL_SECONDS
+    ):
         return None
     cached_items: list[object] = []
+    # The synthetic ``__workspace__`` entry carries workspace-root
+    # awaits-user items (messages with ``scope IN ('', 'inbox')`` that
+    # don't belong to any tracked project). Union them first so the
+    # returned list mirrors the direct sweep's content. A fresh empty
+    # sentinel contributes zero items here (round-5 fast path).
+    for item in workspace_items:
+        cached_items.append(item)
     for project_key, entry in snapshot.items():
+        if project_key == WORKSPACE_PROJECT_KEY:
+            continue
         if project_key not in known_projects:
             # The cache may carry an entry for a project that was just
             # untracked. Skip — the direct path also drops it.
@@ -549,11 +561,19 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     the rail badge would silently drop work that's still waiting on
     the user.
 
-    Workspace-root fall-through (PR #2026 review blocker 3): the
-    refresher does not project workspace-root inbox messages
-    (``scope IN ('', 'inbox')``) into any per-project entry, so the
-    cached sum would silently under-count them. Defer to the direct
-    sweep whenever the workspace-root inbox is non-empty.
+    #2051: workspace-root awaits-user rows (``scope IN ('', 'inbox')``)
+    are summed from the synthetic ``__workspace__`` cache entry
+    emitted by the refresher (see
+    :data:`pollypm.state_cache.entry.WORKSPACE_PROJECT_KEY`).
+    The earlier workspace-root probe + forced fall-through were
+    removed; the cache is now authoritative for those rows too.
+
+    Codex review of #2051: when the synthetic ``__workspace__`` entry
+    is ABSENT from the snapshot, the cache is incomplete (the sentinel
+    has not been refreshed yet, or the refresher has not seen an event
+    that touched workspace-root rows). Return ``None`` so the caller
+    falls back to the direct sweep — serving zero would silently drop
+    real workspace-root work.
     """
 
     try:
@@ -590,12 +610,56 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     # direct path so the badge stays correct during the boot-time gap.
     if not known_projects.issubset(snapshot.keys()):
         return None
-    # Workspace-root guard (PR #2026 review blocker 3): see
-    # ``_maybe_cache_route_awaits_user`` for rationale.
-    if _workspace_root_inbox_has_open(config):
+    # #2051 (Codex review): a snapshot missing the synthetic
+    # ``__workspace__`` entry is an incomplete cache, NOT a proven-empty
+    # workspace inbox. Without the sentinel we cannot prove that no
+    # workspace-root awaits-user rows exist, so we MUST fall through to
+    # the direct sweep. See the sibling guard in
+    # :func:`_maybe_cache_route_awaits_user`.
+    from pollypm.state_cache.entry import (
+        WORKSPACE_ENTRY_TTL_SECONDS,
+        WORKSPACE_PROJECT_KEY,
+    )
+    if WORKSPACE_PROJECT_KEY not in snapshot:
+        return None
+    # #2051 round-4 (Codex review): bounded-staleness guard via TTL.
+    # ``PgStore.close_message`` / ``PgStore.clear_alert`` /
+    # ``service_api.v1.clear_alert`` close workspace-root rows without
+    # emitting a state-cache audit event, so a positive cached count
+    # can over-report after a close. The TTL below caps that staleness
+    # window so the rail badge can't show a closed row indefinitely.
+    # See ``_maybe_cache_route_awaits_user`` for the full rationale.
+    #
+    # #2051 round-5 (Codex review): the round-3 empty-sentinel
+    # always-fall-through was removed. The TTL guard alone covers the
+    # staleness invariant — a fresh empty sentinel serves count 0 as
+    # the fast path (steady state for most workspaces); a stale
+    # sentinel of any count falls through below.
+    import time as _ws_time
+    workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
+    workspace_count = (
+        int(getattr(workspace_entry, "awaits_user_count", 0) or 0)
+        if workspace_entry is not None
+        else 0
+    )
+    workspace_refreshed_at = float(
+        getattr(workspace_entry, "computed_at", 0.0) or 0.0
+        if workspace_entry is not None
+        else 0.0
+    )
+    if (
+        _ws_time.monotonic() - workspace_refreshed_at
+        >= WORKSPACE_ENTRY_TTL_SECONDS
+    ):
         return None
     total = 0
+    # Pull the workspace-root awaits-user count off the synthetic
+    # ``__workspace__`` entry. Authoritative within the TTL window
+    # (which caps the staleness from message-store closes/clears).
+    total += workspace_count
     for project_key, entry in snapshot.items():
+        if project_key == WORKSPACE_PROJECT_KEY:
+            continue
         if project_key not in known_projects:
             continue
         total += int(getattr(entry, "awaits_user_count", 0) or 0)

@@ -38,7 +38,11 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from pollypm.state_cache.entry import ProjectStateCacheEntry, empty_entry
+from pollypm.state_cache.entry import (
+    WORKSPACE_PROJECT_KEY,
+    ProjectStateCacheEntry,
+    empty_entry,
+)
 from pollypm.state_cache.project_state_cache import ProjectStateCache
 
 logger = logging.getLogger(__name__)
@@ -68,6 +72,28 @@ _INVALIDATING_EVENTS: frozenset[str] = frozenset({
     "marker.leaked",
     "work_table.cleared",
     "heartbeat.tick",
+})
+
+# Signals that an event touches workspace-root awaits-user rows
+# (``messages`` with ``scope IN ('', 'inbox')`` — they surface as
+# ``project == 'inbox'`` after :func:`message_row_to_inbox_entry`).
+# When :func:`_dispatch_event` sees one of these, it ALSO invalidates
+# the ``__workspace__`` synthetic entry on top of whatever per-project
+# invalidation the event triggers. Workspace-scoped events (empty
+# ``project``) already enqueue every known key via ``invalidate(None)``
+# — that path already covers the sentinel because the project-keys
+# provider includes it.
+#
+# Tracked-project ``task.*`` events that ALSO write a workspace-root
+# row (cross-posted notifications) are conservatively covered by
+# invalidating ``__workspace__`` on every event in
+# :data:`_INVALIDATING_EVENTS` — N+1 refreshes per event is cheap
+# (the workspace-root sweep is a single bulk query) and the upside
+# is that the sentinel can never go stale while the per-project
+# entries refresh.
+_WORKSPACE_ROOT_PROJECT_SIGNALS: frozenset[str] = frozenset({
+    "",       # workspace-scoped emit (no project payload)
+    "inbox",  # workspace-root inbox tasks / notifications
 })
 
 # Poll interval for the tail thread. Mirrors the existing SSE tail
@@ -346,8 +372,22 @@ class StateCacheRefresher:
     def _dispatch_event(self, *, event: str, project: str) -> None:
         if event not in _INVALIDATING_EVENTS:
             return
-        if not project:
-            # Workspace-scoped event — invalidate all known projects.
+        # #2051 (Codex review): every invalidating event MUST also
+        # invalidate the ``__workspace__`` sentinel. Tracked-project
+        # events can cross-post into the workspace-root inbox (e.g.
+        # a task created against project="inbox" surfaces in the
+        # workspace-root awaits-user sweep), and the cache-read
+        # boundary now refuses to serve a list/count when the
+        # sentinel is stale or missing. Refreshing it on every event
+        # is cheap — the workspace-root sweep is a single bulk query
+        # and coalesces with the rest of the drain.
+        self._cache.invalidate(WORKSPACE_PROJECT_KEY)
+        if not project or project in _WORKSPACE_ROOT_PROJECT_SIGNALS:
+            # Workspace-scoped event (empty project) OR an event whose
+            # ``project`` payload is itself a workspace-root signal
+            # (``"inbox"`` — workspace-root inbox tasks emit this).
+            # Invalidate every known project key so the snapshot stays
+            # consistent across the per-project + sentinel union.
             self._cache.invalidate(None)
             return
         self._cache.invalidate(project)

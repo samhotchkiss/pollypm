@@ -103,8 +103,15 @@ def _stamped_entry(
     items: list[Any] | None = None,
     state: ProjectState = ProjectState.WAITING,
 ) -> ProjectStateCacheEntry:
-    """Build an entry stamped with ``config``'s identity (mirrors refresh)."""
+    """Build an entry stamped with ``config``'s identity (mirrors refresh).
 
+    Stamps ``computed_at`` with the current monotonic time so the round-4
+    workspace-sentinel TTL guard (#2051) treats the entry as fresh — the
+    identity-guard tests in this module only care about the identity
+    field, not staleness.
+    """
+
+    import time as _t
     items = items or []
     return ProjectStateCacheEntry(
         project_key=project_key,
@@ -121,6 +128,7 @@ def _stamped_entry(
         awaits_user_count=len(items),
         awaits_user_items=tuple(items),
         config_identity=config_identity(config),
+        computed_at=_t.monotonic(),
     )
 
 
@@ -128,8 +136,36 @@ def _seed_cache(
     monkeypatch: pytest.MonkeyPatch,
     entries: dict[str, ProjectStateCacheEntry],
 ) -> ProjectStateCache:
+    # #2051 (Codex review): the cache-read boundary now requires the
+    # synthetic ``__workspace__`` entry to be present. Auto-seed an
+    # entry whose ``config_identity`` matches the FIRST stamped entry
+    # in ``entries`` so cross-config tests still exercise the identity
+    # guard (the workspace sentinel rides the same stamp). Tests that
+    # specifically want to omit the sentinel pass an explicit entry.
     cache = ProjectStateCache(refresh_fn=lambda k: None)
-    for key, entry in entries.items():
+    seeded = dict(entries)
+    if "__workspace__" not in seeded and seeded:
+        # Pick the first entry's stamp so cross-identity-mismatch tests
+        # don't have a workspace sentinel that masks the rejection.
+        sample = next(iter(seeded.values()))
+        identity = getattr(sample, "config_identity", "") or ""
+        seeded["__workspace__"] = ProjectStateCacheEntry(
+            project_key="__workspace__",
+            project_path=Path("/tmp/__workspace__"),
+            tracked=False,
+            state=None,
+            glyph="",
+            detail="",
+            rail_state=None,
+            rail_badge=None,
+            rail_sort_rank=0,
+            rail_reason="",
+            approvals_pending=0,
+            awaits_user_count=0,
+            awaits_user_items=(),
+            config_identity=identity,
+        )
+    for key, entry in seeded.items():
         cache._install_for_test(key, entry)
     monkeypatch.setattr("pollypm.state_cache.is_enabled", lambda: True)
     monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
@@ -166,11 +202,24 @@ class TestConfigIdentityGuard:
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config_a, config_b = self._config_pair(tmp_path)
 
-        # Seed cache with entries stamped against config_A.
+        # Seed cache with entries stamped against config_A. Round-3
+        # (#2051): the matching-identity fast-path now requires a
+        # NON-empty ``__workspace__`` sentinel (empty sentinels trigger
+        # the bounded-staleness fall-through). Seed one workspace-root
+        # item so the matching-identity assertion below proves the
+        # fast-path, not the workspace-empty guard.
+        ws_item = SimpleNamespace(
+            project="inbox", scope="inbox", source="message",
+            task_id=None, message_id="ws-id-1",
+            title="workspace root",
+        )
         entries = {
             key: _stamped_entry(key, config=config_a, items=[])
             for key in config_a.projects.keys()
         }
+        entries["__workspace__"] = _stamped_entry(
+            "__workspace__", config=config_a, items=[ws_item],
+        )
         _seed_cache(monkeypatch, entries)
 
         # Looking up with config_B (overlapping keys, different
@@ -181,22 +230,35 @@ class TestConfigIdentityGuard:
         # And looking up with config_A (matching identity) MUST hit.
         result_a = cockpit_inbox._maybe_cache_route_awaits_user(config_a)
         assert result_a is not None
-        assert result_a == []  # no items seeded, but the path served
+        # Only the workspace-root item (per-project entries seeded empty).
+        assert result_a == [ws_item]
 
     def test_count_awaits_user_declines_on_identity_mismatch(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config_a, config_b = self._config_pair(tmp_path)
+        # Round-3 (#2051): non-empty workspace sentinel required for
+        # the matching-identity fast-path. Mirrors the sibling list
+        # test above.
+        ws_item = SimpleNamespace(
+            project="inbox", scope="inbox", source="message",
+            task_id=None, message_id="ws-id-2",
+            title="workspace root",
+        )
         entries = {
             key: _stamped_entry(key, config=config_a, items=[])
             for key in config_a.projects.keys()
         }
+        entries["__workspace__"] = _stamped_entry(
+            "__workspace__", config=config_a, items=[ws_item],
+        )
         _seed_cache(monkeypatch, entries)
 
         assert cockpit_inbox._maybe_cache_count_awaits_user(config_b) is None
-        # Matching identity → 0 items total.
-        assert cockpit_inbox._maybe_cache_count_awaits_user(config_a) == 0
+        # Matching identity → 1 workspace-root item (per-project entries
+        # are empty; only the workspace sentinel contributes).
+        assert cockpit_inbox._maybe_cache_count_awaits_user(config_a) == 1
 
     def test_operator_view_declines_on_identity_mismatch(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -314,30 +376,50 @@ class TestConfigIdentityGuard:
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config_a, config_b = self._same_root_different_path_pair(tmp_path)
+        # Round-3 (#2051): non-empty workspace sentinel required for
+        # the matching-identity fast-path assertion below.
+        ws_item = SimpleNamespace(
+            project="inbox", scope="inbox", source="message",
+            task_id=None, message_id="ws-id-3",
+            title="workspace root",
+        )
         entries = {
             key: _stamped_entry(key, config=config_a, items=[])
             for key in config_a.projects.keys()
         }
+        entries["__workspace__"] = _stamped_entry(
+            "__workspace__", config=config_a, items=[ws_item],
+        )
         _seed_cache(monkeypatch, entries)
 
         assert cockpit_inbox._maybe_cache_route_awaits_user(config_b) is None
         result_a = cockpit_inbox._maybe_cache_route_awaits_user(config_a)
         assert result_a is not None
-        assert result_a == []
+        assert result_a == [ws_item]
 
     def test_count_awaits_user_declines_same_root_different_path(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config_a, config_b = self._same_root_different_path_pair(tmp_path)
+        # Round-3 (#2051): non-empty workspace sentinel required —
+        # see sibling list test for rationale.
+        ws_item = SimpleNamespace(
+            project="inbox", scope="inbox", source="message",
+            task_id=None, message_id="ws-id-4",
+            title="workspace root",
+        )
         entries = {
             key: _stamped_entry(key, config=config_a, items=[])
             for key in config_a.projects.keys()
         }
+        entries["__workspace__"] = _stamped_entry(
+            "__workspace__", config=config_a, items=[ws_item],
+        )
         _seed_cache(monkeypatch, entries)
 
         assert cockpit_inbox._maybe_cache_count_awaits_user(config_b) is None
-        assert cockpit_inbox._maybe_cache_count_awaits_user(config_a) == 0
+        assert cockpit_inbox._maybe_cache_count_awaits_user(config_a) == 1
 
     def test_operator_view_declines_same_root_different_path(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -404,10 +486,14 @@ class TestConfigIdentityGuard:
         parity tests.
         """
 
+        import time as _t
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config_a, _ = self._config_pair(tmp_path)
 
         # Hand-roll an unstamped entry (config_identity defaults to "").
+        # ``computed_at`` is stamped freshly so the round-4 workspace
+        # TTL guard doesn't reject the entry on staleness — this test
+        # isolates the IDENTITY bypass, not staleness.
         unstamped = ProjectStateCacheEntry(
             project_key="alpha",
             project_path=Path("/tmp/alpha"),
@@ -415,25 +501,44 @@ class TestConfigIdentityGuard:
             state=ProjectState.IDLE,
             awaits_user_count=0,
             awaits_user_items=(),
+            computed_at=_t.monotonic(),
         )
         assert unstamped.config_identity == ""
-        _seed_cache(monkeypatch, {"alpha": unstamped})
+        # Round-3 (#2051): the bounded-staleness guard rejects an empty
+        # workspace sentinel. To prove the identity-bypass for legacy
+        # unstamped entries, supply a non-empty unstamped workspace
+        # entry too — its ``config_identity`` is also "" so the bypass
+        # applies uniformly.
+        ws_item = SimpleNamespace(
+            project="inbox", scope="inbox", source="message",
+            task_id=None, message_id="ws-unstamped",
+            title="workspace root",
+        )
+        unstamped_workspace = ProjectStateCacheEntry(
+            project_key="__workspace__",
+            project_path=Path("/tmp/__workspace__"),
+            tracked=False,
+            state=None,
+            awaits_user_count=1,
+            awaits_user_items=(ws_item,),
+            computed_at=_t.monotonic(),
+        )
+        assert unstamped_workspace.config_identity == ""
+        _seed_cache(
+            monkeypatch,
+            {"alpha": unstamped, "__workspace__": unstamped_workspace},
+        )
 
         # Even with a mismatched-looking config, unstamped entries are
-        # served (this is the test-compat escape hatch).
+        # served (this is the test-compat escape hatch). #2051 removed
+        # the ``_workspace_root_inbox_has_open`` probe, so the only
+        # remaining gates that could decline are the config-identity
+        # guard (which we're isolating here) and the cold-cache /
+        # partial-cache guards (both satisfied by the seed above).
         config_solo = _make_config(["alpha"], tmp_path / "workspace-a")
         result = cockpit_inbox._maybe_cache_route_awaits_user(config_solo)
-        # Either the served path returns the empty list, or the route
-        # declines for an OTHER reason (workspace-root probe, etc.).
-        # The point is: the identity guard didn't fire on the
-        # unstamped entry.
-        # Force the workspace-root probe to "no open" to isolate the
-        # identity gate from other guards.
-        monkeypatch.setattr(
-            cockpit_inbox, "_workspace_root_inbox_has_open", lambda cfg: False,
-        )
-        result = cockpit_inbox._maybe_cache_route_awaits_user(config_solo)
-        assert result == []
+        # The workspace-root item rides the cache (only item present).
+        assert result == [ws_item]
 
 
 # ── refresh stamping ──────────────────────────────────────────────

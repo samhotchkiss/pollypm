@@ -1,12 +1,20 @@
 # Move A — In-Process Project-State Cache with Epoch-Driven Invalidation
 
-## Implementation drift (2026-05-22)
+## Implementation drift (2026-05-22, updated 2026-05-23)
 
-The shipped Move A behavior diverges from the original design in three places. This section is the source of truth; the original sections below are kept for historical context but should be read as superseded where they conflict.
+The shipped Move A behavior diverges from the original design in two places. This section is the source of truth; the original sections below are kept for historical context but should be read as superseded where they conflict.
 
 - `latest_heartbeat_by_session` is reserved on `ProjectStateCacheEntry` but NOT populated. Rail heartbeat sites read `pollypm.storage.pg_heartbeats.latest_heartbeat` directly via `CockpitRouter._latest_heartbeat_cached`. Bulk prefetch + cache invalidation deferred to [#2050](https://github.com/samhotchkiss/pollypm/issues/2050).
 - `_maybe_cache_route_rollups` declines (returns `None`) when any tracked project has a live actionable alert — cache cannot recompute the alert-to-rollup contract. Tracked in [#2049](https://github.com/samhotchkiss/pollypm/issues/2049).
-- `_maybe_cache_route_awaits_user` / `_maybe_cache_count_awaits_user` decline when the workspace-root inbox has any open message (via `has_workspace_root_open_messages` probe). Workspace-root inbox isn't yet represented in cache entries. Tracked in [#2051](https://github.com/samhotchkiss/pollypm/issues/2051).
+
+### Workspace-root inbox is now cache-routed (#2051 — closed by PR #2078)
+
+The third drift item from the original list (workspace-root inbox not represented in cache entries) is closed by PR #2078. The shipped behavior:
+
+- Workspace-root awaits-user rows (`messages` with `scope IN ('', 'inbox')`, surfaced as `project == "inbox"` after `message_row_to_inbox_entry`) are represented in the cache via a **synthetic `__workspace__` entry**. The sentinel key (`WORKSPACE_PROJECT_KEY = "__workspace__"`) and TTL constant (`WORKSPACE_ENTRY_TTL_SECONDS = 10.0`) live in `pollypm.state_cache.entry` so the refresher, refresh-impl, `cockpit_inbox`, and tests all share one source of truth.
+- The refresher's project-keys provider always includes the sentinel, so the synthetic entry is computed on boot and on every full pass. `StateCacheRefresher._dispatch_event` invalidates `__workspace__` on every event in `_INVALIDATING_EVENTS` so workspace-root invalidations never lag the per-project ones.
+- The earlier `has_workspace_root_open_messages` probe and the forced fall-through it gated are **removed**. `_maybe_cache_route_awaits_user` / `_maybe_cache_count_awaits_user` now union the `__workspace__` entry with the per-project entries directly; the cache is authoritative for workspace-root rows.
+- The sentinel carries a **bounded-staleness TTL** (`WORKSPACE_ENTRY_TTL_SECONDS = 10s`). Several message-store paths (`PgStore.close_message`, `PgStore.clear_alert`, `service_api.v1.clear_alert`) mutate workspace-root awaits-user rows without emitting a state-cache audit event, so the refresher doesn't see those closes. The TTL caps the staleness window — once the sentinel ages past the TTL, the cache-read boundary falls through to the direct sweep. Full audit-event wiring for the message-store close/clear paths is deferred past v1 RC; the TTL is a documented bounded-staleness window, not an invariant.
 
 Design document for issue [#1664](https://github.com/samhotchkiss/pollypm/issues/1664).
 Status: **implemented** (2026-05-20) — PR 1 #2000, PR 2 #2016, PR 3 #2026, PR 4 #2029.

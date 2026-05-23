@@ -135,7 +135,14 @@ def _entry(
     detail: str = "",
     latest_heartbeat_by_session: dict[str, Any] | None = None,
     config_identity: str = "",
+    computed_at: float | None = None,
 ) -> ProjectStateCacheEntry:
+    """Build a test entry. ``computed_at`` defaults to ``time.monotonic()``
+    so the round-4 workspace TTL guard treats the entry as fresh; tests
+    that want a stale entry pass an explicit past-time value.
+    """
+
+    import time as _t
     return ProjectStateCacheEntry(
         project_key=project_key,
         project_path=Path(f"/tmp/{project_key}"),
@@ -152,6 +159,7 @@ def _entry(
         awaits_user_items=tuple(items),
         latest_heartbeat_by_session=dict(latest_heartbeat_by_session or {}),
         config_identity=config_identity,
+        computed_at=_t.monotonic() if computed_at is None else computed_at,
     )
 
 
@@ -164,10 +172,32 @@ def _seed_cache(
     Avoids spinning up the real refresher (which would tail the audit
     log dir and run the full per-project compute). The cache itself
     is the real class; only its entries are pre-baked.
+
+    #2051 (Codex review): the cache-read boundary now treats a snapshot
+    missing the synthetic ``__workspace__`` entry as INCOMPLETE and
+    falls through to the direct sweep. Round-3 of that review added a
+    second guard: a present-but-EMPTY ``__workspace__`` entry is also
+    treated as not-authoritative (bounded-staleness against message-
+    store writes that bypass audit-event invalidation). Tests that
+    want the fast-path must therefore seed a non-empty
+    ``__workspace__`` entry explicitly. Tests exercising the absent-
+    or empty-sentinel guards build the cache by hand below.
     """
 
     cache = ProjectStateCache(refresh_fn=lambda k: None)
-    for key, entry in entries.items():
+    seeded = dict(entries)
+    if "__workspace__" not in seeded and seeded:
+        # Auto-seed an empty workspace sentinel ONLY when the caller
+        # didn't provide one. With the round-3 bounded-staleness guard,
+        # this empty seed now triggers fall-through — so any test that
+        # relies on the fast-path firing must supply an explicit
+        # non-empty ``__workspace__`` entry. Kept here so legacy callers
+        # that don't care about the workspace sentinel still pass the
+        # absent-sentinel guard (the snapshot DOES contain the key).
+        seeded["__workspace__"] = _entry(
+            "__workspace__", state=None, items=[],
+        )
+    for key, entry in seeded.items():
         cache._install_for_test(key, entry)
     monkeypatch.setattr("pollypm.state_cache.is_enabled", lambda: True)
     monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
@@ -227,16 +257,30 @@ class TestAwaitsUserParity:
     def test_flag_on_with_populated_cache_uses_fast_path(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Cache fast-path returns identical content + skips the direct call."""
+        """Cache fast-path returns identical content + skips the direct call.
+
+        #2051 round-3 (Codex review): the cache-read boundary now also
+        falls through when ``__workspace__`` is present-but-empty
+        (bounded-staleness guard against message-store writes that
+        bypass audit-event invalidation). Seed a non-empty workspace
+        sentinel so the fast-path actually fires here.
+        """
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha", "beta", "gamma"], tmp_path)
-        _seed_cache(monkeypatch, self._entries_from_direct())
+        entries = self._entries_from_direct()
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-fast-path",
+        )
+        entries["__workspace__"] = _entry(
+            "__workspace__", state=None, items=[workspace_root],
+        )
+        _seed_cache(monkeypatch, entries)
 
         direct_called = {"n": 0}
 
         def _no_call(_cfg: Any) -> list[Any]:
             direct_called["n"] += 1
-            return self._direct_items()
+            return self._direct_items() + [workspace_root]
 
         monkeypatch.setattr(
             cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _no_call,
@@ -247,7 +291,9 @@ class TestAwaitsUserParity:
         # first call lands on counter==1 → no sample. So the direct
         # path stays untouched.
         assert direct_called["n"] == 0
-        matched, reason = compare_awaits_user_lists(result, self._direct_items())
+        matched, reason = compare_awaits_user_lists(
+            result, self._direct_items() + [workspace_root],
+        )
         assert matched, reason
 
     def test_flag_on_with_empty_cache_falls_through(
@@ -496,7 +542,21 @@ class TestDivergenceSampler:
             cache_item,
             _inbox_item(project="alpha", source="message", ident="m-extra"),
         ]
-        entries = {"alpha": _entry("alpha", state=ProjectState.WAITING, items=[cache_item])}
+        # #2051 round-3: seed a non-empty ``__workspace__`` entry so the
+        # bounded-staleness guard doesn't fall through before the
+        # sampler runs (we're testing the sampler, not the guard).
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-sampler",
+        )
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WAITING, items=[cache_item],
+            ),
+            "__workspace__": _entry(
+                "__workspace__", state=None, items=[workspace_root],
+            ),
+        }
+        direct_items.append(workspace_root)
         _seed_cache(monkeypatch, entries)
 
         # Force every call to sample by swapping in a rate-1 counter.
@@ -637,9 +697,19 @@ class TestInboxDefaultLensInvariant:
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         items = self._items()
         config = _make_config(["alpha", "beta"], tmp_path)
+        # #2051 round-3: include a workspace-root item via a non-empty
+        # ``__workspace__`` sentinel so the cache fast-path stays
+        # authoritative (an empty sentinel now triggers fall-through).
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-invariant",
+        )
+        items = items + [workspace_root]
         entries = {
             "alpha": _entry("alpha", state=ProjectState.WAITING, items=[items[0]]),
             "beta": _entry("beta", state=ProjectState.WAITING, items=[items[1]]),
+            "__workspace__": _entry(
+                "__workspace__", state=None, items=[workspace_root],
+            ),
         }
         _seed_cache(monkeypatch, entries)
         # The legacy TTL would clobber the cache-routed result; clear
@@ -675,10 +745,19 @@ class TestCountInboxTasksForLabelParity:
             _inbox_item(project="beta", source="message", ident="m-b1"),
         ]
         items_gamma: list[Any] = []
+        # #2051 round-3: non-empty ``__workspace__`` sentinel so the
+        # bounded-staleness guard doesn't fall through (we're proving
+        # the fast-path skips the workspace sweep here).
+        workspace_items = [
+            _inbox_item(project="inbox", source="message", ident="ws-root-count"),
+        ]
         entries = {
             "alpha": _entry("alpha", state=ProjectState.WAITING, items=items_alpha),
             "beta": _entry("beta", state=ProjectState.WAITING, items=items_beta),
             "gamma": _entry("gamma", state=ProjectState.IDLE, items=items_gamma),
+            "__workspace__": _entry(
+                "__workspace__", state=None, items=workspace_items,
+            ),
         }
         _seed_cache(monkeypatch, entries)
 
@@ -686,15 +765,18 @@ class TestCountInboxTasksForLabelParity:
 
         def _no_call(_cfg: Any) -> list[Any]:
             direct_called["n"] += 1
-            return items_alpha + items_beta + items_gamma
+            return (
+                items_alpha + items_beta + items_gamma + workspace_items
+            )
 
         monkeypatch.setattr(
             cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _no_call,
         )
 
         counted = cockpit_inbox._count_inbox_tasks_for_label(config)
-        # Three items total; the direct sweep wasn't touched.
-        assert counted == 3
+        # Four items total (3 per-project + 1 workspace-root); the
+        # direct sweep wasn't touched.
+        assert counted == 4
         assert direct_called["n"] == 0
 
     def test_flag_off_uses_direct_path(
@@ -1485,71 +1567,81 @@ class TestPr2026ReviewBlocker2HeartbeatNoStale:
 
 
 class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
-    """Blocker 3: workspace-root inbox messages (``scope IN ('', 'inbox')``)
-    are not represented in any per-project cache entry, so the cache
-    routes for awaits-user list + count MUST fall through to the
-    direct path whenever the workspace-root inbox is non-empty.
+    """Issue #2051: workspace-root inbox messages (``scope IN ('',
+    'inbox')``) now ride a synthetic ``__workspace__`` cache entry
+    emitted by the refresher. The cache fast-path MUST serve them
+    alongside per-project items — no more probe-driven fall-through.
+
+    These tests previously pinned the OPPOSITE behavior (forced
+    fall-through whenever the workspace-root probe saw a live row).
+    Flipped by #2051: the cache is authoritative for workspace-root
+    rows too. The ``_workspace_root_inbox_has_open`` probe + its
+    callers were removed.
     """
 
-    def test_workspace_root_message_forces_list_fallthrough(
+    def test_workspace_root_message_served_by_cache(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """A live workspace-root row → list cache declines, direct path runs.
-
-        Pinned to the cached vs direct equality: both MUST return the
-        same set of items (workspace-root included), proving the
-        fall-through is what carried the workspace row.
+        """List route returns workspace-root item from the ``__workspace__``
+        entry without touching the direct sweep.
         """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
 
-        # Per-project items the cache CAN represent.
+        # Per-project items live on the project's entry.
         per_project = [
             _inbox_item(project="alpha", source="task", ident="alpha/1"),
         ]
-        # The workspace-root item with project="inbox" — the cache
-        # CANNOT represent this (refresher filters by project_key only).
+        # Workspace-root items live on the synthetic ``__workspace__``
+        # entry the refresher emits for #2051.
         workspace_root = _inbox_item(
             project="inbox", source="message", ident="ws-root-1",
-        )
-        # And the workspace-root probe MUST see it (simulate pg row).
-        monkeypatch.setattr(
-            cockpit_inbox,
-            "_workspace_root_inbox_has_open",
-            lambda cfg: True,
         )
         entries = {
             "alpha": _entry(
                 "alpha", state=ProjectState.WAITING, items=per_project,
             ),
+            "__workspace__": _entry(
+                "__workspace__",
+                state=None,
+                items=[workspace_root],
+            ),
         }
         _seed_cache(monkeypatch, entries)
 
-        # Direct sweep returns BOTH (per-project + workspace-root).
-        direct_items = list(per_project) + [workspace_root]
+        # Direct sweep MUST NOT be called — the cache is now
+        # authoritative for workspace-root rows.
         direct_called = {"n": 0}
 
         def _direct(_cfg: Any) -> list[Any]:
             direct_called["n"] += 1
-            return list(direct_items)
+            return list(per_project) + [workspace_root]
 
         monkeypatch.setattr(
             cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
         )
+        # Pin the sampler off so the divergence sampler can't sneak in
+        # a direct read.
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         result = cockpit_inbox.pm_inbox_awaits_user_list(config)
-        assert direct_called["n"] == 1
-        # Workspace-root item is in the result (would have been
-        # silently dropped if we had stayed on the fast-path).
-        ids = {getattr(item, "message_id", None) or getattr(item, "task_id", None) for item in result}
+        assert direct_called["n"] == 0
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in result
+        }
+        # Both per-project AND workspace-root items are present.
         assert "ws-root-1" in ids
         assert "alpha/1" in ids
 
-    def test_workspace_root_message_forces_count_fallthrough(
+    def test_workspace_root_message_served_by_cache_count(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Same gate fires on the count helper — sums match direct len()."""
+        """Count helper sums per-project AND ``__workspace__`` entries
+        directly from the snapshot — no direct sweep.
+        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
@@ -1559,57 +1651,199 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         workspace_root = _inbox_item(
             project="inbox", source="message", ident="ws-root-2",
         )
-        monkeypatch.setattr(
-            cockpit_inbox,
-            "_workspace_root_inbox_has_open",
-            lambda cfg: True,
-        )
         entries = {
             "alpha": _entry(
                 "alpha", state=ProjectState.WAITING, items=per_project,
             ),
+            "__workspace__": _entry(
+                "__workspace__",
+                state=None,
+                items=[workspace_root],
+            ),
         }
         _seed_cache(monkeypatch, entries)
 
-        direct_items = list(per_project) + [workspace_root]
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [workspace_root]
+
         monkeypatch.setattr(
             cockpit_inbox,
             "_pm_inbox_awaits_user_list_uncached",
-            lambda cfg: list(direct_items),
+            _direct,
         )
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         counted = cockpit_inbox._count_inbox_tasks_for_label(config)
-        # Cache would have returned 1 (only alpha); fall-through gives 2.
+        assert direct_called["n"] == 0
+        # Per-project + workspace-root counts both contribute.
         assert counted == 2
 
-    def test_workspace_root_empty_keeps_cache_fast_path(
+    def test_no_workspace_entry_falls_through_to_direct_sweep(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Empty workspace-root → cache fast-path stays available."""
+        """Snapshot without a ``__workspace__`` entry — the cache MUST
+        fall through to the direct sweep (Codex review of #2051).
+
+        Inverted from the original ``…_still_serves_per_project_via_cache``
+        test which pinned the OPPOSITE behavior. The invariant is:
+        a snapshot missing the synthetic ``__workspace__`` sentinel is
+        an INCOMPLETE cache, not a proven-empty workspace inbox.
+        Serving the per-project items alone would silently drop any
+        workspace-root awaits-user rows the sentinel was supposed to
+        carry. Producers that bypass the audit-event invalidation path
+        (message-store alert/notification writes today) MUST be picked
+        up by the direct sweep.
+        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
         per_project = [
             _inbox_item(project="alpha", source="task", ident="alpha/1"),
         ]
+        # Critically: no ``__workspace__`` entry. Build the cache by
+        # hand to bypass ``_seed_cache``'s auto-sentinel — this test
+        # exists precisely to exercise the absent-sentinel guard.
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry("alpha", state=ProjectState.WAITING, items=per_project),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        direct_called = {"n": 0}
+        # Simulate the worst case: the workspace-root sweep finds a row
+        # the cache snapshot has no idea about.
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-missed",
+        )
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [workspace_root]
+
+        monkeypatch.setattr(
+            cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
+        )
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        result = cockpit_inbox.pm_inbox_awaits_user_list(config)
+        # Direct sweep MUST have run — the cache-read boundary refused
+        # the incomplete snapshot.
+        assert direct_called["n"] == 1
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in result
+        }
+        # The workspace-root row the cache missed is now in the result.
+        assert "ws-root-missed" in ids
+        assert "alpha/1" in ids
+
+    def test_no_workspace_entry_count_falls_through_to_direct_sweep(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Count helper mirrors the list-helper guard (Codex review of #2051).
+
+        Snapshot without ``__workspace__`` → fall through to the direct
+        sweep so the rail badge can't silently drop a workspace-root
+        row.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # Same hand-rolled bypass as the sibling list test — auto-seed
+        # would mask the absent-sentinel behavior we're pinning.
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry("alpha", state=ProjectState.WAITING, items=per_project),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
+        direct_called = {"n": 0}
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-missed-count",
+        )
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [workspace_root]
+
         monkeypatch.setattr(
             cockpit_inbox,
-            "_workspace_root_inbox_has_open",
-            lambda cfg: False,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
         )
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.WAITING, items=per_project,
-            ),
-        }
-        _seed_cache(monkeypatch, entries)
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        # Direct sweep ran via the list fall-through; count == 2.
+        assert direct_called["n"] >= 1
+        assert counted == 2
 
-        # Pin the sampler off so the divergence-comparator path
-        # doesn't masquerade as a fall-through. Earlier tests in this
-        # module may have swapped in a rate-1 counter that would
-        # sample every call; restore a fresh default-rate counter.
-        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
-        # Direct sweep MUST NOT be called.
+    def test_fresh_empty_workspace_entry_serves_zero_from_cache(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Round-5 Codex review of #2051: a fresh EMPTY ``__workspace__``
+        sentinel is the steady state for most workspaces — the cache
+        fast-path MUST serve it.
+
+        Round-3 added an always-fall-through on present-but-empty
+        sentinels; round-4 added a TTL guard. Codex round-5 observed
+        that the TTL alone covers the staleness invariant (empty +
+        stale falls through), so the round-3 fall-through defeats the
+        fast path in the common case (workspaces with zero
+        workspace-root awaits-user rows). This test pins the round-5
+        contract: a fresh empty sentinel returns just the per-project
+        items (no workspace contribution) and the direct sweep is NOT
+        invoked.
+        """
+
+        import time as _t
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # Hand-roll the cache so the empty ``__workspace__`` sentinel
+        # is exactly what the refresher would install after computing
+        # zero workspace-root rows — stamped fresh (well inside TTL).
+        fresh_at = _t.monotonic()
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=per_project,
+                computed_at=fresh_at,
+            ),
+        )
+        cache._install_for_test(
+            "__workspace__",
+            _entry(
+                "__workspace__",
+                state=None,
+                items=[],
+                computed_at=fresh_at,
+            ),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
         direct_called = {"n": 0}
 
         def _direct(_cfg: Any) -> list[Any]:
@@ -1617,358 +1851,436 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
             return list(per_project)
 
         monkeypatch.setattr(
-            cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
         )
+        # Pin the divergence sampler off — its random direct call would
+        # blur the "did the cache fast-path fire" assertion.
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+
+        # Direct contract: the list helper MUST return the per-project
+        # items only (zero workspace contribution) — NOT None.
+        routed = cockpit_inbox._maybe_cache_route_awaits_user(config)
+        assert routed is not None
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in routed
+        }
+        assert ids == {"alpha/1"}
+
+        # Count helper served from cache as 1 (per-project only).
+        cached_count = cockpit_inbox._maybe_cache_count_awaits_user(config)
+        assert cached_count == 1
+
+        # Direct sweep was NOT invoked — the fast-path served both
+        # helpers from the snapshot (this is the round-5 fix).
+        assert direct_called["n"] == 0
+
+    def test_stale_empty_workspace_entry_falls_through_after_ttl(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Round-5 Codex review of #2051: an EMPTY ``__workspace__``
+        sentinel past its TTL is NOT authoritative.
+
+        Mirrors :func:`test_stale_non_empty_workspace_entry_falls_through_after_ttl`
+        for the empty case — message-store writes (alerts,
+        notifications, ``pm notify`` workspace-root rows) can land
+        AFTER the sentinel's last refresh without emitting an
+        invalidating audit event, so once the empty sentinel ages
+        past the TTL both helpers MUST fall through to the direct
+        sweep and surface the late-arriving row.
+
+        This pins the staleness invariant in the round-5 simplified
+        model: TTL alone covers it (empty + stale → fall through;
+        empty + fresh → serve zero, which is the correct fast-path
+        behavior).
+        """
+
+        import time as _t
+        from pollypm.state_cache.entry import (
+            WORKSPACE_ENTRY_TTL_SECONDS,
+        )
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # Stamp the empty sentinel well beyond the TTL.
+        stale_at = _t.monotonic() - (WORKSPACE_ENTRY_TTL_SECONDS + 20.0)
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=per_project,
+                computed_at=_t.monotonic(),
+            ),
+        )
+        cache._install_for_test(
+            "__workspace__",
+            _entry(
+                "__workspace__",
+                state=None,
+                items=[],
+                computed_at=stale_at,
+            ),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
+        # Simulate a workspace-root message-store write that landed
+        # AFTER the refresher stamped the empty sentinel. The direct
+        # sweep MUST be invoked to find it.
+        late_arrival = _inbox_item(
+            project="inbox", source="message", ident="ws-root-late",
+        )
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [late_arrival]
+
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
+        )
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+
+        # Direct contract: BOTH cache-routed helpers MUST decline
+        # (return None) when the empty sentinel is past its TTL.
+        assert (
+            cockpit_inbox._maybe_cache_route_awaits_user(config) is None
+        )
+        assert (
+            cockpit_inbox._maybe_cache_count_awaits_user(config) is None
+        )
+
+        # Integrated contract: the public list helper falls through
+        # to the direct sweep and surfaces the late-arriving row.
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         result = cockpit_inbox.pm_inbox_awaits_user_list(config)
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in result
+        }
+        assert "ws-root-late" in ids
+        assert "alpha/1" in ids
+        assert direct_called["n"] >= 1
+
+        # Count helper mirrors.
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        before = direct_called["n"]
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        assert counted == 2
+        assert direct_called["n"] > before
+
+    def test_fresh_empty_workspace_entry_with_create_after_refresh_within_ttl(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Round-5 Codex review of #2051: documents the TTL trade-off.
+
+        Codex round-3 worried that an empty + fresh sentinel could
+        miss a workspace-root row that was created AFTER the refresh
+        but BEFORE the TTL expires. Round-5 accepts this bounded
+        staleness as the documented contract: within the TTL window
+        the cache MAY serve stale (zero), and that is acceptable per
+        the same trade-off accepted for non-empty stale entries in
+        round-4. The TTL caps the staleness window; full audit-event
+        wiring for workspace-root producers is deferred past v1 RC.
+
+        This test pins that contract: with a fresh empty sentinel,
+        even though a late row exists in the message store, the cache
+        fast-path serves zero (per-project items only) and does NOT
+        invoke the direct sweep.
+        """
+
+        import time as _t
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # Fresh empty sentinel — refresher just installed it.
+        fresh_at = _t.monotonic()
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=per_project,
+                computed_at=fresh_at,
+            ),
+        )
+        cache._install_for_test(
+            "__workspace__",
+            _entry(
+                "__workspace__",
+                state=None,
+                items=[],
+                computed_at=fresh_at,
+            ),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
+        # A workspace-root row exists in the underlying store but has
+        # NOT yet been refreshed into the cache. The TTL contract
+        # tolerates this — within the TTL window the cache may serve
+        # stale zero. We pin that behaviour here.
+        late_arrival = _inbox_item(
+            project="inbox", source="message", ident="ws-root-late",
+        )
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [late_arrival]
+
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
+        )
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+
+        # The fresh empty sentinel MUST be served (TTL contract).
+        routed = cockpit_inbox._maybe_cache_route_awaits_user(config)
+        assert routed is not None
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in routed
+        }
+        # Late arrival is NOT included — the cache served stale zero.
+        assert ids == {"alpha/1"}
+        assert "ws-root-late" not in ids
+
+        # Count helper agrees.
+        cached_count = cockpit_inbox._maybe_cache_count_awaits_user(config)
+        assert cached_count == 1
+
+        # Direct sweep was NOT invoked. This is the documented
+        # bounded-staleness behaviour: within ``WORKSPACE_ENTRY_TTL_SECONDS``
+        # the cache fast-path serves what it knows. Past the TTL the
+        # sibling
+        # ``test_stale_empty_workspace_entry_falls_through_after_ttl``
+        # proves the fall-through fires.
         assert direct_called["n"] == 0
-        assert len(result) == 1
 
-
-class TestPr2026V3WorkspaceRootProbeUnbounded:
-    """PR #2026 v3 (Codex blocker 1): the workspace-root probe must NOT
-    depend on row recency. The old implementation called
-    ``open_messages(limit=50)`` and Python-scanned for ``scope IN ('',
-    'inbox')``; with 50+ newer project-scoped rows + 1 older
-    workspace-root row, the probe returned False and the cache silently
-    dropped the workspace work.
-
-    The fix adds a dedicated SQL existence query
-    (``cockpit_pg_aggregates.has_workspace_root_open_messages``) with
-    a workspace-root predicate + ``LIMIT 1`` — independent of how many
-    newer non-workspace rows exist.
-
-    This test calls the REAL ``_workspace_root_inbox_has_open`` (no
-    monkeypatch on that function) against a fake pg_pool that simulates
-    the bug scenario.
-    """
-
-    def test_workspace_root_row_under_50_newer_rows_is_still_seen(
+    def test_stale_non_empty_workspace_entry_falls_through_after_ttl(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Seed pg with 50 newer project-scoped rows + 1 older
-        workspace-root row; the SQL existence query MUST return True.
+        """Round-4 Codex review of #2051: a NON-EMPTY ``__workspace__``
+        entry stamped before the TTL window is NOT authoritative.
+
+        Round-3 closed the empty-sentinel hole but left a residual:
+        ``PgStore.close_message`` / ``PgStore.clear_alert`` /
+        ``service_api.v1.clear_alert`` can close a workspace-root
+        row AFTER the refresher cached it. Those paths write
+        ``messages``-table events, not state-cache audit events, so
+        ``StateCacheRefresher._dispatch_event`` never sees the close
+        and the cached row stays "open" until the next full refresh.
+
+        The bounded-staleness TTL on the workspace sentinel
+        (``WORKSPACE_ENTRY_TTL_SECONDS``) caps that staleness. Once
+        the entry ages past the TTL the cache MUST decline and the
+        direct sweep MUST run — surfacing whatever the message-store
+        actually contains, not the stale snapshot.
         """
 
-        config = _make_config(["alpha"], tmp_path)
-
-        # Track which SQL was executed so the assertion proves the
-        # workspace-root existence query (not the legacy newest-50
-        # scan) is what gave the True answer.
-        executed: list[tuple[str, tuple[Any, ...]]] = []
-
-        class _FakeCursor:
-            def __init__(self) -> None:
-                self._result: list[tuple[Any, ...]] = []
-
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, sql: str, params: Any) -> None:
-                executed.append((sql, tuple(params)))
-                # Workspace-root probe: predicate includes the
-                # ``scope = '' OR scope IS NULL OR scope = 'inbox'``
-                # branch + a ``LIMIT 1``. Return one row.
-                if "scope = 'inbox'" in sql and "LIMIT 1" in sql:
-                    self._result = [(1,)]
-                    return
-                # Anything else (e.g. the legacy newest-N scan) —
-                # return 50 project-scoped rows so the OLD code
-                # would have missed the workspace-root row entirely.
-                self._result = [
-                    (i, "alpha", "notify", "info", "user", "sender",
-                     "open", "subj", "body", {}, [], "kind",
-                     None, None, None)
-                    for i in range(50)
-                ]
-
-            def fetchone(self) -> Any:
-                return self._result[0] if self._result else None
-
-            def fetchall(self) -> list[tuple[Any, ...]]:
-                return list(self._result)
-
-            @property
-            def description(self) -> list[Any]:
-                return [SimpleNamespace(name=n) for n in (
-                    "id", "scope", "type", "tier", "recipient",
-                    "sender", "state", "subject", "body",
-                    "payload_json", "labels", "kind",
-                    "created_at", "updated_at", "closed_at",
-                )]
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
-
-        def _fake_get_ro_pool(_cfg: Any) -> _FakePool:
-            return _FakePool()
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", _fake_get_ro_pool,
+        import time as _t
+        from pollypm.state_cache.entry import (
+            WORKSPACE_ENTRY_TTL_SECONDS,
         )
-
-        # Call the REAL function (no monkeypatch on _workspace_root_inbox_has_open).
-        assert cockpit_inbox._workspace_root_inbox_has_open(config) is True
-
-        # Prove the SQL the function executed was the bounded-1
-        # existence query, not the legacy newest-N scan.
-        assert executed, "fake pg pool was never queried"
-        executed_sqls = [sql for sql, _params in executed]
-        assert any(
-            "scope = 'inbox'" in sql and "LIMIT 1" in sql
-            for sql in executed_sqls
-        ), (
-            f"workspace-root probe should issue a LIMIT-1 existence "
-            f"query; saw {executed_sqls!r}"
-        )
-
-    def test_real_probe_drives_cache_fall_through(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """The probe's True answer MUST flip
-        ``_maybe_cache_route_awaits_user`` to fall through to direct.
-        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
-
-        class _FakeCursor:
-            def __init__(self) -> None:
-                self._result: list[tuple[Any, ...]] = []
-
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, sql: str, params: Any) -> None:
-                if "LIMIT 1" in sql:
-                    self._result = [(1,)]
-                else:
-                    self._result = []
-
-            def fetchone(self) -> Any:
-                return self._result[0] if self._result else None
-
-            def fetchall(self) -> list[tuple[Any, ...]]:
-                return list(self._result)
-
-            @property
-            def description(self) -> list[Any]:
-                return [SimpleNamespace(name="x")]
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # The cached workspace row that the refresher last computed.
+        # Simulates the state right before someone closed it.
+        cached_workspace_row = _inbox_item(
+            project="inbox",
+            source="message",
+            ident="ws-root-closed-after-refresh",
         )
-
-        # Seed a populated cache for alpha. No monkeypatch on
-        # _workspace_root_inbox_has_open — it executes the REAL pg
-        # path against the fake pool above and returns True.
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.IDLE, items=[],
+        # Stamp the entry well beyond the TTL — this is the staleness
+        # that round-4 closes.
+        stale_at = _t.monotonic() - (WORKSPACE_ENTRY_TTL_SECONDS + 20.0)
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=per_project,
+                computed_at=_t.monotonic(),
             ),
-        }
-        _seed_cache(monkeypatch, entries)
-
-        # The fast-path MUST decline so the direct sweep can carry
-        # the workspace-root row.
-        assert cockpit_inbox._maybe_cache_route_awaits_user(config) is None
-
-    # ── PR #2026 v6 regression tests (Codex round-6 blocker) ──────────
-    #
-    # The v5 helper returns True on pool/query failure to keep the cache
-    # authoritative-or-deferred. These tests pin that contract end-to-end:
-    # (1) the helper itself returns True on each failure mode, and
-    # (2) the failure flows through _maybe_cache_{route,count}_awaits_user
-    # as a fall-through (cache declines).
-
-    def test_pool_open_failure_returns_true_conservative(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """``has_workspace_root_open_messages`` must return True when the
-        pg pool cannot be opened — conservative-on-failure contract.
-        """
-
-        from pollypm import cockpit_pg_aggregates
-
-        config = _make_config(["alpha"], tmp_path)
-
-        def _boom_ro(_cfg: Any) -> Any:
-            raise RuntimeError("ro pool unavailable")
-
-        def _boom_rw(_cfg: Any) -> Any:
-            raise RuntimeError("rw pool unavailable")
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", _boom_ro,
+        )
+        cache._install_for_test(
+            "__workspace__",
+            _entry(
+                "__workspace__",
+                state=None,
+                items=[cached_workspace_row],
+                computed_at=stale_at,
+            ),
         )
         monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_rw_pool", _boom_rw,
+            "pollypm.state_cache.is_enabled", lambda: True,
         )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
 
+        # The direct sweep returns a DIFFERENT view — the stale cached
+        # row is gone (a close landed) and a new row arrived. Both
+        # divergences MUST surface in the routed helpers, proving the
+        # cache declined.
+        new_workspace_row = _inbox_item(
+            project="inbox",
+            source="message",
+            ident="ws-root-new",
+        )
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [new_workspace_row]
+
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
+        )
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+
+        # Direct contract: BOTH cache-routed helpers MUST decline (return
+        # None) when the workspace sentinel is past its TTL.
         assert (
-            cockpit_pg_aggregates.has_workspace_root_open_messages(config)
-            is True
+            cockpit_inbox._maybe_cache_route_awaits_user(config) is None
         )
-
-    def test_query_failure_returns_true_conservative(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """Pool open succeeds but ``cur.execute()`` raises — the helper
-        must still return True (conservative).
-        """
-
-        from pollypm import cockpit_pg_aggregates
-
-        config = _make_config(["alpha"], tmp_path)
-
-        class _FakeCursor:
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, _sql: str, _params: Any) -> None:
-                raise RuntimeError("query exploded")
-
-            def fetchone(self) -> Any:
-                return None
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
-        )
-
         assert (
-            cockpit_pg_aggregates.has_workspace_root_open_messages(config)
-            is True
+            cockpit_inbox._maybe_cache_count_awaits_user(config) is None
         )
 
-    def test_pool_failure_drives_cache_fall_through(
+        # Integrated contract: the public list helper surfaces the
+        # direct-sweep result (the NEW row), not the stale cached row.
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        result = cockpit_inbox.pm_inbox_awaits_user_list(config)
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in result
+        }
+        assert "ws-root-new" in ids
+        assert "ws-root-closed-after-refresh" not in ids
+        assert "alpha/1" in ids
+        assert direct_called["n"] >= 1
+
+        # Count helper mirrors: it sums the direct sweep (2), NOT the
+        # cached snapshot (which would also have summed to 2 here but
+        # via the wrong row — the proof is that the direct sweep ran).
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        before = direct_called["n"]
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        assert counted == 2
+        assert direct_called["n"] > before
+
+    def test_fresh_non_empty_workspace_entry_serves_from_cache(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Pool failure → wrapper returns True → ``_maybe_cache_route_awaits_user``
-        declines so the direct sweep carries any uncached awaits-user work.
+        """Round-4 Codex review of #2051 — happy path.
+
+        A non-empty workspace sentinel stamped INSIDE the TTL window
+        is still authoritative: the cache fast-path serves it and the
+        direct sweep does NOT run (modulo the divergence sampler,
+        which we disable for this assertion). This pins the trade-off
+        the TTL was sized for — short bursts of consumer reads stay
+        on the cache fast-path.
         """
+
+        import time as _t
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
-
-        def _boom_ro(_cfg: Any) -> Any:
-            raise RuntimeError("ro pool unavailable")
-
-        def _boom_rw(_cfg: Any) -> Any:
-            raise RuntimeError("rw pool unavailable")
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", _boom_ro,
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        fresh_workspace_row = _inbox_item(
+            project="inbox", source="message", ident="ws-root-fresh",
         )
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_rw_pool", _boom_rw,
-        )
-
-        # Cache seeded with an uncached-style entry — the only way the
-        # fast-path can decline is via the workspace-root guard, which
-        # depends on the failing probe.
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.IDLE, items=[],
+        # Stamp the entry as JUST refreshed — well inside the TTL.
+        fresh_at = _t.monotonic()
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=per_project,
+                computed_at=fresh_at,
             ),
-        }
-        _seed_cache(monkeypatch, entries)
+        )
+        cache._install_for_test(
+            "__workspace__",
+            _entry(
+                "__workspace__",
+                state=None,
+                items=[fresh_workspace_row],
+                computed_at=fresh_at,
+            ),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
 
-        assert cockpit_inbox._maybe_cache_route_awaits_user(config) is None
+        direct_called = {"n": 0}
 
-    def test_query_failure_drives_count_fall_through(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """Query failure → wrapper returns True → ``_maybe_cache_count_awaits_user``
-        declines so the rail badge falls back to the direct sweep.
-        """
-
-        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
-        config = _make_config(["alpha"], tmp_path)
-
-        class _FakeCursor:
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, _sql: str, _params: Any) -> None:
-                raise RuntimeError("query exploded")
-
-            def fetchone(self) -> Any:
-                return None
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [fresh_workspace_row]
 
         monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
         )
+        # Pin the divergence sampler off — its random direct call would
+        # blur the "did the cache fast-path fire" assertion.
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
 
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.IDLE, items=[],
-            ),
+        # The cache-route helper MUST return a list (cache served it),
+        # not None — proving the TTL guard passed.
+        routed = cockpit_inbox._maybe_cache_route_awaits_user(config)
+        assert routed is not None
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in routed
         }
-        _seed_cache(monkeypatch, entries)
-
-        assert cockpit_inbox._maybe_cache_count_awaits_user(config) is None
+        assert "ws-root-fresh" in ids
+        assert "alpha/1" in ids
+        # Count helper served from cache too.
+        cached_count = cockpit_inbox._maybe_cache_count_awaits_user(config)
+        assert cached_count == 2
+        # Direct sweep was NOT invoked — the fast-path served both
+        # helpers from the snapshot.
+        assert direct_called["n"] == 0

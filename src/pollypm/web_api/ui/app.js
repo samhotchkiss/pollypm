@@ -20,12 +20,22 @@
   const MAX_MESSAGES = 50;
   const SESSION_ISSUED_COOKIE = "pollypm-session-issued-at";
   const SESSION_EXPIRY_WARNING_MS = 6 * 24 * 60 * 60 * 1000;
+  const TASK_RAIL_LIMIT = 200;
+  const AUDIT_LIMIT = 25;
 
   const state = {
     surfaces: [],
+    taskSurfaces: [],
+    taskLoadError: null,
+    selectedKind: null,
     selectedSurface: null,
+    selectedTaskKey: null,
     messageTimer: null,
     sessionExpiryDismissed: false,
+    auditExpanded: {},
+    auditEntries: {},
+    auditErrors: {},
+    auditLoading: {},
     surfaceMidStream: {},
     surfaceFilter: "",
   };
@@ -175,16 +185,154 @@
     return resp.json();
   }
 
+  async function apiJsonOptional(path) {
+    const resp = await fetch(path, {
+      credentials: "include",
+      headers: { "Accept": "application/json" },
+    });
+    if (resp.status === 401) {
+      setStatus("error", "auth required");
+      showAuthGate();
+      throw new Error("unauthorized");
+    }
+    if (!resp.ok) {
+      let body = null;
+      try { body = await resp.json(); } catch (e) { /* ignore */ }
+      const detail = body && body.error
+        ? body.error.message || body.error.code
+        : ("HTTP " + resp.status);
+      throw new Error(detail);
+    }
+    return resp.json();
+  }
+
   // ----- surfaces (left rail) --------------------------------------------
 
   async function loadSurfaces() {
     try {
       const data = await apiJson(API + "/chat/sessions");
       state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
-      renderSurfaces();
     } catch (err) {
       renderSurfaceError(err);
+      return;
     }
+
+    state.taskLoadError = null;
+    try {
+      const taskData = await apiJsonOptional(
+        API + "/tasks?limit=" + TASK_RAIL_LIMIT,
+      );
+      const items = Array.isArray(taskData.items) ? taskData.items : [];
+      state.taskSurfaces = items.map(normalizeTaskSurface);
+    } catch (err) {
+      state.taskSurfaces = [];
+      state.taskLoadError = err;
+    }
+    renderSurfaces();
+  }
+
+  function normalizeTaskSurface(task) {
+    const project = task.project || "";
+    const number = task.task_number == null ? "" : String(task.task_number);
+    const key = project && number ? project + "/" + number
+      : task.task_id || task.title || "task";
+    return {
+      key: key,
+      task_id: task.task_id || "",
+      project: project,
+      task_number: number,
+      title: task.title || key,
+      work_status: task.work_status || "unknown",
+      type: task.type || "task",
+      priority: task.priority || "",
+      assignee: task.assignee || "",
+      updated_at: task.updated_at || "",
+    };
+  }
+
+  function taskDotClass(status) {
+    if (status === "in_progress" || status === "rework") return "present";
+    if (status === "queued" || status === "review") return "waiting";
+    if (status === "blocked" || status === "on_hold") return "dead";
+    if (status === "done") return "done";
+    if (status === "cancelled") return "dead";
+    return "";
+  }
+
+  function appendRailGroup(list, label) {
+    list.appendChild(el("li", { class: "surface-group", text: label }));
+  }
+
+  function renderChatSurfaceItem(list, s) {
+    const dotClass =
+      s.window && s.window.pane_dead
+        ? "surface-dot dead"
+        : s.window && s.window.present
+          ? "surface-dot present"
+          : "surface-dot";
+    const labelParts = [];
+    if (s.surface_type) labelParts.push(s.surface_type);
+    if (s.persona && s.persona !== s.surface_type) labelParts.push(s.persona);
+    if (s.project) labelParts.push(s.project);
+    const li = el(
+      "li",
+      {
+        "data-session": s.session_name,
+        "class": (
+          state.selectedKind === "chat"
+          && state.selectedSurface === s.session_name
+        ) ? "active" : "",
+      },
+      [
+        el("span", { class: "surface-name" }, [
+          el("span", { class: dotClass }),
+          document.createTextNode(s.session_name),
+        ]),
+        el("span", {
+          class: "surface-meta",
+          text: labelParts.join(" · ") || "—",
+        }),
+      ],
+    );
+    li.addEventListener("click", () => selectSurface(s.session_name));
+    list.appendChild(li);
+  }
+
+  function renderTaskSurfaceItem(list, task) {
+    const meta = [
+      "task",
+      task.work_status,
+      task.project,
+    ].filter(Boolean);
+    if (task.assignee) meta.push("@" + task.assignee);
+    const li = el(
+      "li",
+      {
+        "data-task": task.key,
+        "class": (
+          "task-surface "
+          + (
+            state.selectedKind === "task"
+            && state.selectedTaskKey === task.key
+              ? "active" : ""
+          )
+        ).trim(),
+      },
+      [
+        el("span", { class: "surface-name" }, [
+          el("span", {
+            class: ("surface-dot " + taskDotClass(task.work_status)).trim(),
+          }),
+          document.createTextNode(task.title),
+        ]),
+        el("span", {
+          class: "surface-meta",
+          text: meta.join(" · "),
+        }),
+      ],
+    );
+    li.addEventListener("click", () => selectTask(task.key));
+    list.appendChild(li);
   }
 
   function renderSurfaces() {
@@ -196,48 +344,45 @@
         String(s.session_name || "").toLowerCase().includes(filter)
       ))
       : state.surfaces;
-    if (state.surfaces.length === 0) {
+    const taskSurfaces = filter
+      ? state.taskSurfaces.filter((task) => (
+        String(task.key || "").toLowerCase().includes(filter)
+        || String(task.title || "").toLowerCase().includes(filter)
+        || String(task.project || "").toLowerCase().includes(filter)
+        || String(task.work_status || "").toLowerCase().includes(filter)
+        || String(task.assignee || "").toLowerCase().includes(filter)
+      ))
+      : state.taskSurfaces;
+    const hasRegistered = (
+      state.surfaces.length > 0
+      || state.taskSurfaces.length > 0
+      || state.taskLoadError
+    );
+    if (!hasRegistered) {
       list.appendChild(
         el("li", { class: "surface-empty", text: "no surfaces registered" }),
       );
       return;
     }
-    if (surfaces.length === 0) {
+    if (surfaces.length === 0 && taskSurfaces.length === 0 && !state.taskLoadError) {
       list.appendChild(
         el("li", { class: "surface-empty", text: "no matching surfaces" }),
       );
       return;
     }
-    for (const s of surfaces) {
-      const dotClass =
-        s.window && s.window.pane_dead
-          ? "surface-dot dead"
-          : s.window && s.window.present
-            ? "surface-dot present"
-            : "surface-dot";
-      const labelParts = [];
-      if (s.surface_type) labelParts.push(s.surface_type);
-      if (s.persona && s.persona !== s.surface_type) labelParts.push(s.persona);
-      if (s.project) labelParts.push(s.project);
-      const li = el(
-        "li",
-        {
-          "data-session": s.session_name,
-          "class": state.selectedSurface === s.session_name ? "active" : "",
-        },
-        [
-          el("span", { class: "surface-name" }, [
-            el("span", { class: dotClass }),
-            document.createTextNode(s.session_name),
-          ]),
-          el("span", {
-            class: "surface-meta",
-            text: labelParts.join(" · ") || "—",
-          }),
-        ],
-      );
-      li.addEventListener("click", () => selectSurface(s.session_name));
-      list.appendChild(li);
+    if (surfaces.length > 0) {
+      appendRailGroup(list, "Chat surfaces");
+      for (const s of surfaces) renderChatSurfaceItem(list, s);
+    }
+    if (taskSurfaces.length > 0 || state.taskLoadError) {
+      appendRailGroup(list, "Tasks");
+      for (const task of taskSurfaces) renderTaskSurfaceItem(list, task);
+      if (state.taskLoadError) {
+        list.appendChild(el("li", {
+          class: "surface-empty",
+          text: "tasks unavailable: " + state.taskLoadError.message,
+        }));
+      }
     }
   }
 
@@ -250,7 +395,9 @@
   }
 
   function selectSurface(name) {
+    state.selectedKind = "chat";
     state.selectedSurface = name;
+    state.selectedTaskKey = null;
     $("pane-title").textContent = name;
     $("pane-meta").textContent = "";
     $("send-input").disabled = false;
@@ -258,7 +405,214 @@
     updateStopAgentButton();
     renderSurfaces();
     loadHistory(name);
+    if (state.auditExpanded[name]) loadAuditForSurface(name);
     schedulePoll();
+  }
+
+  function selectTask(key) {
+    const task = state.taskSurfaces.find((item) => item.key === key);
+    if (!task) return;
+    state.selectedKind = "task";
+    state.selectedSurface = null;
+    state.selectedTaskKey = key;
+    if (state.messageTimer) clearInterval(state.messageTimer);
+    state.messageTimer = null;
+    $("pane-title").textContent = task.key;
+    $("pane-meta").textContent = [
+      task.work_status,
+      task.type,
+      task.priority,
+    ].filter(Boolean).join(" · ");
+    $("send-input").disabled = true;
+    $("send-button").disabled = true;
+    updateStopAgentButton();
+    renderSurfaces();
+    renderTaskSummary(task);
+    loadTaskDetail(task);
+  }
+
+  function renderTaskSummary(task, detail) {
+    const data = detail || task;
+    const list = $("message-list");
+    list.innerHTML = "";
+    const rows = [
+      ["Status", data.work_status],
+      ["Project", data.project],
+      ["Task", data.task_number],
+      ["Assignee", data.assignee],
+      ["Priority", data.priority],
+      ["Updated", data.updated_at],
+    ].filter((row) => row[1] != null && row[1] !== "");
+    const children = [
+      el("div", { class: "task-detail-title", text: data.title || task.title }),
+    ];
+    if (data.description) {
+      children.push(el("div", {
+        class: "task-detail-description",
+        text: data.description,
+      }));
+    }
+    for (const row of rows) {
+      children.push(el("div", { class: "task-detail-row" }, [
+        el("span", { class: "task-detail-label", text: row[0] }),
+        el("span", { class: "task-detail-value", text: String(row[1]) }),
+      ]));
+    }
+    if (data.acceptance_criteria) {
+      children.push(el("div", {
+        class: "task-detail-description",
+        text: data.acceptance_criteria,
+      }));
+    }
+    list.appendChild(el("div", { class: "task-detail" }, children));
+  }
+
+  async function loadTaskDetail(task) {
+    if (!task.project || !task.task_number) return;
+    try {
+      const path = API + "/tasks/" + encodeURIComponent(task.project)
+        + "/" + encodeURIComponent(task.task_number);
+      const detail = await apiJson(path);
+      if (
+        state.selectedKind === "task"
+        && state.selectedTaskKey === task.key
+      ) {
+        renderTaskSummary(task, detail);
+      }
+    } catch (err) {
+      if (
+        state.selectedKind === "task"
+        && state.selectedTaskKey === task.key
+      ) {
+        const list = $("message-list");
+        list.appendChild(el("div", {
+          class: "error-banner",
+          text: "task detail error: " + err.message,
+        }));
+      }
+    }
+  }
+
+  function surfaceByName(name) {
+    return state.surfaces.find((s) => s.session_name === name) || null;
+  }
+
+  function auditPatternForSurface(surface, name) {
+    if (
+      surface
+      && surface.surface_type === "worker"
+      && surface.project
+      && surface.task_id != null
+    ) {
+      return surface.project + "/" + surface.task_id;
+    }
+    return name;
+  }
+
+  function auditPathForSurface(name) {
+    const surface = surfaceByName(name);
+    const params = new URLSearchParams();
+    params.set("limit", String(AUDIT_LIMIT));
+    params.set("since", "7d");
+    params.set("pattern", auditPatternForSurface(surface, name));
+    if (surface && surface.project) params.set("project", surface.project);
+    return API + "/audit/grep?" + params.toString();
+  }
+
+  function auditSummary(entry) {
+    const parts = [entry.event || "audit"];
+    if (entry.subject) parts.push(entry.subject);
+    if (entry.status) parts.push(entry.status);
+    if (entry.actor) parts.push("by " + entry.actor);
+    return parts.join(" · ");
+  }
+
+  function removeExistingAuditPanel(list) {
+    const existing = list.querySelector(".audit-panel");
+    if (existing) existing.remove();
+  }
+
+  function renderAuditPanel(name) {
+    if (!name) return;
+    const list = $("message-list");
+    removeExistingAuditPanel(list);
+    const expanded = Boolean(state.auditExpanded[name]);
+    const entries = state.auditEntries[name] || [];
+    const loading = Boolean(state.auditLoading[name]);
+    const error = state.auditErrors[name];
+    const children = [];
+    const toggle = el("button", {
+      class: "audit-toggle",
+      type: "button",
+      "aria-expanded": expanded ? "true" : "false",
+      text: expanded ? "Hide audit log" : "Show audit log",
+    });
+    toggle.addEventListener("click", () => {
+      state.auditExpanded[name] = !state.auditExpanded[name];
+      renderAuditPanel(name);
+      if (state.auditExpanded[name]) loadAuditForSurface(name);
+    });
+    const headerChildren = [
+      el("div", { class: "audit-title", text: "Audit log" }),
+      toggle,
+    ];
+    if (expanded) {
+      const refresh = el("button", {
+        class: "audit-refresh",
+        type: "button",
+        text: "Refresh",
+      });
+      refresh.addEventListener("click", () => loadAuditForSurface(name));
+      headerChildren.push(refresh);
+    }
+    children.push(el("div", { class: "audit-header" }, headerChildren));
+    if (expanded) {
+      const bodyChildren = [];
+      if (loading) {
+        bodyChildren.push(el("div", {
+          class: "audit-empty",
+          text: "loading audit entries...",
+        }));
+      } else if (error) {
+        bodyChildren.push(el("div", {
+          class: "audit-empty",
+          text: "audit error: " + error.message,
+        }));
+      } else if (entries.length === 0) {
+        bodyChildren.push(el("div", {
+          class: "audit-empty",
+          text: "no audit entries",
+        }));
+      } else {
+        for (const entry of entries.slice(0, AUDIT_LIMIT)) {
+          bodyChildren.push(el("div", { class: "audit-entry" }, [
+            el("span", { class: "audit-ts", text: entry.ts || "" }),
+            el("span", { class: "audit-line", text: auditSummary(entry) }),
+          ]));
+        }
+      }
+      children.push(el("div", { class: "audit-body" }, bodyChildren));
+    }
+    list.appendChild(el("div", { class: "audit-panel" }, children));
+  }
+
+  async function loadAuditForSurface(name) {
+    if (!name) return;
+    state.auditLoading[name] = true;
+    state.auditErrors[name] = null;
+    renderAuditPanel(name);
+    try {
+      const data = await apiJson(auditPathForSurface(name));
+      state.auditEntries[name] = Array.isArray(data.events) ? data.events : [];
+    } catch (err) {
+      state.auditEntries[name] = [];
+      state.auditErrors[name] = err;
+    } finally {
+      state.auditLoading[name] = false;
+      if (state.selectedSurface === name && state.auditExpanded[name]) {
+        renderAuditPanel(name);
+      }
+    }
   }
 
   function messageLooksMidStream(message) {
@@ -312,6 +666,7 @@
       list.appendChild(
         el("div", { class: "message-empty", text: "no messages yet" }),
       );
+      renderAuditPanel(data.session_name);
       return;
     }
     // API returned newest-first; render oldest-first so the latest is
@@ -331,6 +686,7 @@
       );
     }
     list.scrollTop = list.scrollHeight;
+    renderAuditPanel(data.session_name);
   }
 
   function renderHistoryError(err) {
@@ -339,6 +695,7 @@
     list.appendChild(
       el("div", { class: "error-banner", text: "history error: " + err.message }),
     );
+    renderAuditPanel(state.selectedSurface);
     updateStopAgentButton();
   }
 
@@ -512,6 +869,8 @@
 
   function schedulePoll() {
     if (state.messageTimer) clearInterval(state.messageTimer);
+    state.messageTimer = null;
+    if (state.selectedKind !== "chat") return;
     state.messageTimer = setInterval(() => {
       if (state.selectedSurface) loadHistory(state.selectedSurface);
     }, POLL_MESSAGES_MS);
@@ -525,7 +884,9 @@
     form.addEventListener("submit", (ev) => {
       ev.preventDefault();
       const text = input.value.trim();
-      if (!text || !state.selectedSurface) return;
+      if (!text || state.selectedKind !== "chat" || !state.selectedSurface) {
+        return;
+      }
       input.value = "";
       sendMessage(state.selectedSurface, text).catch((err) => {
         renderHistoryError(err);
@@ -578,8 +939,12 @@
     loadSurfaces: loadSurfaces,
     loadHistory: loadHistory,
     sendMessage: sendMessage,
+    selectSurface: selectSurface,
+    selectTask: selectTask,
     interruptSurface: interruptSurface,
     pollDashboard: pollDashboard,
+    renderAuditPanel: renderAuditPanel,
+    renderSurfaces: renderSurfaces,
     renderDashboard: renderDashboard,
     state: state,
   };

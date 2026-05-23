@@ -4,7 +4,7 @@ import { test, expect } from "@playwright/test";
  * Surface list (left rail) scenarios.
  *
  * Anchors: #surface-list, .surface-empty, [data-session], #pane-title,
- * #pane-meta, #message-list, .message-empty.
+ * #pane-meta, #message-list, .message-empty, .audit-panel.
  */
 
 test.describe("surfaces", () => {
@@ -22,7 +22,10 @@ test.describe("surfaces", () => {
         const items = document.querySelectorAll(
           "#surface-list li[data-session]",
         ).length;
-        if (items > 0) return true;
+        const tasks = document.querySelectorAll(
+          "#surface-list li[data-task]",
+        ).length;
+        if (items > 0 || tasks > 0) return true;
         const empty = document.querySelector(
           "#surface-list .surface-empty",
         ) as HTMLElement | null;
@@ -115,6 +118,13 @@ test.describe("surfaces", () => {
         }),
       }),
     );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      }),
+    );
     await page.goto("/ui/");
     await page.locator("li[data-session='fake-empty']").click();
     await expect(page.locator("#message-list .message-empty")).toHaveText(
@@ -127,5 +137,136 @@ test.describe("surfaces", () => {
     await expect(page.locator("#pane-title")).toHaveText("Select a surface");
     await expect(page.locator("#send-input")).toBeDisabled();
     await expect(page.locator("#send-button")).toBeDisabled();
+  });
+
+  test("task surfaces render in a separate rail group", async ({ page }) => {
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              task_id: "task-queued",
+              project: "demo",
+              task_number: 4,
+              title: "Queued rail item",
+              work_status: "queued",
+              type: "task",
+              priority: "normal",
+              assignee: "agent-1",
+              updated_at: "2026-05-23T00:00:00Z",
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/tasks/demo/4", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          task_id: "task-queued",
+          project: "demo",
+          task_number: 4,
+          title: "Queued rail item",
+          work_status: "queued",
+          type: "task",
+          priority: "normal",
+          assignee: "agent-1",
+          updated_at: "2026-05-23T00:00:00Z",
+          description: "Visible task detail",
+          relationships: {},
+          transitions: [],
+          executions: [],
+        }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    await expect(page.locator("#surface-list .surface-group")).toHaveText([
+      "Tasks",
+    ]);
+    await page.locator("li[data-task='demo/4']").click();
+    await expect(page.locator("#pane-title")).toHaveText("demo/4");
+    await expect(page.locator("#send-input")).toBeDisabled();
+    await expect(page.locator("#message-list")).toContainText(
+      "Visible task detail",
+    );
+  });
+
+  test("audit panel expands and queries current surface scope", async ({ page }) => {
+    await page.route("**/api/v1/chat/*/messages*", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          session_name: "task-demo-4",
+          surface_type: "worker",
+          transcript_source: "jsonl",
+          messages: [],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          sessions: [
+            {
+              session_name: "task-demo-4",
+              surface_type: "worker",
+              persona: "worker",
+              project: "demo",
+              task_id: 4,
+              window: { present: true, pane_dead: false },
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/audit/grep**", (route) => {
+      const url = new URL(route.request().url());
+      expect(url.searchParams.get("project")).toBe("demo");
+      expect(url.searchParams.get("pattern")).toBe("demo/4");
+      expect(url.searchParams.get("limit")).toBe("25");
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          events: [
+            {
+              schema: 1,
+              ts: "2026-05-23T00:00:00Z",
+              project: "demo",
+              event: "task.status_changed",
+              subject: "demo/4",
+              actor: "agent-1",
+              status: "ok",
+              metadata: {},
+            },
+          ],
+          next_cursor: null,
+        }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.locator("li[data-session='task-demo-4']").click();
+    await page.locator(".audit-toggle").click();
+    await expect(page.locator(".audit-entry")).toContainText(
+      "task.status_changed",
+    );
+    await expect(page.locator(".audit-entry")).toContainText(
+      "2026-05-23T00:00:00Z",
+    );
   });
 });

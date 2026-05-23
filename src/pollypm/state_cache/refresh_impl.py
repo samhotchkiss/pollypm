@@ -412,9 +412,10 @@ def _actionable_alert_ids_for(
     workspace-wide ``(alerts, valid)`` pair the sweep-level refresher
     pre-fetches once and threads through every per-project compute.
     When provided we skip the per-project ``_open_alerts_for`` call
-    entirely — that's where the N×Supervisor-construction perf cost
-    lived. When ``None`` we fall back to the on-demand read so
-    single-project event-triggered refreshes keep working unchanged.
+    entirely — that's where the N×pg-alerts-read perf cost lived
+    (one pg round-trip per project). When ``None`` we fall back to
+    the on-demand read so single-project event-triggered refreshes
+    keep working unchanged.
     """
 
     try:
@@ -445,49 +446,44 @@ def _actionable_alert_ids_for(
 def _open_alerts_for(config: Any) -> tuple[list[Any], bool]:
     """Return ``(open_alerts, valid)``.
 
-    Reads :meth:`Supervisor.open_alerts` — the same source the cockpit
-    direct path uses (cockpit_rail constructs a supervisor and reads
-    ``supervisor.open_alerts()`` per render). The lazy import keeps
-    the leaf ``state_cache`` package light.
+    Reads :func:`pollypm.storage.pg_alerts.open_alerts` — the canonical
+    pg facade for the cluster-B ``messages``-table alert read. This is
+    the same row source the cockpit's direct path ultimately queries
+    (via ``self._msg_store.query_messages(type='alert', state='open')``
+    on the unified Store); going to the facade directly keeps the leaf
+    ``state_cache`` package free of the broad runtime supervisor and
+    legacy sqlite-state boundary — see
+    ``tests/test_state_cache_no_sqlite_imports.py`` for the pinned
+    invariant (PR #2085 round-3 Codex blocker).
+
+    The lazy import keeps the leaf ``state_cache`` package light.
 
     #2049 follow-up (Codex blocker on PR #2085): every failure path
     returns ``([], False)`` — the empty list is for callers that need
     to keep computing a rollup without crashing, the ``False`` is the
     signal the refresher stamps onto
     :attr:`ProjectStateCacheEntry.alerts_snapshot_valid`. The cache
-    fast-path declines on ``False`` so a transient supervisor-side
-    failure doesn't install a no-alert rollup that masks a live RED
-    alert on the next render.
+    fast-path declines on ``False`` so a transient read failure
+    doesn't install a no-alert rollup that masks a live RED alert on
+    the next render.
 
-    Construction failures: supervisor construction can fail on cold
-    start (backend pool not warm, etc.); these are real read failures,
-    not "no alerts," and are reported as such.
+    Pool / cold-start failures: the pg pool can fail to warm on cold
+    start; these are real read failures (not "no alerts") and are
+    reported as such.
     """
 
     try:
-        from pollypm.supervisor import Supervisor
+        from pollypm.storage import pg_alerts
     except Exception:  # noqa: BLE001
         return [], False
-    supervisor = None
     try:
-        supervisor = Supervisor(config, readonly_state=True)
-        return list(supervisor.open_alerts()), True
+        return list(pg_alerts.open_alerts(config=config)), True
     except Exception:  # noqa: BLE001
         logger.warning(
-            "state_cache: supervisor.open_alerts() failed",
+            "state_cache: pg_alerts.open_alerts() failed",
             exc_info=True,
         )
         return [], False
-    finally:
-        # ``Supervisor`` opens a StateStore handle on construction; the
-        # leaf state_cache module shouldn't leak it across refresh ticks.
-        if supervisor is not None:
-            try:
-                close = getattr(getattr(supervisor, "store", None), "close", None)
-                if callable(close):
-                    close()
-            except Exception:  # noqa: BLE001
-                pass
 
 
 def _categorize_and_rollup(

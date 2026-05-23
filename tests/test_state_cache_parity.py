@@ -1596,11 +1596,17 @@ class TestActionableAlertSnapshotValidity:
     def test_open_alerts_failure_marks_entry_invalid(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """A failing ``supervisor.open_alerts()`` → ``alerts_snapshot_valid=False``.
+        """A failing pg-alerts read → ``alerts_snapshot_valid=False``.
 
-        Drives :func:`compute_entry_for_project` with a supervisor that
-        raises and asserts the resulting entry stamps invalidity onto
-        itself rather than silently producing a no-alert entry.
+        Drives :func:`compute_entry_for_project` with a pg-alerts
+        facade that raises and asserts the resulting entry stamps
+        invalidity onto itself rather than silently producing a
+        no-alert entry.
+
+        PR #2085 round-3: ``_open_alerts_for`` no longer constructs a
+        Supervisor — it reads through
+        :func:`pollypm.storage.pg_alerts.open_alerts`. The patch
+        target follows; the validity contract is unchanged.
         """
 
         from pollypm.dashboard.categorization import ProjectState as _PS
@@ -1608,22 +1614,16 @@ class TestActionableAlertSnapshotValidity:
 
         project_key = "alpha"
 
-        class _ExplodingSupervisor:
-            def __init__(self, *args: Any, **kwargs: Any) -> None:
-                pass
-
-            def open_alerts(self) -> list[Any]:
-                raise RuntimeError("transient store failure")
-
-            store = None
+        def _exploding_open_alerts(**kwargs: Any) -> list[Any]:
+            raise RuntimeError("transient store failure")
 
         # Patch the lazy import inside _open_alerts_for. Importing the
-        # supervisor module first lets us monkeypatch its Supervisor
-        # attribute; refresh_impl does a fresh ``from pollypm.supervisor
-        # import Supervisor`` on every call so the patch is picked up.
-        import pollypm.supervisor as supervisor_mod
+        # pg_alerts module first lets us monkeypatch its open_alerts
+        # attribute; refresh_impl does a fresh ``from pollypm.storage
+        # import pg_alerts`` on every call so the patch is picked up.
+        import pollypm.storage.pg_alerts as pg_alerts_mod
         monkeypatch.setattr(
-            supervisor_mod, "Supervisor", _ExplodingSupervisor,
+            pg_alerts_mod, "open_alerts", _exploding_open_alerts,
         )
 
         # Short-circuit the heavy categorize/rollup path: the

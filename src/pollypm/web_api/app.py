@@ -16,9 +16,10 @@ import concurrent.futures
 import logging
 import threading
 import time
+from concurrent.futures import thread as _futures_thread
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import AsyncIterator
+from typing import Any, AsyncIterator
 
 from fastapi import Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -82,6 +83,59 @@ _DOCTOR_THREAD_PREFIX = "doctor"
 _DOCTOR_SHUTDOWN_GRACE_S = 5.0
 
 
+class _DaemonThread(threading.Thread):
+    """``threading.Thread`` subclass that defaults ``daemon=True``.
+
+    Used as a drop-in replacement for ``threading.Thread`` inside
+    :class:`DaemonThreadPoolExecutor._adjust_thread_count` so worker
+    threads inherit ``daemon=True`` without us having to mirror the
+    cpython ``_adjust_thread_count`` body (its argument shape differs
+    between Python 3.13 and 3.14, and pyproject.toml currently allows
+    both — see Codex round-6 on #2058).
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:  # noqa: D401
+        kwargs.setdefault("daemon", True)
+        super().__init__(*args, **kwargs)
+
+
+class DaemonThreadPoolExecutor(concurrent.futures.ThreadPoolExecutor):
+    """ThreadPoolExecutor whose worker threads are daemon threads.
+
+    Required for executors that may have wedged workers at shutdown:
+    a non-daemon ``ThreadPoolExecutor`` worker keeps the interpreter
+    alive after ``executor.shutdown(wait=False)`` returns, so ``pm
+    serve`` cannot exit while a doctor check is hung even though
+    FastAPI lifespan teardown has already returned.
+
+    Trade-off: daemon threads can be terminated mid-operation when the
+    process exits. That is acceptable for doctor work because by the
+    time the process is exiting the operator has already received a
+    504 (``routes/doctor.py:_await_with_budget`` returns while
+    abandoning the worker), and there is no recoverable in-process
+    state — fixes that mutate disk/storage are bounded by their own
+    cooperative checks, not by the worker thread's liveness.
+
+    We override ``_adjust_thread_count`` by temporarily patching
+    ``concurrent.futures.thread.threading.Thread`` (the symbol the
+    stdlib body uses to construct workers) to a daemon-defaulting
+    subclass, then delegating to ``super()``. This avoids mirroring
+    the stdlib body — its ``threading.Thread(...)`` ``args=`` tuple
+    shape changed between Python 3.13 (``(weakref, queue, init,
+    initargs)``) and 3.14 (``(weakref, worker_context, queue)``), and
+    pyproject.toml allows both interpreters. Patching the constructor
+    is version-portable.
+    """
+
+    def _adjust_thread_count(self) -> None:  # type: ignore[override]
+        original_thread_cls = _futures_thread.threading.Thread
+        _futures_thread.threading.Thread = _DaemonThread  # type: ignore[attr-defined,misc]
+        try:
+            super()._adjust_thread_count()
+        finally:
+            _futures_thread.threading.Thread = original_thread_cls  # type: ignore[attr-defined,misc]
+
+
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """FastAPI lifespan that owns the doctor executor + locks.
@@ -90,11 +144,14 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     doctor routes resolve them via ``request.app.state`` rather than
     reaching into module-level globals:
 
-    - ``doctor_executor``: shared ``ThreadPoolExecutor`` for check /
-      fix / verify work. ``max_workers=2`` matches the per-request
-      ``--fix`` single-flight: one slot for fix, one for parallel
-      read-only checks. Larger fan-out is gratuitous (doctor is an
-      operator surface, not a hot path).
+    - ``doctor_executor``: shared :class:`DaemonThreadPoolExecutor`
+      for check / fix / verify work. ``max_workers=2`` matches the
+      per-request ``--fix`` single-flight: one slot for fix, one for
+      parallel read-only checks. Larger fan-out is gratuitous
+      (doctor is an operator surface, not a hot path). Daemon
+      workers are mandatory so a wedged check doesn't keep
+      ``pm serve`` alive after shutdown — see Codex round-6 on
+      #2058 and the class docstring for the trade-off.
     - ``doctor_fix_lock``: serializes ``fix=true`` runs across the
       app. Held by the request that wins, released by the worker's
       done-callback when the future truly terminates (not when the
@@ -111,7 +168,17 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     log a warning if any worker is still alive (the v1 RC tradeoff:
     we can't kill the thread, but we can refuse to block on it).
     """
-    app.state.doctor_executor = concurrent.futures.ThreadPoolExecutor(
+    # Daemon-thread executor so a wedged worker doesn't keep the
+    # interpreter alive past app shutdown. ``executor.shutdown(wait=
+    # False)`` releases FastAPI lifespan, but a non-daemon worker
+    # would still block ``pm serve`` exit until the worker returns
+    # naturally — see Codex round-6 on #2058. Daemon workers let the
+    # interpreter exit; the trade-off (workers can be killed mid-op
+    # at process exit) is acceptable because the operator has already
+    # been told 504 by ``_await_with_budget`` and doctor fix
+    # mutations are bounded by cooperative checks rather than worker
+    # liveness.
+    app.state.doctor_executor = DaemonThreadPoolExecutor(
         max_workers=_DOCTOR_MAX_WORKERS,
         thread_name_prefix=_DOCTOR_THREAD_PREFIX,
     )
@@ -149,6 +216,24 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 len(still_running),
                 _DOCTOR_SHUTDOWN_GRACE_S,
             )
+            # ``concurrent.futures`` registers an ``atexit`` hook
+            # (``_python_exit``) that joins every executor worker
+            # via the module-level ``_threads_queues`` dict. That
+            # join blocks ``pm serve`` interpreter exit even when
+            # the workers are daemon threads. Pop our workers out
+            # of that mapping so the atexit hook can't reach them
+            # — combined with ``daemon=True`` (see
+            # :class:`DaemonThreadPoolExecutor`) the process can
+            # now exit. Codex round-6 on #2058.
+            try:
+                for t in still_running:
+                    _futures_thread._threads_queues.pop(t, None)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "lifespan: failed to evict wedged doctor worker(s) "
+                    "from concurrent.futures._threads_queues",
+                    exc_info=True,
+                )
 
 
 def create_app(

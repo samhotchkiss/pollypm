@@ -973,3 +973,190 @@ def test_doctor_app_teardown_returns_promptly_with_running_worker(
     assert app.state.doctor_executor._shutdown is True, (
         "lifespan did not shut down the doctor executor"
     )
+
+
+def test_doctor_executor_workers_are_daemon_threads(
+    client, auth_headers, patch_registry,
+) -> None:
+    """Doctor executor worker threads must be daemons.
+
+    Codex round-6 on PR #2058: a non-daemon
+    ``ThreadPoolExecutor`` worker keeps the Python interpreter
+    alive after ``executor.shutdown(wait=False)`` returns, so
+    ``pm serve`` cannot exit while a doctor check is wedged even
+    though FastAPI lifespan teardown has already completed.
+    :class:`DaemonThreadPoolExecutor` overrides
+    ``_adjust_thread_count`` so every worker thread inherits
+    ``daemon=True``; this test pins that invariant by submitting
+    a trivial check and inspecting ``executor._threads``.
+    """
+    import time as _time
+
+    patch_registry([_check("alpha", _ok("alpha"))])
+
+    # Drive a real request so the executor materializes worker
+    # threads on demand (workers are lazy — they are only spawned
+    # once ``submit()`` is called and the pool is below
+    # ``max_workers``).
+    response = client.post(
+        "/api/v1/doctor/run",
+        headers=auth_headers,
+        json={"check": "alpha"},
+    )
+    assert response.status_code == 200, response.json()
+
+    executor = client.app.state.doctor_executor
+    # Give the worker a beat to register itself in
+    # ``executor._threads`` (it's added immediately after
+    # ``t.start()`` so this is essentially zero on a healthy box,
+    # but we tolerate scheduler jitter on CI).
+    deadline = _time.monotonic() + 2.0
+    while _time.monotonic() < deadline and not executor._threads:
+        _time.sleep(0.01)
+
+    workers = list(executor._threads)
+    assert workers, (
+        "expected at least one worker thread to be spawned after a "
+        "doctor run; got none"
+    )
+    for worker in workers:
+        assert worker.daemon is True, (
+            f"doctor worker thread {worker.name!r} is not a daemon; "
+            f"non-daemon workers block interpreter exit on a wedged "
+            f"check (Codex round-6 on #2058)."
+        )
+
+
+def test_doctor_pm_serve_process_exits_with_wedged_worker(tmp_path: Path) -> None:
+    """A wedged doctor worker does not keep the ``pm serve`` process alive.
+
+    Codex round-6 on PR #2058 demanded a real process-liveness
+    regression: app-lifespan timing alone is not enough because a
+    non-daemon ``ThreadPoolExecutor`` worker survives lifespan
+    teardown and blocks interpreter exit until the worker thread
+    returns. This test spawns a child process that mirrors the
+    smoke Codex described:
+
+    1. Build the app + start the lifespan.
+    2. Submit a hung check to the doctor executor (no HTTP roundtrip
+       needed — we put a ``time.sleep(60)`` straight onto the pool
+       so the test isn't sensitive to route-layer plumbing).
+    3. Exit the lifespan.
+    4. Drop our hard reference and let the interpreter try to exit.
+
+    Pre-fix, the child takes ~60s (waiting on the non-daemon
+    worker) and we kill it via timeout. Post-fix (daemon worker
+    + atexit eviction in the lifespan finalizer), the child exits
+    cleanly in well under the 15s budget.
+    """
+    import subprocess
+    import sys
+    import textwrap
+    import time as _time
+
+    child_script = textwrap.dedent(
+        """
+        import sys, time
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from pollypm.config import (
+            AccountConfig, MemorySettings, PollyPMConfig,
+            PollyPMSettings, ProjectSettings,
+        )
+        from pollypm.models import (
+            KnownProject, ProjectKind, ProviderKind, RuntimeKind,
+        )
+        from pollypm.web_api import create_app, ensure_token
+
+        workspace = Path(sys.argv[1])
+        token_path = Path(sys.argv[2])
+        ensure_token(token_path)
+
+        base_dir = workspace / ".pollypm"
+        config = PollyPMConfig(
+            project=ProjectSettings(
+                name="PollyPM", root_dir=workspace,
+                tmux_session="pollypm-test",
+                workspace_root=workspace, base_dir=base_dir,
+                logs_dir=base_dir / "logs",
+                snapshots_dir=base_dir / "snapshots",
+                state_db=base_dir / "state.db",
+            ),
+            pollypm=PollyPMSettings(
+                controller_account="codex_primary",
+                open_permissions_by_default=False,
+                failover_enabled=False, failover_accounts=[],
+                heartbeat_backend="local",
+                scheduler_backend="inline",
+                lease_timeout_minutes=30,
+            ),
+            accounts={
+                "codex_primary": AccountConfig(
+                    name="codex_primary",
+                    provider=ProviderKind.CODEX,
+                    email="codex@example.com",
+                    runtime=RuntimeKind.LOCAL,
+                    home=base_dir / "homes" / "codex_primary",
+                ),
+            },
+            sessions={},
+            projects={
+                "myproj": KnownProject(
+                    key="myproj", path=workspace, name="My Project",
+                    tracked=True, kind=ProjectKind.GIT,
+                ),
+            },
+            memory=MemorySettings(backend="file"),
+        )
+
+        app = create_app(config=config, token_path=token_path)
+        with TestClient(app):
+            # Submit a wedged job directly to the executor so the
+            # test doesn't depend on doctor-route plumbing. The
+            # daemon-thread invariant is a property of the
+            # executor, not the route.
+            app.state.doctor_executor.submit(time.sleep, 60)
+            time.sleep(0.2)
+        # Lifespan has exited; daemon workers + atexit-eviction
+        # should let the interpreter exit immediately.
+        print("CHILD EXIT OK", flush=True)
+        """
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".pollypm").mkdir()
+    token_path = tmp_path / "api-token"
+
+    t0 = _time.monotonic()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", child_script,
+             str(workspace), str(token_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = _time.monotonic() - t0
+        pytest.fail(
+            f"child process did not exit within 15s (took {elapsed:.1f}s) — "
+            f"a wedged doctor worker is keeping the interpreter alive. "
+            f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
+        )
+
+    elapsed = _time.monotonic() - t0
+    assert result.returncode == 0, (
+        f"child exited with rc={result.returncode}; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "CHILD EXIT OK" in result.stdout, (
+        f"child did not reach the post-lifespan print; "
+        f"stdout={result.stdout!r}"
+    )
+    # The lifespan grace is 5s and atexit eviction is O(workers),
+    # so even with launcher overhead this should land well under 12s.
+    assert elapsed < 12.0, (
+        f"child took {elapsed:.1f}s; the wedged worker should not "
+        f"have blocked interpreter exit past the lifespan grace."
+    )

@@ -234,22 +234,27 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
 def patch_parser(monkeypatch: pytest.MonkeyPatch):
     """Factory installing a stub for ``parse_events_jsonl``.
 
-    Signature mirrors what the chat-messages route actually calls
-    today (:func:`pollypm.web_api.chat.transcripts.parse_events_jsonl`
-    with ``actor_fallback`` + ``strict`` only). The real parser also
-    accepts an ``include_thinking`` kwarg (restored in #2048 — this
-    PR), but the route does not pass it: thinking promotion to the
-    HTTP surface is deferred to #2082. Tests that need real parser
-    behavior (Blocker 1) drive the on-disk parser directly via a JSONL
-    fixture instead of installing this stub.
+    Signature mirrors the real parser on main
+    (:func:`pollypm.web_api.chat.transcripts.parse_events_jsonl`),
+    including the ``include_thinking`` knob the route plumbs through
+    (#2082). Tests that need real parser behavior (Blocker 1) drive
+    the on-disk parser directly via a JSONL fixture instead of
+    installing this stub.
     """
     def install(envelopes_by_path: dict[Path, list[MessageEnvelope]]) -> None:
-        def fake(path, *, actor_fallback="agent", strict=False):
+        def fake(
+            path, *, actor_fallback="agent", strict=False,
+            include_thinking=False,
+        ):
             # ``strict`` is accepted for forward-compat with the
             # ``source=auto`` unreadable-archive fallback added in the
             # round-6 fix; this stub treats it as a no-op (returns the
-            # same envelopes regardless of strict mode).
-            del strict
+            # same envelopes regardless of strict mode). Likewise the
+            # ``include_thinking`` flag is accepted so the route's
+            # plumbing path (#2082) doesn't trip a TypeError; the stub
+            # returns the same list either way and individual tests
+            # assert the route's filtering / non-filtering behavior.
+            del strict, include_thinking
             return list(envelopes_by_path.get(Path(path), []))
         monkeypatch.setattr(
             chat_messages_routes, "parse_events_jsonl", fake,
@@ -579,32 +584,63 @@ def test_messages_endpoint_accepts_limit_500(
 # ---------------------------------------------------------------------------
 
 
-def test_messages_endpoint_drops_thinking_envelopes(
-    client, auth_headers, patch_registry, patch_parser, tmp_path,
+def test_messages_endpoint_drops_thinking_envelopes_by_default(
+    client, auth_headers, patch_registry, tmp_path,
 ):
-    """Thinking blocks are filtered out at the HTTP route boundary.
+    """Default ``include_thinking=false`` — thinking envelopes are
+    gated at the parser layer and never reach the response.
 
-    As of #2048 (this PR) the parser CAN emit
-    :class:`ParserInternalType.THINKING` envelopes when callers pass
-    ``include_thinking=True`` to ``parse_events_jsonl``. The
-    ``GET /messages`` route, however, still calls the parser with the
-    default ``include_thinking=False`` AND defensively drops any
-    parser-internal types downstream, so the public response catalog
-    stays equal to the public :class:`MessageType` enum. Promoting
-    thinking blocks onto the HTTP surface (route query param + OpenAPI
-    enum entry) is parked until follow-up #2082.
+    Drives the real parser via an on-disk JSONL fixture so the route's
+    default-False call to ``parse_events_jsonl`` is exercised end-to-end.
     """
+    import json as _json
+
     archive = tmp_path / "events.jsonl"
-    archive.write_text("x")
-    envelopes = [
-        _env("t", type_="thinking", text="(thinking)"),
-        _env("text", type_=MessageType.TEXT, text="visible"),
+    events = [
+        {
+            "timestamp": "2026-05-21T10:00:00Z",
+            "event_type": "thinking",
+            "session_id": "s",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": 0,
+            "cwd": "/tmp/repo",
+            "model_name": "claude-opus-4-7",
+            "payload": {
+                "text": "I should think first.",
+                "signature": "opaque",
+                "raw": {
+                    "type": "thinking",
+                    "thinking": "I should think first.",
+                    "signature": "opaque",
+                },
+            },
+        },
+        {
+            "timestamp": "2026-05-21T10:00:01Z",
+            "event_type": "assistant_turn",
+            "session_id": "s",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": 1,
+            "cwd": "/tmp/repo",
+            "model_name": "claude-opus-4-7",
+            "payload": {"text": "Public reply."},
+        },
     ]
+    archive.write_text("\n".join(_json.dumps(ev) for ev in events) + "\n")
     patch_registry([_surface(
         "operator", SurfaceType.OPERATOR, persona="Polly",
         transcript_path=archive,
     )])
-    patch_parser({archive: envelopes})
+    # NOTE: no patch_parser — drive the real parser so the
+    # default-False include_thinking branch is exercised.
+    from pollypm.web_api.chat.transcripts import _parse_cache_clear
+    _parse_cache_clear()
     body = client.get(
         "/api/v1/chat/operator/messages?direction=asc",
         headers=auth_headers,
@@ -614,39 +650,73 @@ def test_messages_endpoint_drops_thinking_envelopes(
     assert "text" in types
 
 
-def test_messages_endpoint_rejects_include_thinking_query_param(
-    client, auth_headers, patch_registry, patch_parser, tmp_path,
+def test_messages_endpoint_emits_thinking_envelopes_when_include_thinking_true(
+    client, auth_headers, patch_registry, tmp_path,
 ):
-    """``include_thinking`` is not yet exposed on the HTTP route.
+    """Opt-in ``include_thinking=true`` — thinking envelopes appear in
+    the response alongside normal turns (#2082).
 
-    #2048 (this PR) restored parser-level support for thinking blocks
-    via :class:`ParserInternalType.THINKING`, but promoting them onto
-    the HTTP surface — wiring an ``include_thinking`` query param and
-    adding ``thinking`` to the OpenAPI ``MessageType`` enum — is
-    deferred to follow-up #2082. FastAPI ignores unknown query params
-    by default, so we confirm passing the param has no effect: the
-    route still calls the parser with ``include_thinking=False`` and
-    filters parser-internal types, so ``thinking`` never appears in
-    the response.
+    Drives the real parser via an on-disk JSONL fixture so the route's
+    plumbing of the flag into ``parse_events_jsonl`` is exercised
+    end-to-end.
     """
+    import json as _json
+
     archive = tmp_path / "events.jsonl"
-    archive.write_text("x")
-    envelopes = [
-        _env("t", type_="thinking", text="(thinking)"),
-        _env("text", type_=MessageType.TEXT, text="visible"),
+    events = [
+        {
+            "timestamp": "2026-05-21T10:00:00Z",
+            "event_type": "thinking",
+            "session_id": "s",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": 0,
+            "cwd": "/tmp/repo",
+            "model_name": "claude-opus-4-7",
+            "payload": {
+                "text": "I should think first.",
+                "signature": "opaque",
+                "raw": {
+                    "type": "thinking",
+                    "thinking": "I should think first.",
+                    "signature": "opaque",
+                },
+            },
+        },
+        {
+            "timestamp": "2026-05-21T10:00:01Z",
+            "event_type": "assistant_turn",
+            "session_id": "s",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": 1,
+            "cwd": "/tmp/repo",
+            "model_name": "claude-opus-4-7",
+            "payload": {"text": "Public reply."},
+        },
     ]
+    archive.write_text("\n".join(_json.dumps(ev) for ev in events) + "\n")
     patch_registry([_surface(
         "operator", SurfaceType.OPERATOR, persona="Polly",
         transcript_path=archive,
     )])
-    patch_parser({archive: envelopes})
+    from pollypm.web_api.chat.transcripts import _parse_cache_clear
+    _parse_cache_clear()
     body = client.get(
         "/api/v1/chat/operator/messages?include_thinking=true&direction=asc",
         headers=auth_headers,
     ).json()
     types = [m["type"] for m in body["messages"]]
-    # include_thinking has no effect — thinking is still filtered out.
-    assert "thinking" not in types
+    # Both the thinking envelope and the assistant turn surface, in order.
+    assert types == ["thinking", "text"]
+    thinking_msg = body["messages"][0]
+    assert thinking_msg["role"] == "assistant"
+    assert thinking_msg["text"] == "I should think first."
+    assert thinking_msg["metadata"]["signature"] == "opaque"
 
 
 def test_messages_endpoint_no_subagent_inlining_by_default(
@@ -1432,11 +1502,10 @@ def test_messages_endpoint_source_auto_still_fail_soft_on_capture_error(
 #
 # The fixtures above monkeypatch ``parse_events_jsonl`` /
 # ``capture_envelopes`` for speed and isolation. The two tests below
-# pin the production wiring by driving the REAL helpers — a
-# monkeypatch with a stale signature (e.g. accepting an
-# ``include_thinking`` kwarg the route doesn't pass) or a fake
-# capture that raised instead of the real fail-soft helper previously
-# hid two TypeError / silent-empty bugs in production.
+# pin the production wiring by driving the REAL helpers — a fake
+# capture that raised instead of the real fail-soft helper (or a
+# parser-stub signature mismatch like the one Blocker 1 caught)
+# previously hid TypeError / silent-empty bugs in production.
 # ---------------------------------------------------------------------------
 
 
@@ -1445,16 +1514,12 @@ def test_messages_endpoint_jsonl_uses_real_parser_no_typeerror(
 ):
     """REAL ``parse_events_jsonl`` call — Blocker 1 regression.
 
-    Historically the route's call signature drifted from the real
-    parser's (e.g. the route briefly passed ``include_thinking=...``
-    when the parser had dropped the kwarg in #2044). Tests passed
-    because the fixture stub silently accepted the extra kwarg; in
-    production every ``source=jsonl`` request raised ``TypeError``.
-    #2048 (this PR) restored ``include_thinking`` on the parser, but
-    the route still does NOT pass it — promoting thinking blocks to
-    the HTTP surface is deferred to #2082. This test drives the real
-    parser via an on-disk JSONL fixture so the wiring is exercised
-    end-to-end and any future signature drift fails loudly.
+    Pins the route → parser kwarg surface. Historically this test caught
+    a ``include_thinking=...`` plumbing mismatch where the fixture stub
+    accepted a kwarg the real parser did not (#2044). Today the parser
+    accepts ``include_thinking`` (#2082) and the route forwards it
+    through; the test still pins the real wiring so any future
+    signature drift trips here instead of in production.
     """
     import json as _json
 
@@ -1661,7 +1726,8 @@ def test_messages_endpoint_operator_lookup_skips_work_service(
     )
     monkeypatch.setattr(
         chat_messages_routes, "parse_events_jsonl",
-        lambda path, *, actor_fallback="agent", strict=False: [],
+        lambda path, *, actor_fallback="agent", strict=False,
+        include_thinking=False: [],
     )
     response = client.get(
         "/api/v1/chat/operator/messages",
@@ -1704,7 +1770,8 @@ def test_messages_endpoint_architect_lookup_skips_work_service(
     )
     monkeypatch.setattr(
         chat_messages_routes, "parse_events_jsonl",
-        lambda path, *, actor_fallback="agent", strict=False: [],
+        lambda path, *, actor_fallback="agent", strict=False,
+        include_thinking=False: [],
     )
     response = client.get(
         "/api/v1/chat/architect_myproj/messages",
@@ -1758,7 +1825,8 @@ def test_messages_endpoint_worker_lookup_opens_work_service(
     )
     monkeypatch.setattr(
         chat_messages_routes, "parse_events_jsonl",
-        lambda path, *, actor_fallback="agent", strict=False: [],
+        lambda path, *, actor_fallback="agent", strict=False,
+        include_thinking=False: [],
     )
     response = client.get(
         "/api/v1/chat/task-myproj-7/messages",

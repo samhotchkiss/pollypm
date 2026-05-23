@@ -219,21 +219,13 @@ Pull a window of messages from a single session's transcript.
 | `limit` | `100` | Max messages, must be `1..500`. Values outside that range return `422 validation_error` (FastAPI Pydantic-level rejection). |
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
 | `include_subagents` | `false` | When `true`, each `subagent_result` envelope's `metadata.subagent_transcript` is populated by parsing the raw Claude JSONL the parent `task-notification.output-file` points at. Paths outside the project/workspace transcript allowlist are silently skipped. Capped per envelope. (#2052) |
+| `include_thinking` | `false` | When `true`, Anthropic extended-thinking blocks are emitted as `type=thinking` envelopes alongside the normal turns. Default `false` preserves the historical envelope contract so existing clients see no new types unless they opt in. See §4 type catalog and #2082. |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
 
-> Note: Anthropic extended-thinking blocks are preserved by the
-> ingestor and surfaced by `parse_events_jsonl(include_thinking=True)`
-> as a **parser-internal** discriminator
-> (`ParserInternalType.THINKING`, see #2048). They are intentionally
-> NOT part of the HTTP-public `ChatMessageType` enum — the route calls
-> the parser with the default (`include_thinking=False`) and
-> additionally filters out any parser-internal-type envelopes before
-> serialization. Promoting `thinking` into the public catalog +
-> wiring an `include_thinking` query param through the route + OpenAPI
-> schema is tracked in
-> [#2082](https://github.com/samhotchkiss/pollypm/issues/2082). Until
-> that lands, clients of `GET /messages` will never see
-> `type="thinking"` envelopes regardless of query string.
+> Note: `thinking` envelopes are gated behind `?include_thinking=true`.
+> Clients that do not pass the flag will not see `type="thinking"`
+> rows in the response, preserving the historical envelope contract
+> (see #2048 / #2082).
 
 **Response:**
 
@@ -405,7 +397,7 @@ which variant the envelope represents and what shape `metadata` takes.
   "ts": "2026-05-21T20:53:12.123Z",
   "role": "user" | "assistant" | "tool" | "system",
   "actor": "Sam" | "Polly" | "Archie" | "Codex" | "system",
-  "type": "text" | "tool_use" | "tool_result" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event",
+  "type": "text" | "tool_use" | "tool_result" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event" | "thinking",
   "text": "...display-ready string...",
   "metadata": { "...": "type-specific" }
 }
@@ -428,16 +420,7 @@ structured original lives in `metadata`.
 | `subagent_spawn` | assistant | `Task` tool call | `metadata`: `subagent_id`, `subagent_type`, `description`, `prompt`, `isolation`. |
 | `subagent_result` | tool | `Task` tool return | `metadata`: `subagent_id`, `summary`, `duration_ms`, `total_tokens`, `worktree_path`, `output_file`. With `?include_subagents=true`: `metadata.subagent_transcript` carries envelopes parsed from the raw subagent JSONL at `output_file` (#2052). |
 | `system_event` | system | Compaction, session-start, error | `metadata.subtype` ∈ `compaction`, `session_start`, `session_resume`, `error`. |
-
-> Parser-internal discriminator: Anthropic extended-thinking blocks
-> are preserved by the ingestor and surfaced by
-> `parse_events_jsonl(include_thinking=True)` as
-> `ParserInternalType.THINKING` (`src/pollypm/web_api/chat/envelope.py`).
-> This is **not** an HTTP response `type` value — the chat-messages
-> route filters parser-internal-type envelopes out before serialization,
-> and the OpenAPI `ChatMessageType` enum does not include it. Promoting
-> `thinking` into the public catalog is tracked in
-> [#2082](https://github.com/samhotchkiss/pollypm/issues/2082).
+| `thinking` | assistant | Anthropic extended-thinking block (#2048) | Only emitted when the request passes `?include_thinking=true`. `metadata`: `provider`, `model`, `signature` (opaque). Default `include_thinking=false` drops these so historical clients see no new types. See #2082. |
 
 ### Example payloads
 

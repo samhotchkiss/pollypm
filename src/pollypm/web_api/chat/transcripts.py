@@ -36,13 +36,12 @@ the following non-trivial mappings:
 - Claude ``SendUserFile`` tool calls become ``file`` envelopes.
 - Compaction / session-start markers become ``system_event``.
 - ``thinking`` ingestor events (Anthropic extended-thinking content
-  blocks; see GitHub #2048) become :class:`ParserInternalType.THINKING`
+  blocks; see GitHub #2048) become :attr:`MessageType.THINKING`
   envelopes, but ONLY when callers pass ``include_thinking=True`` —
   default drops them so the historical envelope contract is preserved.
-  Thinking is a parser-internal discriminator (not part of the public
-  ``MessageType`` enum / ``ChatMessageType`` OpenAPI schema); the
-  chat-messages route additionally filters it out before serialization
-  until follow-up #2082 wires the HTTP-public path.
+  The chat-messages route exposes this as the ``include_thinking``
+  query parameter (default ``False``), and ``thinking`` is part of the
+  public ``ChatMessageType`` OpenAPI enum (#2082).
 
 The parser is pure: takes a file path + flags, returns a list of
 envelopes. The P2 router layers pagination / filtering on top.
@@ -63,7 +62,6 @@ from pollypm.web_api.chat.envelope import (
     MessageEnvelope,
     MessageRole,
     MessageType,
-    ParserInternalType,
 )
 
 logger = logging.getLogger(__name__)
@@ -354,15 +352,13 @@ def parse_events_jsonl(
     callers also skip the mtime cache so validation paths always see a
     fresh parse.
 
-    ``include_thinking`` (default ``False``; see GitHub #2048) — when
-    ``True``, Anthropic extended-thinking content blocks preserved by
-    the ingestor as ``event_type="thinking"`` are surfaced as
-    :class:`ParserInternalType.THINKING` envelopes — a parser-internal
-    discriminator that is intentionally NOT in the HTTP-public
-    :class:`MessageType` catalog. The chat-messages route filters these
-    out before serialization until follow-up #2082 wires the public
-    route. The default keeps the historical envelope contract: existing
-    callers (and HTTP clients) see no new types.
+    ``include_thinking`` (default ``False``; see GitHub #2048 / #2082)
+    — when ``True``, Anthropic extended-thinking content blocks
+    preserved by the ingestor as ``event_type="thinking"`` are surfaced
+    as :attr:`MessageType.THINKING` envelopes. The chat-messages route
+    exposes this as the ``include_thinking`` query parameter; the
+    default keeps the historical envelope contract so existing callers
+    (and HTTP clients) see no new types.
 
     Caching (issue #2069): for ``strict=False`` callers we memoize on
     ``(events_path, include_thinking, mtime, actor_fallback)``. The
@@ -835,10 +831,11 @@ def _envelope_thinking(
     thinking content directly so the same "dumb client renders ``text``
     without parsing metadata" contract holds.
 
-    The envelope's ``type`` is :class:`ParserInternalType.THINKING`, a
-    parser-internal discriminator intentionally NOT in the HTTP-public
-    :class:`MessageType` enum. The chat-messages route drops these
-    envelopes before serialization (see #2082).
+    The envelope's ``type`` is :attr:`MessageType.THINKING`, which is
+    part of the HTTP-public ``ChatMessageType`` enum. The chat-messages
+    route gates emission on the ``include_thinking`` query parameter
+    (#2082); the parser itself only emits thinking envelopes when its
+    own ``include_thinking=True`` flag is set.
     """
     text = str(payload.get("text") or "")
     signature = str(payload.get("signature") or "")
@@ -847,7 +844,7 @@ def _envelope_thinking(
         ts=timestamp,
         role=MessageRole.ASSISTANT,
         actor=actor_fallback,
-        type=ParserInternalType.THINKING,
+        type=MessageType.THINKING,
         text=text,
         metadata={
             "provider": event.get("provider", ""),

@@ -4,9 +4,16 @@
 
 This is not a unit test suite. Unit tests live under `tests/` and are run by `pytest`. This plan is for the kind of verification you do *before declaring ready-to-ship*: a structured pass through the system that catches the things automated tests miss — kludge, latency, confusion, "huh that's weird" moments, magic-feeling that's actually broken.
 
+**User contract:** the user/operator is never expected to run CLI commands to make the product usable. CLI, `curl`, SQL, and filesystem probes in this plan are for testing agents only: setup, instrumentation, failure injection, and diagnosis. A user-facing scenario does not pass just because a command works; it passes when the behavior is visible and usable through Web UI, TUI, inbox, notification, or another product surface.
+
 ## How to use
 
 Each section lives in its own file and is **self-contained**. You should be able to open `01-task-lifecycle.md` cold, in a fresh session with no prior context, and execute it end-to-end. Sections reference each other by filename, never by "as discussed."
+
+At least some testing must be done exactly as a user would interact with the product:
+- **Web UI:** drive flows through Playwright and, for exploratory checks, a real browser.
+- **TUI:** send keystrokes to `pm cockpit` in tmux (or use Textual `pilot`), not direct service calls.
+- **CLI/API probes:** allowed only as tester instrumentation; they cannot be the sole evidence for an intuitive or magical pass.
 
 For multi-agent execution, use **`parallel-execution.md`**. It defines which lanes Claude owns, which lanes Codex owns, and where Codex should produce actual product code rather than only review.
 

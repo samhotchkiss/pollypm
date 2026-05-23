@@ -8,6 +8,8 @@
 
 **Prereqs:** §00 baseline green. `pm serve` running. At least one project tracked (`pollypm` itself works).
 
+**User-surface rule:** the operator/user is never expected to run CLI commands. Command blocks in this file are tester setup, instrumentation, or failure injection. A user-facing lifecycle scenario only passes when the same state is observable and actionable through the product surfaces: Web UI via Playwright/real browser, and TUI via keystrokes sent to `pm cockpit` in tmux or a Textual `pilot` test.
+
 Setup:
 ```bash
 export BASE=http://$(tailscale ip -4):8765
@@ -249,9 +251,9 @@ pm task queue "$TID"
 sleep 2  # let it land
 
 (curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-   -d '{"actor":"a"}' $BASE/api/v1/tasks/pollypm/$TID/claim &
+   -d '{"actor":"a"}' "$BASE/api/v1/tasks/$TID/claim" &
  curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-   -d '{"actor":"b"}' $BASE/api/v1/tasks/pollypm/$TID/claim &
+   -d '{"actor":"b"}' "$BASE/api/v1/tasks/$TID/claim" &
  wait)
 ```
 

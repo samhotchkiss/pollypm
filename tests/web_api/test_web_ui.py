@@ -963,6 +963,20 @@ def test_ui_app_js_renderdashboard_uses_buildcard_helper(
     assert "(filtered)" in body
 
 
+def test_ui_app_js_has_surface_audit_panel_hooks(client: TestClient) -> None:
+    """The selected-surface pane exposes the audit grep panel."""
+    body = client.get("/ui/app.js").text
+    for expected in (
+        "/audit/grep",
+        "AUDIT_LIMIT = 25",
+        "renderAuditPanel",
+        "loadAuditForSurface",
+        "auditPatternForSurface",
+        "audit-toggle",
+    ):
+        assert expected in body
+
+
 # -------- Round-5: executable renderDashboard coverage ------------------
 #
 # Codex round-5 blocker: the prior three tests (static greps over

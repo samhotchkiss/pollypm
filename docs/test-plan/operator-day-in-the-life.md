@@ -114,6 +114,7 @@ If any of these fails, the product is not ship-ready. This is THE scenario.
 These are magic-gap indicators. If the operator catches themselves doing any of these during a real day, the system has failed.
 
 - **Drop to TUI to figure out why something is broken in Web.** Web should surface enough state.
+- **Run CLI commands to accomplish normal work.** CLI is for agents, diagnostics, and automation — not the expected user path.
 - **Run `pm doctor` to find a stuck task.** The cockpit / Web UI should already flag it.
 - **Manually claim a task.** Auto-claim or worker assignment should be the path.
 - **Manually restart a session.** The cascade should self-heal.

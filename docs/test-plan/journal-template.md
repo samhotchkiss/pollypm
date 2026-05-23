@@ -51,6 +51,7 @@ For each section/scenario:
 - **Result:** pass / fail / flake / partial / skipped
 - **Axes:** functional / reliable / fast / intuitive / magical — note per-axis
 - **Evidence:** <command output snippet, screenshot path, trace path, perf numbers, audit-log excerpt>
+- **User-surface evidence:** <Playwright trace / browser screenshot / tmux keystroke transcript / Textual pilot output, or "not user-facing">
 - **Issues filed:** #<N> <bug:|flake:|perf:|ux:|magic-gap:><short>
 - **Notes:** <observations, follow-up threads, what was interesting>
 

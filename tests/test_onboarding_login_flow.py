@@ -118,19 +118,30 @@ def test_run_login_window_cancelled_attach_returns_cleanly_to_caller(tmp_path: P
 
 def test_wait_for_login_completion_force_fresh_auth_uses_email_detection(monkeypatch, tmp_path):
     """With force_fresh_auth=True, detection of an email at the new home
-    counts as completion even though allow_existing_auth_shortcut=False.
-    This unblocks the Claude REPL case where the printf marker only fires
-    after the user exits the REPL — which they shouldn't have to do."""
+    counts as completion once the post-logout marker has been seen in the pane.
+    This unblocks the Claude REPL case where the printf completion marker only
+    fires after the user exits the REPL — which they shouldn't have to do.
+    The post-logout sentinel ensures stale credentials are cleared first."""
     from pollypm.onboarding import _wait_for_login_completion
     from pollypm.models import ProviderKind
 
     home = tmp_path / "home"
     home.mkdir()
 
-    # Pane never contains the marker and never contains an email.
+    # Pane sequence: first poll is empty, second poll contains the
+    # post-logout marker, subsequent polls continue showing it (sticky).
+    pane_sequence = [
+        "",
+        "\nPollyPM: logout-complete\nWelcome back, Sam!",
+    ]
+    pane_iter = iter(pane_sequence + [pane_sequence[-1]] * 20)
+
     class FakeTmux:
         def capture_pane(self, target, lines):
-            return "Welcome back, Sam!"  # claude REPL post-auth content
+            try:
+                return next(pane_iter)
+            except StopIteration:
+                return pane_sequence[-1]
 
     monkeypatch.setattr(
         "pollypm.onboarding._detect_account_email",
@@ -138,6 +149,91 @@ def test_wait_for_login_completion_force_fresh_auth_uses_email_detection(monkeyp
     )
 
     completed, pane = _wait_for_login_completion(
+        FakeTmux(),
+        target="dummy",
+        provider=ProviderKind.CLAUDE,
+        home=home,
+        allow_existing_auth_shortcut=False,
+        force_fresh_auth=True,
+        timeout_seconds=5,
+        poll_interval=0.1,
+    )
+    assert completed is True
+
+
+def test_wait_for_login_completion_force_fresh_does_not_short_circuit_on_stale_email(monkeypatch, tmp_path):
+    """When force_fresh_auth=True and the home still has stale credentials
+    BEFORE the logout step completes, polling MUST NOT use that stale email
+    as a completion signal. Only after seeing the post-logout marker can
+    email detection trigger completion. (Codex round-1 review of #2094.)"""
+    from pollypm.onboarding import _wait_for_login_completion
+    from pollypm.models import ProviderKind
+
+    home = tmp_path / "home"
+    home.mkdir()
+
+    panes = ["", "", "", ""]  # capture_pane returns sequential empty snapshots
+    pane_iter = iter(panes)
+
+    class FakeTmux:
+        def capture_pane(self, target, lines):
+            try:
+                return next(pane_iter)
+            except StopIteration:
+                return ""
+
+    # The stale email IS present at the home from the start.
+    monkeypatch.setattr(
+        "pollypm.onboarding._detect_account_email",
+        lambda provider, h: "stale@example.com",
+    )
+    monkeypatch.setattr("pollypm.onboarding.time.sleep", lambda seconds: None)
+
+    # Polling should time out, NOT short-circuit on the stale email.
+    completed, _pane = _wait_for_login_completion(
+        FakeTmux(),
+        target="dummy",
+        provider=ProviderKind.CLAUDE,
+        home=home,
+        allow_existing_auth_shortcut=False,
+        force_fresh_auth=True,
+        timeout_seconds=0.01,
+        poll_interval=0,
+    )
+    assert completed is False
+
+
+def test_wait_for_login_completion_force_fresh_succeeds_after_logout_marker(monkeypatch, tmp_path):
+    """After the post-logout marker is seen in the pane, email detection
+    is accepted as completion. (Codex round-1 review of #2094.)"""
+    from pollypm.onboarding import _wait_for_login_completion
+    from pollypm.models import ProviderKind
+
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # Sequence: first poll has no marker; second poll has the post-logout
+    # marker; subsequent polls keep it (sticky).
+    panes = [
+        "",
+        "\nPollyPM: logout-complete\n",
+        "\nPollyPM: logout-complete\n",
+    ]
+    pane_iter = iter(panes + [panes[-1]] * 20)  # repeat the last one
+
+    class FakeTmux:
+        def capture_pane(self, target, lines):
+            try:
+                return next(pane_iter)
+            except StopIteration:
+                return panes[-1]
+
+    monkeypatch.setattr(
+        "pollypm.onboarding._detect_account_email",
+        lambda provider, h: "fresh@example.com",
+    )
+
+    completed, _pane = _wait_for_login_completion(
         FakeTmux(),
         target="dummy",
         provider=ProviderKind.CLAUDE,

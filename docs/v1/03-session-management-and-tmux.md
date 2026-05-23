@@ -28,14 +28,33 @@ Every session in PollyPM is an interactive CLI agent running in a tmux window. S
 
 ## Tmux Integration
 
-### Single Tmux Session
+### Cockpit And Storage-Closet Sessions
 
-PollyPM creates and manages exactly one tmux session, named `pollypm`. All agent windows live inside this session.
+PollyPM separates the visible cockpit from the managed agent windows. The
+configured `project.tmux_session` (usually `pollypm`) is the human-facing
+cockpit session. Agent panes live in the storage-closet tmux session named
+`<project.tmux_session>-storage-closet` (for example,
+`pollypm-storage-closet`).
+
+Use the fully qualified storage-closet target when capturing or sending to an
+agent pane. For the default operator window, the canonical target is:
+
+```bash
+tmux capture-pane -t pollypm-storage-closet:pm-operator -p
+```
+
+Do not use `pollypm:pm-operator` unless `project.tmux_session` itself is
+configured to a different storage layout. API responses expose this as
+`window_target`, and that field is the source of truth for test plans and
+operator scripts.
 
 ```
-tmux session: pollypm
+tmux session: pollypm                  (cockpit)
+  window 0: PollyPM                    (human-facing TUI)
+
+tmux session: pollypm-storage-closet   (managed agents)
   window 0: heartbeat        (heartbeat supervisor)
-  window 1: polly            (operator)
+  window 1: pm-operator      (operator)
   window 2: task-acme-12     (per-task worker for acme/12)
   window 3: task-widgets-3   (per-task worker for widgets/3)
 ```
@@ -48,18 +67,18 @@ windows can coexist for the same project, one per active claim.
 
 | Operation | Tmux Command | When |
 |-----------|-------------|------|
-| Create session | `tmux new-session -d -s pollypm` | `pm up` (first time) |
-| Create window | `tmux new-window -t pollypm -n <name>` | Session launch |
-| Rename window | `tmux rename-window -t pollypm:<idx> <name>` | Session recovery with same identity |
-| Kill window | `tmux kill-window -t pollypm:<name>` | Session stop |
-| Kill session | `tmux kill-session -t pollypm` | `pm down` |
+| Create storage closet | `tmux new-session -d -s pollypm-storage-closet` | `pm up` (first time) |
+| Create agent window | `tmux new-window -t pollypm-storage-closet -n <name>` | Session launch |
+| Rename agent window | `tmux rename-window -t pollypm-storage-closet:<idx> <name>` | Session recovery with same identity |
+| Kill agent window | `tmux kill-window -t pollypm-storage-closet:<name>` | Session stop |
+| Kill storage closet | `tmux kill-session -t pollypm-storage-closet` | `pm down` |
 
 ### Pane Logging
 
 Every session window has pane logging enabled via `tmux pipe-pane`.
 
 ```bash
-tmux pipe-pane -t pollypm:<name> -o "cat >> <project>/.pollypm/logs/<name>/<launch-id>/pane.log"
+tmux pipe-pane -t pollypm-storage-closet:<name> -o "cat >> <project>/.pollypm/logs/<name>/<launch-id>/pane.log"
 ```
 
 Pane logging captures all terminal output — agent responses, tool use, errors, and any human input when a human is attached. Logging starts at launch and stops at session termination.
@@ -71,7 +90,7 @@ In addition to pane logs, PollyPM maintains its own transcript archive at `<proj
 Periodic snapshots of the visible pane content are taken via `tmux capture-pane`.
 
 ```bash
-tmux capture-pane -t pollypm:<name> -p > <project>/.pollypm/logs/<name>/<launch-id>/snapshots/<timestamp>.txt
+tmux capture-pane -t pollypm-storage-closet:<name> -p > <project>/.pollypm/logs/<name>/<launch-id>/snapshots/<timestamp>.txt
 ```
 
 Captures are taken:
@@ -86,7 +105,7 @@ Captures are taken:
 PollyPM sends prompts and commands to agent sessions via `tmux send-keys`.
 
 ```bash
-tmux send-keys -t pollypm:<name> "<prompt text>" Enter
+tmux send-keys -t pollypm-storage-closet:<name> "<prompt text>" Enter
 ```
 
 Input is only sent when PollyPM holds the lease for that pane. If a human holds the lease, input is queued until the lease is released.
@@ -150,7 +169,7 @@ The TUI displays lease information for each session:
 
 PollyPM detects human presence by monitoring tmux client attachment and pane input events:
 
-- `tmux list-clients -t pollypm` reveals attached clients
+- `tmux list-clients -t pollypm-storage-closet` reveals attached clients
 - Pane input that does not originate from `tmux send-keys` (PollyPM's own commands use a tagged prefix) indicates human activity
 - The heartbeat checks for human presence on each cycle
 

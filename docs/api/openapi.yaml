@@ -4376,6 +4376,7 @@ components:
 
     RegenerateBriefingRequest:
       type: object
+      additionalProperties: false
       properties:
         project:
           type: string

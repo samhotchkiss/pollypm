@@ -205,30 +205,86 @@ class BriefingRenderProvider(Protocol):
         ...
 
 
-_render_providers: dict[str, BriefingRenderProvider] = {}
+@dataclass(frozen=True, slots=True)
+class BriefingRenderRegistration:
+    """Provider + metadata for one briefing type.
+
+    The Web API's ``GET /briefings`` discovery endpoint surfaces the
+    ``description`` to clients and uses ``is_available`` to compute
+    the per-request availability flag. Plugins supply both at
+    :func:`register_briefing_render_provider` time so the registry is
+    the single source of truth for what types exist, what they're for,
+    and whether they can run right now (Codex round-10 on #2059 —
+    previously the Web API maintained its own private ``_REGISTRY``
+    keyed only on ``"morning"`` and ignored plugin-contributed types
+    even though :func:`registered_briefing_render_types` exposed them).
+    """
+
+    provider: BriefingRenderProvider
+    description: str
+    is_available: Callable[[Any], bool]
+
+
+def _default_is_available(_config: Any) -> bool:
+    """Fallback availability check: a registered provider is available."""
+    return True
+
+
+_render_providers: dict[str, BriefingRenderRegistration] = {}
 
 
 def register_briefing_render_provider(
     type_name: str,
     provider: BriefingRenderProvider | None,
+    *,
+    description: str = "",
+    is_available: Callable[[Any], bool] | None = None,
 ) -> None:
     """Install (or clear) a render / regenerate provider for a briefing type.
 
-    Plugins call this in their ``initialize`` hook. Passing ``None``
+    Plugins call this in their ``initialize`` hook. Passing ``provider=None``
     clears the slot (used by tests + the plugin-disable cleanup path).
-    The Web API consumes providers via :func:`get_briefing_render_provider`,
-    keeping ``plugins_builtin`` out of the core import graph.
+    The Web API consumes providers via :func:`get_briefing_render_provider`
+    and surfaces ``description`` / ``is_available`` through its
+    discovery endpoint, keeping ``plugins_builtin`` out of the core
+    import graph.
+
+    ``description`` is the human-readable blurb returned by
+    ``GET /briefings`` for this type. ``is_available`` is called with
+    the per-request config and must return whether this type can render
+    now (e.g. plugin enabled, backing store reachable). Both keyword
+    args default to spec-compatible no-ops so legacy callers that only
+    pass a provider keep working — though new types should supply them
+    for the discovery endpoint to render usefully (Codex round-10 on
+    #2059).
     """
     if provider is None:
         _render_providers.pop(type_name, None)
         return
-    _render_providers[type_name] = provider
+    _render_providers[type_name] = BriefingRenderRegistration(
+        provider=provider,
+        description=description,
+        is_available=is_available or _default_is_available,
+    )
 
 
 def get_briefing_render_provider(
     type_name: str,
 ) -> BriefingRenderProvider | None:
     """Return the provider installed for ``type_name``, or ``None``."""
+    registration = _render_providers.get(type_name)
+    return registration.provider if registration is not None else None
+
+
+def get_briefing_render_registration(
+    type_name: str,
+) -> BriefingRenderRegistration | None:
+    """Return the full registration record for ``type_name`` (with metadata).
+
+    Used by surfaces that need the description / availability adapter
+    (the Web API's ``GET /briefings``). Returns ``None`` for unknown
+    type names.
+    """
     return _render_providers.get(type_name)
 
 
@@ -268,7 +324,9 @@ __all__ = [
     "BriefingEntryLike",
     "BriefingProvider",
     "BriefingRenderProvider",
+    "BriefingRenderRegistration",
     "get_briefing_render_provider",
+    "get_briefing_render_registration",
     "is_briefing_provider_registered",
     "is_plugin_disabled_in_config",
     "list_briefings",

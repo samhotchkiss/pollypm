@@ -1528,3 +1528,140 @@ def test_disabled_morning_plugin_per_request(
     finally:
         # Drop the global render provider so sibling tests start clean.
         register_briefing_render_provider("morning", None)
+
+
+# ---------------------------------------------------------------------------
+# Codex round-10 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_registered_briefing_types_surface_in_list_endpoint(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_registry: dict[str, _BriefingAdapter],  # noqa: ARG001
+) -> None:
+    """Plugin-contributed types via the registry surface in ``GET /briefings``.
+
+    Codex round-10 on #2059: the route used to keep a private
+    ``_REGISTRY`` dict containing only ``"morning"``. Registering a
+    ``"weekly"`` provider via
+    :func:`pollypm.briefings_registry.register_briefing_render_provider`
+    would return ``("weekly",)`` from
+    :func:`registered_briefing_render_types`, but the route's list
+    endpoint and ``_lookup_type`` ignored it. With the round-10 fix the
+    registry is the single source of truth; this regression pins it.
+    """
+    from pollypm.briefings_registry import (
+        BriefingArtifact,
+        register_briefing_render_provider,
+    )
+
+    weekly_description = (
+        "Weekly digest — last 7 days of activity per project."
+    )
+
+    class _FakeWeeklyProvider:
+        def render_last(self, _config):  # type: ignore[no-untyped-def]
+            return None
+
+        def regenerate(self, _config, project=None):  # type: ignore[no-untyped-def]
+            return BriefingArtifact(
+                date_local="2026-05-22",
+                markdown="# Weekly\n",
+                mode="synthesized",
+            )
+
+    register_briefing_render_provider(
+        "weekly",
+        _FakeWeeklyProvider(),
+        description=weekly_description,
+        is_available=lambda _config: True,
+    )
+    try:
+        response = client.get("/api/v1/briefings", headers=auth_headers)
+        assert response.status_code == 200, response.json()
+        types_by_name = {
+            entry["name"]: entry for entry in response.json()["types"]
+        }
+        assert "weekly" in types_by_name, (
+            "register_briefing_render_provider('weekly', ...) should "
+            "make ``weekly`` show up in GET /briefings — the registry "
+            "is the single source of truth (Codex round-10 on #2059)."
+        )
+        assert types_by_name["weekly"]["description"] == weekly_description
+        assert types_by_name["weekly"]["available"] is True
+        # The morning override from ``patched_registry`` still wins for
+        # ``morning`` (test stubs beat plugin registrations).
+        assert "morning" in types_by_name
+    finally:
+        register_briefing_render_provider("weekly", None)
+
+
+def test_regenerate_rejects_unknown_field(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_registry: dict[str, _BriefingAdapter],  # noqa: ARG001
+) -> None:
+    """``RegenerateRequest`` rejects unknown body fields with 422.
+
+    Codex round-10 on #2059: a typo like ``{"project_key": "myproj"}``
+    used to validate as ``{"project": None}`` and trigger a
+    whole-workspace regenerate — even though ``{"project": "myproj"}``
+    is intentionally rejected for the built-in ``morning`` type with a
+    400. For a side-effecting endpoint, unknown fields must surface as
+    422 instead of being silently dropped.
+    """
+    response = client.post(
+        "/api/v1/briefings/morning/regenerate",
+        json={"project_key": "myproj"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 422, response.json()
+    body = response.json()
+    # FastAPI / Pydantic v2 emits ``extra_forbidden`` in the error
+    # detail. We grep the rendered envelope rather than introspecting
+    # the precise FastAPI error shape so this still passes if the
+    # error envelope wrapper changes around the body.
+    rendered = repr(body).lower()
+    assert "extra_forbidden" in rendered or "extra fields" in rendered or "project_key" in rendered, (
+        "422 envelope should identify the unknown field "
+        "(``project_key``) or the ``extra_forbidden`` error type — "
+        f"got: {body!r}"
+    )
+
+
+def test_regenerate_request_schema_forbids_extras() -> None:
+    """Pin ``RegenerateBriefingRequest`` extras=forbid in runtime + static YAML.
+
+    Codex round-10 on #2059. Mirror of
+    ``tests/web_api/test_openapi_conformance.py::test_task_patch_request_schema_forbids_extras``
+    (#2064 round-12 / round-8 pattern): generated clients reading
+    ``docs/api/openapi.yaml`` must see ``additionalProperties: false``
+    on the regenerate request body so the typo
+    ``{"project_key": "myproj"}`` surfaces as a schema violation, not
+    a runtime-only 422. Runtime-vs-static parity is also pinned so a
+    future ``extra='allow'`` drift on either side trips here.
+    """
+    import yaml
+
+    contract_path = (
+        Path(__file__).resolve().parent.parent
+        / "docs" / "api" / "openapi.yaml"
+    )
+    contract = yaml.safe_load(contract_path.read_text())
+    static_schema = contract["components"]["schemas"]["RegenerateBriefingRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "RegenerateBriefingRequest in docs/api/openapi.yaml must "
+        "declare ``additionalProperties: false`` to mirror the "
+        "runtime ``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys (e.g. ``project_key`` typo) as "
+        "valid even though the server returns 422 (#2059 round-10)."
+    )
+
+    runtime_schema = RegenerateRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime RegenerateRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )

@@ -23,6 +23,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from pollypm.briefings_registry import (
+    is_plugin_disabled_in_config,
     register_briefing_provider,
     register_briefing_render_provider,
 )
@@ -82,6 +83,36 @@ def _register_handlers(api: JobHandlerAPI) -> None:
     )
 
 
+_MORNING_BRIEFING_DESCRIPTION = (
+    "Daily morning briefing — yesterday's progress, today's "
+    "priorities, watch items. Fires at the configured local hour."
+)
+
+
+def _morning_is_available(config: object) -> bool:
+    """Per-request availability for the ``morning`` briefing type.
+
+    Two gates:
+
+    1. ``config.plugins.disabled`` must not contain ``morning_briefing``
+       (Codex round-9 on #2059: ``create_app`` reloads config per
+       request, so a mid-run edit to ``[plugins].disabled`` must flip
+       ``available=false`` without restarting ``pm serve``).
+    2. This very plugin must be the one currently installed — i.e. our
+       provider is the one in the registry slot, not a stale provider
+       from a torn-down test fixture.
+
+    Lives in the plugin (not in the route) so the registry is the
+    single source of truth for the per-type availability adapter
+    (Codex round-10 on #2059).
+    """
+    from pollypm.briefings_registry import get_briefing_render_provider
+
+    if is_plugin_disabled_in_config(config, "morning_briefing"):
+        return False
+    return get_briefing_render_provider(MorningBriefingRenderProvider.type_name) is not None
+
+
 def _initialize(api: PluginAPI) -> None:
     """Wire the briefing-inbox provider AND render facade for core surfaces.
 
@@ -93,14 +124,20 @@ def _initialize(api: PluginAPI) -> None:
 
     The Web API additionally renders / regenerates briefings through
     :func:`pollypm.briefings_registry.get_briefing_render_provider`.
-    We install the morning render facade here so the API never imports
-    ``plugins_builtin.morning_briefing`` directly (#2059 round-9).
+    We install the morning render facade here, along with its
+    user-facing ``description`` and per-request ``is_available``
+    adapter, so the Web API discovery endpoint can surface the type
+    without knowing anything plugin-specific (#2059 round-9 + #2059
+    round-10: the registry is the single source of truth for briefing
+    type metadata, not a private dict in the route module).
     """
     del api  # unused — both seams are accessed through the registry
     register_briefing_provider(list_briefings)
     register_briefing_render_provider(
         MorningBriefingRenderProvider.type_name,
         MorningBriefingRenderProvider(),
+        description=_MORNING_BRIEFING_DESCRIPTION,
+        is_available=_morning_is_available,
     )
 
 

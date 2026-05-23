@@ -147,7 +147,16 @@ class RegenerateRequest(BaseModel):
     we accept the field for forward compatibility so plugin-contributed
     briefing types (e.g. per-project weekly) don't need a body-schema
     bump later.
+
+    ``extra='forbid'`` (Codex round-10 on #2059): a side-effecting
+    endpoint must surface client typos as 422 rather than silently
+    dropping the unknown field. A client POSTing
+    ``{"project_key": "myproj"}`` (a plausible mistake) used to validate
+    as ``{"project": None}`` and trigger a whole-workspace regenerate;
+    the request now rejects with ``extra_forbidden`` instead.
     """
+
+    model_config = {"extra": "forbid"}
 
     project: str | None = None
 
@@ -328,18 +337,109 @@ def _morning_regenerate(config: Any, body: RegenerateRequest) -> BriefingRespons
     return _artifact_to_response(_MORNING_BRIEFING_TYPE_NAME, artifact)
 
 
-_REGISTRY: dict[str, _BriefingAdapter] = {
-    "morning": _BriefingAdapter(
-        name="morning",
-        description=(
-            "Daily morning briefing — yesterday's progress, today's "
-            "priorities, watch items. Fires at the configured local hour."
-        ),
-        available=_morning_available,
-        render_last=_morning_render_last,
-        regenerate=_morning_regenerate,
-    ),
-}
+# Test-override slot. Production code path consults
+# :func:`pollypm.briefings_registry.get_briefing_render_registration`
+# (Codex round-10 on #2059: the registry is now the single source of
+# truth for briefing type discovery; the route used to keep its own
+# dict that ignored plugin-contributed types). Tests still monkeypatch
+# entries here to inject controllable stubs without going through the
+# plugin bootstrap path — see ``tests/test_briefings_endpoint.py``
+# fixture ``patched_registry``. When a name is in both ``_REGISTRY``
+# and the global registry, the override wins (tests beat plugins).
+_REGISTRY: dict[str, _BriefingAdapter] = {}
+
+
+def _registration_to_adapter(
+    type_name: str,
+    registration: Any,
+) -> _BriefingAdapter:
+    """Wrap a :class:`BriefingRenderRegistration` for the route layer.
+
+    The registry returns a (provider, description, is_available) record.
+    The route's :class:`_BriefingAdapter` expects three callables
+    (``available``, ``render_last``, ``regenerate``) — this glue
+    translates one to the other and centralizes the
+    ``BriefingArtifact`` → :class:`BriefingResponse` mapping.
+    """
+    provider = registration.provider
+
+    def _available(config: Any) -> bool:
+        return registration.is_available(config)
+
+    def _render_last(config: Any) -> BriefingResponse | None:
+        if not registration.is_available(config):
+            return None
+        artifact = provider.render_last(config)
+        if artifact is None:
+            return None
+        return _artifact_to_response(type_name, artifact)
+
+    def _regenerate(config: Any, body: RegenerateRequest) -> BriefingResponse:
+        if not registration.is_available(config):
+            raise service_unavailable(
+                f"briefing {type_name!r} provider is unavailable",
+                hint=(
+                    "Enable the corresponding plugin in pollypm.toml "
+                    "and re-trigger; or rely on the next briefing tick."
+                ),
+            )
+        try:
+            artifact = provider.regenerate(config, project=body.project)
+        except ValueError as exc:
+            raise invalid_request(
+                str(exc) or "project-scoped briefing not implemented",
+                hint=(
+                    f"Omit the `project` field — the {type_name} briefing "
+                    "is whole-workspace only."
+                ),
+            ) from exc
+        return _artifact_to_response(type_name, artifact)
+
+    return _BriefingAdapter(
+        name=type_name,
+        description=registration.description or f"Briefing type {type_name!r}",
+        available=_available,
+        render_last=_render_last,
+        regenerate=_regenerate,
+    )
+
+
+def _resolve_adapter(type_name: str) -> _BriefingAdapter | None:
+    """Return the live adapter for ``type_name`` or ``None`` if unknown.
+
+    Lookup order:
+    1. ``_REGISTRY`` override slot (test stubs).
+    2. :func:`pollypm.briefings_registry.get_briefing_render_registration`
+       — the plugin-installed provider + metadata.
+    """
+    override = _REGISTRY.get(type_name)
+    if override is not None:
+        return override
+    from pollypm.briefings_registry import get_briefing_render_registration
+
+    registration = get_briefing_render_registration(type_name)
+    if registration is None:
+        return None
+    return _registration_to_adapter(type_name, registration)
+
+
+def _all_adapters() -> list[_BriefingAdapter]:
+    """Return adapters for every known briefing type (override + registry).
+
+    Tests inject under ``_REGISTRY``; production registers through the
+    plugin bootstrap → :mod:`pollypm.briefings_registry`. We union the
+    two so the discovery endpoint surfaces both surfaces' types (test
+    stubs always win when the name collides).
+    """
+    from pollypm.briefings_registry import registered_briefing_render_types
+
+    names = set(_REGISTRY) | set(registered_briefing_render_types())
+    adapters: list[_BriefingAdapter] = []
+    for name in sorted(names):
+        adapter = _resolve_adapter(name)
+        if adapter is not None:
+            adapters.append(adapter)
+    return adapters
 
 
 # ---------------------------------------------------------------------------
@@ -361,14 +461,25 @@ def _parse_iso(value: str) -> datetime | None:
 
 
 def _lookup_type(type_name: str) -> _BriefingAdapter:
-    """Resolve a briefing type or raise 404."""
-    adapter = _REGISTRY.get(type_name)
+    """Resolve a briefing type or raise 404.
+
+    Consults the test-override slot first, then the
+    :mod:`pollypm.briefings_registry` plugin registrations (Codex
+    round-10 on #2059: a private route-owned dict ignored
+    plugin-contributed types like a future ``weekly`` even though they
+    were properly registered via
+    :func:`register_briefing_render_provider`).
+    """
+    adapter = _resolve_adapter(type_name)
     if adapter is None:
+        from pollypm.briefings_registry import registered_briefing_render_types
+
+        known = sorted(set(_REGISTRY) | set(registered_briefing_render_types()))
         raise not_found(
             f"Unknown briefing type: {type_name!r}",
             hint=(
                 "Use GET /api/v1/briefings to list available types. "
-                f"Known types: {sorted(_REGISTRY)}"
+                f"Known types: {known}"
             ),
         )
     return adapter
@@ -422,7 +533,7 @@ def list_briefing_types_endpoint(config: ConfigDep) -> BriefingTypesResponse:
             description=adapter.description,
             available=adapter.is_available(config),
         )
-        for adapter in _REGISTRY.values()
+        for adapter in _all_adapters()
     ]
     return BriefingTypesResponse(types=types)
 

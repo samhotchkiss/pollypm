@@ -16,10 +16,12 @@ Design
   made postgres the supported production backend; leaving sqlite
   registered let a misconfigured ``[storage].backend = "sqlite"``
   silently open an empty shadow alongside the real pg state. Sqlite
-  is now opt-in via :func:`register_backend` — tests and the legacy
-  ``pm notify --db <path>`` / ``pm inbox --db <path>`` escape hatches
-  call it explicitly; ``get_store(config)`` with backend=="sqlite"
-  on a stock install fails loud with :class:`StoreBackendNotFound`.
+  is now test-only via :func:`register_backend`: the function hard-
+  rejects ``name == "sqlite"`` outside a pytest process (refs #1971,
+  #1970), and ``get_store(config)`` with backend=="sqlite" on a stock
+  install fails loud with :class:`StoreBackendNotFound`. The
+  ``pm notify --db <path>`` / ``pm inbox --db <path>`` CLI flags no
+  longer opt sqlite back in either — they target a pg URL only.
 * **URL resolution lives in one place.** If ``config.storage.url`` is
   empty and the backend is sqlite (i.e. an opt-in caller registered
   it), we derive ``sqlite:///<project.state_db>`` so a test using
@@ -60,13 +62,15 @@ logger = logging.getLogger(__name__)
 # #1956: sqlite was removed from the ``pollypm.store_backend`` entry-point
 # group in ``pyproject.toml`` so a misconfigured ``[storage].backend
 # = "sqlite"`` fails loud at :func:`get_store` instead of silently
-# opening an empty sqlite shadow next to the real pg state. Tests and
-# the legacy ``--db <path>`` CLI escape hatches that legitimately need
-# sqlite call :func:`register_backend` to opt back in.
+# opening an empty sqlite shadow next to the real pg state. Only the
+# pytest suite may re-register sqlite via :func:`register_backend`;
+# the function hard-rejects ``name == "sqlite"`` outside a pytest
+# process (refs #1971, #1970). The previous ``pm notify --db`` /
+# ``pm inbox --db`` CLI escape hatches no longer opt sqlite back in.
 #
 # Lookup order in the resolvers below:
-#   1. ``_REGISTERED_BACKENDS`` (this in-process map; tests + opt-in
-#      callers register here).
+#   1. ``_REGISTERED_BACKENDS`` (this in-process map; pytest fixtures
+#      register here).
 #   2. ``importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)``
 #      (installed packages; only ``postgres`` ships by default).
 _REGISTERED_BACKENDS: dict[str, Callable[..., "Store"]] = {}
@@ -76,13 +80,15 @@ _REGISTRATION_LOCK = threading.Lock()
 def _running_under_pytest() -> bool:
     """Return True when the active interpreter is a pytest run.
 
-    Used by :func:`register_backend` to suppress the production-sqlite
-    warn-log under the test suite (where re-registering sqlite is the
-    documented opt-in path; see ``tests/conftest.py``). The check is
-    deliberately permissive — either ``PYTEST_CURRENT_TEST`` (set by
-    pytest for the duration of each item) or ``pytest`` being imported
-    is enough; we'd rather under-warn in a niche test harness than
-    spam the rail in production.
+    Used by :func:`register_backend` to gate the sqlite opt-in: only
+    the test suite (where re-registering sqlite is the documented
+    fixture path; see ``tests/conftest.py``) may opt back in.
+    Production processes hard-fail with :class:`ValueError` instead.
+    The check is deliberately permissive — either
+    ``PYTEST_CURRENT_TEST`` (set by pytest for the duration of each
+    item) or ``pytest`` being imported is enough; we'd rather under-
+    reject in a niche test harness than break a production rail by
+    failing a legitimate pytest run.
     """
     if "PYTEST_CURRENT_TEST" in os.environ:
         return True
@@ -94,8 +100,6 @@ def _running_under_pytest() -> bool:
 def register_backend(
     name: str,
     factory: Callable[..., "Store"],
-    *,
-    quiet: bool = False,
 ) -> None:
     """Register ``factory`` as the in-process backend for ``name``.
 
@@ -115,10 +119,6 @@ def register_backend(
         Anything callable with ``url=<str>`` returning a
         :class:`~pollypm.store.protocol.Store`. Typically
         :class:`~pollypm.store.sqlalchemy_store.SQLAlchemyStore`.
-    quiet
-        Reserved for the pytest conftest's opt-in path. Production
-        callers must leave it ``False`` so the production-sqlite guard
-        below fires.
 
     Raises
     ------
@@ -126,10 +126,14 @@ def register_backend(
         When ``name == "sqlite"`` is requested from a non-pytest
         process. Post-sqlite-ripout (refs #1971, #1970) sqlite is
         gone from every production code path; the previous warn-log
-        is now a hard rejection so a stray subprocess that imports
+        plus ``quiet=True`` bypass is now an unconditional hard
+        rejection so a stray subprocess that imports
         :class:`~pollypm.store.sqlalchemy_store.SQLAlchemyStore` and
         tries to re-register cannot reactivate the split-brain
-        sqlite-shadow class of bugs.
+        sqlite-shadow class of bugs. There is intentionally no
+        production-callable opt-out: a future legacy migration tool
+        would live under ``tests/`` or a dedicated migration-only
+        module that pytest treats as an in-process test.
 
     Notes
     -----
@@ -137,18 +141,15 @@ def register_backend(
     no-op. Re-registering with a different factory replaces the prior
     entry — the test suite relies on that during teardown.
     """
-    if (
-        name == "sqlite"
-        and not quiet
-        and not _running_under_pytest()
-    ):
+    if name == "sqlite" and not _running_under_pytest():
         raise ValueError(
             "pollypm.store: refusing to register the sqlite backend in "
             "a production process. The pg cutover (#1737) made postgres "
             "the only supported backend; sqlite was removed from every "
             "production code path in the sqlite-ripout sequence "
-            "(refs #1971, #1970). If you are running a one-off legacy "
-            "migration tool, pass quiet=True to acknowledge the opt-in."
+            "(refs #1971, #1970). There is no production-callable "
+            "opt-out; if you genuinely need sqlite for a migration, "
+            "drive it from a pytest-invoked test module."
         )
     with _REGISTRATION_LOCK:
         _REGISTERED_BACKENDS[name] = factory
@@ -322,13 +323,15 @@ def get_store_by_url(url: str, *, backend: str = "sqlite") -> "Store":
     ``SQLAlchemyStore`` per call would pin ~16 SQLite handles per
     invocation; routing through this helper keeps the pool singleton.
 
-    #1956: sqlite is no longer entry-pointed. The default
-    ``backend="sqlite"`` kwarg keeps the historical signature but
-    callers reaching for sqlite must ensure :func:`register_backend`
-    has been invoked first (tests/conftest, ``pm notify --db`` escape
-    hatches). An un-registered sqlite call raises
+    #1956: sqlite is no longer entry-pointed and the CLI ``--db``
+    flags no longer opt sqlite back in. The default
+    ``backend="sqlite"`` kwarg only keeps the historical signature
+    for the pytest suite, which registers sqlite via
+    :func:`register_backend` in ``tests/conftest``. A production
+    caller reaching this helper with ``backend="sqlite"`` raises
     :class:`StoreBackendNotFound` listing the backends that *are*
-    available.
+    available; production callers should pass an explicit
+    ``backend="postgres"`` instead.
     """
     key = (backend, url)
     cached = _STORES.get(key)

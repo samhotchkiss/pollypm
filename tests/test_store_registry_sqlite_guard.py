@@ -120,15 +120,48 @@ def test_register_backend_non_sqlite_unaffected(
         unregister_backend(backend_name)
 
 
-def test_register_backend_sqlite_quiet_opt_in_outside_pytest(
+def test_register_backend_has_no_production_bypass() -> None:
+    """No production-callable opt-out re-enables sqlite process-wide.
+
+    Codex flagged (PR #2074 review) that the historical ``quiet=True``
+    kwarg was an unconditional production bypass — any runtime caller
+    could pass it to opt sqlite back in, defeating the source-level
+    guard. Removing that kwarg is the fix; pin it here so a future
+    commit cannot silently reintroduce a non-pytest opt-out.
+
+    Two assertions hold the line:
+
+    1. The :func:`register_backend` signature exposes no ``quiet`` /
+       ``force`` / ``allow_sqlite`` style kwarg — operators can't pass
+       one even by accident.
+    2. Calling the function with such a kwarg from a non-pytest
+       process raises (``TypeError`` for the unexpected kwarg, before
+       the sqlite guard even runs).
+    """
+    import inspect
+
+    sig = inspect.signature(register_backend)
+    parameters = set(sig.parameters)
+    for forbidden in ("quiet", "force", "allow_sqlite", "bypass"):
+        assert forbidden not in parameters, (
+            f"register_backend must not expose a {forbidden!r} kwarg — "
+            "any such kwarg is a production-callable bypass of the "
+            "sqlite-ripout guard (refs PR #2074 Codex review, #1970)."
+        )
+
+
+def test_register_backend_sqlite_no_kwarg_bypass_outside_pytest(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The ``quiet=True`` opt-in remains available for legacy migrations.
+    """Even when called with an opt-out-looking kwarg, the call fails.
 
-    A one-off legacy migration tool that genuinely needs sqlite can
-    pass ``quiet=True`` to acknowledge the opt-in. The docstring
-    promises this escape hatch; pin it here so a future tightening
-    doesn't break the migration path silently.
+    Belt-and-braces companion to
+    :func:`test_register_backend_has_no_production_bypass`: simulate a
+    caller who copy-pasted the old ``quiet=True`` invocation and
+    confirm the call raises before any registry mutation. This is the
+    behaviour Codex pinned in PR #2074 review (Finding 1) — any
+    runtime caller passing the old kwarg must hit a hard error, not
+    silently re-enable sqlite.
     """
     from pollypm.store import registry as registry_mod
 
@@ -136,10 +169,13 @@ def test_register_backend_sqlite_quiet_opt_in_outside_pytest(
         registry_mod, "_running_under_pytest", lambda: False,
     )
 
-    try:
-        register_backend("sqlite", _dummy_factory, quiet=True)
-        assert "sqlite" in registry_mod._REGISTERED_BACKENDS, (
-            "quiet=True must remain an explicit migration opt-in."
-        )
-    finally:
-        unregister_backend("sqlite")
+    with pytest.raises(TypeError):
+        # ``quiet`` is no longer a parameter, so the call raises
+        # before the guard even runs. We deliberately use ``**`` to
+        # bypass any static-analysis check that might otherwise flag
+        # the unknown kwarg at import time.
+        register_backend("sqlite", _dummy_factory, **{"quiet": True})
+
+    assert "sqlite" not in registry_mod._REGISTERED_BACKENDS, (
+        "rejected bypass attempts must never mutate the registry."
+    )

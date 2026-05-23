@@ -567,7 +567,7 @@ def _mount_web_ui(
         # gets the HTML but NO cookie. The SPA surfaces a 401 on its
         # first /api/ call so the operator knows to access via
         # loopback or tailnet. See spec doc:
-        # docs/pollypm-web-ui-2065-security-spec.md (decision d-ii).
+        # docs/web-ui-2065-security-spec.md (decision d-ii).
         client_host = request.client.host if request.client else None
         is_loopback = client_host in ("127.0.0.1", "::1")
         is_tailnet = tailnet_trust_enabled and is_tailscale_ip(client_host)

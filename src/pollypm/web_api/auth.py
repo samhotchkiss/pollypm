@@ -33,7 +33,7 @@ mints a ``pollypm-session`` cookie from the on-disk token for any
 loopback caller (and for tailnet callers when the flag above is on) as
 a convenience for the local-operator workflow: a browser on the same
 machine shouldn't have to paste a bearer to view the cockpit. See
-``docs/pollypm-web-ui-2065-security-spec.md`` decision **d-ii** for the
+``docs/web-ui-2065-security-spec.md`` decision **d-ii** for the
 signed-off trade-off — loopback-cookie-mint is an explicit local-
 operator bypass, not an oversight.
 """

@@ -26,6 +26,9 @@ flows through the same code path ``pm serve`` uses at runtime.
 from __future__ import annotations
 
 import asyncio
+import json
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -319,6 +322,136 @@ def test_detect_tailscale_ip_returns_none_when_binary_missing() -> None:
         return_value=None,
     ):
         assert detect_tailscale_ip() is None
+
+
+# -------- Round-5: detect_tailscale_ip output validation ----------------
+#
+# Codex round-5 blocker: the detector previously returned the first
+# non-empty stdout token from ``tailscale ip -4`` without validating
+# either parseability or membership in the Tailscale CGNAT range
+# (100.64.0.0/10). The serve path enables ``tailnet_trust=True``
+# whenever this function returns a non-``None`` value, so leaking a
+# malformed token (e.g. "not-an-ip") or a parseable-but-non-tailnet
+# address would silently grant credential-free CGNAT trust to a peer
+# we could not have verified came in on tailscale0. Lock the validator
+# contract to (parseable IPv4) AND (inside CGNAT range).
+
+
+def _patch_tailscale_stdout(stdout: str):
+    """Build the (which + subprocess.run) double-mock the tests need."""
+
+    class _FakeResult:
+        def __init__(self) -> None:
+            self.returncode = 0
+            self.stdout = stdout
+
+    def _fake_run(*_args, **_kwargs):
+        return _FakeResult()
+
+    return patch(
+        "pollypm.cli_features.web_api.shutil.which",
+        return_value="/usr/bin/tailscale",
+    ), patch(
+        "pollypm.cli_features.web_api.subprocess.run",
+        side_effect=_fake_run,
+    )
+
+
+def test_detect_tailscale_ip_rejects_malformed_output() -> None:
+    """Garbage on stdout → ``None`` (not the raw token)."""
+    which_p, run_p = _patch_tailscale_stdout("not-an-ip\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() is None
+
+
+def test_detect_tailscale_ip_rejects_non_cgnat_ipv4() -> None:
+    """Parseable IPv4 outside 100.64.0.0/10 → ``None``.
+
+    A LAN router that happens to be reachable as 192.168.1.1 must NOT
+    be treated as a verified Tailscale peer; the serve path keys
+    ``tailnet_trust=True`` off this function's truthiness.
+    """
+    which_p, run_p = _patch_tailscale_stdout("192.168.1.1\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() is None
+
+
+def test_detect_tailscale_ip_rejects_public_ipv4() -> None:
+    """A public IPv4 (e.g. 8.8.8.8) must also be refused."""
+    which_p, run_p = _patch_tailscale_stdout("8.8.8.8\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() is None
+
+
+def test_detect_tailscale_ip_rejects_ipv6_output() -> None:
+    """IPv6 token (CGNAT is IPv4-only) → ``None``."""
+    which_p, run_p = _patch_tailscale_stdout("fd7a:115c:a1e0::1\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() is None
+
+
+def test_detect_tailscale_ip_accepts_valid_cgnat_ipv4() -> None:
+    """A parseable IPv4 inside 100.64.0.0/10 → the address string."""
+    which_p, run_p = _patch_tailscale_stdout("100.64.0.5\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() == "100.64.0.5"
+
+
+def test_detect_tailscale_ip_accepts_upper_cgnat_boundary() -> None:
+    """Boundary check: 100.127.255.254 is still inside 100.64.0.0/10."""
+    which_p, run_p = _patch_tailscale_stdout("100.127.255.254\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() == "100.127.255.254"
+
+
+def test_detect_tailscale_ip_rejects_just_outside_cgnat() -> None:
+    """100.128.0.0 is one bit outside 100.64.0.0/10 → ``None``."""
+    which_p, run_p = _patch_tailscale_stdout("100.128.0.1\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() is None
+
+
+def test_detect_tailscale_ip_handles_empty_output() -> None:
+    """Empty stdout → ``None`` (no token to validate)."""
+    which_p, run_p = _patch_tailscale_stdout("")
+    with which_p, run_p:
+        assert detect_tailscale_ip() is None
+
+
+def test_detect_tailscale_ip_handles_whitespace_only_output() -> None:
+    """Whitespace-only stdout → ``None`` (no non-empty token)."""
+    which_p, run_p = _patch_tailscale_stdout("\n   \n\t\n")
+    with which_p, run_p:
+        assert detect_tailscale_ip() is None
+
+
+def test_pm_serve_does_not_trust_explicit_host_matching_garbage(
+    api_config, token_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit ``--host not-an-ip`` cannot inherit tailnet trust.
+
+    Companion to the detector tests: even if a future detector
+    regression returned an unvalidated token, the validated detector
+    contract guarantees ``detected is None`` whenever the candidate is
+    not a verified CGNAT IPv4, so the explicit-host equality branch
+    (``cli_features/web_api.py:245-248``) cannot flip
+    ``tailnet_trust_enabled`` for a non-CGNAT host.
+    """
+    # detect_result=None simulates the post-validation detector
+    # rejecting an invalid `tailscale ip -4` output.
+    result, captured = _run_serve_command(
+        api_config,
+        token_path,
+        monkeypatch,
+        detect_result=None,
+        extra_args=["--host", "192.168.1.1", "--allow-remote"],
+    )
+    assert result.exit_code == 0, result.output
+    create_app_kwargs = captured["create_app_kwargs"]
+    assert create_app_kwargs["tailnet_trust_enabled"] is False, (
+        "Non-CGNAT explicit host must never enable tailnet trust; "
+        f"got create_app kwargs: {create_app_kwargs}"
+    )
 
 
 def _run_serve_command(
@@ -655,3 +788,292 @@ def test_ui_app_js_renderdashboard_uses_buildcard_helper(
     # workspace-wide.
     assert "scoped_fields" in body
     assert "(filtered)" in body
+
+
+# -------- Round-5: executable renderDashboard coverage ------------------
+#
+# Codex round-5 blocker: the prior three tests (static greps over
+# ``/ui/app.js``) cannot catch a runtime mapping bug where the right
+# field names appear in source but flow into the wrong card, or where a
+# refactor silently breaks the rendered output. Feed a representative
+# ``DashboardResponse`` payload through the REAL ``renderDashboard``
+# under node, then assert visible labels + values land in the rendered
+# DOM. This is the executable coverage Codex asked for.
+
+
+def _node_render_dashboard(payload: dict) -> str:
+    """Load ``app.js`` under node with a minimal DOM shim and render.
+
+    Returns the ``innerHTML`` of the ``#dashboard-rollups`` container
+    after ``window.PollyPM.renderDashboard(payload)`` executes. The DOM
+    shim implements only what ``app.js`` touches at render time:
+    ``document.getElementById``, ``document.createElement`` returning
+    nodes with ``setAttribute`` / ``appendChild`` / ``className`` /
+    ``textContent`` / ``innerHTML`` / ``querySelector``. We deliberately
+    avoid pulling in ``jsdom`` to keep the dev-deps surface flat — this
+    SPA is tiny enough that ~60 LOC of shim covers it.
+    """
+    node_bin = shutil.which("node")
+    if node_bin is None:
+        pytest.skip("node binary not available; cannot run executable JS harness")
+    app_js_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "pollypm"
+        / "web_api"
+        / "ui"
+        / "app.js"
+    )
+    assert app_js_path.is_file(), f"app.js missing at {app_js_path}"
+    # When invoked as ``node -e <code> ARG1 ARG2``, ``process.argv`` is
+    # ``[node, ARG1, ARG2]`` (no script slot for ``-e``), so the
+    # app.js path lands at argv[1] and the JSON payload at argv[2].
+    harness = r"""
+const fs = require("fs");
+const path = process.argv[1];
+const payload = JSON.parse(process.argv[2]);
+
+// ---- minimal DOM shim --------------------------------------------------
+function makeNode(tag) {
+  const node = {
+    tagName: (tag || "div").toUpperCase(),
+    children: [],
+    attrs: {},
+    className: "",
+    textContent: "",
+    style: {},
+  };
+  Object.defineProperty(node, "innerHTML", {
+    get() {
+      function render(n) {
+        if (n.__text != null) {
+          return String(n.__text)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+        }
+        const tag = n.tagName.toLowerCase();
+        const parts = [];
+        for (const k of Object.keys(n.attrs)) {
+          parts.push(k + '="' + n.attrs[k] + '"');
+        }
+        if (n.className) parts.push('class="' + n.className + '"');
+        const open = parts.length
+          ? "<" + tag + " " + parts.join(" ") + ">"
+          : "<" + tag + ">";
+        let inner = "";
+        if (n.textContent && n.children.length === 0) {
+          inner = String(n.textContent)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+        } else {
+          inner = n.children.map(render).join("");
+        }
+        return open + inner + "</" + tag + ">";
+      }
+      return node.children.map(render).join("");
+    },
+    set(v) {
+      if (v === "") node.children = [];
+    },
+  });
+  node.setAttribute = function (k, v) { node.attrs[k] = v; };
+  node.appendChild = function (child) { node.children.push(child); return child; };
+  node.removeChild = function (child) {
+    node.children = node.children.filter((c) => c !== child);
+    return child;
+  };
+  node.querySelector = function () { return null; };
+  node.addEventListener = function () {};
+  return node;
+}
+
+const elements = {
+  "dashboard-rollups": makeNode("div"),
+  "surface-list": makeNode("ul"),
+  "message-list": makeNode("div"),
+  "send-input": makeNode("input"),
+  "send-button": makeNode("button"),
+  "send-form": makeNode("form"),
+  "pane-title": makeNode("div"),
+  "pane-meta": makeNode("div"),
+  "conn-status": makeNode("div"),
+  "layout": makeNode("div"),
+};
+
+global.document = {
+  getElementById: (id) => elements[id] || null,
+  createElement: (tag) => makeNode(tag),
+  createTextNode: (text) => {
+    const n = makeNode("span");
+    n.__text = text;
+    return n;
+  },
+  addEventListener: function () {},
+  readyState: "complete",
+  body: makeNode("body"),
+};
+global.window = {};
+global.setInterval = function () { return 0; };
+global.clearInterval = function () {};
+global.setTimeout = function () { return 0; };
+global.fetch = function () { return Promise.reject(new Error("no network")); };
+
+// ---- load app.js IIFE --------------------------------------------------
+const source = fs.readFileSync(path, "utf8");
+// eslint-disable-next-line no-eval
+eval(source);
+
+if (!global.window.PollyPM || typeof global.window.PollyPM.renderDashboard !== "function") {
+  console.error("PollyPM.renderDashboard not exposed");
+  process.exit(2);
+}
+global.window.PollyPM.renderDashboard(payload);
+process.stdout.write(elements["dashboard-rollups"].innerHTML);
+"""
+    proc = subprocess.run(
+        [node_bin, "-e", harness, str(app_js_path), json.dumps(payload)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"node harness failed (rc={proc.returncode}):\n"
+            f"STDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
+        )
+    return proc.stdout
+
+
+def test_render_dashboard_real_payload_executes() -> None:
+    """Feed a representative DashboardResponse through ``renderDashboard``.
+
+    Asserts the rendered DOM contains:
+    - the inbox count + label
+    - the plan-reviews count + label
+    - the alert count + ``alerts`` label
+    - the daemon ``up`` status + label
+    - the activity sweeps/msgs label
+    - the active-sessions count
+    - the tracked-projects count
+
+    Static greps could not catch (a) a refactor that routes
+    ``rollups.open_inbox_count`` into the ``alerts`` card by mistake,
+    or (b) a typo that drops the value from the rendered DOM while
+    keeping the field name in source. This test fails on both.
+    """
+    payload = {
+        "rollups": {
+            "open_inbox_count": 7,
+            "pending_plan_reviews": 2,
+            "alert_count": 3,
+            "sweep_count_24h": 12,
+            "message_count_24h": 47,
+            "tracked_count": 5,
+        },
+        "daemon_status": "up",
+        "active_sessions": [
+            {"session_name": "a"},
+            {"session_name": "b"},
+            {"session_name": "c"},
+            {"session_name": "d"},
+        ],
+        "scoped_fields": [],
+        "projects": [],
+        "recent_messages": [],
+    }
+    rendered = _node_render_dashboard(payload)
+
+    # Sanity: the container actually got cards.
+    assert "rollup-card" in rendered, (
+        f"renderDashboard produced no cards; output was:\n{rendered}"
+    )
+
+    # Each counter's label appears.
+    for label in (
+        "inbox",
+        "plan reviews",
+        "alerts",
+        "activity (24h)",
+        "daemon",
+        "active sessions",
+        "projects tracked",
+    ):
+        assert label in rendered, (
+            f"expected card label {label!r} in rendered DOM; got:\n{rendered}"
+        )
+
+    # Values are present (these are the load-bearing assertions — a
+    # mapping bug that routes the wrong field into the wrong card
+    # would fail here even if the labels still grep-match).
+    assert "7 items" in rendered, "inbox count missing/wrong"
+    assert "2 waiting" in rendered, "plan-reviews count missing/wrong"
+    assert ">3<" in rendered, "alert_count value 3 missing"
+    assert "12 sweeps / 47 msgs" in rendered, "activity 24h composite missing"
+    assert ">up<" in rendered, "daemon status 'up' missing"
+    assert ">4<" in rendered, "active_sessions count (len=4) missing"
+    assert ">5<" in rendered, "tracked_count value 5 missing"
+
+    # Color-coding contract: daemon=up → rollup-working; alert_count>0
+    # → rollup-blocked. Pin these too so a future restyle that drops
+    # the class hooks fails loudly.
+    assert "rollup-working" in rendered
+    assert "rollup-blocked" in rendered
+
+
+def test_render_dashboard_daemon_down_uses_blocked_class() -> None:
+    """``daemon_status='down'`` flips the daemon card to the blocked class.
+
+    Executable variant of the per-status branch in ``renderDashboard``
+    (``app.js:358-367``). Pinning this catches a future swap of
+    ``up``/``down`` or ``rollup-working``/``rollup-blocked``.
+    """
+    payload = {
+        "rollups": {
+            "open_inbox_count": 0,
+            "pending_plan_reviews": 0,
+            "alert_count": 0,
+            "sweep_count_24h": 0,
+            "message_count_24h": 0,
+            "tracked_count": 0,
+        },
+        "daemon_status": "down",
+        "active_sessions": [],
+        "scoped_fields": [],
+        "projects": [],
+        "recent_messages": [],
+    }
+    rendered = _node_render_dashboard(payload)
+    assert ">down<" in rendered
+    # daemon card is the one with text "daemon" and class rollup-blocked
+    assert "rollup-blocked" in rendered
+
+
+def test_render_dashboard_scoped_fields_tag_filtered_cards() -> None:
+    """``scoped_fields`` flags a card with ``(filtered)`` in its label.
+
+    Executable variant of the ``scoped_fields`` path
+    (``app.js:280-291``). Confirms the runtime mapping actually appends
+    the tag rather than just containing the literal in source.
+    """
+    payload = {
+        "rollups": {
+            "open_inbox_count": 1,
+            "pending_plan_reviews": 0,
+            "alert_count": 0,
+            "sweep_count_24h": 0,
+            "message_count_24h": 0,
+            "tracked_count": 0,
+        },
+        "daemon_status": "up",
+        "active_sessions": [],
+        "scoped_fields": ["rollups.open_inbox_count"],
+        "projects": [],
+        "recent_messages": [],
+    }
+    rendered = _node_render_dashboard(payload)
+    assert "inbox (filtered)" in rendered, (
+        f"scoped inbox card should carry the (filtered) tag; got:\n{rendered}"
+    )

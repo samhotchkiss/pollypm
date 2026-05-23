@@ -23,6 +23,7 @@ surface.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import shutil
 import subprocess
@@ -32,19 +33,32 @@ import typer
 
 from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+from pollypm.web_api.auth import _TAILSCALE_CGNAT_NET
 
 logger = logging.getLogger(__name__)
 
 
 def detect_tailscale_ip() -> str | None:
-    """Return the operator's Tailscale IPv4 or ``None`` if unavailable.
+    """Return the operator's verified Tailscale IPv4 or ``None``.
 
     Shells out to ``tailscale ip -4`` (the same command the spec uses
-    in its access doc). Returns ``None`` for any of:
+    in its access doc) and validates that the first non-empty token is
+    both a parseable IPv4 address AND a member of the Tailscale CGNAT
+    range (100.64.0.0/10). Returns ``None`` for any of:
 
     - ``tailscale`` binary not on ``$PATH``
     - command exits non-zero (not logged in, daemon down, no IP yet)
-    - stdout is empty / not a parseable IPv4
+    - stdout empty
+    - stdout token is not a parseable IPv4 address
+    - stdout token is parseable but outside the Tailscale CGNAT range
+
+    The CGNAT-range check is load-bearing for the trust invariant: the
+    serve path enables ``tailnet_trust=True`` whenever this function
+    returns a non-``None`` value, so we MUST refuse to return anything
+    we have not confirmed is in 100.64.0.0/10. See the security
+    rationale in ``docs/web-ui-2065-security-spec.md`` (decision around
+    Fix #2) and the defense-in-depth notes on
+    :func:`pollypm.web_api.auth.is_tailscale_ip`.
 
     Never raises — the caller decides whether to fall back to localhost
     with a warning or hard-fail.
@@ -64,14 +78,26 @@ def detect_tailscale_ip() -> str | None:
         return None
     if result.returncode != 0:
         return None
-    # ``tailscale ip -4`` prints one address per line; take the first
-    # non-empty token. We don't validate the dotted-quad shape here —
-    # the auth layer's ``is_tailscale_ip`` does that defensively.
+    # ``tailscale ip -4`` prints one address per line. Take the first
+    # non-empty token, then validate it: parseable IPv4 AND inside the
+    # Tailscale CGNAT range. Anything else (malformed output, IPv6
+    # surprise, parseable-but-non-tailnet address) → None so the serve
+    # path does NOT flip ``tailnet_trust`` for an unverified address.
+    candidate: str | None = None
     for line in result.stdout.splitlines():
-        candidate = line.strip()
-        if candidate:
-            return candidate
-    return None
+        token = line.strip()
+        if token:
+            candidate = token
+            break
+    if candidate is None:
+        return None
+    try:
+        addr = ipaddress.IPv4Address(candidate)
+    except (ValueError, ipaddress.AddressValueError):
+        return None
+    if addr not in _TAILSCALE_CGNAT_NET:
+        return None
+    return str(addr)
 
 
 _SERVE_HELP = help_with_examples(

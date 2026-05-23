@@ -435,12 +435,18 @@
     setInterval(pollDashboard, POLL_DASHBOARD_MS);
   }
 
-  // Expose for tests / debugging.
+  // Expose for tests / debugging. ``renderDashboard`` is exported so
+  // an executable test harness can feed a representative
+  // ``DashboardResponse`` payload through the real mapping logic and
+  // assert visible labels/values — static source greps cannot catch a
+  // runtime mapping bug that still happens to contain the right field
+  // names (Codex round-5 blocker).
   window.PollyPM = {
     loadSurfaces: loadSurfaces,
     loadHistory: loadHistory,
     sendMessage: sendMessage,
     pollDashboard: pollDashboard,
+    renderDashboard: renderDashboard,
     state: state,
   };
 

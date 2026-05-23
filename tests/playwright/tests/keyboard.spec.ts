@@ -26,6 +26,13 @@ async function stubBasics(page: import("@playwright/test").Page) {
       body: JSON.stringify({ sessions: [FAKE_SURFACE] }),
     }),
   );
+  await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    }),
+  );
   await page.route("**/api/v1/chat/operator/messages*", (route) =>
     route.fulfill({
       status: 200,

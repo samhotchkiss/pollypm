@@ -167,14 +167,31 @@ aside#dashboard-rail {
   cursor: default;
   font-style: italic;
 }
+.surface-list li.surface-group {
+  background: transparent;
+  border-color: transparent;
+  color: var(--text-muted);
+  cursor: default;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  margin: 10px 0 4px;
+  padding: 4px 8px;
+  text-transform: uppercase;
+}
+.surface-list li.task-surface {
+  border-left: 2px solid var(--border-line);
+}
 .surface-name {
   color: var(--text-heading);
   font-weight: 500;
   font-size: 13px;
+  overflow-wrap: anywhere;
 }
 .surface-meta {
   color: var(--text-muted);
   font-size: 11px;
+  overflow-wrap: anywhere;
 }
 .surface-dot {
   display: inline-block;
@@ -186,6 +203,8 @@ aside#dashboard-rail {
   vertical-align: middle;
 }
 .surface-dot.present { background: var(--working); }
+.surface-dot.waiting { background: var(--waiting); }
+.surface-dot.done    { background: var(--info); }
 .surface-dot.dead    { background: var(--blocked); }
 
 section#message-pane {
@@ -252,6 +271,39 @@ section#message-pane {
   font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
     Monaco, Consolas, monospace;
   font-size: 12.5px;
+}
+
+.task-detail {
+  background: var(--bg-row);
+  border: 1px solid var(--border-line);
+  border-radius: 6px;
+  padding: 12px;
+}
+.task-detail-title {
+  color: var(--text-heading-bright);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.task-detail-description {
+  color: var(--text-body);
+  font-size: 12.5px;
+  margin: 8px 0;
+  white-space: pre-wrap;
+}
+.task-detail-row {
+  display: grid;
+  grid-template-columns: 92px minmax(0, 1fr);
+  gap: 8px;
+  padding: 3px 0;
+  font-size: 12px;
+}
+.task-detail-label {
+  color: var(--text-muted);
+  text-transform: uppercase;
+}
+.task-detail-value {
+  color: var(--text-body);
+  overflow-wrap: anywhere;
 }
 
 .send-form {

@@ -1062,6 +1062,192 @@ process.stdout.write(elements["dashboard-rollups"].innerHTML);
     return proc.stdout
 
 
+def _node_render_surface_rail(payload: dict) -> dict:
+    """Render the left rail under node and optionally select a task."""
+    node_bin = shutil.which("node")
+    if node_bin is None:
+        pytest.skip("node binary not available; cannot run executable JS harness")
+    app_js_path = (
+        Path(__file__).resolve().parents[2]
+        / "src"
+        / "pollypm"
+        / "web_api"
+        / "ui"
+        / "app.js"
+    )
+    harness = r"""
+const fs = require("fs");
+const path = process.argv[1];
+const payload = JSON.parse(process.argv[2]);
+
+function makeNode(tag) {
+  const node = {
+    tagName: (tag || "div").toUpperCase(),
+    children: [],
+    attrs: {},
+    className: "",
+    textContent: "",
+    disabled: false,
+  };
+  Object.defineProperty(node, "innerHTML", {
+    get() {
+      function render(n) {
+        if (n.__text != null) return String(n.__text);
+        const tag = n.tagName.toLowerCase();
+        const parts = [];
+        for (const k of Object.keys(n.attrs)) {
+          parts.push(k + '="' + n.attrs[k] + '"');
+        }
+        if (n.className) parts.push('class="' + n.className + '"');
+        const open = parts.length
+          ? "<" + tag + " " + parts.join(" ") + ">"
+          : "<" + tag + ">";
+        const inner = n.textContent && n.children.length === 0
+          ? String(n.textContent)
+          : n.children.map(render).join("");
+        return open + inner + "</" + tag + ">";
+      }
+      return node.children.map(render).join("");
+    },
+    set(v) {
+      if (v === "") {
+        node.children = [];
+        node.textContent = "";
+      }
+    },
+  });
+  node.setAttribute = function (k, v) { node.attrs[k] = v; };
+  node.appendChild = function (child) { node.children.push(child); return child; };
+  node.querySelector = function () { return null; };
+  node.addEventListener = function () {};
+  return node;
+}
+
+const elements = {
+  "dashboard-rollups": makeNode("div"),
+  "surface-list": makeNode("ul"),
+  "message-list": makeNode("div"),
+  "send-input": makeNode("input"),
+  "send-button": makeNode("button"),
+  "send-form": makeNode("form"),
+  "pane-title": makeNode("div"),
+  "pane-meta": makeNode("div"),
+  "conn-status": makeNode("div"),
+  "layout": makeNode("div"),
+};
+
+global.document = {
+  getElementById: (id) => elements[id] || null,
+  createElement: (tag) => makeNode(tag),
+  createTextNode: (text) => {
+    const n = makeNode("span");
+    n.__text = text;
+    return n;
+  },
+  addEventListener: function () {},
+  readyState: "complete",
+  body: makeNode("body"),
+};
+global.window = {};
+global.setInterval = function () { return 0; };
+global.clearInterval = function () {};
+global.setTimeout = function () { return 0; };
+global.fetch = function () { return Promise.reject(new Error("no network")); };
+
+const source = fs.readFileSync(path, "utf8");
+// eslint-disable-next-line no-eval
+eval(source);
+
+global.window.PollyPM.state.surfaces = payload.surfaces || [];
+global.window.PollyPM.state.taskSurfaces = payload.tasks || [];
+global.window.PollyPM.renderSurfaces();
+if (payload.selectTask) {
+  global.window.PollyPM.selectTask(payload.selectTask);
+}
+process.stdout.write(JSON.stringify({
+  rail: elements["surface-list"].innerHTML,
+  title: elements["pane-title"].textContent,
+  meta: elements["pane-meta"].textContent,
+  messages: elements["message-list"].innerHTML,
+  sendInputDisabled: elements["send-input"].disabled,
+  sendButtonDisabled: elements["send-button"].disabled,
+}));
+"""
+    proc = subprocess.run(
+        [node_bin, "-e", harness, str(app_js_path), json.dumps(payload)],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise AssertionError(
+            f"node harness failed (rc={proc.returncode}):\n"
+            f"STDOUT: {proc.stdout}\nSTDERR: {proc.stderr}"
+        )
+    return json.loads(proc.stdout)
+
+
+def test_render_surface_rail_groups_chat_and_task_surfaces() -> None:
+    rendered = _node_render_surface_rail({
+        "surfaces": [
+            {
+                "session_name": "operator",
+                "surface_type": "operator",
+                "persona": "Polly",
+                "project": None,
+                "window": {"present": True, "pane_dead": False},
+            },
+        ],
+        "tasks": [
+            {
+                "key": "myproj/2",
+                "task_id": "task-2",
+                "project": "myproj",
+                "task_number": "2",
+                "title": "Queued work",
+                "work_status": "queued",
+                "type": "task",
+                "priority": "normal",
+                "assignee": "agent-1",
+                "updated_at": "2026-05-23T00:00:00Z",
+            },
+        ],
+    })
+    rail = rendered["rail"]
+    assert "Chat surfaces" in rail
+    assert "Tasks" in rail
+    assert 'data-session="operator"' in rail
+    assert 'data-task="myproj/2"' in rail
+    assert "Queued work" in rail
+    assert "queued" in rail
+
+
+def test_selecting_task_surface_disables_chat_send() -> None:
+    rendered = _node_render_surface_rail({
+        "tasks": [
+            {
+                "key": "myproj/7",
+                "task_id": "task-7",
+                "project": "myproj",
+                "task_number": "7",
+                "title": "Historical fix",
+                "work_status": "done",
+                "type": "bug",
+                "priority": "high",
+                "assignee": "",
+                "updated_at": "2026-05-23T00:00:00Z",
+            },
+        ],
+        "selectTask": "myproj/7",
+    })
+    assert rendered["title"] == "myproj/7"
+    assert "done" in rendered["meta"]
+    assert "Historical fix" in rendered["messages"]
+    assert rendered["sendInputDisabled"] is True
+    assert rendered["sendButtonDisabled"] is True
+
+
 def test_render_dashboard_real_payload_executes() -> None:
     """Feed a representative DashboardResponse through ``renderDashboard``.
 

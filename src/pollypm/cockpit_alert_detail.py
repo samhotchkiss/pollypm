@@ -11,7 +11,9 @@ Contract:
   collects.
 - Invariants: this module owns one widget class and nothing else; it
   does not depend on cockpit state, services, or the rail.
-- Allowed dependencies: Textual primitives only.
+- Allowed dependencies: Textual primitives plus
+  ``pollypm.cockpit_theme.State`` for semantic palette values; no
+  cockpit state, services, or rail dependencies.
 - Private: ``_AlertDetailModal`` is underscore-prefixed and re-exported
   via ``cockpit_ui`` for back-compat (see #1354).
 

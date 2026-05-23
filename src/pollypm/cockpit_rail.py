@@ -2104,8 +2104,8 @@ class CockpitRouter:
         ignores it and reads the entry directly.
 
         #2049 follow-up (Codex blocker on PR #2085): when the
-        refresher's alert read itself failed (transient supervisor /
-        store failure), the entry stamps
+        refresher's alert read itself failed (transient
+        ``pg_alerts`` facade / pg pool failure), the entry stamps
         ``alerts_snapshot_valid = False`` and the fast-path declines
         so the live alerts argument drives the direct-path rollup
         instead of serving a stale no-alert entry that would hide a

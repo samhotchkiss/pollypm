@@ -170,8 +170,9 @@ def compute_entry_for_project(
     # than crashing the refresh.
     #
     # PR #2085 round-2: if the sweep-level refresher pre-fetched the
-    # workspace alert snapshot, reuse it (collapses N supervisor reads
-    # per sweep to 1). Otherwise fall back to the per-project read.
+    # workspace alert snapshot, reuse it (collapses N
+    # ``pg_alerts.open_alerts`` reads per sweep to 1). Otherwise fall
+    # back to the per-project read.
     actionable_alert_ids, alerts_valid = _actionable_alert_ids_for(
         project_key, config, alerts_snapshot=alerts_snapshot,
     )

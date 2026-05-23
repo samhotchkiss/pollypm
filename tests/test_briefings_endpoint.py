@@ -1074,3 +1074,82 @@ def test_briefings_late_failure_logged(
             f"expected scope + exception repr in log; got: "
             f"{[r.getMessage() for r in late_logs]}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Codex round-6 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_briefings_executor_workers_are_daemons(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All briefings-executor worker threads must be daemon threads.
+
+    Codex round-6 P0: the round-5 bounded-shutdown fix made FastAPI
+    lifespan teardown return promptly, but workers were still
+    non-daemon ``threading.Thread`` instances. Any live non-daemon
+    thread keeps the CPython interpreter alive past ``sys.exit``,
+    so a wedged regenerate provider would still block ``pm serve``
+    shutdown / restart even after the route 504'd and the lifespan
+    "leaked" the worker. The fix is :class:`_DaemonThreadPoolExecutor`,
+    which mirrors CPython's ``_adjust_thread_count`` but sets
+    ``t.daemon = True`` before ``t.start()``.
+
+    This test forces the pool to actually spin up a worker (the
+    executor is lazy — ``_threads`` is empty until a future is
+    submitted) by firing a no-op regenerate, then asserts every
+    thread in ``executor._threads`` is a daemon.
+    """
+    from pollypm.web_api.routes import briefings as br
+
+    def _available(_config) -> bool:
+        return True
+
+    def _fast_regenerate(_config, _body: RegenerateRequest) -> BriefingResponse:
+        return _make_response(type_name="morning", markdown="ok")
+
+    monkeypatch.setitem(
+        br._REGISTRY,
+        "morning",
+        _BriefingAdapter(
+            name="morning",
+            description="daemon-thread test",
+            available=_available,
+            render_last=lambda _c: _make_response(
+                type_name="morning", markdown="ok",
+            ),
+            regenerate=_fast_regenerate,
+        ),
+    )
+
+    app = create_app(config=api_config, token_path=token_path)
+
+    with TestClient(app) as client:
+        # Trigger a regenerate so the pool spins up at least one
+        # worker thread. Without this the executor is lazy and
+        # ``_threads`` is empty.
+        response = client.post(
+            "/api/v1/briefings/morning/regenerate?timeout_seconds=5",
+            json={},
+            headers=auth_headers,
+        )
+        assert response.status_code == 200, response.json()
+
+        executor = app.state.briefing_executor
+        threads = list(getattr(executor, "_threads", []) or [])
+        assert threads, (
+            "briefing executor spawned no worker threads even after "
+            "a successful regenerate — test is not exercising the "
+            "daemon-flag code path"
+        )
+        non_daemons = [t for t in threads if not t.daemon]
+        assert not non_daemons, (
+            "briefing executor worker(s) are non-daemon — leaked "
+            "threads will keep pm serve alive past shutdown: "
+            f"{[t.name for t in non_daemons]}"
+        )

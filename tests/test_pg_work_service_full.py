@@ -825,6 +825,191 @@ def test_concurrent_claim_serializes_one_winner_one_loser(pg_service):
     )
 
 
+def test_concurrent_role_update_does_not_leak_into_claim(pg_service):
+    """Spec §P-9 + concurrency safety (#2064 round-13 blocker #1).
+
+    Until round-13, ``PgWorkService.claim()`` read the full task
+    OUTSIDE the write transaction (``self.get(task_id)`` at the top),
+    resolved the node assignee from ``task.roles`` on that snapshot,
+    THEN opened the write tx + ``SELECT ... FOR UPDATE``. Between the
+    pre-read and the row lock, a concurrent ``svc.update(roles=...)``
+    could mutate the worker binding; ``SELECT FOR UPDATE`` only
+    revalidated ``work_status`` / ``assignee``, so the UPDATE landed
+    with the STALE pre-read assignee. The new worker silently lost
+    the binding.
+
+    Round-13 fix: every claim-dependent read (status, roles,
+    current_node_id, blockers) is sourced from the FOR-UPDATE-locked
+    row inside the transaction. A concurrent role update committed
+    before the lock is visible; one waiting on the lock is invisible
+    until commit. Either way the decision is consistent with the
+    locked snapshot, never with a stale pre-tx view.
+
+    Deterministic interleaving: a cursor wrapper intercepts the
+    ``SELECT ... FOR UPDATE`` statement INSIDE t1's claim transaction
+    and pauses BEFORE running it. While t1 is paused, t2 commits an
+    ``update(roles={'worker': 'carol'})``. T1 then proceeds; its
+    SELECT-FOR-UPDATE reads the fresh roles. The new claim resolves
+    assignee from the locked row, so the final assignee MUST be
+    'carol' (not the pre-mutation 'alice').
+
+    Regression target: on the round-12 head this test fails — the
+    pre-read captured ``roles['worker'] = 'alice'``, resolved
+    ``assignee = 'alice'`` before the pause, and committed the
+    UPDATE with the stale value. On the round-13 head it passes
+    because the in-tx revalidation reads the post-mutation roles.
+    """
+    import threading
+
+    from pollypm.work.models import WorkStatus
+
+    task = _make_draft(
+        pg_service, roles={"worker": "alice", "reviewer": "bob"}
+    )
+    pg_service.queue(task.task_id, actor="user")
+    assert pg_service.get(task.task_id).work_status is WorkStatus.QUEUED
+
+    t1_at_lock_point = threading.Event()
+    t2_role_update_done = threading.Event()
+    results: dict[str, object] = {}
+    errors: dict[str, BaseException] = {}
+
+    tls = threading.local()
+    original_connection = pg_service._pool.connection
+
+    class _CheckpointingCursor:
+        def __init__(self, real_cursor):
+            self._real = real_cursor
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def __enter__(self):
+            self._real.__enter__()
+            return self
+
+        def __exit__(self, *a):
+            return self._real.__exit__(*a)
+
+        def execute(self, sql, params=None, *args, **kwargs):
+            # Pause BEFORE running the SELECT-FOR-UPDATE so t2 can
+            # mutate roles without contending for a row lock t1 has
+            # not yet taken. This matches the real-world race the
+            # round-13 fix closes: the OLD code resolved the node
+            # assignee from its pre-tx ``self.get()`` snapshot
+            # BEFORE reaching this statement, so by the time the
+            # lock acquires it's too late to pick up t2's update.
+            if (
+                getattr(tls, "is_t1", False)
+                and "FOR UPDATE" in (sql or "")
+                and not t1_at_lock_point.is_set()
+            ):
+                t1_at_lock_point.set()
+                t2_role_update_done.wait(timeout=5)
+            if params is None:
+                return self._real.execute(sql, *args, **kwargs)
+            return self._real.execute(sql, params, *args, **kwargs)
+
+    class _ConnProxy:
+        def __init__(self, real_conn):
+            object.__setattr__(self, "_real", real_conn)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._real, name, value)
+
+        def cursor(self, *args, **kwargs):
+            return _CheckpointingCursor(self._real.cursor(*args, **kwargs))
+
+    class _CheckpointingConn:
+        def __init__(self, real_cm):
+            self._real_cm = real_cm
+
+        def __enter__(self):
+            real_conn = self._real_cm.__enter__()
+            return _ConnProxy(real_conn)
+
+        def __exit__(self, *a):
+            return self._real_cm.__exit__(*a)
+
+    def _wrapping_connection():
+        return _CheckpointingConn(original_connection())
+
+    pg_service._pool.connection = _wrapping_connection
+
+    def _t1_claim() -> None:
+        tls.is_t1 = True
+        try:
+            results["t1"] = pg_service.claim(
+                task.task_id, actor="t1_actor"
+            )
+        except BaseException as exc:  # noqa: BLE001
+            errors["t1"] = exc
+            t1_at_lock_point.set()
+            t2_role_update_done.set()
+        finally:
+            tls.is_t1 = False
+
+    def _t2_update_role() -> None:
+        try:
+            assert t1_at_lock_point.wait(timeout=5), (
+                "t1 never reached the SELECT-FOR-UPDATE checkpoint"
+            )
+            pg_service.update(
+                task.task_id,
+                roles={"worker": "carol", "reviewer": "bob"},
+            )
+            results["t2"] = "ok"
+        except BaseException as exc:  # noqa: BLE001
+            errors["t2"] = exc
+        finally:
+            t2_role_update_done.set()
+
+    try:
+        t1 = threading.Thread(target=_t1_claim)
+        t2 = threading.Thread(target=_t2_update_role)
+        t1.start()
+        t2.start()
+        t1.join(timeout=15)
+        t2.join(timeout=15)
+    finally:
+        pg_service._pool.connection = original_connection
+
+    assert not t1.is_alive() and not t2.is_alive(), (
+        "thread deadlocked — claim() may be holding the lock across "
+        "the role update window"
+    )
+    assert "t2" in results, (
+        f"t2 role update should have succeeded; got error: "
+        f"{errors.get('t2')!r}"
+    )
+    assert "t1" in results, (
+        f"t1 claim should have succeeded; got error: "
+        f"{errors.get('t1')!r}"
+    )
+
+    final = pg_service.get(task.task_id)
+    assert final.work_status is WorkStatus.IN_PROGRESS, (
+        f"task must be in_progress after the claim; got "
+        f"{final.work_status!r}"
+    )
+    assert final.roles.get("worker") == "carol", (
+        f"role mutation must have committed; got roles={final.roles!r}"
+    )
+    # The invariant the fix establishes: assignee resolves from the
+    # FOR-UPDATE-locked roles, NOT the pre-tx snapshot. On the
+    # round-12 head the assignee would be 'alice' (pre-read value);
+    # on round-13 it must be 'carol' (locked value).
+    assert final.assignee == "carol", (
+        f"assignee must reflect the role binding visible under the "
+        f"row lock; got {final.assignee!r}. If this is 'alice', the "
+        f"claim used a stale pre-transaction snapshot — the round-13 "
+        f"in-lock revalidation regressed."
+    )
+
+
 def test_update_combined_assignee_and_external_refs_single_call(pg_service):
     """Combining columns in one update() call — single transaction.
 

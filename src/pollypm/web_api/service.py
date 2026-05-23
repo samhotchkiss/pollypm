@@ -1698,10 +1698,13 @@ def patch_task(
         raise not_found(f"Project not registered: {project_key}")
 
     task_id = f"{project_key}/{task_number}"
-    valid_statuses = {
-        "draft", "queued", "in_progress", "rework", "blocked",
-        "on_hold", "review", "done", "cancelled",
-    }
+    # #2064 round-13: source the lifecycle state set from the canonical
+    # ``WorkStatus`` enum instead of hand-copying it here. Adding /
+    # renaming a state in ``pollypm.work.models`` should not also
+    # require touching the HTTP layer to keep PATCH validation in sync.
+    from pollypm.work.models import WorkStatus
+
+    valid_statuses = {s.value for s in WorkStatus}
     if status is not None and status not in valid_statuses:
         raise APIError(
             status_code=422,
@@ -1731,13 +1734,15 @@ def patch_task(
         with create_work_service(
             config=config, project_key=project_key, project_path=project.path
         ) as svc:
-            # Confirm task exists up-front so empty-PATCH still 404s.
-            try:
-                svc.get(task_id)
-            except _BACKING_STORE_ERRORS:
-                raise
-            except Exception as exc:  # noqa: BLE001
-                raise not_found(f"Task not found: {task_id}") from exc
+            # #2064 round-13: the previous existence probe here caught
+            # ``Exception`` and re-raised as ``not_found``, masking
+            # ``_row_to_task`` bugs, facade misconfigurations, and other
+            # 500-class failures as a benign-looking 404. The probe is
+            # gone; each downstream call surfaces its own
+            # ``TaskNotFoundError`` (mapped to 404) and lets every other
+            # exception propagate to the existing 503/500 handlers.
+            # Empty-PATCH still 404s via the unconditional ``svc.get``
+            # at the end of the block.
 
             # Field-only PATCH: labels and/or metadata land in ONE
             # ``svc.update(...)`` call so they share a single DB
@@ -1794,7 +1799,14 @@ def patch_task(
                         message=str(exc) or "status transition gate failed.",
                     ) from exc
 
-            task = svc.get(task_id)
+            # Final read also serves as the existence probe for an
+            # all-None PATCH (route layer already rejects truly-empty
+            # PATCH bodies, but a body with nothing matching the
+            # accepted fields would otherwise sail through silently).
+            try:
+                task = svc.get(task_id)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
             return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(

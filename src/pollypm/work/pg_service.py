@@ -1718,163 +1718,164 @@ class PgWorkService:
         Loads the flow template, resolves the start (or current) node,
         moves the task to ``in_progress`` (or ``review`` for a review
         start node), and writes the audit transition row.
+
+        Round-13 (#2064): EVERY claim-dependent read happens INSIDE the
+        write transaction against the FOR-UPDATE-locked row. The prior
+        implementation pre-read the task outside the lock, validated
+        ``work_status``/``blocked``, resolved the node assignee from
+        ``task.roles``, then opened the transaction. Between the
+        pre-read and the row lock a concurrent writer could:
+        * ``pm task update --role`` mutate ``roles`` so the locked-in
+          assignee was stale, OR
+        * ``pm task link <blocker> <this> blocks`` add a blocker so the
+          task should have refused the claim.
+
+        Either window let claim commit on a stale view. With the
+        full-row revalidation below, the loser of any concurrent edit
+        race re-reads the freshly-committed row under FOR UPDATE and
+        bails with ``InvalidTransitionError`` instead of silently
+        adopting the old view.
         """
-        task = self.get(task_id)
-        if task.work_status != WorkStatus.QUEUED:
-            if task.work_status == WorkStatus.IN_PROGRESS:
-                claimant = task.assignee or "another actor"
-                raise InvalidTransitionError(
-                    f"Task {task_id} is already claimed by '{claimant}'.\n"
-                    f"\n"
-                    f"Why: the task is in 'in_progress' and assigned. A "
-                    f"second claim would orphan the first worker's "
-                    f"session.\n"
-                    f"\n"
-                    f"Fix: use `pm task get {task_id}` to see the current "
-                    f"state. If the existing claim is stale (worker "
-                    f"session dead), hold and resume:\n"
-                    f"    pm task hold {task_id} --reason 'stale claim'\n"
-                    f"    pm task resume {task_id}\n"
-                    f"Otherwise, find an unclaimed task with `pm task next`."
-                )
-            raise InvalidTransitionError(
-                f"Cannot claim task in '{task.work_status.value}' state.\n"
-                f"\n"
-                f"Why: only tasks in 'queued' state can be claimed.\n"
-                f"\n"
-                f"Fix: if the task is 'draft', run "
-                f"`pm task queue {task_id}` first. If it's 'done' or "
-                f"'cancelled', find another task with `pm task next`."
-            )
-        if task.blocked:
-            raise InvalidTransitionError(
-                f"Cannot claim task {task_id}: it is blocked by another "
-                f"task.\n"
-                f"\n"
-                f"Why: blocking tasks must reach a terminal state before "
-                f"dependents can start.\n"
-                f"\n"
-                f"Fix: run `pm task get {task_id}` to see the blockers, "
-                f"then work on those first (or unblock with "
-                f"`pm task unlink`)."
-            )
-
-        flow = self._load_flow(task)
-        node_id = task.current_node_id or flow.start_node
-        if not node_id:
-            raise InvalidTransitionError(
-                f"Task {task_id} has no claimable flow node."
-            )
-        node = flow.nodes.get(node_id)
-        if node is None:
-            raise InvalidTransitionError(
-                f"Current node '{node_id}' not found in flow '{flow.name}'."
-            )
-        if node.type == NodeType.TERMINAL:
-            raise InvalidTransitionError(
-                f"Current node '{node_id}' is terminal and cannot be claimed."
-            )
-
-        assignee = self._resolve_node_assignee(task, node) or actor
-        target_status = (
-            WorkStatus.REVIEW
-            if node.type == NodeType.REVIEW
-            else WorkStatus.IN_PROGRESS
-        )
-        # #1737 — pre-claim cap check. Mirrors the sqlite transition
-        # manager so a Postgres-backed workspace also refuses cap-exceeded
-        # claims cleanly instead of leaving the task ``in_progress`` with
-        # no worker. See ``SessionManager.check_parallel_cap``.
-        if (
-            target_status is WorkStatus.IN_PROGRESS
-            and not skip_gates
-            and self._session_mgr is not None
-        ):
-            check_cap = getattr(
-                self._session_mgr, "check_parallel_cap", None,
-            )
-            if callable(check_cap):
-                check_cap(task.project, task_id)
+        project, task_number = _parse_task_id(task_id)
         now = _now_iso()
+        # Outside-the-lock state we'll read back AFTER the commit so the
+        # post-tx side effects (sync, session provisioning, rollback)
+        # have the values they need without re-reading the row.
+        task_for_postcommit: Task | None = None
+        target_status: WorkStatus | None = None
+        node_id_committed: str | None = None
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
-                # #2064 round-8 — single-writer claim. Without the row
-                # lock, two concurrent claim() calls both see
-                # work_status='queued' at the pre-transaction read
-                # above (line 1635), both pass validation, both fire
-                # the UPDATE serially, and both insert a queued ->
-                # in_progress transition + node-execution row. The
-                # second writer overwrites the first's assignee and
-                # the first worker's session is orphaned with no
-                # corresponding task ownership. Same race shape as
-                # the round-4 reassign bug (see ``reassign_task`` at
-                # the ``FOR UPDATE`` block) — fix is the same:
-                # re-read + re-validate inside the transaction so
-                # the loser bails with InvalidTransitionError -> 409.
-                cur.execute(
-                    "SELECT work_status, assignee FROM work_tasks "
-                    "WHERE project = %s AND task_number = %s "
-                    "FOR UPDATE",
-                    (task.project, task.task_number),
+                # SELECT the full row + FOR UPDATE in one query. Every
+                # subsequent decision (status, roles, current_node_id,
+                # assignee resolution) reads from this snapshot, so a
+                # concurrent ``update(roles=...)`` or ``link(blocks)``
+                # observed AFTER this lock acquires either:
+                # (a) committed before our lock — visible here, OR
+                # (b) waiting on our lock — invisible until we commit.
+                # Either case is consistent: we never decide on a view
+                # that was already stale at the time of decision.
+                locked_task = self._fetch_task_for_claim_locked(
+                    cur, project, task_number, task_id
                 )
-                locked = cur.fetchone()
-                if locked is None:
-                    # Row was deleted between the pre-transaction
-                    # read and the lock attempt. Vanishingly rare
-                    # (tasks are not hard-deleted in normal flows)
-                    # but still safer than blindly UPDATE-ing a
-                    # ghost row.
-                    raise TaskNotFoundError(
-                        f"Task '{task_id}' not found."
-                    )
-                locked_status, locked_assignee = locked[0], locked[1]
-                if locked_status != WorkStatus.QUEUED.value:
-                    # Another writer won the race and already
-                    # transitioned this task. Surface the same
-                    # InvalidTransitionError shape callers (CLI +
-                    # POST /tasks/{p}/{n}/claim → 409) already
-                    # handle for the pre-transaction validation
-                    # path, so the loser sees a coherent error
-                    # instead of a silent overwrite.
-                    if locked_status == WorkStatus.IN_PROGRESS.value:
-                        claimant = locked_assignee or "another actor"
+
+                if locked_task.work_status != WorkStatus.QUEUED:
+                    if locked_task.work_status == WorkStatus.IN_PROGRESS:
+                        claimant = locked_task.assignee or "another actor"
                         raise InvalidTransitionError(
                             f"Task {task_id} is already claimed by "
                             f"'{claimant}'.\n"
                             f"\n"
-                            f"Why: a concurrent claim won the race "
-                            f"and moved the task to 'in_progress'.\n"
+                            f"Why: the task is in 'in_progress' and "
+                            f"assigned. A second claim would orphan "
+                            f"the first worker's session.\n"
                             f"\n"
-                            f"Fix: pick another task with "
-                            f"`pm task next`, or if the winner's "
-                            f"session is stale: "
-                            f"`pm task hold {task_id} --reason "
-                            f"'stale claim'` then "
-                            f"`pm task resume {task_id}`."
+                            f"Fix: use `pm task get {task_id}` to see "
+                            f"the current state. If the existing claim "
+                            f"is stale (worker session dead), hold and "
+                            f"resume:\n"
+                            f"    pm task hold {task_id} --reason 'stale claim'\n"
+                            f"    pm task resume {task_id}\n"
+                            f"Otherwise, find an unclaimed task with "
+                            f"`pm task next`."
                         )
                     raise InvalidTransitionError(
-                        f"Cannot claim task in '{locked_status}' "
-                        f"state.\n"
+                        f"Cannot claim task in "
+                        f"'{locked_task.work_status.value}' state.\n"
                         f"\n"
-                        f"Why: a concurrent writer transitioned the "
-                        f"task out of 'queued' before this claim "
-                        f"could acquire the row lock.\n"
+                        f"Why: only tasks in 'queued' state can be claimed.\n"
                         f"\n"
-                        f"Fix: re-read with `pm task get {task_id}` "
-                        f"and pick another task with `pm task next`."
+                        f"Fix: if the task is 'draft', run "
+                        f"`pm task queue {task_id}` first. If it's "
+                        f"'done' or 'cancelled', find another task "
+                        f"with `pm task next`."
                     )
+                # Blocker check uses the dependencies table; a fresh
+                # ``link(blocks)`` committed after our lock acquires is
+                # visible to this READ COMMITTED select. Without the
+                # in-tx re-read, a blocker inserted between the pre-tx
+                # read and the lock would be ignored and the claim
+                # would commit.
+                if self._has_unresolved_blockers_locked(
+                    cur, project, task_number
+                ):
+                    raise InvalidTransitionError(
+                        f"Cannot claim task {task_id}: it is blocked by "
+                        f"another task.\n"
+                        f"\n"
+                        f"Why: blocking tasks must reach a terminal "
+                        f"state before dependents can start.\n"
+                        f"\n"
+                        f"Fix: run `pm task get {task_id}` to see the "
+                        f"blockers, then work on those first (or "
+                        f"unblock with `pm task unlink`)."
+                    )
+
+                # Flow + node resolution from the LOCKED row. The flow
+                # template id is immutable post-create (update() rejects
+                # ``flow_template`` changes) so the template load is
+                # safe outside the lock, but the resolved
+                # ``current_node_id`` and the role binding used by
+                # ``_resolve_node_assignee`` come from ``locked_task``.
+                flow = self._load_flow(locked_task)
+                node_id = locked_task.current_node_id or flow.start_node
+                if not node_id:
+                    raise InvalidTransitionError(
+                        f"Task {task_id} has no claimable flow node."
+                    )
+                node = flow.nodes.get(node_id)
+                if node is None:
+                    raise InvalidTransitionError(
+                        f"Current node '{node_id}' not found in flow "
+                        f"'{flow.name}'."
+                    )
+                if node.type == NodeType.TERMINAL:
+                    raise InvalidTransitionError(
+                        f"Current node '{node_id}' is terminal and "
+                        f"cannot be claimed."
+                    )
+
+                # ``_resolve_node_assignee`` reads ``task.roles`` for
+                # ROLE-typed nodes; passing ``locked_task`` ensures we
+                # use the role binding visible under the row lock, not
+                # a stale pre-tx snapshot.
+                assignee = (
+                    self._resolve_node_assignee(locked_task, node) or actor
+                )
+                resolved_target_status = (
+                    WorkStatus.REVIEW
+                    if node.type == NodeType.REVIEW
+                    else WorkStatus.IN_PROGRESS
+                )
+                # #1737 — pre-claim cap check. Runs INSIDE the
+                # transaction but BEFORE the UPDATE so cap-exceeded
+                # callers don't commit a transition they'll then have
+                # to roll back. The cap check queries worker session
+                # rows (not work_tasks), so it doesn't deadlock against
+                # our row lock. Mirrors the sqlite transition manager.
+                if (
+                    resolved_target_status is WorkStatus.IN_PROGRESS
+                    and not skip_gates
+                    and self._session_mgr is not None
+                ):
+                    check_cap = getattr(
+                        self._session_mgr, "check_parallel_cap", None,
+                    )
+                    if callable(check_cap):
+                        check_cap(project, task_id)
+
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, assignee = %s, "
                     "current_node_id = %s, updated_at = %s "
                     "WHERE project = %s AND task_number = %s",
                     (
-                        target_status.value,
+                        resolved_target_status.value,
                         assignee,
                         node_id,
                         now,
-                        task.project,
-                        task.task_number,
+                        project,
+                        task_number,
                     ),
                 )
                 # If we're resuming a blocked execution, flip its status;
@@ -1884,11 +1885,11 @@ class PgWorkService:
                     "WHERE task_project = %s AND task_number = %s "
                     "AND node_id = %s "
                     "ORDER BY visit DESC, id DESC LIMIT 1",
-                    (task.project, task.task_number, node_id),
+                    (project, task_number, node_id),
                 )
                 latest = cur.fetchone()
                 if (
-                    task.current_node_id is not None
+                    locked_task.current_node_id is not None
                     and latest is not None
                     and latest[1] == ExecutionStatus.BLOCKED.value
                 ):
@@ -1898,12 +1899,12 @@ class PgWorkService:
                         (ExecutionStatus.ACTIVE.value, latest[0]),
                     )
                 elif not (
-                    task.current_node_id is not None
+                    locked_task.current_node_id is not None
                     and latest is not None
                     and latest[1] == ExecutionStatus.ACTIVE.value
                 ):
                     visit = self._next_visit_locked(
-                        cur, task.project, task.task_number, node_id
+                        cur, project, task_number, node_id
                     )
                     cur.execute(
                         "INSERT INTO work_node_executions "
@@ -1911,8 +1912,8 @@ class PgWorkService:
                         "status, started_at) VALUES "
                         "(%s, %s, %s, %s, %s, %s)",
                         (
-                            task.project,
-                            task.task_number,
+                            project,
+                            task_number,
                             node_id,
                             visit,
                             ExecutionStatus.ACTIVE.value,
@@ -1921,14 +1922,23 @@ class PgWorkService:
                     )
                 self._insert_transition_locked(
                     cur,
-                    task.project,
-                    task.task_number,
+                    project,
+                    task_number,
                     WorkStatus.QUEUED.value,
-                    target_status.value,
+                    resolved_target_status.value,
                     actor,
                     None,
                 )
             conn.commit()
+            task_for_postcommit = locked_task
+            target_status = resolved_target_status
+            node_id_committed = node_id
+        # Post-commit side effects mirror the pre-refactor surface; the
+        # locals above are guaranteed set because conn.commit() raises
+        # before we get here on failure.
+        assert task_for_postcommit is not None
+        assert target_status is not None
+        assert node_id_committed is not None
         result = self.get(task_id)
         self._sync_transition(
             result, WorkStatus.QUEUED.value, target_status.value
@@ -1959,9 +1969,9 @@ class PgWorkService:
                     WorkStatus.IN_PROGRESS
                 ):
                     rollback_committed = self._rollback_claim_to_queued(
-                        task.project,
-                        task.task_number,
-                        node_id,
+                        task_for_postcommit.project,
+                        task_for_postcommit.task_number,
+                        node_id_committed,
                         actor,
                         exc,
                     )
@@ -1972,6 +1982,90 @@ class PgWorkService:
                         # captured pre-provisioning.
                         result = self.get(task_id)
         return result
+
+    def _fetch_task_for_claim_locked(
+        self, cur, project: str, task_number: int, task_id: str
+    ) -> Task:
+        """SELECT the full task row + FOR UPDATE and hydrate as a Task.
+
+        Used by :meth:`claim` so every claim-dependent decision
+        (status, roles, current_node_id) reads from the locked row
+        rather than a pre-transaction snapshot (#2064 round-13).
+
+        Relationships are loaded on the same cursor to inherit the
+        tx's read snapshot — a fresh ``link(blocks)`` committed before
+        our row lock is visible; one waiting on our lock is not.
+        """
+        cur.execute(
+            "SELECT project, task_number, project_key, title, type, labels, "
+            "work_status, flow_template_id, flow_template_version, "
+            "current_node_id, assignee, priority, requires_human_review, "
+            "description, acceptance_criteria, constraints, relevant_files, "
+            "parent_project, parent_task_number, "
+            "supersedes_project, supersedes_task_number, "
+            "plan_version, predecessor_task_id, kind, "
+            "roles, external_refs, "
+            "created_at, created_by, updated_at "
+            "FROM work_tasks "
+            "WHERE project = %s AND task_number = %s "
+            "FOR UPDATE",
+            (project, task_number),
+        )
+        row = cur.fetchone()
+        if row is None:
+            # Row was deleted between any caller-side pre-read and the
+            # lock attempt. Vanishingly rare (tasks are not
+            # hard-deleted in normal flows) but still safer than
+            # blindly UPDATE-ing a ghost row.
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        # Relationship rows live in work_task_dependencies; reading
+        # them on the same cursor pulls the latest committed snapshot
+        # which is what ``_has_unresolved_blockers_locked`` will also
+        # use below for the blocker re-check.
+        cur.execute(
+            "SELECT from_project, from_task_number, "
+            "       to_project, to_task_number, kind, "
+            "       1 AS is_outgoing, 0 AS is_incoming "
+            "  FROM work_task_dependencies "
+            " WHERE from_project = %s AND from_task_number = %s "
+            "UNION ALL "
+            "SELECT from_project, from_task_number, "
+            "       to_project, to_task_number, kind, "
+            "       0 AS is_outgoing, 1 AS is_incoming "
+            "  FROM work_task_dependencies "
+            " WHERE to_project = %s AND to_task_number = %s",
+            (project, task_number, project, task_number),
+        )
+        rels = _aggregate_relationship_rows(cur.fetchall())
+        return self._row_to_task(row, relationships=rels)
+
+    def _has_unresolved_blockers_locked(
+        self, cur, project: str, task_number: int
+    ) -> bool:
+        """In-tx variant of :meth:`_has_unresolved_blockers`.
+
+        Same query body — runs on the caller's cursor so the read
+        sees the same READ COMMITTED snapshot the rest of the claim
+        transaction does. Used by :meth:`claim` so a blocker dependency
+        committed after a hypothetical pre-tx read still gates the
+        claim (#2064 round-13).
+        """
+        cur.execute(
+            "SELECT t.work_status FROM work_task_dependencies d "
+            "JOIN work_tasks t "
+            "  ON t.project = d.from_project "
+            " AND t.task_number = d.from_task_number "
+            "WHERE d.to_project = %s AND d.to_task_number = %s "
+            "AND d.kind = %s",
+            (project, task_number, LinkKind.BLOCKS.value),
+        )
+        for row in cur.fetchall():
+            if row[0] not in (
+                WorkStatus.DONE.value,
+                WorkStatus.CANCELLED.value,
+            ):
+                return True
+        return False
 
     def _rollback_claim_to_queued(
         self,

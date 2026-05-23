@@ -1900,7 +1900,7 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         """
 
         import time as _t
-        from pollypm.state_cache.refresh_impl import (
+        from pollypm.state_cache.entry import (
             WORKSPACE_ENTRY_TTL_SECONDS,
         )
 
@@ -2104,7 +2104,7 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         """
 
         import time as _t
-        from pollypm.state_cache.refresh_impl import (
+        from pollypm.state_cache.entry import (
             WORKSPACE_ENTRY_TTL_SECONDS,
         )
 

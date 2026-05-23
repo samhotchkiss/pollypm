@@ -209,7 +209,7 @@ def get_cache() -> StateCacheLike:
                     # full pass (workspace-wide invalidations re-enqueue
                     # every currently-known key — by appearing here the
                     # sentinel rides that path too).
-                    from pollypm.state_cache.refresh_impl import (
+                    from pollypm.state_cache.entry import (
                         WORKSPACE_PROJECT_KEY,
                     )
                     try:

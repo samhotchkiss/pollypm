@@ -38,7 +38,11 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from pollypm.state_cache.entry import ProjectStateCacheEntry, empty_entry
+from pollypm.state_cache.entry import (
+    WORKSPACE_PROJECT_KEY,
+    ProjectStateCacheEntry,
+    empty_entry,
+)
 from pollypm.state_cache.project_state_cache import ProjectStateCache
 
 logger = logging.getLogger(__name__)
@@ -69,13 +73,6 @@ _INVALIDATING_EVENTS: frozenset[str] = frozenset({
     "work_table.cleared",
     "heartbeat.tick",
 })
-
-# #2051 (Codex review): the sentinel project key for the synthetic
-# ``__workspace__`` cache entry. Pinned by string so this leaf module
-# doesn't have to import :mod:`pollypm.state_cache.refresh_impl` at
-# module load time (avoids a circular-import hazard between the
-# refresher infra and the refresh-impl that consumes it).
-_WORKSPACE_PROJECT_KEY: str = "__workspace__"
 
 # Signals that an event touches workspace-root awaits-user rows
 # (``messages`` with ``scope IN ('', 'inbox')`` — they surface as
@@ -384,7 +381,7 @@ class StateCacheRefresher:
         # sentinel is stale or missing. Refreshing it on every event
         # is cheap — the workspace-root sweep is a single bulk query
         # and coalesces with the rest of the drain.
-        self._cache.invalidate(_WORKSPACE_PROJECT_KEY)
+        self._cache.invalidate(WORKSPACE_PROJECT_KEY)
         if not project or project in _WORKSPACE_ROOT_PROJECT_SIGNALS:
             # Workspace-scoped event (empty project) OR an event whose
             # ``project`` payload is itself a workspace-root signal

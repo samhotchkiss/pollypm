@@ -253,7 +253,7 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     #2051: workspace-root awaits-user messages (``scope IN ('',
     'inbox')``) now live on a synthetic ``__workspace__`` cache entry
     emitted by the refresher (see
-    :data:`pollypm.state_cache.refresh_impl.WORKSPACE_PROJECT_KEY`).
+    :data:`pollypm.state_cache.entry.WORKSPACE_PROJECT_KEY`).
     This helper unions those items with the per-project ones so the
     rail badge / inbox count include them. The earlier
     ``_workspace_root_inbox_has_open`` probe + its forced
@@ -318,7 +318,7 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     # before the refresher's initial full-refresh stamps the sentinel,
     # and not every workspace-root producer emits an invalidating audit
     # event. Falling through to the direct sweep is the safety net.
-    from pollypm.state_cache.refresh_impl import (
+    from pollypm.state_cache.entry import (
         WORKSPACE_ENTRY_TTL_SECONDS,
         WORKSPACE_PROJECT_KEY,
     )
@@ -564,7 +564,7 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     #2051: workspace-root awaits-user rows (``scope IN ('', 'inbox')``)
     are summed from the synthetic ``__workspace__`` cache entry
     emitted by the refresher (see
-    :data:`pollypm.state_cache.refresh_impl.WORKSPACE_PROJECT_KEY`).
+    :data:`pollypm.state_cache.entry.WORKSPACE_PROJECT_KEY`).
     The earlier workspace-root probe + forced fall-through were
     removed; the cache is now authoritative for those rows too.
 
@@ -616,7 +616,7 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     # workspace-root awaits-user rows exist, so we MUST fall through to
     # the direct sweep. See the sibling guard in
     # :func:`_maybe_cache_route_awaits_user`.
-    from pollypm.state_cache.refresh_impl import (
+    from pollypm.state_cache.entry import (
         WORKSPACE_ENTRY_TTL_SECONDS,
         WORKSPACE_PROJECT_KEY,
     )

@@ -223,14 +223,22 @@ def load_paused_state(config: Any) -> MarkerState:
         state = MarkerState.absent()
         _record_marker_kind_transition(config, state)
         return state
-    if not path.exists():
+    # Codex PR #2081 round 4: do NOT call ``path.exists()`` before the
+    # discriminated read. On Python 3.14 a permission-denied ``stat()``
+    # raises ``PermissionError`` from ``Path.exists()`` rather than
+    # returning ``False``, which would escape the OSError handler below
+    # and bypass the documented ``MarkerState.unreadable`` fail-closed
+    # contract. Instead we let ``read_text`` itself discriminate:
+    # ``FileNotFoundError`` -> absent, any other ``OSError`` (permission
+    # denied, IsADirectoryError, etc) -> unreadable with a reason.
+    try:
+        raw = path.read_text()
+    except FileNotFoundError:
         state = MarkerState.absent()
         _record_marker_kind_transition(config, state)
         return state
-    try:
-        raw = path.read_text()
     except OSError as exc:
-        reason = f"read failed: {exc!s}"
+        reason = f"read failed: {type(exc).__name__}: {exc!s}"
         logger.debug("pause marker read failed: %s", path, exc_info=True)
         state = MarkerState.unreadable(reason)
         _record_marker_kind_transition(config, state)

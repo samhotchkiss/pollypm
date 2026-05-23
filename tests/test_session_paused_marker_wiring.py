@@ -327,6 +327,97 @@ def test_is_paused_fails_closed_on_permission_error(
     ) is True
 
 
+@pytest.mark.skipif(
+    __import__("os").geteuid() == 0,
+    reason="root bypasses chmod 0o000 so the permission denial never fires",
+)
+def test_is_paused_fails_closed_on_real_chmod_permission_denied(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """Real ``chmod 0o000`` regression — Codex PR #2081 round 4.
+
+    The monkeypatched ``read_text`` test above proves the OSError branch
+    wires through ``MarkerState.unreadable``, but it CANNOT catch the
+    Python 3.14 regression where ``Path.exists()`` itself raises
+    ``PermissionError`` on a permission-denied ``stat()`` (the pre-fix
+    code path ran ``path.exists()`` BEFORE the try block, so a 3.14
+    stat-raises permission error escaped the discriminated read).
+
+    This test exercises the real OS-level denial: chmod the marker to
+    ``0o000`` and verify the helper still:
+
+    * returns ``MarkerState.unreadable`` (fail-closed contract),
+    * makes ``is_paused`` return True for ANY session, and
+    * emits the canonical ``session.pause.marker_unreadable`` audit
+      diagnostic.
+    """
+    import os
+
+    from pollypm.audit.log import SCHEMA_VERSION
+    from pollypm.session_paused import (
+        PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
+        _reset_skip_throttle_for_tests,
+        is_paused,
+        load_paused_state,
+    )
+
+    _reset_skip_throttle_for_tests()
+    marker = _write_marker(config_with_base_dir, ["operator"])
+    original_mode = marker.stat().st_mode & 0o777
+    try:
+        os.chmod(marker, 0o000)
+        # Sanity: confirm the OS actually denies us. If the platform
+        # silently grants read regardless (some FUSE / CI surfaces do),
+        # skip rather than emit a false negative.
+        try:
+            with open(marker, "rb"):
+                pytest.skip(
+                    "platform/filesystem ignored chmod 0o000 — cannot "
+                    "exercise real permission-denied path",
+                )
+        except PermissionError:
+            pass
+
+        state = load_paused_state(config_with_base_dir)
+        assert state.kind == "unreadable", state
+        # is_paused fails closed for ANY session name, including ones
+        # we know are not in the marker list.
+        assert is_paused(config_with_base_dir, "operator") is True
+        assert is_paused(
+            config_with_base_dir, "definitely-not-in-marker",
+        ) is True
+
+        # Canonical audit diagnostic landed on the project's audit.jsonl.
+        audit_path = (
+            config_with_base_dir.project.base_dir / "audit.jsonl"
+        )
+        assert audit_path.exists(), "expected audit.jsonl to be emitted"
+        rows = [
+            json.loads(line)
+            for line in audit_path.read_text().splitlines()
+            if line.strip()
+        ]
+        unreadable_rows = [
+            r for r in rows
+            if r.get("event") == PAUSE_MARKER_UNREADABLE_EVENT_TYPE
+        ]
+        assert len(unreadable_rows) >= 1, rows
+        row = unreadable_rows[0]
+        assert row["schema"] == SCHEMA_VERSION
+        assert row["status"] == "warn"
+        assert row["actor"] == "system"
+        # The reason carries the OSError class name so an operator can
+        # tell a permission denial apart from a JSON parse failure.
+        reason = row["metadata"].get("reason", "")
+        assert "PermissionError" in reason or "Errno 13" in reason, reason
+    finally:
+        # Restore so tmp_path teardown can clean up.
+        try:
+            os.chmod(marker, original_mode or 0o600)
+        except OSError:
+            pass
+
+
 def test_is_paused_unreadable_emits_audit_event_once(
     config_with_base_dir: _FakeConfig,
 ) -> None:

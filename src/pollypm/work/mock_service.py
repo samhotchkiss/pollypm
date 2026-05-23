@@ -409,10 +409,10 @@ class MockWorkService:
         # the surface must agree.
         if task.work_status is WorkStatus.QUEUED:
             raise InvalidTransitionError(
-                f"Cannot reassign task in 'queued' state. Queued "
-                f"tasks can't be reassigned; cancel + re-queue with "
-                f"role assignment. Queued dispatch routes by "
-                f"`roles['worker']`, not the `assignee` column."
+                "Cannot reassign task in 'queued' state. Queued "
+                "tasks can't be reassigned; cancel + re-queue with "
+                "role assignment. Queued dispatch routes by "
+                "`roles['worker']`, not the `assignee` column."
             )
         if task.work_status in {
             WorkStatus.DRAFT,

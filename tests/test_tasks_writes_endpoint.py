@@ -259,9 +259,9 @@ class FakeWorkService:
             # below would never trip.
             if task.work_status is WorkStatus.QUEUED:
                 raise InvalidTransitionError(
-                    f"Cannot reassign task in 'queued' state. "
-                    f"Queued tasks can't be reassigned; cancel + "
-                    f"re-queue with role assignment."
+                    "Cannot reassign task in 'queued' state. "
+                    "Queued tasks can't be reassigned; cancel + "
+                    "re-queue with role assignment."
                 )
             if task.work_status in (
                 WorkStatus.DRAFT, WorkStatus.DONE, WorkStatus.CANCELLED,
@@ -748,8 +748,8 @@ def test_claim_worker_cap_exceeded_returns_429(
             # ``pg_service.py:1759-1763`` — raises BEFORE the DB
             # transition fires so no state change is visible.
             raise WorkerCapExceededError(
-                f"Cannot spawn worker for myproj/301: project 'myproj' "
-                f"already has 4 active worker sessions (cap=4)."
+                "Cannot spawn worker for myproj/301: project 'myproj' "
+                "already has 4 active worker sessions (cap=4)."
             )
 
     def _factory(**_kwargs: object) -> _CapExceededWorkService:

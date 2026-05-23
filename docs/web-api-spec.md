@@ -116,13 +116,35 @@ or hosted Postgres).
 
 ## 3. Authentication
 
-### Bearer token
+### Credential modes
 
-Every request (except `GET /api/v1/health`) must carry:
+Every request (except `GET /api/v1/health`) must satisfy one of the
+following three credential modes. They are tried in order by the daemon's
+auth dependency (`src/pollypm/web_api/auth.py`):
 
-```
-Authorization: Bearer <token>
-```
+1. **Bearer header** — `Authorization: Bearer <token>` matching the
+   on-disk token at `~/.pollypm/api-token` (mode 0600). Always accepted.
+   This is the canonical mode for non-browser clients (cockpit CLI,
+   scripts, curl).
+2. **`pollypm-session` cookie** — minted by `GET /ui/` and then sent
+   automatically by the browser on every subsequent `/api/v1/*` request.
+   The cookie value is the same on-disk token; it is compared with the
+   same constant-time check as the header. `GET /ui/` only issues the
+   cookie when the caller is a loopback peer (`127.0.0.1` / `::1`), a
+   verified tailnet peer (CGNAT-range source *and* the app was built with
+   `tailnet_trust_enabled=True`), or already presented a valid bearer
+   header. LAN clients receive the HTML without `Set-Cookie` and get
+   `401` on their first API call.
+3. **Credential-free tailnet peer** — accepted *only* when the app was
+   constructed with `tailnet_trust_enabled=True`, which `pm serve` sets
+   automatically when `detect_tailscale_ip()` returns a verified
+   Tailscale IPv4 and uvicorn binds that interface. Without that flag
+   (loopback bind, explicit `--host`, `--allow-remote`), CGNAT-source
+   peers fall back to bearer or cookie like any other client.
+
+See [`docs/web-ui-2065-security-spec.md`](web-ui-2065-security-spec.md)
+for the ADR-level decision rationale (LAN exposure, CGNAT spoofing,
+credential-issuance gating).
 
 ### SSE escape hatch (`?token=`)
 

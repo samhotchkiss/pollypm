@@ -135,8 +135,11 @@ actively streaming output (see §5.3). Override with
 ## 3. Endpoint reference
 
 All endpoints are mounted under `/api/v1/chat/` on the PollyPM web API
-(`src/pollypm/web_api/app.py`). All responses are JSON. All endpoints
-require `Authorization: Bearer <token>`; absent or wrong token returns
+(`src/pollypm/web_api/app.py`). All responses are JSON. Chat endpoints
+accept the same 3 auth modes as the rest of `/api/v1` (bearer header,
+`pollypm-session` cookie, or credential-free tailnet peer in
+`tailnet_trust` mode). See [`web-api-spec.md`](web-api-spec.md) §3
+Authentication for details. Absent or wrong credentials return
 `401 Unauthorized` (handled by the daemon-wide auth middleware, not by
 the chat router).
 

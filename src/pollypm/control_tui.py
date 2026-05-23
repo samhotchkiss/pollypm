@@ -1404,7 +1404,7 @@ class PollyPMApp(App[None]):
             self.notify(
                 "Add Claude requires an email for Max plans. Use "
                 "`pm cockpit` → Settings → Add Claude (modal prompts for email), "
-                "or `pm account add claude --email <your-email>`.",
+                "or `pm add-account claude --email <your-email>`.",
                 severity="warning",
                 timeout=8.0,
             )

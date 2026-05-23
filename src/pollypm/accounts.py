@@ -558,6 +558,17 @@ def add_account_via_login(
     detected_is_sentinel = ":" in detected_email and "@" not in detected_email
 
     if email_hint is not None:
+        if not detected_is_sentinel and email_hint != detected_email:
+            # Detection returned a real email but the hint disagrees — this is
+            # a mismatch. The hint is only valid as a fallback for Max-plan
+            # sentinels. A disagreement here means either the wrong account
+            # was logged in or the hint is mistyped.
+            raise typer.BadParameter(
+                f"Email hint {email_hint!r} does not match detected logged-in "
+                f"email {detected_email!r}. The hint is for Claude Max plans "
+                f"(where detection returns no email). Remove the --email flag, "
+                f"or re-log in as the intended account."
+            )
         email = email_hint
     elif detected_is_sentinel:
         raise typer.BadParameter(

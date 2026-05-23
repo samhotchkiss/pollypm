@@ -287,3 +287,96 @@ def test_add_account_invalid_email_hint_raises(
             email_hint="not-an-email",
         )
     assert "email" in str(excinfo.value).lower()
+
+
+def test_add_account_email_hint_matching_detected_email_succeeds(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """email_hint that matches detected email (case-insensitive) succeeds."""
+    config_path = tmp_path / "pollypm.toml"
+    write_config(_config(tmp_path), config_path)
+    monkeypatch.setattr("pollypm.accounts.GLOBAL_CONFIG_DIR", tmp_path / ".pollypm")
+
+    def fake_login_window(_tmux, *, provider, home, window_label, **_kwargs):  # noqa: ANN001
+        home.mkdir(parents=True, exist_ok=True)
+        return "done"
+
+    monkeypatch.setattr("pollypm.accounts._run_login_window", fake_login_window)
+    # Detection returns a real email; hint differs only in case
+    monkeypatch.setattr(
+        "pollypm.accounts._detect_account_email",
+        lambda provider, home: "real@example.com",
+    )
+    monkeypatch.setattr("pollypm.accounts._prime_claude_home", lambda home: None)
+
+    # Hint is same email with different casing — should succeed
+    key, email = add_account_via_login(
+        config_path,
+        ProviderKind.CLAUDE,
+        email_hint="Real@Example.com",
+    )
+    assert key == "claude_real_example_com"
+    assert email == "real@example.com"
+
+
+def test_add_account_email_hint_disagrees_with_detected_email_raises(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """email_hint that disagrees with a real detected email raises BadParameter."""
+    import pytest
+    import typer
+
+    config_path = tmp_path / "pollypm.toml"
+    write_config(_config(tmp_path), config_path)
+    monkeypatch.setattr("pollypm.accounts.GLOBAL_CONFIG_DIR", tmp_path / ".pollypm")
+
+    def fake_login_window(_tmux, *, provider, home, window_label, **_kwargs):  # noqa: ANN001
+        home.mkdir(parents=True, exist_ok=True)
+        return "done"
+
+    monkeypatch.setattr("pollypm.accounts._run_login_window", fake_login_window)
+    # Detection returns a real email
+    monkeypatch.setattr(
+        "pollypm.accounts._detect_account_email",
+        lambda provider, home: "real@example.com",
+    )
+    monkeypatch.setattr("pollypm.accounts._prime_claude_home", lambda home: None)
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        add_account_via_login(
+            config_path,
+            ProviderKind.CLAUDE,
+            email_hint="other@example.com",
+        )
+    assert "does not match" in str(excinfo.value)
+    assert "other@example.com" in str(excinfo.value)
+    assert "real@example.com" in str(excinfo.value)
+
+
+def test_add_account_email_hint_with_sentinel_detection_succeeds(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """email_hint is accepted when detection returns a Max-plan sentinel."""
+    config_path = tmp_path / "pollypm.toml"
+    write_config(_config(tmp_path), config_path)
+    monkeypatch.setattr("pollypm.accounts.GLOBAL_CONFIG_DIR", tmp_path / ".pollypm")
+
+    def fake_login_window(_tmux, *, provider, home, window_label, **_kwargs):  # noqa: ANN001
+        home.mkdir(parents=True, exist_ok=True)
+        return "done"
+
+    monkeypatch.setattr("pollypm.accounts._run_login_window", fake_login_window)
+    # Sentinel: contains ":" but no "@"
+    monkeypatch.setattr(
+        "pollypm.accounts._detect_account_email",
+        lambda provider, home: "claude.ai:max",
+    )
+    monkeypatch.setattr("pollypm.accounts._prime_claude_home", lambda home: None)
+
+    key, email = add_account_via_login(
+        config_path,
+        ProviderKind.CLAUDE,
+        email_hint="backup@example.com",
+    )
+    assert key == "claude_backup_example_com"
+    assert email == "backup@example.com"

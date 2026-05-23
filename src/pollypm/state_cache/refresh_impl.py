@@ -141,11 +141,20 @@ def compute_entry_for_project(
     tracked = bool(getattr(project, "tracked", True)) if project else False
 
     awaits_user_items = _awaits_user_items_for(project_key, config)
+    # #2049 — workspace-wide alert fetch, filtered to this project's
+    # actionable task alerts. ``rollup_project_state`` consumes the
+    # filtered set; folding it in here means the cached ``rail_*``
+    # fields match the direct path even when a live alert is present.
+    # Best-effort: on any failure we degrade to "no alerts," which
+    # matches the pre-fix workaround's worst-case (no RED bump) rather
+    # than crashing the refresh.
+    actionable_alert_ids = _actionable_alert_ids_for(project_key, config)
     state, glyph, detail, rail_rollup, session_names = _categorize_and_rollup(
         project_key=project_key,
         config=config,
         tracked=tracked,
         awaits_user_items=list(awaits_user_items),
+        actionable_alert_task_ids=actionable_alert_ids,
     )
 
     # #2050: bulk-prefetch heartbeats for every session known to this
@@ -172,6 +181,10 @@ def compute_entry_for_project(
         rail_sort_rank=rail_rollup[2] if rail_rollup else 0,
         rail_reason=rail_rollup[3] if rail_rollup else "",
         approvals_pending=rail_rollup[4] if rail_rollup else 0,
+        # #2049 — alert-driven actionable_key (issues-route id) is the
+        # 6th tuple slot. Empty actionable alerts produce ``None`` to
+        # match ``rollup_project_state``'s direct-path return.
+        actionable_key=rail_rollup[5] if rail_rollup else None,
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
         latest_heartbeat_by_session=latest_heartbeat_by_session,
@@ -330,29 +343,113 @@ def _compute_workspace_entry(config: Any) -> ProjectStateCacheEntry:
     )
 
 
+def _actionable_alert_ids_for(
+    project_key: str, config: Any,
+) -> frozenset[str]:
+    """Return the per-project actionable-task-alert ids.
+
+    #2049 — folds the live alert set into the cached entry's rail
+    rollup so the cache fast-path can serve a rollup that matches the
+    direct path even when a ``stuck_on_task:<project>/<n>`` or
+    ``no_session_for_assignment:<project>/<n>`` alert is present.
+    Pre-fix the cache declined for any render with a tracked-project
+    actionable alert (the PR #2026 workaround) which killed the cache
+    benefit during the most common rail state.
+
+    Best-effort: every failure path returns ``frozenset()`` so a broken
+    store / supervisor falls back to "no alerts." That matches the
+    legacy fallthrough's no-RED-bump behaviour rather than crashing
+    the refresh.
+    """
+
+    try:
+        from pollypm.cockpit_project_state import actionable_alert_task_ids
+    except Exception:  # noqa: BLE001
+        return frozenset()
+
+    alerts = _open_alerts_for(config)
+    try:
+        return actionable_alert_task_ids(
+            alerts, project_key=project_key,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_cache: actionable_alert_task_ids failed for %s",
+            project_key,
+            exc_info=True,
+        )
+        return frozenset()
+
+
+def _open_alerts_for(config: Any) -> list[Any]:
+    """Return the workspace's open alerts, or ``[]`` on any failure.
+
+    Reads :meth:`Supervisor.open_alerts` — the same source the cockpit
+    direct path uses (cockpit_rail constructs a supervisor and reads
+    ``supervisor.open_alerts()`` per render). The lazy import keeps
+    the leaf ``state_cache`` package light.
+
+    Construction is best-effort and read-only. Supervisor construction
+    can fail on first call (e.g. backend pool not yet warm during cold
+    start) — every failure path degrades to ``[]`` so a refresh tick
+    never hard-fails on the alert overlay; we just lose the RED-bump
+    for that one refresh cycle.
+    """
+
+    try:
+        from pollypm.supervisor import Supervisor
+    except Exception:  # noqa: BLE001
+        return []
+    supervisor = None
+    try:
+        supervisor = Supervisor(config, readonly_state=True)
+        return list(supervisor.open_alerts())
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_cache: supervisor.open_alerts() failed",
+            exc_info=True,
+        )
+        return []
+    finally:
+        # ``Supervisor`` opens a StateStore handle on construction; the
+        # leaf state_cache module shouldn't leak it across refresh ticks.
+        if supervisor is not None:
+            try:
+                close = getattr(getattr(supervisor, "store", None), "close", None)
+                if callable(close):
+                    close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 def _categorize_and_rollup(
     *,
     project_key: str,
     config: Any,
     tracked: bool,
     awaits_user_items: list[Any],
+    actionable_alert_task_ids: frozenset[str] = frozenset(),
 ) -> tuple[
     Any, str, str,
-    tuple[Any, Any, int, str, int] | None,
+    tuple[Any, Any, int, str, int, str | None] | None,
     list[str],
 ]:
     """Run ``categorize_project`` + ``rollup_project_state`` for one project.
 
     Returns ``(state, glyph, detail, rollup_tuple_or_None, session_names)``.
     The rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
-    approvals_pending)`` — kept positional so the caller can ``zip``
-    it into the entry fields without a second import of the rollup
-    types here. ``session_names`` is every tmux session this project
-    is known to drive (canonical ``architect_<key>`` /
-    ``plan_gate-<key>`` / ``worker_<key>`` plus the per-task
-    ``worker_<key>/<n>`` rows the live worker_sessions table reports)
-    — passed to :func:`_fetch_latest_heartbeats` for the heartbeat
-    prefetch (#2050).
+    approvals_pending, actionable_key)`` — kept positional so the
+    caller can ``zip`` it into the entry fields without a second
+    import of the rollup types here. ``session_names`` is every tmux
+    session this project is known to drive (canonical
+    ``architect_<key>`` / ``plan_gate-<key>`` / ``worker_<key>`` plus
+    the per-task ``worker_<key>/<n>`` rows the live worker_sessions
+    table reports) — passed to :func:`_fetch_latest_heartbeats` for
+    the heartbeat prefetch (#2050).
+
+    #2049: takes ``actionable_alert_task_ids`` so the rail rollup
+    folds in the alert overlay (RED bump for non-user-waiting alerted
+    tasks, alert-driven ``actionable_key``) at compute time.
 
     Failures degrade silently — a broken work-service drops the
     project to IDLE (or PAUSED when not tracked) with no rollup and an
@@ -447,13 +544,18 @@ def _categorize_and_rollup(
         except Exception:  # noqa: BLE001
             project_tasks = []
         try:
-            rollup = rollup_project_state(project_key, project_tasks)
+            rollup = rollup_project_state(
+                project_key,
+                project_tasks,
+                actionable_task_alert_ids=actionable_alert_task_ids,
+            )
             rollup_tuple = (
                 rollup.state,
                 rollup.badge,
                 rollup.sort_rank,
                 rollup.reason,
                 rollup.approvals_pending,
+                rollup.actionable_key,
             )
         except Exception:  # noqa: BLE001
             logger.warning(

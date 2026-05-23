@@ -2090,24 +2090,18 @@ class CockpitRouter:
         """Cache fast-path for :meth:`_project_state_rollups`.
 
         Returns ``None`` when the env flag is off, the cache is cold,
-        the cache is missing any tracked project, OR any tracked
-        project has a live actionable task alert. The fall-through
-        path then runs the direct per-project rollup compute, which
-        re-derives RED / badge / reason from the alerts.
+        or the cache is missing any tracked project. The fall-through
+        path then runs the direct per-project rollup compute.
 
-        Alert fall-through rationale (PR #2026 review blocker 1):
-        ``rollup_project_state`` folds ``actionable_task_alert_ids``
-        into the final ``rail_state`` / ``rail_badge`` / ``rail_reason``
-        / ``actionable_key`` — a live ``stuck_on_task:<project>/<n>``
-        or ``no_session_for_assignment:<project>/<n>`` alert can flip
-        a WORKING project to RED and reshape ``actionable_key`` into
-        the issues-route id. The cache entry's ``rail_*`` fields were
-        computed by the refresher WITHOUT alert state, so we cannot
-        synthesize a rollup that matches the direct path when an
-        actionable alert exists. Decline the cache for that whole
-        rendering so the direct path produces the authoritative answer.
-        Follow-up issue: cache ``actionable_alert_task_ids`` into the
-        refresher so the fast-path stays available with alerts.
+        #2049: the actionable-alert fall-through has been removed —
+        :func:`compute_entry_for_project` now folds
+        ``actionable_alert_task_ids`` into the rail rollup at refresh
+        time (see ``state_cache/refresh_impl.py``) and stamps the
+        alert-driven ``actionable_key`` onto the entry. The cached
+        entry is therefore authoritative for both the no-alert and
+        alert-present cases. ``alerts`` is still accepted so the
+        signature matches the direct path; the cache fast-path
+        ignores it and reads the entry directly.
         """
 
         try:
@@ -2147,15 +2141,6 @@ class CockpitRouter:
         if not all(key in snapshot_keys for key in known_keys):
             return None
 
-        # PR #2026 review blocker 1: ANY tracked project with a live
-        # actionable task alert forces fall-through. We don't try to
-        # serve the unaffected projects from cache because callers
-        # consume the whole map at once and a partial answer would
-        # mix cached + direct semantics in a single render.
-        for project_key in known_keys:
-            if actionable_alert_task_ids(alerts, project_key=project_key):
-                return None
-
         rollups: dict[str, ProjectStateRollup] = {}
         for project_key in known_keys:
             entry = snapshot[project_key]
@@ -2167,11 +2152,12 @@ class CockpitRouter:
                 state=rail_state,
                 badge=getattr(entry, "rail_badge", None),
                 sort_rank=int(getattr(entry, "rail_sort_rank", 0) or 0),
-                # No actionable alerts in scope (gated above), so the
-                # actionable_key derived from alerts is always None
-                # here — matches the direct path's behavior when
-                # ``actionable_task_alert_ids`` is empty.
-                actionable_key=None,
+                # #2049 — alert-driven actionable_key is folded into
+                # the entry by the refresher. Empty alerts produce
+                # ``None`` (matching the direct path), and a live
+                # ``stuck_on_task:<project>/<n>`` non-user-waiting
+                # alert produces ``project:<key>:issues``.
+                actionable_key=getattr(entry, "actionable_key", None),
                 reason=str(getattr(entry, "rail_reason", "") or ""),
                 approvals_pending=int(
                     getattr(entry, "approvals_pending", 0) or 0

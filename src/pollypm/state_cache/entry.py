@@ -159,6 +159,18 @@ class ProjectStateCacheEntry:
     rail_reason: str = ""
     approvals_pending: int = 0
     plan_blocked: bool = False
+    # #2049 — ``actionable_key`` is the rail-route id
+    # (``project:<key>:issues``) that ``rollup_project_state`` returns
+    # when an alerted task drives the rollup. Stored on the entry so the
+    # cache fast-path can serve a rollup that matches the direct path
+    # even when a live ``stuck_on_task:`` / ``no_session_for_assignment:``
+    # alert is present. Without this field the alert overlay had to be
+    # re-applied at read time (which requires task-status info the entry
+    # didn't carry) — the PR #2026 workaround declined the cache for any
+    # render with a tracked-project actionable alert. The refresher now
+    # folds alerts into the entry at compute time so the read path is
+    # authoritative.
+    actionable_key: str | None = None
 
     # ── awaits-user list (the expensive one) ───────────────────────
     awaits_user_count: int = 0

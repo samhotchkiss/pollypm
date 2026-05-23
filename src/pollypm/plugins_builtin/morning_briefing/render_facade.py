@@ -20,12 +20,11 @@ With this module the boundary is restored:
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime
+from datetime import UTC
 from typing import Any
 
 from pollypm.briefings_registry import BriefingArtifact
 from pollypm.config import DEFAULT_CONFIG_PATH, resolve_config_path
-from pollypm.tz import get_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -115,9 +114,16 @@ class MorningBriefingRenderProvider:
         config_path = getattr(config, "config_path", None) or DEFAULT_CONFIG_PATH
         settings = load_briefing_settings(resolve_config_path(config_path))
 
+        # Mirror the CLI's timezone-resolution precedence
+        # (``cli.py:_current_local_now`` -> ``_tick._local_now``):
+        #   ``[briefing].timezone`` -> ``[pollypm].timezone`` -> system TZ.
+        # The previous implementation only consulted ``[pollypm].timezone``,
+        # so a config with ``[pollypm].timezone="UTC"`` plus a
+        # ``[briefing].timezone="America/Los_Angeles"`` override would
+        # regenerate against the wrong local day / quiet-mode window.
+        # (Codex round-10 P0 on PR #2059.)
         fallback_tz = getattr(config.pollypm, "timezone", "") or ""
-        timezone = get_timezone(fallback_tz)
-        now_local = datetime.now(timezone)
+        now_local = _tick._local_now(settings, fallback_tz)
         state = load_state(base_dir)
 
         result = _tick.fire_briefing(

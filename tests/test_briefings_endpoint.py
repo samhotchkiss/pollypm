@@ -561,6 +561,83 @@ def test_briefings_uses_injected_config_not_default(
     assert captured_paths[0] == custom_toml.resolve()
 
 
+def test_regenerate_uses_briefing_settings_timezone_first(
+    api_config: PollyPMConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Regenerate must honor ``[briefing].timezone`` over ``[pollypm].timezone``.
+
+    Codex round-10 P0 on PR #2059: the API regenerate path computed
+    ``now_local`` from ``config.pollypm.timezone`` only, while the CLI
+    (``cli.py:_current_local_now``) and the scheduled tick
+    (``handlers/briefing_tick.py:_local_now`` /
+    ``_resolve_timezone``) prefer ``settings.timezone`` first and fall
+    back to the global ``[pollypm]`` timezone. With
+    ``[pollypm].timezone="UTC"`` and
+    ``[briefing].timezone="America/Los_Angeles"`` the API would render
+    against the wrong local day / quiet-mode window.
+
+    This regression captures the ``now_local`` argument the facade
+    passes to ``fire_briefing`` and asserts the timezone is the
+    briefing override, not the global fallback. It FAILS on the
+    round-9 head (tzinfo == UTC).
+    """
+    from zoneinfo import ZoneInfo
+
+    from pollypm.plugins_builtin.morning_briefing.render_facade import (
+        MorningBriefingRenderProvider,
+    )
+    from pollypm.plugins_builtin.morning_briefing.settings import (
+        BriefingSettings,
+    )
+
+    # Global TZ is UTC, briefing override is LA.
+    api_config.pollypm.timezone = "UTC"
+    api_config.config_path = tmp_path / "pollypm.toml"
+    api_config.config_path.write_text("")
+
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.morning_briefing.settings.load_briefing_settings",
+        lambda _path: BriefingSettings(timezone="America/Los_Angeles"),
+    )
+
+    captured: dict[str, Any] = {}
+
+    def _fake_fire(**kwargs: Any) -> dict[str, Any]:
+        captured["now_local"] = kwargs["now_local"]
+        return {
+            "fired": True,
+            "emitted": False,
+            "draft": {
+                "date_local": "2026-05-22",
+                "mode": "test",
+                "markdown": "x",
+            },
+        }
+
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick.fire_briefing",
+        _fake_fire,
+    )
+    monkeypatch.setattr(
+        "pollypm.plugins_builtin.morning_briefing.state.load_state",
+        lambda _base: None,
+    )
+
+    artifact = MorningBriefingRenderProvider().regenerate(api_config)
+    assert artifact is not None
+
+    now_local = captured.get("now_local")
+    assert now_local is not None, "fire_briefing was not invoked"
+    # The briefing override wins — tzinfo must be Los_Angeles, not UTC.
+    assert now_local.tzinfo == ZoneInfo("America/Los_Angeles"), (
+        f"expected America/Los_Angeles, got {now_local.tzinfo!r}; "
+        "[briefing].timezone must take precedence over [pollypm].timezone "
+        "(parity with pm briefing now / scheduled tick)"
+    )
+
+
 def test_briefings_regenerate_timeout_is_non_blocking(
     client: TestClient,
     auth_headers: dict[str, str],

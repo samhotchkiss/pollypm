@@ -1251,6 +1251,185 @@ def _extract_task_notification(content: Any) -> dict[str, Any] | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# Raw Claude subagent JSONL parser (issue #2052).
+#
+# Subagents spawned via the Claude ``Task`` tool write their own JSONL
+# stream to the path carried in the parent's ``task-notification``
+# block as ``output-file``. That file is the RAW provider JSONL — the
+# same shape :func:`pollypm.transcript_ingest._normalize_claude_line`
+# consumes — NOT the normalized ``events.jsonl`` archive that
+# :func:`parse_events_jsonl` consumes.
+#
+# We deliberately keep this resolver-side (in the chat API) rather
+# than forcing the ingestor to normalize per-subagent: subagent
+# transcripts are read-only artifacts referenced only when a caller
+# explicitly opts into ``include_subagents=true`` on the messages
+# endpoint, so paying the parse cost lazily at request time is
+# strictly better than pre-normalizing every subagent JSONL on every
+# ingest tick.
+# ---------------------------------------------------------------------------
+
+
+_RAW_USER_TYPES = frozenset({"user"})
+_RAW_ASSISTANT_TYPES = frozenset({"assistant"})
+
+
+def parse_raw_subagent_jsonl(
+    path: Path,
+    *,
+    actor_fallback: str = "subagent",
+    limit: int | None = None,
+) -> list[MessageEnvelope]:
+    """Parse a raw Claude subagent JSONL into :class:`MessageEnvelope` rows.
+
+    The subagent JSONL shape (one JSON object per line) is what the
+    Claude CLI writes verbatim — distinct from the normalized
+    ``events.jsonl`` :func:`parse_events_jsonl` consumes:
+
+    .. code-block:: json
+
+        {
+          "type": "user" | "assistant" | "error",
+          "sessionId": "<uuid>",
+          "cwd": "/path/to/project",
+          "timestamp": "2026-05-21T20:48:11Z",
+          "message": {
+            "model": "claude-opus-4-7",
+            "content": "..." | [{"type": "text", "text": "..."}, ...],
+            "usage": {...}
+          }
+        }
+
+    Each ``user`` / ``assistant`` line becomes one envelope; ``error``
+    lines become ``system_event`` envelopes with ``subtype=error``.
+    Anything else (``summary``, telemetry-only lines, malformed JSON)
+    is skipped.
+
+    ``limit`` (optional): cap on emitted envelopes. ``None`` returns
+    every envelope. The caller (the chat-messages route) sets a small
+    cap so the inlined transcript doesn't balloon the parent response.
+
+    Fail-soft: every I/O or JSON failure is logged at debug and the
+    caller receives whatever envelopes were accumulated so far. This
+    mirrors the posture of :func:`parse_events_jsonl` with
+    ``strict=False`` — the subagent transcript is a best-effort
+    enrichment, never the primary signal.
+    """
+    envelopes: list[MessageEnvelope] = []
+    if not path.exists():
+        return envelopes
+    source_key = hashlib.blake2b(
+        str(path).encode("utf-8"), digest_size=4,
+    ).hexdigest()
+    try:
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            for index, line in enumerate(handle):
+                if limit is not None and len(envelopes) >= limit:
+                    break
+                stripped = line.strip()
+                if not stripped:
+                    continue
+                try:
+                    obj = json.loads(stripped)
+                except json.JSONDecodeError:
+                    logger.debug(
+                        "chat.transcripts: skipping malformed raw "
+                        "subagent line in %s @ %d", path, index,
+                    )
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                envelope = _raw_subagent_line_to_envelope(
+                    obj,
+                    index=index,
+                    source_key=source_key,
+                    actor_fallback=actor_fallback,
+                )
+                if envelope is not None:
+                    envelopes.append(envelope)
+    except OSError as exc:
+        logger.warning(
+            "chat.transcripts: read failed for raw subagent %s: %s",
+            path, exc,
+        )
+    return envelopes
+
+
+def _raw_subagent_line_to_envelope(
+    obj: dict[str, Any],
+    *,
+    index: int,
+    source_key: str,
+    actor_fallback: str,
+) -> MessageEnvelope | None:
+    """Map one raw Claude JSONL line to a :class:`MessageEnvelope`.
+
+    Returns ``None`` for line types we don't surface (``summary``,
+    ``session_state``, malformed shapes). The id is deterministic per
+    ``(file, line index)`` so a repeated parse yields stable ids.
+    """
+    line_type = obj.get("type")
+    timestamp = str(obj.get("timestamp") or "")
+    msg_id = f"sub_{source_key}_{index:06d}"
+    message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+    content = message.get("content") if isinstance(message, dict) else None
+
+    if line_type in _RAW_USER_TYPES:
+        text = _extract_text_from_blocks(content) or _extract_text_from_blocks(message)
+        return MessageEnvelope(
+            id=msg_id,
+            ts=timestamp,
+            role=MessageRole.USER,
+            actor="user",
+            type=MessageType.TEXT,
+            text=text,
+            metadata={
+                "provider": "claude",
+                "source": "subagent_jsonl",
+                "session_id": str(obj.get("sessionId") or ""),
+            },
+        )
+    if line_type in _RAW_ASSISTANT_TYPES:
+        text = _extract_text_from_blocks(content) or _extract_text_from_blocks(message)
+        model_name = ""
+        if isinstance(message, dict):
+            raw_model = message.get("model")
+            if isinstance(raw_model, str):
+                model_name = raw_model
+        return MessageEnvelope(
+            id=msg_id,
+            ts=timestamp,
+            role=MessageRole.ASSISTANT,
+            actor=actor_fallback,
+            type=MessageType.TEXT,
+            text=text,
+            metadata={
+                "provider": "claude",
+                "source": "subagent_jsonl",
+                "session_id": str(obj.get("sessionId") or ""),
+                "model": model_name,
+            },
+        )
+    if line_type == "error":
+        # Surface subagent errors as system_event so the caller's UI
+        # doesn't lose them in the inlined stream.
+        return MessageEnvelope(
+            id=msg_id,
+            ts=timestamp,
+            role=MessageRole.SYSTEM,
+            actor="system",
+            type=MessageType.SYSTEM_EVENT,
+            text=_extract_text_from_blocks(obj.get("error")) or "(subagent error)",
+            metadata={
+                "subtype": "error",
+                "provider": "claude",
+                "source": "subagent_jsonl",
+            },
+        )
+    return None
+
+
 __all__ = [
     "STALE_THRESHOLD_SECONDS",
     "build_session_index",
@@ -1258,5 +1437,6 @@ __all__ = [
     "lookup_transcript_path",
     "parse_events_jsonl",
     "parse_events_jsonl_tail",
+    "parse_raw_subagent_jsonl",
     "resolve_transcript_path",
 ]

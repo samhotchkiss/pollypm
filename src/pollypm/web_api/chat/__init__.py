@@ -51,6 +51,7 @@ from pollypm.web_api.chat.transcripts import (
     is_archive_stale,
     parse_events_jsonl,
     parse_events_jsonl_tail,
+    parse_raw_subagent_jsonl,
     resolve_transcript_path,
 )
 
@@ -70,6 +71,7 @@ __all__ = [
     "is_archive_stale",
     "parse_events_jsonl",
     "parse_events_jsonl_tail",
+    "parse_raw_subagent_jsonl",
     "resolve_transcript_path",
     "synthesize_capture_id",
 ]

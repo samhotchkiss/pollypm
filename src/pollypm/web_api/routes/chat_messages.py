@@ -26,6 +26,7 @@ opening a read-only work-service handle (matches the pattern used by
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +47,7 @@ from pollypm.web_api.chat import (
     is_archive_stale,
     parse_events_jsonl,
     parse_events_jsonl_tail,
+    parse_raw_subagent_jsonl,
 )
 from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.routes._deps import ConfigDep
@@ -703,6 +705,7 @@ def _apply_filters_and_paginate(
     since_id: str | None,
     direction: Direction,
     limit: int,
+    post_process: Any = None,
 ) -> tuple[list[ChatMessageEnvelope], bool, str | None]:
     """Apply spec §2.2 query semantics and return ``(rows, has_more, cursor)``.
 
@@ -732,12 +735,10 @@ def _apply_filters_and_paginate(
        endpoint).
     6. Slice to ``limit`` and compute ``has_more`` / ``next_cursor``.
 
-    NOTE: ``include_subagents`` is deferred to #2052 — the v3
-    implementation called ``parse_events_jsonl`` on
-    ``metadata.output_file``, but that field is the raw Claude
-    task-notification subagent JSONL (different shape than the
-    normalized archive). The path-traversal allowlist and inliner
-    were removed alongside the query param.
+    NOTE: subagent inlining lives in
+    :func:`_inline_subagent_transcript` and runs in the endpoint after
+    pagination — see the doc-block above that function for the
+    allowlist + raw-parser contract (issue #2052).
     """
     # Normalize the lower bound to tz-aware UTC so the comparison with
     # parsed timestamps (always tz-aware after _parse_envelope_ts) never
@@ -796,15 +797,175 @@ def _apply_filters_and_paginate(
     if has_more and page:
         next_cursor = page[-1].id
 
+    if post_process is not None:
+        page = [post_process(env) for env in page]
+
     return [_envelope_to_wire(env) for env in page], has_more, next_cursor
 
 
-# NOTE: ``_inline_subagent`` / ``_allowed_transcript_roots`` /
-# ``_is_within`` were removed in PR #2045 round-4. The v3 implementation
-# called ``parse_events_jsonl`` on ``metadata.output_file``, but that
-# field is the raw Claude task-notification subagent JSONL — a totally
-# different shape than the normalized archive ``parse_events_jsonl``
-# consumes. Re-implementation tracked in #2052.
+# ---------------------------------------------------------------------------
+# Subagent inlining (#2052)
+#
+# When ``include_subagents=true`` is passed, each ``subagent_result``
+# envelope in the page is enriched with ``metadata.subagent_transcript``
+# — a list of envelopes parsed from the raw Claude JSONL the parent
+# ``task-notification`` block points at (``metadata.output_file``).
+#
+# Security boundary: ``metadata.output_file`` is supplied by transcript
+# content and an authenticated caller who can influence what an agent
+# writes could otherwise make the API stat/read arbitrary local paths
+# (``/etc/passwd``, ``../../../escape.jsonl``). The inliner constrains
+# candidates to :func:`_allowed_transcript_roots` (project + workspace
+# transcript dirs) via ``Path.resolve`` + ``is_relative_to``. Paths
+# outside every allowed root are skipped silently (debug log, no
+# raise) so a malformed transcript can't 500 the endpoint.
+#
+# Parser asymmetry: subagent JSONLs are the RAW Claude per-session
+# stream, not the normalized ``events.jsonl`` archive — we route the
+# read through :func:`parse_raw_subagent_jsonl`. See the docstring on
+# that function for the shape contract.
+# ---------------------------------------------------------------------------
+
+
+# Cap per-subagent inlined envelopes so a runaway subagent transcript
+# can't balloon a single parent response. The cap is generous (matches
+# the messages endpoint's hard max) but bounded; callers who need the
+# full subagent transcript should query it through its own session.
+_SUBAGENT_INLINE_LIMIT = 500
+
+
+def _allowed_transcript_roots(config: Any) -> list[Path]:
+    """Compute directories that may contain subagent transcripts.
+
+    Security boundary for :func:`_inline_subagent`. ``metadata.output_file``
+    is supplied by transcript content and must never be trusted as a
+    filesystem authority — the inliner only reads paths that resolve
+    under one of these roots.
+
+    Roots covered:
+
+    - ``<workspace>/.pollypm/transcripts/`` for the operator workspace.
+    - ``<project>/.pollypm/transcripts/`` for every known project in
+      ``config.projects`` (same set the chat registry enumerates).
+
+    Each returned root is ``resolve()``d so the membership check lines
+    up with a likewise-resolved candidate path.
+    """
+    from pollypm.projects import project_transcripts_dir
+
+    roots: list[Path] = []
+    seen: set[str] = set()
+
+    def _add(path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError):
+            return
+        key = str(resolved)
+        if key in seen:
+            return
+        seen.add(key)
+        roots.append(resolved)
+
+    project_settings = getattr(config, "project", None)
+    if project_settings is not None:
+        for attr in ("workspace_root", "root_dir"):
+            base = getattr(project_settings, attr, None)
+            if isinstance(base, Path):
+                _add(project_transcripts_dir(base))
+
+    projects = getattr(config, "projects", None) or {}
+    for known in projects.values():
+        project_path = getattr(known, "path", None)
+        if isinstance(project_path, Path):
+            _add(project_transcripts_dir(project_path))
+
+    return roots
+
+
+def _is_within(candidate: Path, root: Path) -> bool:
+    """``Path.is_relative_to`` shim that returns ``False`` instead of raising.
+
+    Both ``candidate`` and ``root`` are expected to already be
+    ``resolve()``d so symlinks don't sneak a candidate past the
+    boundary.
+    """
+    try:
+        candidate.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _inline_subagent_transcript(
+    envelope: MessageEnvelope,
+    *,
+    allowed_roots: list[Path],
+    actor_fallback: str,
+) -> MessageEnvelope:
+    """Enrich a ``subagent_result`` envelope with its subagent transcript.
+
+    Reads the raw Claude JSONL at ``metadata.output_file`` (set by the
+    parser when the parent ``task-notification`` block carries one),
+    rejects any candidate outside ``allowed_roots``, and dumps the
+    parsed envelopes into ``metadata.subagent_transcript``.
+
+    Failures are silent — a missing, unreadable, or out-of-bounds
+    subagent transcript just leaves the envelope unchanged. The chat
+    history endpoint never 500s on enrichment.
+    """
+    if str(envelope.type) != "subagent_result":
+        return envelope
+    output_file = envelope.metadata.get("output_file")
+    if not isinstance(output_file, str) or not output_file:
+        return envelope
+    try:
+        sub_path = Path(output_file).resolve()
+    except (OSError, RuntimeError):
+        logger.debug(
+            "chat_messages: subagent path resolve failed for %s",
+            output_file, exc_info=True,
+        )
+        return envelope
+    if not allowed_roots or not any(
+        _is_within(sub_path, root) for root in allowed_roots
+    ):
+        logger.debug(
+            "chat_messages: subagent path %s outside allowed transcript "
+            "roots (%d roots); skipping inline",
+            output_file, len(allowed_roots),
+        )
+        return envelope
+    if not sub_path.exists():
+        return envelope
+    try:
+        sub_envelopes = parse_raw_subagent_jsonl(
+            sub_path,
+            actor_fallback=actor_fallback,
+            limit=_SUBAGENT_INLINE_LIMIT,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "chat_messages: subagent parse failed for %s",
+            sub_path, exc_info=True,
+        )
+        return envelope
+    # Cache-poisoning guard: the transcript parser cache stores the
+    # same ``MessageEnvelope`` instances we receive here (the cache
+    # only copies the outer list, not the dataclass or its mutable
+    # ``metadata`` dict — see ``transcripts._PARSE_CACHE``). Mutating
+    # ``envelope.metadata`` in place would persist ``subagent_transcript``
+    # on the cached entry, so a later default ``include_subagents=false``
+    # request against the same archive/mtime would still return the
+    # inlined payload. Build a fresh envelope with a shallow-cloned
+    # metadata dict so the enrichment never leaks back into the cache.
+    new_metadata = dict(envelope.metadata or {})
+    new_metadata["subagent_transcript"] = [
+        env.to_dict() for env in sub_envelopes
+    ]
+    return dataclasses.replace(envelope, metadata=new_metadata)
 
 
 # ---------------------------------------------------------------------------
@@ -873,29 +1034,15 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
     )] = "auto",
     include_subagents: Annotated[bool, Query(
         description=(
-            "DEFERRED (#2052): the v3 inliner called the normalized "
-            "events.jsonl parser on metadata.output_file, but that "
-            "field is the raw Claude subagent JSONL (different shape). "
-            "Passing include_subagents=true returns 422 until the "
-            "task-notification.output-file → normalized child archive "
-            "resolver lands."
+            "Inline each subagent_result envelope's child transcript at "
+            "metadata.subagent_transcript. The child JSONL is read from "
+            "the parent task-notification.output-file via the raw "
+            "Claude-shape parser; paths are constrained to project + "
+            "workspace transcript roots (issue #2052)."
         ),
     )] = False,
 ) -> ChatMessagesResponse:
     """GET /api/v1/chat/{session_name}/messages per spec §2.2."""
-    if include_subagents:
-        # Reject the deferred param explicitly so callers learn it's
-        # gone rather than silently getting un-inlined results.
-        raise APIError(
-            status_code=422,
-            code="validation_error",
-            message=(
-                "include_subagents is not currently supported; the "
-                "task-notification.output-file -> normalized archive "
-                "resolver is deferred."
-            ),
-            hint="Track re-implementation in #2052.",
-        )
     surface = _find_surface(config, session_name)
     since_dt = _parse_since(since)
 
@@ -920,12 +1067,25 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         surface, source=source, tail_hint=tail_hint,
     )
 
+    post_process: Any = None
+    if include_subagents:
+        allowed_roots = _allowed_transcript_roots(config)
+        actor_fallback = surface.persona or "subagent"
+
+        def post_process(env: MessageEnvelope) -> MessageEnvelope:
+            return _inline_subagent_transcript(
+                env,
+                allowed_roots=allowed_roots,
+                actor_fallback=actor_fallback,
+            )
+
     rows, has_more, next_cursor = _apply_filters_and_paginate(
         envelopes,
         since=since_dt,
         since_id=since_id,
         direction=direction,
         limit=limit,
+        post_process=post_process,
     )
 
     return ChatMessagesResponse(

@@ -218,7 +218,7 @@ Pull a window of messages from a single session's transcript.
 | `since_id` | none | Message id (string). Return messages strictly after this id. Both `since` and `since_id` are applied if passed together (the `since` lower-bound is applied first, then the cursor walk). |
 | `limit` | `100` | Max messages, must be `1..500`. Values outside that range return `422 validation_error` (FastAPI Pydantic-level rejection). |
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
-| `include_subagents` | `false` | DEFERRED — server returns 422 if true. Re-enabled when #2052 lands ingestor-side subagent normalization. |
+| `include_subagents` | `false` | When `true`, each `subagent_result` envelope's `metadata.subagent_transcript` is populated by parsing the raw Claude JSONL the parent `task-notification.output-file` points at. Paths outside the project/workspace transcript allowlist are silently skipped. Capped per envelope. (#2052) |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
 
 > Note: Anthropic extended-thinking blocks are preserved by the
@@ -426,7 +426,7 @@ structured original lives in `metadata`.
 | `ask_user` | assistant | `AskUserQuestion` tool | `metadata`: `questions[]`, `answered`, `answers`. See §5.5. |
 | `file` | assistant | `SendUserFile` tool | `metadata`: `files[]` (local paths), `caption`, `status`. |
 | `subagent_spawn` | assistant | `Task` tool call | `metadata`: `subagent_id`, `subagent_type`, `description`, `prompt`, `isolation`. |
-| `subagent_result` | tool | `Task` tool return | `metadata`: `subagent_id`, `summary`, `duration_ms`, `total_tokens`, `worktree_path`. Note: subagent_transcript inlining is deferred — see #2052. |
+| `subagent_result` | tool | `Task` tool return | `metadata`: `subagent_id`, `summary`, `duration_ms`, `total_tokens`, `worktree_path`, `output_file`. With `?include_subagents=true`: `metadata.subagent_transcript` carries envelopes parsed from the raw subagent JSONL at `output_file` (#2052). |
 | `system_event` | system | Compaction, session-start, error | `metadata.subtype` ∈ `compaction`, `session_start`, `session_resume`, `error`. |
 
 > Parser-internal discriminator: Anthropic extended-thinking blocks
@@ -542,7 +542,11 @@ Once answered, the envelope reappears with `answered=true` and
 }
 ```
 
-Note: subagent_transcript inlining is deferred — see #2052.
+With `?include_subagents=true` the same envelope also carries
+`metadata.subagent_transcript` — a list of envelopes parsed from the
+raw Claude JSONL referenced by `output_file`. Paths outside the
+project/workspace transcript allowlist are silently skipped; inlining
+is capped per envelope to keep responses bounded (#2052).
 
 `system_event`:
 
@@ -590,7 +594,15 @@ block.
 `subagent_result` envelopes; the subagent's full transcript is NOT
 inlined.
 
-Note: subagent_transcript inlining is deferred — see #2052.
+**Opt-in inlining:** pass `?include_subagents=true` and each
+`subagent_result` carries `metadata.subagent_transcript`, parsed
+from the raw Claude JSONL referenced by `output_file`. The path
+resolver constrains candidates to project + workspace transcript
+roots (`.pollypm/transcripts/`); paths outside the allowlist are
+silently skipped so a malformed transcript cannot stat arbitrary
+files. Inlining is capped per envelope (default 500 child envelopes);
+callers who need the entire subagent transcript should query its own
+session through `/api/v1/chat/sessions`. (#2052)
 
 ### 5.3 Mid-stream sends (`409 unsafe_mid_stream`)
 
@@ -835,9 +847,10 @@ pm chat send <session_name> <text> [--no-enter]
   every flag as the matching query param. `--since-id` is cursor
   pagination (pass the previous response's `next_cursor`). `--pane` is
   not exposed because GET never differentiates panes (§5.4).
-  `--include-subagents` is currently a no-op surface: the help text
-  flags it as deferred and the server returns `422 validation_error`
-  if you pass it until #2052 lands.
+  `--include-subagents` forwards as `?include_subagents=true`, which
+  enriches each `subagent_result` envelope with
+  `metadata.subagent_transcript` parsed from the raw subagent JSONL
+  at `output_file` (allowlist-constrained, capped per envelope).
 - `pm chat send` → `POST /api/v1/chat/<session>/send`. `--no-enter`
   maps to `press_enter=false`. `--selection` is repeatable for
   multi-select `AskUserQuestion` replies. `--pane` forwards the
@@ -924,9 +937,24 @@ selection.
    `AskUserQuestion` stdin protocol may have changed (see §5.5 open
    question). File a bug.
 
-### (f) `include_subagents=true` returns 422
+### (f) `include_subagents=true` returns an empty `subagent_transcript`
 
-`include_subagents=true` returns 422 until #2052 lands.
+Most likely causes:
+
+1. **The `output_file` path is outside the allowlist.** Only paths
+   under a project or the workspace `.pollypm/transcripts/` root are
+   eligible — anything else (an `/etc/...` path, a worktree outside
+   the configured project, an absolute path the agent fabricated) is
+   silently skipped. Confirm via `metadata.output_file` on the
+   `subagent_result` envelope.
+2. **The subagent JSONL hasn't been written yet.** Brand-new
+   subagents may have a `task-notification.output-file` set but the
+   raw JSONL is empty / still being appended.
+3. **The subagent JSONL is not raw Claude shape.** The resolver
+   expects the per-session Claude format (`type=user|assistant`,
+   `message.content`). A normalized `events.jsonl` archive at that
+   path will parse empty — request the child surface directly via
+   `/api/v1/chat/sessions` instead.
 
 ### (g) Transcript appears truncated or out of order
 

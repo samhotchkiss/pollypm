@@ -3581,6 +3581,31 @@ class Supervisor:
         to move to a SessionRecovery subsystem in Step 8 of the Supervisor
         decomposition.
         """
+        # #2068 — honour the sessions-admin pause marker. This is the
+        # chokepoint for BOTH the periodic health sweep (which calls
+        # ``_maybe_recover_session`` on each unhealthy session) AND the
+        # default recovery policy's intervention apply path (the
+        # supervisor consumes :class:`DefaultRecoveryPolicy`'s
+        # recommendation via ``_policy_recommendation`` below). A
+        # ``POST /api/v1/sessions/{name}/pause`` writes the marker and
+        # this guard stops the relaunch / failover apply from firing —
+        # leaving the policy classification + recommendation in place
+        # so an operator can still see what would have happened.
+        from pollypm.session_paused import skip_if_paused
+
+        if skip_if_paused(
+            self.config,
+            launch.session.name,
+            store=self._msg_store,
+            loop="supervisor.maybe_recover_session",
+            reason=f"failure_type={failure_type}",
+        ):
+            logger.info(
+                "maybe_recover_session: skipped %s — pause marker present",
+                launch.session.name,
+            )
+            return
+
         # Consult the recovery policy for a canonical intervention
         # recommendation. The apply side below currently only branches on
         # ``failure_type`` — Step 8 will fold these into intervention-kind

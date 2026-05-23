@@ -1725,14 +1725,18 @@ paths:
     post:
       tags: [Sessions]
       operationId: pauseSession
-      summary: Tag a session paused (INFORMATIONAL marker only)
+      summary: Tag a session paused (partial enforcement — see description)
       description: |
-        **Informational marker only.** The supervisor / recovery /
-        dispatch loops do NOT consume `<base_dir>/paused-sessions.json`
-        today — they will still act on the session even after a
-        successful pause. The response `message` calls this out so
-        operators know they have tagged the session, not quiesced the
-        daemon. Daemon-side enforcement is tracked as a follow-up.
+        **Partial enforcement.** The pause marker is HONORED by the
+        recovery loops
+        (`pollypm.recovery.no_session_spawn.auto_recover_no_session_alerts`
+        + `pollypm.supervisor.Supervisor.maybe_recover_session`, which
+        covers loop 1 plus loops 2/3 via the shared apply path); those
+        loops emit a `session.pause.skip` audit event and yield. The
+        remaining dispatch / cockpit / heartbeat loops do NOT yet
+        consume the marker — closing those gaps is tracked under #2068.
+        The response `message` spells out which loops have been
+        quiesced so operators are never misled.
 
         Idempotent. Writes the session name into the project's pause
         marker (`<base_dir>/paused-sessions.json`) using atomic
@@ -1755,9 +1759,23 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           description: |
-            Filesystem error while writing the pause marker
-            (`code=service_unavailable`). Check filesystem permissions
-            on `~/.pollypm`.
+            One of three transient states:
+
+            * `code=marker_unreadable` — the on-disk pause marker
+              exists but cannot be parsed (corrupt JSON, wrong
+              document shape, or permission denied). The recovery
+              loops are failing closed (treating every session as
+              paused) until an operator repairs or deletes the
+              marker manually. The endpoint refuses to overwrite the
+              file because doing so would silently drop any other
+              paused sessions the marker may have held (PR #2081
+              round 3 finding 2).
+            * `code=daemon_unavailable` — the config carries no
+              `project.base_dir`, so the marker has nowhere to
+              live. Bring the daemon / cockpit up and retry.
+            * `code=service_unavailable` — filesystem error while
+              writing the marker. Check permissions on
+              `~/.pollypm`.
           content:
             application/json:
               schema:
@@ -1769,12 +1787,14 @@ paths:
     post:
       tags: [Sessions]
       operationId: resumeSession
-      summary: Clear the informational pause tag for a session (inverse of pause)
+      summary: Clear the pause marker for a session (inverse of pause)
       description: |
-        Idempotent inverse of `pauseSession`. Same daemon-control
-        caveat applies — the marker is informational, so "resuming" a
-        session the supervisor never stopped acting on is a no-op
-        from the runtime's perspective.
+        Idempotent inverse of `pauseSession`. Same partial-enforcement
+        caveat applies — clearing the marker lifts the yield in the
+        recovery loops (`no_session_spawn`,
+        `Supervisor.maybe_recover_session`) immediately, but the
+        remaining dispatch / cockpit / heartbeat loops were never
+        honouring the marker in the first place (tracked under #2068).
 
         Removes the session name from the project's pause marker.
         Returns 200 with no state change if the session wasn't
@@ -1792,8 +1812,20 @@ paths:
           $ref: "#/components/responses/NotFound"
         "503":
           description: |
-            Filesystem error while writing the pause marker
-            (`code=service_unavailable`).
+            One of three transient states:
+
+            * `code=marker_unreadable` — the on-disk pause marker
+              exists but cannot be parsed (corrupt JSON, wrong
+              document shape, or permission denied). Recovery loops
+              are failing closed until an operator repairs or
+              deletes the marker; the endpoint deliberately refuses
+              to claim a successful resume in this state because the
+              recovery loops would remain quiesced (PR #2081 round
+              3 finding 2).
+            * `code=daemon_unavailable` — the config carries no
+              `project.base_dir`.
+            * `code=service_unavailable` — filesystem error while
+              writing the marker.
           content:
             application/json:
               schema:
@@ -3918,9 +3950,11 @@ components:
         boolean so a paused-but-missing or paused-but-stale session
         still reports its true runtime state. Folding pause into
         `status` was removed in PR #2061 round 2 because the
-        supervisor / recovery / dispatch loops do not consume the
-        marker today (see #2068) — `status="paused"` would have
-        misled operators into believing the daemon had quiesced.
+        marker is only PARTIALLY enforced today: the recovery loops
+        (`no_session_spawn`, `Supervisor.maybe_recover_session`)
+        honour it but the dispatch / cockpit / heartbeat loops do
+        not yet (#2068). `status="paused"` would have masked the
+        actual runtime classification for the loops that still act.
 
     SessionInfo:
       type: object
@@ -3976,13 +4010,20 @@ components:
         paused:
           type: boolean
           description: |
-            Informational marker set via POST
-            /sessions/{name}/pause. The supervisor / recovery /
-            dispatch loops do NOT currently consume this marker (see
-            #2068). The `status` field above remains the source of
+            Operator-intent marker set via POST
+            /sessions/{name}/pause and cleared via POST
+            /sessions/{name}/resume. Remains a separate boolean from
+            `status`: the `status` field above is still the source of
             truth for runtime health — a paused-but-missing session
             reports `status="missing"` AND `paused=true`, not
             `status="paused"`.
+
+            Partial enforcement today: the recovery loops
+            (`no_session_spawn.auto_recover_no_session_alerts` and
+            `Supervisor.maybe_recover_session`) honor this marker and
+            skip respawn when set. The dispatch / cockpit / heartbeat
+            loops do NOT yet consume it — that wiring is tracked under
+            #2068.
 
     SessionsListResponse:
       type: object

@@ -18,14 +18,17 @@ Endpoints
   ``409 unsafe_mid_turn`` when the agent is mid-turn (or 503
   ``unsafe_mid_turn_unknown`` when the safety probe itself fails)
   unless ``?safety=force``.
-- ``POST   /api/v1/sessions/{name}/pause``     — write an
-  **informational** pause marker. Consumers can observe it via the
-  separate ``paused: bool`` field on ``GET /api/v1/sessions`` rows;
-  the ``status`` field is unaffected (Codex PR #2061 round 2 —
-  pause must NEVER mask the real runtime-health classification).
-  The supervisor / recovery / dispatch loops do NOT yet consume
-  this marker (see ``ActionResult.message`` and #2068).
-  Idempotent.
+- ``POST   /api/v1/sessions/{name}/pause``     — write the pause
+  marker. The marker is exposed via the separate ``paused: bool``
+  field on ``GET /api/v1/sessions`` rows; the ``status`` field is
+  unaffected (Codex PR #2061 round 2 — pause must NEVER mask the
+  real runtime-health classification). **Partial enforcement**:
+  the recovery loops
+  (:func:`pollypm.recovery.no_session_spawn.auto_recover_no_session_alerts`,
+  :meth:`pollypm.supervisor.Supervisor.maybe_recover_session`) HONOR
+  this marker and yield with an audit event. The remaining dispatch
+  / cockpit / heartbeat loops do NOT yet consume it — tracked under
+  #2068. Idempotent.
 - ``POST   /api/v1/sessions/{name}/resume``    — remove the marker.
   Idempotent.
 
@@ -63,23 +66,28 @@ Design notes
   §10.4) — typical restart time is < 5s and the spec defers
   ``?async`` to Phase 2.5.
 
-* **Pause / resume — informational only.** No existing supervisor /
-  recovery / dispatch loop consumes the pause marker today, so this
-  surface is documented as **informational**. Crucially, the marker
-  is exposed as a *separate* ``paused: bool`` field on the
-  ``SessionInfo`` row rather than as a value of ``status`` (Codex
-  PR #2061 round 2). Folding it into ``status`` was incoherent with
-  the round-1 "informational only" stance: a paused-but-missing
-  session reported ``status="paused"`` and operators believed the
-  daemon had quiesced when in fact the session was simply absent.
-  Now ``status`` reflects pure runtime health (``healthy`` /
-  ``stale`` / ``missing`` / ``unknown``) and ``paused`` carries the
-  operator intent. The response ``message`` and OpenAPI description
-  both call this out so operators are not misled into thinking the
-  marker quiesces the daemon. Daemon-side enforcement is tracked as
-  follow-up #2068. Both operations are idempotent and return 200,
-  and concurrent writes are serialised by an ``fcntl.flock`` on the
-  marker file.
+* **Pause / resume — partial enforcement.** The pause marker is
+  HONORED by the recovery loops (``no_session_spawn.auto_recover``
+  + ``Supervisor.maybe_recover_session`` — covering the auto-spawn
+  loop and both the policy-driven and health-sweep recovery paths)
+  as of PR ``feat/sessions-pause-marker-wire-loops-1-3``. Those
+  loops emit a ``session.pause.skip`` audit event and yield without
+  acting. The remaining dispatch / cockpit / heartbeat loops still
+  treat the marker as informational; closing those gaps is tracked
+  under #2068. The marker is exposed as a *separate* ``paused:
+  bool`` field on the ``SessionInfo`` row rather than as a value of
+  ``status`` (Codex PR #2061 round 2). Folding it into ``status``
+  was incoherent: a paused-but-missing session would report
+  ``status="paused"`` and operators would believe the daemon had
+  quiesced when in fact the session was simply absent. ``status``
+  reflects pure runtime health (``healthy`` / ``stale`` /
+  ``missing`` / ``unknown``) and ``paused`` carries the operator
+  intent. The response ``message`` and OpenAPI description both
+  spell out which loops do and do not yet consume the marker so an
+  operator is never misled. Both operations are idempotent and
+  return 200, and concurrent writes are serialised by an
+  ``fcntl.flock`` on the marker file (see
+  :func:`pollypm.session_paused.pause_marker_lock`).
 
 * **pg outages → 503.** ``GET`` endpoints downgrade pg outages to a
   best-effort response (``status="unknown"`` on the affected row).
@@ -93,10 +101,7 @@ Auth follows the standard bearer-dependency wiring in
 
 from __future__ import annotations
 
-import json
 import logging
-from contextlib import contextmanager
-from pathlib import Path
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query
@@ -123,6 +128,18 @@ from pollypm.session_health import (
 from pollypm.session_health import (
     storage_session_name as _shared_storage_session_name,
 )
+from pollypm.session_paused import (
+    load_paused_names as _load_paused_names,
+)
+from pollypm.session_paused import (
+    load_paused_state as _load_paused_state,
+)
+from pollypm.session_paused import (
+    pause_marker_lock as _pause_marker_lock,
+)
+from pollypm.session_paused import (
+    save_paused_names as _save_paused_names,
+)
 from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.models import ActionResult
 from pollypm.web_api.routes._deps import ConfigDep
@@ -137,11 +154,10 @@ router = APIRouter(tags=["Sessions"])
 # ---------------------------------------------------------------------------
 
 
-# Filename used by :func:`_pause_marker_path`. One JSON file per
-# project; the document is a list of paused session names. Sitting in
-# the project's ``base_dir`` keeps it next to ``state.db`` /
-# ``audit.jsonl`` so storage hygiene already covers it.
-_PAUSE_MARKER_FILENAME = "paused-sessions.json"
+# Pause-marker filename + path + lock helpers all live in
+# :mod:`pollypm.session_paused` so the read-side (recovery loops) and
+# write-side (this route) cannot drift on filename or location (Codex
+# PR #2081 round 1 blocker 2). Import aliases above.
 
 
 SafetyMode = Literal["strict", "loose", "force"]
@@ -168,10 +184,14 @@ class SessionInfo(BaseModel):
     last_heartbeat_age_seconds: int | None = None
     auth_token_present: bool
     enabled: bool
-    # Informational marker (Codex PR #2061 round 2). Decoupled from
-    # ``status`` so a paused-but-missing or paused-but-stale session
-    # still reports its true runtime health — the daemon does NOT
-    # consume this marker today (see #2068).
+    # Operator-intent marker (Codex PR #2061 round 2). Remains a
+    # separate boolean from ``status`` so a paused-but-missing or
+    # paused-but-stale session still reports its true runtime health.
+    # Partial enforcement today: the recovery loops
+    # (``no_session_spawn.auto_recover_no_session_alerts`` and
+    # ``Supervisor.maybe_recover_session``) honor this marker and skip
+    # respawn when set. The dispatch / cockpit / heartbeat loops do
+    # NOT yet consume it — that wiring is tracked under #2068.
     paused: bool = False
 
 
@@ -287,6 +307,40 @@ def _daemon_unavailable(name: str, detail: str) -> APIError:
     )
 
 
+def _marker_unreadable(name: str, path: str, reason: str) -> APIError:
+    """503 envelope for a pause/resume call against an unreadable marker.
+
+    Codex PR #2081 round 3 — finding 2: the write-side pause/resume
+    endpoints used to call ``load_paused_names`` (which collapses an
+    unreadable marker to ``set()``) inside their read-modify-write
+    path. With a corrupt or permission-broken marker on disk, ``pause``
+    would overwrite the file with just the newly requested name —
+    silently losing every other paused session — and ``resume`` would
+    return a cheerful 200 ``already untagged`` while the recovery loops
+    stayed quiesced (they fail closed on the unreadable state).
+
+    The fix is to refuse the mutation with a typed 503 that names the
+    marker path and the parse failure. The operator can then either
+    delete or repair the marker manually; we deliberately do NOT
+    auto-repair because the operator's intent (which sessions were
+    paused) is exactly the data we'd be making up.
+    """
+    return APIError(
+        status_code=503,
+        code="marker_unreadable",
+        message=(
+            f"Cannot act on session {name!r}: pause marker at {path} is "
+            f"unreadable ({reason}). Recovery loops are quiesced (fail-"
+            f"closed) until an operator repairs or deletes the marker."
+        ),
+        hint=(
+            "Inspect / repair / delete the marker file manually, then "
+            "retry. Auto-overwriting would silently drop other paused "
+            "sessions, so the API refuses."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Helpers — heartbeat, tmux probe, pause marker
 # ---------------------------------------------------------------------------
@@ -310,95 +364,29 @@ def _storage_session_name(config: Any) -> str:
     return _shared_storage_session_name(base)
 
 
-def _pause_marker_path(config: Any) -> Path | None:
-    """Return ``<base_dir>/paused-sessions.json`` or ``None`` if no base_dir."""
-    base_dir = getattr(getattr(config, "project", None), "base_dir", None)
-    if base_dir is None:
-        return None
-    return Path(base_dir) / _PAUSE_MARKER_FILENAME
+# Marker filename, path helper, atomic-write helper, and the
+# pause/resume read-modify-write lock all live in
+# :mod:`pollypm.session_paused` (Codex PR #2081 round 1 blocker 2 — the
+# read-side recovery loops and the write-side route MUST share these,
+# or a rename / shape change would silently desync them). Imported as
+# ``_load_paused_names`` / ``_save_paused_names`` / ``_pause_marker_lock``
+# at the top of this module.
 
 
-def _load_paused_names(config: Any) -> set[str]:
-    """Read the pause marker; empty set on missing / malformed file."""
-    path = _pause_marker_path(config)
-    if path is None or not path.exists():
-        return set()
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        logger.debug("pause marker unreadable: %s", path, exc_info=True)
-        return set()
-    if not isinstance(data, list):
-        return set()
-    return {str(name) for name in data if isinstance(name, str)}
-
-
-def _write_paused_names(config: Any, names: set[str]) -> None:
-    """Atomically write the pause marker. Raises on filesystem failure."""
-    path = _pause_marker_path(config)
-    if path is None:
-        raise _daemon_unavailable(
-            "<unknown>",
-            "no base_dir on config; pause marker has nowhere to live",
-        )
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    payload = sorted(names)
-    tmp.write_text(json.dumps(payload, indent=2) + "\n")
-    tmp.replace(path)
-
-
-# Operator-facing message appended to pause/resume responses so a CLI
-# user or automation script knows the marker is *informational only*
-# (Codex PR #2061 P0 #3). The supervisor / recovery / dispatch loops
-# do NOT yet consult this marker — making this clear in the response
-# stops operators from believing they have quiesced the daemon when
-# they have only tagged the session.
-_PAUSE_INFORMATIONAL_NOTE = (
-    "informational marker only — supervisor / recovery / dispatch "
-    "loops do NOT yet consult it; daemon-side enforcement is a "
-    "follow-up. The marker is visible via GET /api/v1/sessions."
+# Operator-facing message appended to pause/resume responses. The
+# marker is now PARTIALLY enforced — the recovery loops
+# (no_session_spawn + Supervisor.maybe_recover_session) honour it, but
+# the dispatch / cockpit / heartbeat loops still treat it as
+# informational. Spelling out which side is which keeps an operator
+# from over- OR under-trusting the call: pausing is not a full daemon
+# quiesce yet, but it is no longer a pure tag either.
+_PAUSE_PARTIAL_ENFORCEMENT_NOTE = (
+    "pause marker is HONORED by recovery loops "
+    "(no_session_spawn, Supervisor.maybe_recover_session) but the "
+    "dispatch / cockpit / heartbeat loops do NOT yet consume it — "
+    "tracked under #2068. The marker is visible via "
+    "GET /api/v1/sessions on the separate `paused` field."
 )
-
-
-@contextmanager
-def _pause_marker_lock(config: Any):
-    """Serialise pause/resume read-modify-write across concurrent callers.
-
-    Codex PR #2061 P0 #3 flagged the unguarded ``_load_paused_names``
-    → mutate → ``_write_paused_names`` sequence as racy: two
-    near-simultaneous pause + resume calls could clobber each other's
-    writes. We take an ``fcntl.flock`` on a sibling ``.lock`` file
-    that lives in the same directory as the marker — best-effort on
-    platforms without ``fcntl`` (Windows), which is fine for the v1
-    RC where the API runs on macOS/Linux only.
-    """
-    path = _pause_marker_path(config)
-    if path is None:
-        # No base_dir → no lock to take; caller will hit the same 503
-        # in ``_write_paused_names`` anyway.
-        yield
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lock_path = path.with_suffix(path.suffix + ".lock")
-    try:
-        import fcntl  # type: ignore[import-not-found]
-    except ImportError:
-        # No fcntl (e.g. Windows): degrade to no-op lock. The marker
-        # write is still atomic via tmp+rename; only the
-        # read-modify-write window is unprotected, which matches the
-        # pre-#2061 behaviour.
-        yield
-        return
-    fh = open(lock_path, "a+")  # noqa: SIM115 — closed in finally
-    try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-    finally:
-        fh.close()
 
 
 # ---------------------------------------------------------------------------
@@ -1023,27 +1011,47 @@ def restart_session_endpoint(
     "/sessions/{name}/pause",
     response_model=ActionResult,
     summary=(
-        "Tag a session as paused (INFORMATIONAL marker; supervisor "
-        "loops do not yet consume it)"
+        "Tag a session as paused (recovery loops honor the marker; "
+        "dispatch/cockpit/heartbeat loops do not yet — #2068)"
     ),
     operation_id="pauseSession",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Session not found."},
+        # PR #2081 round 3 finding 2: a corrupt / permission-broken
+        # marker fails closed in the recovery loops, so we refuse to
+        # overwrite it from this endpoint. ``marker_unreadable`` is the
+        # specific machine-readable code; ``daemon_unavailable`` covers
+        # the no-base_dir case.
+        "503": {
+            "description": (
+                "Pause marker is unreadable (``marker_unreadable``) or "
+                "the daemon has no base_dir to write to "
+                "(``daemon_unavailable``)."
+            ),
+        },
+    },
 )
 def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
-    """POST /api/v1/sessions/{name}/pause — write an informational marker.
+    """POST /api/v1/sessions/{name}/pause — write the pause marker.
 
-    **This is an informational marker only.** Codex PR #2061 P0 #3
-    flagged that the supervisor / recovery / dispatch loops do NOT
-    consume ``<base_dir>/paused-sessions.json`` today — they will
-    still act on the session even after a successful pause. The
-    response ``message`` calls this out so operators know they have
-    tagged the session, not quiesced the daemon. Daemon-side
-    enforcement is tracked as a follow-up.
+    **Partial enforcement.** The pause marker is HONORED by the
+    recovery loops
+    (:func:`pollypm.recovery.no_session_spawn.auto_recover_no_session_alerts`
+    and :meth:`pollypm.supervisor.Supervisor.maybe_recover_session`,
+    covering loop 1 + loops 2/3 via the shared apply path); those
+    loops emit a ``session.pause.skip`` audit event and yield. The
+    remaining dispatch / cockpit / heartbeat loops do NOT yet
+    consume the marker — closing those gaps is tracked under #2068.
+    The response ``message`` spells this out so operators know which
+    loops they have quiesced and which still act.
 
     Writes ``<base_dir>/paused-sessions.json`` (atomic tmp+rename,
     serialised via ``fcntl.flock`` against concurrent pause/resume
-    callers) so ``GET /api/v1/sessions`` surfaces ``paused=true`` on
-    the affected row. The ``status`` field continues to reflect
-    actual runtime health (``healthy`` / ``stale`` / ``missing`` /
+    callers — see :func:`pollypm.session_paused.pause_marker_lock`)
+    so ``GET /api/v1/sessions`` surfaces ``paused=true`` on the
+    affected row. The ``status`` field continues to reflect actual
+    runtime health (``healthy`` / ``stale`` / ``missing`` /
     ``unknown``) — a paused-but-missing session reports
     ``status="missing"`` AND ``paused=true``, not ``status="paused"``
     (Codex PR #2061 round 2). Idempotent: pausing an already-paused
@@ -1052,19 +1060,47 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     _find_session(config, name)  # 404 if unknown
     try:
         with _pause_marker_lock(config):
-            names = _load_paused_names(config)
+            # PR #2081 round 3 finding 2 — go through the discriminated
+            # state reader instead of the best-effort ``load_paused_names``.
+            # The best-effort reader collapses an unreadable marker to an
+            # empty set; combined with our read-modify-write below, that
+            # would silently overwrite a corrupt-but-existing marker with
+            # just the newly requested name and lose every other paused
+            # session. The discriminated reader lets us fail closed with
+            # a typed 503 instead.
+            state = _load_paused_state(config)
+            if state.kind == "unreadable":
+                marker_path = (
+                    config.project.base_dir / "paused-sessions.json"
+                    if getattr(config.project, "base_dir", None) is not None
+                    else "<unknown>"
+                )
+                raise _marker_unreadable(
+                    name, str(marker_path), state.reason,
+                )
+            # ``absent`` and ``ok`` both have an empty-or-populated
+            # ``names`` we can mutate; convert the frozenset to a
+            # working set.
+            names = set(state.names)
             if name in names:
                 return ActionResult(
                     ok=True,
                     message=(
                         f"{name} already tagged paused — "
-                        f"{_PAUSE_INFORMATIONAL_NOTE}"
+                        f"{_PAUSE_PARTIAL_ENFORCEMENT_NOTE}"
                     ),
                 )
             names.add(name)
-            _write_paused_names(config, names)
+            _save_paused_names(config, names)
     except APIError:
         raise
+    except RuntimeError as exc:
+        # ``save_paused_names`` raises ``RuntimeError`` when the
+        # config has no ``project.base_dir`` (the marker has nowhere
+        # to live). Translate to the 503 ``daemon_unavailable`` shape
+        # the rest of this surface uses for "system can't act".
+        logger.debug("pause marker has no path for %s", name, exc_info=True)
+        raise _daemon_unavailable(name, str(exc)) from exc
     except OSError as exc:
         logger.debug("pause marker write failed for %s", name, exc_info=True)
         raise service_unavailable(
@@ -1073,7 +1109,7 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
         ) from exc
     return ActionResult(
         ok=True,
-        message=f"tagged {name} paused — {_PAUSE_INFORMATIONAL_NOTE}",
+        message=f"tagged {name} paused — {_PAUSE_PARTIAL_ENFORCEMENT_NOTE}",
     )
 
 
@@ -1081,35 +1117,71 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     "/sessions/{name}/resume",
     response_model=ActionResult,
     summary=(
-        "Clear the informational pause marker for a session (see "
-        "pauseSession for the daemon-control caveat)"
+        "Clear the pause marker (recovery loops resume immediately; "
+        "dispatch/cockpit/heartbeat loops were never paused — #2068)"
     ),
     operation_id="resumeSession",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Session not found."},
+        # PR #2081 round 3 finding 2: resume cannot silently return
+        # "already untagged" against an unreadable marker — the
+        # recovery loops are failing closed, so the operator needs to
+        # know the resume did NOT take effect.
+        "503": {
+            "description": (
+                "Pause marker is unreadable (``marker_unreadable``) or "
+                "the daemon has no base_dir to write to "
+                "(``daemon_unavailable``)."
+            ),
+        },
+    },
 )
 def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
-    """POST /api/v1/sessions/{name}/resume — clear the informational marker.
+    """POST /api/v1/sessions/{name}/resume — clear the pause marker.
 
-    Idempotent inverse of :func:`pause_session_endpoint`. Same
-    daemon-control caveat applies: the marker is informational, so
-    "resuming" a session that the supervisor never stopped acting on
-    is a no-op from the runtime's perspective.
+    Idempotent inverse of :func:`pause_session_endpoint`. The same
+    partial-enforcement caveat applies: clearing the marker lifts
+    the yield in the recovery loops immediately, but the remaining
+    dispatch / cockpit / heartbeat loops were never honouring it in
+    the first place (tracked under #2068).
     """
     _find_session(config, name)  # 404 if unknown
     try:
         with _pause_marker_lock(config):
-            names = _load_paused_names(config)
+            # PR #2081 round 3 finding 2 — same discriminated-reader
+            # gate as the pause endpoint. ``load_paused_names`` would
+            # collapse an unreadable marker to an empty set and the
+            # idempotent branch below would return ``200 already
+            # untagged`` while the recovery loops stayed quiesced.
+            # Refuse with a 503 instead so the operator knows the
+            # resume did NOT take effect.
+            state = _load_paused_state(config)
+            if state.kind == "unreadable":
+                marker_path = (
+                    config.project.base_dir / "paused-sessions.json"
+                    if getattr(config.project, "base_dir", None) is not None
+                    else "<unknown>"
+                )
+                raise _marker_unreadable(
+                    name, str(marker_path), state.reason,
+                )
+            names = set(state.names)
             if name not in names:
                 return ActionResult(
                     ok=True,
                     message=(
                         f"{name} already untagged — "
-                        f"{_PAUSE_INFORMATIONAL_NOTE}"
+                        f"{_PAUSE_PARTIAL_ENFORCEMENT_NOTE}"
                     ),
                 )
             names.discard(name)
-            _write_paused_names(config, names)
+            _save_paused_names(config, names)
     except APIError:
         raise
+    except RuntimeError as exc:
+        logger.debug("pause marker has no path for %s", name, exc_info=True)
+        raise _daemon_unavailable(name, str(exc)) from exc
     except OSError as exc:
         logger.debug("pause marker write failed for %s", name, exc_info=True)
         raise service_unavailable(
@@ -1118,7 +1190,7 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
         ) from exc
     return ActionResult(
         ok=True,
-        message=f"cleared pause tag on {name} — {_PAUSE_INFORMATIONAL_NOTE}",
+        message=f"cleared pause tag on {name} — {_PAUSE_PARTIAL_ENFORCEMENT_NOTE}",
     )
 
 

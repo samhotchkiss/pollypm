@@ -98,7 +98,7 @@ class SpawnDecision:
     project: str
     outcome: str  # "spawned", "skipped_young", "skipped_backoff",
                   # "skipped_role", "skipped_unknown_project",
-                  # "spawn_failed", "escalated"
+                  # "spawn_failed", "escalated", "skipped_paused"
     attempt_number: int = 0
     detail: str = ""
 
@@ -620,6 +620,37 @@ def auto_recover_no_session_alerts(
                 )
             )
             continue
+        # #2068 — honour the sessions-admin pause marker. The
+        # ``<role>/no_session`` alert keys on either the role-candidate
+        # session name (singleton roles like ``reviewer``) or the
+        # project-scoped expansion. We check BOTH so an operator who
+        # paused either spelling stops the auto-spawn for this loop tick.
+        expected_session = _expected_session_name(role, project)
+        from pollypm.session_paused import skip_if_paused
+
+        paused_match: str | None = None
+        for candidate in (session_name, expected_session):
+            if candidate and skip_if_paused(
+                getattr(services, "config", None),
+                candidate,
+                store=store,
+                loop="no_session_spawn.auto_recover",
+                reason=f"role={role} project={project}",
+            ):
+                paused_match = candidate
+                break
+        if paused_match is not None:
+            decisions.append(
+                SpawnDecision(
+                    session_name=session_name,
+                    role=role,
+                    project=project,
+                    outcome="skipped_paused",
+                    detail=f"pause marker present for {paused_match}",
+                )
+            )
+            continue
+
         opened_at = _parse_iso(getattr(alert, "created_at", None))
         if opened_at is not None and now - opened_at < timedelta(
             seconds=threshold_seconds,

@@ -26,6 +26,7 @@ opening a read-only work-service handle (matches the pattern used by
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
@@ -943,10 +944,20 @@ def _inline_subagent_transcript(
             sub_path, exc_info=True,
         )
         return envelope
-    envelope.metadata["subagent_transcript"] = [
+    # Cache-poisoning guard: the transcript parser cache stores the
+    # same ``MessageEnvelope`` instances we receive here (the cache
+    # only copies the outer list, not the dataclass or its mutable
+    # ``metadata`` dict — see ``transcripts._PARSE_CACHE``). Mutating
+    # ``envelope.metadata`` in place would persist ``subagent_transcript``
+    # on the cached entry, so a later default ``include_subagents=false``
+    # request against the same archive/mtime would still return the
+    # inlined payload. Build a fresh envelope with a shallow-cloned
+    # metadata dict so the enrichment never leaks back into the cache.
+    new_metadata = dict(envelope.metadata or {})
+    new_metadata["subagent_transcript"] = [
         env.to_dict() for env in sub_envelopes
     ]
-    return envelope
+    return dataclasses.replace(envelope, metadata=new_metadata)
 
 
 # ---------------------------------------------------------------------------

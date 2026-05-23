@@ -1093,6 +1093,183 @@ def test_messages_endpoint_include_subagents_inlines_with_real_parser(
     assert transcript[1]["metadata"]["model"] == "claude-opus-4-7"
 
 
+def test_include_subagents_does_not_poison_cache_for_subsequent_default_request(
+    client, auth_headers, patch_registry, project_root,
+    monkeypatch, tmp_path,
+):
+    """Cache-poisoning regression for ``include_subagents`` (Codex review #2083).
+
+    The transcript parser cache stores ``MessageEnvelope`` instances by
+    reference (the cache only copies the outer list, not the dataclass
+    or its mutable ``metadata`` dict). A prior implementation mutated
+    ``envelope.metadata['subagent_transcript']`` in place, so a single
+    ``?include_subagents=true`` request would leave the inlined payload
+    on the cached envelope and a subsequent default
+    ``include_subagents=false`` (or omitted) request against the same
+    archive/mtime would still return the inlined data — even though the
+    client never opted in.
+
+    This test uses the REAL parser / cache (no monkeypatched parser):
+
+    1. First request with ``?include_subagents=true`` — envelope must
+       carry ``metadata.subagent_transcript``.
+    2. Second request with default opt-out (no query) against the SAME
+       archive (mtime unchanged → cache HIT) — envelope must NOT carry
+       ``metadata.subagent_transcript``.
+    """
+    import json
+
+    from pollypm.projects import project_transcripts_dir
+
+    transcripts_root = project_transcripts_dir(project_root)
+    parent_dir = transcripts_root / "parent-session-cache"
+    parent_dir.mkdir(parents=True)
+    parent_archive = parent_dir / "events.jsonl"
+    child_dir = transcripts_root / "child-subagent-cache"
+    child_dir.mkdir(parents=True)
+    child_jsonl = child_dir / "raw.jsonl"
+    child_jsonl.write_text(
+        "\n".join([
+            json.dumps({
+                "type": "user",
+                "sessionId": "child-cache",
+                "cwd": str(project_root),
+                "timestamp": "2026-05-22T10:00:00Z",
+                "message": {"content": "kick off subagent"},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "sessionId": "child-cache",
+                "cwd": str(project_root),
+                "timestamp": "2026-05-22T10:00:05Z",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "subagent reply"}],
+                },
+            }),
+        ]) + "\n"
+    )
+
+    parent_events = [
+        {
+            "timestamp": "2026-05-22T09:59:00Z",
+            "event_type": "tool_call",
+            "session_id": "parent-cache",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": str(parent_archive),
+            "source_offset": 0,
+            "cwd": str(project_root),
+            "model_name": "claude-opus-4-7",
+            "payload": {
+                "type": "tool_use",
+                "id": "toolu_sub_cache",
+                "name": "Task",
+                "input": {"description": "Run the subagent"},
+            },
+        },
+        {
+            "timestamp": "2026-05-22T10:00:10Z",
+            "event_type": "tool_result",
+            "session_id": "parent-cache",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": str(parent_archive),
+            "source_offset": 1,
+            "cwd": str(project_root),
+            "model_name": "claude-opus-4-7",
+            "payload": {
+                "type": "tool_result",
+                "tool_use_id": "toolu_sub_cache",
+                "content": [
+                    {"type": "text", "text": "Subagent done."},
+                    {
+                        "type": "task-notification",
+                        "task-id": "child-cache",
+                        "output-file": str(child_jsonl),
+                        "duration-ms": 1234,
+                        "total-tokens": 567,
+                        "worktree-path": str(project_root),
+                    },
+                ],
+            },
+        },
+    ]
+    parent_archive.write_text(
+        "\n".join(json.dumps(e) for e in parent_events) + "\n"
+    )
+
+    # Capture the archive mtime so we can assert the second request
+    # actually hits the parser cache (same mtime → cache HIT, which is
+    # precisely the path that previously exposed the mutation bug).
+    initial_mtime = parent_archive.stat().st_mtime
+
+    # Drop any cached parse from prior tests so this run is clean.
+    from pollypm.web_api.chat.transcripts import (
+        _PARSE_CACHE,
+        _parse_cache_clear,
+    )
+
+    _parse_cache_clear()
+
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=parent_archive,
+    )])
+
+    # --- First request: opt IN to inlined subagent transcript. ---
+    response_in = client.get(
+        "/api/v1/chat/operator/messages?include_subagents=true&direction=asc",
+        headers=auth_headers,
+    )
+    assert response_in.status_code == 200, response_in.text
+    body_in = response_in.json()
+    result_envs_in = [
+        m for m in body_in["messages"] if m["type"] == "subagent_result"
+    ]
+    assert len(result_envs_in) == 1, body_in
+    transcript_in = result_envs_in[0]["metadata"].get("subagent_transcript")
+    assert isinstance(transcript_in, list)
+    assert len(transcript_in) == 2
+
+    # The parser cache should now hold a single entry for the parent
+    # archive. The cached envelopes are the same objects we just
+    # enriched; if the enrichment was in-place they would still carry
+    # ``subagent_transcript`` and leak it into the next request.
+    assert parent_archive.resolve() in _PARSE_CACHE
+    cached_mtime, cached_envelopes, _ = _PARSE_CACHE[parent_archive.resolve()]
+    assert cached_mtime == initial_mtime
+    for env in cached_envelopes:
+        assert "subagent_transcript" not in (env.metadata or {}), (
+            "Cached envelope metadata was mutated by include_subagents=true; "
+            "later default requests will leak the inlined transcript."
+        )
+
+    # --- Second request: default (no ``include_subagents``). ---
+    # Archive mtime is unchanged so the parser cache is hit; if the
+    # enrichment had mutated the cached envelopes, this response would
+    # still expose ``subagent_transcript`` even though the client did
+    # not opt in.
+    assert parent_archive.stat().st_mtime == initial_mtime
+    response_default = client.get(
+        "/api/v1/chat/operator/messages?direction=asc",
+        headers=auth_headers,
+    )
+    assert response_default.status_code == 200, response_default.text
+    body_default = response_default.json()
+    result_envs_default = [
+        m for m in body_default["messages"] if m["type"] == "subagent_result"
+    ]
+    assert len(result_envs_default) == 1, body_default
+    metadata_default = result_envs_default[0]["metadata"]
+    assert "subagent_transcript" not in metadata_default, (
+        "Cache poisoning: a prior include_subagents=true request leaked "
+        "metadata.subagent_transcript into a later default response."
+    )
+
+
 def test_messages_endpoint_include_subagents_default_no_inline(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):

@@ -103,8 +103,15 @@ def _stamped_entry(
     items: list[Any] | None = None,
     state: ProjectState = ProjectState.WAITING,
 ) -> ProjectStateCacheEntry:
-    """Build an entry stamped with ``config``'s identity (mirrors refresh)."""
+    """Build an entry stamped with ``config``'s identity (mirrors refresh).
 
+    Stamps ``computed_at`` with the current monotonic time so the round-4
+    workspace-sentinel TTL guard (#2051) treats the entry as fresh — the
+    identity-guard tests in this module only care about the identity
+    field, not staleness.
+    """
+
+    import time as _t
     items = items or []
     return ProjectStateCacheEntry(
         project_key=project_key,
@@ -121,6 +128,7 @@ def _stamped_entry(
         awaits_user_count=len(items),
         awaits_user_items=tuple(items),
         config_identity=config_identity(config),
+        computed_at=_t.monotonic(),
     )
 
 
@@ -478,10 +486,14 @@ class TestConfigIdentityGuard:
         parity tests.
         """
 
+        import time as _t
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config_a, _ = self._config_pair(tmp_path)
 
         # Hand-roll an unstamped entry (config_identity defaults to "").
+        # ``computed_at`` is stamped freshly so the round-4 workspace
+        # TTL guard doesn't reject the entry on staleness — this test
+        # isolates the IDENTITY bypass, not staleness.
         unstamped = ProjectStateCacheEntry(
             project_key="alpha",
             project_path=Path("/tmp/alpha"),
@@ -489,6 +501,7 @@ class TestConfigIdentityGuard:
             state=ProjectState.IDLE,
             awaits_user_count=0,
             awaits_user_items=(),
+            computed_at=_t.monotonic(),
         )
         assert unstamped.config_identity == ""
         # Round-3 (#2051): the bounded-staleness guard rejects an empty
@@ -508,6 +521,7 @@ class TestConfigIdentityGuard:
             state=None,
             awaits_user_count=1,
             awaits_user_items=(ws_item,),
+            computed_at=_t.monotonic(),
         )
         assert unstamped_workspace.config_identity == ""
         _seed_cache(

@@ -135,7 +135,14 @@ def _entry(
     detail: str = "",
     latest_heartbeat_by_session: dict[str, Any] | None = None,
     config_identity: str = "",
+    computed_at: float | None = None,
 ) -> ProjectStateCacheEntry:
+    """Build a test entry. ``computed_at`` defaults to ``time.monotonic()``
+    so the round-4 workspace TTL guard treats the entry as fresh; tests
+    that want a stale entry pass an explicit past-time value.
+    """
+
+    import time as _t
     return ProjectStateCacheEntry(
         project_key=project_key,
         project_path=Path(f"/tmp/{project_key}"),
@@ -152,6 +159,7 @@ def _entry(
         awaits_user_items=tuple(items),
         latest_heartbeat_by_session=dict(latest_heartbeat_by_session or {}),
         config_identity=config_identity,
+        computed_at=_t.monotonic() if computed_at is None else computed_at,
     )
 
 
@@ -1883,3 +1891,206 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         counted = cockpit_inbox._count_inbox_tasks_for_label(config)
         assert counted == 2
         assert direct_called["n"] > before
+
+    def test_stale_non_empty_workspace_entry_falls_through_after_ttl(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Round-4 Codex review of #2051: a NON-EMPTY ``__workspace__``
+        entry stamped before the TTL window is NOT authoritative.
+
+        Round-3 closed the empty-sentinel hole but left a residual:
+        ``PgStore.close_message`` / ``PgStore.clear_alert`` /
+        ``service_api.v1.clear_alert`` can close a workspace-root
+        row AFTER the refresher cached it. Those paths write
+        ``messages``-table events, not state-cache audit events, so
+        ``StateCacheRefresher._dispatch_event`` never sees the close
+        and the cached row stays "open" until the next full refresh.
+
+        The bounded-staleness TTL on the workspace sentinel
+        (``WORKSPACE_ENTRY_TTL_SECONDS``) caps that staleness. Once
+        the entry ages past the TTL the cache MUST decline and the
+        direct sweep MUST run — surfacing whatever the message-store
+        actually contains, not the stale snapshot.
+        """
+
+        import time as _t
+        from pollypm.state_cache.refresh_impl import (
+            WORKSPACE_ENTRY_TTL_SECONDS,
+        )
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # The cached workspace row that the refresher last computed.
+        # Simulates the state right before someone closed it.
+        cached_workspace_row = _inbox_item(
+            project="inbox",
+            source="message",
+            ident="ws-root-closed-after-refresh",
+        )
+        # Stamp the entry well beyond the TTL — this is the staleness
+        # that round-4 closes.
+        stale_at = _t.monotonic() - (WORKSPACE_ENTRY_TTL_SECONDS + 20.0)
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=per_project,
+                computed_at=_t.monotonic(),
+            ),
+        )
+        cache._install_for_test(
+            "__workspace__",
+            _entry(
+                "__workspace__",
+                state=None,
+                items=[cached_workspace_row],
+                computed_at=stale_at,
+            ),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
+        # The direct sweep returns a DIFFERENT view — the stale cached
+        # row is gone (a close landed) and a new row arrived. Both
+        # divergences MUST surface in the routed helpers, proving the
+        # cache declined.
+        new_workspace_row = _inbox_item(
+            project="inbox",
+            source="message",
+            ident="ws-root-new",
+        )
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [new_workspace_row]
+
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
+        )
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+
+        # Direct contract: BOTH cache-routed helpers MUST decline (return
+        # None) when the workspace sentinel is past its TTL.
+        assert (
+            cockpit_inbox._maybe_cache_route_awaits_user(config) is None
+        )
+        assert (
+            cockpit_inbox._maybe_cache_count_awaits_user(config) is None
+        )
+
+        # Integrated contract: the public list helper surfaces the
+        # direct-sweep result (the NEW row), not the stale cached row.
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        result = cockpit_inbox.pm_inbox_awaits_user_list(config)
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in result
+        }
+        assert "ws-root-new" in ids
+        assert "ws-root-closed-after-refresh" not in ids
+        assert "alpha/1" in ids
+        assert direct_called["n"] >= 1
+
+        # Count helper mirrors: it sums the direct sweep (2), NOT the
+        # cached snapshot (which would also have summed to 2 here but
+        # via the wrong row — the proof is that the direct sweep ran).
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        before = direct_called["n"]
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        assert counted == 2
+        assert direct_called["n"] > before
+
+    def test_fresh_non_empty_workspace_entry_serves_from_cache(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Round-4 Codex review of #2051 — happy path.
+
+        A non-empty workspace sentinel stamped INSIDE the TTL window
+        is still authoritative: the cache fast-path serves it and the
+        direct sweep does NOT run (modulo the divergence sampler,
+        which we disable for this assertion). This pins the trade-off
+        the TTL was sized for — short bursts of consumer reads stay
+        on the cache fast-path.
+        """
+
+        import time as _t
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        fresh_workspace_row = _inbox_item(
+            project="inbox", source="message", ident="ws-root-fresh",
+        )
+        # Stamp the entry as JUST refreshed — well inside the TTL.
+        fresh_at = _t.monotonic()
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry(
+                "alpha",
+                state=ProjectState.WAITING,
+                items=per_project,
+                computed_at=fresh_at,
+            ),
+        )
+        cache._install_for_test(
+            "__workspace__",
+            _entry(
+                "__workspace__",
+                state=None,
+                items=[fresh_workspace_row],
+                computed_at=fresh_at,
+            ),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [fresh_workspace_row]
+
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
+        )
+        # Pin the divergence sampler off — its random direct call would
+        # blur the "did the cache fast-path fire" assertion.
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+
+        # The cache-route helper MUST return a list (cache served it),
+        # not None — proving the TTL guard passed.
+        routed = cockpit_inbox._maybe_cache_route_awaits_user(config)
+        assert routed is not None
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in routed
+        }
+        assert "ws-root-fresh" in ids
+        assert "alpha/1" in ids
+        # Count helper served from cache too.
+        cached_count = cockpit_inbox._maybe_cache_count_awaits_user(config)
+        assert cached_count == 2
+        # Direct sweep was NOT invoked — the fast-path served both
+        # helpers from the snapshot.
+        assert direct_called["n"] == 0

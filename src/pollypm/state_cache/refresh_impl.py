@@ -48,6 +48,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "ConfigProvider",
+    "WORKSPACE_ENTRY_TTL_SECONDS",
     "WORKSPACE_PROJECT_KEY",
     "build_refresh_fn",
     "compute_entry_for_project",
@@ -63,6 +64,31 @@ __all__ = [
 # established ``__workspace__`` sentinel used by other inbox
 # code paths (see ``cockpit_inbox_items._WORKSPACE_DB_KEY``).
 WORKSPACE_PROJECT_KEY = "__workspace__"
+
+
+# Bounded-staleness TTL for the synthetic workspace sentinel (#2051
+# round-4 Codex review). A non-empty ``__workspace__`` entry is only
+# treated as authoritative for this many monotonic seconds after the
+# refresher stamped it. After the window expires the cache-read
+# boundary falls through to the direct sweep — see
+# ``cockpit_inbox._maybe_cache_route_awaits_user`` and
+# ``_maybe_cache_count_awaits_user``.
+#
+# Rationale: several message-store paths
+# (``PgStore.close_message``, ``PgStore.clear_alert``,
+# ``service_api.v1.clear_alert``) mutate workspace-root awaits-user
+# rows but do NOT emit a ``state-cache`` audit event the refresher's
+# ``_dispatch_event`` consumes. Without a TTL a cached non-empty
+# sentinel can serve closed rows or an inflated count indefinitely.
+#
+# 10 seconds was picked as a compromise: short enough that any close-
+# then-read sequence the operator notices stays inside one rail tick
+# window (rail polls ~1s); long enough that the cache still absorbs
+# bursty consumer reads inside a single refresh cycle. Full audit-
+# event wiring for the message-store close/clear paths is deferred
+# past v1 RC — this TTL is a documented bounded-staleness window,
+# not an invariant.
+WORKSPACE_ENTRY_TTL_SECONDS = 10.0
 
 
 # Callable returning the current workspace config. Injected so a

@@ -318,7 +318,10 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     # before the refresher's initial full-refresh stamps the sentinel,
     # and not every workspace-root producer emits an invalidating audit
     # event. Falling through to the direct sweep is the safety net.
-    from pollypm.state_cache.refresh_impl import WORKSPACE_PROJECT_KEY
+    from pollypm.state_cache.refresh_impl import (
+        WORKSPACE_ENTRY_TTL_SECONDS,
+        WORKSPACE_PROJECT_KEY,
+    )
     if WORKSPACE_PROJECT_KEY not in snapshot:
         return None
     # #2051 round-3 (Codex review): bounded-staleness guard. Once the
@@ -328,13 +331,23 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     # (alerts, notifications, `pm notify`) can still land after that
     # refresh without emitting an invalidating audit event, leaving the
     # empty entry stale. Treat a present-but-empty workspace entry as
-    # NOT-AUTHORITATIVE and fall through to the direct sweep. A non-
-    # empty entry is trusted: the refresher just computed it and the
-    # items are real. Cost: workspaces with genuinely zero root-level
-    # awaits-user rows pay the direct-sweep cost on every call (per-
-    # project entries still benefit from the rest of the cache). Full
-    # audit-event wiring for workspace-root producers is deferred past
-    # v1 RC.
+    # NOT-AUTHORITATIVE and fall through to the direct sweep.
+    #
+    # #2051 round-4 (Codex review): the same staleness reasoning applies
+    # to NON-EMPTY sentinels. ``PgStore.close_message`` /
+    # ``PgStore.clear_alert`` / ``service_api.v1.clear_alert`` can close
+    # workspace-root rows AFTER the refresher computed the entry — those
+    # paths write a ``messages``-table event, not a state-cache audit
+    # event, so the refresher never sees the close and the cached
+    # items / count stay stale until the next full refresh. The TTL
+    # below caps that staleness window. Trade-off: workspaces with
+    # genuinely zero root-level awaits-user rows pay the direct-sweep
+    # cost on every call (empty case); workspaces with stable non-empty
+    # workspace-root rows hit the direct sweep at most once per TTL
+    # window. Per-project entries still benefit from the full cache.
+    # Full audit-event wiring for the message-store close/clear paths
+    # is deferred past v1 RC.
+    import time as _ws_time
     workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
     workspace_items = (
         getattr(workspace_entry, "awaits_user_items", ()) or ()
@@ -342,6 +355,14 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
         else ()
     )
     if not workspace_items:
+        return None
+    workspace_refreshed_at = float(
+        getattr(workspace_entry, "computed_at", 0.0) or 0.0
+    )
+    if (
+        _ws_time.monotonic() - workspace_refreshed_at
+        >= WORKSPACE_ENTRY_TTL_SECONDS
+    ):
         return None
     cached_items: list[object] = []
     # The synthetic ``__workspace__`` entry carries workspace-root
@@ -599,7 +620,10 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     # workspace-root awaits-user rows exist, so we MUST fall through to
     # the direct sweep. See the sibling guard in
     # :func:`_maybe_cache_route_awaits_user`.
-    from pollypm.state_cache.refresh_impl import WORKSPACE_PROJECT_KEY
+    from pollypm.state_cache.refresh_impl import (
+        WORKSPACE_ENTRY_TTL_SECONDS,
+        WORKSPACE_PROJECT_KEY,
+    )
     if WORKSPACE_PROJECT_KEY not in snapshot:
         return None
     # #2051 round-3 (Codex review): bounded-staleness guard mirroring
@@ -608,8 +632,17 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     # message-store writes that bypass audit-event invalidation can
     # land after the sentinel was last refreshed, leaving the zero
     # stale. Fall through to the direct sweep so the rail badge can't
-    # under-report. See ``_maybe_cache_route_awaits_user`` for the full
-    # rationale and trade-offs.
+    # under-report.
+    #
+    # #2051 round-4 (Codex review): the same staleness reasoning applies
+    # to a positive cached count. ``PgStore.close_message`` /
+    # ``PgStore.clear_alert`` / ``service_api.v1.clear_alert`` close
+    # workspace-root rows without emitting a state-cache audit event,
+    # so a positive cached count can over-report after a close. The
+    # TTL below caps that staleness window so the rail badge can't
+    # show a closed row indefinitely. See
+    # ``_maybe_cache_route_awaits_user`` for the full rationale.
+    import time as _ws_time
     workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
     workspace_count = (
         int(getattr(workspace_entry, "awaits_user_count", 0) or 0)
@@ -617,6 +650,14 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
         else 0
     )
     if workspace_count <= 0:
+        return None
+    workspace_refreshed_at = float(
+        getattr(workspace_entry, "computed_at", 0.0) or 0.0
+    )
+    if (
+        _ws_time.monotonic() - workspace_refreshed_at
+        >= WORKSPACE_ENTRY_TTL_SECONDS
+    ):
         return None
     total = 0
     # Pull the workspace-root awaits-user count off the synthetic

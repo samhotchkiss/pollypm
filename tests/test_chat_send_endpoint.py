@@ -525,11 +525,18 @@ def test_ended_worker_session_returns_404(
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_session_returns_404(
+def test_unknown_session_returns_404_session_unknown_not_window_missing(
     client: TestClient,
     auth_headers: dict[str, str],
     patched_tmux: type[FakeTmuxClient],  # noqa: ARG001
 ) -> None:
+    """Unknown names fail at the registry layer, not tmux resolution.
+
+    ``window_missing`` is reserved for a registered chat surface whose
+    tmux window is absent. A name that is neither a configured session
+    nor an active worker should stay ``session_unknown`` so clients can
+    distinguish typos from runtime process loss.
+    """
     response = client.post(
         "/api/v1/chat/nope/send",
         json={"text": "hello"},

@@ -36,10 +36,12 @@ from pollypm.web_api.chat import (
     parse_events_jsonl,
     resolve_transcript_path,
 )
+from pollypm.web_api.chat import transcripts as transcripts_module
 from pollypm.web_api.chat.transcripts import (
     _extract_text_from_blocks,
     _format_tool_use_summary,
     _looks_like_subagent_result,
+    _parse_cache_clear,
     build_session_index,
     lookup_transcript_path,
 )
@@ -649,6 +651,135 @@ def test_parse_empty_file_returns_empty_list(tmp_path: Path) -> None:
     events_path.write_text("")
     envelopes = parse_events_jsonl(events_path)
     assert envelopes == []
+
+
+# ---------------------------------------------------------------------------
+# mtime cache (issue #2069)
+#
+# The history endpoint polls every ~5s and the parse body forward-
+# readlines the full archive each call. For unchanged files the
+# memoized envelopes must be returned without re-running the heavy
+# event-to-envelope translation. ``strict=True`` callers (validation
+# paths) MUST bypass the cache so they still see fresh parse errors.
+# ---------------------------------------------------------------------------
+
+
+def test_parse_unchanged_file_hits_cache(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    _parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [
+        _claude_event("user_turn", text="hi"),
+        _claude_event("assistant_turn", text="hello"),
+    ])
+
+    parse_calls = {"count": 0}
+    real_event_to_envelopes = transcripts_module._event_to_envelopes
+
+    def counting(*args, **kwargs):  # type: ignore[no-untyped-def]
+        parse_calls["count"] += 1
+        return real_event_to_envelopes(*args, **kwargs)
+
+    monkeypatch.setattr(transcripts_module, "_event_to_envelopes", counting)
+
+    first = parse_events_jsonl(events_path)
+    second = parse_events_jsonl(events_path)
+    third = parse_events_jsonl(events_path)
+
+    # Two events in the archive -> 2 _event_to_envelopes calls on the
+    # initial parse, zero on subsequent calls when mtime is unchanged.
+    assert parse_calls["count"] == 2
+    assert [env.text for env in first] == ["hi", "hello"]
+    assert [env.text for env in second] == ["hi", "hello"]
+    assert [env.text for env in third] == ["hi", "hello"]
+    # Each call returns a fresh list — callers sort in place
+    # (_apply_filters_and_paginate), so handing them the cached list
+    # directly would corrupt the cache.
+    assert first is not second
+    assert second is not third
+
+
+def test_parse_cache_invalidates_on_mtime_change(
+    tmp_path: Path,
+) -> None:
+    _parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [_claude_event("user_turn", text="one")])
+    first = parse_events_jsonl(events_path)
+    assert [env.text for env in first] == ["one"]
+
+    # Append a new event AND bump mtime so the cache invalidates.
+    with events_path.open("a") as handle:
+        handle.write(json.dumps(_claude_event("user_turn", text="two")) + "\n")
+    new_mtime = events_path.stat().st_mtime + 5.0
+    import os
+    os.utime(events_path, (new_mtime, new_mtime))
+
+    second = parse_events_jsonl(events_path)
+    assert [env.text for env in second] == ["one", "two"]
+
+
+def test_parse_cache_skips_strict_mode(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    """``strict=True`` callers want fresh parses (validation surface)."""
+    _parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [_claude_event("user_turn", text="a")])
+
+    parse_calls = {"count": 0}
+    real_event_to_envelopes = transcripts_module._event_to_envelopes
+
+    def counting(*args, **kwargs):  # type: ignore[no-untyped-def]
+        parse_calls["count"] += 1
+        return real_event_to_envelopes(*args, **kwargs)
+
+    monkeypatch.setattr(transcripts_module, "_event_to_envelopes", counting)
+
+    parse_events_jsonl(events_path, strict=True)
+    parse_events_jsonl(events_path, strict=True)
+    parse_events_jsonl(events_path, strict=True)
+    # One event * 3 strict calls = 3 conversions (no caching).
+    assert parse_calls["count"] == 3
+
+
+def test_parse_cache_distinguishes_actor_fallback(
+    tmp_path: Path,
+) -> None:
+    """Different actor_fallback must re-parse so the persona is baked in."""
+    _parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [_claude_event("assistant_turn", text="hi")])
+
+    polly_run = parse_events_jsonl(events_path, actor_fallback="Polly")
+    worker_run = parse_events_jsonl(events_path, actor_fallback="worker")
+
+    assert polly_run[0].actor == "Polly"
+    assert worker_run[0].actor == "worker"
+
+
+def test_parse_cache_lru_evicts_oldest_when_full(tmp_path: Path) -> None:
+    """Cap at _PARSE_CACHE_MAX entries; oldest insertion evicts first."""
+    _parse_cache_clear()
+    # Fill the cache to cap by parsing one file per entry.
+    for idx in range(transcripts_module._PARSE_CACHE_MAX):
+        path = tmp_path / f"events-{idx}.jsonl"
+        _write_events(path, [_claude_event("user_turn", text=f"e{idx}")])
+        parse_events_jsonl(path)
+    assert len(transcripts_module._PARSE_CACHE) == transcripts_module._PARSE_CACHE_MAX
+    oldest_path = tmp_path / "events-0.jsonl"
+    assert oldest_path in transcripts_module._PARSE_CACHE
+
+    # One more parse pushes us past the cap -> oldest evicts.
+    overflow = tmp_path / "events-overflow.jsonl"
+    _write_events(overflow, [_claude_event("user_turn", text="overflow")])
+    parse_events_jsonl(overflow)
+    assert len(transcripts_module._PARSE_CACHE) == transcripts_module._PARSE_CACHE_MAX
+    assert oldest_path not in transcripts_module._PARSE_CACHE
+    assert overflow in transcripts_module._PARSE_CACHE
 
 
 # ---------------------------------------------------------------------------

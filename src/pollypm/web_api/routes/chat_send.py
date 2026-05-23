@@ -76,9 +76,9 @@ import subprocess
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Response
+from fastapi import APIRouter, Query, Response
 from pydantic import BaseModel, Field
 
 from pollypm.tmux.client import DeadPaneError, TmuxClient
@@ -1264,8 +1264,19 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
     body: ChatSendRequest,
     config: ConfigDep,
     response: Response,
+    safety: Annotated[
+        Literal["strict", "loose", "force"] | None,
+        Query(
+            description=(
+                "Optional query-string safety override. When present, "
+                "this takes precedence over the JSON body safety field."
+            )
+        ),
+    ] = None,
 ) -> ChatSendResponse:
     """POST /api/v1/chat/{session_name}/send — push text into a tmux pane."""
+    safety_mode = safety or body.safety
+
     # 1. Resolve session via the P1 facade (validates workers against
     # the work-service — see Codex review block 2).
     surface = _resolve_surface(config, session_name)
@@ -1321,7 +1332,7 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
             # without the transcript. Force still proceeds (no
             # ask_envelope means selections-only sends will fail
             # later — that's fine; force is "I know what I'm doing").
-            if body.safety == "strict":
+            if safety_mode == "strict":
                 raise _unsafe_unavailable_transcript(str(exc)) from exc
             # loose: continue; the answer_to branch below will surface
             # ``answer_to_missing`` if the envelope can't be found, and
@@ -1338,7 +1349,7 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
 
     # 3. Safety gates (§4.1, §4.3) — use the exact session transcript
     # (Codex review block 3).
-    if body.safety != "force":
+    if safety_mode != "force":
         if resolution == "absent_but_others_exist":
             # Strict and loose both require an exact transcript
             # mapping. Other transcripts exist for the project but
@@ -1353,26 +1364,26 @@ def send_chat_message(  # noqa: PLR0912, PLR0915 — gate logic is intentionally
             transcript_unavailable_detail = (
                 transcript_unavailable_detail or str(exc)
             )
-            if body.safety == "strict":
+            if safety_mode == "strict":
                 raise _unsafe_unavailable_transcript(str(exc)) from exc
             # loose: continue — warning header is set below.
         try:
             age = _heartbeat_age_seconds(config, session_name)
         except HeartbeatUnavailable as exc:
             # Strict: fail closed; loose: continue with warning header.
-            if body.safety == "strict":
+            if safety_mode == "strict":
                 raise _unsafe_unavailable_heartbeat(str(exc)) from exc
             # loose
             response.headers["X-PollyPM-Warning"] = "heartbeat-unavailable"
             streaming = False
         else:
             streaming = age is not None and age < _MID_STREAM_WINDOW_SECONDS
-        if body.safety == "strict" and streaming:
+        if safety_mode == "strict" and streaming:
             raise _unsafe_mid_stream()
-        if body.safety == "loose" and streaming:
+        if safety_mode == "loose" and streaming:
             response.headers["X-PollyPM-Warning"] = "agent-may-be-streaming"
         if (
-            body.safety == "loose"
+            safety_mode == "loose"
             and transcript_unavailable_detail is not None
             and "X-PollyPM-Warning" not in response.headers
         ):

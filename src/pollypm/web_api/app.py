@@ -411,6 +411,7 @@ def create_app(
         # frontend can read it, defeating the documented contract.
         expose_headers=["Last-Event-ID", "X-PollyPM-Warning"],
     )
+    app.state.tailnet_trust_enabled = tailnet_trust_enabled
 
     # Wire the config provider. When the loaded config carries the
     # on-disk ``config_path`` (always true for ``pm serve``), re-invoke

@@ -382,11 +382,19 @@ def _parse_pollypm_settings(raw: dict[str, object], sessions: dict[str, SessionC
     failover_accounts = [str(item) for item in pollypm_raw.get("failover_accounts", [])]
     failover_enabled = bool(pollypm_raw.get("failover_enabled", bool(failover_accounts)))
     open_permissions_by_default = bool(pollypm_raw.get("open_permissions_by_default", True))
+    threshold_raw = pollypm_raw.get("failover_usage_threshold_pct", 85)
+    try:
+        failover_usage_threshold_pct = int(threshold_raw)
+    except (TypeError, ValueError):
+        failover_usage_threshold_pct = 85
+    if isinstance(threshold_raw, bool) or not 1 <= failover_usage_threshold_pct <= 100:
+        failover_usage_threshold_pct = 85
     return PollyPMSettings(
         controller_account=controller_account,
         open_permissions_by_default=open_permissions_by_default,
         failover_enabled=failover_enabled,
         failover_accounts=failover_accounts,
+        failover_usage_threshold_pct=failover_usage_threshold_pct,
         heartbeat_backend=str(pollypm_raw.get("heartbeat_backend", "local")),
         scheduler_backend=str(pollypm_raw.get("scheduler_backend", "inline")),
         lease_timeout_minutes=max(1, int(pollypm_raw.get("lease_timeout_minutes", 30))),
@@ -1114,6 +1122,7 @@ def _render_global_config(config: PollyPMConfig) -> str:
         f'controller_account = "{config.pollypm.controller_account}"',
         f"open_permissions_by_default = {'true' if config.pollypm.open_permissions_by_default else 'false'}",
         f"failover_enabled = {'true' if config.pollypm.failover_enabled else 'false'}",
+        f"failover_usage_threshold_pct = {config.pollypm.failover_usage_threshold_pct}",
         f'heartbeat_backend = "{config.pollypm.heartbeat_backend}"',
         f'scheduler_backend = "{config.pollypm.scheduler_backend}"',
         f"lease_timeout_minutes = {config.pollypm.lease_timeout_minutes}",

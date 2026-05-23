@@ -2,6 +2,7 @@
 
 Covers ``POST /api/v1/projects/{key}/pause``,
 ``POST /api/v1/projects/{key}/resume``,
+``POST /api/v1/projects/{key}/unpause``,
 ``POST /api/v1/projects/{key}/archive``, and
 ``POST /api/v1/projects/{key}/init-guide`` per the Phase 2 endpoints
 spec §6.2.
@@ -237,6 +238,42 @@ def test_resume_is_idempotent_on_already_tracked(
     assert config.projects["myproj"].tracked is True
 
 
+def test_unpause_alias_sets_tracked_true(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config_path: Path,
+) -> None:
+    paused = load_config(config_path)
+    paused.projects["myproj"].tracked = False
+    write_config(paused, config_path, force=True)
+
+    response = client.post(
+        "/api/v1/projects/myproj/unpause", headers=auth_headers, json={}
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["key"] == "myproj"
+    assert body["tracked"] is True
+
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is True
+
+
+def test_unpause_alias_is_idempotent_on_already_tracked(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    config_path: Path,
+) -> None:
+    response = client.post(
+        "/api/v1/projects/myproj/unpause", headers=auth_headers, json={}
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["tracked"] is True
+
+    reloaded = load_config(config_path)
+    assert reloaded.projects["myproj"].tracked is True
+
+
 # ---------------------------------------------------------------------------
 # Archive
 # ---------------------------------------------------------------------------
@@ -283,6 +320,12 @@ def test_archive_irreversible_resume_after_archive_returns_404(
     )
     assert resume_attempt.status_code == 404
     assert resume_attempt.json()["error"]["code"] == "not_found"
+
+    unpause_attempt = client.post(
+        "/api/v1/projects/myproj/unpause", headers=auth_headers, json={}
+    )
+    assert unpause_attempt.status_code == 404
+    assert unpause_attempt.json()["error"]["code"] == "not_found"
 
     pause_attempt = client.post(
         "/api/v1/projects/myproj/pause", headers=auth_headers, json={}
@@ -391,6 +434,11 @@ def test_archive_requires_auth(client: TestClient) -> None:
     assert response.status_code == 401
 
 
+def test_unpause_requires_auth(client: TestClient) -> None:
+    response = client.post("/api/v1/projects/myproj/unpause", json={})
+    assert response.status_code == 401
+
+
 def test_init_guide_requires_auth(client: TestClient) -> None:
     response = client.post(
         "/api/v1/projects/myproj/init-guide", json={"role": "architect"}
@@ -419,6 +467,18 @@ def test_resume_unknown_project_returns_404(
         json={},
     )
     assert response.status_code == 404
+
+
+def test_unpause_unknown_project_returns_404(
+    client: TestClient, auth_headers: dict[str, str]
+) -> None:
+    response = client.post(
+        "/api/v1/projects/no-such-project/unpause",
+        headers=auth_headers,
+        json={},
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
 
 
 def test_archive_unknown_project_returns_404(

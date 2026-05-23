@@ -640,9 +640,11 @@ def test_messages_endpoint_rejects_include_thinking_query_param(
 def test_messages_endpoint_no_subagent_inlining_by_default(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
-    """``include_subagents`` is deferred (#2052) — default behavior
-    returns the parent envelope without any ``subagent_transcript``
-    field, even when the parent carries an ``output_file`` reference.
+    """Without ``include_subagents=true`` no ``subagent_transcript`` is added.
+
+    The parent envelope still carries ``output_file`` (the
+    task-notification reference) but inlining stays opt-in to keep the
+    default response shape stable (#2052).
     """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
@@ -886,50 +888,14 @@ def test_messages_endpoint_desc_cursor_pagination_no_overlap(
 
 
 # ---------------------------------------------------------------------------
-# Security: subagent path-traversal allowlist (PR #2045 blocker 3)
+# Security: subagent path-traversal allowlist (#2052)
 # ---------------------------------------------------------------------------
-
-
-def test_messages_endpoint_rejects_include_subagents_true_with_422(
-    client, auth_headers, patch_registry, tmp_path,
-):
-    """``include_subagents=true`` is deferred (#2052) and must return 422.
-
-    The v3 implementation called ``parse_events_jsonl`` on
-    ``metadata.output_file``, but that field is the raw Claude
-    subagent JSONL — a different shape than the normalized archive
-    the parser consumes. Until a proper resolver lands, the param is
-    rejected so callers don't get silently-empty inlining (and the
-    path-traversal attack surface goes with it).
-
-    Replaces the v3 path-traversal tests: those exercised the
-    allowlist that no longer exists. The 422 here forecloses on
-    ``/etc/passwd`` / ``../../../escape.jsonl`` exploits at the same
-    boundary.
-    """
-    archive = tmp_path / "events.jsonl"
-    archive.write_text("x")
-    patch_registry([_surface(
-        "operator", SurfaceType.OPERATOR, persona="Polly",
-        transcript_path=archive,
-    )])
-    response = client.get(
-        "/api/v1/chat/operator/messages?include_subagents=true",
-        headers=auth_headers,
-    )
-    assert response.status_code == 422
-    body = response.json()
-    assert body["error"]["code"] == "validation_error"
-    assert "include_subagents" in body["error"]["message"]
 
 
 def test_messages_endpoint_include_subagents_false_explicit_is_ok(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
-    """Explicit ``include_subagents=false`` must still return 200.
-
-    Only ``=true`` trips the deferral guard.
-    """
+    """Explicit ``include_subagents=false`` must return 200."""
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
     patch_registry([_surface(
@@ -942,6 +908,216 @@ def test_messages_endpoint_include_subagents_false_explicit_is_ok(
         headers=auth_headers,
     )
     assert response.status_code == 200
+
+
+def test_messages_endpoint_include_subagents_rejects_path_traversal(
+    client, auth_headers, patch_registry, patch_parser, tmp_path,
+):
+    """``output_file`` pointing outside the project transcripts root is skipped.
+
+    The allowlist forecloses on ``/etc/passwd`` / ``../../../escape.jsonl``
+    exploits: an envelope referencing a path outside the project +
+    workspace transcripts roots silently skips inlining (no raise, no
+    metadata.subagent_transcript) so a malformed transcript can't 500
+    the endpoint or stat arbitrary files.
+    """
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    escape = tmp_path / "escape.jsonl"
+    escape.write_text('{"type":"assistant","message":{"content":"leaked"}}\n')
+    parent = _env(
+        "result_1",
+        type_=MessageType.SUBAGENT_RESULT,
+        text="Subagent done.",
+        metadata={
+            "subagent_id": "abc",
+            "output_file": str(escape),  # outside transcripts roots
+        },
+    )
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    patch_parser({archive: [parent]})
+    response = client.get(
+        "/api/v1/chat/operator/messages?include_subagents=true",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert "subagent_transcript" not in body["messages"][0]["metadata"]
+
+
+def test_messages_endpoint_include_subagents_inlines_with_real_parser(
+    client, auth_headers, patch_registry, project_root,
+    monkeypatch, tmp_path,
+):
+    """Real-parser regression for ``include_subagents=true`` (issue #2052).
+
+    Does NOT monkeypatch ``parse_events_jsonl`` or ``parse_raw_subagent_jsonl``;
+    instead writes both a real normalized ``events.jsonl`` archive
+    (parent) and a real raw Claude subagent JSONL (child) under the
+    project's ``.pollypm/transcripts/`` root so the allowlist accepts
+    the path. Asserts the inlined ``metadata.subagent_transcript``
+    actually contains envelopes derived from the raw shape — proves
+    the round-4 contract gap (events.jsonl parser called on raw JSONL)
+    is closed.
+    """
+    import json
+
+    from pollypm.projects import project_transcripts_dir
+
+    transcripts_root = project_transcripts_dir(project_root)
+    # Parent surface archive (normalized shape).
+    parent_dir = transcripts_root / "parent-session"
+    parent_dir.mkdir(parents=True)
+    parent_archive = parent_dir / "events.jsonl"
+    # Child subagent JSONL (raw Claude shape) — must live under the
+    # project transcripts root so the allowlist admits it.
+    child_dir = transcripts_root / "child-subagent"
+    child_dir.mkdir(parents=True)
+    child_jsonl = child_dir / "raw.jsonl"
+    child_jsonl.write_text(
+        "\n".join([
+            json.dumps({
+                "type": "user",
+                "sessionId": "child-1",
+                "cwd": str(project_root),
+                "timestamp": "2026-05-21T10:00:00Z",
+                "message": {"content": "kick off subagent"},
+            }),
+            json.dumps({
+                "type": "assistant",
+                "sessionId": "child-1",
+                "cwd": str(project_root),
+                "timestamp": "2026-05-21T10:00:05Z",
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [{"type": "text", "text": "subagent reply"}],
+                },
+            }),
+        ]) + "\n"
+    )
+
+    # Parent normalized events.jsonl: spawn + result with the
+    # task-notification pointing at the child raw JSONL.
+    parent_events = [
+        {
+            "timestamp": "2026-05-21T09:59:00Z",
+            "event_type": "tool_call",
+            "session_id": "parent-1",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": str(parent_archive),
+            "source_offset": 0,
+            "cwd": str(project_root),
+            "model_name": "claude-opus-4-7",
+            "payload": {
+                "type": "tool_use",
+                "id": "toolu_sub_real",
+                "name": "Task",
+                "input": {"description": "Run the subagent"},
+            },
+        },
+        {
+            "timestamp": "2026-05-21T10:00:10Z",
+            "event_type": "tool_result",
+            "session_id": "parent-1",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": str(parent_archive),
+            "source_offset": 1,
+            "cwd": str(project_root),
+            "model_name": "claude-opus-4-7",
+            "payload": {
+                "type": "tool_result",
+                "tool_use_id": "toolu_sub_real",
+                "content": [
+                    {"type": "text", "text": "Subagent done."},
+                    {
+                        "type": "task-notification",
+                        "task-id": "child-1",
+                        "output-file": str(child_jsonl),
+                        "duration-ms": 1234,
+                        "total-tokens": 567,
+                        "worktree-path": str(project_root),
+                    },
+                ],
+            },
+        },
+    ]
+    parent_archive.write_text(
+        "\n".join(json.dumps(e) for e in parent_events) + "\n"
+    )
+
+    # Drop the in-process parse cache so a previous test's cached
+    # entry can't shadow our fixture.
+    from pollypm.web_api.chat.transcripts import _parse_cache_clear
+
+    _parse_cache_clear()
+
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=parent_archive,
+    )])
+
+    response = client.get(
+        "/api/v1/chat/operator/messages?include_subagents=true&direction=asc",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Locate the subagent_result envelope.
+    result_envs = [
+        m for m in body["messages"] if m["type"] == "subagent_result"
+    ]
+    assert len(result_envs) == 1, body
+    metadata = result_envs[0]["metadata"]
+    assert metadata["output_file"] == str(child_jsonl)
+    transcript = metadata.get("subagent_transcript")
+    assert isinstance(transcript, list)
+    assert len(transcript) == 2
+    # First child envelope: user turn with "kick off" text; second:
+    # assistant turn with the reply.
+    assert transcript[0]["role"] == "user"
+    assert transcript[0]["type"] == "text"
+    assert "kick off" in transcript[0]["text"]
+    assert transcript[1]["role"] == "assistant"
+    assert transcript[1]["type"] == "text"
+    assert transcript[1]["text"] == "subagent reply"
+    # Provenance marker so downstream consumers can distinguish
+    # inlined-from-raw envelopes from the normalized stream.
+    assert transcript[0]["metadata"]["source"] == "subagent_jsonl"
+    assert transcript[1]["metadata"]["model"] == "claude-opus-4-7"
+
+
+def test_messages_endpoint_include_subagents_default_no_inline(
+    client, auth_headers, patch_registry, patch_parser, tmp_path,
+):
+    """Omitting ``include_subagents`` leaves ``subagent_transcript`` absent."""
+    archive = tmp_path / "events.jsonl"
+    archive.write_text("x")
+    parent = _env(
+        "result_1",
+        type_=MessageType.SUBAGENT_RESULT,
+        text="Subagent done.",
+        metadata={
+            "subagent_id": "abc",
+            "output_file": str(tmp_path / "subagent.jsonl"),
+        },
+    )
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    patch_parser({archive: [parent]})
+    body = client.get(
+        "/api/v1/chat/operator/messages",
+        headers=auth_headers,
+    ).json()
+    assert "subagent_transcript" not in body["messages"][0]["metadata"]
 
 
 # ---------------------------------------------------------------------------

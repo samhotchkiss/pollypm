@@ -15,6 +15,7 @@ from pollypm.onboarding import (
     DEMO_PROJECT_TEMPLATE_DIR,
     DEMO_PROJECT_REPLAY_COMMIT_COUNT,
     OnboardingResult,
+    _connect_accounts_interactively,
     _scan_recent_projects,
     _seeded_demo_route,
     build_onboarded_config,
@@ -326,6 +327,142 @@ def test_run_onboarding_launches_seeded_demo_experience(monkeypatch, tmp_path: P
         )
 
     assert launched == [result]
+
+
+# ---------------------------------------------------------------------------
+# Regression tests: duplicate same-email home-path isolation (#2088 / #2089)
+# ---------------------------------------------------------------------------
+
+def test_connect_accounts_interactively_suffixes_duplicate_claude_key_and_preserves_distinct_homes(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Claude: second account with same email gets a suffixed key; home paths stay distinct."""
+    root_dir = tmp_path / ".pollypm"
+    first_home = root_dir / "homes" / "onboarding_claude_1"
+    first_home.mkdir(parents=True, exist_ok=True)
+
+    first_account = ConnectedAccount(
+        provider=ProviderKind.CLAUDE,
+        email="user@example.com",
+        account_name="claude_user_example_com",
+        home=first_home,
+    )
+    accounts: dict[str, ConnectedAccount] = {"claude_user_example_com": first_account}
+
+    # The second login lands on the same email; the temp home is different because
+    # Claude keeps the temp dir (no home promotion for Claude).
+    second_home = root_dir / "homes" / "onboarding_claude_2"
+    second_home.mkdir(parents=True, exist_ok=True)
+
+    duplicate_account = ConnectedAccount(
+        provider=ProviderKind.CLAUDE,
+        email="user@example.com",
+        account_name="claude_user_example_com",
+        home=second_home,
+    )
+
+    call_count = {"n": 0}
+
+    def mock_connect_via_tmux(tmux, *, root_dir, provider, index, **kwargs):
+        call_count["n"] += 1
+        return duplicate_account
+
+    def mock_select_provider(installed, accounts):
+        # Return Claude the first time, None (done) on the second call.
+        if call_count["n"] == 0:
+            return ProviderKind.CLAUDE
+        return None
+
+    monkeypatch.setattr("pollypm.onboarding._connect_account_via_tmux", mock_connect_via_tmux)
+    monkeypatch.setattr("pollypm.onboarding._select_provider_to_connect", mock_select_provider)
+    monkeypatch.setattr("pollypm.onboarding._render_connected_account", lambda *_a, **_kw: None)
+    monkeypatch.setattr("pollypm.onboarding.typer.echo", lambda *_a, **_kw: None)
+    monkeypatch.setattr("pollypm.onboarding.typer.confirm", lambda *_a, **_kw: False)
+
+    from pollypm.onboarding_models import CliAvailability
+    available = [CliAvailability(provider=ProviderKind.CLAUDE, label="Claude", binary="claude", installed=True)]
+
+    result = _connect_accounts_interactively(
+        None,  # type: ignore[arg-type]  # tmux unused — mocked
+        root_dir=root_dir,
+        accounts=accounts,
+        available=available,
+    )
+
+    assert "claude_user_example_com_2" in result, (
+        "Expected duplicate Claude account to receive a suffixed key"
+    )
+    new_account = result["claude_user_example_com_2"]
+    original_account = result["claude_user_example_com"]
+
+    # Key is suffixed
+    assert new_account.account_name == "claude_user_example_com_2"
+    # Home-path isolation: the two accounts must NOT share the same directory
+    assert new_account.home != original_account.home, (
+        "Home paths must be distinct for isolated accounts"
+    )
+
+
+def test_connect_accounts_interactively_rejects_duplicate_codex_same_email(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    """Non-Claude (Codex): duplicate same-email must raise BadParameter, not silently share a home."""
+    import typer
+
+    root_dir = tmp_path / ".pollypm"
+    first_home = root_dir / "homes" / "codex_user_example_com"
+    first_home.mkdir(parents=True, exist_ok=True)
+
+    first_account = ConnectedAccount(
+        provider=ProviderKind.CODEX,
+        email="user@example.com",
+        account_name="codex_user_example_com",
+        home=first_home,
+    )
+    accounts: dict[str, ConnectedAccount] = {"codex_user_example_com": first_account}
+
+    # The second login lands on the same email; by this point Codex has promoted the home to
+    # homes/codex_user_example_com — same path as the first account.
+    duplicate_account = ConnectedAccount(
+        provider=ProviderKind.CODEX,
+        email="user@example.com",
+        account_name="codex_user_example_com",
+        home=first_home,  # same home — the invariant that must be rejected
+    )
+
+    call_count = {"n": 0}
+
+    def mock_connect_via_tmux(tmux, *, root_dir, provider, index, **kwargs):
+        call_count["n"] += 1
+        return duplicate_account
+
+    def mock_select_provider(installed, accounts):
+        if call_count["n"] == 0:
+            return ProviderKind.CODEX
+        return None
+
+    monkeypatch.setattr("pollypm.onboarding._connect_account_via_tmux", mock_connect_via_tmux)
+    monkeypatch.setattr("pollypm.onboarding._select_provider_to_connect", mock_select_provider)
+    monkeypatch.setattr("pollypm.onboarding._render_connected_account", lambda *_a, **_kw: None)
+    monkeypatch.setattr("pollypm.onboarding.typer.echo", lambda *_a, **_kw: None)
+    monkeypatch.setattr("pollypm.onboarding.typer.confirm", lambda *_a, **_kw: False)
+
+    from pollypm.onboarding_models import CliAvailability
+    available = [CliAvailability(provider=ProviderKind.CODEX, label="Codex", binary="codex", installed=True)]
+
+    with pytest.raises(typer.BadParameter) as exc_info:
+        _connect_accounts_interactively(
+            None,  # type: ignore[arg-type]  # tmux unused — mocked
+            root_dir=root_dir,
+            accounts=accounts,
+            available=available,
+        )
+
+    assert "already connected" in str(exc_info.value).lower() or "not yet supported" in str(exc_info.value).lower(), (
+        f"Expected a clear rejection message, got: {exc_info.value}"
+    )
 
 
 def test_launch_onboarding_experience_prepares_cockpit_before_attach(

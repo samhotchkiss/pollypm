@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import platform
 import shutil
@@ -10,6 +11,8 @@ from datetime import datetime
 from pathlib import Path
 
 import typer
+
+logger = logging.getLogger(__name__)
 
 from pollypm.agent_profiles.defaults import heartbeat_prompt, polly_prompt
 from pollypm.config import GLOBAL_CONFIG_DIR, config_rmw_lock, load_config, write_config
@@ -520,11 +523,14 @@ def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[st
     if email is None:
         raise typer.BadParameter(f"Could not detect the logged-in email for the new {provider.value} account.")
 
-    key = _slugify_email(provider, email)
-    if key in config.accounts:
-        if home.exists() and home != config.accounts[key].home:
-            shutil.rmtree(home, ignore_errors=True)
-        raise typer.BadParameter(f"Account {email} already exists.")
+    base_key = _slugify_email(provider, email)
+    key = base_key
+    n = 2
+    while key in config.accounts:
+        key = f"{base_key}_{n}"
+        n += 1
+    if key != base_key:
+        logger.info("account %s already exists; adding as %s", base_key, key)
 
     if provider is ProviderKind.CLAUDE:
         # Claude auth lives in macOS Keychain, keyed to the CLAUDE_CONFIG_DIR path hash.
@@ -556,14 +562,22 @@ def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[st
     # forward rather than overwritten.
     with config_rmw_lock(config_path):
         fresh = load_config(config_path)
-        fresh.accounts[key] = AccountConfig(
-            name=key,
+        # Re-run suffix-bump inside the lock so concurrent adds can't collide.
+        final_key = base_key
+        fn = 2
+        while final_key in fresh.accounts:
+            final_key = f"{base_key}_{fn}"
+            fn += 1
+        if final_key != key:
+            logger.info("account key shifted to %s after re-check inside lock", final_key)
+        fresh.accounts[final_key] = AccountConfig(
+            name=final_key,
             provider=provider,
             email=email,
             home=final_home,
         )
         write_config(fresh, config_path, force=True)
-    return key, email
+    return final_key, email
 
 
 def relogin_account(config_path: Path, identifier: str) -> tuple[str, str]:

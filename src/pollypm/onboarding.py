@@ -267,12 +267,40 @@ def _connect_accounts_interactively(
             provider=provider,
             index=_next_account_index(accounts, provider),
         )
-        if account.account_name in accounts:
-            raise typer.BadParameter(
-                f"Duplicate connected account detected for {account.email}. "
-                "Each connected account email must be unique."
-            )
-        accounts[account.account_name] = account
+        base_account_name = account.account_name
+        final_account_name = base_account_name
+        if base_account_name in accounts:
+            if provider is ProviderKind.CLAUDE:
+                # Claude auth is keyed to the home directory path in the macOS Keychain;
+                # the home stays in place (temp dir not promoted), so it is safe to give
+                # the second account a suffixed key while reusing the existing home path.
+                an = 2
+                while final_account_name in accounts:
+                    final_account_name = f"{base_account_name}_{an}"
+                    an += 1
+                logger.info(
+                    "onboarding: Claude account %s already exists; adding as %s",
+                    base_account_name,
+                    final_account_name,
+                )
+                account = ConnectedAccount(
+                    provider=account.provider,
+                    email=account.email,
+                    account_name=final_account_name,
+                    home=account.home,
+                )
+            else:
+                # For non-Claude providers the home has already been promoted to a path
+                # derived from the account name.  Suffix-bumping the key AFTER promotion
+                # would leave the new account pointing at the original home, violating
+                # account isolation.  Reject the duplicate until a full fix is shipped.
+                raise typer.BadParameter(
+                    f"Account {base_account_name!r} is already connected. "
+                    "Adding a second account with the same email address is not yet "
+                    "supported for non-Claude providers. Use a different email to add "
+                    "another account, or remove the existing one first."
+                )
+        accounts[final_account_name] = account
         typer.echo("")
         _render_connected_account(account, len(accounts))
         typer.echo("")

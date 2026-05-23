@@ -997,3 +997,70 @@ def test_audit_grep_regex_mode_requires_since(
         headers=auth_headers,
     )
     assert ok_response.status_code == 200, ok_response.text
+
+
+# ---------------------------------------------------------------------------
+# Round-5 guardrail (Codex review on PR #2062): ``deadline_seconds`` must
+# bound the FIRST regex line too. Round-4 wired a request-level deadline
+# but ``_BoundedRegexSession.search`` still waited ``_STARTUP_GRACE_S = 5.0``
+# on the first call, so a caller requesting ``deadline_seconds=0.5`` could
+# still spend ~5 s on a pathological first line. The fix clamps both the
+# steady-state per-line poll AND the first-line startup grace to the
+# remaining request budget.
+# ---------------------------------------------------------------------------
+def test_audit_grep_deadline_bounds_first_pathological_line(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """A small ``deadline_seconds`` must cap the FIRST regex line too.
+
+    Round-4 regression: even one pathological row blocks for
+    ``_STARTUP_GRACE_S`` (5 s) before the walker can truncate, because
+    the first call to the regex worker pays for forkserver warmup. A
+    caller asking for ``deadline_seconds=0.5`` should NOT spend ~5 s.
+
+    Verified to FAIL on round-4 (elapsed ≈ 5.0 s, well above 2 s
+    ceiling) and PASS with the round-5 ``max_wall_clock_s`` plumbing.
+    """
+    import time
+
+    pathological_subject = "a" * 40 + "!"
+    # Just a handful of rows — the bug is on the FIRST line; even one
+    # is enough to reproduce.
+    _write_jsonl(
+        _per_project_log(project_root),
+        [_make_event(subject=pathological_subject) for _ in range(3)],
+    )
+
+    start = time.monotonic()
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={
+            "project": "myproj",
+            "pattern": "(a+)+b",
+            "safe_regex": "true",
+            "since": "30d",
+            "deadline_seconds": "0.5",
+        },
+        headers=auth_headers,
+    )
+    elapsed = time.monotonic() - start
+
+    # 2 s ceiling: deadline=0.5 s + one in-flight line clamped to ≤0.5 s
+    # + worker respawn (~500 ms on macOS) + FastAPI/TestClient overhead.
+    # Round-4 elapsed ≈ 5.0 s (the un-clamped startup grace), so any
+    # ceiling between 2 s and 5 s would catch the bug; 2 s gives clear
+    # signal without flaking on a loaded CI host.
+    assert elapsed < 2.0, (
+        f"deadline_seconds=0.5 did not bound first pathological line; "
+        f"elapsed={elapsed:.3f}s (round-4 bug elapses ~5.0s due to "
+        f"_STARTUP_GRACE_S)"
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # The request was bounded by the deadline, so truncation must be
+    # surfaced even though only one or two lines were scanned.
+    assert body.get("_truncated_by_deadline") is True, body
+    assert body["events"] == []

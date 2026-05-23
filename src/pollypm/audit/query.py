@@ -171,12 +171,22 @@ class _BoundedRegexSession:
         self._process = process
         self._conn = parent_conn
 
-    def search(self, line: str) -> tuple[bool, bool]:
+    def search(
+        self, line: str, *, max_wall_clock_s: float | None = None
+    ) -> tuple[bool, bool]:
         """Return ``(matched, timed_out)`` for ``line``.
 
         On timeout: kills the child, returns ``(False, True)``. The
         next call respawns. On crash: returns ``(False, True)`` too —
         we'd rather count a phantom timeout than silently drop matches.
+
+        ``max_wall_clock_s`` (Codex round-5 finding, PR #2062) clamps
+        BOTH the steady-state per-line timeout AND the first-call
+        startup grace to the remaining request budget. Without this,
+        an operator who specifies ``deadline_seconds=0.5`` on a regex
+        request can still pay the full ``_STARTUP_GRACE_S = 5.0`` on
+        the first line before the walker can truncate — contradicting
+        the request-level deadline contract.
         """
         if self._process is None or self._conn is None:
             self._spawn()
@@ -190,8 +200,18 @@ class _BoundedRegexSession:
         # Wait for the child's response with a wall-clock deadline.
         # ``poll`` is the only Pipe API that takes a timeout in stdlib
         # multiprocessing.
-        deadline = _STARTUP_GRACE_S if self._needs_warmup else _PER_LINE_TIMEOUT_S
+        base_deadline = (
+            _STARTUP_GRACE_S if self._needs_warmup else _PER_LINE_TIMEOUT_S
+        )
         self._needs_warmup = False
+        if max_wall_clock_s is not None:
+            # Clamp to remaining request budget. ``max(0.0, …)`` keeps
+            # ``poll`` from rejecting a negative timeout if the caller
+            # is already past their deadline — in that case we want a
+            # non-blocking poll that returns immediately.
+            deadline = max(0.0, min(base_deadline, max_wall_clock_s))
+        else:
+            deadline = base_deadline
         if not self._conn.poll(deadline):
             self._teardown()
             return (False, True)
@@ -554,6 +574,14 @@ def iter_matching_events(
     + ``stats["lines_scanned"]`` so the caller can tell the response
     is bounded rather than complete. ``None`` (default — CLI path) =
     no deadline; the CLI operator owns the clock via Ctrl+C.
+
+    Round-5 follow-up: the remaining budget is also passed into
+    :meth:`_BoundedRegexSession.search` so the worker's per-line poll
+    (including the first-line startup grace) cannot itself exceed the
+    request deadline. Otherwise a caller requesting ``deadline_s=0.5``
+    on a pathological pattern would still spend ``_STARTUP_GRACE_S``
+    (~5 s) on the very first line before the walker's pre-line check
+    could fire again.
     """
     use_bounded_regex = (
         bounded_regex and pattern is not None and pattern.pattern and not literal
@@ -578,10 +606,13 @@ def iter_matching_events(
                     stripped = line.strip()
                     if not stripped:
                         continue
-                    if deadline_at is not None and time.monotonic() >= deadline_at:
-                        if stats is not None:
-                            stats["truncated_by_deadline"] = 1
-                        return
+                    remaining_budget: float | None = None
+                    if deadline_at is not None:
+                        remaining_budget = deadline_at - time.monotonic()
+                        if remaining_budget <= 0:
+                            if stats is not None:
+                                stats["truncated_by_deadline"] = 1
+                            return
                     if stats is not None:
                         stats["lines_scanned"] = (
                             stats.get("lines_scanned", 0) + 1
@@ -592,7 +623,12 @@ def iter_matching_events(
                         if literal not in stripped:
                             continue
                     elif session is not None:
-                        matched, timed_out = session.search(stripped)
+                        # Codex round-5: pass remaining request budget so
+                        # the worker poll (including first-line startup
+                        # grace) can't outrun the request-level deadline.
+                        matched, timed_out = session.search(
+                            stripped, max_wall_clock_s=remaining_budget
+                        )
                         if timed_out:
                             if stats is not None:
                                 stats["pattern_timeouts"] = (

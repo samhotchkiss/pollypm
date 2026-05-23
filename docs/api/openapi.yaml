@@ -20,6 +20,31 @@ info:
 
     The API is single-user / personal-use. There is no multi-tenant
     auth in v1.
+
+    ## Authentication
+
+    Three credential modes are accepted (see
+    [`docs/web-api-spec.md`](../web-api-spec.md) §3 and
+    [`docs/web-ui-2065-security-spec.md`](../web-ui-2065-security-spec.md)
+    for the full rationale):
+
+    1. **Bearer header** — `Authorization: Bearer <token>` against
+       `~/.pollypm/api-token`. Always accepted; canonical mode for
+       non-browser clients (cockpit CLI, scripts, curl). Modeled here as
+       `bearerAuth`.
+    2. **Session cookie** — `pollypm-session=<token>`, minted by
+       `GET /ui/` only when the caller is a loopback peer, a verified
+       tailnet peer (with `tailnet_trust_enabled=True`), or already
+       presented a valid bearer header. Modeled here as `cookieAuth`.
+    3. **Credential-free tailnet peer** — accepted only when the server
+       was constructed with `tailnet_trust_enabled=True`, which `pm
+       serve` auto-sets when `detect_tailscale_ip()` returns a verified
+       Tailscale IPv4 and uvicorn binds that interface. Modeled here as
+       the empty (no-credential) entry in the global `security` list.
+
+    Default `pm serve` auto-binds the detected Tailscale IPv4 when
+    available; otherwise it binds loopback (`127.0.0.1`) only. LAN
+    exposure is intentionally unsupported in v0.
   contact:
     name: PollyPM project
     url: https://github.com/swhmm/pollypm/issues
@@ -29,17 +54,30 @@ info:
 
 servers:
   - url: http://{host}:{port}/api/v1
-    description: Local pm serve instance (loopback by default)
+    description: |
+      Local `pm serve` instance. Auto-binds the detected Tailscale IPv4
+      when available, otherwise loopback (`127.0.0.1`). LAN binds are
+      not a supported v0 configuration.
     variables:
       host:
         default: 127.0.0.1
-        description: Host pm serve is bound to.
+        description: |
+          Host pm serve is bound to. Loopback (`127.0.0.1`) when no
+          Tailscale interface is detected; otherwise the verified
+          tailnet IPv4 returned by `detect_tailscale_ip()`.
       port:
         default: "8765"
         description: Port pm serve is listening on.
 
+# Each entry is an independent way to satisfy auth. The empty `{}`
+# entry means "no credential required" — used by the credential-free
+# tailnet-peer mode, which the server enforces at runtime (only honored
+# when `tailnet_trust_enabled=True`). See the top-level Authentication
+# section for the full credential model.
 security:
   - bearerAuth: []
+  - cookieAuth: []
+  - {}
 
 tags:
   - name: Health
@@ -2179,8 +2217,20 @@ components:
       scheme: bearer
       bearerFormat: opaque
       description: |
-        Token from `~/.pollypm/api-token`. Generated on first
-        `pm serve` startup; rotated via `pm api regen-token`.
+        Bearer token from `~/.pollypm/api-token`. Generated on first
+        `pm serve` startup; rotated via `pm api regen-token`. Always
+        accepted. See `docs/web-api-spec.md` §3.
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: pollypm-session
+      description: |
+        Session cookie minted by `GET /ui/` for loopback peers,
+        verified tailnet peers (when `tailnet_trust_enabled=True`), or
+        callers presenting a valid bearer header. The cookie value is
+        the same on-disk token as `bearerAuth`; comparison is
+        constant-time. LAN clients receive HTML without `Set-Cookie`
+        and 401 on the first API call. See `docs/web-api-spec.md` §3.
 
   parameters:
     ProjectKey:

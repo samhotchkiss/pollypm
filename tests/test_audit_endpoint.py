@@ -267,6 +267,8 @@ def test_grep_regex_pattern_filters_lines(
             "project": "myproj",
             "pattern": r"myproj/\d+",
             "safe_regex": "true",
+            # Round-4: regex mode requires ``since`` to bound the scan.
+            "since": "30d",
         },
         headers=auth_headers,
     )
@@ -723,6 +725,12 @@ def test_audit_grep_short_pathological_pattern_does_not_hang(
             "project": "myproj",
             "pattern": "(a+)+b",
             "safe_regex": "true",
+            # Round-4: regex mode requires ``since``; pick a window
+            # generous enough to keep all three rows in scope.
+            "since": "30d",
+            # Round-4: deadline well above the 3-row worst case so we're
+            # still measuring the per-line bound, not the request bound.
+            "deadline_seconds": "30.0",
         },
         headers=auth_headers,
     )
@@ -867,3 +875,125 @@ def test_audit_stats_skips_malformed_rows(
     # before reaching the by-event counter.
     assert body["total"] == 2
     assert body["by_event"] == {"task.created": 2}
+
+
+# ---------------------------------------------------------------------------
+# Round-4 guardrails (Codex review on PR #2062): request-level bound for the
+# HTTP regex path. ``limit`` caps matches, not scanned lines, so a no-match
+# pathological regex over many rows can still hold an API worker for roughly
+# ``per_line_timeout * timed_out_lines``. The deadline + safe_regex-requires-
+# since invariants bound that work explicitly and surface a diagnostic so
+# callers can tell complete-but-empty from bounded-and-truncated.
+# ---------------------------------------------------------------------------
+
+
+def test_audit_grep_request_deadline_truncates_pathological_scan(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Request-level deadline halts a no-match pathological regex scan.
+
+    Round-3 left ``limit`` capping matches only; a no-match regex still
+    walks every line. With many pathological rows the per-line timeout
+    (100 ms) stacks: 30 rows = ~3 s, 100 = ~10 s, etc. ``deadline_s=1.0``
+    must cap total wall-clock and surface ``_truncated_by_deadline=true``
+    so the caller knows results are bounded, not complete. Verifies the
+    regression FAILED on round-3 (no truncation field surfaced) and now
+    PASSES with the request-level bound wired through.
+    """
+    import time
+
+    # 60 pathological rows: each timed-out line costs ~100 ms timeout +
+    # worker respawn (~500 ms on macOS) → un-bounded baseline is roughly
+    # 60 × 0.6 s ≈ 36 s. The deadline must cut this off well before then.
+    pathological_subject = "a" * 40 + "!"
+    total_rows = 60
+    _write_jsonl(
+        _per_project_log(project_root),
+        [_make_event(subject=pathological_subject) for _ in range(total_rows)],
+    )
+
+    start = time.monotonic()
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={
+            "project": "myproj",
+            "pattern": "(a+)+b",
+            "safe_regex": "true",
+            "since": "30d",
+            "deadline_seconds": "1.0",
+        },
+        headers=auth_headers,
+    )
+    elapsed = time.monotonic() - start
+
+    # The deadline check fires BEFORE each line is searched, but a line
+    # already in flight when the deadline elapses still runs to per-line
+    # completion (~100 ms timeout + ~500 ms respawn). 15 s ceiling sits
+    # comfortably below the ~36 s un-bounded baseline (60 rows × ~600 ms)
+    # while absorbing forkserver warmup variability on a loaded CI host.
+    assert elapsed < 15.0, (
+        f"deadline did not fire; elapsed={elapsed:.3f}s "
+        f"(un-bounded would be ~{total_rows * 0.6:.0f}s)"
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # Bounded-truncation diagnostic must be set so the caller can tell
+    # this from a complete-but-empty scan.
+    assert body.get("_truncated_by_deadline") is True, body
+    # And the walker must have stopped strictly before the full row set
+    # (otherwise the deadline didn't actually save work).
+    assert body.get("_lines_scanned", 0) < total_rows, body
+    assert body.get("_lines_scanned", 0) >= 1, body
+    # No matches expected — pathological pattern never hits ``b``.
+    assert body["events"] == []
+
+
+def test_audit_grep_regex_mode_requires_since(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``safe_regex=true`` without ``since`` → ``400 invalid_request``.
+
+    Mirrors the round-2 ``/audit/stats`` invariant: regex mode walks
+    every line in the window, so the window must be bounded. Literal-
+    substring mode (default) is immune to ReDoS and stays unbounded.
+    """
+    _write_jsonl(
+        _per_project_log(project_root),
+        [_make_event(subject="myproj/whatever")],
+    )
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={
+            "project": "myproj",
+            "pattern": "foo",
+            "safe_regex": "true",
+            # NB: no ``since`` — must 400.
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 400, response.text
+    body = response.json()
+    assert body["error"]["code"] == "invalid_request"
+    assert "since" in body["error"]["message"].lower()
+    hint = (body["error"].get("hint") or "").lower()
+    assert "since" in hint or "literal" in hint
+
+    # Sanity check: the same request WITH ``since`` must succeed (so the
+    # 400 is specifically about the missing window, not the pattern).
+    ok_response = client.get(
+        "/api/v1/audit/grep",
+        params={
+            "project": "myproj",
+            "pattern": "foo",
+            "safe_regex": "true",
+            "since": "30d",
+        },
+        headers=auth_headers,
+    )
+    assert ok_response.status_code == 200, ok_response.text

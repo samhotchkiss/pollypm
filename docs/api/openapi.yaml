@@ -2021,6 +2021,15 @@ paths:
         archived row failed `Event` validation (typically a non-ISO
         `ts` from an old schema) and was dropped rather than 500'ing
         the response.
+
+        Round-4 (PR #2062) added request-level bounds for the regex
+        path: `safe_regex=true` now REQUIRES `since` (returns
+        `400 invalid_request` without it — `limit` only caps matches,
+        not scanned lines, so the window must be bounded up front),
+        and `deadline_seconds` (default 5.0) imposes a wall-clock
+        budget. When the deadline fires the response sets
+        `_truncated_by_deadline=true` and `_lines_scanned` reports
+        how far the walker got.
       parameters:
         - in: query
           name: project
@@ -2066,6 +2075,21 @@ paths:
             maximum: 1000
             default: 100
           description: Cap matches returned. Max 1000 per spec §8.3.
+        - in: query
+          name: deadline_seconds
+          schema:
+            type: number
+            format: float
+            minimum: 0.5
+            maximum: 60.0
+            default: 5.0
+          description: |
+            Request-level wall-clock budget (seconds). When exceeded
+            the walker stops, the response sets
+            `_truncated_by_deadline=true`, and `_lines_scanned`
+            reports how many non-empty lines were examined. Caps
+            no-match pathological regex cost; required because `limit`
+            only caps matches, not scanned lines (PR #2062 round 4).
       responses:
         "200":
           description: Matching events, capped at `limit`.
@@ -4029,6 +4053,24 @@ components:
             running a deliberately exploratory regex can tell when the
             ReDoS guardrail fired vs. there genuinely being no matches.
             (Codex P0 finding, PR #2062 round 2.)
+        _truncated_by_deadline:
+          type: boolean
+          default: false
+          description: |
+            `true` when the request-level wall-clock deadline
+            (`deadline_seconds`) fired before the walker finished
+            scanning every target file. Lets callers tell a
+            complete-but-empty scan from a bounded-and-truncated one
+            so they can re-run with a tighter filter or larger budget.
+            (Codex P0 finding, PR #2062 round 4.)
+        _lines_scanned:
+          type: integer
+          default: 0
+          description: |
+            How many non-empty lines the walker actually examined.
+            Paired with `_truncated_by_deadline` so a truncated
+            response reports how far it got across live + rotated
+            logs. (Codex P0 finding, PR #2062 round 4.)
 
     AuditStatsResponse:
       type: object

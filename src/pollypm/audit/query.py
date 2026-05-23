@@ -36,6 +36,7 @@ import json
 import multiprocessing
 import multiprocessing.connection
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, MutableMapping
@@ -498,6 +499,7 @@ def iter_matching_events(
     event_type: str | None,
     stats: MutableMapping[str, int] | None = None,
     bounded_regex: bool = False,
+    deadline_s: float | None = None,
 ) -> Iterator[dict]:
     """Stream parsed events from ``targets`` that pass every filter.
 
@@ -542,12 +544,32 @@ def iter_matching_events(
       no-matches and (if ``stats`` is provided)
       ``stats["pattern_timeouts"]`` is bumped so the caller can
       surface the count in its response envelope.
+
+    Request-level bound (Codex round-4 finding, PR #2062): ``limit``
+    caps matches but NOT scanned lines. A pathological no-match regex
+    can still hold an API worker for ``per_line_timeout * timed_out_lines``
+    across every live + rotated log. ``deadline_s`` adds a wall-clock
+    request budget: after each line the walker checks elapsed time and
+    stops if exceeded, surfacing ``stats["truncated_by_deadline"] = 1``
+    + ``stats["lines_scanned"]`` so the caller can tell the response
+    is bounded rather than complete. ``None`` (default — CLI path) =
+    no deadline; the CLI operator owns the clock via Ctrl+C.
     """
     use_bounded_regex = (
         bounded_regex and pattern is not None and pattern.pattern and not literal
     )
     session: _BoundedRegexSession | None = (
         _BoundedRegexSession(pattern) if use_bounded_regex else None  # type: ignore[arg-type]
+    )
+    # Request-level deadline (Codex round-4): check elapsed wall-clock
+    # after every non-empty line. The literal/regex cost is paid before
+    # the check, but the per-line timeout already bounds a single line
+    # so the budget overshoot is at most one per_line_timeout (~100 ms
+    # in HTTP mode) — bounded and predictable.
+    deadline_at: float | None = (
+        time.monotonic() + deadline_s
+        if deadline_s is not None and deadline_s > 0
+        else None
     )
     try:
         for path in targets:
@@ -556,6 +578,14 @@ def iter_matching_events(
                     stripped = line.strip()
                     if not stripped:
                         continue
+                    if deadline_at is not None and time.monotonic() >= deadline_at:
+                        if stats is not None:
+                            stats["truncated_by_deadline"] = 1
+                        return
+                    if stats is not None:
+                        stats["lines_scanned"] = (
+                            stats.get("lines_scanned", 0) + 1
+                        )
                     # Cheap reject — literal substring is much cheaper
                     # than regex and immune to catastrophic backtracking.
                     if literal:

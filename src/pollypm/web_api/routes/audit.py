@@ -91,12 +91,25 @@ class AuditGrepResponse(BaseModel):
     returned within bounded time (each timed-out line is treated as a
     no-match) but the operator should know which queries triggered the
     safety net. Always zero in literal-substring mode.
+
+    ``_truncated_by_deadline`` (Codex round-4 finding, PR #2062) is
+    ``True`` when the request-level wall-clock deadline fired before
+    the walker finished scanning every target file. ``_lines_scanned``
+    reports how many non-empty lines were actually examined. Together
+    they let the caller distinguish a complete-but-empty scan from a
+    bounded-and-truncated one. ``limit`` caps returned matches; it
+    does NOT cap scanned lines, so a no-match pathological regex
+    still costs per-line work — the deadline is the hard upper bound.
     """
 
     events: list[Event]
     next_cursor: str | None = None
     malformed_rows_skipped: int = Field(default=0, alias="_malformed_rows_skipped")
     pattern_timeouts: int = Field(default=0, alias="_pattern_timeouts")
+    truncated_by_deadline: bool = Field(
+        default=False, alias="_truncated_by_deadline"
+    )
+    lines_scanned: int = Field(default=0, alias="_lines_scanned")
 
     model_config = {"populate_by_name": True}
 
@@ -246,6 +259,20 @@ def grep_audit_endpoint(
             ),
         ),
     ] = _GREP_LIMIT_DEFAULT,
+    deadline_seconds: Annotated[
+        float,
+        Query(
+            ge=0.5,
+            le=60.0,
+            description=(
+                "Request-level wall-clock budget (seconds). Default 5.0. "
+                "When exceeded, the response sets _truncated_by_deadline=true "
+                "and _lines_scanned reports how far the walker got. Caps "
+                "no-match pathological regex cost; required because 'limit' "
+                "only caps matches, not scanned lines (Codex round-4)."
+            ),
+        ),
+    ] = 5.0,
 ) -> AuditGrepResponse:
     """Return audit events matching the supplied filters.
 
@@ -271,6 +298,24 @@ def grep_audit_endpoint(
         # — operator probably just enabled it speculatively.
         pass
 
+    # Round-4 (Codex): ``safe_regex=true`` MUST come with ``since`` so the
+    # pattern only runs over a bounded slice of history — mirrors the
+    # round-2 stats invariant. Without this, a no-match pathological
+    # regex (``(a+)+b``) walks every live + rotated log; ``deadline_s``
+    # bounds wall-clock but ``since`` bounds the row count up front,
+    # which is cheaper and gives the operator an actionable error.
+    # Checked AFTER pattern compilation so a malformed regex still
+    # surfaces its own 400 first — operator gets the actionable error.
+    if safe_regex and since_dt is None:
+        raise invalid_request(
+            "'since' is required when 'safe_regex=true'",
+            hint=(
+                "Pass an ISO-8601 timestamp or shortcut (e.g. since=24h). "
+                "Regex mode walks every line in the window; bound it. "
+                "Literal-substring mode (default) has no such requirement."
+            ),
+        )
+
     targets = resolve_target_files(project_filter=project, config=config)
 
     events: list[Event] = []
@@ -284,6 +329,7 @@ def grep_audit_endpoint(
         event_type=event_type,
         stats=walker_stats,
         bounded_regex=True,
+        deadline_s=deadline_seconds,
     ):
         event = _coerce_record_to_event(record)
         if event is None:
@@ -305,6 +351,8 @@ def grep_audit_endpoint(
             malformed + walker_stats.get("malformed_rows_skipped", 0)
         ),
         _pattern_timeouts=walker_stats.get("pattern_timeouts", 0),
+        _truncated_by_deadline=bool(walker_stats.get("truncated_by_deadline", 0)),
+        _lines_scanned=walker_stats.get("lines_scanned", 0),
     )
 
 

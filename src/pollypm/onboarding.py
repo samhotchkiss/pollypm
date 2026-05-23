@@ -267,12 +267,25 @@ def _connect_accounts_interactively(
             provider=provider,
             index=_next_account_index(accounts, provider),
         )
-        if account.account_name in accounts:
-            raise typer.BadParameter(
-                f"Duplicate connected account detected for {account.email}. "
-                "Each connected account email must be unique."
+        base_account_name = account.account_name
+        final_account_name = base_account_name
+        an = 2
+        while final_account_name in accounts:
+            final_account_name = f"{base_account_name}_{an}"
+            an += 1
+        if final_account_name != base_account_name:
+            logger.info(
+                "onboarding: account %s already exists; adding as %s",
+                base_account_name,
+                final_account_name,
             )
-        accounts[account.account_name] = account
+            account = ConnectedAccount(
+                provider=account.provider,
+                email=account.email,
+                account_name=final_account_name,
+                home=account.home,
+            )
+        accounts[final_account_name] = account
         typer.echo("")
         _render_connected_account(account, len(accounts))
         typer.echo("")

@@ -1535,24 +1535,32 @@ class CockpitRouter:
     ) -> object | None:
         """Return the latest heartbeat for ``session_name``.
 
-        PR #2026 review blocker 2 (fall-through workaround): the cache
-        fast-path is DISABLED until the refresher learns to invalidate
-        on heartbeat writes. ``state_cache/refresher.py`` only listens
-        for ``task.*`` / ``marker.*`` audit events, so a fresh
-        heartbeat row never invalidates ``latest_heartbeat_by_session``
-        — the cache would serve a stale snapshot indefinitely and
-        drive the UI's "offline" / "stale" treatments off it.
+        #2050 fast-path: when the state cache is enabled, scan the
+        snapshot's per-project ``latest_heartbeat_by_session`` for
+        ``session_name``. The refresher subscribes to ``heartbeat.tick``
+        audit events (see ``state_cache/refresher.py``), so a fresh
+        heartbeat row invalidates the affected entries on the next
+        refresh — the snapshot can never go indefinitely stale the way
+        it did before PR #2026's workaround.
 
-        Until ``heartbeat.*`` invalidation lands (filed as a follow-up
-        issue), every call hits the direct pg facade. Method name kept
-        for call-site stability (no API change).
+        Direct pg facade remains the fallback for three cases:
+        1. Cache flag off (``POLLYPM_STATE_CACHE=0``).
+        2. Cache miss — session not represented in any entry (cold
+           start before the first refresh, or a session_name that
+           doesn't match a project's canonical / live-worker rows).
+        3. ``pg_heartbeats`` raises — degrades to ``supervisor.store``.
         """
+
+        # ── #2050 cache fast-path ────────────────────────────────────
+        config = getattr(supervisor, "config", None)
+        cached = self._latest_heartbeat_from_cache(session_name, config)
+        if cached is not None:
+            return cached
 
         try:
             from pollypm.storage import pg_heartbeats
         except Exception:  # noqa: BLE001
             pg_heartbeats = None  # type: ignore[assignment]
-        config = getattr(supervisor, "config", None)
         if pg_heartbeats is not None:
             try:
                 return pg_heartbeats.latest_heartbeat(
@@ -1570,6 +1578,69 @@ class CockpitRouter:
             return store.latest_heartbeat(session_name)
         except Exception:  # noqa: BLE001
             return None
+
+    def _latest_heartbeat_from_cache(
+        self,
+        session_name: str,
+        config: object | None,
+    ) -> object | None:
+        """Look up ``session_name`` in the state-cache snapshot.
+
+        Returns the cached :class:`HeartbeatRecord` (or whatever the
+        refresher stamped under ``latest_heartbeat_by_session``) if
+        any project entry holds an entry for this session, else
+        ``None``. A ``None`` return means the caller falls through to
+        the direct pg facade.
+
+        Safe to call when the cache is disabled / unimported — every
+        failure mode (flag off, import error, empty snapshot) returns
+        ``None`` and the direct facade takes over.
+
+        Config-identity guard (PR #2026 v7 — Codex r7 contract): the
+        cache singleton is process-wide and may carry entries computed
+        against a different ``config`` (different config_path /
+        workspace_root) than the live caller. Skip any entry whose
+        stamped identity disagrees with the live config's identity —
+        without this guard a session_name collision across workspaces
+        would serve cross-config heartbeat data. Unstamped entries
+        (``""``) are treated as matching so legacy / test fixtures
+        that construct entries by hand still hit the fast path.
+        Mirrors the guard pattern in ``cockpit_inbox`` and the rail
+        rollup map's ``_project_rollups_from_cache``.
+        """
+
+        try:
+            from pollypm.state_cache import get_cache, is_enabled
+        except Exception:  # noqa: BLE001
+            return None
+        if not is_enabled():
+            return None
+        try:
+            cache = get_cache()
+            snapshot = cache.snapshot()
+        except Exception:  # noqa: BLE001
+            return None
+        if not snapshot:
+            return None
+        try:
+            from pollypm.state_cache.entry import config_identity
+            live_identity = config_identity(config)
+        except Exception:  # noqa: BLE001
+            return None
+        for entry in snapshot.values():
+            entry_identity = getattr(entry, "config_identity", "") or ""
+            if entry_identity and entry_identity != live_identity:
+                # Cross-config entry — refuse to serve and keep
+                # scanning in case another entry (or the direct
+                # facade) holds the live value.
+                continue
+            by_session = getattr(entry, "latest_heartbeat_by_session", None)
+            if not by_session:
+                continue
+            hb = by_session.get(session_name)
+            if hb is not None:
+                return hb
+        return None
 
     # ── #989 — alert metadata attachment ────────────────────────────────
     #

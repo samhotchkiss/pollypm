@@ -49,6 +49,15 @@ __all__ = ["StateCacheRefresher", "default_audit_dir", "stub_refresh_fn"]
 # Event names that should invalidate a project's cache entry. Pinned
 # to the constants exported from ``pollypm.audit.log`` so the cache
 # stays in sync if those names ever change (a test pins this list).
+#
+# ``heartbeat.tick`` is workspace-scoped (audit_watchdog.emit_heartbeat_tick
+# fires with ``project=""``) so a single tick invalidates every known
+# project's entry. That's the contract that lets
+# ``cockpit_rail._latest_heartbeat_cached`` serve the snapshot's
+# ``latest_heartbeat_by_session`` fast-path without going stale —
+# without this entry the cache would serve an indefinitely-old
+# heartbeat and drive the UI's "offline" / "stale" treatments off it
+# (#2050).
 _INVALIDATING_EVENTS: frozenset[str] = frozenset({
     "task.created",
     "task.status_changed",
@@ -58,6 +67,7 @@ _INVALIDATING_EVENTS: frozenset[str] = frozenset({
     "marker.create_failed",
     "marker.leaked",
     "work_table.cleared",
+    "heartbeat.tick",
 })
 
 # Poll interval for the tail thread. Mirrors the existing SSE tail

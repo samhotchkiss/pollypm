@@ -106,6 +106,52 @@ def test_non_invalidating_event_is_ignored(audit_dir: Path) -> None:
     assert cache.get("alpha") is None
 
 
+def test_heartbeat_tick_event_invalidates_project(audit_dir: Path) -> None:
+    """#2050 — ``heartbeat.tick`` is now in ``_INVALIDATING_EVENTS``.
+
+    The audit watchdog emits one ``heartbeat.tick`` per sweep; the
+    refresher must invalidate the affected project entry so the next
+    refresh repopulates ``latest_heartbeat_by_session`` from a fresh
+    pg query and the rail's snapshot can never go indefinitely stale.
+    """
+
+    log = audit_dir / "alpha.jsonl"
+    log.touch()
+    cache = ProjectStateCache(refresh_fn=lambda k: empty_entry(k))
+    refresher = StateCacheRefresher(cache, audit_dir=audit_dir)
+    refresher._seek_to_end()
+
+    _write_event(log, event="heartbeat.tick", project="alpha")
+    _drain_for_test(refresher)
+
+    assert cache.get("alpha") is not None
+    assert cache.version("alpha") == 1
+
+
+def test_workspace_scoped_heartbeat_tick_invalidates_all_known(
+    audit_dir: Path,
+) -> None:
+    """``heartbeat.tick`` fires with ``project=""`` from
+    ``audit_watchdog.emit_heartbeat_tick`` — must enqueue every known
+    project (matches the ``work_table.cleared`` workspace-scope path).
+    """
+
+    log = audit_dir / "_workspace.jsonl"
+    log.touch()
+    cache = ProjectStateCache(refresh_fn=lambda k: empty_entry(k))
+    cache._install_for_test("alpha", empty_entry("alpha"))
+    cache._install_for_test("beta", empty_entry("beta"))
+
+    refresher = StateCacheRefresher(cache, audit_dir=audit_dir)
+    refresher._seek_to_end()
+
+    _write_event(log, event="heartbeat.tick", project="")
+    _drain_for_test(refresher)
+
+    assert cache.version("alpha") == 2
+    assert cache.version("beta") == 2
+
+
 def test_workspace_scoped_event_invalidates_known_projects(
     audit_dir: Path,
 ) -> None:

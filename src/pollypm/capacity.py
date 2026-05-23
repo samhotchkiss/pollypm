@@ -43,6 +43,10 @@ FAILOVER_TRIGGERS = frozenset({
 # limit. 10% left = 90% used — matches the #103 requirement.
 PROACTIVE_ROLLOVER_THRESHOLD_PCT = 10
 
+# Controller-account soft failover defaults to 85% used so the primary
+# keeps enough headroom for late operator approvals and emergency dispatch.
+DEFAULT_FAILOVER_USAGE_THRESHOLD_PCT = 85
+
 # Recovery priority: which sessions to recover first when capacity returns
 RECOVERY_PRIORITY = (
     "heartbeat",
@@ -60,6 +64,7 @@ class CapacityProbeResult:
     account_name: str
     provider: ProviderKind
     state: CapacityState
+    used_pct: int | None = None
     remaining_pct: int | None = None
     reset_time: str | None = None
     reason: str = ""
@@ -83,6 +88,19 @@ class FailoverDecision:
     failed_account: str
     selected_account: str | None = None
     reason: str = ""
+    candidates_evaluated: int = 0
+
+
+@dataclass(slots=True)
+class ProactiveFailoverDecision:
+    """Soft controller failover decision from cached account usage."""
+
+    action: str
+    primary_account: str
+    current_account: str
+    selected_account: str | None = None
+    reason: str = ""
+    threshold_pct: int = DEFAULT_FAILOVER_USAGE_THRESHOLD_PCT
     candidates_evaluated: int = 0
 
 
@@ -138,11 +156,13 @@ def probe_capacity(
         if usage.remaining_pct is not None
         else _parse_remaining_pct(usage.usage_summary)
     )
+    used = usage.used_pct if usage.used_pct is not None else _used_pct_from_remaining(remaining)
 
     return CapacityProbeResult(
         account_name=account_name,
         provider=account.provider,
         state=state,
+        used_pct=used,
         remaining_pct=remaining,
         reason=usage.usage_summary,
     )
@@ -207,6 +227,116 @@ def account_needs_proactive_rollover(
     if probe.remaining_pct is None:
         return False, probe  # unknown usage — don't gamble
     return probe.remaining_pct <= threshold_pct, probe
+
+
+def evaluate_proactive_controller_failover(
+    config: PollyPMConfig,
+    store: object | None,
+    *,
+    current_account: str | None = None,
+    threshold_pct: int | None = None,
+) -> ProactiveFailoverDecision:
+    """Choose whether the controller should soft-swap accounts.
+
+    ``config.pollypm.controller_account`` remains the primary source of truth.
+    Callers pass the currently-running controller account, usually the
+    operator session's runtime effective account. When the primary drops back
+    under the threshold, the returned action is ``"return"`` so the caller can
+    clear the effective-account override by switching back to the primary.
+    """
+    primary = config.pollypm.controller_account
+    current = current_account or primary
+    threshold = _coerce_usage_threshold(
+        threshold_pct
+        if threshold_pct is not None
+        else getattr(config.pollypm, "failover_usage_threshold_pct", DEFAULT_FAILOVER_USAGE_THRESHOLD_PCT)
+    )
+
+    if not config.pollypm.failover_enabled:
+        return ProactiveFailoverDecision(
+            action="none",
+            primary_account=primary,
+            current_account=current,
+            reason="Failover is not enabled",
+            threshold_pct=threshold,
+        )
+    if not primary or primary not in config.accounts:
+        return ProactiveFailoverDecision(
+            action="none",
+            primary_account=primary,
+            current_account=current,
+            reason="Controller account not found in config",
+            threshold_pct=threshold,
+        )
+
+    primary_probe = probe_capacity(config, store, primary)
+    primary_used = _probe_used_pct(primary_probe)
+    if primary_used is None:
+        return ProactiveFailoverDecision(
+            action="none",
+            primary_account=primary,
+            current_account=current,
+            reason="Primary usage is unknown",
+            threshold_pct=threshold,
+        )
+
+    if primary_used < threshold:
+        if current != primary:
+            return ProactiveFailoverDecision(
+                action="return",
+                primary_account=primary,
+                current_account=current,
+                selected_account=primary,
+                reason="primary_below_threshold",
+                threshold_pct=threshold,
+            )
+        return ProactiveFailoverDecision(
+            action="none",
+            primary_account=primary,
+            current_account=current,
+            reason="Primary usage below threshold",
+            threshold_pct=threshold,
+        )
+
+    candidates_evaluated = 0
+    for candidate_name in config.pollypm.failover_accounts:
+        if candidate_name == primary or candidate_name not in config.accounts:
+            continue
+        candidates_evaluated += 1
+        candidate_probe = probe_capacity(config, store, candidate_name)
+        if candidate_probe.state in FAILOVER_TRIGGERS:
+            continue
+        candidate_used = _probe_used_pct(candidate_probe)
+        if candidate_used is None or candidate_used >= threshold:
+            continue
+        if current == candidate_name:
+            return ProactiveFailoverDecision(
+                action="none",
+                primary_account=primary,
+                current_account=current,
+                selected_account=candidate_name,
+                reason="Already on threshold-safe failover account",
+                threshold_pct=threshold,
+                candidates_evaluated=candidates_evaluated,
+            )
+        return ProactiveFailoverDecision(
+            action="switch",
+            primary_account=primary,
+            current_account=current,
+            selected_account=candidate_name,
+            reason="used_pct_threshold",
+            threshold_pct=threshold,
+            candidates_evaluated=candidates_evaluated,
+        )
+
+    return ProactiveFailoverDecision(
+        action="alert",
+        primary_account=primary,
+        current_account=current,
+        reason="no_failover_account_below_threshold",
+        threshold_pct=threshold,
+        candidates_evaluated=candidates_evaluated,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -416,9 +546,9 @@ def persist_capacity_probe(
         raw_text="",
         remaining_pct=result.remaining_pct,
         used_pct=(
-            None
-            if result.remaining_pct is None
-            else max(0, 100 - result.remaining_pct)
+            result.used_pct
+            if result.used_pct is not None
+            else _used_pct_from_remaining(result.remaining_pct)
         ),
         reset_at=result.reset_time,
     )
@@ -450,3 +580,25 @@ def _parse_remaining_pct(summary: str) -> int | None:
     if match:
         return int(match.group(1))
     return None
+
+
+def _used_pct_from_remaining(remaining_pct: int | None) -> int | None:
+    if remaining_pct is None:
+        return None
+    return max(0, min(100, 100 - int(remaining_pct)))
+
+
+def _probe_used_pct(probe: CapacityProbeResult) -> int | None:
+    if probe.used_pct is not None:
+        return max(0, min(100, int(probe.used_pct)))
+    return _used_pct_from_remaining(probe.remaining_pct)
+
+
+def _coerce_usage_threshold(value: object) -> int:
+    try:
+        threshold = int(value)
+    except (TypeError, ValueError):
+        return DEFAULT_FAILOVER_USAGE_THRESHOLD_PCT
+    if isinstance(value, bool) or not 1 <= threshold <= 100:
+        return DEFAULT_FAILOVER_USAGE_THRESHOLD_PCT
+    return threshold

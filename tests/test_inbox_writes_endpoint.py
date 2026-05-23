@@ -1512,6 +1512,100 @@ class _ArchiveRaceLoserSvc:
         self.add_context_calls.append((args, kwargs))
 
 
+class _AlreadyArchivedInboxTask(_ConcurrentLoserStubTask):
+    @property
+    def work_status(self):  # noqa: D401
+        from pollypm.work.models import WorkStatus
+        return WorkStatus.DONE
+
+
+class _TerminalNonInboxTask(_NonInboxStubTask):
+    @property
+    def work_status(self):  # noqa: D401
+        from pollypm.work.models import WorkStatus
+        return WorkStatus.DONE
+
+
+class _AlreadyArchivedSvc:
+    def __init__(self, task) -> None:
+        self._task = task
+        self.archive_calls = 0
+        self.add_context_calls = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def get(self, item_id):
+        return self._task
+
+    def archive_task(self, *args, **kwargs):
+        self.archive_calls += 1
+        raise AssertionError("already-archived rows should fail before mutation")
+
+    def add_context(self, *args, **kwargs):
+        self.add_context_calls += 1
+        raise AssertionError("already-archived rows should not write reason notes")
+
+
+def test_archive_already_archived_inbox_item_returns_409(
+    config, monkeypatch,
+) -> None:
+    """A terminal row that still has inbox identity is already archived.
+
+    Regression for #2112: after the first successful archive, the row
+    exits the open inbox set, so the normal read-surface predicate
+    returns false. The write path still needs to distinguish that from
+    "never was an inbox item" and return 409 ``invalid_state`` instead
+    of 404 ``not_found``.
+    """
+    from pollypm.web_api import service as web_service
+
+    svc = _AlreadyArchivedSvc(_AlreadyArchivedInboxTask())
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(
+            config, "myproj/1", reason="second click", actor="api",
+        )
+    assert excinfo.value.status_code == 409
+    assert excinfo.value.code == "invalid_state"
+    assert "already done" in excinfo.value.message
+    assert svc.archive_calls == 0
+    assert svc.add_context_calls == 0
+
+
+def test_archive_terminal_non_inbox_task_still_returns_404(
+    config, monkeypatch,
+) -> None:
+    """Terminal status alone must not widen the inbox write surface."""
+    from pollypm.web_api import service as web_service
+
+    svc = _AlreadyArchivedSvc(_TerminalNonInboxTask())
+
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+
+    with pytest.raises(APIError) as excinfo:
+        web_service.archive_inbox_item(config, "myproj/1", reason="x")
+    assert excinfo.value.status_code == 404
+    assert excinfo.value.code == "not_found"
+    assert svc.archive_calls == 0
+    assert svc.add_context_calls == 0
+
+
 def test_archive_strict_loser_does_not_persist_reason_note(
     config, monkeypatch,
 ) -> None:

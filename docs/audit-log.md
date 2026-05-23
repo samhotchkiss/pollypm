@@ -252,3 +252,20 @@ For watchdog work, keep pure detection logic in `pollypm.audit.watchdog` and
 cadence/alert/dispatch wiring in
 `pollypm.plugins_builtin.core_recurring.audit_watchdog`. This keeps detectors
 testable without tmux, the job queue, or a live work-service database.
+
+## Process Backfills
+
+### 2026-05-23 Direct-To-Main Help Trim
+
+Commit `3878a1d72d5efbe15843635d8a7d002f63d63b9c`
+(`fix(cli): trim pm doctor examples to satisfy help-block 2-3 cap`) landed
+directly on `main` while unblocking the test environment. The immediate
+failure was that `cli_help.examples_block` rejects more than three help
+examples, which made `pm` itself unimportable.
+
+Retroactive review found a narrow docs/help-only diff in
+`src/pollypm/cli_features/maintenance.py`: the `pm doctor --json` and
+`pm doctor --alert-type project-guide-drift` examples were removed, leaving
+the full checklist, fix mode, and verbose-detail examples. No command behavior,
+runtime state, storage path, or public API changed. The change is benign and no
+follow-up code PR is needed.

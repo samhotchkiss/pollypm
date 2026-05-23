@@ -50,6 +50,8 @@ class HealthResponse(BaseModel):
     version: str
     schema_version: int
     started_at: datetime
+    auth_mode: Literal["tailnet_trust", "bearer_only"]
+    tailnet_trust_enabled: bool
 
 
 # ---------------------------------------------------------------------------

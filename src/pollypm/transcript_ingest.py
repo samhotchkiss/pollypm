@@ -332,6 +332,36 @@ def _normalize_claude_line(
                             payload=item,
                         )
                     )
+                elif item.get("type") == "thinking":
+                    # Anthropic thinking blocks ship as
+                    # ``{"type": "thinking", "thinking": "<text>",
+                    #   "signature": "<opaque>"}`` (extended thinking).
+                    # Preserve the block verbatim under ``payload`` so
+                    # downstream consumers (chat API, replay tooling)
+                    # can render it without re-fetching the raw JSONL.
+                    # See GitHub #2048 for the envelope contract.
+                    thinking_text = item.get("thinking")
+                    if not isinstance(thinking_text, str):
+                        thinking_text = ""
+                    events.append(
+                        _event_base(
+                            event_type="thinking",
+                            session_id=session_id,
+                            account_name=account_name,
+                            provider=account.provider.value,
+                            project_key=project_key,
+                            timestamp=timestamp,
+                            source_path=source_path,
+                            source_offset=source_offset,
+                            cwd=cwd,
+                            model_name=model_name,
+                            payload={
+                                "text": thinking_text,
+                                "signature": item.get("signature") or "",
+                                "raw": item,
+                            },
+                        )
+                    )
     elif line_type == "error":
         events.append(
             _event_base(
@@ -512,6 +542,12 @@ def _normalize_codex_line(
                 payload=payload,
             )
         )
+    # TODO(#2048): Codex rollouts do not currently surface a ``reasoning``
+    # ``event_msg`` payload type — only ``reasoning_output_tokens`` is
+    # exposed via the ``token_count`` info blob (see line ~413). Wire a
+    # ``thinking`` branch here if/when Codex starts emitting reasoning
+    # content blocks; until then leaving this absent so the parser
+    # contract stays Claude-only for the THINKING envelope.
     elif payload_type == "error":
         events.append(
             _event_base(

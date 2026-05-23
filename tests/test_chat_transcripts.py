@@ -156,6 +156,82 @@ def test_session_state_events_are_dropped(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Extended-thinking (Anthropic ``thinking`` content blocks) — gated by
+# ``include_thinking``. See GitHub #2048.
+# ---------------------------------------------------------------------------
+
+
+def test_thinking_envelope_emitted_when_flag_true(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [_claude_event(
+        "thinking",
+        text="Let me think about this...",
+        signature="opaque-sig-xyz",
+        raw={
+            "type": "thinking",
+            "thinking": "Let me think about this...",
+            "signature": "opaque-sig-xyz",
+        },
+    )])
+    _parse_cache_clear()
+    envelopes = parse_events_jsonl(
+        events_path, actor_fallback="Polly", include_thinking=True,
+    )
+    assert len(envelopes) == 1
+    env = envelopes[0]
+    assert env.type == MessageType.THINKING
+    assert env.role == MessageRole.ASSISTANT
+    assert env.actor == "Polly"
+    assert env.text == "Let me think about this..."
+    assert env.metadata["provider"] == "claude"
+    assert env.metadata["model"] == "claude-opus-4-7"
+    assert env.metadata["signature"] == "opaque-sig-xyz"
+
+
+def test_thinking_envelope_dropped_when_flag_false(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [
+        _claude_event(
+            "thinking",
+            text="Hidden by default.",
+            signature="opaque",
+            raw={"type": "thinking", "thinking": "Hidden by default.", "signature": "opaque"},
+        ),
+        _claude_event("assistant_turn", text="Public reply."),
+    ])
+    _parse_cache_clear()
+    envelopes = parse_events_jsonl(events_path, actor_fallback="Polly")
+    # Default ``include_thinking=False`` drops the thinking envelope.
+    assert [env.type for env in envelopes] == [MessageType.TEXT]
+    assert envelopes[0].text == "Public reply."
+
+
+def test_thinking_cache_does_not_leak_between_flag_values(tmp_path: Path) -> None:
+    # The mtime cache must key on ``include_thinking`` so a False call
+    # doesn't poison a subsequent True call (or vice versa).
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [
+        _claude_event(
+            "thinking",
+            text="Thought one.",
+            signature="",
+            raw={"type": "thinking", "thinking": "Thought one.", "signature": ""},
+        ),
+        _claude_event("assistant_turn", text="Spoken."),
+    ])
+    _parse_cache_clear()
+    # First: default False, only assistant_turn surfaces.
+    no_thinking = parse_events_jsonl(events_path)
+    assert [env.type for env in no_thinking] == [MessageType.TEXT]
+    # Same path, same mtime — flipping the flag must return a thinking
+    # envelope, not the cached non-thinking list.
+    with_thinking = parse_events_jsonl(events_path, include_thinking=True)
+    assert [env.type for env in with_thinking] == [
+        MessageType.THINKING, MessageType.TEXT,
+    ]
+
+
+# ---------------------------------------------------------------------------
 # Tool use / tool result pairing
 # ---------------------------------------------------------------------------
 
@@ -771,16 +847,17 @@ def test_parse_cache_lru_evicts_oldest_when_full(tmp_path: Path) -> None:
         _write_events(path, [_claude_event("user_turn", text=f"e{idx}")])
         parse_events_jsonl(path)
     assert len(transcripts_module._PARSE_CACHE) == transcripts_module._PARSE_CACHE_MAX
-    oldest_path = tmp_path / "events-0.jsonl"
-    assert oldest_path in transcripts_module._PARSE_CACHE
+    # Cache key is ``(events_path, include_thinking)`` after #2048.
+    oldest_key = (tmp_path / "events-0.jsonl", False)
+    assert oldest_key in transcripts_module._PARSE_CACHE
 
     # One more parse pushes us past the cap -> oldest evicts.
     overflow = tmp_path / "events-overflow.jsonl"
     _write_events(overflow, [_claude_event("user_turn", text="overflow")])
     parse_events_jsonl(overflow)
     assert len(transcripts_module._PARSE_CACHE) == transcripts_module._PARSE_CACHE_MAX
-    assert oldest_path not in transcripts_module._PARSE_CACHE
-    assert overflow in transcripts_module._PARSE_CACHE
+    assert oldest_key not in transcripts_module._PARSE_CACHE
+    assert (overflow, False) in transcripts_module._PARSE_CACHE
 
 
 # ---------------------------------------------------------------------------

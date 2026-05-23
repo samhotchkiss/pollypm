@@ -470,3 +470,69 @@ def test_up_starts_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert calls == [str(config_path.parent / ".pollypm")]
+
+
+def test_ingestor_preserves_thinking_content_blocks(tmp_path: Path) -> None:
+    """Anthropic extended-thinking blocks survive ingest (GitHub #2048).
+
+    Claude raw lines may include ``{"type": "thinking", "thinking": "...",
+    "signature": "..."}`` blocks alongside text/tool_use in the assistant
+    ``content`` list. The ingestor must emit a normalized
+    ``event_type="thinking"`` event preserving the text + signature so
+    downstream consumers can render extended thinking without re-reading
+    the raw provider JSONL.
+    """
+    config, _config_path = _config(tmp_path)
+    claude_file = config.accounts["claude_main"].home / ".claude/projects/demo/session-thinking.jsonl"
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-23T00:00:00Z",
+                "type": "assistant",
+                "sessionId": "session-thinking",
+                "cwd": str(config.project.root_dir),
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Reconsidering the approach...",
+                            "signature": "sig-abc",
+                        },
+                        {"type": "text", "text": "Here is the answer."},
+                    ],
+                    "usage": {"total_tokens": 7},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events = [
+        json.loads(line)
+        for line in (
+            config.project.root_dir / ".pollypm/transcripts/session-thinking/events.jsonl"
+        ).read_text().splitlines()
+    ]
+
+    event_types = [event["event_type"] for event in events]
+    assert "thinking" in event_types
+    # ``assistant_turn`` should still be emitted for the text block.
+    assert "assistant_turn" in event_types
+    # Token usage is independent of thinking — verify it still flows.
+    assert "token_usage" in event_types
+
+    thinking_event = next(event for event in events if event["event_type"] == "thinking")
+    assert thinking_event["provider"] == "claude"
+    assert thinking_event["payload"]["text"] == "Reconsidering the approach..."
+    assert thinking_event["payload"]["signature"] == "sig-abc"
+    # ``raw`` round-trips the original provider block verbatim so
+    # replay tooling can reconstruct the exact content.
+    assert thinking_event["payload"]["raw"] == {
+        "type": "thinking",
+        "thinking": "Reconsidering the approach...",
+        "signature": "sig-abc",
+    }

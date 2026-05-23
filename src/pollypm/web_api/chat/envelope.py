@@ -6,7 +6,7 @@ shape mirrors spec §3 verbatim so the JSON serialization (handled by
 :mod:`pollypm.web_api.chat` consumers / the P2 router) is a direct
 ``dataclasses.asdict`` away.
 
-Eight discriminators are defined in :class:`MessageType`. Each
+Nine discriminators are defined in :class:`MessageType`. Each
 envelope's ``metadata`` payload is type-specific; callers branch on
 ``envelope.type`` to interpret it.
 """
@@ -30,15 +30,16 @@ class MessageRole(StrEnum):
 class MessageType(StrEnum):
     """Envelope discriminator per spec §3.
 
-    NOTE: ``thinking`` is intentionally absent. The transcript ingestor
-    does not currently preserve provider thinking blocks, so adding the
-    discriminator before the upstream support exists would let callers
-    branch on a type that's never emitted. Tracking the follow-up arc
-    (preserve thinking in TranscriptIngestor + add the envelope type)
-    as a separate GitHub issue.
+    ``thinking`` is emitted only when callers pass
+    ``include_thinking=True`` to :func:`parse_events_jsonl` — the
+    ingestor preserves Anthropic extended-thinking blocks under the
+    ``thinking`` ingestor event type (see GitHub #2048), but the
+    chat-messages endpoint defaults to dropping them so existing
+    clients are unaffected.
     """
 
     TEXT = "text"
+    THINKING = "thinking"
     TOOL_USE = "tool_use"
     TOOL_RESULT = "tool_result"
     ASK_USER = "ask_user"

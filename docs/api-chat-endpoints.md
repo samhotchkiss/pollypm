@@ -219,9 +219,8 @@ Pull a window of messages from a single session's transcript.
 | `limit` | `100` | Max messages, must be `1..500`. Values outside that range return `422 validation_error` (FastAPI Pydantic-level rejection). |
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
 | `include_subagents` | `false` | DEFERRED — server returns 422 if true. Re-enabled when #2052 lands ingestor-side subagent normalization. |
+| `include_thinking` | `false` | When `true`, Anthropic extended-thinking content blocks are surfaced as `type="thinking"` envelopes (see §4 type catalog). Default `false` preserves the historical contract — existing clients see no new types. Tracked in [#2048](https://github.com/samhotchkiss/pollypm/issues/2048). |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
-
-> Note: A `type="thinking"` envelope is planned but not yet implemented — tracked in [#2048](https://github.com/samhotchkiss/pollypm/issues/2048).
 
 **Response:**
 
@@ -393,7 +392,7 @@ which variant the envelope represents and what shape `metadata` takes.
   "ts": "2026-05-21T20:53:12.123Z",
   "role": "user" | "assistant" | "tool" | "system",
   "actor": "Sam" | "Polly" | "Archie" | "Codex" | "system",
-  "type": "text" | "tool_use" | "tool_result" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event",
+  "type": "text" | "thinking" | "tool_use" | "tool_result" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event",
   "text": "...display-ready string...",
   "metadata": { "...": "type-specific" }
 }
@@ -409,6 +408,7 @@ structured original lives in `metadata`.
 | Type | Role | When | Notes |
 |---|---|---|---|
 | `text` | user / assistant | Plain turn text | The 80% case. `metadata: {}`. |
+| `thinking` | assistant | Anthropic extended-thinking content block | Only emitted when `include_thinking=true` is passed on the messages query. `metadata`: `provider`, `model`, `signature` (opaque, may be empty). `text` carries the thinking content. See [#2048](https://github.com/samhotchkiss/pollypm/issues/2048). |
 | `tool_use` | assistant | Tool call | `metadata`: `tool_use_id`, `tool_name`, `tool_input`. |
 | `tool_result` | tool | Tool return | `metadata`: `tool_use_id`, `is_error`, `content[]`. |
 | `ask_user` | assistant | `AskUserQuestion` tool | `metadata`: `questions[]`, `answered`, `answers`. See §5.5. |
@@ -418,6 +418,21 @@ structured original lives in `metadata`.
 | `system_event` | system | Compaction, session-start, error | `metadata.subtype` ∈ `compaction`, `session_start`, `session_resume`, `error`. |
 
 ### Example payloads
+
+`thinking` (only when `include_thinking=true`):
+
+```json
+{
+  "type": "thinking",
+  "role": "assistant",
+  "text": "Let me reconsider the approach...",
+  "metadata": {
+    "provider": "claude",
+    "model": "claude-opus-4-7",
+    "signature": "opaque-anthropic-sig"
+  }
+}
+```
 
 `tool_use`:
 

@@ -134,6 +134,7 @@ def _entry(
     glyph: str = "",
     detail: str = "",
     latest_heartbeat_by_session: dict[str, Any] | None = None,
+    config_identity: str = "",
 ) -> ProjectStateCacheEntry:
     return ProjectStateCacheEntry(
         project_key=project_key,
@@ -150,6 +151,7 @@ def _entry(
         awaits_user_count=len(items),
         awaits_user_items=tuple(items),
         latest_heartbeat_by_session=dict(latest_heartbeat_by_session or {}),
+        config_identity=config_identity,
     )
 
 
@@ -1139,6 +1141,74 @@ class TestLatestHeartbeatParity:
         result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
         assert called == ["worker_alpha/1"]
         assert result is hb
+
+    def test_cross_config_cache_entry_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Stamped cross-config entry → fast-path declines, direct serves.
+
+        PR #2080 Codex r1 blocker: the cache singleton is process-wide
+        and the heartbeat fast-path was returning the first
+        ``by_session[session_name]`` hit without comparing
+        ``entry.config_identity`` to the live config's identity. With
+        overlapping session names across workspaces, that leaks
+        cross-config data. Pin the guard: when the stamped identity
+        disagrees, skip the entry and fall through to the direct pg
+        facade (matches the guard in ``cockpit_inbox`` and the rail
+        rollup map).
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+
+        cross_hb = SimpleNamespace(
+            session_name="worker_alpha/1",
+            created_at="2026-05-21T01:00:00Z",
+            tag="STALE_CROSS_CONFIG",
+        )
+        # Entry stamped with config_identity="alpha" — a different
+        # workspace from the live config below (identity "beta").
+        entries = {
+            "alpha": _entry(
+                "alpha",
+                state=ProjectState.WORKING,
+                items=[],
+                latest_heartbeat_by_session={"worker_alpha/1": cross_hb},
+                config_identity="alpha",
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        # Direct facade returns the authoritative live-config value.
+        direct_hb = SimpleNamespace(
+            session_name="worker_alpha/1",
+            created_at="2026-05-21T02:00:00Z",
+            tag="FROM_DIRECT_LIVE_CONFIG",
+        )
+        pg_calls: list[str] = []
+
+        def _direct(name, *, config=None):  # noqa: ANN001, ANN201
+            pg_calls.append(name)
+            return direct_hb
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _direct,
+        )
+
+        # Live config has identity "beta" — different from the
+        # stamped entry — via ``config_path`` (the preferred identity
+        # source in ``state_cache.entry.config_identity``).
+        live_config = SimpleNamespace(config_path="beta")
+        supervisor = SimpleNamespace(store=None, config=live_config)
+
+        result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
+
+        # The cross-config entry must NOT be served. The direct
+        # facade was called and its result was returned.
+        assert result is not cross_hb
+        assert getattr(result, "tag", None) != "STALE_CROSS_CONFIG"
+        assert pg_calls == ["worker_alpha/1"]
+        assert result is direct_hb
 
 
 # ── Move A PR 3 — TTL removal regression test ───────────────────────

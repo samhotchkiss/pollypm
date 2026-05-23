@@ -66,11 +66,14 @@ The chat API reuses PollyPM's existing daemon-wide bearer-token auth.
   The `Authorization: Bearer <token>` header is still accepted in
   every mode.
 - In `tailnet_trust_enabled=False` mode (loopback default, or any
-  explicit `--host` override that isn't the detected Tailscale IPv4,
-  including `--host 0.0.0.0 --allow-remote`), every request needs an
+  explicit `--host` override — unconditionally, even when the address
+  matches the detected Tailscale IPv4, including
+  `--host 0.0.0.0 --allow-remote`), every request needs an
   `Authorization: Bearer <token>` header or the `pollypm-session`
   cookie (issued from `GET /ui/` for loopback callers or for any
-  caller that already presents a valid bearer header).
+  caller that already presents a valid bearer header). The
+  auto-detect path is the only way to enable
+  `tailnet_trust_enabled=True`.
 - The `/ui/` cookie bootstrap is gated to: loopback callers, verified
   Tailscale peers when trust is enabled, or callers that already
   present a valid bearer header. CGNAT-source peers in untrusted

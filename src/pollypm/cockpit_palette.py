@@ -405,16 +405,12 @@ def _dispatch_palette_tag(app: App, tag: str | None) -> None:
         _palette_notify(app, f"Command failed: {exc}")
 
 
-def _resolve_palette_dispatch():
-    """Preserve the legacy ``pollypm.cockpit_ui`` monkeypatch seam."""
-    try:
-        from pollypm import cockpit_ui
-    except Exception:  # noqa: BLE001
-        return _dispatch_palette_tag
-    dispatch = getattr(cockpit_ui, "_dispatch_palette_tag", None)
+def _resolve_palette_dispatch(app: App):
+    """Return the host-owned palette dispatcher when one exists."""
+    dispatch = getattr(app, "dispatch_palette_tag", None)
     if callable(dispatch):
         return dispatch
-    return _dispatch_palette_tag
+    return lambda tag: _dispatch_palette_tag(app, tag)
 
 
 def _palette_nav(app: App, target: str, *, is_project: bool = False) -> None:
@@ -529,7 +525,7 @@ def _open_command_palette(app: App) -> None:
     def _on_dismiss(tag: str | None) -> None:
         if tag:
             _record_palette_command(app, tag)
-        _resolve_palette_dispatch()(app, tag)
+        _resolve_palette_dispatch(app)(tag)
 
     try:
         commands = build_palette_commands(
@@ -659,54 +655,22 @@ def _right_pane_help_section_for_cockpit(
 ) -> tuple[str, list[tuple[str, str]]] | None:
     """Return a help section for whatever the cockpit's right pane is showing.
 
-    Resolves ``selected_key`` to the right-pane App class, walks its
-    ``BINDINGS`` the same way ``_collect_keybindings_for_screen`` does
-    for the host app, and labels the resulting section by surface name
-    so the user can tell which keys belong to the right pane vs the
-    rail (#860).
+    The host app owns right-pane routing, so it provides the selected
+    pane class/label. The palette only walks that class's ``BINDINGS``
+    the same way ``_collect_keybindings_for_screen`` does for the host
+    app, and labels the resulting section by surface name so the user
+    can tell which keys belong to the right pane vs the rail (#860).
     """
-    selected = getattr(app, "selected_key", "") or ""
-
-    # Late imports keep cockpit_palette free of the cockpit_ui import
-    # graph; only matters when the rail-help dialog opens.
+    resolve_target = getattr(app, "right_pane_help_target", None)
+    if not callable(resolve_target):
+        return None
     try:
-        from pollypm.cockpit_ui import (
-            PollyActivityFeedApp,
-            PollyDashboardApp,
-            PollyInboxApp,
-            PollyProjectDashboardApp,
-            PollyProjectSettingsApp,
-            PollySettingsPaneApp,
-            PollyWorkerRosterApp,
-        )
+        target = resolve_target()
     except Exception:  # noqa: BLE001
         return None
-
-    target_cls = None
-    surface_label = ""
-    if selected == "inbox":
-        target_cls, surface_label = PollyInboxApp, "Inbox"
-    elif selected == "activity":
-        target_cls, surface_label = PollyActivityFeedApp, "Activity feed"
-    elif selected == "settings":
-        target_cls, surface_label = PollySettingsPaneApp, "Settings"
-    elif selected == "workers":
-        target_cls, surface_label = PollyWorkerRosterApp, "Workers"
-    elif selected in {"polly", "dashboard"}:
-        target_cls, surface_label = PollyDashboardApp, "Home dashboard"
-    elif selected.startswith("project:"):
-        # ``project:<key>:settings`` vs ``project:<key>[:dashboard]``.
-        if selected.endswith(":settings"):
-            target_cls, surface_label = (
-                PollyProjectSettingsApp, "Project settings",
-            )
-        else:
-            target_cls, surface_label = (
-                PollyProjectDashboardApp, "Project dashboard",
-            )
-
-    if target_cls is None:
+    if target is None:
         return None
+    target_cls, surface_label = target
 
     rows: list[tuple[int, int, str, str]] = []
     for order, binding in enumerate(getattr(target_cls, "BINDINGS", None) or []):

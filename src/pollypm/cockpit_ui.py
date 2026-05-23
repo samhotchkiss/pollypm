@@ -625,6 +625,29 @@ class PollyCockpitApp(App[None]):
     def action_show_keyboard_help(self) -> None:
         _open_keyboard_help(self)
 
+    def dispatch_palette_tag(self, tag: str | None) -> None:
+        """Dispatch command-palette selections through the UI module seam."""
+        _dispatch_palette_tag(self, tag)
+
+    def right_pane_help_target(self) -> tuple[type[App], str] | None:
+        """Return the selected right-pane App class for keyboard help."""
+        selected = self.selected_key or ""
+        if selected == "inbox":
+            return PollyInboxApp, "Inbox"
+        if selected == "activity":
+            return PollyActivityFeedApp, "Activity feed"
+        if selected == "settings":
+            return PollySettingsPaneApp, "Settings"
+        if selected == "workers":
+            return PollyWorkerRosterApp, "Workers"
+        if selected in {"polly", "dashboard"}:
+            return PollyDashboardApp, "Home dashboard"
+        if selected.startswith("project:"):
+            if selected.endswith(":settings"):
+                return PollyProjectSettingsApp, "Project settings"
+            return PollyProjectDashboardApp, "Project dashboard"
+        return None
+
     # Keys the App's BINDINGS treat as priority. When KeyboardHelpModal
     # is on the screen stack we must yield these to the modal so it can
     # dismiss / scroll itself (#917). Textual's priority pass walks from

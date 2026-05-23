@@ -234,12 +234,14 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
 def patch_parser(monkeypatch: pytest.MonkeyPatch):
     """Factory installing a stub for ``parse_events_jsonl``.
 
-    Signature mirrors the real parser on main
-    (:func:`pollypm.web_api.chat.transcripts.parse_events_jsonl`) — the
-    ``include_thinking`` knob was removed when thinking-block
-    round-tripping was parked (follow-up #2048). Tests that need real
-    parser behavior (Blocker 1) drive the on-disk parser directly via
-    a JSONL fixture instead of installing this stub.
+    Signature mirrors what the chat-messages route actually calls
+    today (:func:`pollypm.web_api.chat.transcripts.parse_events_jsonl`
+    with ``actor_fallback`` + ``strict`` only). The real parser also
+    accepts an ``include_thinking`` kwarg (restored in #2048 — this
+    PR), but the route does not pass it: thinking promotion to the
+    HTTP surface is deferred to #2082. Tests that need real parser
+    behavior (Blocker 1) drive the on-disk parser directly via a JSONL
+    fixture instead of installing this stub.
     """
     def install(envelopes_by_path: dict[Path, list[MessageEnvelope]]) -> None:
         def fake(path, *, actor_fallback="agent", strict=False):
@@ -580,13 +582,17 @@ def test_messages_endpoint_accepts_limit_500(
 def test_messages_endpoint_drops_thinking_envelopes(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
-    """Thinking blocks are filtered out — the parser on main never
-    surfaces them, but the router keeps a defensive filter so any
-    future capture-mode emitter can't smuggle them through.
+    """Thinking blocks are filtered out at the HTTP route boundary.
 
-    The ``include_thinking`` query param + thinking round-tripping is
-    parked until follow-up #2048 wires the ingestor side; until then
-    the API never emits ``type=thinking`` envelopes.
+    As of #2048 (this PR) the parser CAN emit
+    :class:`ParserInternalType.THINKING` envelopes when callers pass
+    ``include_thinking=True`` to ``parse_events_jsonl``. The
+    ``GET /messages`` route, however, still calls the parser with the
+    default ``include_thinking=False`` AND defensively drops any
+    parser-internal types downstream, so the public response catalog
+    stays equal to the public :class:`MessageType` enum. Promoting
+    thinking blocks onto the HTTP surface (route query param + OpenAPI
+    enum entry) is parked until follow-up #2082.
     """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
@@ -611,11 +617,17 @@ def test_messages_endpoint_drops_thinking_envelopes(
 def test_messages_endpoint_rejects_include_thinking_query_param(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):
-    """``include_thinking`` was removed from the endpoint signature
-    (follow-up #2048 will reinstate it once the ingestor preserves
-    thinking blocks). FastAPI ignores unknown query params by default,
-    so we just confirm the param is no longer wired — passing it has
-    no effect on the response.
+    """``include_thinking`` is not yet exposed on the HTTP route.
+
+    #2048 (this PR) restored parser-level support for thinking blocks
+    via :class:`ParserInternalType.THINKING`, but promoting them onto
+    the HTTP surface — wiring an ``include_thinking`` query param and
+    adding ``thinking`` to the OpenAPI ``MessageType`` enum — is
+    deferred to follow-up #2082. FastAPI ignores unknown query params
+    by default, so we confirm passing the param has no effect: the
+    route still calls the parser with ``include_thinking=False`` and
+    filters parser-internal types, so ``thinking`` never appears in
+    the response.
     """
     archive = tmp_path / "events.jsonl"
     archive.write_text("x")
@@ -1421,9 +1433,10 @@ def test_messages_endpoint_source_auto_still_fail_soft_on_capture_error(
 # The fixtures above monkeypatch ``parse_events_jsonl`` /
 # ``capture_envelopes`` for speed and isolation. The two tests below
 # pin the production wiring by driving the REAL helpers — a
-# monkeypatch that accepted the now-removed ``include_thinking`` kwarg
-# (or a fake capture that raised instead of the real fail-soft helper)
-# previously hid two TypeError / silent-empty bugs in production.
+# monkeypatch with a stale signature (e.g. accepting an
+# ``include_thinking`` kwarg the route doesn't pass) or a fake
+# capture that raised instead of the real fail-soft helper previously
+# hid two TypeError / silent-empty bugs in production.
 # ---------------------------------------------------------------------------
 
 
@@ -1432,13 +1445,16 @@ def test_messages_endpoint_jsonl_uses_real_parser_no_typeerror(
 ):
     """REAL ``parse_events_jsonl`` call — Blocker 1 regression.
 
-    Previously the route passed ``include_thinking=...`` to
-    ``parse_events_jsonl``, but the authoritative parser on main no
-    longer accepts that kwarg (it was removed in #2044). Tests passed
-    because the fixture stub accepted the kwarg; in production every
-    ``source=jsonl`` request raised ``TypeError``. This test drives the
-    real parser via an on-disk JSONL fixture so the wiring is exercised
-    end-to-end.
+    Historically the route's call signature drifted from the real
+    parser's (e.g. the route briefly passed ``include_thinking=...``
+    when the parser had dropped the kwarg in #2044). Tests passed
+    because the fixture stub silently accepted the extra kwarg; in
+    production every ``source=jsonl`` request raised ``TypeError``.
+    #2048 (this PR) restored ``include_thinking`` on the parser, but
+    the route still does NOT pass it — promoting thinking blocks to
+    the HTTP surface is deferred to #2082. This test drives the real
+    parser via an on-disk JSONL fixture so the wiring is exercised
+    end-to-end and any future signature drift fails loudly.
     """
     import json as _json
 

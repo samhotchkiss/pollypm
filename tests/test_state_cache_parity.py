@@ -1485,71 +1485,81 @@ class TestPr2026ReviewBlocker2HeartbeatNoStale:
 
 
 class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
-    """Blocker 3: workspace-root inbox messages (``scope IN ('', 'inbox')``)
-    are not represented in any per-project cache entry, so the cache
-    routes for awaits-user list + count MUST fall through to the
-    direct path whenever the workspace-root inbox is non-empty.
+    """Issue #2051: workspace-root inbox messages (``scope IN ('',
+    'inbox')``) now ride a synthetic ``__workspace__`` cache entry
+    emitted by the refresher. The cache fast-path MUST serve them
+    alongside per-project items — no more probe-driven fall-through.
+
+    These tests previously pinned the OPPOSITE behavior (forced
+    fall-through whenever the workspace-root probe saw a live row).
+    Flipped by #2051: the cache is authoritative for workspace-root
+    rows too. The ``_workspace_root_inbox_has_open`` probe + its
+    callers were removed.
     """
 
-    def test_workspace_root_message_forces_list_fallthrough(
+    def test_workspace_root_message_served_by_cache(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """A live workspace-root row → list cache declines, direct path runs.
-
-        Pinned to the cached vs direct equality: both MUST return the
-        same set of items (workspace-root included), proving the
-        fall-through is what carried the workspace row.
+        """List route returns workspace-root item from the ``__workspace__``
+        entry without touching the direct sweep.
         """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
 
-        # Per-project items the cache CAN represent.
+        # Per-project items live on the project's entry.
         per_project = [
             _inbox_item(project="alpha", source="task", ident="alpha/1"),
         ]
-        # The workspace-root item with project="inbox" — the cache
-        # CANNOT represent this (refresher filters by project_key only).
+        # Workspace-root items live on the synthetic ``__workspace__``
+        # entry the refresher emits for #2051.
         workspace_root = _inbox_item(
             project="inbox", source="message", ident="ws-root-1",
-        )
-        # And the workspace-root probe MUST see it (simulate pg row).
-        monkeypatch.setattr(
-            cockpit_inbox,
-            "_workspace_root_inbox_has_open",
-            lambda cfg: True,
         )
         entries = {
             "alpha": _entry(
                 "alpha", state=ProjectState.WAITING, items=per_project,
             ),
+            "__workspace__": _entry(
+                "__workspace__",
+                state=None,
+                items=[workspace_root],
+            ),
         }
         _seed_cache(monkeypatch, entries)
 
-        # Direct sweep returns BOTH (per-project + workspace-root).
-        direct_items = list(per_project) + [workspace_root]
+        # Direct sweep MUST NOT be called — the cache is now
+        # authoritative for workspace-root rows.
         direct_called = {"n": 0}
 
         def _direct(_cfg: Any) -> list[Any]:
             direct_called["n"] += 1
-            return list(direct_items)
+            return list(per_project) + [workspace_root]
 
         monkeypatch.setattr(
             cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
         )
+        # Pin the sampler off so the divergence sampler can't sneak in
+        # a direct read.
+        cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         result = cockpit_inbox.pm_inbox_awaits_user_list(config)
-        assert direct_called["n"] == 1
-        # Workspace-root item is in the result (would have been
-        # silently dropped if we had stayed on the fast-path).
-        ids = {getattr(item, "message_id", None) or getattr(item, "task_id", None) for item in result}
+        assert direct_called["n"] == 0
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in result
+        }
+        # Both per-project AND workspace-root items are present.
         assert "ws-root-1" in ids
         assert "alpha/1" in ids
 
-    def test_workspace_root_message_forces_count_fallthrough(
+    def test_workspace_root_message_served_by_cache_count(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Same gate fires on the count helper — sums match direct len()."""
+        """Count helper sums per-project AND ``__workspace__`` entries
+        directly from the snapshot — no direct sweep.
+        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
@@ -1559,44 +1569,48 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         workspace_root = _inbox_item(
             project="inbox", source="message", ident="ws-root-2",
         )
-        monkeypatch.setattr(
-            cockpit_inbox,
-            "_workspace_root_inbox_has_open",
-            lambda cfg: True,
-        )
         entries = {
             "alpha": _entry(
                 "alpha", state=ProjectState.WAITING, items=per_project,
             ),
+            "__workspace__": _entry(
+                "__workspace__",
+                state=None,
+                items=[workspace_root],
+            ),
         }
         _seed_cache(monkeypatch, entries)
 
-        direct_items = list(per_project) + [workspace_root]
+        direct_called = {"n": 0}
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [workspace_root]
+
         monkeypatch.setattr(
             cockpit_inbox,
             "_pm_inbox_awaits_user_list_uncached",
-            lambda cfg: list(direct_items),
+            _direct,
         )
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         counted = cockpit_inbox._count_inbox_tasks_for_label(config)
-        # Cache would have returned 1 (only alpha); fall-through gives 2.
+        assert direct_called["n"] == 0
+        # Per-project + workspace-root counts both contribute.
         assert counted == 2
 
-    def test_workspace_root_empty_keeps_cache_fast_path(
+    def test_no_workspace_entry_still_serves_per_project_via_cache(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Empty workspace-root → cache fast-path stays available."""
+        """Snapshot without a ``__workspace__`` entry — the cache
+        still serves per-project items from the fast-path. Absent
+        workspace entry contributes 0 to the union/count.
+        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         config = _make_config(["alpha"], tmp_path)
         per_project = [
             _inbox_item(project="alpha", source="task", ident="alpha/1"),
         ]
-        monkeypatch.setattr(
-            cockpit_inbox,
-            "_workspace_root_inbox_has_open",
-            lambda cfg: False,
-        )
         entries = {
             "alpha": _entry(
                 "alpha", state=ProjectState.WAITING, items=per_project,
@@ -1604,12 +1618,9 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         }
         _seed_cache(monkeypatch, entries)
 
-        # Pin the sampler off so the divergence-comparator path
-        # doesn't masquerade as a fall-through. Earlier tests in this
-        # module may have swapped in a rate-1 counter that would
-        # sample every call; restore a fresh default-rate counter.
+        # Sampler-off so divergence comparator can't masquerade as a
+        # fall-through.
         cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
-        # Direct sweep MUST NOT be called.
         direct_called = {"n": 0}
 
         def _direct(_cfg: Any) -> list[Any]:
@@ -1624,351 +1635,3 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         assert direct_called["n"] == 0
         assert len(result) == 1
 
-
-class TestPr2026V3WorkspaceRootProbeUnbounded:
-    """PR #2026 v3 (Codex blocker 1): the workspace-root probe must NOT
-    depend on row recency. The old implementation called
-    ``open_messages(limit=50)`` and Python-scanned for ``scope IN ('',
-    'inbox')``; with 50+ newer project-scoped rows + 1 older
-    workspace-root row, the probe returned False and the cache silently
-    dropped the workspace work.
-
-    The fix adds a dedicated SQL existence query
-    (``cockpit_pg_aggregates.has_workspace_root_open_messages``) with
-    a workspace-root predicate + ``LIMIT 1`` — independent of how many
-    newer non-workspace rows exist.
-
-    This test calls the REAL ``_workspace_root_inbox_has_open`` (no
-    monkeypatch on that function) against a fake pg_pool that simulates
-    the bug scenario.
-    """
-
-    def test_workspace_root_row_under_50_newer_rows_is_still_seen(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """Seed pg with 50 newer project-scoped rows + 1 older
-        workspace-root row; the SQL existence query MUST return True.
-        """
-
-        config = _make_config(["alpha"], tmp_path)
-
-        # Track which SQL was executed so the assertion proves the
-        # workspace-root existence query (not the legacy newest-50
-        # scan) is what gave the True answer.
-        executed: list[tuple[str, tuple[Any, ...]]] = []
-
-        class _FakeCursor:
-            def __init__(self) -> None:
-                self._result: list[tuple[Any, ...]] = []
-
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, sql: str, params: Any) -> None:
-                executed.append((sql, tuple(params)))
-                # Workspace-root probe: predicate includes the
-                # ``scope = '' OR scope IS NULL OR scope = 'inbox'``
-                # branch + a ``LIMIT 1``. Return one row.
-                if "scope = 'inbox'" in sql and "LIMIT 1" in sql:
-                    self._result = [(1,)]
-                    return
-                # Anything else (e.g. the legacy newest-N scan) —
-                # return 50 project-scoped rows so the OLD code
-                # would have missed the workspace-root row entirely.
-                self._result = [
-                    (i, "alpha", "notify", "info", "user", "sender",
-                     "open", "subj", "body", {}, [], "kind",
-                     None, None, None)
-                    for i in range(50)
-                ]
-
-            def fetchone(self) -> Any:
-                return self._result[0] if self._result else None
-
-            def fetchall(self) -> list[tuple[Any, ...]]:
-                return list(self._result)
-
-            @property
-            def description(self) -> list[Any]:
-                return [SimpleNamespace(name=n) for n in (
-                    "id", "scope", "type", "tier", "recipient",
-                    "sender", "state", "subject", "body",
-                    "payload_json", "labels", "kind",
-                    "created_at", "updated_at", "closed_at",
-                )]
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
-
-        def _fake_get_ro_pool(_cfg: Any) -> _FakePool:
-            return _FakePool()
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", _fake_get_ro_pool,
-        )
-
-        # Call the REAL function (no monkeypatch on _workspace_root_inbox_has_open).
-        assert cockpit_inbox._workspace_root_inbox_has_open(config) is True
-
-        # Prove the SQL the function executed was the bounded-1
-        # existence query, not the legacy newest-N scan.
-        assert executed, "fake pg pool was never queried"
-        executed_sqls = [sql for sql, _params in executed]
-        assert any(
-            "scope = 'inbox'" in sql and "LIMIT 1" in sql
-            for sql in executed_sqls
-        ), (
-            f"workspace-root probe should issue a LIMIT-1 existence "
-            f"query; saw {executed_sqls!r}"
-        )
-
-    def test_real_probe_drives_cache_fall_through(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """The probe's True answer MUST flip
-        ``_maybe_cache_route_awaits_user`` to fall through to direct.
-        """
-
-        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
-        config = _make_config(["alpha"], tmp_path)
-
-        class _FakeCursor:
-            def __init__(self) -> None:
-                self._result: list[tuple[Any, ...]] = []
-
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, sql: str, params: Any) -> None:
-                if "LIMIT 1" in sql:
-                    self._result = [(1,)]
-                else:
-                    self._result = []
-
-            def fetchone(self) -> Any:
-                return self._result[0] if self._result else None
-
-            def fetchall(self) -> list[tuple[Any, ...]]:
-                return list(self._result)
-
-            @property
-            def description(self) -> list[Any]:
-                return [SimpleNamespace(name="x")]
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
-        )
-
-        # Seed a populated cache for alpha. No monkeypatch on
-        # _workspace_root_inbox_has_open — it executes the REAL pg
-        # path against the fake pool above and returns True.
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.IDLE, items=[],
-            ),
-        }
-        _seed_cache(monkeypatch, entries)
-
-        # The fast-path MUST decline so the direct sweep can carry
-        # the workspace-root row.
-        assert cockpit_inbox._maybe_cache_route_awaits_user(config) is None
-
-    # ── PR #2026 v6 regression tests (Codex round-6 blocker) ──────────
-    #
-    # The v5 helper returns True on pool/query failure to keep the cache
-    # authoritative-or-deferred. These tests pin that contract end-to-end:
-    # (1) the helper itself returns True on each failure mode, and
-    # (2) the failure flows through _maybe_cache_{route,count}_awaits_user
-    # as a fall-through (cache declines).
-
-    def test_pool_open_failure_returns_true_conservative(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """``has_workspace_root_open_messages`` must return True when the
-        pg pool cannot be opened — conservative-on-failure contract.
-        """
-
-        from pollypm import cockpit_pg_aggregates
-
-        config = _make_config(["alpha"], tmp_path)
-
-        def _boom_ro(_cfg: Any) -> Any:
-            raise RuntimeError("ro pool unavailable")
-
-        def _boom_rw(_cfg: Any) -> Any:
-            raise RuntimeError("rw pool unavailable")
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", _boom_ro,
-        )
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_rw_pool", _boom_rw,
-        )
-
-        assert (
-            cockpit_pg_aggregates.has_workspace_root_open_messages(config)
-            is True
-        )
-
-    def test_query_failure_returns_true_conservative(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """Pool open succeeds but ``cur.execute()`` raises — the helper
-        must still return True (conservative).
-        """
-
-        from pollypm import cockpit_pg_aggregates
-
-        config = _make_config(["alpha"], tmp_path)
-
-        class _FakeCursor:
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, _sql: str, _params: Any) -> None:
-                raise RuntimeError("query exploded")
-
-            def fetchone(self) -> Any:
-                return None
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
-        )
-
-        assert (
-            cockpit_pg_aggregates.has_workspace_root_open_messages(config)
-            is True
-        )
-
-    def test_pool_failure_drives_cache_fall_through(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """Pool failure → wrapper returns True → ``_maybe_cache_route_awaits_user``
-        declines so the direct sweep carries any uncached awaits-user work.
-        """
-
-        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
-        config = _make_config(["alpha"], tmp_path)
-
-        def _boom_ro(_cfg: Any) -> Any:
-            raise RuntimeError("ro pool unavailable")
-
-        def _boom_rw(_cfg: Any) -> Any:
-            raise RuntimeError("rw pool unavailable")
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", _boom_ro,
-        )
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_rw_pool", _boom_rw,
-        )
-
-        # Cache seeded with an uncached-style entry — the only way the
-        # fast-path can decline is via the workspace-root guard, which
-        # depends on the failing probe.
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.IDLE, items=[],
-            ),
-        }
-        _seed_cache(monkeypatch, entries)
-
-        assert cockpit_inbox._maybe_cache_route_awaits_user(config) is None
-
-    def test_query_failure_drives_count_fall_through(
-        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
-    ) -> None:
-        """Query failure → wrapper returns True → ``_maybe_cache_count_awaits_user``
-        declines so the rail badge falls back to the direct sweep.
-        """
-
-        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
-        config = _make_config(["alpha"], tmp_path)
-
-        class _FakeCursor:
-            def __enter__(self) -> "_FakeCursor":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def execute(self, _sql: str, _params: Any) -> None:
-                raise RuntimeError("query exploded")
-
-            def fetchone(self) -> Any:
-                return None
-
-        class _FakeConn:
-            def __enter__(self) -> "_FakeConn":
-                return self
-
-            def __exit__(self, *_a: Any) -> None:
-                pass
-
-            def cursor(self) -> _FakeCursor:
-                return _FakeCursor()
-
-        class _FakePool:
-            def connection(self) -> _FakeConn:
-                return _FakeConn()
-
-        monkeypatch.setattr(
-            "pollypm.storage.pg_pool.get_ro_pool", lambda _cfg: _FakePool(),
-        )
-
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.IDLE, items=[],
-            ),
-        }
-        _seed_cache(monkeypatch, entries)
-
-        assert cockpit_inbox._maybe_cache_count_awaits_user(config) is None

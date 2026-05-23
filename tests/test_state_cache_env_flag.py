@@ -232,14 +232,19 @@ def test_singleton_wires_project_keys_provider_for_initial_refresh(
         # The provider must be wired on the refresher instance — this is
         # the property whose absence was the Codex blocker.
         assert refresher._project_keys is not None  # noqa: SLF001
+        # #2051: provider also yields the ``__workspace__`` sentinel so
+        # the refresher computes a synthetic workspace-root inbox entry
+        # on boot + on every full pass.
         assert sorted(refresher._project_keys()) == [  # noqa: SLF001
-            "alpha", "beta", "gamma",
+            "__workspace__", "alpha", "beta", "gamma",
         ]
         # And the startup full-refresh must have populated the cache
         # with entries for every configured project (no audit events
-        # required).
+        # required) plus the workspace sentinel.
         snapshot = cache.snapshot()
-        assert set(snapshot.keys()) == {"alpha", "beta", "gamma"}
+        assert set(snapshot.keys()) == {
+            "__workspace__", "alpha", "beta", "gamma",
+        }
     finally:
         reset_for_test()
 
@@ -311,8 +316,12 @@ class TestDivergenceSamplerNoop:
 def test_singleton_provider_degrades_gracefully_on_config_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The provider must catch ``load_config`` failures and return ``[]``
-    — the cache stays empty instead of taking down the cockpit.
+    """The provider must catch ``load_config`` failures and degrade
+    gracefully instead of taking down the cockpit.
+
+    #2051: the provider yields the ``__workspace__`` sentinel even on
+    config-load failure so the workspace-root inbox entry can still be
+    refreshed (the workspace probe is config-tolerant).
     """
 
     monkeypatch.setenv(ENV_FLAG, "1")
@@ -333,10 +342,17 @@ def test_singleton_provider_degrades_gracefully_on_config_failure(
     refresher = get_refresher()
     try:
         assert refresher is not None
-        # Provider is wired, but it absorbs the load_config exception
-        # and yields the empty list.
+        # Provider is wired, but it absorbs the load_config exception.
+        # #2051: even on config-load failure the provider still yields
+        # the ``__workspace__`` sentinel so the workspace-root inbox
+        # entry refreshes against whatever config the workspace probe
+        # can resolve (the inbox aggregator handles a None/broken
+        # config gracefully).
         assert refresher._project_keys is not None  # noqa: SLF001
-        assert refresher._project_keys() == []  # noqa: SLF001
-        assert cache.snapshot() == {}
+        assert refresher._project_keys() == ["__workspace__"]  # noqa: SLF001
+        # The workspace entry refresh ran during the initial full
+        # refresh — snapshot has the sentinel even though no projects
+        # could be resolved from the (broken) config.
+        assert set(cache.snapshot().keys()) == {"__workspace__"}
     finally:
         reset_for_test()

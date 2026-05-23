@@ -420,18 +420,12 @@ class TestConfigIdentityGuard:
         _seed_cache(monkeypatch, {"alpha": unstamped})
 
         # Even with a mismatched-looking config, unstamped entries are
-        # served (this is the test-compat escape hatch).
+        # served (this is the test-compat escape hatch). #2051 removed
+        # the ``_workspace_root_inbox_has_open`` probe, so the only
+        # remaining gates that could decline are the config-identity
+        # guard (which we're isolating here) and the cold-cache /
+        # partial-cache guards (both satisfied by the seed above).
         config_solo = _make_config(["alpha"], tmp_path / "workspace-a")
-        result = cockpit_inbox._maybe_cache_route_awaits_user(config_solo)
-        # Either the served path returns the empty list, or the route
-        # declines for an OTHER reason (workspace-root probe, etc.).
-        # The point is: the identity guard didn't fire on the
-        # unstamped entry.
-        # Force the workspace-root probe to "no open" to isolate the
-        # identity gate from other guards.
-        monkeypatch.setattr(
-            cockpit_inbox, "_workspace_root_inbox_has_open", lambda cfg: False,
-        )
         result = cockpit_inbox._maybe_cache_route_awaits_user(config_solo)
         assert result == []
 

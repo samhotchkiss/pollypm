@@ -202,6 +202,16 @@ def get_cache() -> StateCacheLike:
                     # newly-added projects are picked up without having
                     # to bounce the cache. Failures degrade to the empty
                     # list (matches the provider-less PR 1 behavior).
+                    #
+                    # #2051: always include the ``__workspace__``
+                    # sentinel so the refresher computes the synthetic
+                    # workspace-root inbox entry on boot and on every
+                    # full pass (workspace-wide invalidations re-enqueue
+                    # every currently-known key — by appearing here the
+                    # sentinel rides that path too).
+                    from pollypm.state_cache.refresh_impl import (
+                        WORKSPACE_PROJECT_KEY,
+                    )
                     try:
                         config = _config_provider()
                     except Exception:  # noqa: BLE001
@@ -209,16 +219,16 @@ def get_cache() -> StateCacheLike:
                             "state_cache: project_keys provider — "
                             "config load failed",
                         )
-                        return []
+                        return [WORKSPACE_PROJECT_KEY]
                     try:
                         projects = getattr(config, "projects", {}) or {}
-                        return list(projects.keys())
+                        return [WORKSPACE_PROJECT_KEY, *projects.keys()]
                     except Exception:  # noqa: BLE001
                         logger.exception(
                             "state_cache: project_keys provider — "
                             "projects access failed",
                         )
-                        return []
+                        return [WORKSPACE_PROJECT_KEY]
 
                 refresh_fn = build_refresh_fn(_config_provider)
                 project_keys_provider = _project_keys_provider

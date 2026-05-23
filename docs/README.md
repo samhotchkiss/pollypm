@@ -10,6 +10,8 @@ and working design docs. If you are not sure where to start, start here:
   operator/contributor recipes.
 - [Worker Guide](worker-guide.md) — the operating manual for spawned worker
   sessions.
+- [Reverse Proxy Deploy](deploy/reverse-proxy.md) — run `pm serve` behind
+  Caddy with Tailscale HTTPS certificates.
 - [Plugin Authoring](plugin-authoring.md) — the shortest path to building and
   testing a PollyPM plugin.
 - [Plugin Trust Model](plugin-trust.md) — what installing a third-party
@@ -23,6 +25,8 @@ and working design docs. If you are not sure where to start, start here:
   workflow, and governance model behind `pm task`.
 - [Audit Log](audit-log.md) — where task/marker lifecycle events land and how
   watchdog findings surface.
+- [Reverse Proxy Deploy](deploy/reverse-proxy.md) — a Caddy + Tailscale HTTPS
+  deployment pattern for the web UI/API.
 - [Issue Tracker](issue-tracker.md) — explains the legacy file-based tracker
   and why the work service is now the source of truth.
 - Plugin feature specs such as

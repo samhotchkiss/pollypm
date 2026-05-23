@@ -35,6 +35,7 @@ from pollypm.web_api.errors import (
     APIError,
     not_found,
     service_unavailable,
+    too_many_requests,
 )
 from pollypm.web_api.models import (
     ContextEntry as APIContextEntry,
@@ -1171,13 +1172,7 @@ def get_task_detail(
                 raise
             except Exception:  # noqa: BLE001
                 return None
-            plan: APIPlan | None = None
-            if _is_plan_task(task) and _is_in_review(task):
-                try:
-                    plan = _build_plan(svc, task)
-                except Exception:  # noqa: BLE001
-                    plan = None
-            return _task_to_detail(task, plan=plan)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "get_task_detail: backing store error for %s/%s: %s",
@@ -1277,15 +1272,10 @@ def queue_task(
                     hint="Fix the failing gate (e.g. add a description) before queueing.",
                 ) from exc
             # Re-read so the response carries the post-transition
-            # snapshot the client would see on a follow-up GET.
+            # snapshot the client would see on a follow-up GET — that
+            # includes plan hydration for plan-review tasks (#2064 r4).
             task = svc.get(task_id)
-            plan: APIPlan | None = None
-            if _is_plan_task(task) and _is_in_review(task):
-                try:
-                    plan = _build_plan(svc, task)
-                except Exception:  # noqa: BLE001
-                    plan = None
-            return _task_to_detail(task, plan=plan)
+            return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "queue_task: backing store error for %s: %s",
@@ -1295,6 +1285,538 @@ def queue_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while queueing {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def claim_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+) -> tuple[APITaskDetail, list[str]]:
+    """Atomically claim a queued task via the work-service.
+
+    Mirrors ``pm work claim``. The work-service handles the
+    queued-and-unblocked check, sets ``assignee``, advances to the
+    flow's start node, and writes the transition row. We translate
+    work-service exceptions into the API's typed error envelope.
+
+    Routes through :func:`create_work_service_with_session` (the
+    same facade ``pm task claim`` uses) so the SessionManager is
+    wired BEFORE ``svc.claim`` fires — the API surface therefore
+    provisions the per-task worker session, applies the parallel-
+    cap check, and surfaces ``last_provision_error`` exactly like
+    the CLI (#2064 round-9 blocker #2). The earlier head called
+    ``create_work_service`` directly with no SessionManager wiring;
+    a successful API claim would mark the task ``in_progress`` with
+    no worker lane and no error feedback, silently breaking the
+    operator workflow.
+
+    Returns ``(task_detail, warnings)``. ``warnings`` is a (possibly
+    empty) list of operator-facing strings that the route layer
+    surfaces in ``TaskActionResult.warnings`` (#2064 round-10). The
+    claim path uses it to forward ``svc.last_provision_error`` (post-
+    commit worker-session failures captured by ``PgWorkService.claim``
+    at ``pg_service.py:1905-1910``) AND
+    ``svc._session_attach_error`` (SessionManager wire-up failures
+    captured in ``service_factory.attach_session_manager``). Both
+    surface with the same recovery wording the CLI emits at
+    ``work/cli.py:912-929`` so cockpit operators see the same
+    story regardless of channel.
+    """
+    from pollypm.work.service_factory import (
+        create_work_service_with_session,
+    )
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+    )
+    # #2064 round-11 blocker #1 — map cap back-pressure to a typed
+    # 429 envelope instead of leaking ``WorkerCapExceededError`` as
+    # 500 ``internal_error``. The exception lives in the session
+    # manager module; lazy import keeps the web_api package free of
+    # tmux/state-store imports at startup (same pattern the work-
+    # service factory uses above).
+    from pollypm.work.session_manager import WorkerCapExceededError
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    try:
+        with create_work_service_with_session(
+            config=config,
+            project_key=project_key,
+            project_path=project.path,
+        ) as svc:
+            try:
+                svc.claim(task_id, actor)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc) or f"Task {task_id} cannot be claimed.",
+                    hint="Only queued+unblocked tasks can be claimed.",
+                ) from exc
+            except WorkerCapExceededError as exc:
+                # #2064 round-11 blocker #1: pre-claim cap probe at
+                # ``PgWorkService.claim`` (``pg_service.py:1759-1763``)
+                # raises ``WorkerCapExceededError`` from
+                # ``SessionManager.check_parallel_cap`` (``session_manager.py:418/473``).
+                # That is normal back-pressure — the project is at its
+                # ``max_parallel_workers`` ceiling — not a server bug.
+                # Surface it as ``429`` with a stable
+                # ``worker_cap_exceeded`` code so clients can apply
+                # back-off and operators see the same recovery story
+                # the CLI emits.
+                raise too_many_requests(
+                    f"Worker cap exceeded for project "
+                    f"{project_key}: {exc}",
+                    code="worker_cap_exceeded",
+                    hint=(
+                        "Wait for an in-progress task on this "
+                        "project to finish, raise "
+                        "`max_parallel_workers` under "
+                        f"`[projects.{project_key}]` in pollypm.toml, "
+                        "or retry the claim once a slot frees up."
+                    ),
+                ) from exc
+            task = svc.get(task_id)
+            warnings = _collect_claim_warnings(svc, task, task_id)
+            return _task_to_detail_with_plan(task, svc=svc), warnings
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "claim_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while claiming {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def _collect_claim_warnings(
+    svc: object, task: object, task_id: str
+) -> list[str]:
+    """Build the ``TaskActionResult.warnings`` list for a successful claim.
+
+    Three sources combine into one operator-facing list (#2064 round-10 + 11):
+
+    - ``svc.last_provision_error`` — set by
+      ``PgWorkService.claim`` (``pg_service.py:1905-1910``) when the
+      DB transition committed but the per-task worker session
+      failed to provision (tmux blew up, parallel-cap, worktree
+      checkout, prompt write, etc). Round-11 refinement: that path
+      can ALSO roll the task back to ``queued`` (cap-exceeded race;
+      ``pg_service.py:1917-1939``). When the rollback fired the
+      warning wording must say "rolled back" — saying "the DB claim
+      is in effect" lies because the row is back to ``queued``.
+    - ``svc._session_attach_error`` — set by
+      :func:`pollypm.work.service_factory.attach_session_manager` when
+      the SessionManager itself could not be wired (missing imports,
+      StateStore failure, tmux client construction, etc). Without
+      this surface the API would silently behave like a DB-only
+      claim even though the operator expects the per-task worker
+      lifecycle.
+
+    Each entry uses the same "what to do" wording as the CLI warning
+    at ``src/pollypm/work/cli.py:912-929`` so the recovery story is
+    identical across surfaces. The list is empty on the happy path —
+    clients can branch on ``len(warnings) > 0`` to decide whether to
+    surface a banner.
+    """
+    warnings: list[str] = []
+    last_provision_error = getattr(svc, "last_provision_error", None)
+    session_attach_error = getattr(svc, "_session_attach_error", None)
+    # Round-11 blocker #2: the claim path's post-commit rollback
+    # (``pg_service.py:1917-1939``) sets ``last_provision_error`` AND
+    # flips the row back to ``queued``. Inspect the post-claim
+    # task to tell the operator the truth. ``work_status`` may be a
+    # :class:`WorkStatus` enum or a string depending on whether the
+    # caller passed a real pg ``Task`` or the FakeWorkService in
+    # tests; normalise to the underlying value.
+    status_attr = getattr(task, "work_status", None)
+    status_value = getattr(status_attr, "value", status_attr)
+    rolled_back = (
+        bool(last_provision_error) and status_value == "queued"
+    )
+    if last_provision_error:
+        if rolled_back:
+            warnings.append(
+                f"Worker session provisioning failed for {task_id}: "
+                f"{last_provision_error}. The DB claim was rolled "
+                f"back; the task is queued again so auto-claim can "
+                f"retry. To recover: wait for the next claim sweep, "
+                f"or raise `max_parallel_workers` under "
+                f"`[projects.{_project_of(task_id)}]` in pollypm.toml "
+                f"if back-pressure caused the rollback."
+            )
+        else:
+            warnings.append(
+                f"Worker session provisioning failed for {task_id}: "
+                f"{last_provision_error}. The DB claim is in effect, "
+                f"but no live agent lane was created. To recover: "
+                f"either continue work from an existing worker "
+                f"session for this project, or hold + resume to "
+                f"retry provisioning "
+                f"(`pm task hold {task_id} --reason 'provision "
+                f"failed'` then `pm task resume {task_id}`)."
+            )
+    if session_attach_error:
+        warnings.append(
+            f"SessionManager wire-up failed for {task_id}: "
+            f"{session_attach_error}. The DB claim is in effect, "
+            f"but the worker-session subsystem could not be "
+            f"initialised for this request — no per-task tmux lane "
+            f"was provisioned. Check tmux availability and the "
+            f"project worktree, then hold + resume the task to "
+            f"retry (`pm task hold {task_id} --reason "
+            f"'session attach failed'` then `pm task resume "
+            f"{task_id}`)."
+        )
+    return warnings
+
+
+def _project_of(task_id: str) -> str:
+    """Best-effort project-key extraction for warning wording.
+
+    Task IDs are ``"<project>/<n>"`` (see ``_parse_task_id`` in
+    ``pollypm.work.pg_service``). Falls back to ``"<project>"`` if
+    the shape is unexpected — the warning still renders, just with
+    a placeholder. Used only for operator-facing messages, never
+    for routing.
+    """
+    project, sep, _ = task_id.partition("/")
+    return project if sep else "<project>"
+
+
+def cancel_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str = "api",
+    reason: str | None = None,
+) -> APITaskDetail:
+    """Cancel a non-terminal task via the work-service.
+
+    Mirrors ``pm work cancel``. ``reason`` is optional at the API
+    surface (spec §5.3 body ``{reason?: str}``); the work-service's
+    ``cancel`` requires a string, so we fall back to a generic message
+    when the caller doesn't supply one — preserving the audit row's
+    ``reason`` slot regardless.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    cancel_reason = reason or "cancelled via API"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                svc.cancel(task_id, actor, cancel_reason)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                # Cancelling a terminal task is the most common path
+                # here; spec §5.5 maps that to 409 ``invalid_state``.
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc) or f"Task {task_id} cannot be cancelled.",
+                    hint="Tasks in terminal state (done/cancelled) cannot be cancelled again.",
+                ) from exc
+            task = svc.get(task_id)
+            return _task_to_detail_with_plan(task, svc=svc)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "cancel_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while cancelling {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def reassign_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+) -> APITaskDetail:
+    """Change the task's ``assignee`` via :meth:`WorkService.reassign_task`.
+
+    Routes through the dedicated ``reassign_task`` work-service method
+    (#2064 round-3) rather than ``svc.update(assignee=...)`` so the
+    column write and the context-log breadcrumb commit in a single
+    transaction. Spec §P-9 requires that mid-flight reassignment record
+    a row like ``"worker reassigned from pete to nora"`` so the new
+    owner can recover context via ``pm task get``. Using ``update``
+    would update the column silently and break that invariant.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                # ``actor`` in the request body is the *new assignee*
+                # (see :class:`TaskReassignRequest`). We attribute the
+                # context-log entry to the API surface — the HTTP layer
+                # is the operator of the handoff.
+                task = svc.reassign_task(
+                    task_id, new_assignee=actor, actor="api"
+                )
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                # #2064 round-9 blocker #4: reassign now refuses
+                # terminal / draft tasks (live-worker-swap invariant).
+                # The work-service raises ``InvalidTransitionError``
+                # from inside the row-lock select; surface as 409 so
+                # the contract matches the ``/claim`` / ``/cancel``
+                # transition endpoints.
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc)
+                    or f"Task {task_id} cannot be reassigned in its "
+                    f"current state.",
+                    hint=(
+                        "Reassign is a live-worker handoff; it refuses "
+                        "draft (queue + claim first) and terminal "
+                        "(done / cancelled) tasks."
+                    ),
+                ) from exc
+            except WorkValidationError as exc:
+                raise APIError(
+                    status_code=422,
+                    code="validation_error",
+                    message=str(exc) or "Reassignment failed validation.",
+                ) from exc
+            return _task_to_detail_with_plan(task, svc=svc)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "reassign_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while reassigning {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+# Labels supported on PATCH ``status`` — we route the request through the
+# work-service lifecycle method that maps to each value. Statuses without
+# a direct setter (e.g. ``in_progress``, ``review``) raise 422 with a
+# pointer to the dedicated transition endpoint. Spec §5.4 frames PATCH as
+# "selective field updates"; status-as-transition is the safe interpretation.
+_PATCH_STATUS_TO_METHOD: dict[str, str] = {
+    "queued": "queue",
+    "cancelled": "cancel",
+}
+
+
+def patch_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str = "api",
+    labels: list[str] | None = None,
+    status: str | None = None,
+    metadata: dict[str, str] | None = None,
+) -> APITaskDetail:
+    """Selective edits — labels / status / metadata.
+
+    Atomicity contract (#2064 round-2): the route layer refuses any
+    request that combines ``status`` with ``labels`` / ``metadata``
+    (returns ``400 invalid_request``) BEFORE this helper is called.
+    That means each invocation here is one of two shapes:
+
+    1. **Status-only PATCH** → routed through the matching lifecycle
+       method (``svc.queue`` / ``svc.cancel``). A single work-service
+       call, single DB write — naturally atomic.
+    2. **Field-only PATCH** (labels and/or metadata) → one
+       ``svc.update(...)`` call, batched into one ``UPDATE`` row
+       statement by ``PgWorkService.update`` — naturally atomic.
+
+    The previous in-memory preflight that gated labels+status across
+    two service calls was racy under concurrent writers (the task's
+    status could flip between preflight and the lifecycle call,
+    leaving labels committed and the status write 409'ing). The
+    narrowed contract above removes the racy code path entirely.
+
+    ``status`` is mapped to the matching lifecycle method (``queue``,
+    ``cancel``) when supported; everything else (in_progress /
+    review / on_hold / etc.) returns 422 with a hint to the dedicated
+    transition endpoint. ``metadata`` is stored as ``external_refs``
+    (the existing free-form per-task key/value surface).
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    # #2064 round-13: source the lifecycle state set from the canonical
+    # ``WorkStatus`` enum instead of hand-copying it here. Adding /
+    # renaming a state in ``pollypm.work.models`` should not also
+    # require touching the HTTP layer to keep PATCH validation in sync.
+    from pollypm.work.models import WorkStatus
+
+    valid_statuses = {s.value for s in WorkStatus}
+    if status is not None and status not in valid_statuses:
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=f"Unknown status: {status!r}",
+            hint=(
+                "Valid statuses: " + ", ".join(sorted(valid_statuses))
+            ),
+        )
+    # Reject unsupported PATCH status targets BEFORE opening a writer.
+    if status is not None and status not in _PATCH_STATUS_TO_METHOD:
+        raise APIError(
+            status_code=422,
+            code="validation_error",
+            message=(
+                f"PATCH cannot set status={status!r}; this state "
+                "is only reachable via a flow transition."
+            ),
+            hint=(
+                "Use the dedicated endpoint (e.g. /claim, "
+                "/approve-plan) or POST a context-aware "
+                "transition instead of PATCH."
+            ),
+        )
+
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            # #2064 round-13: the previous existence probe here caught
+            # ``Exception`` and re-raised as ``not_found``, masking
+            # ``_row_to_task`` bugs, facade misconfigurations, and other
+            # 500-class failures as a benign-looking 404. The probe is
+            # gone; each downstream call surfaces its own
+            # ``TaskNotFoundError`` (mapped to 404) and lets every other
+            # exception propagate to the existing 503/500 handlers.
+            # Empty-PATCH still 404s via the unconditional ``svc.get``
+            # at the end of the block.
+
+            # Field-only PATCH: labels and/or metadata land in ONE
+            # ``svc.update(...)`` call so they share a single DB
+            # transaction. ``PgWorkService.update`` batches set-clauses
+            # into a single UPDATE; combining the fields here prevents
+            # any labels-commit-then-metadata-fails partial-write
+            # window. Cannot coexist with ``status`` (route-layer 400).
+            combined_fields: dict[str, object] = {}
+            if labels is not None:
+                combined_fields["labels"] = labels
+            if metadata is not None:
+                combined_fields["external_refs"] = metadata
+            if combined_fields:
+                try:
+                    svc.update(task_id, **combined_fields)
+                except TaskNotFoundError as exc:
+                    raise not_found(f"Task not found: {task_id}") from exc
+                except WorkValidationError as exc:
+                    raise APIError(
+                        status_code=422,
+                        code="validation_error",
+                        message=(
+                            str(exc)
+                            or "labels/metadata update failed validation."
+                        ),
+                    ) from exc
+
+            # Status-only PATCH: route through the lifecycle owner
+            # (``svc.queue`` / ``svc.cancel``). One service call, one
+            # DB write — atomic. The route layer guarantees this
+            # branch never coexists with a labels/metadata write.
+            if status is not None:
+                method_name = _PATCH_STATUS_TO_METHOD[status]
+                try:
+                    if method_name == "queue":
+                        svc.queue(task_id, actor)
+                    elif method_name == "cancel":
+                        svc.cancel(task_id, actor, "patched via API")
+                except TaskNotFoundError as exc:
+                    raise not_found(f"Task not found: {task_id}") from exc
+                except InvalidTransitionError as exc:
+                    raise APIError(
+                        status_code=409,
+                        code="invalid_state",
+                        message=(
+                            str(exc)
+                            or f"Status transition to {status!r} refused."
+                        ),
+                    ) from exc
+                except WorkValidationError as exc:
+                    raise APIError(
+                        status_code=422,
+                        code="validation_error",
+                        message=str(exc) or "status transition gate failed.",
+                    ) from exc
+
+            # Final read also serves as the existence probe for an
+            # all-None PATCH (route layer already rejects truly-empty
+            # PATCH bodies, but a body with nothing matching the
+            # accepted fields would otherwise sail through silently).
+            try:
+                task = svc.get(task_id)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            return _task_to_detail_with_plan(task, svc=svc)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "patch_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while patching {task_id}",
             hint="Retry shortly; check `pm doctor` if the failure persists.",
         ) from exc
 
@@ -1997,6 +2519,33 @@ def _task_to_summary(task) -> APITaskSummary:
     )
 
 
+def _task_to_detail_with_plan(task, *, svc) -> APITaskDetail:
+    """Return :class:`APITaskDetail` with ``plan`` hydrated for plan reviews.
+
+    Mirrors the rule applied at :func:`get_task_detail` (the canonical
+    GET-shape builder) and :func:`queue_task`: if the task is a plan
+    task currently in review, build the ``APIPlan`` payload from the
+    same ``_build_plan`` helper the GET path uses. Any mutation helper
+    that returns a :class:`TaskActionResult` (claim / reassign / patch
+    / queue / cancel) MUST route through this helper so the response's
+    ``task`` field carries the same shape as a follow-up GET — the
+    ``TaskActionResult`` envelope is documented as the
+    refresh-without-follow-up-GET contract (#2064 round-4, spec §5.3,
+    ``src/pollypm/web_api/models.py:347``).
+
+    Plan hydration is best-effort: ``_build_plan`` exceptions collapse
+    to ``plan=None`` rather than 500'ing the mutation, matching the
+    long-standing GET behaviour.
+    """
+    plan: APIPlan | None = None
+    if _is_plan_task(task) and _is_in_review(task):
+        try:
+            plan = _build_plan(svc, task)
+        except Exception:  # noqa: BLE001
+            plan = None
+    return _task_to_detail(task, plan=plan)
+
+
 def _task_to_detail(task, *, plan: APIPlan | None = None) -> APITaskDetail:
     relationships = APITaskRelationships(
         parent=_pair_to_id(task.parent_project, task.parent_task_number),
@@ -2522,6 +3071,8 @@ __all__ = [
     "archive_inbox_item",
     "archive_project",
     "audit_event_to_api",
+    "cancel_task",
+    "claim_task",
     "get_active_plan",
     "get_inbox_item",
     "get_project",
@@ -2533,9 +3084,11 @@ __all__ = [
     "list_projects",
     "load_api_config",
     "mark_read_inbox_item",
+    "patch_task",
     "project_drilldown",
     "promote_inbox_to_task",
     "queue_task",
+    "reassign_task",
     "reply_inbox_item",
     "set_project_tracked",
     "snooze_inbox_item",

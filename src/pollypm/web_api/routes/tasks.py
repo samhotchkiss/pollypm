@@ -9,6 +9,12 @@ Phase 2 scaffolding (work-service factory, typed errors, ActionResult
 envelope, Idempotency-Key plumbing) without dragging in the
 plan/code-review state machine. ``approve`` / ``reject`` follow once
 the wedge is in.
+
+Phase 2 surface #3 (#1548 spec §5.3 + §5.4) adds the remaining
+task-state-mutation verbs: ``/claim``, ``/cancel``, ``/reassign``
+and the ``PATCH`` edit surface. Each new handler returns
+``TaskActionResult = {ok, message, task: TaskDetail}`` so clients
+refresh state in one round-trip (spec §5.3 wrapper).
 """
 
 from __future__ import annotations
@@ -16,21 +22,30 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Header, Query
+from fastapi import APIRouter, Query
 
-from pollypm.web_api.errors import APIError, not_found
+from pollypm.web_api.errors import APIError, invalid_request, not_found
 from pollypm.web_api.models import (
     ActionResult,
+    TaskActionResult,
+    TaskCancelRequest,
+    TaskClaimRequest,
     TaskDetail,
     TaskListResponse,
     TaskListWarning,
+    TaskPatchRequest,
+    TaskReassignRequest,
 )
 from pollypm.web_api.routes._deps import ConfigDep
 from pollypm.web_api.service import (
     StaleCursorError,
+    cancel_task,
+    claim_task,
     get_task_detail,
     list_all_tasks,
+    patch_task,
     queue_task,
+    reassign_task,
 )
 
 router = APIRouter(tags=["Tasks"])
@@ -149,17 +164,17 @@ def get_task_endpoint(project: str, n: int, config: ConfigDep) -> TaskDetail:
         "401": {"description": "Missing or invalid bearer token."},
         "404": {"description": "Project or task not found."},
         "409": {"description": "Task is not in a queueable state."},
+        # #2064 round-9 blocker #3: the service helper catches
+        # ``_BACKING_STORE_ERRORS`` and raises ``service_unavailable``;
+        # advertise that here so generated clients branch on the same
+        # 503 envelope they'll see on a real pg outage.
+        "503": {"description": "Backing store unavailable."},
     },
 )
 def queue_task_endpoint(
     project: str,
     n: int,
     config: ConfigDep,
-    # ``Idempotency-Key`` is accepted in Phase 2 per the issue scope
-    # ("OPTIONAL in Phase 2 — actual replay-cache persistence ships in
-    # Phase 3"). We don't dedupe yet; declaring the header keeps the
-    # OpenAPI contract honest and lets clients send it from day one.
-    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
 ) -> ActionResult:
     # The work-service knows how to look up the task; we still
     # short-circuit on an unregistered project so the 404 message is
@@ -168,3 +183,222 @@ def queue_task_endpoint(
         raise not_found(f"Project not registered: {project}")
     task = queue_task(config, project, n)
     return ActionResult(ok=True, message=f"queued {task.task_id}")
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 surface #3 — claim / cancel / reassign / PATCH
+#
+# Each handler short-circuits on an unregistered project so the 404
+# message is project-specific (consistent with the GET / queue
+# handlers). ``Idempotency-Key`` and ``If-Match`` are intentionally
+# NOT declared on these handlers — no replay cache or version-token
+# enforcement exists yet (mirrors #2060 round-1 decision for the
+# inbox writes). Advertising them but discarding them would lie to
+# clients: a lost-response retry would 409 instead of replaying, and
+# concurrent edits would race silently. The headers will reappear
+# once a real replay store + ``If-Match`` enforcement ships.
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/tasks/{project}/{n}/claim",
+    response_model=TaskActionResult,
+    summary="Atomically claim a queued task",
+    operation_id="claimTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Task is not in a claimable state."},
+        "422": {"description": "Claim gate failure."},
+        "429": {
+            "description": (
+                "Worker cap exceeded — normal back-pressure from "
+                "`max_parallel_workers`. Retry once a slot frees."
+            ),
+        },
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def claim_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskClaimRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    # ``claim_task`` returns ``(task, warnings)`` — warnings carry
+    # post-commit operator advisories like ``last_provision_error``
+    # and SessionManager attach failures (#2064 round-10). They never
+    # fail the request; the envelope's ``warnings`` field lets the
+    # client surface a banner alongside the ``in_progress`` task.
+    task, warnings = claim_task(config, project, n, actor=body.actor)
+    # #2064 round-11 blocker #2: the message must reflect the actual
+    # post-claim state. The post-commit cap race
+    # (``pg_service.py:1917-1939``) can roll the row back to
+    # ``queued`` after the initial transition — saying "claimed
+    # myproj/3" then would lie. Inspect ``task.work_status`` instead
+    # of assuming success.
+    if task.work_status == "queued":
+        message = (
+            f"claim attempted but rolled back; task "
+            f"{task.task_id} remains queued"
+        )
+    else:
+        message = f"claimed {task.task_id}"
+    return TaskActionResult(
+        ok=True,
+        message=message,
+        task=task,
+        warnings=warnings,
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/cancel",
+    response_model=TaskActionResult,
+    summary="Cancel a non-terminal task",
+    operation_id="cancelTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Task is already in a terminal state."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def cancel_task_endpoint(
+    project: str,
+    n: int,
+    config: ConfigDep,
+    body: TaskCancelRequest | None = None,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    reason = body.reason if body is not None else None
+    task = cancel_task(config, project, n, reason=reason)
+    return TaskActionResult(
+        ok=True, message=f"cancelled {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/reassign",
+    response_model=TaskActionResult,
+    summary="Change the task's assignee",
+    operation_id="reassignTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        # #2064 round-9 blocker #4: reassign now refuses
+        # terminal / draft tasks (live-worker-swap invariant) with
+        # a 409 invalid_state, matching ``/claim`` and ``/cancel``.
+        "409": {
+            "description": (
+                "Task is in a state that does not permit a worker swap "
+                "(draft / done / cancelled)."
+            ),
+        },
+        "422": {"description": "Assignee value rejected."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def reassign_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskReassignRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = reassign_task(config, project, n, actor=body.actor)
+    return TaskActionResult(
+        ok=True,
+        message=f"reassigned {task.task_id} to {body.actor}",
+        task=task,
+    )
+
+
+@router.patch(
+    "/tasks/{project}/{n}",
+    response_model=TaskActionResult,
+    summary="Selective task edits (labels, status, metadata)",
+    operation_id="patchTask",
+    responses={
+        "400": {
+            "description": (
+                "Cannot combine `status` with other mutable fields in a "
+                "single PATCH."
+            ),
+        },
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Status transition refused by the state machine."},
+        "422": {"description": "Body validation / unsupported status."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def patch_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskPatchRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    # No-op guard (#2064 round-6): ``TaskPatchRequest`` makes every
+    # field optional so the wire shape can carry "just labels" or
+    # "just status" without sending the others. An all-``None`` body
+    # has no observable effect on the task, but the handler would
+    # still ``svc.get(...)`` and respond ``200 ok`` — masking client
+    # bugs (e.g. a frontend that forgot to attach the form payload).
+    # Refuse the empty shape up front with the same typed-error
+    # helper the combined-shape check below uses.
+    if body.labels is None and body.status is None and body.metadata is None:
+        raise invalid_request(
+            (
+                "PATCH body must include at least one of: "
+                "`labels`, `status`, `metadata`."
+            ),
+            hint=(
+                "Send the field you want to change; an empty body "
+                "or one with only `null` values is rejected to "
+                "surface client-side payload bugs."
+            ),
+        )
+    # Atomicity contract (#2064 round-2): PATCH cannot combine
+    # ``status`` with labels/metadata. ``svc.update(...)`` and the
+    # lifecycle methods (``svc.queue`` / ``svc.cancel``) commit in
+    # separate transactions, so a concurrent writer can flip the
+    # task's status between the in-memory preflight and the
+    # lifecycle call — leaving labels/metadata committed while the
+    # status write 409s. Refuse the combined shape up front; clients
+    # should send one PATCH per concern, or use the dedicated
+    # ``/queue`` / ``/cancel`` / ``/claim`` / ``/reassign`` endpoints
+    # for status changes. Rejecting BEFORE any work-service call
+    # guarantees no partial commit.
+    if body.status is not None and (
+        body.labels is not None or body.metadata is not None
+    ):
+        raise invalid_request(
+            (
+                "PATCH cannot combine `status` with `labels` or "
+                "`metadata` in a single request."
+            ),
+            hint=(
+                "Send separate PATCH requests (one for status, one "
+                "for the other fields), or use the dedicated status "
+                "endpoints (POST /tasks/{project}/{n}/queue, /cancel, "
+                "/claim, /reassign)."
+            ),
+        )
+    task = patch_task(
+        config,
+        project,
+        n,
+        labels=body.labels,
+        status=body.status,
+        metadata=body.metadata,
+    )
+    return TaskActionResult(
+        ok=True, message=f"patched {task.task_id}", task=task
+    )

@@ -887,6 +887,65 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+    patch:
+      tags: [Tasks]
+      operationId: patchTask
+      summary: Selective task edits (labels, status, metadata)
+      description: |
+        Partial update — every field is optional. Lists replace, not
+        merge (spec §5.4). `metadata` is stored as the task's
+        `external_refs` map.
+
+        **PATCH cannot combine `status` with other fields.** Requests
+        that send `status` together with `labels` or `metadata` are
+        rejected with `400 invalid_request` BEFORE any write occurs.
+        This narrows the contract so each PATCH is naturally atomic:
+        a status-only PATCH routes through the work-service lifecycle
+        method (`queued` → `svc.queue`, `cancelled` → `svc.cancel`)
+        as a single transaction, and a field-only PATCH (labels
+        and/or metadata) lands in one `svc.update(...)` call. The
+        combined shape was racy under concurrent writers — a status
+        flip between the preflight and the lifecycle call could
+        leave labels committed while the status write 409'd
+        (#2064 round-2).
+
+        Clients that need to change status alongside other fields
+        must send separate PATCH requests, or use the dedicated
+        status endpoints (`/queue`, `/cancel`, `/claim`,
+        `/reassign`). `status` values without a direct PATCH→lifecycle
+        map (e.g. `in_progress`, `review`) raise `422
+        validation_error` with a hint pointing to the dedicated
+        transition endpoint.
+
+        `Idempotency-Key` and `If-Match` are intentionally NOT
+        accepted — no replay cache or version-token enforcement
+        exists yet (#2064, mirrors #2060).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskPatchRequest"
+      responses:
+        "200":
+          description: Edit applied; response carries the post-edit
+            task snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "400":
+          $ref: "#/components/responses/InvalidRequest"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /tasks/{project}/{n}/queue:
     parameters:
@@ -896,8 +955,9 @@ paths:
       tags: [Tasks]
       operationId: queueTask
       summary: Queue a draft task for execution
-      parameters:
-        - $ref: "#/components/parameters/IdempotencyKey"
+      description: |
+        `Idempotency-Key` is intentionally NOT accepted — no replay
+        cache exists yet (#2064 round-1, mirrors #2060).
       responses:
         "200":
           description: Task transitioned `draft` → `queued`.
@@ -911,6 +971,182 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/claim:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: claimTask
+      summary: Atomically claim a queued task
+      description: |
+        Sets the task's `assignee` and advances the flow to the start
+        (or current) node. Refuses non-queued tasks with `409
+        invalid_state`. Refuses claims that would exceed the
+        project's `max_parallel_workers` ceiling with `429
+        worker_cap_exceeded` (#2064 round-11) — normal back-pressure
+        the client should retry once an existing worker finishes.
+        `Idempotency-Key` and `If-Match` are intentionally NOT
+        accepted — no replay cache or version-token enforcement
+        exists yet (#2064 round-1, mirrors #2060).
+
+        The response message reflects the actual post-claim state:
+        if a post-commit worker-cap race rolls the DB transition
+        back to `queued`, the envelope's `message` says "rolled
+        back" and `warnings` describes the recovery path (#2064
+        round-11 blocker #2).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskClaimRequest"
+      responses:
+        "200":
+          description: Claim recorded; task is now `in_progress` (or
+            `review` for a review-start node). Status may instead
+            read `queued` if a post-commit cap-race rolled the
+            transition back — clients route on `task.work_status`
+            and surface `warnings[]`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          description: |
+            Worker cap exceeded — the project already has
+            `max_parallel_workers` active worker sessions. Body
+            uses error code `worker_cap_exceeded`. Retry after a
+            worker finishes, or raise the cap in `pollypm.toml`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/cancel:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: cancelTask
+      summary: Cancel a non-terminal task
+      description: |
+        Moves any non-terminal task to `cancelled` and emits the
+        cancel-cascade (dependents get an `_on_cancelled` breadcrumb).
+        Cancelling a terminal (done/cancelled) task returns `409
+        invalid_state`. `Idempotency-Key` and `If-Match` are
+        intentionally NOT accepted — no replay cache or version-token
+        enforcement exists yet (#2064 round-1, mirrors #2060).
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskCancelRequest"
+      responses:
+        "200":
+          description: Task transitioned to `cancelled`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/reassign:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: reassignTask
+      summary: Change the task's assignee
+      description: |
+        Reassigns the task to a new worker. Updates the `assignee`
+        column AND appends a work-context breadcrumb (entry_type
+        `reassignment`) recording the old→new transition. Both
+        mutations land in a single transaction; concurrent reassigns
+        serialize via `SELECT ... FOR UPDATE` so the breadcrumb chain
+        names the actual previous owner.
+
+        The task's `work_status` is unchanged (no state-machine
+        transition fires). Spec §5.3 leaves `null ⇒ unassign` open;
+        this endpoint requires a non-empty `actor`. The breadcrumb is
+        attributed to `"api"` (the HTTP layer is the operator).
+
+        This is the ONLY operator surface for changing `assignee`
+        (#2064 round-9 blocker #5). PATCH `/tasks/{p}/{n}` does not accept the assignee field
+        — the `TaskPatchRequest` schema is
+        `additionalProperties: false`, so unknown keys including
+        `assignee` are rejected with `422 validation_error` at
+        request validation. `pm task update` does not advertise
+        `--assignee` either. There is no breadcrumb-less assignee
+        update path on either surface — every assignee change
+        records a `reassignment` context entry so the new owner
+        can recover via `pm task get`.
+
+        Refuses non-live tasks (`draft`, `queued`, `done`,
+        `cancelled`) with `409 invalid_state` — reassign is a
+        mid-flight worker swap (spec §P-9), not a generic
+        owner-relabel. Queued tasks cannot be reassigned (#2064
+        round-11 blocker #3): queued dispatch routes by
+        `task.roles["worker"]`, not the `assignee` column, so a
+        queued reassign would set `assignee` to the new owner but
+        the next `claim()` would still route to the original role
+        owner. To redirect a queued task: cancel + re-queue with
+        the new `roles.worker`.
+
+        `Idempotency-Key` and `If-Match` are intentionally NOT
+        accepted — no replay cache or version-token enforcement
+        exists yet (#2064 round-1, mirrors #2060).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskReassignRequest"
+      responses:
+        "200":
+          description: |
+            200 OK with hydrated TaskDetail including the new context
+            entry (entry_type='reassignment') with body like
+            `worker reassigned from <old> to <new>`. The assignee
+            column is updated and the breadcrumb is appended in a
+            single atomic transaction.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 
   /inbox:
     get:
@@ -2694,6 +2930,136 @@ components:
         reason:
           type: string
           minLength: 1
+
+    TaskClaimRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: |
+            Identity to record on the claim audit row. The
+            work-service derives the resulting `assignee` from the
+            task's flow + roles when applicable.
+      description: |
+        `additionalProperties: false` mirrors the runtime
+        `TaskClaimRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys — including
+        `assignee` (spec §5.3 mentions it, but this endpoint derives
+        the assignee from the work-service; use `/reassign` instead)
+        — surface as a `422 validation_error` from the request
+        validator instead of being silently dropped (#2064 round-12).
+
+    TaskCancelRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          description: |
+            Optional explanation; absent reasons collapse to
+            "cancelled via API" in the audit row.
+      description: |
+        `additionalProperties: false` mirrors the runtime
+        `TaskCancelRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys surface as a
+        `422 validation_error` instead of being silently dropped
+        (#2064 round-12).
+
+    TaskReassignRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: |
+            New assignee. Updates the `assignee` column AND appends a
+            work-context breadcrumb (entry_type `reassignment`) noting
+            the old→new transition. Both mutations land in a single
+            transaction; concurrent reassigns serialize via
+            `SELECT ... FOR UPDATE`. No state-machine transition
+            fires (`work_status` unchanged).
+      description: |
+        `additionalProperties: false` mirrors the runtime
+        `TaskReassignRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys surface as a
+        `422 validation_error` instead of being silently dropped
+        (#2064 round-12).
+
+    TaskPatchRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Partial-update body. Every field is optional; only fields
+        present in the body are written. Lists replace, not merge
+        (spec §5.4).
+
+        `additionalProperties: false` mirrors the runtime
+        `TaskPatchRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys — typos like
+        `metdata` or unsupported fields like `priority` / `assignee`
+        — surface as a `422 validation_error` from the request
+        validator instead of being silently dropped. Generated
+        clients reading this schema see the same contract the
+        server enforces.
+      properties:
+        labels:
+          type: array
+          items: { type: string }
+          description: |
+            Replacement label set. Pass `[]` to clear. Pass `null`
+            (i.e. omit the key) to leave labels untouched.
+        status:
+          type: string
+          description: |
+            Target work-status. Only `queued` and `cancelled` are
+            routed via PATCH (mapped to `svc.queue` / `svc.cancel`);
+            other statuses raise `422 validation_error` with a hint
+            pointing to the dedicated transition endpoint.
+        metadata:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            Free-form per-task key/value map. Stored as the task's
+            `external_refs` column.
+
+    TaskActionResult:
+      type: object
+      required: [ok, task]
+      description: |
+        Mutation envelope for the task transition / edit endpoints
+        (spec §5.3). Carries the post-mutation `TaskDetail` so the
+        client refreshes its UI without a follow-up `GET`.
+      properties:
+        ok:
+          type: boolean
+        message:
+          type: string
+          description: Operator-facing summary; clients should not parse it.
+        task:
+          $ref: "#/components/schemas/TaskDetail"
+        warnings:
+          type: array
+          default: []
+          items:
+            type: string
+          description: |
+            Operator-facing warnings about side effects of the
+            transition that did NOT fail the request (#2064
+            round-10). Today this is populated by the claim path
+            to surface `last_provision_error` when the DB claim
+            committed but the per-task worker session could not
+            be provisioned (tmux/worktree/cap failures), and to
+            surface SessionManager wire-up failures. Each entry
+            includes recovery wording (hold + resume) matching
+            the CLI's `pm task claim` stderr warning. Empty on
+            the happy path; clients can branch on
+            `len(warnings) > 0` to render a banner alongside the
+            now-`in_progress` task.
 
     # ---- Plan -------------------------------------------------------
     PlanJudgmentCall:

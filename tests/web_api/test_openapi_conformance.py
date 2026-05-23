@@ -187,6 +187,71 @@ def test_static_yaml_does_not_advertise_idempotency_on_inbox_writes() -> None:
         )
 
 
+def test_static_yaml_does_not_advertise_idempotency_or_ifmatch_on_tasks() -> None:
+    """Static contract must match the implementation: no Idempotency-Key
+    or If-Match on task-state-mutation paths.
+
+    #2064 round-1 stripped both headers from the FastAPI handlers for
+    /queue, /claim, /cancel, /reassign, and PATCH /tasks/{p}/{n}
+    (mirrors #2060 round-1) because no replay cache or version-token
+    enforcement exists. Generated clients reading the static YAML
+    must see the same contract — otherwise they'd send headers the
+    server silently discards (Idempotency-Key) or thinks it honors
+    (If-Match concurrency).
+    """
+    contract = _load_contract()
+    paths = contract.get("paths", {})
+
+    # POST /tasks/{p}/{n}/{claim,cancel,reassign,queue}
+    task_post_paths = [
+        "/tasks/{project}/{n}/queue",
+        "/tasks/{project}/{n}/claim",
+        "/tasks/{project}/{n}/cancel",
+        "/tasks/{project}/{n}/reassign",
+    ]
+    for path in task_post_paths:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        params = post.get("parameters", []) or []
+        refs = [
+            p.get("$ref", "") for p in params if isinstance(p, dict)
+        ]
+        assert not any(
+            "IdempotencyKey" in ref for ref in refs
+        ), (
+            f"{path} static contract still advertises Idempotency-Key "
+            "but the handler does not implement it (#2064). Strip the "
+            "$ref or wire a real replay cache first."
+        )
+        # Inline If-Match (no shared component for it today).
+        for param in params:
+            if isinstance(param, dict) and param.get("name") == "If-Match":
+                raise AssertionError(
+                    f"{path} static contract still advertises If-Match "
+                    "but the handler does not enforce it (#2064). Strip "
+                    "the parameter or wire real version-token enforcement."
+                )
+
+    # PATCH /tasks/{project}/{n} lives on the GET path too — check the
+    # patch op specifically.
+    patch_op = paths.get("/tasks/{project}/{n}", {}).get("patch", {})
+    patch_params = patch_op.get("parameters", []) or []
+    patch_refs = [
+        p.get("$ref", "") for p in patch_params if isinstance(p, dict)
+    ]
+    assert not any("IdempotencyKey" in ref for ref in patch_refs), (
+        "PATCH /tasks/{project}/{n} static contract still advertises "
+        "Idempotency-Key but the handler does not implement it (#2064)."
+    )
+    for param in patch_params:
+        if isinstance(param, dict) and param.get("name") == "If-Match":
+            raise AssertionError(
+                "PATCH /tasks/{project}/{n} static contract still "
+                "advertises If-Match but the handler does not enforce "
+                "it (#2064)."
+            )
+
+
 def test_static_yaml_declares_503_on_inbox_write_paths() -> None:
     """Static contract must declare 503 on every inbox-write path.
 
@@ -223,6 +288,124 @@ def test_static_yaml_declares_503_on_inbox_write_paths() -> None:
             "errors to a 503 with the service_unavailable envelope; "
             "the YAML must say so too."
         )
+
+
+def test_static_yaml_declares_503_on_task_write_paths() -> None:
+    """Static contract must declare 503 on every task-write path.
+
+    Round 9 of #2064 — mirror of the inbox-write 503 conformance
+    test above. The FastAPI handlers in
+    ``src/pollypm/web_api/routes/tasks.py`` catch
+    ``_BACKING_STORE_ERRORS`` (psycopg.OperationalError /
+    psycopg_pool.PoolTimeout) and raise ``service_unavailable``
+    (503), but ``docs/api/openapi.yaml`` was missing the 503 entry
+    on ``/queue``, ``/claim``, ``/cancel``, ``/reassign``, and
+    PATCH ``/tasks/{project}/{n}``. Generated clients would not
+    know to handle a real pg outage with the same typed-error
+    envelope they see from the live server.
+
+    Pin coverage so future drift trips CI.
+    """
+    contract = _load_contract()
+    task_write_paths_post = [
+        "/tasks/{project}/{n}/queue",
+        "/tasks/{project}/{n}/claim",
+        "/tasks/{project}/{n}/cancel",
+        "/tasks/{project}/{n}/reassign",
+    ]
+    paths = contract.get("paths", {})
+    for path in task_write_paths_post:
+        ops = paths.get(path, {})
+        post = ops.get("post", {})
+        responses = post.get("responses", {}) or {}
+        assert "503" in responses, (
+            f"{path} POST missing 503 response in static contract "
+            "(#2064 round-9). The FastAPI handler maps backing-store "
+            "errors to a 503 with the service_unavailable envelope; "
+            "the YAML must say so too."
+        )
+    patch_responses = (
+        paths.get("/tasks/{project}/{n}", {})
+        .get("patch", {})
+        .get("responses", {})
+        or {}
+    )
+    assert "503" in patch_responses, (
+        "PATCH /tasks/{project}/{n} missing 503 response in static "
+        "contract (#2064 round-9). The FastAPI handler maps "
+        "backing-store errors to a 503 with the service_unavailable "
+        "envelope; the YAML must say so too."
+    )
+
+
+def test_task_write_endpoints_document_503() -> None:
+    """Implementation-side conformance for task-write 503 coverage.
+
+    Mirrors :func:`test_static_yaml_declares_503_on_inbox_write_paths`
+    on the auto-generated FastAPI OpenAPI document. Every task-write
+    route's ``responses=`` map must include 503 so generated clients
+    branch on the same typed envelope they see at runtime
+    (#2064 round-9 blocker #3).
+    """
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+    )
+    from pollypm.models import ProviderKind, RuntimeKind
+    from pollypm.web_api import create_app
+
+    base = Path(__file__).resolve().parent
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="P", root_dir=base, tmux_session="t",
+            workspace_root=base, base_dir=base / ".pollypm",
+            logs_dir=base / ".pollypm/logs",
+            snapshots_dir=base / ".pollypm/snapshots",
+            state_db=base / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={"codex_primary": AccountConfig(
+            name="codex_primary", provider=ProviderKind.CODEX,
+            email="codex@example.com", runtime=RuntimeKind.LOCAL,
+            home=base / ".pollypm/homes/codex_primary",
+        )},
+        sessions={},
+        projects={},
+        memory=MemorySettings(backend="file"),
+    )
+    app = create_app(config=config, token_path=base / "tmp-token")
+    raw = app.openapi()
+    paths = raw["paths"]
+
+    post_paths = [
+        "/api/v1/tasks/{project}/{n}/queue",
+        "/api/v1/tasks/{project}/{n}/claim",
+        "/api/v1/tasks/{project}/{n}/cancel",
+        "/api/v1/tasks/{project}/{n}/reassign",
+    ]
+    for path in post_paths:
+        responses = paths[path]["post"]["responses"]
+        assert "503" in responses, (
+            f"Implementation OpenAPI for POST {path} is missing a 503 "
+            "response — keep the route's ``responses=`` map in sync "
+            "with the static contract (#2064 round-9)."
+        )
+    patch_responses = paths["/api/v1/tasks/{project}/{n}"]["patch"]["responses"]
+    assert "503" in patch_responses, (
+        "Implementation OpenAPI for PATCH /api/v1/tasks/{project}/{n} "
+        "is missing a 503 response (#2064 round-9)."
+    )
 
 
 def test_inbox_archive_reason_documented_as_post_transition() -> None:
@@ -331,6 +514,183 @@ def test_archive_documents_409_session_reference_conflict() -> None:
         "Implementation OpenAPI for POST /api/v1/projects/{key}/archive is "
         "missing a 409 response — keep the route's ``responses=`` map in "
         "sync with the static contract (Codex round 4 on #2063)."
+    )
+
+
+def test_reassign_docs_dont_suggest_patch_assignee() -> None:
+    """Pin out the stale PATCH-assignee guidance on the reassign endpoint.
+
+    Round 7 (Codex) on #2064 flagged that the reassign endpoint
+    description in ``docs/api/openapi.yaml`` told clients to use
+    ``PATCH /tasks/{project}/{n}`` with ``assignee`` for low-level
+    bookkeeping. ``TaskPatchRequest`` only accepts ``labels``,
+    ``status``, and ``metadata`` (and now forbids extras), so a client
+    following that prose would get a 422 instead of an assignee
+    update. The description was rewritten to make clear that PATCH
+    does NOT accept ``assignee`` and that low-level updates must go
+    through the work service directly via the CLI.
+
+    This test fails if anyone re-introduces the PATCH-assignee
+    suggestion into the reassign description.
+    """
+    contract = _load_contract()
+    reassign_op = (
+        contract["paths"]["/tasks/{project}/{n}/reassign"]["post"]
+    )
+    description = reassign_op["description"]
+    lowered = description.lower()
+    assert "does not accept the assignee" in lowered, (
+        "Reassign description must explicitly tell clients that "
+        "PATCH /tasks/{p}/{n} does NOT accept ``assignee`` "
+        "(#2064 round-7). Got: " + description
+    )
+    # The old guidance variant — pin it out so a doc-sync regression
+    # surfaces here instead of in a generated-client bug report.
+    assert "operator bookkeeping" not in lowered, (
+        "Reassign description reverted to the old PATCH-assignee "
+        "guidance (``... is for operator bookkeeping only``). PATCH "
+        "/tasks/{p}/{n} rejects ``assignee`` with 422 — see "
+        "TaskPatchRequest in src/pollypm/web_api/models.py."
+    )
+
+
+def test_task_patch_request_schema_forbids_extras() -> None:
+    """Pin ``TaskPatchRequest`` extras=forbid in the static YAML.
+
+    Round 8 (Codex) on #2064: the runtime model has
+    ``model_config = {"extra": "forbid"}`` (see
+    ``src/pollypm/web_api/models.py:350``), so the FastAPI
+    request validator rejects unknown keys with 422. Without
+    ``additionalProperties: false`` on the static
+    ``TaskPatchRequest`` schema, generated clients reading
+    ``docs/api/openapi.yaml`` treat extras as schema-valid and
+    only discover the rejection at runtime — exactly the
+    drift Codex flagged.
+
+    This test pins the static schema. It also pins the
+    runtime-vs-static parity by re-reading the Pydantic
+    model's generated schema so a future ``extra="allow"``
+    drift on either side trips here.
+    """
+    from pollypm.web_api.models import TaskPatchRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskPatchRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskPatchRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys (typos like ``metdata`` or "
+        "unsupported fields like ``priority`` / ``assignee``) as "
+        "valid even though the server returns 422 (#2064 round-8)."
+    )
+
+    # Runtime-vs-static parity: if the Pydantic model ever
+    # relaxes back to ``extra='allow'``/``ignore``, the
+    # generated schema drops ``additionalProperties: false`` and
+    # this assertion fires before the contract drifts again.
+    runtime_schema = TaskPatchRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskPatchRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )
+
+
+def test_task_claim_request_schema_forbids_extras() -> None:
+    """Pin ``TaskClaimRequest`` extras=forbid in runtime + static YAML.
+
+    Round 12 (Codex) on #2064: the round-6 fix locked down
+    ``TaskPatchRequest`` but the sibling request models
+    (``TaskClaimRequest`` / ``TaskCancelRequest`` /
+    ``TaskReassignRequest``) still defaulted to Pydantic
+    ``extra='ignore'``. A client following spec §5.3 and
+    POSTing ``{"actor": "alice", "assignee": "bob"}`` to
+    ``/claim`` would get a silent 200 with the ``assignee``
+    field dropped on the floor — the work-service derives
+    assignee from the flow + roles. Forbidding extras turns
+    that into a 422 instead.
+
+    Mirrors ``test_task_patch_request_schema_forbids_extras``
+    above; runtime + static parity so neither side can drift
+    back without tripping CI.
+    """
+    from pollypm.web_api.models import TaskClaimRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskClaimRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskClaimRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys (e.g. ``assignee`` from spec "
+        "§5.3, which the work-service derives instead) as valid "
+        "even though the server returns 422 (#2064 round-12)."
+    )
+
+    runtime_schema = TaskClaimRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskClaimRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )
+
+
+def test_task_cancel_request_schema_forbids_extras() -> None:
+    """Pin ``TaskCancelRequest`` extras=forbid in runtime + static YAML.
+
+    Round 12 (Codex) on #2064. See
+    ``test_task_claim_request_schema_forbids_extras`` for the
+    framing.
+    """
+    from pollypm.web_api.models import TaskCancelRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskCancelRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskCancelRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys as valid even though the "
+        "server returns 422 (#2064 round-12)."
+    )
+
+    runtime_schema = TaskCancelRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskCancelRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
+    )
+
+
+def test_task_reassign_request_schema_forbids_extras() -> None:
+    """Pin ``TaskReassignRequest`` extras=forbid in runtime + static YAML.
+
+    Round 12 (Codex) on #2064. See
+    ``test_task_claim_request_schema_forbids_extras`` for the
+    framing.
+    """
+    from pollypm.web_api.models import TaskReassignRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskReassignRequest"]
+    assert static_schema.get("additionalProperties") is False, (
+        "TaskReassignRequest in docs/api/openapi.yaml must declare "
+        "``additionalProperties: false`` to mirror the runtime "
+        "``extra='forbid'`` config — generated clients would "
+        "otherwise treat unknown keys as valid even though the "
+        "server returns 422 (#2064 round-12)."
+    )
+
+    runtime_schema = TaskReassignRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False, (
+        "Runtime TaskReassignRequest no longer emits "
+        "``additionalProperties: false``. Restore "
+        "``model_config = {'extra': 'forbid'}`` on the Pydantic "
+        "model so the static YAML and the request validator agree."
     )
 
 

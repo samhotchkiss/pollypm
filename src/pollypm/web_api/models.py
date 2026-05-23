@@ -290,6 +290,126 @@ class TaskListResponse(BaseModel):
     warnings: list[TaskListWarning] | None = None
 
 
+# ---------------------------------------------------------------------------
+# Task transition / edit request + response shapes (Phase 2 — #1548)
+# ---------------------------------------------------------------------------
+
+
+class TaskClaimRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/claim``.
+
+    Spec §5.3 documents ``{assignee, actor}``; this PR keeps the
+    surface tight to ``actor`` (the assigning user) — the
+    work-service derives the resulting ``assignee`` from the task's
+    flow + roles. A separate ``/reassign`` endpoint covers "change
+    owner" semantics.
+
+    ``extra="forbid"`` (Codex round-12, #2064): without it Pydantic
+    silently drops unsupported keys (e.g. an ``assignee`` field a
+    client sends thinking ``/claim`` accepts the spec §5.3 shape),
+    and the request is processed as if the field were never sent.
+    Forbidding extras turns those typos / unsupported fields into a
+    ``422 Unprocessable Entity`` from FastAPI's request validator so
+    the client sees the contract mismatch immediately. Mirrors
+    ``TaskPatchRequest`` below.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+
+
+class TaskCancelRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/cancel``.
+
+    ``reason`` is optional per spec §5.3; absent reasons resolve to
+    ``"cancelled via API"`` in the audit row so grep stays meaningful.
+
+    ``extra="forbid"`` (Codex round-12, #2064): see ``TaskClaimRequest``
+    above — keep the request surface tight so misspelled / unsupported
+    fields surface as 422 instead of being silently dropped.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    reason: str | None = None
+
+
+class TaskReassignRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/reassign``.
+
+    Sets the task's ``assignee`` to ``actor``. ``null`` is not yet
+    supported (spec leaves "null ⇒ unassign" open; we'd need a second
+    column setter for that and the use-case is rare today).
+
+    ``extra="forbid"`` (Codex round-12, #2064): see ``TaskClaimRequest``
+    above — keep the request surface tight so misspelled / unsupported
+    fields surface as 422 instead of being silently dropped.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+
+
+class TaskPatchRequest(BaseModel):
+    """Body for ``PATCH /tasks/{project}/{n}``.
+
+    Per spec §5.4 — selective field updates. Lists replace (not
+    merge). Unrecognised statuses raise 422; statuses that aren't
+    reachable via the work-service's direct setters (e.g.
+    ``in_progress``, ``review``) also raise 422 with a hint pointing
+    to the dedicated transition endpoint.
+
+    ``extra="forbid"`` (Codex round-6, #2064): without it Pydantic
+    silently drops misspelled keys (e.g. ``metdata``) and forwards an
+    all-``None`` body, so the route returns ``200 ok`` even though
+    nothing changed. Forbidding extras turns typos / unsupported
+    fields like ``priority`` into a ``422 Unprocessable Entity`` from
+    FastAPI's request validator, giving the client an actionable
+    error instead of a silent no-op.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    labels: list[str] | None = None
+    status: str | None = None
+    metadata: dict[str, str] | None = None
+
+
+class TaskActionResult(BaseModel):
+    """Wrapper envelope for task mutations — ``{ok, message, task, warnings}``.
+
+    Spec §5.3 specifies this exact shape so the client can refresh
+    its UI without a follow-up ``GET``. ``message`` is informational
+    only (operator-facing); clients should route on ``task.work_status``
+    instead of parsing the string.
+
+    ``warnings`` is a (possibly empty) list of operator-facing strings.
+    Today the claim path uses it to surface ``last_provision_error``
+    when the DB transition committed but the per-task worker session
+    failed to provision — the task is ``in_progress`` with no live
+    agent lane, and the operator needs to recover manually. This
+    mirrors the CLI's stderr warning at
+    ``src/pollypm/work/cli.py:912-929`` so the API and ``pm task
+    claim`` give the same recovery story (#2064 round-10).
+    """
+
+    ok: bool
+    message: str | None = None
+    task: TaskDetail
+    warnings: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Operator-facing warnings about side effects of the "
+            "transition that did not fail the request — e.g. the "
+            "claim path surfaces ``last_provision_error`` here when "
+            "the DB claim committed but the worker session did not "
+            "provision."
+        ),
+    )
+
+
 class ProjectDrilldown(Project):
     recent_activity: list[ProjectActivityEntry]
     top_tasks: list[TaskSummary]
@@ -495,9 +615,14 @@ __all__ = [
     "StorageConfigFiles",
     "StorageEntry",
     "StorageReport",
+    "TaskActionResult",
+    "TaskCancelRequest",
+    "TaskClaimRequest",
     "TaskDetail",
     "TaskListResponse",
     "TaskListWarning",
+    "TaskPatchRequest",
+    "TaskReassignRequest",
     "TaskRelationships",
     "TaskSummary",
     "Transition",

@@ -368,13 +368,77 @@ class MockWorkService:
         if task is None:
             raise TaskNotFoundError(f"Task '{task_id}' not found.")
 
+        # ``assignee`` and ``external_refs`` mirror the pg surface
+        # widened in #2064 (see ``PgWorkService._UPDATE_ALLOWED_COLUMNS``).
+        # Keeping the mock narrower than pg would let the web API rely on
+        # a contract the in-memory backend rejects, so the protocol stays
+        # one source of truth. ``assignee`` is plain column write (use
+        # ``reassign_task`` for a real handoff so the context-log
+        # breadcrumb lands). ``external_refs`` replaces the dict; passing
+        # ``{}`` clears it.
         allowed = {"title", "description", "priority", "labels", "roles",
-                    "acceptance_criteria", "constraints", "relevant_files"}
+                    "acceptance_criteria", "constraints", "relevant_files",
+                    "assignee", "external_refs"}
         for key, value in fields.items():
             if key not in allowed:
                 raise ValidationError(f"Field '{key}' is not updatable.")
             setattr(task, key, value)
         task.updated_at = _now()
+        return deepcopy(task)
+
+    def reassign_task(
+        self,
+        task_id: str,
+        *,
+        new_assignee: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> Task:
+        """In-memory mirror of :meth:`PgWorkService.reassign_task` (#2064)."""
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        # #2064 round-9 blocker #4 / round-11 blocker #3: live-worker-
+        # swap invariant. Mirror the pg backend's check so swap-backend
+        # tests can rely on the same contract — reassign refuses
+        # ``draft`` (no worker yet), terminal ``done`` / ``cancelled``
+        # tasks, AND ``queued`` (round-11: queued dispatch routes by
+        # ``roles["worker"]`` not ``assignee``). The pg backend enforces
+        # this under the same FOR UPDATE row lock that orders the
+        # assignee write; the in-memory mock doesn't need a lock but
+        # the surface must agree.
+        if task.work_status is WorkStatus.QUEUED:
+            raise InvalidTransitionError(
+                "Cannot reassign task in 'queued' state. Queued "
+                "tasks can't be reassigned; cancel + re-queue with "
+                "role assignment. Queued dispatch routes by "
+                "`roles['worker']`, not the `assignee` column."
+            )
+        if task.work_status in {
+            WorkStatus.DRAFT,
+            WorkStatus.DONE,
+            WorkStatus.CANCELLED,
+        }:
+            raise InvalidTransitionError(
+                f"Cannot reassign task in '{task.work_status.value}' "
+                f"state. Reassign is a mid-flight worker swap "
+                f"(spec §P-9); it refuses draft (queue + claim first) "
+                f"and terminal (done / cancelled) tasks."
+            )
+        old_assignee = task.assignee
+        task.assignee = new_assignee
+        task.updated_at = _now()
+        old_label = old_assignee if old_assignee else "<unassigned>"
+        body = f"worker reassigned from {old_label} to {new_assignee}"
+        if reason:
+            body += f" (reason: {reason})"
+        entry = ContextEntry(
+            actor=actor,
+            timestamp=_now(),
+            text=body,
+            entry_type="reassignment",
+        )
+        self._context.setdefault(task_id, []).append(entry)
         return deepcopy(task)
 
     def cancel(self, task_id: str, actor: str, reason: str) -> Task:

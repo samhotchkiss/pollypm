@@ -138,9 +138,57 @@ class WorkService(Protocol):
         ...
 
     def update(self, task_id: str, **fields: object) -> Task:
-        """Update mutable fields (title, description, priority, labels, roles).
+        """Update mutable fields on a task.
 
-        Cannot change ``work_status`` directly -- use lifecycle methods instead.
+        Low-level column writer. Accepted fields are ``title``,
+        ``description``, ``priority``, ``labels``, ``roles``,
+        ``acceptance_criteria``, ``constraints``, ``relevant_files``,
+        ``assignee``, and ``external_refs``. Cannot change
+        ``work_status`` or ``flow_template`` directly — use lifecycle
+        methods instead.
+
+        ``assignee`` is accepted by the column schema for symmetry
+        with the legacy SQLite backend, but **no operator surface
+        exposes a breadcrumb-less assignee write** (#2064 round-9
+        blocker #5). The CLI ``pm task update`` does not advertise an
+        ``--assignee`` flag, the API ``PATCH /tasks/{p}/{n}`` body
+        (``TaskPatchRequest``) refuses the ``assignee`` key with
+        ``extra='forbid'``, and ``POST /tasks/{p}/{n}/reassign`` now
+        routes exclusively through :meth:`reassign_task`. The single
+        operator path for changing ``assignee`` is therefore
+        :meth:`reassign_task`, which writes the column AND appends a
+        ``reassignment`` breadcrumb in one transaction so the new
+        owner can recover context via ``pm task get`` (spec §P-9).
+        ``update(assignee=...)`` remains callable from in-process
+        plugins / migrations that explicitly accept the audit gap.
+
+        ``external_refs`` replaces the dict wholesale (pass ``{}`` to
+        clear); it carries the API's free-form ``metadata`` surface.
+
+        Both ``PgWorkService`` and ``MockWorkService`` must accept the
+        same field set so backend swaps don't surface a contract gap.
+        """
+        ...
+
+    def reassign_task(
+        self,
+        task_id: str,
+        *,
+        new_assignee: str,
+        actor: str,
+        reason: str | None = None,
+    ) -> Task:
+        """Mid-flight reassign: update ``assignee`` AND append context entry atomically.
+
+        Implements the work-service spec §P-9 invariant: when a live
+        worker is swapped, the new owner needs a breadcrumb in the
+        context log so they can recover context via ``pm task get``.
+        The column write and the context-log row commit in a single
+        transaction; failure of either rolls both back.
+
+        ``actor`` is the operator/agent who initiated the reassignment
+        (recorded on the context entry). ``reason``, when present, is
+        appended to the breadcrumb body.
         """
         ...
 

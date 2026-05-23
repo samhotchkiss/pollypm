@@ -428,6 +428,10 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | POST   | `/api/v1/tasks/{project}/{n}/approve` | Approve plan or code review |
 | POST   | `/api/v1/tasks/{project}/{n}/reject` | Reject + capture reason |
 | POST   | `/api/v1/tasks/{project}/{n}/queue` | Queue a draft task |
+| POST   | `/api/v1/tasks/{project}/{n}/claim` | Claim a queued task (set assignee + activate first node, fires `queued→in_progress`). Returns `429 worker_cap_exceeded` when the project is at `max_parallel_workers` (#2064 round-11). Post-commit cap races may roll the row back to `queued`; the response `message` and `warnings[]` describe the actual state |
+| POST   | `/api/v1/tasks/{project}/{n}/cancel` | Cancel a non-terminal task (mapped to `svc.cancel`; optional `reason` — absent reasons resolve to `"cancelled via API"` in the audit row) |
+| POST   | `/api/v1/tasks/{project}/{n}/reassign` | Reassign mid-flight: updates `assignee` AND appends a `reassignment` context breadcrumb (old→new) in one transaction. Concurrent reassigns serialize via `SELECT ... FOR UPDATE`. Refuses `draft` / `queued` / `done` / `cancelled` with `409 invalid_state` — queued routing uses `roles["worker"]` not `assignee`, so queued reassign is a no-op; cancel + re-queue with the new role instead (#2064 round-11) |
+| PATCH  | `/api/v1/tasks/{project}/{n}` | Partial update of mutable fields. Body accepts ONLY `labels` / `metadata` / `status` (extras like `priority` or role assignments → `422` from request validation; use `/claim` and `/reassign` for ownership changes). `status` is routed to `svc.queue`/`svc.cancel` (other statuses → 422); `labels` / `metadata` flow through `svc.update`. Status MUST NOT be combined with other fields in one body (`400 invalid_request` if both present — use separate requests). An all-`null` / empty body is rejected with `400 invalid_request` |
 | GET    | `/api/v1/inbox` | List inbox items (`?project=&type=&state=&limit=&cursor=`) |
 | GET    | `/api/v1/inbox/{id}` | Inbox item detail (with full thread messages) |
 | POST   | `/api/v1/inbox/{id}/reply` | Reply to a thread |
@@ -628,10 +632,16 @@ pagination with `?limit=` and `?cursor=`. Response body carries
 
 ### Idempotency
 
-`POST` endpoints accept an optional `Idempotency-Key` header. When
-present, the server stores the response for 24h and replays it for
-duplicate keys. Recommended for approve / reject / queue / reply,
-where a network glitch + retry could otherwise double-submit.
+DEFERRED. The original v1 spec proposed an `Idempotency-Key` header
+(with stored replay for 24h) and an `If-Match` precondition for
+optimistic concurrency. Both were removed from the implementation
+and the OpenAPI document until real replay storage and version
+enforcement ship — accepting either header today without enforcing
+the contract would give clients false guarantees against double-
+submit / lost-update races. Clients SHOULD treat write endpoints
+as non-idempotent for now: avoid blind retries on 5xx, and reconcile
+state via `GET` after any retried POST/PATCH. The headers will be
+reintroduced in a follow-up issue once the backing store lands.
 
 ---
 

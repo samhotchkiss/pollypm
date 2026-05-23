@@ -980,10 +980,14 @@ def test_briefings_app_teardown_bounded_with_running_worker(
             "expected bounded shutdown to return within ~5s"
         )
 
-        # And the leak warning should have been logged.
+        # And the leak warning should have been logged. The shared
+        # ``_shutdown_daemon_executor`` helper (PR #2059 round-7,
+        # mirroring #2058) emits "still running after Ns grace;
+        # leaking thread(s) past app teardown".
         leak_logs = [
             r for r in caplog.records
-            if "still running at shutdown" in r.getMessage()
+            if "briefing executor" in r.getMessage()
+            and "still running" in r.getMessage()
         ]
         assert leak_logs, (
             "expected lifespan to log a warning about leaked worker(s); "
@@ -1153,3 +1157,145 @@ def test_briefings_executor_workers_are_daemons(
             "threads will keep pm serve alive past shutdown: "
             f"{[t.name for t in non_daemons]}"
         )
+
+
+def test_briefings_pm_serve_process_exits_with_wedged_worker(
+    tmp_path: Path,
+) -> None:
+    """A wedged briefings worker does not keep the ``pm serve`` process alive.
+
+    Codex round-7 on PR #2059: the round-6 daemon-only fix is not
+    process-safe on its own — ``concurrent.futures`` registers an
+    ``atexit`` hook (``_python_exit``) that joins every executor
+    worker via the module-level ``_threads_queues`` dict. That join
+    blocks ``pm serve`` interpreter exit even when the workers are
+    daemon threads. The lifespan finalizer now mirrors #2058's
+    pattern (shared :class:`DaemonThreadPoolExecutor` + atexit
+    eviction) so a wedged regen worker can't keep the process alive.
+
+    Same shape as
+    ``test_doctor_pm_serve_process_exits_with_wedged_worker`` —
+    spawns a child process that:
+
+    1. Builds the app + starts the lifespan.
+    2. Submits a hung job to the briefings executor (no HTTP
+       roundtrip — the daemon/eviction discipline is a property of
+       the executor + lifespan, not the route).
+    3. Exits the lifespan.
+    4. Drops references and lets the interpreter try to exit.
+
+    Pre-fix, the child takes ~60s (waiting on the non-daemon worker
+    via the atexit hook) and we kill it via timeout. Post-fix, the
+    child exits cleanly in well under the 15s budget.
+    """
+    import subprocess
+    import sys
+    import textwrap
+    import time as _time
+
+    child_script = textwrap.dedent(
+        """
+        import sys, time
+        from pathlib import Path
+        from fastapi.testclient import TestClient
+        from pollypm.config import (
+            AccountConfig, MemorySettings, PollyPMConfig,
+            PollyPMSettings, ProjectSettings,
+        )
+        from pollypm.models import (
+            KnownProject, ProjectKind, ProviderKind, RuntimeKind,
+        )
+        from pollypm.web_api import create_app, ensure_token
+
+        workspace = Path(sys.argv[1])
+        token_path = Path(sys.argv[2])
+        ensure_token(token_path)
+
+        base_dir = workspace / ".pollypm"
+        config = PollyPMConfig(
+            project=ProjectSettings(
+                name="PollyPM", root_dir=workspace,
+                tmux_session="pollypm-test",
+                workspace_root=workspace, base_dir=base_dir,
+                logs_dir=base_dir / "logs",
+                snapshots_dir=base_dir / "snapshots",
+                state_db=base_dir / "state.db",
+            ),
+            pollypm=PollyPMSettings(
+                controller_account="codex_primary",
+                open_permissions_by_default=False,
+                failover_enabled=False, failover_accounts=[],
+                heartbeat_backend="local",
+                scheduler_backend="inline",
+                lease_timeout_minutes=30,
+            ),
+            accounts={
+                "codex_primary": AccountConfig(
+                    name="codex_primary",
+                    provider=ProviderKind.CODEX,
+                    email="codex@example.com",
+                    runtime=RuntimeKind.LOCAL,
+                    home=base_dir / "homes" / "codex_primary",
+                ),
+            },
+            sessions={},
+            projects={
+                "myproj": KnownProject(
+                    key="myproj", path=workspace, name="My Project",
+                    tracked=True, kind=ProjectKind.GIT,
+                ),
+            },
+            memory=MemorySettings(backend="file"),
+        )
+
+        app = create_app(config=config, token_path=token_path)
+        with TestClient(app):
+            # Submit a wedged job directly to the executor so the
+            # test doesn't depend on briefings-route plumbing. The
+            # daemon-thread + atexit-eviction invariant is a property
+            # of the executor + lifespan, not the route.
+            app.state.briefing_executor.submit(time.sleep, 60)
+            time.sleep(0.2)
+        # Lifespan has exited; daemon workers + atexit eviction
+        # should let the interpreter exit immediately.
+        print("CHILD EXIT OK", flush=True)
+        """
+    )
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".pollypm").mkdir()
+    token_path = tmp_path / "api-token"
+
+    t0 = _time.monotonic()
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", child_script,
+             str(workspace), str(token_path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired as exc:
+        elapsed = _time.monotonic() - t0
+        pytest.fail(
+            f"child process did not exit within 15s (took {elapsed:.1f}s) — "
+            f"a wedged briefings worker is keeping the interpreter alive. "
+            f"stdout={exc.stdout!r} stderr={exc.stderr!r}"
+        )
+
+    elapsed = _time.monotonic() - t0
+    assert result.returncode == 0, (
+        f"child exited with rc={result.returncode}; "
+        f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+    assert "CHILD EXIT OK" in result.stdout, (
+        f"child did not reach the post-lifespan print; "
+        f"stdout={result.stdout!r}"
+    )
+    # The lifespan grace is 5s and atexit eviction is O(workers),
+    # so even with launcher overhead this should land well under 12s.
+    assert elapsed < 12.0, (
+        f"child took {elapsed:.1f}s; the wedged worker should not "
+        f"have blocked interpreter exit past the lifespan grace."
+    )

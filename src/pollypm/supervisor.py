@@ -93,6 +93,7 @@ from pollypm.providers.claude.resume import (
     transcript_matches_session as _claude_transcript_matches_session,
 )
 from pollypm.schedulers import ScheduledJob, get_scheduler_backend
+from pollypm.session_leases import SessionLeaseConflictError
 from pollypm.store.registry import get_store
 from pollypm.transcript_ledger import sync_token_ledger_for_config
 from pollypm import supervisor_alerts as _supervisor_alerts
@@ -3762,10 +3763,29 @@ class Supervisor:
             retry_at=(datetime.now(UTC) + timedelta(minutes=15)).isoformat(),
         )
 
-    def _restart_session(self, session_name: str, account_name: str, *, failure_type: str) -> None:
-        return self.restart_session(session_name, account_name, failure_type=failure_type)
+    def _restart_session(
+        self,
+        session_name: str,
+        account_name: str,
+        *,
+        failure_type: str,
+        force: bool = False,
+    ) -> None:
+        return self.restart_session(
+            session_name,
+            account_name,
+            failure_type=failure_type,
+            force=force,
+        )
 
-    def restart_session(self, session_name: str, account_name: str, *, failure_type: str) -> None:
+    def restart_session(
+        self,
+        session_name: str,
+        account_name: str,
+        *,
+        failure_type: str,
+        force: bool = False,
+    ) -> None:
         """Restart ``session_name`` on ``account_name`` after a failure.
 
         Inputs: the session name, the target account to switch to, and the
@@ -3777,6 +3797,7 @@ class Supervisor:
         self._assert_lease_available(
             session_name,
             owner="pollypm",
+            force=force,
             action="restart",
         )
         tmux_session = self._tmux_session_for_launch(launch)
@@ -4141,8 +4162,10 @@ class Supervisor:
         lease = self._get_lease(session_name)
         if lease is None or lease.owner == owner or force:
             return
-        raise RuntimeError(
-            f"Cannot {action} {session_name}: session is currently leased to {lease.owner}; use --force to bypass"
+        raise SessionLeaseConflictError(
+            session_name=session_name,
+            owner=lease.owner,
+            action=action,
         )
 
     def _release_session_locks(self, launch: SessionLaunchSpec) -> None:

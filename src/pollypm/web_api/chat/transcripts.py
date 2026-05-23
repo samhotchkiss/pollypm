@@ -36,9 +36,13 @@ the following non-trivial mappings:
 - Claude ``SendUserFile`` tool calls become ``file`` envelopes.
 - Compaction / session-start markers become ``system_event``.
 - ``thinking`` ingestor events (Anthropic extended-thinking content
-  blocks; see GitHub #2048) become ``MessageType.THINKING`` envelopes,
-  but ONLY when callers pass ``include_thinking=True`` — default
-  drops them so the historical envelope contract is preserved.
+  blocks; see GitHub #2048) become :class:`ParserInternalType.THINKING`
+  envelopes, but ONLY when callers pass ``include_thinking=True`` —
+  default drops them so the historical envelope contract is preserved.
+  Thinking is a parser-internal discriminator (not part of the public
+  ``MessageType`` enum / ``ChatMessageType`` OpenAPI schema); the
+  chat-messages route additionally filters it out before serialization
+  until follow-up #2082 wires the HTTP-public path.
 
 The parser is pure: takes a file path + flags, returns a list of
 envelopes. The P2 router layers pagination / filtering on top.
@@ -59,6 +63,7 @@ from pollypm.web_api.chat.envelope import (
     MessageEnvelope,
     MessageRole,
     MessageType,
+    ParserInternalType,
 )
 
 logger = logging.getLogger(__name__)
@@ -352,8 +357,12 @@ def parse_events_jsonl(
     ``include_thinking`` (default ``False``; see GitHub #2048) — when
     ``True``, Anthropic extended-thinking content blocks preserved by
     the ingestor as ``event_type="thinking"`` are surfaced as
-    :class:`MessageType.THINKING` envelopes. The default keeps the
-    historical envelope contract: existing clients see no new types.
+    :class:`ParserInternalType.THINKING` envelopes — a parser-internal
+    discriminator that is intentionally NOT in the HTTP-public
+    :class:`MessageType` catalog. The chat-messages route filters these
+    out before serialization until follow-up #2082 wires the public
+    route. The default keeps the historical envelope contract: existing
+    callers (and HTTP clients) see no new types.
 
     Caching (issue #2069): for ``strict=False`` callers we memoize on
     ``(events_path, include_thinking, mtime, actor_fallback)``. The
@@ -463,6 +472,7 @@ def parse_events_jsonl_tail(
     *,
     limit: int,
     actor_fallback: str = "agent",
+    include_thinking: bool = False,
 ) -> list[MessageEnvelope]:
     """Return roughly the last ``limit`` envelopes by tail-reading the file.
 
@@ -513,7 +523,7 @@ def parse_events_jsonl_tail(
     except OSError:
         cached_mtime = None
     if cached_mtime is not None:
-        cached = _PARSE_CACHE.get(events_path)
+        cached = _PARSE_CACHE.get((events_path, include_thinking))
         if (
             cached is not None
             and cached[0] == cached_mtime
@@ -535,7 +545,9 @@ def parse_events_jsonl_tail(
             events_path, exc,
         )
         return parse_events_jsonl(
-            events_path, actor_fallback=actor_fallback,
+            events_path,
+            actor_fallback=actor_fallback,
+            include_thinking=include_thinking,
         )[-limit:]
 
     if file_size == 0:
@@ -549,6 +561,7 @@ def parse_events_jsonl_tail(
                 chunk_size=chunk_size,
                 source_key=source_key,
                 actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )
         except (UnicodeDecodeError, OSError) as exc:
             # Chunk-boundary read landed inside a multi-byte sequence
@@ -560,14 +573,18 @@ def parse_events_jsonl_tail(
                 events_path, exc,
             )
             return parse_events_jsonl(
-                events_path, actor_fallback=actor_fallback,
+                events_path,
+                actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )[-limit:]
         if envelopes is None:
             # Sentinel: chunk parse hit a defensive bailout (e.g. a
             # malformed-but-not-skipped line). Treat the same as a
             # decode error and use the forward parser.
             return parse_events_jsonl(
-                events_path, actor_fallback=actor_fallback,
+                events_path,
+                actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )[-limit:]
         if len(envelopes) >= limit:
             return envelopes[-limit:]
@@ -580,7 +597,9 @@ def parse_events_jsonl_tail(
     # sparsely populated with valid envelopes (lots of dropped
     # token_usage / malformed lines).
     return parse_events_jsonl(
-        events_path, actor_fallback=actor_fallback,
+        events_path,
+        actor_fallback=actor_fallback,
+        include_thinking=include_thinking,
     )[-limit:]
 
 
@@ -591,6 +610,7 @@ def _parse_tail_chunk(
     chunk_size: int,
     source_key: str,
     actor_fallback: str,
+    include_thinking: bool = False,
 ) -> list[MessageEnvelope] | None:
     """Read ``chunk_size`` bytes from EOF, parse the lines, return envelopes.
 
@@ -648,6 +668,7 @@ def _parse_tail_chunk(
             offset=line_offset,
             source_key=source_key,
             actor_fallback=actor_fallback,
+            include_thinking=include_thinking,
         )
         envelopes.extend(converted)
     return envelopes
@@ -813,6 +834,11 @@ def _envelope_thinking(
     next to the assistant turn it precedes. ``text`` carries the
     thinking content directly so the same "dumb client renders ``text``
     without parsing metadata" contract holds.
+
+    The envelope's ``type`` is :class:`ParserInternalType.THINKING`, a
+    parser-internal discriminator intentionally NOT in the HTTP-public
+    :class:`MessageType` enum. The chat-messages route drops these
+    envelopes before serialization (see #2082).
     """
     text = str(payload.get("text") or "")
     signature = str(payload.get("signature") or "")
@@ -821,7 +847,7 @@ def _envelope_thinking(
         ts=timestamp,
         role=MessageRole.ASSISTANT,
         actor=actor_fallback,
-        type=MessageType.THINKING,
+        type=ParserInternalType.THINKING,
         text=text,
         metadata={
             "provider": event.get("provider", ""),

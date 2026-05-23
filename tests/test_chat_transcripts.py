@@ -31,6 +31,7 @@ from pathlib import Path
 from pollypm.web_api.chat import (
     MessageRole,
     MessageType,
+    ParserInternalType,
     STALE_THRESHOLD_SECONDS,
     is_archive_stale,
     parse_events_jsonl,
@@ -179,7 +180,11 @@ def test_thinking_envelope_emitted_when_flag_true(tmp_path: Path) -> None:
     )
     assert len(envelopes) == 1
     env = envelopes[0]
-    assert env.type == MessageType.THINKING
+    assert env.type == ParserInternalType.THINKING
+    # ParserInternalType is deliberately separate from the public
+    # MessageType catalog (#2082); the route filters it out before
+    # serialization so the wire enum stays closed.
+    assert env.type not in {member for member in MessageType}
     assert env.role == MessageRole.ASSISTANT
     assert env.actor == "Polly"
     assert env.text == "Let me think about this..."
@@ -227,7 +232,7 @@ def test_thinking_cache_does_not_leak_between_flag_values(tmp_path: Path) -> Non
     # envelope, not the cached non-thinking list.
     with_thinking = parse_events_jsonl(events_path, include_thinking=True)
     assert [env.type for env in with_thinking] == [
-        MessageType.THINKING, MessageType.TEXT,
+        ParserInternalType.THINKING, MessageType.TEXT,
     ]
 
 
@@ -951,7 +956,9 @@ def test_parse_tail_uses_mtime_cache_when_populated(tmp_path: Path) -> None:
 
     # Populate the cache by calling the full parser.
     parse_events_jsonl(events_path)
-    assert events_path in transcripts_module._PARSE_CACHE
+    # Cache key is ``(events_path, include_thinking)`` after #2048 +
+    # #2070 composition.
+    assert (events_path, False) in transcripts_module._PARSE_CACHE
 
     # Tail should now read from the cached list, not the disk.
     tail = parse_events_jsonl_tail(events_path, limit=10)
@@ -966,7 +973,7 @@ def test_parse_tail_does_not_populate_mtime_cache(tmp_path: Path) -> None:
     _write_user_turn_lines(events_path, 100)
 
     parse_events_jsonl_tail(events_path, limit=10)
-    assert events_path not in transcripts_module._PARSE_CACHE
+    assert (events_path, False) not in transcripts_module._PARSE_CACHE
 
 
 def test_parse_tail_falls_back_for_pretty_printed_event(tmp_path: Path) -> None:

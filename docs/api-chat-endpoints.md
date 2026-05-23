@@ -221,16 +221,19 @@ Pull a window of messages from a single session's transcript.
 | `include_subagents` | `false` | DEFERRED — server returns 422 if true. Re-enabled when #2052 lands ingestor-side subagent normalization. |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
 
-> Note: `type="thinking"` envelopes are supported at the **parser** level
-> (`parse_events_jsonl(include_thinking=True)`, see #2048) but the HTTP
-> endpoint does **not** yet expose the `include_thinking` query
-> parameter — the route always calls the parser with the default
-> (`include_thinking=False`) and additionally drops any `thinking`
-> envelopes defensively. Wiring the query param through the route +
-> OpenAPI schema is tracked in
+> Note: Anthropic extended-thinking blocks are preserved by the
+> ingestor and surfaced by `parse_events_jsonl(include_thinking=True)`
+> as a **parser-internal** discriminator
+> (`ParserInternalType.THINKING`, see #2048). They are intentionally
+> NOT part of the HTTP-public `ChatMessageType` enum — the route calls
+> the parser with the default (`include_thinking=False`) and
+> additionally filters out any parser-internal-type envelopes before
+> serialization. Promoting `thinking` into the public catalog +
+> wiring an `include_thinking` query param through the route + OpenAPI
+> schema is tracked in
 > [#2082](https://github.com/samhotchkiss/pollypm/issues/2082). Until
-> that lands, clients of `GET /messages` will never see `type="thinking"`
-> envelopes regardless of query string.
+> that lands, clients of `GET /messages` will never see
+> `type="thinking"` envelopes regardless of query string.
 
 **Response:**
 
@@ -402,7 +405,7 @@ which variant the envelope represents and what shape `metadata` takes.
   "ts": "2026-05-21T20:53:12.123Z",
   "role": "user" | "assistant" | "tool" | "system",
   "actor": "Sam" | "Polly" | "Archie" | "Codex" | "system",
-  "type": "text" | "thinking" | "tool_use" | "tool_result" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event",
+  "type": "text" | "tool_use" | "tool_result" | "ask_user" | "file" | "subagent_spawn" | "subagent_result" | "system_event",
   "text": "...display-ready string...",
   "metadata": { "...": "type-specific" }
 }
@@ -418,7 +421,6 @@ structured original lives in `metadata`.
 | Type | Role | When | Notes |
 |---|---|---|---|
 | `text` | user / assistant | Plain turn text | The 80% case. `metadata: {}`. |
-| `thinking` | assistant | Anthropic extended-thinking content block | Supported at the parser level (`parse_events_jsonl(include_thinking=True)`, #2048). The HTTP `GET /messages` endpoint does **not** yet emit this type — defensively filtered until #2082 wires the query param through the route + OpenAPI. `metadata`: `provider`, `model`, `signature` (opaque, may be empty). `text` carries the thinking content. |
 | `tool_use` | assistant | Tool call | `metadata`: `tool_use_id`, `tool_name`, `tool_input`. |
 | `tool_result` | tool | Tool return | `metadata`: `tool_use_id`, `is_error`, `content[]`. |
 | `ask_user` | assistant | `AskUserQuestion` tool | `metadata`: `questions[]`, `answered`, `answers`. See §5.5. |
@@ -427,22 +429,17 @@ structured original lives in `metadata`.
 | `subagent_result` | tool | `Task` tool return | `metadata`: `subagent_id`, `summary`, `duration_ms`, `total_tokens`, `worktree_path`. Note: subagent_transcript inlining is deferred — see #2052. |
 | `system_event` | system | Compaction, session-start, error | `metadata.subtype` ∈ `compaction`, `session_start`, `session_resume`, `error`. |
 
+> Parser-internal discriminator: Anthropic extended-thinking blocks
+> are preserved by the ingestor and surfaced by
+> `parse_events_jsonl(include_thinking=True)` as
+> `ParserInternalType.THINKING` (`src/pollypm/web_api/chat/envelope.py`).
+> This is **not** an HTTP response `type` value — the chat-messages
+> route filters parser-internal-type envelopes out before serialization,
+> and the OpenAPI `ChatMessageType` enum does not include it. Promoting
+> `thinking` into the public catalog is tracked in
+> [#2082](https://github.com/samhotchkiss/pollypm/issues/2082).
+
 ### Example payloads
-
-`thinking` (parser-level only — HTTP endpoint does not emit this type yet, see #2082):
-
-```json
-{
-  "type": "thinking",
-  "role": "assistant",
-  "text": "Let me reconsider the approach...",
-  "metadata": {
-    "provider": "claude",
-    "model": "claude-opus-4-7",
-    "signature": "opaque-anthropic-sig"
-  }
-}
-```
 
 `tool_use`:
 

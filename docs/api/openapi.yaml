@@ -3117,16 +3117,21 @@ components:
     ChatMessageType:
       type: string
       description: |
-        Envelope discriminator per spec §3. Mirrors the runtime
-        `MessageType` enum at `src/pollypm/web_api/chat/envelope.py:30-48`
-        — `tests/web_api/test_openapi_conformance.py::test_chat_message_type_enum_matches_runtime`
+        Envelope discriminator per spec §3. Mirrors the HTTP-public
+        runtime `MessageType` enum at
+        `src/pollypm/web_api/chat/envelope.py` —
+        `tests/web_api/test_openapi_conformance.py::test_chat_message_type_enum_matches_runtime`
         asserts set equality so future drift trips CI.
 
-        `thinking` is reserved — the transcript ingestor does not
-        currently preserve thinking blocks, so the API never emits
-        them. The `include_thinking` query param + `thinking` enum
-        value will return once the ingestor learns to round-trip them
-        (follow-up #2048).
+        `thinking` is intentionally **not** in this enum. The
+        transcript ingestor preserves Anthropic extended-thinking
+        blocks and the parser exposes them under
+        `parse_events_jsonl(include_thinking=True)`, but as a
+        parser-internal discriminator
+        (`ParserInternalType.THINKING`) that the chat-messages route
+        filters out before serialization. Promoting `thinking` into
+        this public enum + wiring an `include_thinking` query param
+        through the route is tracked in follow-up #2082.
       enum:
         - text
         - tool_use

@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.web_api.auth import (
+    SESSION_ISSUED_COOKIE_NAME,
     SESSION_COOKIE_NAME,
     _extract_token,
     is_tailscale_ip,
@@ -790,6 +791,15 @@ def _mount_web_ui(
                 secure=False,
                 path="/",
                 max_age=60 * 60 * 24 * 7,  # 7 days
+            )
+            response.set_cookie(
+                key=SESSION_ISSUED_COOKIE_NAME,
+                value=str(int(time.time())),
+                httponly=False,
+                samesite="lax",
+                secure=False,
+                path="/",
+                max_age=60 * 60 * 24 * 7,
             )
         # If the token file doesn't exist yet, or the caller isn't on
         # a trusted path, we still serve the HTML — the SPA will

@@ -346,6 +346,34 @@ section#message-pane {
   line-height: 1.5;
 }
 
+.session-expiry-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 16px;
+  padding: 9px 12px;
+  border: 1px solid var(--waiting);
+  border-radius: 6px;
+  background: rgba(240, 196, 90, 0.10);
+  color: var(--waiting);
+  font-size: 12.5px;
+}
+.session-expiry-dismiss {
+  flex: 0 0 auto;
+  padding: 5px 9px;
+  border: 1px solid var(--waiting);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-heading);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.session-expiry-dismiss:hover {
+  background: rgba(240, 196, 90, 0.14);
+}
+
 /* Mobile / tablet — collapse the three-column grid into a single
  * stacked column so 360–768px viewports (phones in portrait, small
  * tablets) don't horizontally overflow. The cockpit-tinted message

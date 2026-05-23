@@ -1342,12 +1342,7 @@ def register_maintenance_commands(app: typer.Typer) -> None:
             [
                 ("pm doctor", "show the full health checklist"),
                 ("pm doctor --fix", "apply safe automatic repairs"),
-                ("pm doctor --json", "emit the report as machine-readable JSON"),
                 ("pm doctor --verbose", "show full Why/Fix detail (skip clustering)"),
-                (
-                    "pm doctor --alert-type project-guide-drift",
-                    "drill into one cluster by check name",
-                ),
             ],
         )
     )(doctor)

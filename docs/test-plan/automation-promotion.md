@@ -192,7 +192,7 @@ Run quarterly: review unpromoted manual checks. Decide: promote, retire, or acce
 
 ---
 
-## The flake-fix policy (Fernanda)
+## The flake-fix policy (Fernanda's standard)
 
 When a promoted test starts failing intermittently:
 

@@ -40,19 +40,17 @@ Invariants visible in the diagram:
 - Creator labels (`codex-created` / `claude-created`) are durable; ownership labels flip.
 - An open PR always has exactly one ownership label.
 
-## Git authoring identities
+## Authorship identification
 
-Pin authoring identity so creator labels are verifiable from git history.
+**Both Codex and Claude commit as the operator.** Git author lines are identical across agents. The creator label is the sole authoritative identifier of which agent authored a PR.
 
-| Persona | Git author | Authoring trailer |
-|---|---|---|
-| Codex Builder | `Codex` (configured in the Codex environment) | none required; PR identity block is sufficient |
-| Claude Builder | `Claude` or operator (if commits go through `claude` CLI as operator) | `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` |
-| Operator override | Operator (Sam Hotchkiss `claude@swh.me`) | none |
+This means:
+- Do NOT try to verify authorship from `git log` — every commit shows the operator's identity.
+- The `codex-created` / `claude-created` label IS the answer to "who wrote this." A PR's creator label cannot be changed once set (except by adding `mixed-agent-authors` when the other agent contributes code).
+- The PR body Agent Identity block must match the creator label. Drift between the two is `bug:label-author-drift` and blocks merge until reconciled.
+- Co-Authored-By trailers and commit messages MAY mention the agent for clarity, but the trailer is informational, not authoritative.
 
-The creator label is set based on the **commit message trailer + PR identity block**, not solely the git author line — when Claude operates via the Claude Code CLI under the operator's identity, the trailer is what proves Claude authorship.
-
-Mismatched authorship between identity block, creator label, and commit trailers is `bug:label-author-drift` and blocks merge until reconciled.
+When in doubt — when a PR is missing creator labels or has contradictory signals — stop and ask the operator. Do not infer authorship from commit content or timing.
 
 ---
 

@@ -6,6 +6,8 @@
 
 **Prereqs:** §00 green. `pm serve` running. UI accessible from desktop and phone. §01 and §02 reliable enough that performance failures are not hidden functional failures.
 
+**Persona:** this section is Fernanda Raghavan's specialty (see `agent-personas.md`). Freya hands off to Fernanda for scale-matrix execution, p50/p95/p99/max measurement, and promotion decisions. "Feels faster" is rejected; numbers with environment + scale are required.
+
 Setup:
 ```bash
 export BASE=http://$(tailscale ip -4):8765

@@ -14,22 +14,37 @@
 
 **Before running any baseline checks, confirm you are NOT pointing at production.** Several later sections are destructive (§05 kills daemons, drops PG, fills disk). Running them against the operator's live workload destroys real state.
 
+### Test-env marker
+
+The marker file `~/.pollypm/.test-env-marker` opts the local PollyPM instance into destructive testing. Without it, this plan refuses to proceed.
+
+**To enable test mode on a fresh test instance:**
 ```bash
-# 1. Confirm this is a test/dev workspace, not production.
-test -f ~/.pollypm/.test-env-marker && echo "OK: test env marker present" || \
-  { echo "NO .test-env-marker — refuse to proceed"; exit 1; }
-# If you intend this to be a test env, create the marker first:
-# touch ~/.pollypm/.test-env-marker
-
-# 2. Confirm git working tree is clean (or, if not, that the dirty files are this plan itself).
-git -C /Users/sam/dev/pollypm status -s
-
-# 3. Confirm no leftover agent worktrees from prior runs.
-git -C /Users/sam/dev/pollypm worktree list
-# Worktrees under .claude/worktrees/ are agent scratch space. Reap any that are stale.
+mkdir -p ~/.pollypm
+touch ~/.pollypm/.test-env-marker
 ```
 
-If any of these fails, **stop**. Either move to a test environment or get explicit operator approval that this IS the intended target.
+**To verify before each run:**
+```bash
+test -f ~/.pollypm/.test-env-marker && echo "OK: test env marker present" || \
+  { echo "REFUSE: ~/.pollypm/.test-env-marker missing — see §0.0"; exit 1; }
+```
+
+If you're on the operator's daily-driver machine and don't want destructive scenarios touching it: do NOT create the marker. Run §00–§04 only (none are destructive). Skip §05 and the destructive parts of §06 entirely. Document this in your journal as a partial run.
+
+### Working tree + worktrees
+
+```bash
+# Confirm git working tree is clean (or, if not, that the dirty files are this plan itself).
+git -C /Users/sam/dev/pollypm status -s
+
+# Confirm no leftover agent worktrees from prior runs.
+git -C /Users/sam/dev/pollypm worktree list
+# Worktrees under .claude/worktrees/ are agent scratch space. Reap any that are stale via:
+# git worktree remove <path> --force
+```
+
+If any of these surface issues, **stop** and resolve before proceeding. A dirty worktree means the baseline SHA you record isn't actually what's running.
 
 ## 0.1 Sync main
 

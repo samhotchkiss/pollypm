@@ -16,6 +16,11 @@ Required labels:
 - If you author a PR, label it `codex-created` and `needs-claude`.
 - If Claude authored a PR, it should be labeled `claude-created` and may be labeled `needs-codex` for your review.
 
+Authorship identification:
+- Both Codex and Claude commit as the operator. Git author lines are identical across agents.
+- The creator label is the SOLE authoritative identifier of who authored a PR. Do not infer authorship from `git log` — it will not distinguish.
+- If a PR is missing creator labels or has contradictory signals between the label and the Agent Identity block, stop and fix labels before reviewing.
+
 Merge rule:
 - You must NEVER approve or merge a PR labeled `codex-created`.
 - You may approve/merge a PR labeled `claude-created` if it passes review and tests.

@@ -8,6 +8,8 @@ This is the section that catches "the agent acted dumb" — invisible to functio
 
 **Prereqs:** §00 green. §02 translation layer reliable (so we can trust what we read back).
 
+**Persona:** this section is Gustavo Pereira's specialty (see `agent-personas.md`). Freya hands off to Gustavo for refusal-contract design, eval-case writing, and adversarial prompt testing. Findings flow back into Freya's journal.
+
 Setup:
 ```bash
 export BASE=http://$(tailscale ip -4):8765
@@ -34,7 +36,7 @@ Each role has a distinct system prompt + tool access. Verify they actually behav
 - **#2079** — Claude thinking blocks now preserved through ingestor. May affect how architect responses surface (with `include_thinking=true`).
 - **#2018** — Watchdog briefs prepend the auth marker; verify it's emitted.
 
-### Evals philosophy
+### Evals philosophy (Gustavo's standard)
 
 You will not assert exact text. Models drift; exact-match brittle tests teach false confidence. Assert:
 - **Response category** (planning / question / action / refusal).

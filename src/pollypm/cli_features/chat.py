@@ -339,8 +339,9 @@ def chat_history(
         False,
         "--include-subagents",
         help=(
-            "DEFERRED — see issue #2052. Currently the server returns "
-            "422 if this is true."
+            "Enrich subagent_result envelopes with the parsed raw "
+            "subagent JSONL at metadata.output_file (allowlist-"
+            "constrained, capped per envelope). See issue #2052."
         ),
     ),
     source: str | None = typer.Option(

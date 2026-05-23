@@ -714,14 +714,17 @@ paths:
             type: boolean
             default: false
           description: |
-            DEFERRED (#2052). The runtime accepts this parameter for
-            forward-compat with the v3 inliner, but currently returns
-            `422 validation_error` when set to `true`. The v3
-            implementation called `parse_events_jsonl` on the raw
-            Claude task-notification `metadata.output_file`, which is
-            a different JSONL shape than the normalized archive the
-            parser consumes; re-implementation is tracked in #2052.
-            Pass `false` (or omit) until the resolver lands.
+            When `true`, each `subagent_result` envelope on the page
+            is enriched with `metadata.subagent_transcript` — a list
+            of envelopes parsed from the raw Claude JSONL the parent
+            `task-notification.output-file` points at. Paths are
+            constrained to project + workspace transcript roots; any
+            `output_file` outside the allowlist is silently skipped
+            (no inlining, no error) so a malformed transcript cannot
+            stat arbitrary files. Inlining is capped per envelope to
+            keep response sizes bounded; callers needing the full
+            subagent transcript should query its own session via
+            `/api/v1/chat/sessions`. See issue #2052.
         - in: query
           name: source
           schema:
@@ -3160,8 +3163,11 @@ components:
           additionalProperties: true
           description: |
             Type-dependent payload. `subagent_result` envelopes carry
-            `output_file` and `summary`. `subagent_transcript` inlining
-            is deferred — see #2052.
+            `output_file` and `summary`; when the request passes
+            `include_subagents=true`, they also carry
+            `subagent_transcript` — a list of envelopes parsed from
+            the raw Claude subagent JSONL referenced by `output_file`
+            (allowlist-constrained, capped per envelope). See #2052.
 
     ChatMessagesResponse:
       type: object

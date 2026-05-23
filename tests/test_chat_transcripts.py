@@ -31,7 +31,6 @@ from pathlib import Path
 from pollypm.web_api.chat import (
     MessageRole,
     MessageType,
-    ParserInternalType,
     STALE_THRESHOLD_SECONDS,
     is_archive_stale,
     parse_events_jsonl,
@@ -180,11 +179,12 @@ def test_thinking_envelope_emitted_when_flag_true(tmp_path: Path) -> None:
     )
     assert len(envelopes) == 1
     env = envelopes[0]
-    assert env.type == ParserInternalType.THINKING
-    # ParserInternalType is deliberately separate from the public
-    # MessageType catalog (#2082); the route filters it out before
-    # serialization so the wire enum stays closed.
-    assert env.type not in {member for member in MessageType}
+    assert env.type == MessageType.THINKING
+    # ``thinking`` is part of the HTTP-public MessageType catalog
+    # (promoted in #2082). The chat-messages route gates emission on
+    # the ``include_thinking`` query parameter; the parser itself only
+    # emits these when ``include_thinking=True`` is passed.
+    assert env.type.value == "thinking"
     assert env.role == MessageRole.ASSISTANT
     assert env.actor == "Polly"
     assert env.text == "Let me think about this..."
@@ -232,7 +232,7 @@ def test_thinking_cache_does_not_leak_between_flag_values(tmp_path: Path) -> Non
     # envelope, not the cached non-thinking list.
     with_thinking = parse_events_jsonl(events_path, include_thinking=True)
     assert [env.type for env in with_thinking] == [
-        ParserInternalType.THINKING, MessageType.TEXT,
+        MessageType.THINKING, MessageType.TEXT,
     ]
 
 
@@ -347,7 +347,7 @@ def test_include_thinking_preserves_content_block_order_via_ingestor(
     # replay tooling can rely on the normalized stream matching the
     # provider content array.
     assert [env.type for env in envelopes] == [
-        ParserInternalType.THINKING,
+        MessageType.THINKING,
         MessageType.TEXT,
     ]
     assert envelopes[0].text == "think first"

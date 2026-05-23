@@ -37,7 +37,6 @@ from pydantic import BaseModel, Field
 
 from pollypm.tmux.client import TmuxClient
 from pollypm.web_api.chat import (
-    PARSER_INTERNAL_TYPE_VALUES,
     STALE_THRESHOLD_SECONDS,
     ChatSurface,
     MessageEnvelope,
@@ -71,8 +70,7 @@ MAX_MESSAGE_LIMIT = 500
 # the common cockpit-poll shape. For requests under this threshold we
 # tail-read the JSONL archive instead of forward-readlining the full
 # file. The forward parser stays authoritative for ``asc``, cursor
-# paging, ``include_thinking``-style large-window queries, and the
-# strict ``source=jsonl`` validation path.
+# paging, and the strict ``source=jsonl`` validation path.
 TAIL_READ_LIMIT_THRESHOLD = 200
 
 
@@ -523,6 +521,7 @@ def _load_envelopes(
     *,
     source: SourceMode,
     tail_hint: int | None = None,
+    include_thinking: bool = False,
 ) -> tuple[list[MessageEnvelope], str | None, Path | None]:
     """Return ``(envelopes, transcript_source, transcript_path)``.
 
@@ -540,15 +539,13 @@ def _load_envelopes(
     cursor + small ``limit`` at the call site (the helper doesn't
     re-check those conditions).
 
-    NOTE: this helper calls ``parse_events_jsonl`` /
-    ``parse_events_jsonl_tail`` with the default
-    ``include_thinking=False`` (the public ``include_thinking`` query
-    param is still parked until #2082 wires it through the route +
-    OpenAPI). Any thinking envelopes that slip past the parser are
-    additionally dropped downstream in
-    :func:`_apply_filters_and_paginate` via the parser-internal-type
-    filter, so the HTTP response catalog stays equal to the public
-    :class:`MessageType` enum.
+    ``include_thinking`` (issue #2082): forwarded straight to
+    :func:`parse_events_jsonl` / :func:`parse_events_jsonl_tail`. When
+    ``True``, Anthropic extended-thinking blocks are surfaced as
+    ``MessageType.THINKING`` envelopes; when ``False`` (default), they
+    are dropped at parse time. The parser caches separately for each
+    flag value, so a default-False request never sees a thinking-True
+    cache hit and vice versa.
     """
     archive = surface.transcript_path
     actor_fallback = surface.persona or "agent"
@@ -561,6 +558,7 @@ def _load_envelopes(
                 archive,
                 actor_fallback=actor_fallback,
                 strict=True,
+                include_thinking=include_thinking,
             )
         except OSError as exc:
             # The archive exists but we can't read it (permissions,
@@ -597,11 +595,13 @@ def _load_envelopes(
                 archive,
                 limit=tail_hint,
                 actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )
         else:
             envelopes = parse_events_jsonl(
                 archive,
                 actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )
         if envelopes:
             return envelopes, "jsonl", archive
@@ -619,6 +619,7 @@ def _load_envelopes(
                 archive,
                 actor_fallback=actor_fallback,
                 strict=True,
+                include_thinking=include_thinking,
             )
         except OSError:
             logger.debug(
@@ -641,6 +642,7 @@ def _load_envelopes(
         envelopes = parse_events_jsonl(
             archive,
             actor_fallback=actor_fallback,
+            include_thinking=include_thinking,
         )
         return envelopes, "jsonl", archive
     return [], None, None
@@ -714,26 +716,21 @@ def _apply_filters_and_paginate(
     direction — applying ``since_id`` in source order would slice the
     wrong half for ``direction=desc``, duplicating page 1 on page 2):
 
-    1. Drop envelopes whose ``type`` is in
-       :data:`PARSER_INTERNAL_TYPE_VALUES` — these are parser-internal
-       discriminators (today: ``thinking``, from
-       ``parse_events_jsonl(include_thinking=True)``, #2048) that are
-       intentionally NOT part of the HTTP-public ``MessageType`` /
-       ``ChatMessageType`` catalog. Filtering here keeps the public
-       wire enum exactly equal to the OpenAPI ``ChatMessageType`` enum
-       (pinned by ``test_chat_message_type_enum_matches_runtime``)
-       until follow-up #2082 promotes ``thinking`` into the public
-       catalog and wires the ``include_thinking`` query param.
-    2. ``since`` lower-bound on envelope ``ts``.
-    3. Sort by timestamp + position. JSONL ordering is already
+    1. ``since`` lower-bound on envelope ``ts``.
+    2. Sort by timestamp + position. JSONL ordering is already
        chronological; we re-sort defensively so the response is
        deterministic even when the parser returns shuffled rows.
-    4. Reverse for ``direction=desc``.
-    5. ``since_id`` cursor walk — strictly after the matching id in
+    3. Reverse for ``direction=desc``.
+    4. ``since_id`` cursor walk — strictly after the matching id in
        the ordered sequence (the cursor itself is excluded from the
        slice, matching the ``next_cursor`` semantics of the inbox
        endpoint).
-    6. Slice to ``limit`` and compute ``has_more`` / ``next_cursor``.
+    5. Slice to ``limit`` and compute ``has_more`` / ``next_cursor``.
+
+    NOTE: ``thinking`` envelopes are gated upstream in
+    :func:`_load_envelopes` via the ``include_thinking`` flag on the
+    parser (#2082) — they never reach this helper unless the caller
+    opted in.
 
     NOTE: subagent inlining lives in
     :func:`_inline_subagent_transcript` and runs in the endpoint after
@@ -752,8 +749,6 @@ def _apply_filters_and_paginate(
 
     filtered: list[MessageEnvelope] = []
     for envelope in envelopes:
-        if str(envelope.type) in PARSER_INTERNAL_TYPE_VALUES:
-            continue
         if since_aware is not None:
             ts = _parse_envelope_ts(envelope.ts)
             if ts is None:
@@ -1041,6 +1036,14 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
             "workspace transcript roots (issue #2052)."
         ),
     )] = False,
+    include_thinking: Annotated[bool, Query(
+        description=(
+            "When true, Anthropic extended-thinking blocks are emitted "
+            "as `type=thinking` envelopes alongside the normal turns. "
+            "Default false preserves the historical envelope contract — "
+            "callers must opt in explicitly. See issues #2048 / #2082."
+        ),
+    )] = False,
 ) -> ChatMessagesResponse:
     """GET /api/v1/chat/{session_name}/messages per spec §2.2."""
     surface = _find_surface(config, session_name)
@@ -1064,7 +1067,10 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         tail_hint = limit + 1
 
     envelopes, transcript_source, transcript_path = _load_envelopes(
-        surface, source=source, tail_hint=tail_hint,
+        surface,
+        source=source,
+        tail_hint=tail_hint,
+        include_thinking=include_thinking,
     )
 
     post_process: Any = None

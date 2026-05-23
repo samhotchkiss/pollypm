@@ -726,6 +726,18 @@ paths:
             subagent transcript should query its own session via
             `/api/v1/chat/sessions`. See issue #2052.
         - in: query
+          name: include_thinking
+          required: false
+          schema:
+            type: boolean
+            default: false
+          description: |
+            When `true`, Anthropic extended-thinking blocks are emitted
+            as `type=thinking` envelopes alongside the normal turns.
+            Default `false` preserves the historical envelope contract
+            so existing clients see no new types unless they opt in.
+            See issues #2048 / #2082.
+        - in: query
           name: source
           schema:
             type: string
@@ -3158,15 +3170,10 @@ components:
         `tests/web_api/test_openapi_conformance.py::test_chat_message_type_enum_matches_runtime`
         asserts set equality so future drift trips CI.
 
-        `thinking` is intentionally **not** in this enum. The
-        transcript ingestor preserves Anthropic extended-thinking
-        blocks and the parser exposes them under
-        `parse_events_jsonl(include_thinking=True)`, but as a
-        parser-internal discriminator
-        (`ParserInternalType.THINKING`) that the chat-messages route
-        filters out before serialization. Promoting `thinking` into
-        this public enum + wiring an `include_thinking` query param
-        through the route is tracked in follow-up #2082.
+        `thinking` envelopes carry Anthropic extended-thinking blocks
+        and are only emitted when the request opts in via
+        `?include_thinking=true` (default: false). See issues #2048 /
+        #2082.
       enum:
         - text
         - tool_use
@@ -3176,6 +3183,7 @@ components:
         - subagent_spawn
         - subagent_result
         - system_event
+        - thinking
 
     ChatMessageEnvelope:
       type: object

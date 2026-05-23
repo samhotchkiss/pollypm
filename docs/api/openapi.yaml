@@ -4160,3 +4160,16 @@ components:
             truncation, corruption, or read errors. Non-zero means at
             least one archive needs operator attention. (Codex round-7
             finding, PR #2062.)
+        _malformed_rows_skipped:
+          type: integer
+          default: 0
+          minimum: 0
+          description: |
+            Diagnostic counter mirroring `AuditGrepResponse`. Non-zero
+            when at least one archived row failed the walker's `ts`
+            parse gate (typically a non-ISO timestamp from an old
+            schema version) and was skipped instead of inflating
+            `total` / `by_event` / `by_severity`. Lets callers tell a
+            clean aggregation from one where archived rows were
+            silently dropped without having to cross-check via
+            `/audit/grep`. (Codex round-9 finding, PR #2062.)

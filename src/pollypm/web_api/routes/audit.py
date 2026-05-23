@@ -143,6 +143,15 @@ class AuditStatsResponse(BaseModel):
     request-level wall-clock cap; when it fires the caller can tell
     a complete aggregation from a bounded one and re-issue with a
     tighter project/since to make progress.
+
+    ``_malformed_rows_skipped`` (Codex round-9 finding, PR #2062)
+    mirrors the grep envelope: the parse-gated walker bumps the
+    counter when a row's ``ts`` won't parse (typically a non-ISO
+    string from a pre-schema archived row). The previous route
+    dropped this; surfacing it lets the operator distinguish
+    "two events matched" from "two events matched + N archived
+    rows were silently skipped" without having to cross-check via
+    ``/audit/grep``.
     """
 
     total: int
@@ -155,6 +164,9 @@ class AuditStatsResponse(BaseModel):
     lines_scanned: int = Field(default=0, alias="_lines_scanned")
     corrupt_archives_skipped: int = Field(
         default=0, alias="_corrupt_archives_skipped"
+    )
+    malformed_rows_skipped: int = Field(
+        default=0, alias="_malformed_rows_skipped"
     )
 
     model_config = {"populate_by_name": True}
@@ -451,9 +463,10 @@ def stats_audit_endpoint(
     # Round-3 fix: route stats through the same parse-gated walker as
     # grep so malformed-ts rows (and the broken-string-compare bug in
     # round 2) can't inflate ``total``. We pass a ``stats`` dict so
-    # the walker bumps ``malformed_rows_skipped`` for us; we don't
-    # surface the counter in the response today, but reading it keeps
-    # the walker contract symmetric across both endpoints.
+    # the walker bumps ``malformed_rows_skipped`` for us; round-9
+    # surfaces the counter in the response so callers can distinguish
+    # a clean aggregation from one where archived rows were silently
+    # skipped.
     walker_stats: dict[str, int] = {}
     for record in iter_matching_events(
         targets=targets,
@@ -478,6 +491,7 @@ def stats_audit_endpoint(
         _truncated_by_deadline=bool(walker_stats.get("truncated_by_deadline", 0)),
         _lines_scanned=walker_stats.get("lines_scanned", 0),
         _corrupt_archives_skipped=walker_stats.get("corrupt_archives_skipped", 0),
+        _malformed_rows_skipped=walker_stats.get("malformed_rows_skipped", 0),
     )
 
 

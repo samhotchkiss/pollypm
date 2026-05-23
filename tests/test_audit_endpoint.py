@@ -946,6 +946,62 @@ def test_audit_stats_skips_malformed_rows(
     assert body["by_event"] == {"task.created": 2}
 
 
+def test_audit_stats_surfaces_malformed_rows_skipped(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """``/audit/stats`` must surface the walker's malformed-row counter.
+
+    Round-3 routed stats through the parse-gated walker so malformed
+    rows can't inflate totals, but the route dropped the diagnostic.
+    Round-9 (Codex review) surfaces ``_malformed_rows_skipped`` so
+    callers can tell a clean aggregation from one that silently
+    dropped archived rows — same shape grep already exposes.
+
+    Verifies BOTH the live response envelope and the static OpenAPI
+    schema document the field.
+    """
+    log_path = _per_project_log(project_root)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    rows = [
+        _make_event(event="task.created", ts="2026-05-21T00:00:00+00:00"),
+        # Non-ISO ``ts`` — the walker bumps malformed_rows_skipped.
+        _make_event(event="task.created", ts="not-a-date"),
+    ]
+    with open(log_path, "w", encoding="utf-8") as fh:
+        for record in rows:
+            fh.write(json.dumps(record) + "\n")
+
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "30d"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # The one valid row counts; the malformed one is gated out but
+    # the diagnostic counter MUST surface it on the response envelope.
+    assert body["total"] == 1
+    assert body["_malformed_rows_skipped"] >= 1
+
+    # Static OpenAPI yaml must document the same field so SDK
+    # generators don't strip it.
+    spec_path = (
+        Path(__file__).resolve().parent.parent / "docs" / "api" / "openapi.yaml"
+    )
+    spec_text = spec_path.read_text(encoding="utf-8")
+    stats_idx = spec_text.find("AuditStatsResponse:")
+    assert stats_idx != -1, "AuditStatsResponse schema missing from openapi.yaml"
+    # Look only at the AuditStatsResponse block (cut before the next
+    # top-level schema key).
+    stats_block = spec_text[stats_idx : stats_idx + 4000]
+    assert "_malformed_rows_skipped" in stats_block, (
+        "AuditStatsResponse schema must document _malformed_rows_skipped"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Round-4 guardrails (Codex review on PR #2062): request-level bound for the
 # HTTP regex path. ``limit`` caps matches, not scanned lines, so a no-match

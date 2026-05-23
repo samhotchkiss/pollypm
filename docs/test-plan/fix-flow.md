@@ -97,8 +97,8 @@ Examples:
 
 ```bash
 # Codex picks up an issue
-gh issue edit <N> --remove-label needs-codex --add-label needs-claude
-# Meaning: Codex is actively working; final PR will go to Claude.
+gh issue comment <N> --body "Codex is taking this. Implementation PR will be labeled needs-claude + codex-created."
+# Meaning: Codex is actively working. Do not flip the issue to needs-claude before the PR exists.
 
 # Codex opens implementation PR
 gh pr create ... --label needs-claude --label codex-created
@@ -231,11 +231,13 @@ fix(web-ui): <short imperative description>
 
 <Refs or Closes line>
 
-Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+<Optional Co-Authored-By line matching the actual authoring agent; omit if unsure>
 EOF
 )"
 git push -u origin fix/<category>-<short-name>
 ```
+
+Replace commit-message placeholders before committing. Do not leave a Claude co-author trailer on a Codex-authored commit, or a Codex trailer on a Claude-authored commit.
 
 ### Step 6: Open the PR
 
@@ -276,6 +278,8 @@ Closes #<N> (or Refs #<N> for partial)
 EOF
 )" --label <reviewer-label> --label <creator-label>
 ```
+
+Replace every placeholder before running the command. A literal `<reviewer-label>` / `<creator-label>` PR is invalid and must be fixed before review starts.
 
 **Critical:** the reviewer label is what triggers the other agent. If you forget it, the PR sits unowned.
 

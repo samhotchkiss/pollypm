@@ -6,6 +6,8 @@
 
 **Prereqs:** none. This is the lightest-weight check.
 
+**User contract:** this smoke is run by a testing agent, not by the product user. CLI commands are probes and setup only. The user-facing parts must be exercised through Web UI clicks and TUI keystrokes; if a normal operator would need to run `pm` commands to complete the workflow, the smoke is not green.
+
 **Abort rule:** if smoke takes >20 minutes total, **stop**. Something is genuinely slow. File `perf:smoke-overrun` and treat the smoke as red regardless of which step finishes. The whole point of smoke is fast feedback; a slow smoke is a contradiction.
 
 ---
@@ -45,7 +47,7 @@ Use the full 15-min version any time before declaring main shippable for the day
 
 ## The checklist
 
-Open this file. Run each step. Check the box. Anything red → stop and fix.
+Open this file as the testing agent. Run each step. Check the box. Anything red → stop and fix.
 
 ### Setup (2 min)
 
@@ -100,7 +102,7 @@ In Web UI:
 - ☐ Select `operator`. Type "smoke test $(date +%H%M%S)". Send.
 - ☐ Within 1 second: appears in `tmux capture-pane -t pollypm:pm-operator -p | tail -5`.
 
-In tmux operator pane:
+Via tmux keystrokes to the operator pane:
 - ☐ Type "echo from tmux $(date +%H%M%S)" and Enter.
 - ☐ Within 5 seconds: appears in Web UI message list.
 

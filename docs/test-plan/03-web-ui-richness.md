@@ -8,6 +8,8 @@
 
 **Hard invariant:** **nothing the operator clicks in TUI or Web UI may take longer than 1 second to respond.** This is non-negotiable. Anywhere a click feels laggy, file `perf:click-latency` immediately and don't skip past it.
 
+**User-level requirement:** this section must include real user-surface testing. Drive Web flows with Playwright plus exploratory real-browser use. Drive TUI parity with keystrokes sent to `pm cockpit` in tmux or a Textual `pilot` harness. CLI/API checks can corroborate state, but they do not prove the operator experience.
+
 **Performance harness:** all timing claims in this section use the §06 methodology. Manual impressions are useful notes, but pass/fail requires traces or Playwright timing. Run the Web UI checks at S-scale during exploration and at M-scale before release.
 
 Setup:

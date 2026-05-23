@@ -72,7 +72,7 @@ ConfigProvider = Callable[[], Any]
 
 def build_refresh_fn(
     config_provider: ConfigProvider,
-) -> Callable[[str], ProjectStateCacheEntry | None]:
+) -> Callable[..., ProjectStateCacheEntry | None]:
     """Return a :data:`RefreshFn` bound to ``config_provider``.
 
     The returned closure is the callable :class:`ProjectStateCache`
@@ -87,9 +87,18 @@ def build_refresh_fn(
     The PR #2026 v3 fast-path-disable workaround on
     ``cockpit_rail._latest_heartbeat_cached`` is reverted in tandem so
     rail reads serve from the snapshot again.
+
+    PR #2085 round-2 boundary fix: ``**kwargs`` are forwarded into
+    :func:`compute_entry_for_project` so a sweep-level
+    ``alerts_snapshot`` pre-fetched by
+    :class:`StateCacheRefresher` is used in place of a per-project
+    ``_open_alerts_for`` call. Single-project event-triggered
+    refreshes call without kwargs and continue to fetch on demand.
     """
 
-    def _refresh(project_key: str) -> ProjectStateCacheEntry | None:
+    def _refresh(
+        project_key: str, **kwargs: Any,
+    ) -> ProjectStateCacheEntry | None:
         try:
             config = config_provider()
         except Exception:  # noqa: BLE001
@@ -100,13 +109,16 @@ def build_refresh_fn(
                 exc_info=True,
             )
             return empty_entry(project_key)
-        return compute_entry_for_project(project_key, config)
+        return compute_entry_for_project(project_key, config, **kwargs)
 
     return _refresh
 
 
 def compute_entry_for_project(
-    project_key: str, config: Any,
+    project_key: str,
+    config: Any,
+    *,
+    alerts_snapshot: tuple[list[Any], bool] | None = None,
 ) -> ProjectStateCacheEntry:
     """Recompute the entry for ``project_key`` against ``config``.
 
@@ -131,6 +143,14 @@ def compute_entry_for_project(
     fast-path can union it with per-project entries without affecting
     rail / dashboard consumers (which iterate over tracked project
     keys and ignore extras).
+
+    PR #2085 round-2 boundary fix: ``alerts_snapshot`` lets the
+    sweep-level refresher pre-fetch the workspace-wide alert read
+    once and plumb the ``(alerts, valid)`` tuple through every
+    per-project compute. When ``None`` (single-project event-driven
+    refreshes, tests) the helper falls back to one
+    ``_open_alerts_for(config)`` call so legacy single-project paths
+    behave identically.
     """
 
     if project_key == WORKSPACE_PROJECT_KEY:
@@ -148,8 +168,12 @@ def compute_entry_for_project(
     # Best-effort: on any failure we degrade to "no alerts," which
     # matches the pre-fix workaround's worst-case (no RED bump) rather
     # than crashing the refresh.
+    #
+    # PR #2085 round-2: if the sweep-level refresher pre-fetched the
+    # workspace alert snapshot, reuse it (collapses N supervisor reads
+    # per sweep to 1). Otherwise fall back to the per-project read.
     actionable_alert_ids, alerts_valid = _actionable_alert_ids_for(
-        project_key, config,
+        project_key, config, alerts_snapshot=alerts_snapshot,
     )
     state, glyph, detail, rail_rollup, session_names = _categorize_and_rollup(
         project_key=project_key,
@@ -353,7 +377,10 @@ def _compute_workspace_entry(config: Any) -> ProjectStateCacheEntry:
 
 
 def _actionable_alert_ids_for(
-    project_key: str, config: Any,
+    project_key: str,
+    config: Any,
+    *,
+    alerts_snapshot: tuple[list[Any], bool] | None = None,
 ) -> tuple[frozenset[str], bool]:
     """Return ``(actionable_task_alert_ids, alerts_snapshot_valid)``.
 
@@ -380,6 +407,14 @@ def _actionable_alert_ids_for(
     alert read → empty set so the rollup doesn't bump to RED off a
     half-read snapshot. ``actionable_alert_task_ids`` failures are
     treated as failures too (valid=False) — same rationale.
+
+    PR #2085 round-2 boundary fix: ``alerts_snapshot`` is the
+    workspace-wide ``(alerts, valid)`` pair the sweep-level refresher
+    pre-fetches once and threads through every per-project compute.
+    When provided we skip the per-project ``_open_alerts_for`` call
+    entirely — that's where the N×Supervisor-construction perf cost
+    lived. When ``None`` we fall back to the on-demand read so
+    single-project event-triggered refreshes keep working unchanged.
     """
 
     try:
@@ -387,7 +422,10 @@ def _actionable_alert_ids_for(
     except Exception:  # noqa: BLE001
         return frozenset(), False
 
-    alerts, alerts_valid = _open_alerts_for(config)
+    if alerts_snapshot is not None:
+        alerts, alerts_valid = alerts_snapshot
+    else:
+        alerts, alerts_valid = _open_alerts_for(config)
     if not alerts_valid:
         return frozenset(), False
     try:

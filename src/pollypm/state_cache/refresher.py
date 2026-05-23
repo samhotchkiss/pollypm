@@ -184,6 +184,7 @@ class StateCacheRefresher:
         tail_poll_seconds: float = _TAIL_POLL_SECONDS,
         refresh_tick_seconds: float = _REFRESH_TICK_SECONDS,
         project_keys: Callable[[], list[str]] | None = None,
+        config_provider: Callable[[], object] | None = None,
     ) -> None:
         self._cache = cache
         self._audit_dir = audit_dir if audit_dir is not None else default_audit_dir()
@@ -193,6 +194,15 @@ class StateCacheRefresher:
         # refresh — when supplied, the worker enqueues a refresh for
         # every key returned. PR 2 will pass the config-driven list.
         self._project_keys = project_keys
+        # PR #2085 round-2 boundary fix: optional config provider used
+        # to pre-fetch the workspace-wide actionable-alert snapshot
+        # ONCE per sweep (``_initial_full_refresh`` /
+        # ``_worker_once``). Without this each per-project refresh
+        # would call ``_open_alerts_for(config)`` — Supervisor
+        # construction + open_alerts read — N times per sweep, all
+        # under the cache lock. With it, every sweep that touches >1
+        # project pays for exactly one alert read.
+        self._config_provider = config_provider
         self._positions: dict[Path, _Position] = {}
         self._stop_event = threading.Event()
         self._tail_thread: threading.Thread | None = None
@@ -257,12 +267,19 @@ class StateCacheRefresher:
         startup-gap window. Provider-less refreshers (PR 1 tests)
         do nothing here, which is correct — there is no project set
         to refresh yet.
+
+        PR #2085 round-2 boundary fix: workspace-wide alert snapshot
+        is fetched ONCE before the per-project loop and threaded
+        through every ``cache.refresh`` call. Without this, a
+        workspace with N projects paid N × Supervisor construction
+        per sweep — all under the cache lock.
         """
 
         keys = self._candidate_keys()
+        refresh_kwargs = self._sweep_refresh_kwargs(len(keys))
         for key in keys:
             try:
-                self._cache.refresh(key)
+                self._cache.refresh(key, **refresh_kwargs)
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "state_cache: initial refresh failed for %s", key,
@@ -403,13 +420,58 @@ class StateCacheRefresher:
             self._stop_event.wait(self._refresh_tick_seconds)
 
     def _worker_once(self) -> None:
-        for key in self._cache.drain_pending():
+        drained = self._cache.drain_pending()
+        refresh_kwargs = self._sweep_refresh_kwargs(len(drained))
+        for key in drained:
             try:
-                self._cache.refresh(key)
+                self._cache.refresh(key, **refresh_kwargs)
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "state_cache: refresh failed for %s", key,
                 )
+
+    # ── sweep-level pre-fetch ────────────────────────────────────
+
+    def _sweep_refresh_kwargs(self, key_count: int) -> dict[str, object]:
+        """Return kwargs to plumb through every refresh in one sweep.
+
+        PR #2085 round-2 boundary fix: ``_open_alerts_for(config)``
+        constructs a :class:`Supervisor` + reads ``open_alerts()`` —
+        a workspace-wide read. When the sweep touches >1 project,
+        doing this once and passing the result through reduces the
+        per-sweep cost from N × Supervisor reads to 1.
+
+        Single-project sweeps (drain has one key, single-project
+        event-triggered refreshes) skip the pre-fetch — the
+        downstream ``compute_entry_for_project`` will do its own
+        on-demand read, identical cost to the pre-PR behaviour for
+        that path.
+
+        ``config_provider`` unset (PR 1 tests, refreshers without the
+        real refresh function wired in) → no kwargs, same as before.
+        """
+
+        if key_count <= 1 or self._config_provider is None:
+            return {}
+        try:
+            from pollypm.state_cache.refresh_impl import _open_alerts_for
+        except Exception:  # noqa: BLE001
+            return {}
+        try:
+            config = self._config_provider()
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "state_cache: config_provider raised during sweep pre-fetch",
+            )
+            return {}
+        try:
+            alerts_snapshot = _open_alerts_for(config)
+        except Exception:  # noqa: BLE001
+            logger.exception(
+                "state_cache: _open_alerts_for raised during sweep pre-fetch",
+            )
+            return {}
+        return {"alerts_snapshot": alerts_snapshot}
 
 
 # ── test hooks ──────────────────────────────────────────────────

@@ -232,15 +232,21 @@ def get_cache() -> StateCacheLike:
 
                 refresh_fn = build_refresh_fn(_config_provider)
                 project_keys_provider = _project_keys_provider
+                refresher_config_provider: Callable[[], object] | None = (
+                    _config_provider
+                )
             except Exception:  # noqa: BLE001
                 logger.exception(
                     "state_cache: real refresh wiring failed; "
                     "falling back to stub",
                 )
                 refresh_fn = stub_refresh_fn
+                refresher_config_provider = None
             cache = ProjectStateCache(refresh_fn=refresh_fn)
             refresher = StateCacheRefresher(
-                cache, project_keys=project_keys_provider,
+                cache,
+                project_keys=project_keys_provider,
+                config_provider=refresher_config_provider,
             )
             try:
                 refresher.start()

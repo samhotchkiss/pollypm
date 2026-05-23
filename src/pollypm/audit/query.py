@@ -33,10 +33,12 @@ from __future__ import annotations
 
 import gzip
 import json
+import logging
 import multiprocessing
 import multiprocessing.connection
 import re
 import time
+import zlib
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterable, Iterator, MutableMapping
@@ -44,6 +46,8 @@ from typing import Iterable, Iterator, MutableMapping
 from pollypm.audit.log import central_log_path
 from pollypm.config import load_config
 from pollypm.projects import project_audit_log_path
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -401,25 +405,53 @@ def walk_log_chain(live: Path) -> Iterator[Path]:
         yield archive
 
 
-def open_log_lines(path: Path) -> Iterator[str]:
+def open_log_lines(
+    path: Path,
+    *,
+    stats: MutableMapping[str, int] | None = None,
+) -> Iterator[str]:
     """Stream decoded text lines from a live ``.jsonl`` or gzipped archive.
 
     Routes ``.gz`` paths through :func:`gzip.open` in text mode so the
     caller gets the same line iteration shape regardless of file
     format. Decoding errors are swallowed per-file (best-effort: a
     corrupt archive shouldn't break grep across the other files).
+
+    Round-7 hardening (Codex PR #2062): a truncated gzip raises
+    :class:`EOFError` mid-iteration (``Compressed file ended before the
+    end-of-stream marker was reached``); a corrupted gzip header raises
+    :class:`gzip.BadGzipFile`; deeper deflate corruption can surface
+    :class:`zlib.error`. None of those are ``OSError`` subclasses, so
+    the previous narrow ``except OSError`` let them escape past
+    :func:`iter_matching_events` and bubble up to the HTTP route as a
+    500 — defeating the "one bad archive shouldn't break the grep"
+    contract documented above. We now catch the full corrupt-archive
+    set and (when ``stats`` is provided) bump
+    ``stats["corrupt_archives_skipped"]`` so callers can surface the
+    diagnostic in their response envelope (mirrors the
+    ``malformed_rows_skipped`` / ``pattern_timeouts`` pattern).
     """
     try:
         if path.suffix == ".gz":
             fh = gzip.open(path, "rt", encoding="utf-8", errors="replace")
         else:
             fh = open(path, "r", encoding="utf-8", errors="replace")
-    except OSError:
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+        logger.warning("Skipping corrupt audit archive %s: %s", path, exc)
+        if stats is not None:
+            stats["corrupt_archives_skipped"] = (
+                stats.get("corrupt_archives_skipped", 0) + 1
+            )
         return
     try:
         for line in fh:
             yield line
-    except OSError:
+    except (OSError, EOFError, gzip.BadGzipFile, zlib.error) as exc:
+        logger.warning("Truncated audit archive %s: %s", path, exc)
+        if stats is not None:
+            stats["corrupt_archives_skipped"] = (
+                stats.get("corrupt_archives_skipped", 0) + 1
+            )
         return
     finally:
         try:
@@ -602,7 +634,7 @@ def iter_matching_events(
     try:
         for path in targets:
             for chain_path in walk_log_chain(path):
-                for line in open_log_lines(chain_path):
+                for line in open_log_lines(chain_path, stats=stats):
                     stripped = line.strip()
                     if not stripped:
                         continue

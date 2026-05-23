@@ -356,6 +356,75 @@ def test_grep_walks_rotated_gz_archives(
     assert subjects == ["myproj/live", "myproj/archived"]
 
 
+def test_grep_skips_truncated_gz_archive_and_counts_it(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Codex round-7 (PR #2062): a truncated ``.gz`` archive must not 500.
+
+    Before the fix the walker only caught ``OSError`` around
+    ``gzip.open(...)``/iteration; truncated archives raise
+    :class:`EOFError` mid-iteration, which escaped past
+    :func:`iter_matching_events` and bubbled to the route as a 500 —
+    one bad rotated file would take out the whole grep. The fix
+    catches ``EOFError`` / ``gzip.BadGzipFile`` / ``zlib.error``,
+    bumps ``stats["corrupt_archives_skipped"]``, and the route
+    surfaces it as ``_corrupt_archives_skipped`` on the response.
+    """
+    live = _per_project_log(project_root)
+    _write_jsonl(live, [_make_event(subject="myproj/live")])
+
+    # Build a real gzip stream, then truncate it mid-deflate so
+    # iteration raises EOFError (not OSError) — exact failure mode
+    # Codex flagged.
+    valid_archive = live.with_name(live.name + ".1700000000.gz")
+    _write_jsonl_gz(valid_archive, [_make_event(subject="myproj/valid_arch")])
+    valid_bytes = valid_archive.read_bytes()
+    truncated_archive = live.with_name(live.name + ".1699000000.gz")
+    truncated_archive.write_bytes(valid_bytes[: len(valid_bytes) // 2])
+    os.utime(valid_archive, (1_700_000_000, 1_700_000_000))
+    os.utime(truncated_archive, (1_699_000_000, 1_699_000_000))
+
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "pattern": "myproj/"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    subjects = [e["subject"] for e in body["events"]]
+    # Live + valid archive survive; truncated archive is skipped.
+    assert "myproj/live" in subjects
+    assert "myproj/valid_arch" in subjects
+    assert body.get("_corrupt_archives_skipped", 0) >= 1, body
+
+
+def test_grep_skips_bad_gzip_header_archive(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Bogus header (``gzip.BadGzipFile``) is also best-effort skipped."""
+    live = _per_project_log(project_root)
+    _write_jsonl(live, [_make_event(subject="myproj/live")])
+    bogus = live.with_name(live.name + ".1698000000.gz")
+    bogus.write_bytes(b"this is not a gzip file at all")
+    os.utime(bogus, (1_698_000_000, 1_698_000_000))
+
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={"project": "myproj", "pattern": "myproj/"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert any(e["subject"] == "myproj/live" for e in body["events"])
+    assert body.get("_corrupt_archives_skipped", 0) >= 1, body
+
+
 def test_grep_limit_caps_result_count(
     client: TestClient,
     auth_headers: dict[str, str],

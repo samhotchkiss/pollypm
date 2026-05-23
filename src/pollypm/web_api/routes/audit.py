@@ -100,6 +100,15 @@ class AuditGrepResponse(BaseModel):
     bounded-and-truncated one. ``limit`` caps returned matches; it
     does NOT cap scanned lines, so a no-match pathological regex
     still costs per-line work — the deadline is the hard upper bound.
+
+    ``_corrupt_archives_skipped`` (Codex round-7 finding, PR #2062)
+    counts rotated ``.gz`` archives the walker could not finish
+    reading — truncated mid-deflate (``EOFError``), bad gzip header
+    (``gzip.BadGzipFile``), or deeper deflate corruption
+    (``zlib.error``). The walker now treats those as best-effort
+    (one bad archive shouldn't break grep over the remaining files)
+    instead of letting the exception escape as a 500. Non-zero means
+    at least one archive needs operator attention.
     """
 
     events: list[Event]
@@ -110,6 +119,9 @@ class AuditGrepResponse(BaseModel):
         default=False, alias="_truncated_by_deadline"
     )
     lines_scanned: int = Field(default=0, alias="_lines_scanned")
+    corrupt_archives_skipped: int = Field(
+        default=0, alias="_corrupt_archives_skipped"
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -141,6 +153,9 @@ class AuditStatsResponse(BaseModel):
         default=False, alias="_truncated_by_deadline"
     )
     lines_scanned: int = Field(default=0, alias="_lines_scanned")
+    corrupt_archives_skipped: int = Field(
+        default=0, alias="_corrupt_archives_skipped"
+    )
 
     model_config = {"populate_by_name": True}
 
@@ -367,6 +382,7 @@ def grep_audit_endpoint(
         _pattern_timeouts=walker_stats.get("pattern_timeouts", 0),
         _truncated_by_deadline=bool(walker_stats.get("truncated_by_deadline", 0)),
         _lines_scanned=walker_stats.get("lines_scanned", 0),
+        _corrupt_archives_skipped=walker_stats.get("corrupt_archives_skipped", 0),
     )
 
 
@@ -461,6 +477,7 @@ def stats_audit_endpoint(
         since=since_dt,
         _truncated_by_deadline=bool(walker_stats.get("truncated_by_deadline", 0)),
         _lines_scanned=walker_stats.get("lines_scanned", 0),
+        _corrupt_archives_skipped=walker_stats.get("corrupt_archives_skipped", 0),
     )
 
 

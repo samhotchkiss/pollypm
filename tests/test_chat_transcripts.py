@@ -31,6 +31,7 @@ from pathlib import Path
 from pollypm.web_api.chat import (
     MessageRole,
     MessageType,
+    ParserInternalType,
     STALE_THRESHOLD_SECONDS,
     is_archive_stale,
     parse_events_jsonl,
@@ -153,6 +154,205 @@ def test_session_state_events_are_dropped(tmp_path: Path) -> None:
     assert len(envelopes) == 1
     assert envelopes[0].type == MessageType.TEXT
     assert envelopes[0].text == "Hello"
+
+
+# ---------------------------------------------------------------------------
+# Extended-thinking (Anthropic ``thinking`` content blocks) — gated by
+# ``include_thinking``. See GitHub #2048.
+# ---------------------------------------------------------------------------
+
+
+def test_thinking_envelope_emitted_when_flag_true(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [_claude_event(
+        "thinking",
+        text="Let me think about this...",
+        signature="opaque-sig-xyz",
+        raw={
+            "type": "thinking",
+            "thinking": "Let me think about this...",
+            "signature": "opaque-sig-xyz",
+        },
+    )])
+    _parse_cache_clear()
+    envelopes = parse_events_jsonl(
+        events_path, actor_fallback="Polly", include_thinking=True,
+    )
+    assert len(envelopes) == 1
+    env = envelopes[0]
+    assert env.type == ParserInternalType.THINKING
+    # ParserInternalType is deliberately separate from the public
+    # MessageType catalog (#2082); the route filters it out before
+    # serialization so the wire enum stays closed.
+    assert env.type not in {member for member in MessageType}
+    assert env.role == MessageRole.ASSISTANT
+    assert env.actor == "Polly"
+    assert env.text == "Let me think about this..."
+    assert env.metadata["provider"] == "claude"
+    assert env.metadata["model"] == "claude-opus-4-7"
+    assert env.metadata["signature"] == "opaque-sig-xyz"
+
+
+def test_thinking_envelope_dropped_when_flag_false(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [
+        _claude_event(
+            "thinking",
+            text="Hidden by default.",
+            signature="opaque",
+            raw={"type": "thinking", "thinking": "Hidden by default.", "signature": "opaque"},
+        ),
+        _claude_event("assistant_turn", text="Public reply."),
+    ])
+    _parse_cache_clear()
+    envelopes = parse_events_jsonl(events_path, actor_fallback="Polly")
+    # Default ``include_thinking=False`` drops the thinking envelope.
+    assert [env.type for env in envelopes] == [MessageType.TEXT]
+    assert envelopes[0].text == "Public reply."
+
+
+def test_thinking_cache_does_not_leak_between_flag_values(tmp_path: Path) -> None:
+    # The mtime cache must key on ``include_thinking`` so a False call
+    # doesn't poison a subsequent True call (or vice versa).
+    events_path = tmp_path / "events.jsonl"
+    _write_events(events_path, [
+        _claude_event(
+            "thinking",
+            text="Thought one.",
+            signature="",
+            raw={"type": "thinking", "thinking": "Thought one.", "signature": ""},
+        ),
+        _claude_event("assistant_turn", text="Spoken."),
+    ])
+    _parse_cache_clear()
+    # First: default False, only assistant_turn surfaces.
+    no_thinking = parse_events_jsonl(events_path)
+    assert [env.type for env in no_thinking] == [MessageType.TEXT]
+    # Same path, same mtime — flipping the flag must return a thinking
+    # envelope, not the cached non-thinking list.
+    with_thinking = parse_events_jsonl(events_path, include_thinking=True)
+    assert [env.type for env in with_thinking] == [
+        ParserInternalType.THINKING, MessageType.TEXT,
+    ]
+
+
+def test_include_thinking_preserves_content_block_order_via_ingestor(
+    tmp_path: Path,
+) -> None:
+    """Full pipeline preserves Anthropic content-block order.
+
+    Codex review on PR #2079: for a raw Claude assistant message
+    whose ``content`` is ``[thinking, text]``, the normalized
+    events must surface in ``[thinking, assistant_turn, ...]``
+    order so :func:`parse_events_jsonl` with
+    ``include_thinking=True`` returns envelopes that match the
+    provider block sequence — i.e. the THINKING envelope BEFORE
+    the TEXT envelope. The previous implementation flushed the
+    flattened text first then walked content for thinking,
+    reversing the order.
+    """
+    # Late imports keep the heavy ``sync_transcripts_once`` import
+    # off the module path used by the parser-only tests above.
+    from pollypm.models import (
+        AccountConfig,
+        KnownProject,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectKind,
+        ProjectSettings,
+        ProviderKind,
+        SessionConfig,
+    )
+    from pollypm.transcript_ingest import sync_transcripts_once
+
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="pollypm",
+            root_dir=project_root,
+            base_dir=project_root / ".pollypm",
+            logs_dir=project_root / ".pollypm/logs",
+            snapshots_dir=project_root / ".pollypm/snapshots",
+            state_db=project_root / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=project_root / ".pollypm/homes/claude_main",
+            ),
+        },
+        sessions={
+            "heartbeat": SessionConfig(
+                name="heartbeat",
+                role="heartbeat-supervisor",
+                provider=ProviderKind.CLAUDE,
+                account="claude_main",
+                cwd=project_root,
+            ),
+        },
+        projects={
+            "demo": KnownProject(
+                key="demo",
+                path=project_root,
+                name="Demo",
+                kind=ProjectKind.GIT,
+            ),
+        },
+    )
+
+    claude_file = (
+        config.accounts["claude_main"].home
+        / ".claude/projects/demo/session-pipeline.jsonl"
+    )
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-23T00:00:00Z",
+                "type": "assistant",
+                "sessionId": "session-pipeline",
+                "cwd": str(project_root),
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "think first",
+                            "signature": "sig-pipeline",
+                        },
+                        {"type": "text", "text": "answer second"},
+                    ],
+                    "usage": {"total_tokens": 4},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events_path = (
+        project_root / ".pollypm/transcripts/session-pipeline/events.jsonl"
+    )
+    _parse_cache_clear()
+    envelopes = parse_events_jsonl(
+        events_path, actor_fallback="Polly", include_thinking=True,
+    )
+
+    # Provider order ``[thinking, text]`` must survive end-to-end:
+    # the parser surfaces THINKING before TEXT so UI grouping and
+    # replay tooling can rely on the normalized stream matching the
+    # provider content array.
+    assert [env.type for env in envelopes] == [
+        ParserInternalType.THINKING,
+        MessageType.TEXT,
+    ]
+    assert envelopes[0].text == "think first"
+    assert envelopes[0].metadata["signature"] == "sig-pipeline"
+    assert envelopes[1].text == "answer second"
 
 
 # ---------------------------------------------------------------------------
@@ -771,16 +971,17 @@ def test_parse_cache_lru_evicts_oldest_when_full(tmp_path: Path) -> None:
         _write_events(path, [_claude_event("user_turn", text=f"e{idx}")])
         parse_events_jsonl(path)
     assert len(transcripts_module._PARSE_CACHE) == transcripts_module._PARSE_CACHE_MAX
-    oldest_path = tmp_path / "events-0.jsonl"
-    assert oldest_path in transcripts_module._PARSE_CACHE
+    # Cache key is ``(events_path, include_thinking)`` after #2048.
+    oldest_key = (tmp_path / "events-0.jsonl", False)
+    assert oldest_key in transcripts_module._PARSE_CACHE
 
     # One more parse pushes us past the cap -> oldest evicts.
     overflow = tmp_path / "events-overflow.jsonl"
     _write_events(overflow, [_claude_event("user_turn", text="overflow")])
     parse_events_jsonl(overflow)
     assert len(transcripts_module._PARSE_CACHE) == transcripts_module._PARSE_CACHE_MAX
-    assert oldest_path not in transcripts_module._PARSE_CACHE
-    assert overflow in transcripts_module._PARSE_CACHE
+    assert oldest_key not in transcripts_module._PARSE_CACHE
+    assert (overflow, False) in transcripts_module._PARSE_CACHE
 
 
 # ---------------------------------------------------------------------------
@@ -874,7 +1075,9 @@ def test_parse_tail_uses_mtime_cache_when_populated(tmp_path: Path) -> None:
 
     # Populate the cache by calling the full parser.
     parse_events_jsonl(events_path)
-    assert events_path in transcripts_module._PARSE_CACHE
+    # Cache key is ``(events_path, include_thinking)`` after #2048 +
+    # #2070 composition.
+    assert (events_path, False) in transcripts_module._PARSE_CACHE
 
     # Tail should now read from the cached list, not the disk.
     tail = parse_events_jsonl_tail(events_path, limit=10)
@@ -889,7 +1092,7 @@ def test_parse_tail_does_not_populate_mtime_cache(tmp_path: Path) -> None:
     _write_user_turn_lines(events_path, 100)
 
     parse_events_jsonl_tail(events_path, limit=10)
-    assert events_path not in transcripts_module._PARSE_CACHE
+    assert (events_path, False) not in transcripts_module._PARSE_CACHE
 
 
 def test_parse_tail_falls_back_for_pretty_printed_event(tmp_path: Path) -> None:

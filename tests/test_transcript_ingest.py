@@ -470,3 +470,255 @@ def test_up_starts_transcript_ingestion(monkeypatch, tmp_path: Path) -> None:
 
     assert result.exit_code == 0
     assert calls == [str(config_path.parent / ".pollypm")]
+
+
+def test_ingestor_preserves_thinking_content_blocks(tmp_path: Path) -> None:
+    """Anthropic extended-thinking blocks survive ingest (GitHub #2048).
+
+    Claude raw lines may include ``{"type": "thinking", "thinking": "...",
+    "signature": "..."}`` blocks alongside text/tool_use in the assistant
+    ``content`` list. The ingestor must emit a normalized
+    ``event_type="thinking"`` event preserving the text + signature so
+    downstream consumers can render extended thinking without re-reading
+    the raw provider JSONL.
+    """
+    config, _config_path = _config(tmp_path)
+    claude_file = config.accounts["claude_main"].home / ".claude/projects/demo/session-thinking.jsonl"
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-23T00:00:00Z",
+                "type": "assistant",
+                "sessionId": "session-thinking",
+                "cwd": str(config.project.root_dir),
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "Reconsidering the approach...",
+                            "signature": "sig-abc",
+                        },
+                        {"type": "text", "text": "Here is the answer."},
+                    ],
+                    "usage": {"total_tokens": 7},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events = [
+        json.loads(line)
+        for line in (
+            config.project.root_dir / ".pollypm/transcripts/session-thinking/events.jsonl"
+        ).read_text().splitlines()
+    ]
+
+    event_types = [event["event_type"] for event in events]
+    assert "thinking" in event_types
+    # ``assistant_turn`` should still be emitted for the text block.
+    assert "assistant_turn" in event_types
+    # Token usage is independent of thinking — verify it still flows.
+    assert "token_usage" in event_types
+
+    thinking_event = next(event for event in events if event["event_type"] == "thinking")
+    assert thinking_event["provider"] == "claude"
+    assert thinking_event["payload"]["text"] == "Reconsidering the approach..."
+    assert thinking_event["payload"]["signature"] == "sig-abc"
+    # ``raw`` round-trips the original provider block verbatim so
+    # replay tooling can reconstruct the exact content.
+    assert thinking_event["payload"]["raw"] == {
+        "type": "thinking",
+        "thinking": "Reconsidering the approach...",
+        "signature": "sig-abc",
+    }
+
+
+def test_normalize_claude_preserves_content_block_order_thinking_before_text(
+    tmp_path: Path,
+) -> None:
+    """Content-block order is preserved across the normalized stream.
+
+    Codex review on PR #2079 caught that the previous emit order
+    (``assistant_turn`` → ``token_usage`` → ``thinking``)
+    reversed Anthropic's provider order for content
+    ``[thinking, text]``. Replay tooling and UI grouping rely on
+    the normalized stream matching the provider block sequence,
+    so the ingestor must walk content blocks in order and emit
+    ``thinking`` BEFORE the ``assistant_turn`` that the text
+    block produces.
+    """
+    config, _config_path = _config(tmp_path)
+    claude_file = config.accounts["claude_main"].home / ".claude/projects/demo/session-order.jsonl"
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-23T00:00:00Z",
+                "type": "assistant",
+                "sessionId": "session-order",
+                "cwd": str(config.project.root_dir),
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "think first",
+                            "signature": "sig-1",
+                        },
+                        {"type": "text", "text": "answer second"},
+                    ],
+                    "usage": {"total_tokens": 4},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events = [
+        json.loads(line)
+        for line in (
+            config.project.root_dir / ".pollypm/transcripts/session-order/events.jsonl"
+        ).read_text().splitlines()
+    ]
+
+    # Thinking comes first because it leads the provider content
+    # array; assistant_turn follows the text block; token_usage
+    # trails the content walk as message-level metadata.
+    assert [event["event_type"] for event in events] == [
+        "thinking",
+        "assistant_turn",
+        "token_usage",
+    ]
+    thinking_event, assistant_event, usage_event = events
+    assert thinking_event["payload"]["text"] == "think first"
+    assert thinking_event["payload"]["signature"] == "sig-1"
+    assert assistant_event["payload"]["text"] == "answer second"
+    assert usage_event["payload"]["total_tokens"] == 4
+
+
+def test_normalize_claude_preserves_content_block_order_text_before_thinking(
+    tmp_path: Path,
+) -> None:
+    """Reverse ordering ``[text, thinking]`` is faithfully preserved.
+
+    Companion to the ``[thinking, text]`` test — guards against a
+    naive fix that always emits thinking first regardless of
+    provider order.
+    """
+    config, _config_path = _config(tmp_path)
+    claude_file = config.accounts["claude_main"].home / ".claude/projects/demo/session-rev.jsonl"
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-23T00:00:01Z",
+                "type": "assistant",
+                "sessionId": "session-rev",
+                "cwd": str(config.project.root_dir),
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {"type": "text", "text": "spoken first"},
+                        {
+                            "type": "thinking",
+                            "thinking": "reflected after",
+                            "signature": "sig-2",
+                        },
+                    ],
+                    "usage": {"total_tokens": 5},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events = [
+        json.loads(line)
+        for line in (
+            config.project.root_dir / ".pollypm/transcripts/session-rev/events.jsonl"
+        ).read_text().splitlines()
+    ]
+
+    assert [event["event_type"] for event in events] == [
+        "assistant_turn",
+        "thinking",
+        "token_usage",
+    ]
+    assert events[0]["payload"]["text"] == "spoken first"
+    assert events[1]["payload"]["text"] == "reflected after"
+
+
+def test_normalize_claude_coalesces_contiguous_text_blocks(
+    tmp_path: Path,
+) -> None:
+    """Contiguous ``text`` blocks merge into one ``assistant_turn``.
+
+    The wire shape for the text-only case is unchanged by the
+    content-block walk: two adjacent text blocks join with ``\\n``
+    into a single ``assistant_turn`` payload (mirrors
+    :func:`_extract_text`). When a non-text block interrupts the
+    run, the buffer flushes and a fresh ``assistant_turn`` opens
+    for any text that follows.
+    """
+    config, _config_path = _config(tmp_path)
+    claude_file = (
+        config.accounts["claude_main"].home
+        / ".claude/projects/demo/session-coalesce.jsonl"
+    )
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-23T00:00:02Z",
+                "type": "assistant",
+                "sessionId": "session-coalesce",
+                "cwd": str(config.project.root_dir),
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {"type": "text", "text": "first half"},
+                        {"type": "text", "text": "second half"},
+                        {
+                            "type": "thinking",
+                            "thinking": "interlude",
+                            "signature": "",
+                        },
+                        {"type": "text", "text": "after thinking"},
+                    ],
+                    "usage": {"total_tokens": 6},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events = [
+        json.loads(line)
+        for line in (
+            config.project.root_dir
+            / ".pollypm/transcripts/session-coalesce/events.jsonl"
+        ).read_text().splitlines()
+    ]
+
+    # Two text blocks → one assistant_turn (joined), then thinking,
+    # then a fresh assistant_turn for the trailing text block.
+    assert [event["event_type"] for event in events] == [
+        "assistant_turn",
+        "thinking",
+        "assistant_turn",
+        "token_usage",
+    ]
+    assert events[0]["payload"]["text"] == "first half\nsecond half"
+    assert events[1]["payload"]["text"] == "interlude"
+    assert events[2]["payload"]["text"] == "after thinking"

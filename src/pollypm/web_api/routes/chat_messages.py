@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field
 
 from pollypm.tmux.client import TmuxClient
 from pollypm.web_api.chat import (
+    PARSER_INTERNAL_TYPE_VALUES,
     STALE_THRESHOLD_SECONDS,
     ChatSurface,
     MessageEnvelope,
@@ -539,12 +540,15 @@ def _load_envelopes(
     cursor + small ``limit`` at the call site (the helper doesn't
     re-check those conditions).
 
-    NOTE: thinking-block filtering is no longer plumbed through this
-    helper. The authoritative ``parse_events_jsonl`` on main does not
-    surface thinking envelopes (transcript ingestor does not preserve
-    them), so there's nothing to gate. The ``include_thinking`` query
-    param is parked until the ingestor + parser learn how to round-trip
-    thinking blocks (follow-up #2048).
+    NOTE: this helper calls ``parse_events_jsonl`` /
+    ``parse_events_jsonl_tail`` with the default
+    ``include_thinking=False`` (the public ``include_thinking`` query
+    param is still parked until #2082 wires it through the route +
+    OpenAPI). Any thinking envelopes that slip past the parser are
+    additionally dropped downstream in
+    :func:`_apply_filters_and_paginate` via the parser-internal-type
+    filter, so the HTTP response catalog stays equal to the public
+    :class:`MessageType` enum.
     """
     archive = surface.transcript_path
     actor_fallback = surface.persona or "agent"
@@ -710,12 +714,16 @@ def _apply_filters_and_paginate(
     direction — applying ``since_id`` in source order would slice the
     wrong half for ``direction=desc``, duplicating page 1 on page 2):
 
-    1. Drop ``thinking`` envelopes — the authoritative parser does not
-       surface them today (transcript ingestor does not preserve
-       thinking blocks); this defensive filter keeps capture-mode
-       output consistent if a future capture path ever emits one.
-       ``include_thinking`` is parked until follow-up #2048 wires the
-       full thinking round-trip.
+    1. Drop envelopes whose ``type`` is in
+       :data:`PARSER_INTERNAL_TYPE_VALUES` — these are parser-internal
+       discriminators (today: ``thinking``, from
+       ``parse_events_jsonl(include_thinking=True)``, #2048) that are
+       intentionally NOT part of the HTTP-public ``MessageType`` /
+       ``ChatMessageType`` catalog. Filtering here keeps the public
+       wire enum exactly equal to the OpenAPI ``ChatMessageType`` enum
+       (pinned by ``test_chat_message_type_enum_matches_runtime``)
+       until follow-up #2082 promotes ``thinking`` into the public
+       catalog and wires the ``include_thinking`` query param.
     2. ``since`` lower-bound on envelope ``ts``.
     3. Sort by timestamp + position. JSONL ordering is already
        chronological; we re-sort defensively so the response is
@@ -744,7 +752,7 @@ def _apply_filters_and_paginate(
 
     filtered: list[MessageEnvelope] = []
     for envelope in envelopes:
-        if str(envelope.type) == "thinking":
+        if str(envelope.type) in PARSER_INTERNAL_TYPE_VALUES:
             continue
         if since_aware is not None:
             ts = _parse_envelope_ts(envelope.ts)

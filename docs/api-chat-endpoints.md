@@ -221,7 +221,19 @@ Pull a window of messages from a single session's transcript.
 | `include_subagents` | `false` | When `true`, each `subagent_result` envelope's `metadata.subagent_transcript` is populated by parsing the raw Claude JSONL the parent `task-notification.output-file` points at. Paths outside the project/workspace transcript allowlist are silently skipped. Capped per envelope. (#2052) |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
 
-> Note: A `type="thinking"` envelope is planned but not yet implemented — tracked in [#2048](https://github.com/samhotchkiss/pollypm/issues/2048).
+> Note: Anthropic extended-thinking blocks are preserved by the
+> ingestor and surfaced by `parse_events_jsonl(include_thinking=True)`
+> as a **parser-internal** discriminator
+> (`ParserInternalType.THINKING`, see #2048). They are intentionally
+> NOT part of the HTTP-public `ChatMessageType` enum — the route calls
+> the parser with the default (`include_thinking=False`) and
+> additionally filters out any parser-internal-type envelopes before
+> serialization. Promoting `thinking` into the public catalog +
+> wiring an `include_thinking` query param through the route + OpenAPI
+> schema is tracked in
+> [#2082](https://github.com/samhotchkiss/pollypm/issues/2082). Until
+> that lands, clients of `GET /messages` will never see
+> `type="thinking"` envelopes regardless of query string.
 
 **Response:**
 
@@ -416,6 +428,16 @@ structured original lives in `metadata`.
 | `subagent_spawn` | assistant | `Task` tool call | `metadata`: `subagent_id`, `subagent_type`, `description`, `prompt`, `isolation`. |
 | `subagent_result` | tool | `Task` tool return | `metadata`: `subagent_id`, `summary`, `duration_ms`, `total_tokens`, `worktree_path`, `output_file`. With `?include_subagents=true`: `metadata.subagent_transcript` carries envelopes parsed from the raw subagent JSONL at `output_file` (#2052). |
 | `system_event` | system | Compaction, session-start, error | `metadata.subtype` ∈ `compaction`, `session_start`, `session_resume`, `error`. |
+
+> Parser-internal discriminator: Anthropic extended-thinking blocks
+> are preserved by the ingestor and surfaced by
+> `parse_events_jsonl(include_thinking=True)` as
+> `ParserInternalType.THINKING` (`src/pollypm/web_api/chat/envelope.py`).
+> This is **not** an HTTP response `type` value — the chat-messages
+> route filters parser-internal-type envelopes out before serialization,
+> and the OpenAPI `ChatMessageType` enum does not include it. Promoting
+> `thinking` into the public catalog is tracked in
+> [#2082](https://github.com/samhotchkiss/pollypm/issues/2082).
 
 ### Example payloads
 

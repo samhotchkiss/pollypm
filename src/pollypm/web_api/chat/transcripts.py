@@ -11,7 +11,7 @@ Each line is one ``_event_base`` dict (see ``transcript_ingest.py``):
     {
       "timestamp": "2026-05-21T20:48:11Z",
       "event_type": "user_turn" | "assistant_turn" | "tool_call"
-                  | "tool_result" | "error" | "token_usage"
+                  | "tool_result" | "thinking" | "error" | "token_usage"
                   | "session_state" | "turn_end",
       "session_id": "<provider-internal uuid>",
       "account_name": "claude_main",
@@ -35,10 +35,14 @@ the following non-trivial mappings:
 - Claude ``AskUserQuestion`` tool calls become ``ask_user`` envelopes.
 - Claude ``SendUserFile`` tool calls become ``file`` envelopes.
 - Compaction / session-start markers become ``system_event``.
-
-The ingestor does NOT currently preserve provider ``thinking`` blocks,
-so the P1 envelope contract does not surface them. Tracking that work
-as a follow-up arc (see GitHub issue linked in the P1 PR description).
+- ``thinking`` ingestor events (Anthropic extended-thinking content
+  blocks; see GitHub #2048) become :class:`ParserInternalType.THINKING`
+  envelopes, but ONLY when callers pass ``include_thinking=True`` —
+  default drops them so the historical envelope contract is preserved.
+  Thinking is a parser-internal discriminator (not part of the public
+  ``MessageType`` enum / ``ChatMessageType`` OpenAPI schema); the
+  chat-messages route additionally filters it out before serialization
+  until follow-up #2082 wires the HTTP-public path.
 
 The parser is pure: takes a file path + flags, returns a list of
 envelopes. The P2 router layers pagination / filtering on top.
@@ -59,6 +63,7 @@ from pollypm.web_api.chat.envelope import (
     MessageEnvelope,
     MessageRole,
     MessageType,
+    ParserInternalType,
 )
 
 logger = logging.getLogger(__name__)
@@ -297,16 +302,18 @@ def is_archive_stale(
 # ~2,800 lines quickly). When the file hasn't been touched since the
 # last parse we can return the cached envelopes instead of re-parsing.
 #
-# Cache key is the ``Path`` instance the caller passed (resolution
-# left to the caller — the chat surfaces always pass the same Path).
-# Cache value is ``(mtime, envelopes, actor_fallback)`` so a caller
-# changing ``actor_fallback`` (different surface persona on the same
-# archive) doesn't get a stale fallback baked into the envelopes.
+# Cache key is ``(events_path, include_thinking)`` so callers that
+# branch on the thinking flag don't share results — the cache value
+# (``mtime, envelopes, actor_fallback``) still gates on actor so a
+# caller changing ``actor_fallback`` (different surface persona on the
+# same archive) doesn't get a stale fallback baked into the envelopes.
 #
 # Insertion-ordered dict + ``next(iter(...))`` gives us LRU-by-
 # insertion eviction without an extra dependency. The cap (100) is
 # generous given each entry is one events.jsonl per chat surface.
-_PARSE_CACHE: dict[Path, tuple[float, list[MessageEnvelope], str]] = {}
+_PARSE_CACHE: dict[
+    tuple[Path, bool], tuple[float, list[MessageEnvelope], str],
+] = {}
 _PARSE_CACHE_MAX = 100
 
 
@@ -320,6 +327,7 @@ def parse_events_jsonl(
     *,
     actor_fallback: str = "agent",
     strict: bool = False,
+    include_thinking: bool = False,
 ) -> list[MessageEnvelope]:
     """Parse an ``events.jsonl`` archive into envelopes.
 
@@ -346,16 +354,23 @@ def parse_events_jsonl(
     callers also skip the mtime cache so validation paths always see a
     fresh parse.
 
-    Caching (issue #2069): for ``strict=False`` callers we memoize on
-    ``(events_path, mtime, actor_fallback)``. The history endpoint
-    polls every few seconds and the underlying read forward-readlines
-    the full archive each call; with operator transcripts running into
-    the thousands of lines this dominates poll latency. When the file
-    mtime is unchanged the cached envelopes are returned directly.
+    ``include_thinking`` (default ``False``; see GitHub #2048) — when
+    ``True``, Anthropic extended-thinking content blocks preserved by
+    the ingestor as ``event_type="thinking"`` are surfaced as
+    :class:`ParserInternalType.THINKING` envelopes — a parser-internal
+    discriminator that is intentionally NOT in the HTTP-public
+    :class:`MessageType` catalog. The chat-messages route filters these
+    out before serialization until follow-up #2082 wires the public
+    route. The default keeps the historical envelope contract: existing
+    callers (and HTTP clients) see no new types.
 
-    NOTE: provider ``thinking`` blocks are not surfaced — the
-    transcript ingestor does not currently preserve them. Tracking the
-    follow-up work as a separate arc (linked from the P1 PR).
+    Caching (issue #2069): for ``strict=False`` callers we memoize on
+    ``(events_path, include_thinking, mtime, actor_fallback)``. The
+    history endpoint polls every few seconds and the underlying read
+    forward-readlines the full archive each call; with operator
+    transcripts running into the thousands of lines this dominates
+    poll latency. When the file mtime is unchanged the cached envelopes
+    are returned directly.
     """
     envelopes: list[MessageEnvelope] = []
     if not events_path.exists():
@@ -364,6 +379,7 @@ def parse_events_jsonl(
     # front; ``strict=True`` callers skip the cache so validation paths
     # always see a fresh parse + propagated OSError.
     cache_eligible = not strict
+    cache_key = (events_path, include_thinking)
     cached_mtime: float | None = None
     if cache_eligible:
         try:
@@ -374,7 +390,7 @@ def parse_events_jsonl(
             # logged with the same context as before.
             cached_mtime = None
         if cached_mtime is not None:
-            cached = _PARSE_CACHE.get(events_path)
+            cached = _PARSE_CACHE.get(cache_key)
             if (
                 cached is not None
                 and cached[0] == cached_mtime
@@ -413,6 +429,7 @@ def parse_events_jsonl(
                     offset=start_offset,
                     source_key=source_key,
                     actor_fallback=actor_fallback,
+                    include_thinking=include_thinking,
                 )
                 envelopes.extend(converted)
     except OSError as exc:
@@ -430,12 +447,12 @@ def parse_events_jsonl(
         # dicts preserve insertion order so ``next(iter(...))`` gives
         # us the oldest key without an auxiliary structure. Pop the
         # current key first (if present) so re-stores refresh ordering.
-        _PARSE_CACHE.pop(events_path, None)
+        _PARSE_CACHE.pop(cache_key, None)
         if len(_PARSE_CACHE) >= _PARSE_CACHE_MAX:
             _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
         # Store a fresh list so test/in-place mutations on the
         # returned copy don't bleed back into the cache.
-        _PARSE_CACHE[events_path] = (cached_mtime, list(envelopes), actor_fallback)
+        _PARSE_CACHE[cache_key] = (cached_mtime, list(envelopes), actor_fallback)
     return envelopes
 
 
@@ -455,6 +472,7 @@ def parse_events_jsonl_tail(
     *,
     limit: int,
     actor_fallback: str = "agent",
+    include_thinking: bool = False,
 ) -> list[MessageEnvelope]:
     """Return roughly the last ``limit`` envelopes by tail-reading the file.
 
@@ -505,7 +523,7 @@ def parse_events_jsonl_tail(
     except OSError:
         cached_mtime = None
     if cached_mtime is not None:
-        cached = _PARSE_CACHE.get(events_path)
+        cached = _PARSE_CACHE.get((events_path, include_thinking))
         if (
             cached is not None
             and cached[0] == cached_mtime
@@ -527,7 +545,9 @@ def parse_events_jsonl_tail(
             events_path, exc,
         )
         return parse_events_jsonl(
-            events_path, actor_fallback=actor_fallback,
+            events_path,
+            actor_fallback=actor_fallback,
+            include_thinking=include_thinking,
         )[-limit:]
 
     if file_size == 0:
@@ -541,6 +561,7 @@ def parse_events_jsonl_tail(
                 chunk_size=chunk_size,
                 source_key=source_key,
                 actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )
         except (UnicodeDecodeError, OSError) as exc:
             # Chunk-boundary read landed inside a multi-byte sequence
@@ -552,14 +573,18 @@ def parse_events_jsonl_tail(
                 events_path, exc,
             )
             return parse_events_jsonl(
-                events_path, actor_fallback=actor_fallback,
+                events_path,
+                actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )[-limit:]
         if envelopes is None:
             # Sentinel: chunk parse hit a defensive bailout (e.g. a
             # malformed-but-not-skipped line). Treat the same as a
             # decode error and use the forward parser.
             return parse_events_jsonl(
-                events_path, actor_fallback=actor_fallback,
+                events_path,
+                actor_fallback=actor_fallback,
+                include_thinking=include_thinking,
             )[-limit:]
         if len(envelopes) >= limit:
             return envelopes[-limit:]
@@ -572,7 +597,9 @@ def parse_events_jsonl_tail(
     # sparsely populated with valid envelopes (lots of dropped
     # token_usage / malformed lines).
     return parse_events_jsonl(
-        events_path, actor_fallback=actor_fallback,
+        events_path,
+        actor_fallback=actor_fallback,
+        include_thinking=include_thinking,
     )[-limit:]
 
 
@@ -583,6 +610,7 @@ def _parse_tail_chunk(
     chunk_size: int,
     source_key: str,
     actor_fallback: str,
+    include_thinking: bool = False,
 ) -> list[MessageEnvelope] | None:
     """Read ``chunk_size`` bytes from EOF, parse the lines, return envelopes.
 
@@ -640,6 +668,7 @@ def _parse_tail_chunk(
             offset=line_offset,
             source_key=source_key,
             actor_fallback=actor_fallback,
+            include_thinking=include_thinking,
         )
         envelopes.extend(converted)
     return envelopes
@@ -651,6 +680,7 @@ def _event_to_envelopes(
     offset: int,
     source_key: str,
     actor_fallback: str,
+    include_thinking: bool = False,
 ) -> list[MessageEnvelope]:
     """Translate one ingestor event into 0+ envelopes.
 
@@ -678,6 +708,14 @@ def _event_to_envelopes(
         return _envelope_tool_result(
             event, payload, msg_id, timestamp, provider,
         )
+    if event_type == "thinking":
+        # Gated behind ``include_thinking`` (default False) so default
+        # callers see no new types — see GitHub #2048.
+        if not include_thinking:
+            return []
+        return [_envelope_thinking(
+            event, payload, msg_id, timestamp, actor_fallback,
+        )]
     if event_type == "error":
         return [_envelope_error(event, payload, msg_id, timestamp)]
     if event_type == "turn_end":
@@ -771,6 +809,50 @@ def _envelope_assistant_turn(
         metadata={
             "provider": event.get("provider", ""),
             "model": event.get("model_name") or "",
+        },
+    )
+
+
+def _envelope_thinking(
+    event: dict[str, Any],
+    payload: dict[str, Any],
+    msg_id: str,
+    timestamp: str,
+    actor_fallback: str,
+) -> MessageEnvelope:
+    """Anthropic extended-thinking block (see GitHub #2048).
+
+    Payload shape (mirrored from the ingestor):
+
+        {
+          "text": "<thinking content>",
+          "signature": "<opaque, may be empty>",
+          "raw": {"type": "thinking", "thinking": "...", "signature": "..."}
+        }
+
+    Surfaced as an assistant-role envelope so UIs can group thinking
+    next to the assistant turn it precedes. ``text`` carries the
+    thinking content directly so the same "dumb client renders ``text``
+    without parsing metadata" contract holds.
+
+    The envelope's ``type`` is :class:`ParserInternalType.THINKING`, a
+    parser-internal discriminator intentionally NOT in the HTTP-public
+    :class:`MessageType` enum. The chat-messages route drops these
+    envelopes before serialization (see #2082).
+    """
+    text = str(payload.get("text") or "")
+    signature = str(payload.get("signature") or "")
+    return MessageEnvelope(
+        id=msg_id,
+        ts=timestamp,
+        role=MessageRole.ASSISTANT,
+        actor=actor_fallback,
+        type=ParserInternalType.THINKING,
+        text=text,
+        metadata={
+            "provider": event.get("provider", ""),
+            "model": event.get("model_name") or "",
+            "signature": signature,
         },
     )
 

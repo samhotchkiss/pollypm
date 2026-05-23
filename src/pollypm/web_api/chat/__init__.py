@@ -3,10 +3,15 @@
 P1 ships the read-side primitives the chat endpoints (P2) compose:
 
 - :mod:`envelope` — the uniform :class:`MessageEnvelope` dataclass and
-  the type discriminators (``text``, ``tool_use``, ``tool_result``,
-  ``ask_user``, ``file``, ``subagent_spawn``, ``subagent_result``,
-  ``system_event``) per spec §3. ``thinking`` is deferred — the
-  ingestor doesn't preserve provider thinking blocks yet.
+  the HTTP-public type discriminators (``text``, ``tool_use``,
+  ``tool_result``, ``ask_user``, ``file``, ``subagent_spawn``,
+  ``subagent_result``, ``system_event``) per spec §3, plus the
+  parser-internal :class:`ParserInternalType` enum (today:
+  ``thinking``). :func:`parse_events_jsonl` may emit envelopes whose
+  ``type`` is a :class:`ParserInternalType` member under explicit
+  opt-in flags (``include_thinking=True``); the chat-messages route
+  filters those out before serialization so the wire catalog stays
+  closed to :class:`MessageType`. See GitHub #2048 / #2082.
 - :mod:`registry` — enumerates every live chat surface (operator,
   architect, advisor, worker) into :class:`ChatSurface` dataclasses,
   resolving the tmux window + transcript path for each.
@@ -24,9 +29,11 @@ router be a thin adapter.
 from __future__ import annotations
 
 from pollypm.web_api.chat.envelope import (
+    PARSER_INTERNAL_TYPE_VALUES,
     MessageEnvelope,
     MessageRole,
     MessageType,
+    ParserInternalType,
 )
 from pollypm.web_api.chat.registry import (
     ChatSurface,
@@ -49,11 +56,13 @@ from pollypm.web_api.chat.transcripts import (
 )
 
 __all__ = [
+    "PARSER_INTERNAL_TYPE_VALUES",
     "STALE_THRESHOLD_SECONDS",
     "ChatSurface",
     "MessageEnvelope",
     "MessageRole",
     "MessageType",
+    "ParserInternalType",
     "SurfaceType",
     "capture_envelopes",
     "enumerate_chat_surfaces",

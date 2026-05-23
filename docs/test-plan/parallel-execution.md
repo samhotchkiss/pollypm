@@ -29,11 +29,12 @@ If two agents need the same files, split by sequence: one writes, the other revi
 | B | Claude | §01 task lifecycle validation | `claude/task-lifecycle-validation` | issues/test notes; backend fixes only after operator approval |
 | C | Claude | §02 translation-layer validation | `claude/translation-validation` | fixture findings; backend fixes only after operator approval |
 | D | Codex | Rich Web UI implementation (§03) | `codex/rich-web-ui` | `src/pollypm/web_api/ui/*`, UI-focused Playwright specs |
-| E | Codex | Performance harness (§06) | `codex/perf-harness` | `scripts/perf/*`, Makefile targets, perf docs |
+| E | Codex | Performance harness + fixture seeds (§06) | `codex/perf-harness` | `scripts/perf/*` (including `seed_sscale.sh`, `seed_mscale.sh`, `seed_lscale.sh`, `measure_http.sh`), Makefile targets, perf docs |
 | F | Codex | Smoke automation (§07) | `codex/smoke-automation` | `scripts/smoke*`, Makefile targets, lightweight CLI checks |
-| G | Codex | Web UI test coverage | `codex/web-ui-playwright` | `tests/playwright/*` only |
+| G | Codex | Web UI test coverage | `codex/web-ui-playwright` | `tests/playwright/*` only (including `tests/playwright/ARCHITECTURE.md`) |
+| H | Codex | Evals harness scaffold (§04) | `codex/evals-harness` | `scripts/evals/*`, `tests/evals/cases/*.yaml`, runner CLI |
 
-Run A first. B, C, D, E, F, and G can start once A has the tested SHA and environment baseline.
+Run A first. B, C, D, E, F, G, and H can start once A has the tested SHA and environment baseline.
 
 ---
 
@@ -128,12 +129,53 @@ Build:
 - Network 4xx/5xx assertion.
 - Mobile-chrome smoke.
 - Trace capture on failure for perf issues.
+- `tests/playwright/ARCHITECTURE.md` describing spec naming convention (one spec per scenario, named for the test-plan reference, e.g. `03-web-ui/3.5-click-rule.spec.ts`).
 
 Coordinate with D so tests target stable selectors and do not fight UI refactors.
 
 Architecture constraints:
 - Prefer user-visible selectors and stable `data-testid` hooks over brittle DOM traversal.
 - Tests should assert public behavior and contracts, not private implementation details.
+
+### H — Evals Harness
+
+Build the runner (not the cases — those are testing-agent territory).
+
+Build:
+- `scripts/evals/run.py` — CLI that takes a YAML manifest of cases, drives each prompt against a named session via the chat API, captures the response, applies category/keyword/structural assertions, emits per-case pass/fail + aggregate report.
+- Case schema (`tests/evals/cases/<role>-<scenario>.yaml`):
+  ```yaml
+  id: architect-planning-3-candidates
+  role: architect
+  session_template: architect_<project>
+  prompt: |
+    What should be the next priority for PollyPM after the current sprint?
+    Give me 3 candidates with one-paragraph reasoning each.
+  assertions:
+    must_contain_at_least:
+      - candidates_count: 3
+    must_match_regex:
+      - "(?i)(priority|next sprint)"
+    must_not_match_regex:
+      - "(?i)i am happy to help"
+    response_category: planning
+  timeout_seconds: 90
+  ```
+- HTML/Markdown report output suitable for inclusion in the journal.
+- Model-version capture per run; the report header includes the model from `pollypm.toml` at run time.
+- One example case per role (architect / advisor / worker / operator) to prove end-to-end wiring.
+
+Architecture constraints:
+- Runner is an isolated tool; does NOT depend on `tests/` internals.
+- Uses public chat API only (no direct PG / events.jsonl access).
+- Cases are versioned YAML; case files are owned by the testing persona, not the harness owner.
+
+Tests:
+- Self-test: a deterministic dry-run mode with a canned response to verify the assertion engine.
+
+Out of scope for lane H:
+- Writing the 20-case suite — that's testing-persona work after the runner ships.
+- CI integration — evals are pre-ship only.
 
 ---
 

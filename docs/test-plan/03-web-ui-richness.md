@@ -278,21 +278,79 @@ pm api regen-token
 
 ## 3.9 Magic-feel checks
 
-**These are the hardest to verify but the most important.** Sit with the system as a user for 30 minutes. Then answer:
+**These are the hardest to verify but the most important.** They are also the easiest to fake. Below are measurable scenarios that capture "feels magical" in a way that another tester could repeat.
 
-1. Did the UI **anticipate** what you needed at any point? (E.g., a relevant inbox item surfaced when you needed it; a stuck task showed itself; a relevant surface auto-selected.)
-2. Did the UI **save you a step** at any point? (E.g., one-click claim, smart default for reassign.)
-3. Did the UI **explain itself** when something went wrong? (Or did you have to drop to `pm doctor` to figure it out?)
-4. Did you ever say "huh, I wish I could..." — what was the wish?
-5. Did the polling feel right, or did you wait for state to refresh?
+### 3.9.1 Cold-operator scenario (measurable)
 
-Every "no" or "I wished for X" is a `magic-gap` issue.
+Seed the system with a specific situation, then ask a fresh operator to act.
 
-The bar: **a user who's never seen PollyPM should be able to sit down at the Web UI and accomplish their first task — without reading docs.**
+**Setup:**
+```bash
+# Create 3 tasks. One stuck (kill its worker pane afterward).
+T1=$(pm task create --project pollypm "magic-feel-stuck" --json | jq -r .task_id)
+T2=$(pm task create --project pollypm "magic-feel-fresh" --json | jq -r .task_id)
+T3=$(pm task create --project pollypm "magic-feel-review" --json | jq -r .task_id)
+pm task queue "$T1"; pm task queue "$T2"; pm task queue "$T3"
+sleep 90  # let them claim
 
-If they can't, document the friction point.
+# Kill the worker on T1's pane to make it "stuck"
+tmux kill-window -t pollypm:worker_pollypm
+sleep 180  # cascade detection window
+```
+
+**Test:** open `/ui/` in a fresh incognito tab. Find a willing tester who has never used PollyPM (or simulate by ignoring everything you know).
+
+Without reading docs or asking questions, the tester must:
+1. Identify which of the three tasks is "the one that needs attention." (Expected: T1, the stuck one.)
+2. Take an action on that task (e.g., view its detail, retry, reassign — any deliberate action).
+
+**Measure:**
+- Time from page-load to action: **must be < 60s.**
+- Did they pick the right task? (Yes / no.)
+- Did they need to drop to `pm doctor`, `pm task get`, or the TUI to figure it out? (No = pass.)
+
+**Pass:** all three measures green. If <60s but they picked wrong task, file `magic-gap:wrong-attention`. If >60s, file `magic-gap:dashboard-not-anticipating`.
+
+### 3.9.2 The "I wish I could…" log
+
+Sit with the system as a user for 30 minutes. Keep a notebook open. Every time you think "I wish I could…", "huh, why doesn't it…", or "I had to drop to CLI for…", write it down.
+
+These are the magic-gap candidates. After 30 minutes, each one becomes a `magic-gap:` issue with:
+- What you were trying to do.
+- What the UI made you do instead.
+- What would have been magical.
+
+**Pass:** the list captured at least 3 specific wishes (a list of 0 means you didn't push hard enough; a list of 20 means the magic gap is large).
+
+The bar: **a user who's never seen PollyPM should be able to sit down at the Web UI and accomplish their first task — without reading docs.** Test §3.9.1 enforces this.
 
 ---
+
+## 3.9.3 TUI parity — measurable via Textual pilot
+
+For TUI interactions, manual stopwatching is unreliable. Use Textual's `pilot` harness to drive cockpit interactions in a test context.
+
+**Pattern:**
+```python
+# tests/test_cockpit_click_rule.py (Codex lane G builds the suite)
+from pollypm.cockpit_ui import CockpitApp
+import time
+
+async def test_rail_navigation_under_1s():
+    app = CockpitApp()
+    async with app.run_test() as pilot:
+        t0 = time.monotonic()
+        await pilot.press("j")
+        await pilot.pause(0)  # process events
+        elapsed = time.monotonic() - t0
+        assert elapsed < 0.250, f"rail j took {elapsed:.3f}s (>250ms budget)"
+```
+
+**Manual fallback (acceptable for §03 exploratory only):**
+- Use `tmux capture-pane -p | wc -l` as a coarse render check.
+- Count seconds aloud (better than nothing, worse than `pilot`).
+
+**Pass criterion:** TUI rail navigation, pane mount, and detail render all measurable via `pilot`. If a behavior is not measurable via `pilot`, that's `bug:tui-untestable` against the cockpit module.
 
 ## 3.10 Mobile-specific UX
 

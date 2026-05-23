@@ -2,9 +2,11 @@
 
 **Goal:** a fast pass that verifies main is shippable right now. Designed to run any time — before a merge, after a deploy, when something feels off, every morning during ship-readiness.
 
-**Time:** 15 minutes.
+**Time:** 15 minutes (full). 5 minutes (crunch — see below).
 
 **Prereqs:** none. This is the lightest-weight check.
+
+**Abort rule:** if smoke takes >20 minutes total, **stop**. Something is genuinely slow. File `perf:smoke-overrun` and treat the smoke as red regardless of which step finishes. The whole point of smoke is fast feedback; a slow smoke is a contradiction.
 
 ---
 
@@ -26,6 +28,18 @@
 - M-scale performance regressions (use §06 before ship/no-ship).
 
 If §07 is green, you can ship a small change. If §07 is red, **do not ship** — investigate.
+
+## The 5-minute crunch version
+
+When you have 5 minutes (e.g., post-merge sanity, mid-incident):
+
+1. **REST liveness** (1 min) — `/health`, `/dashboard`, `/chat/sessions` all 200 + sub-second.
+2. **Web UI load + 3 clicks** (2 min) — open `/ui/`, click 3 surfaces, verify each <1s.
+3. **Send-receive round-trip** (2 min) — Web → tmux (<1s), tmux → Web (<5s).
+
+Skip task cycle, doctor, sessions health. The crunch version catches outright breakage but not subtle drift.
+
+Use the full 15-min version any time before declaring main shippable for the day.
 
 ---
 

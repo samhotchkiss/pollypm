@@ -36,6 +36,17 @@ Legal transitions only. Invalid lifecycle transitions must return typed errors (
 - **TUI**: `pm cockpit` reflects PG state via the state cache.
 - **Web**: `GET /api/v1/dashboard` + `/api/v1/tasks/...` reflect PG state.
 
+### Minimum-viable §01 (if time-constrained)
+
+If you cannot run the full 4–6 hours, run these in order — they catch the highest-leverage failures:
+
+1. **§1.5 cascade recovery** — if recovery doesn't self-heal, nothing else matters.
+2. **§1.3 concurrency** — atomic claims and lost-update prevention are non-negotiable.
+3. **§1.4 visibility** — if the operator can't see what's stuck, the system is unusable even when correct.
+4. **§1.2.2 illegal transitions** — verifies error envelopes are typed, not 500s.
+
+Skip 1.1.x happy paths last — they're the most likely to "just work" without targeted testing.
+
 ### Heartbeat cascade (tier model)
 
 1. **Heartbeat (mechanical):** per-session "I'm alive" ping. Missed → escalate to PM.
@@ -196,6 +207,34 @@ pm task get "$TID"  # still cancelled, assignee empty
 
 **Pass:** cancelled tasks stay cancelled; no worker grabs them.
 
+### 1.2.4 Cancellation undo (operator-error scenario)
+
+Real operators cancel by mistake. Verify what happens when they want it back.
+
+```bash
+TID=$(pm task create --project pollypm "test-1-2-4" --json | jq -r .task_id)
+pm task queue "$TID"
+sleep 60  # let it claim
+# Operator panics, cancels:
+pm task cancel "$TID" --actor operator --reason "oops"
+
+# Now try to recover:
+pm task reopen "$TID" 2>&1 || echo "no reopen command"
+# Or re-queue:
+pm task queue "$TID" 2>&1 || echo "no requeue from cancelled"
+```
+
+**Three acceptable outcomes:**
+- (a) A first-class `pm task reopen` (or `--undo`) restores the previous state.
+- (b) Cancellation is a soft state; re-queueing from cancelled is allowed and surfaces a clear breadcrumb.
+- (c) Cancellation is final; the operator must create a new task with a `Refs <cancelled task id>` link.
+
+**Not acceptable:**
+- (a) No way to recover AND no warning at cancel time.
+- (b) `pm task reopen` exists but silently fails or leaves an inconsistent state.
+
+If outcome (a) or (b), document the path. If only (c), file `magic-gap:cancel-no-undo` — operator panic-cancellation is common enough that "create a new task" friction is a real UX cost.
+
 ---
 
 ## 1.3 Concurrency
@@ -295,9 +334,38 @@ For any task in any non-terminal state for >5 minutes, both TUI and Web should s
 
 **Pass:** every non-terminal task surfaces its dwell time at a glance.
 
-### 1.4.4 "Why is this stuck?"
+### 1.4.4 Plan-review inbox handoff trace
 
-Kill a worker pane mid-task: `tmux kill-window -t pollypm:worker_pollypm`. The task is now stuck — nobody's working on it, but PG still says `in_progress`.
+The architect produces a plan; the operator gets a plan-review item in their inbox. Verify the mechanism, because everything downstream depends on it.
+
+```bash
+# Trigger: ask architect for a plan
+curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"text":"Propose a plan for fixing X."}' \
+  $BASE/api/v1/chat/architect_pollypm/send
+
+# Wait for plan emission (varies; usually <2 min if architect has context)
+sleep 60
+
+# Verify the inbox item exists
+pm inbox list --label plan-review
+# Or via REST:
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/inbox?label=plan-review" | jq
+
+# Verify audit trail
+grep -E 'plan_review_emit|inbox.message_created' ~/.pollypm/audit/pollypm.jsonl | tail -5
+```
+
+**Pass:**
+- Plan-review item appears in inbox within 30s of architect emission.
+- Inbox item references the source session (`architect_pollypm`) and the plan content.
+- Operator can act on it (approve, reject, comment) — see §3.4 for UI verification.
+
+**If no inbox item appears:** the emit path is broken. Check `src/pollypm/work/plan_review_emit.py` for the emit site and the audit log for failures. File `bug:plan-review-emit`.
+
+### 1.4.5 "Why is this stuck?"
+
+Kill a worker pane mid-task: `tmux kill-window -t pollypm:worker_pollypm` (per §1.4.4 prereqs). The task is now stuck — nobody's working on it, but PG still says `in_progress`.
 
 After 2 minutes (recovery cascade detection window), the operator should see:
 - TUI: a clear "stuck" indicator on that task, with the reason (no heartbeat from actor).

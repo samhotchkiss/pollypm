@@ -8,6 +8,23 @@
 
 **Important:** these tests are destructive. Run against a non-production PollyPM instance, or accept that you'll have to restart sessions. Have a known-good state snapshot before starting.
 
+**Prereq: §00.0 environment safety check must have passed.** This section will:
+- Kill the daemon.
+- Drop PG connections.
+- Restart processes mid-task.
+- Corrupt the pause marker.
+- Optionally fill disk.
+
+If any of these would affect the operator's real workload, STOP. Move to a test environment.
+
+Suggested snapshot before starting:
+```bash
+# State you can restore later
+cp -r ~/.pollypm /tmp/pollypm-pre-05-snapshot
+pg_dump pollypm > /tmp/pollypm-pre-05-snapshot.sql
+git -C /Users/sam/dev/pollypm rev-parse HEAD > /tmp/pollypm-pre-05-snapshot.sha
+```
+
 Setup:
 ```bash
 export BASE=http://$(tailscale ip -4):8765
@@ -304,7 +321,74 @@ Run many concurrent API requests (e.g. 50 in parallel). PG connection pool size 
 
 ---
 
-## 5.8 Recovery while under load
+## 5.8 Data corruption recovery
+
+**Goal:** PollyPM should survive a corrupted file or partially-written audit row without crashing or producing fictional state.
+
+### 5.8.1 Truncated audit log
+
+```bash
+# Truncate a project's audit log mid-line
+PROJECT_AUDIT=~/.pollypm/audit/pollypm.jsonl
+cp $PROJECT_AUDIT /tmp/audit-backup
+# Truncate to a random byte mid-record:
+head -c $(($(wc -c < $PROJECT_AUDIT) - 50)) $PROJECT_AUDIT > /tmp/truncated
+mv /tmp/truncated $PROJECT_AUDIT
+```
+
+Restart `pm serve` and observe:
+- Does it start cleanly?
+- Does `pm doctor` flag the corruption?
+- Does the state cache refresh produce stale or fictional state?
+
+**Pass:**
+- Daemon starts.
+- `pm doctor` reports `audit.corrupted` or similar alert.
+- State cache reflects pre-corruption state without inventing rows.
+- A subsequent valid audit append works.
+
+**Fail (any of these):**
+- Daemon crashes.
+- Daemon refuses to start.
+- Silent state divergence (state cache reads a half-record as a real event).
+
+Restore: `mv /tmp/audit-backup $PROJECT_AUDIT`.
+
+### 5.8.2 PG row partially deleted
+
+Manually delete a task row that has live markers / messages referencing it:
+
+```bash
+psql -d pollypm -c "BEGIN; DELETE FROM tasks WHERE id = '<some_task_id>'; COMMIT;"
+```
+
+Try to read state:
+- `pm task get <id>` should return a clean "not found," not 500.
+- Web `/api/v1/tasks/.../<id>` should return 404 typed envelope, not 500.
+- `pm cockpit` rail should not crash trying to render stale references.
+
+**Pass:** referential integrity surfaces are clean. Orphan markers/messages either get GC'd by `pm doctor` or surface as alerts.
+
+**Fail to file:** `bug:orphan-refs-crash` against the cockpit/route that crashed.
+
+### 5.8.3 events.jsonl rotation mid-write
+
+While a Claude session is actively writing, manually rotate the file:
+
+```bash
+# Simulate logrotate-style rotation
+mv ~/.pollypm/sessions/pm-operator/events.jsonl ~/.pollypm/sessions/pm-operator/events.jsonl.1
+touch ~/.pollypm/sessions/pm-operator/events.jsonl
+```
+
+The session continues writing. The new file gets new events. Verify:
+- The translation layer (§02) can still read the current file.
+- The rotated `.1` file is also readable via the API if pointed at it.
+- No duplicate events surface.
+
+**Pass:** new writes go to the new file; rotation doesn't break the API.
+
+## 5.9 Recovery while under load
 
 **Goal:** prove resilience mechanisms do not protect correctness by sacrificing all responsiveness.
 
@@ -323,7 +407,7 @@ File as `perf:recovery-load:<failure>` when correctness recovers but latency/res
 
 ---
 
-## 5.9 The "self-heal rule" audit (continued from §01)
+## 5.10 The "self-heal rule" audit (continued from §01)
 
 For every failure mode in this section: write down what the operator had to do manually. **Every manual step is a bug.** The fix is in the cascade, not in operator runbooks.
 

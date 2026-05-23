@@ -10,6 +10,27 @@
 
 ---
 
+## 0.0 Environment safety + clean working state
+
+**Before running any baseline checks, confirm you are NOT pointing at production.** Several later sections are destructive (§05 kills daemons, drops PG, fills disk). Running them against the operator's live workload destroys real state.
+
+```bash
+# 1. Confirm this is a test/dev workspace, not production.
+test -f ~/.pollypm/.test-env-marker && echo "OK: test env marker present" || \
+  { echo "NO .test-env-marker — refuse to proceed"; exit 1; }
+# If you intend this to be a test env, create the marker first:
+# touch ~/.pollypm/.test-env-marker
+
+# 2. Confirm git working tree is clean (or, if not, that the dirty files are this plan itself).
+git -C /Users/sam/dev/pollypm status -s
+
+# 3. Confirm no leftover agent worktrees from prior runs.
+git -C /Users/sam/dev/pollypm worktree list
+# Worktrees under .claude/worktrees/ are agent scratch space. Reap any that are stale.
+```
+
+If any of these fails, **stop**. Either move to a test environment or get explicit operator approval that this IS the intended target.
+
 ## 0.1 Sync main
 
 ```bash
@@ -31,6 +52,8 @@ Record the SHA you're testing in your test journal. Every issue you file from no
 ```
 
 Allow ~20 minutes. If `.venv/bin/python` doesn't exist, use `uv run --extra test pytest ...` instead.
+
+**Timeout rule:** if pytest does not produce final summary within 30 minutes, force-cancel (Ctrl-C) and treat the baseline as red. A hung pytest run is itself a release-blocker. File `bug:pytest-hang` with the partial output, then either fix or document the hang before proceeding.
 
 **Expected:** all green, or only failures that match the known-pre-existing list below.
 
@@ -73,6 +96,8 @@ POLLYPM_BASE_URL=http://$(tailscale ip -4):8765 npx playwright test --workers=1 
 
 **Acceptable degradation:** if 1–2 mobile-chrome tests fail with stub-related noise, capture the failures and file as a flake issue, then continue. **Do not** continue if chromium-desktop is red.
 
+**Timeout rule:** if Playwright doesn't produce a final summary within 20 minutes (it's normally <5 min), force-cancel and treat as red.
+
 ---
 
 ## 0.4 `pm doctor`
@@ -99,7 +124,34 @@ Stale heartbeats from sessions you don't care about can be ignored — but note 
 
 ---
 
-## 0.6 Performance environment baseline
+## 0.6 Provider + model version capture (for §04 eval trace)
+
+Agent behavior depends on which model version each session is configured to use. Capture this at baseline so §04 evals can be replayed against the same configuration and so a future model upgrade is a visible variable, not a silent one.
+
+```bash
+# Find the model setting per session role:
+grep -A2 'model' ~/.pollypm/pollypm.toml | head -40
+
+# Or, programmatically (preferred — depends on pollypm.toml shape):
+.venv/bin/python -c "
+from pollypm.config import load_config
+c = load_config()
+for s in c.sessions:
+    print(s.name, '->', getattr(s, 'model', 'default'))
+" 2>/dev/null
+```
+
+Record:
+- Operator session model.
+- Each architect's model.
+- Each advisor's model.
+- Each worker template's model.
+
+If any of these change during the run (e.g., operator regens config), §04 results from the prior model version are no longer valid. Note the change and re-baseline.
+
+If you cannot tell which model a session uses, file `bug:model-version-opaque` — being unable to identify the model is itself a release blocker for an agent product.
+
+## 0.7 Performance environment baseline
 
 Before running qualitative sections, capture the environment that all later performance numbers depend on:
 
@@ -126,19 +178,23 @@ This becomes the header for every §06 result. A perf number without environment
 
 ---
 
-## 0.7 Baseline result
+## 0.8 Baseline result
 
 Write down in your test journal:
 
 ```
 Baseline date: 2026-MM-DD HH:MM
 Tested SHA: <git rev-parse HEAD>
+Test env marker: present / absent
 pytest:        <X passed / Y failed> — failures: <list or "only known">
 playwright:    <X passed / Y failed> — failures: <list or "all pass">
 pm doctor:     clean / <N alerts>
 pm sessions:   clean / <N stale>
+models:        operator=<model>, architect=<model>, advisor=<model>, worker=<model>
 perf env:      <machine / browser / scale summary>
 ```
+
+Copy this header into the top of your journal entry (per `journal-template.md`). Every later section references this baseline.
 
 This is the reference point. Every later section's failures must be evaluated **on top of** this baseline. If pytest had 3 failures here and 4 in §01, the new one is the one you investigate.
 

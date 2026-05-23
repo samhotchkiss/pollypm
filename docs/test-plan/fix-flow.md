@@ -10,6 +10,50 @@ Use `agent-personas.md` to decide whether the actor is operating as testing agen
 
 **Issues and PRs move between `needs-codex` and `needs-claude`; the tagged agent implements, then hands off to the other agent for review, approval, and merge. No self-merge.**
 
+## Visual sequence (one happy path)
+
+```
+TESTER (Freya) finds bug
+    │
+    ├──> Files issue with `needs-codex` (mechanical) or `needs-claude` (judgment-heavy)
+    │
+    │  ┌─ needs-codex path ─────────────────────────────────────────┐
+    │  │   Codex Builder implements                                 │
+    │  │   Opens PR with `codex-created` + `needs-claude`           │
+    │  │   Claude Reviewer reads + approves + merges                │
+    │  └────────────────────────────────────────────────────────────┘
+    │
+    │  ┌─ needs-claude path ────────────────────────────────────────┐
+    │  │   Claude Builder implements                                │
+    │  │   Opens PR with `claude-created` + `needs-codex`           │
+    │  │   Codex Reviewer reads + requests changes                  │
+    │  │   ↻ Claude Builder pushes new commit                       │
+    │  │     Re-applies `needs-codex` (drops `needs-claude`)        │
+    │  │   Codex Reviewer reads + approves + merges                 │
+    │  └────────────────────────────────────────────────────────────┘
+    │
+    └──> Issue auto-closes via "Closes #N" trailer in merged commit
+```
+
+Invariants visible in the diagram:
+- The agent that creates a PR is NEVER the agent that merges it.
+- Creator labels (`codex-created` / `claude-created`) are durable; ownership labels flip.
+- An open PR always has exactly one ownership label.
+
+## Git authoring identities
+
+Pin authoring identity so creator labels are verifiable from git history.
+
+| Persona | Git author | Authoring trailer |
+|---|---|---|
+| Codex Builder | `Codex` (configured in the Codex environment) | none required; PR identity block is sufficient |
+| Claude Builder | `Claude` or operator (if commits go through `claude` CLI as operator) | `Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>` |
+| Operator override | Operator (Sam Hotchkiss `claude@swh.me`) | none |
+
+The creator label is set based on the **commit message trailer + PR identity block**, not solely the git author line — when Claude operates via the Claude Code CLI under the operator's identity, the trailer is what proves Claude authorship.
+
+Mismatched authorship between identity block, creator label, and commit trailers is `bug:label-author-drift` and blocks merge until reconciled.
+
 ---
 
 ## Label protocol

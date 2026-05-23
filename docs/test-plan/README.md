@@ -16,6 +16,10 @@ For agent identity and role expectations, use **`agent-personas.md`**. Testing a
 
 For the repo-watching Codex agent, use **`codex-watcher-instructions.md`** as the exact operating prompt.
 
+For the operator workflow this plan must validate, read **`operator-day-in-the-life.md`** first. It anchors the abstract test scenarios in a concrete day of real usage. If a scenario in this plan does not trace to something in that doc, ask whether it's the right scenario.
+
+For session results, use the journal template at **`journal-template.md`**. Every test session writes a journal entry to `docs/test-plan/journals/<YYYY-MM-DD>-<short-label>.md`. Without a journal, the session didn't happen.
+
 **Order:**
 1. **`00-pre-flight-baseline.md` must pass first.** If pytest, Playwright, or `pm doctor` is red on main, every downstream observation in this plan is unreliable. Fix the baseline before you start.
 2. Run §§01–05 to prove the product is correct, coherent, and resilient.
@@ -23,6 +27,40 @@ For the repo-watching Codex agent, use **`codex-watcher-instructions.md`** as th
 4. **`07-quick-smoke.md`** is the 15-minute daily-driver — run it any time before merging to verify main is shippable.
 
 **Pace:** the full plan is a 24+ hour engagement. Don't rush. The point is to find the rough edges, not to speed-run a checklist. If a section reveals something interesting, follow the thread — even if it takes you outside the scripted steps.
+
+## Time-budget guides
+
+The full plan is the goal. When you have less, use one of these slices.
+
+### 2 hours — "is anything obviously broken?"
+
+1. **§07 quick smoke** (15 min) — confirms main is shippable today.
+2. **§01.5 cascade scenarios** (45 min) — the highest-leverage correctness check.
+3. **§03.5 1-second click rule** sweep (30 min) — covers the headline UX invariant.
+4. **§06.3 user-facing budgets**, Web cells only (30 min) — measure click latency under realistic data.
+
+Output: a short journal entry that says "shippable / not-shippable / blocked on X."
+
+### 8 hours — "do the critical paths really work?"
+
+Add to the 2-hour slice:
+- Full **§01** (task lifecycle, all subsections)
+- Full **§02** (translation layer, triple-witness)
+- **§05.1 + §05.2 + §05.4** (daemon kill, pane kill, pause-marker enforcement)
+- **§04.1 + §04.3** (canonical role prompts + auth-marker)
+- **§06.3 + §06.4 + §06.7** at S-scale
+
+Output: a journal entry that classifies each axis (functional, reliable, fast, intuitive, magical) per critical path.
+
+### 24 hours — the full plan
+
+Run everything. Include:
+- M-scale seeding (§06 setup) before the perf section.
+- Real phone for §03.10 and §06.3 phone cells.
+- §06.8 soak (4+ hours background while you do other sections).
+- §04.6 long-context drift (only feasible if there's a long architect session running).
+
+Output: ship/no-ship recommendation in the journal, all `bug:` / `flake:` / `perf:` / `ux:` / `magic-gap:` issues filed with reviewer-label set, promotion-status updated, follow-up sprint backlog drafted.
 
 ## The headline invariant: 1-Second Click Rule
 
@@ -129,3 +167,44 @@ You finish this plan and you can answer **"yes"** to:
 9. You used the system long enough that you forgot you were "testing" — and it kept working.
 
 If any of those is "no," the gap is documented as an issue and on the next sprint's backlog.
+
+## Ship / no-ship decision
+
+This plan exists to support a binary decision. Use these criteria to convert journal entries into a recommendation.
+
+**Ship — green:**
+- §00 baseline green (or known-pre-existing only).
+- §01: all of 1.1, 1.2, 1.3 pass; §1.5 cascade self-heals without manual intervention; §1.6 lifecycle perf within M-scale budget.
+- §02 triple-witness shows zero drift on the sampled scenarios.
+- §03 1-second click rule met for every interaction tested.
+- §04 canonical prompts pass per role; auth-marker contract enforced; no confident hallucination.
+- §05 daemon kill, pane kill, pause-marker fail-closed all recover within budget.
+- §06 M-scale gate green with recorded p50/p95/p99/max for every cell in the budget table.
+- §07 smoke green on the merge commit being shipped.
+
+**Yellow — ship with caveats, requires explicit operator approval:**
+- All Ship criteria EXCEPT one of:
+  - One `magic-gap:` issue surfaces that affects new operators but not existing ones, filed with owner + deadline.
+  - One `perf:` issue affects a non-critical click cell, observed degradation < 50% over budget, filed with owner + deadline.
+  - §06 L-scale headroom is short but M-scale passes.
+
+**Red — do not ship:**
+- Any §01 cascade self-heal requires manual operator action.
+- Any §02 triple-witness scenario shows drift between pane, archive, and REST.
+- Any §03 click breaks the 1-second rule.
+- Any §05 fail-closed scenario fails open (e.g., malformed pause marker silently allows recovery).
+- Any §06 M-scale endpoint p95 above budget, or any payload above budget.
+- Any §04 auth-marker false-positive (unmarked impostor actioned) or false-negative (legitimate marker refused).
+- Any unresolved `bug:` issue on the §07 path.
+
+The decision goes in the journal, signed by the testing persona (per `agent-personas.md`). If the recommendation is yellow or red, the journal entry must include the explicit set of issues blocking ship and proposed remediation owners.
+
+## Stop conditions during the run
+
+Stop and ask the operator if:
+- A scenario reveals a behavior that invalidates the assumptions of a later section (e.g., task lifecycle finds that "claim" doesn't atomically transition — every later UI test depends on that).
+- A fix would require changing task lifecycle invariants, the heartbeat cascade, storage boundaries, or plugin architecture.
+- A perf result is so bad that more investigation is wasted effort until the architecture is reconsidered.
+- The system is producing real data (e.g., recovery actually sending messages to live agents) that you suspect is not a test environment.
+
+Do not silently absorb surprising findings. Surface them.

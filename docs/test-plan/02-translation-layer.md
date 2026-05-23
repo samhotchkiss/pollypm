@@ -55,6 +55,29 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 
 **Pass criterion:** byte-equal match between what's in the pane and what comes back from REST. Any escaping or whitespace drift is a bug.
 
+### 2.1.1.1 Envelope schema
+
+Independent of content, every envelope returned by the API must have a known schema. Sample one response and verify:
+
+```bash
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/v1/chat/operator/messages?limit=1&direction=desc" | \
+  jq '.messages[0] | keys'
+```
+
+**Required keys per envelope (from `web_api/chat/envelope.py`):**
+- `id` — stable identifier.
+- `type` — one of `MessageType` enum values (must match `docs/api/openapi.yaml::ChatMessageType`).
+- `role` — `user` | `assistant` | `tool` | `system`.
+- `actor` — session-name attribution.
+- `text` — rendered content; may be empty for tool envelopes.
+- `metadata` — provider-specific fields (model, signature, tool_name, tool_use_id, etc.).
+- `ts` — ISO timestamp.
+
+**Pass:** keys match exactly; no extra keys leaking private state; `type` is in the public enum.
+
+If you find a key whose name suggests internal state (e.g. `_internal_*`, `__cache_key`, `raw_provider_blob`), that's `bug:envelope-leak`.
+
 ### 2.1.2 Thinking blocks (post-#2079)
 
 Send a prompt that triggers a thinking block: "Think carefully then answer: what's 17 × 23?"
@@ -288,18 +311,47 @@ tail -1 ~/.pollypm/audit/pollypm.jsonl | jq 'keys'
 
 ### 2.6.1 Triple-witness assertion
 
-Send a message via REST. Immediately:
-1. Capture tmux pane: `tmux capture-pane -t pollypm:pm-operator -p | tail -10`.
-2. Read events.jsonl: `tail -1 ~/.pollypm/sessions/pm-operator/events.jsonl | jq`.
-3. Fetch REST: `curl ... /chat/operator/messages?limit=1&direction=desc`.
+Send a message via REST. Immediately capture all three witnesses and compare.
 
-All three must agree on:
-- The message exists.
-- The exact text content.
-- The actor / role.
-- The timestamp (within a few seconds of each other).
+**Manual procedure:**
+```bash
+MSG="triple-witness-$(date +%s%N)"
+curl -sS -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"text\":\"$MSG\"}" $BASE/api/v1/chat/operator/send
 
-**Pass:** zero drift. If any of the three disagrees with the other two, that's `bug:translation-drift`.
+# Wait briefly for ingestion
+sleep 2
+
+# Witness 1: tmux pane (raw visual buffer)
+tmux capture-pane -t pollypm:pm-operator -p | grep "$MSG" | tail -1
+
+# Witness 2: events.jsonl (canonical normalized)
+tail -100 ~/.pollypm/sessions/pm-operator/events.jsonl | \
+  jq -c "select(.text? | test(\"$MSG\"))" | tail -1
+
+# Witness 3: REST API
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "$BASE/api/v1/chat/operator/messages?limit=10&direction=desc" | \
+  jq -c ".messages[] | select(.text | test(\"$MSG\"))" | tail -1
+```
+
+**All three must agree on:**
+- The message text appears verbatim (modulo provider-side reformatting for tmux capture).
+- The actor / role matches (`user` for an operator-injected send).
+- The timestamps are within ±5s of each other.
+- No additional copies of the message in any witness (no double-write).
+
+**Pass:** zero drift. If any of the three disagrees, that's `bug:translation-drift`.
+
+**Automation contract for promotion:**
+The pytest integration test must:
+1. Drive `POST /send` with a known unique token.
+2. Poll until the token appears in events.jsonl (max 10s).
+3. Read the same envelope back via the REST API.
+4. Use `tmux capture-pane` in a subprocess to read the pane.
+5. Assert: byte-equal text content across all three sources, matching role/actor, timestamps within tolerance.
+
+This is the only test that catches slow drift between sources, so it ships first when §02 promotes to pytest.
 
 ---
 
@@ -324,9 +376,14 @@ measure_http "messages-thinking" "$BASE/api/v1/chat/<surface>/messages?limit=50&
 measure_http "messages-subagents" "$BASE/api/v1/chat/<surface>/messages?limit=50&direction=desc&include_subagents=true"
 ```
 
-Use the helper from `06-performance-budgets.md`.
+Use `scripts/perf/measure_http.sh` (per §06 promotion target — built by Codex lane E). The helper is also documented inline in `06-performance-budgets.md::6.2` for one-off use, but the script is the canonical source of truth.
 
-If you are running this file standalone, copy the `measure_http` helper from `06-performance-budgets.md` or use an equivalent 30-sample `curl -w "%{http_code} %{time_total} %{size_download}"` loop.
+```bash
+scripts/perf/measure_http.sh messages-desc-50 \
+  "$BASE/api/v1/chat/<surface>/messages?limit=50&direction=desc"
+```
+
+If the script does not exist yet, use the inline helper from §06.2 but file `bug:perf-script-missing` against lane E.
 
 **Pass:**
 - `direction=desc&limit=50` stays within §06 cold/warm budgets at every size.

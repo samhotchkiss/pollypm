@@ -53,6 +53,14 @@ Architecture rules:
 - UI code must use public REST contracts, not private internals.
 - Do not add cross-layer shortcuts to make a test pass.
 
+Harness rules (lanes E, F, G, H):
+- Test/harness/eval code lives under tests/ and scripts/, never inside src/pollypm/.
+- Harness scripts use the public chat API + CLI; they do not reach into PG, events.jsonl, or tmux state directly.
+- Do not add test-only switches to production modules unless they are explicit documented extension points.
+- Lane E ships scripts/perf/{seed_sscale.sh,seed_mscale.sh,seed_lscale.sh,measure_http.sh} plus the runner.
+- Lane G ships tests/playwright/ARCHITECTURE.md describing spec naming convention.
+- Lane H ships scripts/evals/run.py and the case-schema in tests/evals/cases/.
+
 Testing rules:
 - Add or update targeted tests for code changes.
 - For perf changes, include p50/p95/p99/max before/after evidence.

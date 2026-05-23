@@ -39,6 +39,17 @@ For:
 
 Speed budget: full Playwright sweep < 5 minutes with `--workers=4`.
 
+**Spec organization (lane G owns):** one spec file per major surface, named for the test-plan scenario it covers. Examples:
+- `tests/playwright/specs/01-task-lifecycle/1.4-visibility.spec.ts`
+- `tests/playwright/specs/03-web-ui/3.5-click-rule.spec.ts`
+- `tests/playwright/specs/03-web-ui/3.6-bidirectional-sync.spec.ts`
+- `tests/playwright/specs/03-web-ui/3.7-daemon-down.spec.ts`
+- `tests/playwright/specs/06-performance/click-budgets.spec.ts`
+
+Shared fixtures live under `tests/playwright/fixtures/`. Stable selectors via `data-testid` attributes, not DOM traversal.
+
+Lane G ships `tests/playwright/ARCHITECTURE.md` describing the convention as part of its first PR.
+
 ### Custom perf harness
 
 For:
@@ -134,6 +145,8 @@ All of §02 → pytest. Drive a known fixture transcript file, assert envelope s
 | 5.5 Token rotation | Playwright |
 | 5.6 Network partition | Manual chaos test |
 | 5.7 Resource exhaustion | Manual chaos test |
+| 5.8 Data corruption recovery | pytest integration (truncated audit, orphan refs, rotation) |
+| 5.9 Recovery while under load | pre-release perf/resilience harness; not every PR |
 
 ### §06 Performance Budgets
 

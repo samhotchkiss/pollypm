@@ -27,6 +27,20 @@ If a change makes the core know about a specific feature, project, UI affordance
 - Prefer small files with single responsibilities over expanding already-large modules.
 - Preserve existing plugin discovery, registration, and capability boundaries.
 
+## Test / harness boundary rules
+
+The test plan adds new code categories (perf harness, evals harness, Playwright suite, smoke automation). They have their own boundaries:
+
+- **Test code lives under `tests/`.** Pytest, Playwright specs, evals cases. Production code does not import from `tests/`.
+- **Harness scripts live under `scripts/`.** Perf, evals, smoke. They use public CLI/API only; they do not import from `src/pollypm/` internals except via documented public modules.
+- **Test fixtures live under `tests/fixtures/`** (or `tests/playwright/fixtures/`). Production code does not read fixtures.
+- **Journal entries live under `docs/test-plan/journals/`.** They are documentation, not code; they don't get imported.
+- **Evals cases live under `tests/evals/cases/`** as YAML. The runner consumes them; product code never does.
+- **Perf scripts use the public chat API + CLI.** They don't reach into PG, events.jsonl, or tmux state directly.
+- **Harness tools must NOT add test-only switches to production modules** unless those switches are explicit documented extension points (e.g., a public dry-run flag).
+
+If a test or harness needs to read product internals to verify behavior, the right answer is usually: expose a public introspection API on the product, then have the harness use it. Reaching past the boundary makes the test brittle and the product less modular.
+
 ---
 
 ## When adding functionality

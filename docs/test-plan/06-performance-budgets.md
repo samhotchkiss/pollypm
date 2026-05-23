@@ -33,6 +33,21 @@ If a team wants to ship with one of these red, it requires explicit operator sig
 
 Run budgets at **S** for daily smoke, **M** for release readiness, and **L** for headroom. M-scale is the promised-land bar.
 
+### Fixture seeding
+
+Each scale has a defined fixture. Codex lane E builds the seed scripts under `scripts/perf/seed_<scale>.sh`. They:
+1. Create the configured number of sessions (operator, architects, advisors, workers).
+2. Populate transcripts to the target message count via injected canned conversations.
+3. Create tasks at the target count, spread across states (queued / in_progress / review / done).
+4. Ensure one designated surface has the >1MB (M) or >10MB (L) transcript file.
+5. Verify the resulting state matches the table below; exit non-zero on mismatch.
+
+**Pre-§06 requirement:** before running §06, execute the appropriate seed script and verify with `pm sessions list --json | jq 'length'` and `pm task list --project pollypm --status all --json | jq 'length'`.
+
+If `scripts/perf/seed_mscale.sh` does not exist, file `bug:perf-seed-missing` against lane E and either:
+- Run §06 at S-scale only (smoke coverage), OR
+- Manually seed to M-scale before continuing (document the procedure in your journal so the seed script can be reverse-engineered).
+
 | Scale | Sessions | Tasks | Transcript history | Browsers | Purpose |
 |---|---:|---:|---:|---:|---|
 | **S — daily** | 4 active surfaces | 25 tasks | 50 messages/surface | 1 desktop | Quick regression signal |
@@ -68,6 +83,8 @@ Cache state: cold / warm
 - Do not mix functional setup failures into perf numbers. If a request returns 4xx/5xx unexpectedly, fix or file it before computing percentiles.
 
 ### HTTP timing helper
+
+The canonical implementation lives at **`scripts/perf/measure_http.sh`** (Codex lane E deliverable). The inline shell function below is its reference body, kept here so the doc is self-contained and §02 can reference the same logic.
 
 ```bash
 measure_http() {
@@ -110,6 +127,8 @@ PY
 
 measure_http dashboard "$BASE/api/v1/dashboard"
 ```
+
+When `scripts/perf/measure_http.sh` is available, invoke that instead of redefining. Drift between the script and this inline copy is a `bug:perf-helper-drift` against lane E.
 
 ### Browser timing
 

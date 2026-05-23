@@ -823,6 +823,15 @@ paths:
         `ask_user` envelope, `selections[]` must match one of the
         question's option labels exactly; `notes` are appended
         after the selections joined by newlines.
+      parameters:
+        - in: query
+          name: safety
+          schema:
+            type: string
+            enum: [strict, loose, force]
+          description: |
+            Optional query-string safety override. When present, this
+            takes precedence over the JSON body `safety` field.
       requestBody:
         required: true
         content:

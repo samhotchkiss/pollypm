@@ -18,11 +18,16 @@
   const POLL_DASHBOARD_MS = 15000;
   const POLL_MESSAGES_MS = 5000;
   const MAX_MESSAGES = 50;
+  const AUDIT_LIMIT = 25;
 
   const state = {
     surfaces: [],
     selectedSurface: null,
     messageTimer: null,
+    auditExpanded: {},
+    auditEntries: {},
+    auditErrors: {},
+    auditLoading: {},
     surfaceMidStream: {},
     surfaceFilter: "",
   };
@@ -210,7 +215,130 @@
     updateStopAgentButton();
     renderSurfaces();
     loadHistory(name);
+    if (state.auditExpanded[name]) loadAuditForSurface(name);
     schedulePoll();
+  }
+
+  function surfaceByName(name) {
+    return state.surfaces.find((s) => s.session_name === name) || null;
+  }
+
+  function auditPatternForSurface(surface, name) {
+    if (
+      surface
+      && surface.surface_type === "worker"
+      && surface.project
+      && surface.task_id != null
+    ) {
+      return surface.project + "/" + surface.task_id;
+    }
+    return name;
+  }
+
+  function auditPathForSurface(name) {
+    const surface = surfaceByName(name);
+    const params = new URLSearchParams();
+    params.set("limit", String(AUDIT_LIMIT));
+    params.set("since", "7d");
+    params.set("pattern", auditPatternForSurface(surface, name));
+    if (surface && surface.project) params.set("project", surface.project);
+    return API + "/audit/grep?" + params.toString();
+  }
+
+  function auditSummary(entry) {
+    const parts = [entry.event || "audit"];
+    if (entry.subject) parts.push(entry.subject);
+    if (entry.status) parts.push(entry.status);
+    if (entry.actor) parts.push("by " + entry.actor);
+    return parts.join(" · ");
+  }
+
+  function removeExistingAuditPanel(list) {
+    const existing = list.querySelector(".audit-panel");
+    if (existing) existing.remove();
+  }
+
+  function renderAuditPanel(name) {
+    if (!name) return;
+    const list = $("message-list");
+    removeExistingAuditPanel(list);
+    const expanded = Boolean(state.auditExpanded[name]);
+    const entries = state.auditEntries[name] || [];
+    const loading = Boolean(state.auditLoading[name]);
+    const error = state.auditErrors[name];
+    const children = [];
+    const toggle = el("button", {
+      class: "audit-toggle",
+      type: "button",
+      "aria-expanded": expanded ? "true" : "false",
+      text: expanded ? "Hide audit log" : "Show audit log",
+    });
+    toggle.addEventListener("click", () => {
+      state.auditExpanded[name] = !state.auditExpanded[name];
+      renderAuditPanel(name);
+      if (state.auditExpanded[name]) loadAuditForSurface(name);
+    });
+    const headerChildren = [
+      el("div", { class: "audit-title", text: "Audit log" }),
+      toggle,
+    ];
+    if (expanded) {
+      const refresh = el("button", {
+        class: "audit-refresh",
+        type: "button",
+        text: "Refresh",
+      });
+      refresh.addEventListener("click", () => loadAuditForSurface(name));
+      headerChildren.push(refresh);
+    }
+    children.push(el("div", { class: "audit-header" }, headerChildren));
+    if (expanded) {
+      const bodyChildren = [];
+      if (loading) {
+        bodyChildren.push(el("div", {
+          class: "audit-empty",
+          text: "loading audit entries...",
+        }));
+      } else if (error) {
+        bodyChildren.push(el("div", {
+          class: "audit-empty",
+          text: "audit error: " + error.message,
+        }));
+      } else if (entries.length === 0) {
+        bodyChildren.push(el("div", {
+          class: "audit-empty",
+          text: "no audit entries",
+        }));
+      } else {
+        for (const entry of entries.slice(0, AUDIT_LIMIT)) {
+          bodyChildren.push(el("div", { class: "audit-entry" }, [
+            el("span", { class: "audit-ts", text: entry.ts || "" }),
+            el("span", { class: "audit-line", text: auditSummary(entry) }),
+          ]));
+        }
+      }
+      children.push(el("div", { class: "audit-body" }, bodyChildren));
+    }
+    list.appendChild(el("div", { class: "audit-panel" }, children));
+  }
+
+  async function loadAuditForSurface(name) {
+    if (!name) return;
+    state.auditLoading[name] = true;
+    state.auditErrors[name] = null;
+    renderAuditPanel(name);
+    try {
+      const data = await apiJson(auditPathForSurface(name));
+      state.auditEntries[name] = Array.isArray(data.events) ? data.events : [];
+    } catch (err) {
+      state.auditEntries[name] = [];
+      state.auditErrors[name] = err;
+    } finally {
+      state.auditLoading[name] = false;
+      if (state.selectedSurface === name && state.auditExpanded[name]) {
+        renderAuditPanel(name);
+      }
+    }
   }
 
   function messageLooksMidStream(message) {
@@ -264,6 +392,7 @@
       list.appendChild(
         el("div", { class: "message-empty", text: "no messages yet" }),
       );
+      renderAuditPanel(data.session_name);
       return;
     }
     // API returned newest-first; render oldest-first so the latest is
@@ -283,6 +412,7 @@
       );
     }
     list.scrollTop = list.scrollHeight;
+    renderAuditPanel(data.session_name);
   }
 
   function renderHistoryError(err) {
@@ -291,6 +421,7 @@
     list.appendChild(
       el("div", { class: "error-banner", text: "history error: " + err.message }),
     );
+    renderAuditPanel(state.selectedSurface);
     updateStopAgentButton();
   }
 
@@ -531,6 +662,7 @@
     sendMessage: sendMessage,
     interruptSurface: interruptSurface,
     pollDashboard: pollDashboard,
+    renderAuditPanel: renderAuditPanel,
     renderDashboard: renderDashboard,
     state: state,
   };

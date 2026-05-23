@@ -2564,7 +2564,7 @@ components:
     # ---- Health -----------------------------------------------------
     HealthResponse:
       type: object
-      required: [status, version, schema_version, started_at]
+      required: [status, version, schema_version, started_at, auth_mode, tailnet_trust_enabled]
       properties:
         status:
           type: string
@@ -2578,6 +2578,13 @@ components:
         started_at:
           type: string
           format: date-time
+        auth_mode:
+          type: string
+          enum: [tailnet_trust, bearer_only]
+          description: Authentication posture for this server process.
+        tailnet_trust_enabled:
+          type: boolean
+          description: Whether Tailscale CGNAT peers are accepted without bearer or cookie credentials.
 
     DoctorCheck:
       type: object

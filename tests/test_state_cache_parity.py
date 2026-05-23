@@ -970,10 +970,16 @@ class TestProjectStateRollupsParity:
 
 
 class TestLatestHeartbeatParity:
-    """PR #2026 review blocker 2: ``_latest_heartbeat_cached`` is now a
-    direct-facade pass-through until cache invalidation on heartbeat
-    writes lands (filed as follow-up). The "cached" name is preserved
-    for call-site stability; the body bypasses the cache snapshot.
+    """#2050: ``_latest_heartbeat_cached`` reads the state-cache snapshot
+    first and only falls through to the direct pg facade on a miss.
+
+    PR #2026 disabled the fast-path because the refresher had no
+    ``heartbeat.*`` audit-event subscription and would serve a stale
+    snapshot indefinitely. #2050 added ``heartbeat.tick`` to
+    ``refresher._INVALIDATING_EVENTS`` so every workspace sweep
+    invalidates the affected entries — the snapshot is bounded-stale
+    by the tick cadence again, the rail's fast-path is restored, and
+    the direct facade remains the cold-start / pg-failure fallback.
     """
 
     def _router(self, tmp_path: Path):
@@ -989,42 +995,39 @@ class TestLatestHeartbeatParity:
         )
         return CockpitRouter(config_path)
 
-    def test_always_reads_direct_facade_even_with_populated_cache(
+    def test_populated_cache_skips_direct_facade(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Even with a populated cache, the direct pg facade is the
-        source of truth — guards against the stale-snapshot pathology
-        the cache had with no heartbeat-write invalidation.
+        """Populated cache entry → fast-path hit; pg facade NOT called.
+
+        Pins the #2050 contract: when the refresher has already stamped
+        a heartbeat into ``latest_heartbeat_by_session``, the rail
+        serves it from the snapshot and skips the per-call pg query.
         """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         router = self._router(tmp_path)
 
-        stale_hb = SimpleNamespace(
+        cached_hb = SimpleNamespace(
             session_name="worker_alpha/1",
-            created_at="2026-05-20T01:00:00Z",
-            tag="STALE_CACHE",
+            created_at="2026-05-21T01:00:00Z",
+            tag="FROM_CACHE",
         )
         entries = {
             "alpha": _entry(
                 "alpha",
                 state=ProjectState.WORKING,
                 items=[],
-                latest_heartbeat_by_session={"worker_alpha/1": stale_hb},
+                latest_heartbeat_by_session={"worker_alpha/1": cached_hb},
             ),
         }
         _seed_cache(monkeypatch, entries)
 
-        fresh_hb = SimpleNamespace(
-            session_name="worker_alpha/1",
-            created_at="2026-05-21T01:00:00Z",
-            tag="FRESH_DIRECT",
-        )
         pg_calls: list[str] = []
 
         def _direct(name, *, config=None):  # noqa: ANN001, ANN201
             pg_calls.append(name)
-            return fresh_hb
+            return SimpleNamespace(tag="UNEXPECTED_DIRECT_HIT")
 
         monkeypatch.setattr(
             "pollypm.storage.pg_heartbeats.latest_heartbeat", _direct,
@@ -1032,10 +1035,54 @@ class TestLatestHeartbeatParity:
 
         supervisor = SimpleNamespace(store=None, config=None)
         result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
-        # Direct facade hit; cached stale snapshot ignored.
+        # Cache hit; direct facade was NOT consulted.
+        assert pg_calls == []
+        assert result is cached_hb
+        assert getattr(result, "tag", None) == "FROM_CACHE"
+
+    def test_cache_miss_falls_through_to_direct_facade(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Session not in any cache entry → direct facade serves the read.
+
+        Cold-start safety net: the rail must render heartbeat data even
+        before the refresher has populated the entry for this session.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+
+        # Cache entry exists but holds no heartbeat for the queried
+        # session_name — that's the cache-miss shape.
+        entries = {
+            "alpha": _entry(
+                "alpha",
+                state=ProjectState.WORKING,
+                items=[],
+                latest_heartbeat_by_session={},
+            ),
+        }
+        _seed_cache(monkeypatch, entries)
+
+        direct_hb = SimpleNamespace(
+            session_name="worker_alpha/1",
+            created_at="2026-05-21T02:00:00Z",
+            tag="FROM_DIRECT",
+        )
+        pg_calls: list[str] = []
+
+        def _direct(name, *, config=None):  # noqa: ANN001, ANN201
+            pg_calls.append(name)
+            return direct_hb
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _direct,
+        )
+
+        supervisor = SimpleNamespace(store=None, config=None)
+        result = router._latest_heartbeat_cached(supervisor, "worker_alpha/1")
         assert pg_calls == ["worker_alpha/1"]
-        assert result is fresh_hb
-        assert getattr(result, "tag", None) == "FRESH_DIRECT"
+        assert result is direct_hb
 
     def test_pg_failure_falls_back_to_supervisor_store(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -1067,7 +1114,12 @@ class TestLatestHeartbeatParity:
     def test_flag_off_still_uses_direct_facade(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Flag state is irrelevant — the cache is fully bypassed."""
+        """Flag off → cache fast-path skipped; direct facade serves the read.
+
+        Kill-switch behavior — operators can disable the cache route
+        with ``POLLYPM_STATE_CACHE=0`` and the rail still renders
+        heartbeats via the direct pg path.
+        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
         router = self._router(tmp_path)
@@ -1236,10 +1288,19 @@ class TestPr2026ReviewBlocker1ActionableAlertFallthrough:
 
 
 class TestPr2026ReviewBlocker2HeartbeatNoStale:
-    """Blocker 2: heartbeat reads MUST reflect the latest pg write
-    immediately. The cache had no invalidation on heartbeat ticks and
-    would serve a stale snapshot indefinitely — until the follow-up
-    issue lands, every call hits the direct facade.
+    """Blocker 2 (#2050 follow-up): heartbeat reads MUST NOT serve an
+    indefinitely-stale snapshot. The refresher subscribes to
+    ``heartbeat.tick`` audit events so every workspace sweep
+    invalidates the affected project entries; the next refresh
+    repopulates ``latest_heartbeat_by_session`` from the bulk pg query
+    and the rail's fast-path serves the fresh row.
+
+    These tests pin two invariants:
+    1. ``heartbeat.tick`` is in ``refresher._INVALIDATING_EVENTS`` —
+       the invalidation contract itself.
+    2. After ``cache.invalidate(project)`` the rail no longer sees the
+       previously-cached heartbeat (snapshot miss → direct facade
+       picks up the fresh row).
     """
 
     def _router(self, tmp_path: Path):
@@ -1255,16 +1316,30 @@ class TestPr2026ReviewBlocker2HeartbeatNoStale:
         )
         return CockpitRouter(config_path)
 
-    def test_newer_store_heartbeat_reflected_immediately(
+    def test_heartbeat_tick_is_an_invalidating_event(self) -> None:
+        """The invalidation contract that unblocks the cache fast-path."""
+
+        from pollypm.state_cache.refresher import _INVALIDATING_EVENTS
+
+        assert "heartbeat.tick" in _INVALIDATING_EVENTS
+
+    def test_refresh_after_invalidate_replaces_stale_snapshot(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """A second pg write is visible on the next call — no stale cache."""
+        """Heartbeat tick → invalidate → refresh → fresh row served.
+
+        Simulates the full production cascade end-to-end: the audit
+        tail saw a ``heartbeat.tick`` event, the refresher called
+        ``cache.invalidate(project)``, then drained the pending queue
+        through ``cache.refresh`` (which now repopulates
+        ``latest_heartbeat_by_session`` via ``latest_heartbeats_bulk``).
+        The rail's next read sees the fresh row out of the snapshot —
+        no indefinite stale window the way PR #2026 reverted around.
+        """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
         router = self._router(tmp_path)
 
-        # Seed the cache with an OLD heartbeat to prove we're not
-        # reading from it.
         stale = SimpleNamespace(created_at="2026-05-20T01:00:00Z", n="stale")
         entries = {
             "alpha": _entry(
@@ -1272,31 +1347,71 @@ class TestPr2026ReviewBlocker2HeartbeatNoStale:
                 latest_heartbeat_by_session={"worker_alpha/1": stale},
             ),
         }
-        _seed_cache(monkeypatch, entries)
+        cache = _seed_cache(monkeypatch, entries)
 
-        # First direct read.
-        first = SimpleNamespace(created_at="2026-05-20T02:00:00Z", n="first")
-        second = SimpleNamespace(created_at="2026-05-20T03:00:00Z", n="second")
-        state = {"next": first}
+        # Refresher would call this on a ``heartbeat.tick`` event.
+        cache.invalidate("alpha")
 
+        fresh = SimpleNamespace(created_at="2026-05-20T03:00:00Z", n="fresh")
+        # Re-point the refresh fn so the next refresh repopulates with
+        # the fresh row (mirrors ``compute_entry_for_project`` calling
+        # ``latest_heartbeats_bulk`` after the tick).
+        cache._refresh_fn = lambda key: _entry(  # noqa: SLF001
+            key, state=ProjectState.WORKING, items=[],
+            latest_heartbeat_by_session={"worker_alpha/1": fresh},
+        )
+        # Drain the pending queue (the refresher worker would do this).
+        for pending_key in cache.drain_pending():
+            cache.refresh(pending_key)
+
+        # Guard against any accidental direct-facade fall-through —
+        # the snapshot MUST hold the fresh row now.
         def _direct(name, *, config=None):  # noqa: ANN001, ANN201
-            return state["next"]
+            raise AssertionError(
+                "direct facade hit despite a populated snapshot",
+            )
 
         monkeypatch.setattr(
             "pollypm.storage.pg_heartbeats.latest_heartbeat", _direct,
         )
 
         supervisor = SimpleNamespace(store=None, config=None)
-        assert router._latest_heartbeat_cached(
+        result = router._latest_heartbeat_cached(
             supervisor, "worker_alpha/1",
-        ) is first
-        # Simulate a fresh pg row landing. Without cache invalidation,
-        # the stale snapshot would have won; the direct-facade contract
-        # means the next call sees the newer row.
-        state["next"] = second
+        )
+        assert result is fresh
+
+    def test_pg_failure_still_falls_back_to_supervisor_store(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Direct-facade safety net survives the fast-path restoration.
+
+        PR #2026's blocker-2 fallback contract (pg unreachable →
+        ``supervisor.store.latest_heartbeat``) MUST keep working when
+        the cache is empty / missing the session.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        _seed_cache(monkeypatch, {})
+
+        def _boom(name, *, config=None):  # noqa: ANN001, ANN201
+            raise RuntimeError("pg pool unreachable")
+
+        monkeypatch.setattr(
+            "pollypm.storage.pg_heartbeats.latest_heartbeat", _boom,
+        )
+
+        fallback = SimpleNamespace(created_at="2026-05-20T02:00:00Z")
+
+        class _Store:
+            def latest_heartbeat(self, name):  # noqa: ANN001, ANN201
+                return fallback
+
+        supervisor = SimpleNamespace(store=_Store(), config=None)
         assert router._latest_heartbeat_cached(
-            supervisor, "worker_alpha/1",
-        ) is second
+            supervisor, "worker_beta/3",
+        ) is fallback
 
 
 class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:

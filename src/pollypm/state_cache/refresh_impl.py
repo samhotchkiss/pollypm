@@ -70,13 +70,13 @@ def build_refresh_fn(
     a config reload during a long-running cockpit picks up the new
     paths automatically.
 
-    PR #2026 v3 (Codex re-review): heartbeat prefetch removed entirely.
-    The two rail consumers (``cockpit_rail._latest_heartbeat_cached``)
-    were converted to direct pg-facade reads because the refresher had
-    no ``heartbeat.*`` audit-event subscription and so could only ever
-    serve a stale snapshot. Until that invalidation lands (filed as
-    #2050 follow-up) there's nothing for the refresher to prefetch —
-    the closure is a thin config-provider wrapper.
+    #2050: heartbeat prefetch is back. ``refresher._INVALIDATING_EVENTS``
+    now contains ``heartbeat.tick`` so every workspace heartbeat sweep
+    invalidates the per-project entries and the refresher repopulates
+    ``latest_heartbeat_by_session`` from one bulk pg query per project.
+    The PR #2026 v3 fast-path-disable workaround on
+    ``cockpit_rail._latest_heartbeat_cached`` is reverted in tandem so
+    rail reads serve from the snapshot again.
     """
 
     def _refresh(project_key: str) -> ProjectStateCacheEntry | None:
@@ -118,22 +118,25 @@ def compute_entry_for_project(
     tracked = bool(getattr(project, "tracked", True)) if project else False
 
     awaits_user_items = _awaits_user_items_for(project_key, config)
-    state, glyph, detail, rail_rollup = _categorize_and_rollup(
+    state, glyph, detail, rail_rollup, session_names = _categorize_and_rollup(
         project_key=project_key,
         config=config,
         tracked=tracked,
         awaits_user_items=list(awaits_user_items),
     )
 
-    # PR #2026 v3 (Codex re-review blocker 2): the heartbeat prefetch
-    # path was dead code. ``cockpit_rail._latest_heartbeat_cached``
-    # bypasses ``entry.latest_heartbeat_by_session`` and reads
-    # ``pollypm.storage.pg_heartbeats`` directly because the refresher
-    # has no ``heartbeat.*`` audit-event subscription and can only
-    # serve stale snapshots. Populating the field meant N pg reads
-    # per project per refresh with zero consumers. The entry field is
-    # retained (defaults to ``{}``) so callers don't crash on
-    # attribute access; the bulk-prefetch wiring lands with #2050.
+    # #2050: bulk-prefetch heartbeats for every session known to this
+    # project. ``refresher._INVALIDATING_EVENTS`` listens for
+    # ``heartbeat.tick`` so this dict reflects the freshest pg state on
+    # every refresh; the rail's ``_latest_heartbeat_cached`` reads from
+    # ``latest_heartbeat_by_session`` again and only falls through to
+    # the direct facade on a cache miss (cold start / unknown session
+    # name). One ``latest_heartbeats_bulk`` query per project replaces
+    # the per-call ``latest_heartbeat`` round-trips PR #2026 introduced.
+    latest_heartbeat_by_session = _fetch_latest_heartbeats(
+        session_names, config,
+    )
+
     entry = ProjectStateCacheEntry(
         project_key=project_key,
         project_path=project_path,
@@ -148,6 +151,7 @@ def compute_entry_for_project(
         approvals_pending=rail_rollup[4] if rail_rollup else 0,
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
+        latest_heartbeat_by_session=latest_heartbeat_by_session,
         computed_at=time.monotonic(),
         # PR #2026 v7 (Codex r7 blocker): stamp the config identity so
         # every cache lookup can verify the snapshot was computed
@@ -232,23 +236,24 @@ def _categorize_and_rollup(
 ) -> tuple[
     Any, str, str,
     tuple[Any, Any, int, str, int] | None,
+    list[str],
 ]:
     """Run ``categorize_project`` + ``rollup_project_state`` for one project.
 
-    Returns ``(state, glyph, detail, rollup_tuple_or_None)``. The
-    rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
+    Returns ``(state, glyph, detail, rollup_tuple_or_None, session_names)``.
+    The rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
     approvals_pending)`` — kept positional so the caller can ``zip``
     it into the entry fields without a second import of the rollup
-    types here.
-
-    PR #2026 v3 (Codex re-review blocker 2): no longer returns
-    ``live_workers``. The heartbeat prefetch that consumed that list
-    was dead code (cockpit_rail bypasses the cache for heartbeats);
-    keeping the slice-svc roster query alive cost N pg reads per
-    refresh with zero readers.
+    types here. ``session_names`` is every tmux session this project
+    is known to drive (canonical ``architect_<key>`` /
+    ``plan_gate-<key>`` / ``worker_<key>`` plus the per-task
+    ``worker_<key>/<n>`` rows the live worker_sessions table reports)
+    — passed to :func:`_fetch_latest_heartbeats` for the heartbeat
+    prefetch (#2050).
 
     Failures degrade silently — a broken work-service drops the
-    project to IDLE (or PAUSED when not tracked) with no rollup.
+    project to IDLE (or PAUSED when not tracked) with no rollup and an
+    empty session-name list (heartbeat prefetch becomes a no-op).
     """
 
     try:
@@ -273,7 +278,7 @@ def _categorize_and_rollup(
             project_key,
             exc_info=True,
         )
-        return None, "", "", None
+        return None, "", "", None, []
 
     shared_svc = _open_shared_work_service(config)
     try:
@@ -289,14 +294,22 @@ def _categorize_and_rollup(
                 detail = "Paused"
             else:
                 detail = "Quiet"
-            return state, glyph, detail, None
+            # Without a work-service we still know the canonical session
+            # names for this project — return them so heartbeats keep
+            # flowing through the snapshot even when the work db is
+            # unreachable.
+            return (
+                state, glyph, detail, None,
+                _canonical_session_names(project_key, []),
+            )
 
         tasks_by_alias, workers_by_alias = _prefetch_project_state(
             config, shared_svc,
         )
+        aliases = _aliases_for(config, project_key)
         slice_svc = _ProjectSliceService(
             project_key=project_key,
-            aliases=_aliases_for(config, project_key),
+            aliases=aliases,
             tasks_by_alias=tasks_by_alias,
             workers_by_alias=workers_by_alias,
             shared_svc=shared_svc,
@@ -347,10 +360,110 @@ def _categorize_and_rollup(
             )
             rollup_tuple = None
 
-        return state, glyph, detail, rollup_tuple
+        # #2050: collect every session_name this project is known to
+        # drive, so the bulk heartbeat fetch downstream produces a
+        # snapshot the rail can serve. We union the canonical workspace
+        # sessions (``architect_<key>`` etc.) with the per-task
+        # ``worker_<key>/<n>`` rows the live worker_sessions table
+        # reports — the latter come from the already-prefetched
+        # ``workers_by_alias`` so this costs no extra db round-trip.
+        live_worker_sessions: list[Any] = []
+        for alias in [project_key, *aliases]:
+            live_worker_sessions.extend(
+                workers_by_alias.get(alias, []),
+            )
+        session_names = _canonical_session_names(
+            project_key, aliases,
+            live_worker_sessions=live_worker_sessions,
+        )
+
+        return state, glyph, detail, rollup_tuple, session_names
     finally:
         if shared_svc is not None:
             _safe_close(shared_svc)
+
+
+def _canonical_session_names(
+    project_key: str,
+    aliases: list[str],
+    *,
+    live_worker_sessions: list[Any] | None = None,
+) -> list[str]:
+    """Enumerate every tmux session name this project might heartbeat under.
+
+    The rail's ``_latest_heartbeat_cached`` looks up entries by exact
+    ``session_name``; we union three sources so the snapshot covers
+    every name it might be asked for:
+
+    1. Canonical workspace sessions — ``architect_<key>``,
+       ``plan_gate-<key>``, ``worker_<key>`` (and the same for every
+       storage alias) — these are the rows
+       ``_session_name_for_item`` resolves for project-row PMs.
+    2. Per-task worker sessions reported by ``list_worker_sessions``
+       (``worker_<key>/<task_num>``) — pulled from the already-
+       prefetched ``workers_by_alias`` so no extra db round-trip.
+    3. (de-duplicated, empty names dropped)
+
+    The list is intentionally bounded — only sessions this project is
+    known to drive contribute, never the workspace-wide heartbeat
+    table.
+    """
+
+    seen: set[str] = set()
+    out: list[str] = []
+    keys = [project_key, *aliases]
+    for key in keys:
+        if not key:
+            continue
+        for prefix in ("architect_", "plan_gate-", "worker_"):
+            name = f"{prefix}{key}"
+            if name not in seen:
+                seen.add(name)
+                out.append(name)
+    for session in live_worker_sessions or []:
+        name = str(getattr(session, "session_name", "") or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        out.append(name)
+    return out
+
+
+def _fetch_latest_heartbeats(
+    session_names: list[str], config: Any,
+) -> dict[str, Any]:
+    """Bulk-fetch the most-recent heartbeat row for each session.
+
+    Wraps :func:`pollypm.storage.pg_heartbeats.latest_heartbeats_bulk`
+    behind a soft import so the leaf ``state_cache`` package stays
+    importable in environments where the storage layer is missing
+    (test harnesses that mock the cache out, etc.). On any failure
+    the refresher degrades silently — the cache fast-path will miss
+    on every session name and the rail will fall through to the
+    direct pg facade (same shape as today).
+    """
+
+    if not session_names:
+        return {}
+    try:
+        from pollypm.storage import pg_heartbeats
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "state_cache: pg_heartbeats unavailable; "
+            "skipping heartbeat prefetch", exc_info=True,
+        )
+        return {}
+    try:
+        return pg_heartbeats.latest_heartbeats_bulk(
+            session_names, config=config,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_cache: latest_heartbeats_bulk failed; "
+            "rail will fall through to direct facade",
+            exc_info=True,
+        )
+        return {}
 
 
 # ── refresher integration ─────────────────────────────────────────

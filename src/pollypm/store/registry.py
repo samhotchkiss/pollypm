@@ -102,9 +102,8 @@ def register_backend(
     The opt-in companion to removing sqlite from the
     ``pollypm.store_backend`` entry-point group (#1956). Callers that
     legitimately need a backend not shipped by the installed
-    distribution — the pytest suite, the ``pm notify --db <path>``
-    escape hatch — call this to plug the factory back in for the rest
-    of the process.
+    distribution — currently only the pytest suite — call this to plug
+    the factory back in for the rest of the process.
 
     Parameters
     ----------
@@ -117,9 +116,20 @@ def register_backend(
         :class:`~pollypm.store.protocol.Store`. Typically
         :class:`~pollypm.store.sqlalchemy_store.SQLAlchemyStore`.
     quiet
-        When ``True``, suppress the production warn-log. The test
-        conftest sets this; production opt-ins should leave it
-        ``False`` so the operator sees the sqlite path was reached.
+        Reserved for the pytest conftest's opt-in path. Production
+        callers must leave it ``False`` so the production-sqlite guard
+        below fires.
+
+    Raises
+    ------
+    ValueError
+        When ``name == "sqlite"`` is requested from a non-pytest
+        process. Post-sqlite-ripout (refs #1971, #1970) sqlite is
+        gone from every production code path; the previous warn-log
+        is now a hard rejection so a stray subprocess that imports
+        :class:`~pollypm.store.sqlalchemy_store.SQLAlchemyStore` and
+        tries to re-register cannot reactivate the split-brain
+        sqlite-shadow class of bugs.
 
     Notes
     -----
@@ -127,20 +137,21 @@ def register_backend(
     no-op. Re-registering with a different factory replaces the prior
     entry — the test suite relies on that during teardown.
     """
-    with _REGISTRATION_LOCK:
-        _REGISTERED_BACKENDS[name] = factory
     if (
-        not quiet
-        and name == "sqlite"
+        name == "sqlite"
+        and not quiet
         and not _running_under_pytest()
     ):
-        logger.warning(
-            "pollypm.store: sqlite backend registered in a production "
-            "process (#1956). The pg cutover (#1737) made postgres the "
-            "supported backend; sqlite remains reachable only as a "
-            "test / legacy --db escape hatch. Verify the caller is one "
-            "of those before relying on this path."
+        raise ValueError(
+            "pollypm.store: refusing to register the sqlite backend in "
+            "a production process. The pg cutover (#1737) made postgres "
+            "the only supported backend; sqlite was removed from every "
+            "production code path in the sqlite-ripout sequence "
+            "(refs #1971, #1970). If you are running a one-off legacy "
+            "migration tool, pass quiet=True to acknowledge the opt-in."
         )
+    with _REGISTRATION_LOCK:
+        _REGISTERED_BACKENDS[name] = factory
 
 
 def unregister_backend(name: str) -> None:

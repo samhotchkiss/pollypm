@@ -44,6 +44,7 @@ _OPERATOR_ROLES = frozenset({"operator-pm", "operator"})
 _OPERATOR_NAMES = frozenset({"operator", "polly"})
 _ARCHITECT_ROLES = frozenset({"architect"})
 _ADVISOR_ROLES = frozenset({"advisor"})
+_TMUX_DISCOVERY_TIMEOUT_SECONDS = 1
 
 
 class SurfaceType(StrEnum):
@@ -448,7 +449,13 @@ def _build_tmux_state_cache(
         return cache
     target = config.project.tmux_session
     try:
-        windows = list_windows(target)
+        try:
+            windows = list_windows(target, timeout=_TMUX_DISCOVERY_TIMEOUT_SECONDS)
+        except TypeError:
+            # Test doubles and older TmuxClient-compatible adapters may
+            # not accept the timeout keyword. Keep the registry protocol
+            # permissive while the real client uses the bounded probe.
+            windows = list_windows(target)
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "chat.registry: tmux list_windows(%s) failed: %s",

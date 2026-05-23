@@ -138,6 +138,27 @@ aside#dashboard-rail {
   color: var(--text-muted);
 }
 
+.surface-filter-wrap {
+  padding: 0 12px 8px;
+}
+.surface-filter {
+  width: 100%;
+  padding: 7px 9px;
+  border: 1px solid var(--border-line);
+  border-radius: 6px;
+  background: var(--bg-elevated);
+  color: var(--text-body);
+  font: inherit;
+  font-size: 12.5px;
+}
+.surface-filter::placeholder {
+  color: var(--text-muted);
+}
+.surface-filter:focus {
+  outline: none;
+  border-color: var(--info);
+}
+
 .surface-list {
   list-style: none;
   margin: 0;

@@ -7,14 +7,14 @@ import pytest
 from pollypm.capacity import (
     CapacityProbeResult,
     CapacityState,
-    FailoverCandidate,
-    FailoverDecision,
+    DEFAULT_FAILOVER_USAGE_THRESHOLD_PCT,
     FAILOVER_TRIGGERS,
     PROACTIVE_ROLLOVER_THRESHOLD_PCT,
     RECOVERY_PRIORITY,
     _health_to_state,
     _parse_remaining_pct,
     account_needs_proactive_rollover,
+    evaluate_proactive_controller_failover,
     probe_capacity,
     probe_all_accounts,
     select_failover_account,
@@ -24,10 +24,8 @@ from pollypm.capacity import (
 )
 from pollypm.models import (
     AccountConfig,
-    KnownProject,
     PollyPMConfig,
     PollyPMSettings,
-    ProjectKind,
     ProjectSettings,
     ProviderKind,
     SessionConfig,
@@ -98,6 +96,21 @@ def _config(tmp_path: Path) -> PollyPMConfig:
 def _store(tmp_path: Path) -> StateStore:
     db_path = tmp_path / "state.db"
     return StateStore(db_path)
+
+
+def _usage(store: StateStore, account_name: str, used_pct: int) -> None:
+    remaining_pct = max(0, 100 - used_pct)
+    provider = "codex" if account_name.startswith("codex") else "claude"
+    store.upsert_account_usage(
+        account_name=account_name,
+        provider=provider,
+        plan="max",
+        health="healthy",
+        usage_summary=f"{remaining_pct}% left",
+        raw_text="",
+        used_pct=used_pct,
+        remaining_pct=remaining_pct,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -279,6 +292,86 @@ class TestAccountNeedsProactiveRollover:
         assert account_needs_proactive_rollover(
             config, store, "claude_main", threshold_pct=20,
         )[0] is True
+
+
+class TestEvaluateProactiveControllerFailover:
+    def test_default_used_threshold_is_85(self) -> None:
+        assert DEFAULT_FAILOVER_USAGE_THRESHOLD_PCT == 85
+
+    @pytest.mark.parametrize(
+        ("used_pct", "expected_action"),
+        [
+            (84, "none"),
+            (85, "switch"),
+            (86, "switch"),
+        ],
+    )
+    def test_primary_usage_threshold(self, tmp_path: Path, used_pct: int, expected_action: str) -> None:
+        config = _config(tmp_path)
+        store = _store(tmp_path)
+        _usage(store, "claude_main", used_pct)
+        _usage(store, "claude_backup", 10)
+
+        decision = evaluate_proactive_controller_failover(
+            config,
+            store,
+            current_account="claude_main",
+        )
+
+        assert decision.action == expected_action
+        if expected_action == "switch":
+            assert decision.selected_account == "claude_backup"
+            assert decision.reason == "used_pct_threshold"
+
+    def test_all_failover_accounts_over_threshold_alerts(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        store = _store(tmp_path)
+        _usage(store, "claude_main", 90)
+        _usage(store, "claude_backup", 90)
+        _usage(store, "codex_main", 90)
+
+        decision = evaluate_proactive_controller_failover(
+            config,
+            store,
+            current_account="claude_main",
+        )
+
+        assert decision.action == "alert"
+        assert decision.selected_account is None
+        assert decision.reason == "no_failover_account_below_threshold"
+
+    def test_primary_below_threshold_returns_from_backup(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        store = _store(tmp_path)
+        _usage(store, "claude_main", 50)
+        _usage(store, "claude_backup", 10)
+
+        decision = evaluate_proactive_controller_failover(
+            config,
+            store,
+            current_account="claude_backup",
+        )
+
+        assert decision.action == "return"
+        assert decision.selected_account == "claude_main"
+        assert decision.reason == "primary_below_threshold"
+
+    def test_selects_first_failover_under_threshold(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        store = _store(tmp_path)
+        _usage(store, "claude_main", 90)
+        _usage(store, "claude_backup", 90)
+        _usage(store, "codex_main", 40)
+
+        decision = evaluate_proactive_controller_failover(
+            config,
+            store,
+            current_account="claude_main",
+        )
+
+        assert decision.action == "switch"
+        assert decision.selected_account == "codex_main"
+        assert decision.candidates_evaluated == 2
 
 
 # ---------------------------------------------------------------------------

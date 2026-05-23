@@ -26,6 +26,7 @@
     selectedSurface: null,
     messageTimer: null,
     sessionExpiryDismissed: false,
+    surfaceFilter: "",
   };
 
   // ----- DOM helpers ------------------------------------------------------
@@ -178,13 +179,25 @@
   function renderSurfaces() {
     const list = $("surface-list");
     list.innerHTML = "";
+    const filter = state.surfaceFilter.trim().toLowerCase();
+    const surfaces = filter
+      ? state.surfaces.filter((s) => (
+        String(s.session_name || "").toLowerCase().includes(filter)
+      ))
+      : state.surfaces;
     if (state.surfaces.length === 0) {
       list.appendChild(
         el("li", { class: "surface-empty", text: "no surfaces registered" }),
       );
       return;
     }
-    for (const s of state.surfaces) {
+    if (surfaces.length === 0) {
+      list.appendChild(
+        el("li", { class: "surface-empty", text: "no matching surfaces" }),
+      );
+      return;
+    }
+    for (const s of surfaces) {
       const dotClass =
         s.window && s.window.pane_dead
           ? "surface-dot dead"
@@ -474,8 +487,18 @@
     });
   }
 
+  function wireSurfaceFilter() {
+    const input = $("surface-filter");
+    if (!input) return;
+    input.addEventListener("input", () => {
+      state.surfaceFilter = input.value || "";
+      renderSurfaces();
+    });
+  }
+
   function init() {
     maybeShowSessionExpiryBanner();
+    wireSurfaceFilter();
     wireSendForm();
     setStatus("warn", "connecting…");
     loadSurfaces();

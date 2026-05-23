@@ -292,10 +292,15 @@ class _FakeService:
         self._config.pollypm.failover_accounts = accounts
         return key, enabled
 
-    def add_account(self, provider: ProviderKind) -> tuple[str, str]:
-        self.add_calls.append(provider)
+    def add_account(
+        self,
+        provider: ProviderKind,
+        *,
+        email_hint: str | None = None,
+    ) -> tuple[str, str]:
+        self.add_calls.append((provider, email_hint))
         key = f"{provider.value}_new"
-        email = f"{key}@example.com"
+        email = email_hint or f"{key}@example.com"
         self._statuses.append(
             _fake_status(
                 key,
@@ -778,17 +783,24 @@ def test_add_and_remove_account_actions(settings_env, monkeypatch) -> None:
     app = settings_env["app"]
     service = settings_env["service"]
 
-    def _auto_confirm(_screen, callback):
-        callback(True)
+    # Two modal types are involved:
+    #   _SettingsEmailPromptModal — Add Claude opens this; callback wants a str.
+    #   _SettingsConfirmModal     — Remove account opens this; callback wants a bool.
+    def _auto_modal_response(screen, callback):
+        name = type(screen).__name__
+        if "EmailPrompt" in name:
+            callback("backup@example.com")
+        else:
+            callback(True)
 
-    monkeypatch.setattr(app, "push_screen", _auto_confirm)
+    monkeypatch.setattr(app, "push_screen", _auto_modal_response)
 
     async def body() -> None:
         async with app.run_test(size=(140, 40)) as pilot:
             await pilot.pause()
             await pilot.press("c")
             await pilot.pause()
-            assert service.add_calls == [ProviderKind.CLAUDE]
+            assert service.add_calls == [(ProviderKind.CLAUDE, "backup@example.com")]
             assert "claude_new" in [a["key"] for a in app.data.accounts]
             app._selected_account_key = "claude_new"
             app._render_section("accounts")

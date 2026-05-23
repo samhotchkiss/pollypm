@@ -38,7 +38,7 @@ def test_add_account_reuses_orphaned_home_with_same_email(monkeypatch, tmp_path:
     agent_homes = tmp_path / ".pollypm" / "agent_homes"
     monkeypatch.setattr("pollypm.accounts.Path.home", lambda: tmp_path)
 
-    def fake_login_window(_tmux, provider, home, window_label):  # noqa: ANN001
+    def fake_login_window(_tmux, provider, home, window_label, **_kwargs):  # noqa: ANN001
         home.mkdir(parents=True, exist_ok=True)
         (home / "fresh.txt").write_text("fresh")
         return "done"
@@ -70,7 +70,7 @@ def test_add_account_replaces_orphaned_home_when_stale(monkeypatch, tmp_path: Pa
     agent_homes = tmp_path / ".pollypm" / "agent_homes"
     monkeypatch.setattr("pollypm.accounts.Path.home", lambda: tmp_path)
 
-    def fake_login_window(_tmux, provider, home, window_label):  # noqa: ANN001
+    def fake_login_window(_tmux, provider, home, window_label, **_kwargs):  # noqa: ANN001
         home.mkdir(parents=True, exist_ok=True)
         (home / "fresh.txt").write_text("fresh")
         return "done"
@@ -102,7 +102,7 @@ def test_add_second_account_same_email_gets_suffix_key(monkeypatch, tmp_path: Pa
     )
     write_config(config, config_path)
 
-    def fake_login_window(_tmux, provider, home, window_label):  # noqa: ANN001
+    def fake_login_window(_tmux, provider, home, window_label, **_kwargs):  # noqa: ANN001
         home.mkdir(parents=True, exist_ok=True)
         return "done"
 
@@ -139,7 +139,7 @@ def test_add_third_account_same_email_gets_sequential_suffix(monkeypatch, tmp_pa
         )
     write_config(config, config_path)
 
-    def fake_login_window(_tmux, provider, home, window_label):  # noqa: ANN001
+    def fake_login_window(_tmux, provider, home, window_label, **_kwargs):  # noqa: ANN001
         home.mkdir(parents=True, exist_ok=True)
         return "done"
 
@@ -158,3 +158,116 @@ def test_add_third_account_same_email_gets_sequential_suffix(monkeypatch, tmp_pa
     # name is always reconstructed from the key on load (config.py:_parse_accounts)
     assert saved.accounts["claude_s_example_com_3"].name == "claude_s_example_com_3"
     assert saved.accounts["claude_s_example_com_3"].email == "s@example.com"
+
+
+def test_add_account_forces_fresh_auth_and_disables_shortcut(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """The add path must force fresh auth so the Keychain shortcut can't mask a real login (closes #2088)."""
+    import pytest
+
+    config_path = tmp_path / "pollypm.toml"
+    write_config(_config(tmp_path), config_path)
+    monkeypatch.setattr("pollypm.accounts.Path.home", lambda: tmp_path)
+
+    captured: dict = {}
+
+    def fake_login_window(_tmux, *, provider, home, window_label, **kwargs):  # noqa: ANN001
+        captured.update(kwargs)
+        captured["window_label"] = window_label
+        home.mkdir(parents=True, exist_ok=True)
+        return "done"
+
+    monkeypatch.setattr("pollypm.accounts._run_login_window", fake_login_window)
+    monkeypatch.setattr(
+        "pollypm.accounts._detect_account_email",
+        lambda provider, home: "fresh@example.com",
+    )
+    monkeypatch.setattr("pollypm.accounts._prime_claude_home", lambda home: None)
+
+    key, email = add_account_via_login(config_path, ProviderKind.CLAUDE)
+
+    assert key == "claude_fresh_example_com"
+    assert email == "fresh@example.com"
+    assert captured.get("allow_existing_auth_shortcut") is False
+    assert captured.get("force_fresh_auth") is True
+
+
+def test_add_account_sentinel_without_hint_raises(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """When detection returns a Max-plan sentinel and no email_hint is supplied, raise."""
+    import typer
+
+    config_path = tmp_path / "pollypm.toml"
+    write_config(_config(tmp_path), config_path)
+    monkeypatch.setattr("pollypm.accounts.Path.home", lambda: tmp_path)
+
+    def fake_login_window(_tmux, *, provider, home, window_label, **_kwargs):  # noqa: ANN001
+        home.mkdir(parents=True, exist_ok=True)
+        return "done"
+
+    monkeypatch.setattr("pollypm.accounts._run_login_window", fake_login_window)
+    # Sentinel: contains ":" but no "@"
+    monkeypatch.setattr(
+        "pollypm.accounts._detect_account_email",
+        lambda provider, home: "claude.ai:max",
+    )
+    monkeypatch.setattr("pollypm.accounts._prime_claude_home", lambda home: None)
+
+    import pytest
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        add_account_via_login(config_path, ProviderKind.CLAUDE)
+    assert "--email" in str(excinfo.value)
+    assert "claude.ai:max" in str(excinfo.value)
+
+
+def test_add_account_with_email_hint_normalizes_and_uses_it(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """email_hint overrides detection and is normalized to lowercase + trimmed."""
+    config_path = tmp_path / "pollypm.toml"
+    write_config(_config(tmp_path), config_path)
+    monkeypatch.setattr("pollypm.accounts.Path.home", lambda: tmp_path)
+
+    def fake_login_window(_tmux, *, provider, home, window_label, **_kwargs):  # noqa: ANN001
+        home.mkdir(parents=True, exist_ok=True)
+        return "done"
+
+    monkeypatch.setattr("pollypm.accounts._run_login_window", fake_login_window)
+    # Detection would return a sentinel, but the hint takes precedence.
+    monkeypatch.setattr(
+        "pollypm.accounts._detect_account_email",
+        lambda provider, home: "claude.ai:max",
+    )
+    monkeypatch.setattr("pollypm.accounts._prime_claude_home", lambda home: None)
+
+    key, email = add_account_via_login(
+        config_path,
+        ProviderKind.CLAUDE,
+        email_hint="  BACKUP@Example.COM  ",
+    )
+    assert key == "claude_backup_example_com"
+    assert email == "backup@example.com"
+
+
+def test_add_account_invalid_email_hint_raises(
+    monkeypatch, tmp_path: Path
+) -> None:
+    """An email_hint without '@' is rejected with a clear error."""
+    import typer
+
+    config_path = tmp_path / "pollypm.toml"
+    write_config(_config(tmp_path), config_path)
+    monkeypatch.setattr("pollypm.accounts.Path.home", lambda: tmp_path)
+
+    import pytest
+
+    with pytest.raises(typer.BadParameter) as excinfo:
+        add_account_via_login(
+            config_path,
+            ProviderKind.CLAUDE,
+            email_hint="not-an-email",
+        )
+    assert "email" in str(excinfo.value).lower()

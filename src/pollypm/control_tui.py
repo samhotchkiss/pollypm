@@ -1395,7 +1395,21 @@ class PollyPMApp(App[None]):
     def action_add_claude_account(self) -> None:
         if self._active_tab() != "accounts-tab":
             return
-        self._run("Add Claude account", lambda: self.service.add_account(ProviderKind.CLAUDE))
+        # Claude Max plans on CLI 2.x report loggedIn:true with email:null,
+        # so add_account requires an explicit email_hint (see #2088). This
+        # legacy control TUI has no modal infrastructure to prompt for one;
+        # redirect to the cockpit Settings flow or the CLI which both
+        # support the new contract.
+        try:
+            self.notify(
+                "Add Claude requires an email for Max plans. Use "
+                "`pm cockpit` → Settings → Add Claude (modal prompts for email), "
+                "or `pm account add claude --email <your-email>`.",
+                severity="warning",
+                timeout=8.0,
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def action_context_action_r(self) -> None:
         active = self._active_tab()

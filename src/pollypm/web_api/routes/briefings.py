@@ -403,6 +403,14 @@ def _timeout_error(type_name: str, seconds: float) -> APIError:
     response_model=BriefingTypesResponse,
     summary="List available briefing types",
     operation_id="listBriefingTypes",
+    # #2059 round-8: route decorators must enumerate the same error
+    # surface as ``docs/api/openapi.yaml`` so the live ``/openapi.json``
+    # served by ``pm serve`` matches the static spec generated clients
+    # consume. Without these entries FastAPI only advertises 200+422
+    # and the conformance check passes vacuously.
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+    },
 )
 def list_briefing_types_endpoint(config: ConfigDep) -> BriefingTypesResponse:
     """GET /api/v1/briefings — discover briefing types.
@@ -428,6 +436,15 @@ def list_briefing_types_endpoint(config: ConfigDep) -> BriefingTypesResponse:
     response_model=BriefingResponse,
     summary="Render the last generated briefing of this type",
     operation_id="renderBriefing",
+    # #2059 round-8: mirror static yaml :2032-2048 so the live OpenAPI
+    # exposes the typed 404 (no briefing rendered yet) and 503
+    # (provider plugin not loaded) branches generated clients depend
+    # on. See ``test_briefings_runtime_openapi_matches_static_error_codes``.
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "No briefing has been generated for this type."},
+        "503": {"description": "Provider plugin not loaded for this briefing type."},
+    },
 )
 def render_briefing_endpoint(
     type_name: str,
@@ -467,6 +484,43 @@ def render_briefing_endpoint(
     response_model=BriefingResponse,
     summary="Force regenerate a briefing (sync)",
     operation_id="regenerateBriefing",
+    # #2059 round-8: mirror static yaml :2079-2124 — the regenerate
+    # path has the richest error surface (400 invalid request, 404
+    # unknown type, 409 in-flight scope conflict, 503 provider
+    # unavailable, 504 sync timeout). Without these entries the live
+    # OpenAPI only listed 200+422 and clients had no way to branch on
+    # the typed envelopes the handler actually raises.
+    responses={
+        "400": {
+            "description": (
+                "Invalid request — empty/whitespace ``project`` or "
+                "``project`` passed with ``type_name='morning'`` "
+                "(morning is whole-workspace only in Phase 2)."
+            ),
+        },
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Unknown briefing type."},
+        "409": {
+            "description": (
+                "A regenerate for this ``(type, project)`` scope is "
+                "already running on the shared executor; retry after "
+                "it completes."
+            ),
+        },
+        "503": {
+            "description": (
+                "Provider plugin not loaded or backing store "
+                "unavailable for this briefing type."
+            ),
+        },
+        "504": {
+            "description": (
+                "Sync regenerate exceeded ``timeout_seconds``. The "
+                "worker keeps running on the shared executor so "
+                "retries (after it finishes) do not duplicate work."
+            ),
+        },
+    },
 )
 def regenerate_briefing_endpoint(
     type_name: str,

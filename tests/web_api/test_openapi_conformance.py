@@ -766,3 +766,91 @@ def test_implementation_openapi_validates_as_31() -> None:
     # accepts 3.0 / 3.1 alike.
     assert raw.get("openapi", "").startswith("3.")
     validate_openapi(raw)
+
+
+def test_briefings_runtime_openapi_matches_static_error_codes() -> None:
+    """Pin the briefings route ``responses=`` map against the static YAML.
+
+    Round 8 (Codex) on #2059: the FastAPI route decorators in
+    ``src/pollypm/web_api/routes/briefings.py`` had no ``responses=``
+    map, so the auto-generated ``/openapi.json`` only advertised the
+    success body + FastAPI's default ``422`` validation envelope.
+    ``docs/api/openapi.yaml`` documented the full error surface
+    (401/404/503 on GET, 400/401/404/409/503/504 on regenerate), but
+    generated clients consuming the live spec would not branch on the
+    typed envelopes the handlers actually raise.
+
+    Pin both surfaces so future drift trips CI.
+    """
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+    )
+    from pollypm.models import ProviderKind, RuntimeKind
+    from pollypm.web_api import create_app
+
+    base = Path(__file__).resolve().parent
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="P", root_dir=base, tmux_session="t",
+            workspace_root=base, base_dir=base / ".pollypm",
+            logs_dir=base / ".pollypm/logs",
+            snapshots_dir=base / ".pollypm/snapshots",
+            state_db=base / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={"codex_primary": AccountConfig(
+            name="codex_primary", provider=ProviderKind.CODEX,
+            email="codex@example.com", runtime=RuntimeKind.LOCAL,
+            home=base / ".pollypm/homes/codex_primary",
+        )},
+        sessions={},
+        projects={},
+        memory=MemorySettings(backend="file"),
+    )
+    app = create_app(config=config, token_path=base / "tmp-token")
+    raw = app.openapi()
+    paths = raw["paths"]
+
+    # GET /briefings — 401 only (no typed 4xx / 5xx beyond auth).
+    list_get = paths["/api/v1/briefings"]["get"]["responses"]
+    assert "401" in list_get, (
+        "Implementation OpenAPI for GET /api/v1/briefings is missing "
+        "the 401 response advertised by docs/api/openapi.yaml — keep "
+        "the route's ``responses=`` map in sync (#2059 round-8)."
+    )
+
+    # GET /briefings/{type_name} — 401 / 404 / 503.
+    render_get = paths["/api/v1/briefings/{type_name}"]["get"]["responses"]
+    for code in ("401", "404", "503"):
+        assert code in render_get, (
+            f"Implementation OpenAPI for GET /api/v1/briefings/"
+            f"{{type_name}} is missing the {code} response advertised "
+            "by docs/api/openapi.yaml — keep the route's ``responses=`` "
+            "map in sync (#2059 round-8)."
+        )
+
+    # POST /briefings/{type_name}/regenerate — 400 / 401 / 404 / 409 /
+    # 503 / 504. This is the full typed surface the handler raises
+    # (see ``regenerate_briefing_endpoint`` and the morning adapter).
+    regen_post = (
+        paths["/api/v1/briefings/{type_name}/regenerate"]["post"]["responses"]
+    )
+    for code in ("400", "401", "404", "409", "503", "504"):
+        assert code in regen_post, (
+            f"Implementation OpenAPI for POST /api/v1/briefings/"
+            f"{{type_name}}/regenerate is missing the {code} response "
+            "advertised by docs/api/openapi.yaml — keep the route's "
+            "``responses=`` map in sync (#2059 round-8)."
+        )

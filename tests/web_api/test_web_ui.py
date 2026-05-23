@@ -197,6 +197,24 @@ def test_ui_static_css_served(client: TestClient) -> None:
     assert "--info" in body or "#5b8aff" in body
 
 
+def test_health_reports_bearer_only_auth_mode(client: TestClient) -> None:
+    """Default app health reports the closed-by-default auth posture."""
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["auth_mode"] == "bearer_only"
+    assert body["tailnet_trust_enabled"] is False
+
+
+def test_health_reports_tailnet_trust_mode(tailnet_app) -> None:
+    """Tailnet-bound app health reports credential-free tailnet trust."""
+    response = TestClient(tailnet_app).get("/api/v1/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["auth_mode"] == "tailnet_trust"
+    assert body["tailnet_trust_enabled"] is True
+
+
 def test_auth_via_cookie_works(client: TestClient, token: str) -> None:
     """A request that carries only the session cookie authenticates.
 

@@ -83,7 +83,7 @@ pm add-account claude       # Claude Code — anthropic.com auth
 pm add-account codex        # Codex CLI — openai.com auth
 ```
 
-Each runs the provider's native login flow (browser OAuth for Claude, API key or OAuth for Codex) in an isolated profile directory so accounts don't step on each other.
+Each runs the provider's native login flow (browser OAuth for Claude, API key or OAuth for Codex) in an isolated profile directory so accounts don't step on each other. If you add more than one account with the same provider and email, PollyPM assigns suffixed internal keys such as `claude_user_example_com_2` and keeps a separate profile directory for each account.
 
 **Which to pick?** If you have a Claude subscription, start with `claude` — PollyPM's default profiles are tuned for it. Add `codex` later if you want a second provider for failover or cost-splitting.
 

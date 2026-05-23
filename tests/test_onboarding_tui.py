@@ -297,6 +297,68 @@ def test_connect_provider_cancel_returns_to_onboarding(monkeypatch, tmp_path: Pa
     assert messages[-1] == "Login cancelled. Returned to onboarding."
 
 
+def test_connect_provider_suffixes_duplicate_codex_home(monkeypatch, tmp_path: Path) -> None:
+    app = OnboardingApp(tmp_path / "pollypm.toml")
+    root_dir = app.root_dir
+    first_home = root_dir / "homes" / "codex_user_example_com"
+    temp_home = root_dir / "homes" / "onboarding_codex_2"
+    first_home.mkdir(parents=True, exist_ok=True)
+    temp_home.mkdir(parents=True, exist_ok=True)
+    (temp_home / "auth.json").write_text("{}")
+
+    first_account = ConnectedAccount(
+        provider=ProviderKind.CODEX,
+        email="user@example.com",
+        account_name="codex_user_example_com",
+        home=first_home,
+    )
+    app.state = type(
+        "State",
+        (),
+        {
+            "accounts": {"codex_user_example_com": first_account},
+            "login_preferences": None,
+            "controller_account": "codex_user_example_com",
+            "failover_enabled": False,
+            "open_permissions_by_default": True,
+            "known_projects": {},
+            "selected_project_paths": [],
+        },
+    )()
+    messages: list[str] = []
+    monkeypatch.setattr(app, "_set_message", lambda message="": messages.append(message))
+    monkeypatch.setattr(app, "_render_current_step", lambda: None)
+    monkeypatch.setattr(app, "refresh", lambda *args, **kwargs: None)
+    monkeypatch.setattr(app, "_ensure_tmux_client", lambda: object())
+
+    class _Suspend:
+        def __enter__(self):
+            return None
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    monkeypatch.setattr(app, "suspend", lambda: _Suspend())
+    monkeypatch.setattr(
+        "pollypm.onboarding_tui._connect_account_via_tmux",
+        lambda *args, **kwargs: ConnectedAccount(
+            provider=ProviderKind.CODEX,
+            email="user@example.com",
+            account_name="codex_user_example_com",
+            home=temp_home,
+        ),
+    )
+
+    app._connect_provider(ProviderKind.CODEX)
+
+    new_account = app.state.accounts["codex_user_example_com_2"]
+    assert new_account.home == root_dir / "homes" / "codex_user_example_com_2"
+    assert new_account.home != first_home
+    assert (new_account.home / "auth.json").exists()
+    assert not temp_home.exists()
+    assert messages[-1] == "Connected user@example.com [codex]."
+
+
 def test_onboarding_progress_header_shows_step_count_and_bar() -> None:
     header = onboarding_step_header("projects")
 

@@ -684,6 +684,83 @@ def test_pm_serve_disables_tailnet_trust_on_loopback_fallback(
     )
 
 
+def test_pm_serve_with_explicit_host_skips_tailscale_detection(
+    api_config, token_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Explicit ``--host`` must skip ``detect_tailscale_ip`` entirely.
+
+    Round-9 Codex blocker on #2065: the ``--host`` help text promises
+    "Passing this flag skips Tailscale detection entirely", but the
+    earlier round-5 implementation still re-called
+    ``detect_tailscale_ip()`` in the explicit-host branch to
+    opportunistically enable ``tailnet_trust_enabled`` when the typed
+    host matched the detected IPv4. Help/code drift like that is the
+    exact contract bug Codex flagged.
+
+    This test wires ``detect_tailscale_ip`` to raise; if the explicit
+    branch ever re-introduces the call, the ``RuntimeError`` propagates
+    and the CLI exits non-zero, tripping this assertion.
+    """
+    import typer
+    import uvicorn
+    from typer.testing import CliRunner
+
+    from pollypm.cli_features.web_api import register_web_api_commands
+
+    root = typer.Typer()
+    register_web_api_commands(root)
+
+    captured: dict[str, object] = {}
+
+    def _fake_uvicorn_run(*args, **kwargs):
+        captured["kwargs"] = kwargs
+
+    def _exploding_detect():
+        raise RuntimeError(
+            "detect_tailscale_ip must not be called in the explicit "
+            "--host branch (round-9 #2065)."
+        )
+
+    monkeypatch.setattr(uvicorn, "run", _fake_uvicorn_run)
+    monkeypatch.setattr(
+        "pollypm.cli_features.web_api.detect_tailscale_ip",
+        _exploding_detect,
+    )
+    monkeypatch.setattr(
+        "pollypm.cli_features.web_api.load_config",
+        lambda _path: api_config,
+    )
+    monkeypatch.setattr(
+        "pollypm.web_api.ensure_token",
+        lambda _path: ("test-token", False),
+    )
+
+    import pollypm.web_api as web_api_pkg
+
+    real_create_app = web_api_pkg.create_app
+
+    def _capturing_create_app(**kwargs):
+        captured["create_app_kwargs"] = dict(kwargs)
+        return real_create_app(**kwargs)
+
+    monkeypatch.setattr(web_api_pkg, "create_app", _capturing_create_app)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        root,
+        ["serve", "--token-path", str(token_path), "--host", "127.0.0.1"],
+    )
+    assert result.exit_code == 0, (
+        f"detect_tailscale_ip was called in the explicit --host branch — "
+        f"help-text/code drift regressed (round-9 #2065). Output: "
+        f"{result.output}"
+    )
+    assert captured["kwargs"]["host"] == "127.0.0.1"
+    # And the explicit branch never opts into tailnet trust, even for
+    # a host that happens to look loopback.
+    assert captured["create_app_kwargs"]["tailnet_trust_enabled"] is False
+
+
 # -------- P1: mobile CSS -----------------------------------------------
 
 

@@ -186,7 +186,10 @@ def register_web_api_commands(app: typer.Typer) -> None:
             help=(
                 "Override the bind address. Default: auto-detected "
                 "Tailscale IPv4, else 127.0.0.1. Passing this flag "
-                "skips Tailscale detection entirely."
+                "skips Tailscale detection entirely and leaves "
+                "credential-free tailnet trust OFF — the operator is "
+                "expected to authenticate every request explicitly "
+                "(bearer header or session cookie)."
             ),
         ),
         allow_remote: bool = typer.Option(
@@ -252,9 +255,15 @@ def register_web_api_commands(app: typer.Typer) -> None:
         # Codex round-2 PR #2065.
         tailnet_trust: bool = False
         if host is not None:
-            # Explicit operator override — skip detection. Carry through
-            # the existing --allow-remote gate so accidental 0.0.0.0
-            # binds still trip the safety check.
+            # Explicit operator override — skip detection entirely.
+            # Per the --host help text and Codex round-9 review on
+            # #2065, an explicit bind address leaves tailnet trust OFF
+            # unconditionally: even if the operator happens to type the
+            # detected tailnet IPv4, opting into credential-free CGNAT
+            # access is a choice the auto-detect path makes, not one
+            # the explicit-override path inherits. Operators who want
+            # the trust gate should omit --host and let the auto path
+            # bind the tailnet interface itself.
             bind_mode = "explicit"
             if not allow_remote and host not in {"127.0.0.1", "localhost", "::1"}:
                 typer.echo(
@@ -263,15 +272,6 @@ def register_web_api_commands(app: typer.Typer) -> None:
                     err=True,
                 )
                 raise typer.Exit(code=2)
-            # Explicit override stays untrusted by default. If the
-            # operator typed the actual tailnet IPv4, opt back into
-            # tailnet trust — that's the same wire path as the
-            # auto-detected case. Any other explicit host (loopback,
-            # 0.0.0.0, a LAN address) leaves tailnet_trust False.
-            detected = detect_tailscale_ip()
-            if detected is not None and host == detected:
-                tailscale_ip = detected
-                tailnet_trust = True
         else:
             tailscale_ip = detect_tailscale_ip()
             if tailscale_ip is not None:

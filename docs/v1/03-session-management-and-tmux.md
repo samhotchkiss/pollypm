@@ -1,7 +1,7 @@
 ---
 ## Summary
 
-PollyPM manages agent sessions as tmux windows within a single tmux session. Each agent — heartbeat, operator, or worker — is a real interactive CLI process running in its own window. The lease model governs input arbitration between automation and humans. **Worker sessions are per-task**: a fresh tmux window and worktree are provisioned each time `pm task claim` runs, and the heartbeat sweep delivers the kickoff. Control sessions maintain identity across failover.
+PollyPM manages the human-facing cockpit separately from the storage-closet tmux session that holds agent windows. Each agent — heartbeat, operator, or worker — is a real interactive CLI process running in its own window. The lease model governs input arbitration between automation and humans. **Worker sessions are per-task**: a fresh tmux window and worktree are provisioned each time `pm task claim` runs, and the heartbeat sweep delivers the kickoff. Control sessions maintain identity across failover.
 
 ---
 
@@ -28,14 +28,34 @@ Every session in PollyPM is an interactive CLI agent running in a tmux window. S
 
 ## Tmux Integration
 
-### Single Tmux Session
+### Cockpit And Storage-Closet Sessions
 
-PollyPM creates and manages exactly one tmux session, named `pollypm`. All agent windows live inside this session.
+PollyPM separates the visible cockpit from the managed agent windows. The
+configured `project.tmux_session` (usually `pollypm`) is the human-facing
+cockpit session. Agent panes live in the storage-closet tmux session named
+`<project.tmux_session>-storage-closet` (for example,
+`pollypm-storage-closet`).
+
+Use the fully qualified storage-closet target when capturing or sending to an
+agent pane. For the default operator window, the canonical target is:
+
+```bash
+tmux capture-pane -t pollypm-storage-closet:pm-operator -p
+```
+
+Do not use `pollypm:pm-operator` for managed agents. If the configured
+cockpit session name differs, use `<project.tmux_session>-storage-closet`.
+API responses expose this as
+`window_target`, and that field is the source of truth for test plans and
+operator scripts.
 
 ```
-tmux session: pollypm
+tmux session: pollypm                  (cockpit)
+  window 0: PollyPM                    (human-facing TUI)
+
+tmux session: pollypm-storage-closet   (managed agents)
   window 0: heartbeat        (heartbeat supervisor)
-  window 1: polly            (operator)
+  window 1: pm-operator      (operator)
   window 2: task-acme-12     (per-task worker for acme/12)
   window 3: task-widgets-3   (per-task worker for widgets/3)
 ```
@@ -48,18 +68,18 @@ windows can coexist for the same project, one per active claim.
 
 | Operation | Tmux Command | When |
 |-----------|-------------|------|
-| Create session | `tmux new-session -d -s pollypm` | `pm up` (first time) |
-| Create window | `tmux new-window -t pollypm -n <name>` | Session launch |
-| Rename window | `tmux rename-window -t pollypm:<idx> <name>` | Session recovery with same identity |
-| Kill window | `tmux kill-window -t pollypm:<name>` | Session stop |
-| Kill session | `tmux kill-session -t pollypm` | `pm down` |
+| Create storage closet | `tmux new-session -d -s pollypm-storage-closet` | `pm up` (first time) |
+| Create agent window | `tmux new-window -t pollypm-storage-closet -n <name>` | Session launch |
+| Rename agent window | `tmux rename-window -t pollypm-storage-closet:<idx> <name>` | Session recovery with same identity |
+| Kill agent window | `tmux kill-window -t pollypm-storage-closet:<name>` | Session stop |
+| Kill storage closet | `tmux kill-session -t pollypm-storage-closet` | `pm down` |
 
 ### Pane Logging
 
 Every session window has pane logging enabled via `tmux pipe-pane`.
 
 ```bash
-tmux pipe-pane -t pollypm:<name> -o "cat >> <project>/.pollypm/logs/<name>/<launch-id>/pane.log"
+tmux pipe-pane -t pollypm-storage-closet:<name> -o "cat >> <project>/.pollypm/logs/<name>/<launch-id>/pane.log"
 ```
 
 Pane logging captures all terminal output — agent responses, tool use, errors, and any human input when a human is attached. Logging starts at launch and stops at session termination.
@@ -71,7 +91,7 @@ In addition to pane logs, PollyPM maintains its own transcript archive at `<proj
 Periodic snapshots of the visible pane content are taken via `tmux capture-pane`.
 
 ```bash
-tmux capture-pane -t pollypm:<name> -p > <project>/.pollypm/logs/<name>/<launch-id>/snapshots/<timestamp>.txt
+tmux capture-pane -t pollypm-storage-closet:<name> -p > <project>/.pollypm/logs/<name>/<launch-id>/snapshots/<timestamp>.txt
 ```
 
 Captures are taken:
@@ -86,7 +106,7 @@ Captures are taken:
 PollyPM sends prompts and commands to agent sessions via `tmux send-keys`.
 
 ```bash
-tmux send-keys -t pollypm:<name> "<prompt text>" Enter
+tmux send-keys -t pollypm-storage-closet:<name> "<prompt text>" Enter
 ```
 
 Input is only sent when PollyPM holds the lease for that pane. If a human holds the lease, input is queued until the lease is released.
@@ -150,7 +170,7 @@ The TUI displays lease information for each session:
 
 PollyPM detects human presence by monitoring tmux client attachment and pane input events:
 
-- `tmux list-clients -t pollypm` reveals attached clients
+- `tmux list-clients -t pollypm-storage-closet` reveals attached clients
 - Pane input that does not originate from `tmux send-keys` (PollyPM's own commands use a tagged prefix) indicates human activity
 - The heartbeat checks for human presence on each cycle
 
@@ -166,9 +186,9 @@ Launch is the process of starting a new agent session in a tmux window.
 1. **Resolve account.** Select an account based on the session declaration and current capacity state. Apply failover selection if the declared account is unavailable.
 2. **Prepare environment.** Build the environment variables: account-specific HOME, provider config dirs, API keys, project path.
 3. **Build launch command.** Construct the provider CLI command with arguments from config. Example: `claude --model opus --system-prompt prompts/worker.md`.
-4. **Create tmux window.** `tmux new-window -t pollypm -n <name>`.
-5. **Enable pane logging.** `tmux pipe-pane -t pollypm:<name> -o "cat >> <log-path>"`.
-6. **Start provider CLI.** `tmux send-keys -t pollypm:<name> "<launch-command>" Enter`.
+4. **Create tmux window.** `tmux new-window -t pollypm-storage-closet -n <name>`.
+5. **Enable pane logging.** `tmux pipe-pane -t pollypm-storage-closet:<name> -o "cat >> <log-path>"`.
+6. **Start provider CLI.** `tmux send-keys -t pollypm-storage-closet:<name> "<launch-command>" Enter`.
 7. **Register in state store.** Insert a record in `launches` with timestamp, account, provider, and trigger reason.
 8. **Set lease to pollypm.** Default lease assignment.
 9. **Inject initial prompt.** If the session has a system prompt or recovery context, send it after the CLI is ready.
@@ -205,7 +225,7 @@ Recovery restarts a failed session, potentially on the same account.
 1. **Detect failure.** Heartbeat classifies session as `exited`, `stuck`, or `error`.
 2. **Checkpoint.** Capture: pane snapshot, git state (branch, status, diff stats), last N transcript lines, operational context.
 3. **Select account.** Try the same account first. If unhealthy, apply failover selection.
-4. **Kill old window.** `tmux kill-window -t pollypm:<name>` (if it still exists).
+4. **Kill old window.** `tmux kill-window -t pollypm-storage-closet:<name>` (if it still exists).
 5. **Relaunch.** Execute the full launch sequence with the selected account.
 6. **Inject recovery prompt.** Construct a prompt containing:
    - What the session was doing (from checkpoint)
@@ -305,7 +325,7 @@ When both control sessions are down:
 
 If PollyPM core itself restarts:
 
-1. Detect existing tmux session `pollypm`
+1. Detect existing tmux session `pollypm-storage-closet`
 2. Inventory surviving windows
 3. Re-register surviving sessions in state store
 4. Restart any missing control sessions
@@ -353,7 +373,7 @@ Session management is exposed through the `pm` CLI.
 
 ## Resolved Decisions
 
-1. **One tmux session, not multiple.** All agent windows live in a single tmux session named `pollypm`. This simplifies window management, client attachment, and session discovery. Multiple tmux sessions would fragment the control plane.
+1. **Two tmux sessions: cockpit plus storage closet.** The configured cockpit session (`pollypm` by default) hosts the human-facing TUI. All managed agent windows live in the storage-closet session (`pollypm-storage-closet` by default), which keeps operator scripts and automation targets stable without mixing them into the cockpit.
 
 2. **Window-per-agent, not pane-per-agent.** Each agent gets its own tmux window (full screen), not a pane in a split layout. Windows provide clean isolation for pane logging, independent scrollback, and focused human interaction. Pane splits are available for the human to create manually but are not managed by PollyPM.
 

@@ -48,6 +48,19 @@ def config_with_base_dir(tmp_path: Path) -> _FakeConfig:
     return _FakeConfig(project=_FakeProject(base_dir=base))
 
 
+@pytest.fixture(autouse=True)
+def _reset_pause_throttle_between_tests() -> Any:
+    """Throttle / marker-state-transition bookkeeping is process-global
+    (it has to be, to dedupe across module-level callers). Reset it
+    between each test so ordering can't leak emit/no-emit assertions
+    from one case into the next."""
+    from pollypm.session_paused import _reset_skip_throttle_for_tests
+
+    _reset_skip_throttle_for_tests()
+    yield
+    _reset_skip_throttle_for_tests()
+
+
 def _write_marker(config: _FakeConfig, names: list[str]) -> Path:
     """Write the pause marker the way ``sessions_admin._write_paused_names``
     would — a JSON list of names sitting at ``<base_dir>/paused-sessions.json``."""
@@ -82,13 +95,21 @@ def test_load_paused_names_reads_marker(config_with_base_dir: _FakeConfig) -> No
 def test_load_paused_names_handles_malformed_json(
     config_with_base_dir: _FakeConfig,
 ) -> None:
-    from pollypm.session_paused import load_paused_names
+    """``load_paused_names`` keeps its best-effort empty-set degrade for
+    the GET surface — the read-side helper must not raise on a corrupt
+    marker. Recovery callers go through :func:`is_paused` /
+    :func:`load_paused_state` instead, which fail CLOSED (covered
+    below)."""
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, load_paused_names,
+    )
 
+    _reset_skip_throttle_for_tests()
     (config_with_base_dir.project.base_dir / "paused-sessions.json").write_text(
         "{not json}"
     )
-    # Best-effort: malformed file collapses to empty so the loops gate
-    # on it can't crash the daemon.
+    # The route-side load remains empty so the GET dashboard does not
+    # 500; the safety story sits on ``is_paused`` (see below).
     assert load_paused_names(config_with_base_dir) == set()
 
 
@@ -104,11 +125,85 @@ def test_load_paused_names_handles_no_base_dir() -> None:
     assert load_paused_names(_NullConfig()) == set()
 
 
+# ---------------------------------------------------------------------------
+# Unit — load_paused_state (discriminated marker state, PR #2081 r2)
+# ---------------------------------------------------------------------------
+
+
+def test_load_paused_state_absent_when_no_file(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, load_paused_state,
+    )
+
+    _reset_skip_throttle_for_tests()
+    state = load_paused_state(config_with_base_dir)
+    assert state.kind == "absent"
+    assert state.names == frozenset()
+
+
+def test_load_paused_state_ok_when_file_parses(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, load_paused_state,
+    )
+
+    _reset_skip_throttle_for_tests()
+    _write_marker(config_with_base_dir, ["operator", "reviewer-demo"])
+    state = load_paused_state(config_with_base_dir)
+    assert state.kind == "ok"
+    assert state.names == frozenset({"operator", "reviewer-demo"})
+
+
+def test_load_paused_state_unreadable_on_malformed_json(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, load_paused_state,
+    )
+
+    _reset_skip_throttle_for_tests()
+    (config_with_base_dir.project.base_dir / "paused-sessions.json").write_text(
+        "{not json}"
+    )
+    state = load_paused_state(config_with_base_dir)
+    assert state.kind == "unreadable"
+    assert "malformed JSON" in state.reason
+
+
+def test_load_paused_state_unreadable_on_wrong_shape(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """A JSON document that parses but is not a list collapses to
+    ``unreadable`` — we don't want to silently accept a mis-shaped
+    marker as 'no sessions paused'."""
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, load_paused_state,
+    )
+
+    _reset_skip_throttle_for_tests()
+    (config_with_base_dir.project.base_dir / "paused-sessions.json").write_text(
+        '{"paused": ["operator"]}'
+    )
+    state = load_paused_state(config_with_base_dir)
+    assert state.kind == "unreadable"
+
+
+# ---------------------------------------------------------------------------
+# Unit — is_paused FAIL-CLOSED on unreadable marker (PR #2081 r2)
+# ---------------------------------------------------------------------------
+
+
 def test_is_paused_true_when_name_listed(
     config_with_base_dir: _FakeConfig,
 ) -> None:
-    from pollypm.session_paused import is_paused
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, is_paused,
+    )
 
+    _reset_skip_throttle_for_tests()
     _write_marker(config_with_base_dir, ["operator"])
     assert is_paused(config_with_base_dir, "operator") is True
 
@@ -116,8 +211,11 @@ def test_is_paused_true_when_name_listed(
 def test_is_paused_false_when_name_not_listed(
     config_with_base_dir: _FakeConfig,
 ) -> None:
-    from pollypm.session_paused import is_paused
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, is_paused,
+    )
 
+    _reset_skip_throttle_for_tests()
     _write_marker(config_with_base_dir, ["operator"])
     assert is_paused(config_with_base_dir, "reviewer") is False
 
@@ -125,16 +223,155 @@ def test_is_paused_false_when_name_not_listed(
 def test_is_paused_false_when_marker_missing(
     config_with_base_dir: _FakeConfig,
 ) -> None:
-    from pollypm.session_paused import is_paused
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, is_paused,
+    )
 
+    _reset_skip_throttle_for_tests()
     assert is_paused(config_with_base_dir, "operator") is False
+
+
+def test_is_paused_fails_closed_on_malformed_marker(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """A corrupt pause marker must NOT let recovery restart a session
+    the operator intended to keep paused.
+
+    Previously the helper degraded to 'no sessions paused' on bad JSON
+    (Codex PR #2081 round 1) — Codex round 2 flagged this as a safety
+    bug now that the marker gates the supervisor / no-session-spawn
+    apply paths. The fix: treat unreadable as 'everything paused' so
+    the recovery loops yield until the operator repairs the marker.
+    """
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, is_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    (config_with_base_dir.project.base_dir / "paused-sessions.json").write_text(
+        "{not json}"
+    )
+    # Any session name returns True — fail closed.
+    assert is_paused(config_with_base_dir, "operator") is True
+    assert is_paused(config_with_base_dir, "reviewer") is True
+    assert is_paused(
+        config_with_base_dir, "never-configured-session",
+    ) is True
+
+
+def test_is_paused_fails_closed_on_permission_error(
+    config_with_base_dir: _FakeConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A permission-denied read on the marker also fails closed.
+
+    We can't reliably chmod a file to 000 on every CI surface (root,
+    container variants), so we monkeypatch ``Path.read_text`` to
+    raise the same ``OSError`` the read would surface in production.
+    """
+    from pathlib import Path as _Path
+
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, is_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    _write_marker(config_with_base_dir, ["operator"])
+
+    orig_read_text = _Path.read_text
+
+    def boom(self, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
+        if self.name == "paused-sessions.json":
+            raise PermissionError("simulated denied")
+        return orig_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(_Path, "read_text", boom)
+
+    # Even a name we KNOW isn't in the original list returns True —
+    # the recovery loop has no way to verify, so it yields.
+    assert is_paused(config_with_base_dir, "operator") is True
+    assert is_paused(
+        config_with_base_dir, "definitely-not-in-marker",
+    ) is True
+
+
+def test_is_paused_unreadable_emits_audit_event_once(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """The ``session.pause.marker_unreadable`` audit event lands on the
+    project's ``audit.jsonl`` so an operator can see WHY the loops are
+    failing closed — even when the recovery loop never passes a
+    ``store`` handle into ``is_paused``. Repeated reads within the
+    throttle window must not duplicate the row (Codex PR #2081 r2
+    finding 1)."""
+    from pollypm.session_paused import (
+        PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
+        _reset_skip_throttle_for_tests, is_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    (config_with_base_dir.project.base_dir / "paused-sessions.json").write_text(
+        "{not json}"
+    )
+    # Hammer the read 20 times.
+    for _ in range(20):
+        assert is_paused(config_with_base_dir, "operator") is True
+
+    audit_path = config_with_base_dir.project.base_dir / "audit.jsonl"
+    assert audit_path.exists(), "expected audit.jsonl to be emitted"
+    rows = [
+        json.loads(line)
+        for line in audit_path.read_text().splitlines() if line.strip()
+    ]
+    unreadable_rows = [
+        r for r in rows
+        if r.get("event_type") == PAUSE_MARKER_UNREADABLE_EVENT_TYPE
+    ]
+    # Exactly one despite 20 reads — throttle held.
+    assert len(unreadable_rows) == 1, rows
+
+
+def test_is_paused_unreadable_to_readable_emits_restored(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """When the operator repairs a corrupt marker the helper must
+    emit ``session.pause.marker_restored`` so the audit trail shows
+    the recovery loops returned to their normal gating."""
+    from pollypm.session_paused import (
+        PAUSE_MARKER_RESTORED_EVENT_TYPE,
+        PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
+        _reset_skip_throttle_for_tests, is_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    marker = (
+        config_with_base_dir.project.base_dir / "paused-sessions.json"
+    )
+    marker.write_text("{not json}")
+    assert is_paused(config_with_base_dir, "operator") is True
+
+    # Repair it.
+    _write_marker(config_with_base_dir, ["operator"])
+    assert is_paused(config_with_base_dir, "operator") is True  # still paused
+    assert is_paused(config_with_base_dir, "reviewer") is False  # no fail-closed
+
+    audit_path = config_with_base_dir.project.base_dir / "audit.jsonl"
+    rows = [
+        json.loads(line)
+        for line in audit_path.read_text().splitlines() if line.strip()
+    ]
+    types = [r.get("event_type") for r in rows]
+    assert PAUSE_MARKER_UNREADABLE_EVENT_TYPE in types
+    assert PAUSE_MARKER_RESTORED_EVENT_TYPE in types
 
 
 def test_skip_if_paused_returns_false_for_unpaused_session(
     config_with_base_dir: _FakeConfig,
 ) -> None:
-    from pollypm.session_paused import skip_if_paused
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, skip_if_paused,
+    )
 
+    _reset_skip_throttle_for_tests()
     events: list[tuple] = []
 
     class _Store:
@@ -156,9 +393,11 @@ def test_skip_if_paused_emits_audit_event_on_skip(
     pause — without it, a skipped recovery is invisible."""
     from pollypm.session_paused import (
         PAUSE_SKIP_EVENT_TYPE,
+        _reset_skip_throttle_for_tests,
         skip_if_paused,
     )
 
+    _reset_skip_throttle_for_tests()
     _write_marker(config_with_base_dir, ["operator"])
 
     captured: list[dict[str, Any]] = []
@@ -185,13 +424,106 @@ def test_skip_if_paused_no_store_still_returns_true(
     config_with_base_dir: _FakeConfig,
 ) -> None:
     """Audit emission is optional — pure-boolean guard mode must work."""
-    from pollypm.session_paused import skip_if_paused
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, skip_if_paused,
+    )
 
+    _reset_skip_throttle_for_tests()
     _write_marker(config_with_base_dir, ["operator"])
     # No ``store`` kwarg → no emission, but the guard still trips.
     assert skip_if_paused(
         config_with_base_dir, "operator", loop="boolean_only",
     ) is True
+
+
+def test_skip_if_paused_throttles_repeat_audit_emission(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """A paused session that survives many sweep ticks must NOT pile
+    up one ``session.pause.skip`` audit event per tick (Codex PR
+    #2081 r2 finding 1). The boolean guard still trips every call —
+    only the durable event is throttled per (session, loop)."""
+    from pollypm.session_paused import (
+        PAUSE_SKIP_EVENT_TYPE, _reset_skip_throttle_for_tests,
+        skip_if_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    _write_marker(config_with_base_dir, ["operator"])
+
+    captured: list[dict[str, Any]] = []
+
+    class _Store:
+        def record_event(self, **kwargs):  # noqa: ANN003
+            captured.append(kwargs)
+
+    # Simulate 50 sweep ticks for the same (session, loop) — well past
+    # what a real bug would produce in a few minutes of pause.
+    for _ in range(50):
+        assert skip_if_paused(
+            config_with_base_dir, "operator", store=_Store(),
+            loop="no_session_spawn.auto_recover",
+        ) is True
+
+    skip_events = [
+        e for e in captured if e.get("sender") == PAUSE_SKIP_EVENT_TYPE
+    ]
+    assert len(skip_events) == 1, (
+        f"expected 1 throttled skip event, got {len(skip_events)}: "
+        f"{skip_events}"
+    )
+
+
+def test_skip_if_paused_throttle_is_per_loop(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """The throttle key is (session, loop) — so loop 1 and loop 2 each
+    get their own first-emit even when they hit the same session in
+    the same tick."""
+    from pollypm.session_paused import (
+        PAUSE_SKIP_EVENT_TYPE, _reset_skip_throttle_for_tests,
+        skip_if_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    _write_marker(config_with_base_dir, ["operator"])
+
+    captured: list[dict[str, Any]] = []
+
+    class _Store:
+        def record_event(self, **kwargs):  # noqa: ANN003
+            captured.append(kwargs)
+
+    store = _Store()
+    # Two different loops, same session — both should emit once.
+    skip_if_paused(
+        config_with_base_dir, "operator", store=store,
+        loop="no_session_spawn.auto_recover",
+    )
+    skip_if_paused(
+        config_with_base_dir, "operator", store=store,
+        loop="supervisor.maybe_recover_session",
+    )
+    # Then re-hit each loop a few times — no extra emits.
+    for _ in range(5):
+        skip_if_paused(
+            config_with_base_dir, "operator", store=store,
+            loop="no_session_spawn.auto_recover",
+        )
+        skip_if_paused(
+            config_with_base_dir, "operator", store=store,
+            loop="supervisor.maybe_recover_session",
+        )
+
+    skip_events = [
+        e for e in captured if e.get("sender") == PAUSE_SKIP_EVENT_TYPE
+    ]
+    assert len(skip_events) == 2, skip_events
+    loops = {e["payload"]["loop"] for e in skip_events}
+    assert loops == {
+        "no_session_spawn.auto_recover",
+        "supervisor.maybe_recover_session",
+    }
 
 
 def test_skip_if_paused_swallows_store_errors(
@@ -205,8 +537,11 @@ def test_skip_if_paused_swallows_store_errors(
     paused session and fire the very intervention we just chose to
     skip.
     """
-    from pollypm.session_paused import skip_if_paused
+    from pollypm.session_paused import (
+        _reset_skip_throttle_for_tests, skip_if_paused,
+    )
 
+    _reset_skip_throttle_for_tests()
     _write_marker(config_with_base_dir, ["operator"])
 
     class _FlakyStore:

@@ -4,8 +4,9 @@ This module owns the on-disk pause-marker contract end-to-end:
 
 * The filename constant (``_PAUSE_MARKER_FILENAME``) and the
   config-derived path helper (``_pause_marker_path``).
-* The read helpers (``load_paused_names`` / ``is_paused``) consumed by
-  the supervisor / recovery loops AND the sessions-admin GET surface.
+* The read helpers (``load_paused_state`` / ``load_paused_names`` /
+  ``is_paused``) consumed by the supervisor / recovery loops AND the
+  sessions-admin GET surface.
 * The write helpers (``save_paused_names`` / ``pause_marker_lock``)
   consumed by ``POST /api/v1/sessions/{name}/pause`` and ``resume``.
 
@@ -30,18 +31,51 @@ loops 1–3:
 Remaining dispatch / cockpit / heartbeat loops still treat the marker
 as informational and are tracked as the next slice under #2068.
 
+Marker states
+-------------
+
 The on-disk shape is a JSON list of session names sitting next to
-``state.db`` in the project's ``base_dir``. The reader is best-effort:
-a missing file, malformed JSON, or unreadable bytes collapse to "no
-sessions paused" so a paused marker on a different project / partial
-write can never crash the loops it gates.
+``state.db`` in the project's ``base_dir``. The reader distinguishes
+three states (PR #2081 round 2 — Codex finding 2):
+
+* ``MarkerState.absent`` — no file on disk. No sessions paused.
+* ``MarkerState.ok(names)`` — file parses cleanly to a list of names.
+* ``MarkerState.unreadable(reason)`` — file exists but cannot be read
+  or parsed (corrupt JSON, permission denied, wrong shape).
+
+For recovery / supervisor gating we FAIL CLOSED on ``unreadable``:
+:func:`is_paused` and :func:`skip_if_paused` treat the unreadable case
+as "every session is paused" rather than restarting a session the
+operator intended to keep quiesced. The transition into the unreadable
+state emits a throttled ``session.pause.marker_unreadable`` audit
+event and a one-time stderr warning so the operator can repair the
+marker; the transition back out emits ``session.pause.marker_restored``.
+
+For the read-only sessions-admin GET surface we keep the legacy
+"best-effort empty set" behaviour via :func:`load_paused_names` so a
+stale marker on disk does not 500 the dashboard; the GET path surfaces
+``paused`` purely as a presentational signal.
+
+Audit-event spam (PR #2081 round 2 — Codex finding 1)
+-----------------------------------------------------
+
+:func:`skip_if_paused` is invoked from periodic sweep ticks. The
+audit-event side of the helper is throttled per ``(session, loop)``
+key with :data:`PAUSE_SKIP_THROTTLE_SECONDS` to keep the durable
+event stream bounded on a long-running paused session. The boolean
+return is NOT throttled — the guard always trips on a paused name.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import sys
+import threading
+import time
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -55,6 +89,98 @@ logger = logging.getLogger(__name__)
 # (the shared module) — sessions_admin imports rather than redeclaring
 # (Codex PR #2081 round 1 blocker 2).
 _PAUSE_MARKER_FILENAME = "paused-sessions.json"
+
+
+# How long to suppress repeat ``session.pause.skip`` audit events for
+# the same (session, loop) key. 300s (5 min) is short enough that an
+# operator inspecting the audit stream sees a fresh confirmation that
+# the marker is still in effect within a reasonable window, but long
+# enough that a sweep tick running every few seconds does not pile up
+# unbounded rows. The shorter ``rail_daemon_supervisor`` revival
+# throttle is 60s for a HOT path; this is observability-only, so we
+# can afford a wider window. The watchdog-side audit throttles are
+# 1800s / 5400s but those are for true escalations — a pause is a
+# steady-state condition the operator is actively maintaining, so we
+# split the difference.
+PAUSE_SKIP_THROTTLE_SECONDS = 300.0
+
+# Same throttle for the unreadable-marker audit event. We emit at
+# most one event per process per window so a corrupt marker that
+# survives across many sweep ticks does not spam the durable log;
+# state transitions (unreadable -> readable, readable -> unreadable)
+# bypass the throttle because the operator needs to see them.
+PAUSE_MARKER_UNREADABLE_THROTTLE_SECONDS = PAUSE_SKIP_THROTTLE_SECONDS
+
+
+# Audit-event constants.
+#
+# ``session.pause.skip`` — emitted by the supervisor / recovery loops
+# whenever the guard fires, so the cockpit can show "the loop honored
+# the pause" without operators having to grep logs. Throttled per
+# (session, loop) by :data:`PAUSE_SKIP_THROTTLE_SECONDS`.
+PAUSE_SKIP_EVENT_TYPE = "session.pause.skip"
+
+# ``session.pause.marker_unreadable`` — emitted when the marker file
+# exists but cannot be parsed / read. Recovery loops will be failing
+# closed (treating every session as paused) until the operator
+# repairs the marker, so this event needs to land. Emitted at most
+# once per :data:`PAUSE_MARKER_UNREADABLE_THROTTLE_SECONDS` per
+# process; transitions back to readable emit
+# :data:`PAUSE_MARKER_RESTORED_EVENT_TYPE` and reset the throttle.
+PAUSE_MARKER_UNREADABLE_EVENT_TYPE = "session.pause.marker_unreadable"
+PAUSE_MARKER_RESTORED_EVENT_TYPE = "session.pause.marker_restored"
+
+
+# --- Marker state ---------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MarkerState:
+    """Discriminated state of the on-disk pause marker.
+
+    ``kind`` is one of ``"absent"``, ``"ok"``, ``"unreadable"``.
+
+    * ``absent`` — no file present; ``names`` is the empty frozenset.
+    * ``ok`` — file parsed cleanly; ``names`` is the parsed set.
+    * ``unreadable`` — file present but cannot be read/parsed;
+      ``names`` is empty and ``reason`` carries the failure detail.
+      Recovery callers MUST treat this as "all sessions paused".
+    """
+
+    kind: str
+    names: frozenset[str] = frozenset()
+    reason: str = ""
+
+    @classmethod
+    def absent(cls) -> "MarkerState":
+        return cls(kind="absent")
+
+    @classmethod
+    def ok(cls, names: set[str] | frozenset[str]) -> "MarkerState":
+        return cls(kind="ok", names=frozenset(names))
+
+    @classmethod
+    def unreadable(cls, reason: str) -> "MarkerState":
+        return cls(kind="unreadable", reason=reason)
+
+
+# Per-process throttle state. Keyed by ``(session, loop)`` for the
+# skip event; a single bucket for the unreadable-marker event since
+# it's process-wide.
+_SKIP_THROTTLE_LOCK = threading.Lock()
+_PAUSE_SKIP_LAST_EMITTED: dict[tuple[str, str], float] = {}
+
+_MARKER_STATE_LOCK = threading.Lock()
+# Tracks the most-recent known kind ("ok"/"absent"/"unreadable") so we
+# can detect transitions and emit a restored event when the marker
+# becomes readable again.
+_LAST_MARKER_KIND: dict[str, str] = {}
+# Last monotonic timestamp at which we emitted the unreadable event
+# for a given marker path. ``None`` / missing entry means "never";
+# we deliberately avoid 0.0 because :func:`time.monotonic` can return
+# small values early in a process lifetime on some platforms (notably
+# macOS) which would otherwise look like a recent emit.
+_LAST_UNREADABLE_EMITTED: dict[str, float] = {}
 
 
 def _pause_marker_path(config: Any) -> Path | None:
@@ -73,31 +199,101 @@ def _pause_marker_path(config: Any) -> Path | None:
     return Path(base_dir) / _PAUSE_MARKER_FILENAME
 
 
+def load_paused_state(config: Any) -> MarkerState:
+    """Read the pause marker and return its discriminated state.
+
+    Distinguishes "no marker" from "marker exists but can't be read",
+    so callers that gate destructive recovery (loops 1-3 wired in PR
+    ``feat/sessions-pause-marker-wire-loops-1-3``) can fail closed
+    rather than restart a session the operator intended to keep
+    quiesced (PR #2081 round 2, Codex finding 2).
+
+    * No ``base_dir`` on config → ``MarkerState.absent`` (treated by
+      :func:`is_paused` as "nothing paused"). This matches the existing
+      ``None`` path in :func:`_pause_marker_path` — a partially-loaded
+      config can't have intentionally paused anything.
+    * File missing → ``MarkerState.absent``.
+    * File parses to a JSON list of strings → ``MarkerState.ok(names)``.
+    * Anything else (``OSError`` from read, ``ValueError`` from JSON,
+      wrong document shape) → ``MarkerState.unreadable(reason)``. We
+      emit a throttled audit event + stderr warning the first time we
+      see this so the operator notices.
+    """
+    path = _pause_marker_path(config)
+    if path is None:
+        state = MarkerState.absent()
+        _record_marker_kind_transition(config, state)
+        return state
+    if not path.exists():
+        state = MarkerState.absent()
+        _record_marker_kind_transition(config, state)
+        return state
+    try:
+        raw = path.read_text()
+    except OSError as exc:
+        reason = f"read failed: {exc!s}"
+        logger.debug("pause marker read failed: %s", path, exc_info=True)
+        state = MarkerState.unreadable(reason)
+        _record_marker_kind_transition(config, state)
+        return state
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        reason = f"malformed JSON: {exc!s}"
+        logger.debug("pause marker parse failed: %s", path, exc_info=True)
+        state = MarkerState.unreadable(reason)
+        _record_marker_kind_transition(config, state)
+        return state
+    if not isinstance(data, list):
+        reason = f"unexpected document shape: {type(data).__name__}"
+        state = MarkerState.unreadable(reason)
+        _record_marker_kind_transition(config, state)
+        return state
+    names = {str(name) for name in data if isinstance(name, str)}
+    state = MarkerState.ok(names)
+    _record_marker_kind_transition(config, state)
+    return state
+
+
 def load_paused_names(config: Any) -> set[str]:
     """Read the pause marker; empty set on missing / malformed file.
 
-    Best-effort: filesystem / JSON errors degrade to an empty set with
-    a debug log line — the goal is to never break a recovery loop on a
-    flaky read.
+    Best-effort variant retained for the sessions-admin GET surface
+    and the route's read-modify-write paths. An unreadable marker
+    collapses to an empty set HERE — recovery callers must use
+    :func:`load_paused_state` / :func:`is_paused` instead so they
+    fail closed (treat unreadable as "everything paused") rather than
+    fail open (restart what the operator wanted paused).
     """
-    path = _pause_marker_path(config)
-    if path is None or not path.exists():
-        return set()
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        logger.debug("pause marker unreadable: %s", path, exc_info=True)
-        return set()
-    if not isinstance(data, list):
-        return set()
-    return {str(name) for name in data if isinstance(name, str)}
+    state = load_paused_state(config)
+    if state.kind == "ok":
+        return set(state.names)
+    return set()
 
 
 def is_paused(config: Any, session_name: str) -> bool:
-    """Return True iff ``session_name`` appears in the pause marker."""
+    """Return True iff ``session_name`` is currently paused.
+
+    Fail-closed semantics (PR #2081 round 2, Codex finding 2):
+
+    * ``MarkerState.absent`` → False.
+    * ``MarkerState.ok`` → ``session_name in state.names``.
+    * ``MarkerState.unreadable`` → True for ANY session. A corrupt or
+      permission-broken marker MUST NOT allow recovery loops to
+      restart a session the operator intended to keep paused. The
+      reader emits a throttled ``session.pause.marker_unreadable``
+      audit event + stderr warning on the first occurrence so the
+      operator notices and repairs the marker.
+    """
     if not session_name:
         return False
-    return session_name in load_paused_names(config)
+    state = load_paused_state(config)
+    if state.kind == "absent":
+        return False
+    if state.kind == "ok":
+        return session_name in state.names
+    # ``unreadable`` — fail closed: every session is treated as paused.
+    return True
 
 
 def save_paused_names(config: Any, names: set[str] | list[str]) -> None:
@@ -161,13 +357,6 @@ def pause_marker_lock(config: Any):
         fh.close()
 
 
-# Audit-event constants. The supervisor / recovery loops emit
-# ``session.pause.skip`` via the unified messages store whenever the
-# guard fires, so the cockpit can show "the loop honored the pause"
-# without operators having to grep logs.
-PAUSE_SKIP_EVENT_TYPE = "session.pause.skip"
-
-
 def skip_if_paused(
     config: Any,
     session_name: str,
@@ -176,7 +365,8 @@ def skip_if_paused(
     loop: str = "",
     reason: str = "",
 ) -> bool:
-    """Return True (and emit an audit event) when ``session_name`` is paused.
+    """Return True (and conditionally emit an audit event) when ``session_name``
+    is paused.
 
     ``store`` — when supplied, the helper emits a ``session.pause.skip``
     event via ``store.record_event(scope, sender, subject)`` so the
@@ -189,14 +379,58 @@ def skip_if_paused(
     ``"no_session_spawn.auto_recover"``) so an operator can correlate
     the skip with the loop that yielded.
 
+    Audit-event throttling (PR #2081 round 2, Codex finding 1) —
+    Repeated calls for the same ``(session_name, loop)`` within
+    :data:`PAUSE_SKIP_THROTTLE_SECONDS` (5 min) emit AT MOST one
+    durable audit event; subsequent calls return True without
+    touching the store. The boolean guard return is NOT throttled
+    — the recovery loop must still yield on every tick. Without the
+    throttle a paused-but-unhealthy session would pile up one audit
+    row per sweep tick forever.
+
     Callers that don't want audit emission (e.g. read-side helpers) can
     omit ``store`` and use this purely as a boolean guard.
     """
     if not is_paused(config, session_name):
         return False
-    if store is not None:
+    if store is not None and _should_emit_skip(session_name, loop):
         _emit_pause_skip(store, session_name, loop=loop, reason=reason)
     return True
+
+
+def _should_emit_skip(session_name: str, loop: str) -> bool:
+    """Return True iff we are outside the per-(session, loop) throttle.
+
+    Updates the last-emit timestamp eagerly under a process-wide lock
+    so two threads hitting the same key in the same tick can only race
+    one emission through. We use ``None`` rather than ``0.0`` as the
+    "never emitted" sentinel because :func:`time.monotonic` is allowed
+    to start at an arbitrary low value (a fresh Python process on
+    macOS often returns < 1.0 from monotonic at startup) which would
+    otherwise look like "we just emitted" and silently swallow the
+    first call.
+    """
+    key = (session_name, loop or "unknown_loop")
+    now = time.monotonic()
+    with _SKIP_THROTTLE_LOCK:
+        last = _PAUSE_SKIP_LAST_EMITTED.get(key)
+        if last is not None and now - last < PAUSE_SKIP_THROTTLE_SECONDS:
+            return False
+        _PAUSE_SKIP_LAST_EMITTED[key] = now
+    return True
+
+
+def _reset_skip_throttle_for_tests() -> None:
+    """Clear the throttle state — test-only helper.
+
+    Production code MUST NOT call this. The tests for repeated-tick
+    behaviour rely on a deterministic starting point.
+    """
+    with _SKIP_THROTTLE_LOCK:
+        _PAUSE_SKIP_LAST_EMITTED.clear()
+    with _MARKER_STATE_LOCK:
+        _LAST_MARKER_KIND.clear()
+        _LAST_UNREADABLE_EMITTED.clear()
 
 
 def _emit_pause_skip(
@@ -257,10 +491,145 @@ def _emit_pause_skip(
         )
 
 
+# --- Marker-state transition diagnostics ----------------------------
+
+
+def _marker_state_key(config: Any) -> str:
+    """Return a per-marker-path key for transition tracking.
+
+    Includes the project's ``base_dir`` so two configs that share a
+    process (multi-project daemons) don't cross-contaminate each
+    other's "have we already warned" state.
+    """
+    path = _pause_marker_path(config)
+    if path is None:
+        return "<no_base_dir>"
+    return str(path)
+
+
+def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
+    """Detect ``unreadable`` transitions and emit one-time diagnostics.
+
+    Called from :func:`load_paused_state` on every read. We track the
+    previously-observed kind per marker path:
+
+    * unreadable for the FIRST time, or after being readable → log a
+      stderr warning + emit a throttled
+      ``session.pause.marker_unreadable`` audit event. The operator
+      needs to know the recovery loops are failing closed.
+    * unreadable -> readable (ok/absent) → emit
+      ``session.pause.marker_restored`` (one-shot, not throttled —
+      transitions are rare and informative).
+    """
+    key = _marker_state_key(config)
+    kind = state.kind
+    with _MARKER_STATE_LOCK:
+        prior = _LAST_MARKER_KIND.get(key)
+        _LAST_MARKER_KIND[key] = kind
+        if kind == "unreadable":
+            last_emit = _LAST_UNREADABLE_EMITTED.get(key)
+            now = time.monotonic()
+            became_unreadable = prior != "unreadable"
+            within_throttle = (
+                last_emit is not None
+                and now - last_emit < PAUSE_MARKER_UNREADABLE_THROTTLE_SECONDS
+            )
+            if not became_unreadable and within_throttle:
+                return
+            _LAST_UNREADABLE_EMITTED[key] = now
+            should_emit = True
+            should_warn = became_unreadable
+        else:
+            should_emit = prior == "unreadable"
+            should_warn = False
+            # Successful read resets the unreadable-emit window so the
+            # next failure re-emits even if it lands inside the prior
+            # throttle.
+            _LAST_UNREADABLE_EMITTED.pop(key, None)
+    if should_warn:
+        # Stderr is the only place the operator reliably sees this
+        # without the cockpit attached. Best-effort: a closed stderr
+        # in a test harness must not crash the read.
+        try:
+            print(
+                f"pollypm: pause marker at {key} is unreadable "
+                f"({state.reason}); recovery loops will fail CLOSED "
+                f"(treat all sessions as paused) until repaired.",
+                file=sys.stderr,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug("pause marker stderr warn failed", exc_info=True)
+    if should_emit and kind == "unreadable":
+        _emit_marker_diagnostic(
+            config,
+            event_type=PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
+            subject=(
+                f"pause marker unreadable at {key} ({state.reason}); "
+                "recovery loops failing closed"
+            ),
+            payload={"path": key, "reason": state.reason},
+        )
+    elif should_emit:
+        _emit_marker_diagnostic(
+            config,
+            event_type=PAUSE_MARKER_RESTORED_EVENT_TYPE,
+            subject=(
+                f"pause marker readable again at {key} "
+                f"(kind={kind}); recovery loops resumed normal gating"
+            ),
+            payload={"path": key, "kind": kind},
+        )
+
+
+def _emit_marker_diagnostic(
+    config: Any,
+    *,
+    event_type: str,
+    subject: str,
+    payload: dict[str, Any],
+) -> None:
+    """Append a marker-state diagnostic to the project's audit JSONL.
+
+    The marker reader is called from many code paths (recovery loops,
+    GET surface, supervisor) — most of which don't carry a store
+    handle. We append directly to ``<base_dir>/audit.jsonl`` (the
+    same file ``audit/log.py`` writes to) so the diagnostic lands
+    regardless of caller. Best-effort: any write failure is logged
+    at debug and swallowed.
+    """
+    path = _pause_marker_path(config)
+    if path is None:
+        return
+    audit_path = path.parent / "audit.jsonl"
+    record = {
+        "ts": time.time(),
+        "event_type": event_type,
+        "subject": subject,
+        "payload": payload,
+    }
+    try:
+        audit_path.parent.mkdir(parents=True, exist_ok=True)
+        with audit_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record) + "\n")
+            fh.flush()
+            os.fsync(fh.fileno())
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "pause marker diagnostic %s emit failed", event_type,
+            exc_info=True,
+        )
+
+
 __all__ = [
+    "MarkerState",
+    "PAUSE_MARKER_RESTORED_EVENT_TYPE",
+    "PAUSE_MARKER_UNREADABLE_EVENT_TYPE",
+    "PAUSE_MARKER_UNREADABLE_THROTTLE_SECONDS",
     "PAUSE_SKIP_EVENT_TYPE",
+    "PAUSE_SKIP_THROTTLE_SECONDS",
     "is_paused",
     "load_paused_names",
+    "load_paused_state",
     "pause_marker_lock",
     "save_paused_names",
     "skip_if_paused",

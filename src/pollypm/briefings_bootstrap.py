@@ -51,7 +51,10 @@ def bootstrap_builtin_briefings(config: PollyPMConfig) -> None:
 
     Import failures are logged and swallowed so a missing/broken plugin
     downgrades availability to ``false`` (the route's fail-soft
-    posture) rather than crashing app startup.
+    posture) rather than crashing app startup. The except path also
+    clears any prior registration so a stale provider from a previous
+    app instance doesn't keep the registry reporting ``available=true``
+    (Codex round-14 on #2059).
     """
     if is_plugin_disabled_in_config(config, MORNING_BRIEFING_PLUGIN_NAME):
         # Clear so a previously-enabled run's registration doesn't leak
@@ -77,6 +80,16 @@ def bootstrap_builtin_briefings(config: PollyPMConfig) -> None:
             MorningBriefingRenderProvider,
         )
     except Exception:  # noqa: BLE001
+        # Clear any prior registration so a previously-installed provider
+        # (e.g. from an earlier app instance, a test that pre-seeded the
+        # slot, or a plugin host run before this bootstrap was invoked)
+        # doesn't continue masquerading as the morning provider after we
+        # logged ``available=false``. Without this, ``GET /briefings``
+        # keeps reporting ``morning.available=true`` against a stale
+        # provider while the operator sees only the warning in logs
+        # (Codex round-14 on #2059).
+        register_briefing_provider(None)
+        register_briefing_render_provider(MORNING_BRIEFING_TYPE_NAME, None)
         logger.warning(
             "briefings_bootstrap: %s unavailable; "
             "Web API will report morning.available=false",

@@ -1817,3 +1817,138 @@ def test_disabled_morning_plugin_via_bootstrap_path(
             assert response.json()["error"]["code"] == "service_unavailable"
     finally:
         register_briefing_render_provider("morning", None)
+
+
+# ---------------------------------------------------------------------------
+# Codex round-14 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_clears_registry_on_morning_import_failure(
+    api_config: PollyPMConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failed bootstrap import must clear any pre-existing registration.
+
+    Codex round-14 on #2059: the ``except`` path used to only log and
+    return, leaving a stale provider (from an earlier app instance, a
+    test that pre-seeded the slot, or a plugin host run that fired
+    before bootstrap) installed. ``GET /briefings`` then continued
+    reporting ``morning.available=true`` against the stale provider
+    while the operator saw only the warning in logs.
+
+    This test pre-registers a stub, forces the morning_briefing
+    inbox import to raise during bootstrap, and asserts the registry
+    has been cleared for BOTH the inbox-list provider and the
+    render-provider slot.
+    """
+    from pollypm import briefings_bootstrap as bb
+    from pollypm.briefings_registry import (
+        BriefingArtifact,
+        get_briefing_render_provider,
+        is_briefing_provider_registered,
+        register_briefing_provider,
+        register_briefing_render_provider,
+    )
+
+    class _StubRenderProvider:
+        def render_last(self, _config):
+            return None
+
+        def regenerate(self, _config, project=None):  # noqa: ARG002
+            return BriefingArtifact(date_local="2026-05-22", markdown="")
+
+    def _stub_list_briefings(_base_dir, *, status="open", limit=None):  # noqa: ARG001
+        return []
+
+    # Pre-seed BOTH registry slots so we can detect them surviving the
+    # failed bootstrap.
+    register_briefing_provider(_stub_list_briefings)
+    register_briefing_render_provider(
+        "morning",
+        _StubRenderProvider(),
+        description="stub from a previous run",
+        is_available=lambda _cfg: True,
+    )
+
+    try:
+        assert is_briefing_provider_registered() is True
+        assert get_briefing_render_provider("morning") is not None
+
+        # Force the import inside the bootstrap try-block to raise. The
+        # try block imports from ``pollypm.plugins_builtin.morning_briefing.inbox``
+        # first; sabotaging that module's attribute lookup is enough to
+        # trigger the except path.
+        import sys
+
+        import pollypm.plugins_builtin.morning_briefing.inbox as inbox_mod
+
+        original_list = getattr(inbox_mod, "list_briefings", None)
+        try:
+            monkeypatch.delattr(inbox_mod, "list_briefings", raising=False)
+            # Make the ``from ... import list_briefings`` fail by
+            # ensuring re-imports of the inbox module also lack the
+            # attribute. Pop any cached attribute and force reload-on-
+            # next-import is heavy; deleting the attribute is enough
+            # because the ``from M import X`` statement re-binds X
+            # from the live module object after it's loaded.
+            bb.bootstrap_builtin_briefings(api_config)
+        finally:
+            # Restore so other tests in the file (and subsequent test
+            # files in the session) aren't poisoned.
+            if original_list is not None:
+                inbox_mod.list_briefings = original_list  # type: ignore[attr-defined]
+            sys.modules.pop("pollypm.plugins_builtin.morning_briefing.inbox", None)
+
+        # Both registry slots must be empty — the stale stub MUST NOT
+        # survive a failed bootstrap.
+        assert is_briefing_provider_registered() is False, (
+            "bootstrap import failure left a stale inbox-list provider "
+            "installed; GET /briefings would keep reporting "
+            "morning.available=true against the wrong provider."
+        )
+        assert get_briefing_render_provider("morning") is None, (
+            "bootstrap import failure left a stale render provider "
+            "installed; render/regenerate would run against the wrong "
+            "provider after the operator saw a warning in logs."
+        )
+    finally:
+        # Belt-and-suspenders cleanup for the rest of the suite.
+        register_briefing_provider(None)
+        register_briefing_render_provider("morning", None)
+
+
+def test_regenerate_request_docstring_says_morning_rejects_project() -> None:
+    """``RegenerateRequest`` model description must say morning rejects ``project``.
+
+    Codex round-14 on #2059: pydantic exposes the class docstring via
+    ``model_json_schema()["description"]``, which then surfaces on the
+    live ``/openapi.json``. The previous docstring said morning
+    "ignores" ``project`` — contradicting both the static
+    ``docs/api/openapi.yaml`` and actual runtime behavior (the morning
+    adapter raises ``400 invalid_request`` when ``project`` is set).
+    Generated clients reading the live spec saw the wrong contract.
+
+    This pin asserts the runtime schema's ``description`` field
+    accurately documents the rejection so a future drift back to
+    "ignores" trips here.
+    """
+    schema = RegenerateRequest.model_json_schema()
+    description = schema.get("description", "") or ""
+    lowered = description.lower()
+    assert "morning" in lowered, (
+        "RegenerateRequest description should mention morning by name "
+        "so clients reading /openapi.json see which built-in type "
+        "rejects project."
+    )
+    assert "reject" in lowered or "400" in lowered, (
+        "RegenerateRequest description should say morning REJECTS "
+        "project (or returns 400) — saying it 'ignores' the field "
+        f"contradicts runtime behavior. Got: {description!r}"
+    )
+    # Drift guard against the old wording.
+    assert "ignore" not in lowered, (
+        "RegenerateRequest description still says morning 'ignores' "
+        "project — runtime returns 400 invalid_request when project "
+        f"is set on morning. Got: {description!r}"
+    )

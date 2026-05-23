@@ -4383,6 +4383,7 @@ components:
           nullable: true
           description: |
             Optional project key narrowing the regenerate scope. The
-            built-in `morning` type rejects this field with `400` —
-            morning briefings are workspace-wide only. Plugin-contributed
-            types may honour it; check the type's docs.
+            built-in `morning` type rejects this field with
+            `400 invalid_request` — morning briefings are
+            workspace-wide only. Plugin-contributed types may consume
+            `project` for per-project scope; consult the type's docs.

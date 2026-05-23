@@ -143,10 +143,20 @@ class RegenerateRequest(BaseModel):
     """``POST /briefings/{type}/regenerate`` body.
 
     ``project`` narrows the regenerate scope to a single project key.
-    Today's morning briefing ignores it (it's always whole-workspace);
-    we accept the field for forward compatibility so plugin-contributed
-    briefing types (e.g. per-project weekly) don't need a body-schema
-    bump later.
+    Built-in ``morning`` rejects ``project`` with ``400 invalid_request``
+    — morning briefings are always whole-workspace, and silently
+    dropping the field would let a client think their per-project
+    request worked while the server force-generated a workspace-wide
+    inbox entry instead (Codex round-9 on #2059). Plugin-contributed
+    briefing types (e.g. per-project weekly) may consume ``project``
+    for per-project scope; consult the type's own documentation.
+
+    The docstring is intentionally part of the model: pydantic exposes
+    it via ``model_json_schema()["description"]`` which then surfaces
+    on the live ``/openapi.json``. Keep this paragraph in sync with the
+    static ``docs/api/openapi.yaml`` ``RegenerateBriefingRequest``
+    description so generated clients see the same contract on both
+    surfaces (Codex round-14 on #2059).
 
     ``extra='forbid'`` (Codex round-10 on #2059): a side-effecting
     endpoint must surface client typos as 422 rather than silently

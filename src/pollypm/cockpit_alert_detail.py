@@ -11,7 +11,9 @@ Contract:
   collects.
 - Invariants: this module owns one widget class and nothing else; it
   does not depend on cockpit state, services, or the rail.
-- Allowed dependencies: Textual primitives only.
+- Allowed dependencies: Textual primitives plus
+  ``pollypm.cockpit_theme.State`` for semantic palette values; no
+  cockpit state, services, or rail dependencies.
 - Private: ``_AlertDetailModal`` is underscore-prefixed and re-exported
   via ``cockpit_ui`` for back-compat (see #1354).
 
@@ -33,6 +35,41 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import ListItem, ListView, Static
 
+from pollypm.cockpit_theme import State
+
+
+def _alert_detail_css_with_palette(raw_css: str) -> str:
+    """Substitute canonical ``cockpit_theme.State.*`` hex values into the
+    alert-detail modal CSS so a palette tweak in ``cockpit_theme``
+    propagates here without a manual edit (#1988).
+
+    Mirrors the ``_dashboard_css_with_palette`` pattern in ``cockpit_ui``:
+    using ``str.replace`` (rather than an f-string CSS) keeps the source
+    CSS readable since Textual rule blocks use ``{ ... }`` everywhere,
+    which would force escaping every brace in an f-string. The
+    substitution is byte-identical today (each replaced hex matches the
+    corresponding ``State.*`` literal), so this is a source-level rename,
+    not a redesign.
+
+    What stays literal: the modal dialog ``background`` (``#141a20``) and
+    the list-item highlight ``background`` (``#1f4d7a``). Neither has an
+    analog elsewhere in the cockpit; promoting them would require
+    inventing single-use ``State`` constants and is deferred to a
+    follow-up. See TODO comments in the raw CSS below.
+    """
+    palette = (
+        ("#ff5f6d", State.BLOCKED),
+        ("#f0c45a", State.WAITING),
+        ("#97a6b2", State.NEUTRAL),
+        ("#d6dee5", State.BODY_BRIGHT),
+        ("#eef6ff", State.HEADING_BRIGHT),
+        ("#6b7a88", State.MUTED),
+    )
+    result = raw_css
+    for old, new in palette:
+        result = result.replace(old, new)
+    return result
+
 
 class _AlertDetailModal(ModalScreen[str | None]):
     """Read + recover surface for the rail's ``♡⚠`` badge (#989).
@@ -51,7 +88,10 @@ class _AlertDetailModal(ModalScreen[str | None]):
     the user lands there.
     """
 
-    DEFAULT_CSS = """
+    # Modal CSS — routed through ``cockpit_theme.State`` via
+    # ``_alert_detail_css_with_palette`` so the alert/warn semantic colors
+    # stay in lockstep with the rest of the cockpit (#1988).
+    DEFAULT_CSS = _alert_detail_css_with_palette("""
     _AlertDetailModal {
         align: center middle;
         background: rgba(0, 0, 0, 0.45);
@@ -62,6 +102,10 @@ class _AlertDetailModal(ModalScreen[str | None]):
         height: auto;
         max-height: 22;
         padding: 1 2;
+        /* TODO(#1988): modal dialog panel background — no analog in
+           ``cockpit_theme.State`` yet (single-use surface fill). Promote
+           to ``State.SURFACE_MODAL_BG`` (or similar) in a follow-up when
+           another modal needs the same fill. */
         background: #141a20;
         border: round #ff5f6d;
     }
@@ -94,6 +138,11 @@ class _AlertDetailModal(ModalScreen[str | None]):
         padding: 0 1;
     }
     #alert-detail-actions ListItem.-highlight {
+        /* TODO(#1988): list-item selection highlight — no analog in
+           ``cockpit_theme.State`` yet (single-use highlight fill).
+           Promote to ``State.SURFACE_HIGHLIGHT_BG`` (or similar) in a
+           follow-up when another ListView needs the same selection
+           treatment. */
         background: #1f4d7a;
         color: #eef6ff;
     }
@@ -101,7 +150,7 @@ class _AlertDetailModal(ModalScreen[str | None]):
         color: #6b7a88;
         margin-top: 1;
     }
-    """
+    """)
 
     BINDINGS = [
         Binding("escape", "dismiss_modal", "Close"),

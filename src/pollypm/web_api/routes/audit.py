@@ -123,12 +123,26 @@ class AuditStatsResponse(BaseModel):
     cutoff so the client can confirm the server interpreted shortcuts
     like ``24h`` against its own clock. The HTTP surface requires
     ``since`` to keep stats bounded (see module docstring).
+
+    ``_truncated_by_deadline`` + ``_lines_scanned`` (Codex round-6
+    finding, PR #2062) mirror the grep envelope: ``since`` is a
+    semantic bound but the walker still walks every target file/line
+    until it parses ``ts`` and filters. ``deadline_seconds`` is the
+    request-level wall-clock cap; when it fires the caller can tell
+    a complete aggregation from a bounded one and re-issue with a
+    tighter project/since to make progress.
     """
 
     total: int
     by_event: dict[str, int] = Field(default_factory=dict)
     by_severity: dict[str, int] = Field(default_factory=dict)
     since: datetime | None = None
+    truncated_by_deadline: bool = Field(
+        default=False, alias="_truncated_by_deadline"
+    )
+    lines_scanned: int = Field(default=0, alias="_lines_scanned")
+
+    model_config = {"populate_by_name": True}
 
 
 def _parse_since_or_400(value: str | None) -> datetime | None:
@@ -378,6 +392,24 @@ def stats_audit_endpoint(
             ),
         ),
     ] = None,
+    deadline_seconds: Annotated[
+        float,
+        Query(
+            ge=0.5,
+            le=120.0,
+            description=(
+                "Request-level wall-clock budget (seconds). Default 10.0 "
+                "(higher than /audit/grep's 5.0 because aggregation has "
+                "no early-exit on match-count). When exceeded the walker "
+                "stops, the response sets _truncated_by_deadline=true, "
+                "and _lines_scanned reports how many non-empty lines "
+                "were examined. Required because `since` is only a "
+                "semantic bound — the walker still reads every target "
+                "file/line until it parses `ts` and filters "
+                "(Codex round-6 finding)."
+            ),
+        ),
+    ] = 10.0,
 ) -> AuditStatsResponse:
     """Return per-event and per-severity counts over the target files.
 
@@ -414,6 +446,7 @@ def stats_audit_endpoint(
         since=since_dt,
         event_type=None,
         stats=walker_stats,
+        deadline_s=deadline_seconds,
     ):
         total += 1
         event_name = str(record.get("event") or "")
@@ -426,6 +459,8 @@ def stats_audit_endpoint(
         by_event=by_event,
         by_severity=by_severity,
         since=since_dt,
+        _truncated_by_deadline=bool(walker_stats.get("truncated_by_deadline", 0)),
+        _lines_scanned=walker_stats.get("lines_scanned", 0),
     )
 
 

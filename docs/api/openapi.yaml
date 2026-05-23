@@ -2119,6 +2119,14 @@ paths:
         the CLI (`pm audit grep`) when an operator explicitly wants
         whole-history aggregation. (Codex P0 finding, PR #2062
         round 2.)
+
+        `deadline_seconds` (default 10.0) imposes a request-level
+        wall-clock cap on top of the `since` semantic bound, because
+        the walker still reads every target file/line until it parses
+        `ts` and filters. When exceeded, the response sets
+        `_truncated_by_deadline=true` and `_lines_scanned` reports
+        how far the walker got across live + rotated logs. (Codex
+        P0 finding, PR #2062 round 6.)
       parameters:
         - in: query
           name: project
@@ -2129,6 +2137,22 @@ paths:
           schema: { type: string }
           description: |
             REQUIRED. ISO-8601 or shortcut (`1h` / `24h` / `7d`).
+        - in: query
+          name: deadline_seconds
+          schema:
+            type: number
+            format: float
+            minimum: 0.5
+            maximum: 120.0
+            default: 10.0
+          description: |
+            Request-level wall-clock budget (seconds). Default 10.0.
+            Stats has a higher default than `/audit/grep` (5.0)
+            because aggregation has no early-exit on match-count.
+            When exceeded the walker stops, the response sets
+            `_truncated_by_deadline=true`, and `_lines_scanned`
+            reports how many non-empty lines were examined
+            (PR #2062 round 6).
       responses:
         "200":
           description: Aggregate counts.
@@ -4096,3 +4120,21 @@ components:
             Normalized cutoff the server applied — echoes whatever
             shortcut the client passed so it can confirm the
             interpretation.
+        _truncated_by_deadline:
+          type: boolean
+          default: false
+          description: |
+            `true` when the request-level wall-clock deadline
+            (`deadline_seconds`) fired before the walker finished
+            scanning every target file. Distinguishes a complete
+            aggregation from a bounded one so the caller can re-issue
+            with a tighter project/since. (Codex P0 finding, PR #2062
+            round 6.)
+        _lines_scanned:
+          type: integer
+          default: 0
+          description: |
+            How many non-empty lines the walker actually examined.
+            Paired with `_truncated_by_deadline` so a truncated
+            response reports how far it got across live + rotated
+            logs. (Codex P0 finding, PR #2062 round 6.)

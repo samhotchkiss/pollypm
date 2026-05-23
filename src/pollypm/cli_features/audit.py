@@ -33,7 +33,6 @@ import typer
 
 from pollypm.audit.query import (
     iter_matching_events as _iter_matching_events,
-    open_log_lines as _open_log_lines,
     parse_event_ts as _parse_event_ts,
     parse_since as _parse_since_neutral,
     resolve_target_files as _resolve_target_files,
@@ -250,4 +249,14 @@ __all__ = [
     "audit_app",
     "format_event",
     "parse_since",
+    # Re-exports from the neutral query module — kept for the CLI test
+    # surface (``tests/test_cli_audit_grep.py``) which historically
+    # imported the rotation-aware helpers via this module. Re-exporting
+    # explicitly via ``__all__`` (rather than dropping them) keeps that
+    # test surface stable AND silences F401 for the underscored aliases.
+    "_iter_matching_events",
+    "_parse_event_ts",
+    "_parse_since_neutral",
+    "_resolve_target_files",
+    "_walk_log_chain",
 ]

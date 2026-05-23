@@ -176,7 +176,13 @@ def test_ui_no_cookie_with_invalid_bearer(app, token: str) -> None:
 def test_ui_index_contains_required_anchors(client: TestClient) -> None:
     """The HTML must carry the IDs ``app.js`` queries for."""
     html = client.get("/ui/").text
-    for anchor in ("surface-list", "message-list", "send-input", "send-button"):
+    for anchor in (
+        "surface-list",
+        "message-list",
+        "send-input",
+        "stop-agent-button",
+        "send-button",
+    ):
         assert f'id="{anchor}"' in html, f"missing anchor #{anchor} in index.html"
     # The cookie-based credentials assumption is baked into app.js; the
     # HTML must reference it so cache-busting / rename doesn't silently

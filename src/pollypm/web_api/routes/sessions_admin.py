@@ -102,6 +102,7 @@ Auth follows the standard bearer-dependency wiring in
 from __future__ import annotations
 
 import logging
+import subprocess
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Query
@@ -329,6 +330,36 @@ def _daemon_unavailable(name: str, detail: str) -> APIError:
             f"({detail})."
         ),
         hint="Confirm the daemon / cockpit is running, then retry.",
+    )
+
+
+def _window_missing(name: str, window_name: str, storage_session: str) -> APIError:
+    return APIError(
+        status_code=503,
+        code="window_missing",
+        message=(
+            f"Cannot interrupt {name!r}: tmux window {window_name!r} is "
+            f"not present in storage session {storage_session!r}."
+        ),
+        hint="Refresh the session list; the agent may have exited or moved.",
+    )
+
+
+def _pane_unavailable(name: str, detail: str) -> APIError:
+    return APIError(
+        status_code=409,
+        code="pane_unavailable",
+        message=f"Cannot interrupt {name!r}: {detail}.",
+        hint="Refresh the session list; the pane may have exited.",
+    )
+
+
+def _interrupt_failed(name: str, detail: str) -> APIError:
+    return APIError(
+        status_code=503,
+        code="interrupt_failed",
+        message=f"Failed to send interrupt to {name!r}: {detail}",
+        hint="Check tmux health and retry.",
     )
 
 
@@ -730,6 +761,72 @@ def _find_session(config: Any, name: str) -> Any:
     raise _session_not_found(name)
 
 
+def _task_surface_known(config: Any, name: str) -> bool:
+    """Return True for syntactically valid task worker window names."""
+    try:
+        from pollypm.work.task_state import parse_task_window_name
+    except Exception:  # noqa: BLE001
+        return False
+    parsed = parse_task_window_name(name)
+    if parsed is None:
+        return False
+    project, _number = parsed
+    projects = getattr(config, "projects", None) or {}
+    return project in projects
+
+
+def _interrupt_window_name(config: Any, name: str) -> str:
+    """Resolve ``name`` to a storage-closet window name.
+
+    Configured sessions use their configured ``window_name``. Active
+    task-worker chat surfaces are not part of ``config.sessions``; for
+    those we accept the canonical ``task-<project>-<n>`` window name
+    only when the project is registered.
+    """
+    try:
+        session = _find_session(config, name)
+    except APIError:
+        if _task_surface_known(config, name):
+            return name
+        raise
+    return session.window_name or session.name
+
+
+def _find_interrupt_pane(
+    tmux: Any,
+    *,
+    name: str,
+    storage_session: str,
+    window_name: str,
+) -> str:
+    """Return the pane id backing ``window_name`` or raise a typed API error."""
+    try:
+        windows = tmux.list_windows(storage_session)
+    except FileNotFoundError as exc:
+        raise _interrupt_failed(name, f"tmux binary not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise _interrupt_failed(
+            name, f"tmux command timed out after {exc.timeout}s",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise _interrupt_failed(
+            name,
+            f"tmux list-windows failed with exit {exc.returncode}: {exc.stderr}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _interrupt_failed(name, str(exc)) from exc
+    for window in windows or []:
+        if getattr(window, "name", None) != window_name:
+            continue
+        if getattr(window, "pane_dead", False):
+            raise _pane_unavailable(name, "pane is dead")
+        pane_id = getattr(window, "pane_id", None)
+        if not pane_id:
+            raise _pane_unavailable(name, "pane id missing")
+        return str(pane_id)
+    raise _window_missing(name, window_name, storage_session)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -1048,6 +1145,60 @@ def restart_session_endpoint(
         _close_supervisor_quietly(supervisor)
 
     return ActionResult(ok=True, message=f"restarted {name}")
+
+
+@router.post(
+    "/sessions/{name}/interrupt",
+    response_model=ActionResult,
+    summary="Send Escape to a live session/worker tmux pane",
+    operation_id="interruptSession",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Configured session or task worker not found."},
+        "409": {"description": "Pane is dead or missing a pane id."},
+        "503": {"description": "tmux unavailable or target window missing."},
+    },
+)
+def interrupt_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
+    """POST /api/v1/sessions/{name}/interrupt — send Escape to the pane.
+
+    This is intentionally non-destructive: it sends the key the
+    embedded agents advertise as their interruption path
+    (``esc to interrupt``) instead of ``Ctrl-C``. Configured sessions
+    resolve through ``config.sessions`` and their ``window_name``;
+    per-task worker surfaces resolve only via the canonical
+    ``task-<project>-<n>`` window name for registered projects.
+    """
+    window_name = _interrupt_window_name(config, name)
+    storage_session = _storage_session_name(config)
+    try:
+        from pollypm.tmux.client import TmuxClient
+
+        tmux = TmuxClient()
+    except Exception as exc:  # noqa: BLE001
+        raise _interrupt_failed(name, f"tmux client unavailable: {exc}") from exc
+    pane_id = _find_interrupt_pane(
+        tmux,
+        name=name,
+        storage_session=storage_session,
+        window_name=window_name,
+    )
+    try:
+        tmux.run("send-keys", "-t", pane_id, "Escape")
+    except FileNotFoundError as exc:
+        raise _interrupt_failed(name, f"tmux binary not found: {exc}") from exc
+    except subprocess.TimeoutExpired as exc:
+        raise _interrupt_failed(
+            name, f"tmux command timed out after {exc.timeout}s",
+        ) from exc
+    except subprocess.CalledProcessError as exc:
+        raise _interrupt_failed(
+            name,
+            f"tmux send-keys failed with exit {exc.returncode}: {exc.stderr}",
+        ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise _interrupt_failed(name, str(exc)) from exc
+    return ActionResult(ok=True, message=f"sent Escape to {name}")
 
 
 @router.post(

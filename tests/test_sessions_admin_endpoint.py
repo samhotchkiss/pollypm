@@ -277,6 +277,29 @@ class _FakeSupervisor:
             raise self.restart_raises
 
 
+class _FakeInterruptTmux:
+    def __init__(
+        self,
+        windows: list[Any],
+        *,
+        run_raises: Exception | None = None,
+    ) -> None:
+        self.windows = windows
+        self.run_raises = run_raises
+        self.list_calls: list[str] = []
+        self.run_calls: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    def list_windows(self, name: str) -> list[Any]:
+        self.list_calls.append(name)
+        return list(self.windows)
+
+    def run(self, *args: str, **kwargs: Any) -> Any:
+        self.run_calls.append((args, kwargs))
+        if self.run_raises is not None:
+            raise self.run_raises
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
 @pytest.fixture
 def patch_heartbeat(monkeypatch: pytest.MonkeyPatch):
     """Install a stub for ``_latest_heartbeat`` on the route module."""
@@ -372,6 +395,17 @@ def patch_supervisor(monkeypatch: pytest.MonkeyPatch):
             lambda _config: supervisor,
         )
         return supervisor
+    return install
+
+
+@pytest.fixture
+def patch_interrupt_tmux(monkeypatch: pytest.MonkeyPatch):
+    def install(tmux: _FakeInterruptTmux) -> _FakeInterruptTmux:
+        from pollypm.tmux import client as tmux_client_module
+
+        monkeypatch.setattr(tmux_client_module, "TmuxClient", lambda: tmux)
+        return tmux
+
     return install
 
 
@@ -1371,6 +1405,69 @@ def test_restart_strict_supervisor_closed_after_use(
         "legacy sqlite state.db connection (Codex PR #2061 round 6 "
         "lifecycle note)."
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /sessions/{name}/interrupt
+# ---------------------------------------------------------------------------
+
+
+def test_interrupt_sends_escape_to_configured_session(
+    client, auth_headers, patch_interrupt_tmux,
+):
+    tmux = patch_interrupt_tmux(_FakeInterruptTmux([
+        _fake_window("operator"),
+    ]))
+    response = client.post(
+        "/api/v1/sessions/operator/interrupt", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["message"] == "sent Escape to operator"
+    assert tmux.list_calls == ["pollypm-test-storage-closet"]
+    assert tmux.run_calls == [
+        (("send-keys", "-t", "%9", "Escape"), {}),
+    ]
+
+
+def test_interrupt_allows_registered_task_worker_window(
+    client, auth_headers, patch_interrupt_tmux,
+):
+    tmux = patch_interrupt_tmux(_FakeInterruptTmux([
+        _fake_window("task-myproj-7"),
+    ]))
+    response = client.post(
+        "/api/v1/sessions/task-myproj-7/interrupt", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["message"] == "sent Escape to task-myproj-7"
+    assert tmux.run_calls == [
+        (("send-keys", "-t", "%9", "Escape"), {}),
+    ]
+
+
+def test_interrupt_returns_503_when_window_missing(
+    client, auth_headers, patch_interrupt_tmux,
+):
+    patch_interrupt_tmux(_FakeInterruptTmux([]))
+    response = client.post(
+        "/api/v1/sessions/operator/interrupt", headers=auth_headers,
+    )
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "window_missing"
+
+
+def test_interrupt_unknown_non_task_session_404(
+    client, auth_headers, patch_interrupt_tmux,
+):
+    patch_interrupt_tmux(_FakeInterruptTmux([
+        _fake_window("not-a-config-session"),
+    ]))
+    response = client.post(
+        "/api/v1/sessions/not-a-config-session/interrupt",
+        headers=auth_headers,
+    )
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "not_found"
 
 
 # ---------------------------------------------------------------------------

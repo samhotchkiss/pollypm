@@ -219,8 +219,18 @@ Pull a window of messages from a single session's transcript.
 | `limit` | `100` | Max messages, must be `1..500`. Values outside that range return `422 validation_error` (FastAPI Pydantic-level rejection). |
 | `direction` | `desc` | `desc` (newest first) or `asc`. Pagination cursors assume the same direction. |
 | `include_subagents` | `false` | DEFERRED — server returns 422 if true. Re-enabled when #2052 lands ingestor-side subagent normalization. |
-| `include_thinking` | `false` | When `true`, Anthropic extended-thinking content blocks are surfaced as `type="thinking"` envelopes (see §4 type catalog). Default `false` preserves the historical contract — existing clients see no new types. Tracked in [#2048](https://github.com/samhotchkiss/pollypm/issues/2048). |
 | `source` | `auto` | `auto` (JSONL with capture fallback when archive is missing or >60s stale), `jsonl` (force JSONL; 404 if absent), `capture` (force live `tmux capture-pane`). Any other value returns `422 validation_error`. |
+
+> Note: `type="thinking"` envelopes are supported at the **parser** level
+> (`parse_events_jsonl(include_thinking=True)`, see #2048) but the HTTP
+> endpoint does **not** yet expose the `include_thinking` query
+> parameter — the route always calls the parser with the default
+> (`include_thinking=False`) and additionally drops any `thinking`
+> envelopes defensively. Wiring the query param through the route +
+> OpenAPI schema is tracked in
+> [#2082](https://github.com/samhotchkiss/pollypm/issues/2082). Until
+> that lands, clients of `GET /messages` will never see `type="thinking"`
+> envelopes regardless of query string.
 
 **Response:**
 
@@ -408,7 +418,7 @@ structured original lives in `metadata`.
 | Type | Role | When | Notes |
 |---|---|---|---|
 | `text` | user / assistant | Plain turn text | The 80% case. `metadata: {}`. |
-| `thinking` | assistant | Anthropic extended-thinking content block | Only emitted when `include_thinking=true` is passed on the messages query. `metadata`: `provider`, `model`, `signature` (opaque, may be empty). `text` carries the thinking content. See [#2048](https://github.com/samhotchkiss/pollypm/issues/2048). |
+| `thinking` | assistant | Anthropic extended-thinking content block | Supported at the parser level (`parse_events_jsonl(include_thinking=True)`, #2048). The HTTP `GET /messages` endpoint does **not** yet emit this type — defensively filtered until #2082 wires the query param through the route + OpenAPI. `metadata`: `provider`, `model`, `signature` (opaque, may be empty). `text` carries the thinking content. |
 | `tool_use` | assistant | Tool call | `metadata`: `tool_use_id`, `tool_name`, `tool_input`. |
 | `tool_result` | tool | Tool return | `metadata`: `tool_use_id`, `is_error`, `content[]`. |
 | `ask_user` | assistant | `AskUserQuestion` tool | `metadata`: `questions[]`, `answered`, `answers`. See §5.5. |
@@ -419,7 +429,7 @@ structured original lives in `metadata`.
 
 ### Example payloads
 
-`thinking` (only when `include_thinking=true`):
+`thinking` (parser-level only — HTTP endpoint does not emit this type yet, see #2082):
 
 ```json
 {

@@ -269,6 +269,70 @@ class TestAwaitsUserParity:
         assert called["n"] == 1
         assert len(result) == len(direct)
 
+    def test_slow_uncached_fetch_does_not_write_born_expired_entry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """#1968 regression — when the uncached awaits-user fetch takes
+        longer than ``_AWAITS_USER_TTL_SECONDS``, the cache MUST stamp
+        the completion time (post-fetch) so the entry stays fresh for
+        a full TTL window. Stamping the pre-fetch time would make the
+        entry born-expired and force every subsequent caller within the
+        TTL window to re-run the multi-second sweep.
+
+        Asserts that back-to-back calls share a single uncached invocation
+        even when the first call exceeds the TTL — matching the #1957
+        contract already pinned for ``all_tasks_grouped`` /
+        ``_gather_worker_roster`` / ``_prefetch_project_state``.
+        """
+        # Force the cache fast-path off so we exercise the legacy TTL
+        # cache wrapper (the path that #1968 regresses).
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "0")
+        config = _make_config(["alpha"], tmp_path)
+        direct = self._direct_items()
+
+        call_count = {"n": 0}
+        ttl = cockpit_inbox._AWAITS_USER_TTL_SECONDS
+        # Drive the post-fetch monotonic stamp forward by more than the
+        # TTL during the first call. Using a fake clock keeps the test
+        # fast + deterministic (no real sleep). The first call advances
+        # the clock by ``ttl + 0.2`` between the pre-fetch read inside
+        # the wrapper and the post-fetch read; the second call should
+        # then hit the cache because the post-fetch stamp was used.
+        clock = {"t": 1000.0}
+
+        def _slow_uncached(_cfg: Any) -> list[Any]:
+            call_count["n"] += 1
+            # Simulate a fetch that takes longer than the TTL.
+            clock["t"] += ttl + 0.2
+            return list(direct)
+
+        def _fake_monotonic() -> float:
+            return clock["t"]
+
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _slow_uncached,
+        )
+        # Patch the ``time`` module imported lazily inside the wrapper.
+        import time as _time
+
+        monkeypatch.setattr(_time, "monotonic", _fake_monotonic)
+
+        first = cockpit_inbox.pm_inbox_awaits_user_list(config)
+        # Second call is immediately back-to-back; clock has not
+        # advanced further (no sleep between calls). With the #1968 fix
+        # the cache stamp is the post-fetch time, so the entry's age is
+        # ~0s and the second call MUST be served from cache.
+        second = cockpit_inbox.pm_inbox_awaits_user_list(config)
+
+        assert call_count["n"] == 1, (
+            "uncached fetch was invoked twice — cache entry was born-expired "
+            "(stale pre-fetch stamp). #1968 regression."
+        )
+        assert len(first) == len(direct)
+        assert len(second) == len(direct)
+
 
 # ── project_state_map_from_config parity ───────────────────────────
 

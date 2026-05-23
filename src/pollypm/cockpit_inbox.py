@@ -212,6 +212,10 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
         return list(cached[1])
 
     result = _pm_inbox_awaits_user_list_uncached(config)
+    # #1957 #1968 perf — stamp the cache AFTER the uncached sweep returns
+    # so a cold awaits-user fetch that exceeds the TTL doesn't write a
+    # born-expired entry that forces the next caller to recompute.
+    completed_at = _time.monotonic()
     # Best-effort eviction so the cache doesn't grow across long-lived
     # processes with config reloads (each reload yields a fresh
     # ``id(config)``). Cheap because the dict is typically tiny — one
@@ -219,10 +223,10 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     if len(_AWAITS_USER_CACHE) > 8:
         for stale_key in [
             k for k, (ts, _v) in _AWAITS_USER_CACHE.items()
-            if now - ts >= _AWAITS_USER_TTL_SECONDS
+            if completed_at - ts >= _AWAITS_USER_TTL_SECONDS
         ]:
             _AWAITS_USER_CACHE.pop(stale_key, None)
-    _AWAITS_USER_CACHE[cache_key] = (now, tuple(result))
+    _AWAITS_USER_CACHE[cache_key] = (completed_at, tuple(result))
     return result
 
 

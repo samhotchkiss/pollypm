@@ -41,6 +41,7 @@ from pollypm.onboarding import (
     _display_label,
     _detected_host_account,
     _recover_existing_accounts,
+    _store_connected_account,
     build_onboarded_config,
     demo_project_fallback_destination,
     discover_recent_project_candidates,
@@ -1023,10 +1024,11 @@ class OnboardingApp(App[OnboardingResult | None]):
             self._set_message(f"Login did not complete cleanly: {exc}")
             return
         self.refresh(repaint=True, layout=True)
-        if account.account_name in self.state.accounts:
-            self._set_message(f"{account.email} is already connected.")
-            return
-        self.state.accounts[account.account_name] = account
+        account = _store_connected_account(
+            root_dir=self.root_dir,
+            accounts=self.state.accounts,
+            account=account,
+        )
         if self.state.controller_account is None:
             self.state.controller_account = account.account_name
         self.state.failover_enabled = len(self.state.accounts) > 1

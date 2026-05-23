@@ -404,13 +404,11 @@ def test_connect_accounts_interactively_suffixes_duplicate_claude_key_and_preser
     )
 
 
-def test_connect_accounts_interactively_rejects_duplicate_codex_same_email(
+def test_connect_accounts_interactively_suffixes_duplicate_codex_key_and_promotes_distinct_home(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    """Non-Claude (Codex): duplicate same-email must raise BadParameter, not silently share a home."""
-    import typer
-
+    """Non-Claude: duplicate same-email gets a suffixed key and matching home."""
     root_dir = tmp_path / ".pollypm"
     first_home = root_dir / "homes" / "codex_user_example_com"
     first_home.mkdir(parents=True, exist_ok=True)
@@ -423,13 +421,16 @@ def test_connect_accounts_interactively_rejects_duplicate_codex_same_email(
     )
     accounts: dict[str, ConnectedAccount] = {"codex_user_example_com": first_account}
 
-    # The second login lands on the same email; by this point Codex has promoted the home to
-    # homes/codex_user_example_com — same path as the first account.
+    temp_home = root_dir / "homes" / "onboarding_codex_2"
+    temp_home.mkdir(parents=True, exist_ok=True)
+
+    # The second login lands on the same email. The caller should choose
+    # the final suffixed key before promoting this temporary home.
     duplicate_account = ConnectedAccount(
         provider=ProviderKind.CODEX,
         email="user@example.com",
         account_name="codex_user_example_com",
-        home=first_home,  # same home — the invariant that must be rejected
+        home=temp_home,
     )
 
     call_count = {"n": 0}
@@ -452,17 +453,20 @@ def test_connect_accounts_interactively_rejects_duplicate_codex_same_email(
     from pollypm.onboarding_models import CliAvailability
     available = [CliAvailability(provider=ProviderKind.CODEX, label="Codex", binary="codex", installed=True)]
 
-    with pytest.raises(typer.BadParameter) as exc_info:
-        _connect_accounts_interactively(
-            None,  # type: ignore[arg-type]  # tmux unused — mocked
-            root_dir=root_dir,
-            accounts=accounts,
-            available=available,
-        )
-
-    assert "already connected" in str(exc_info.value).lower() or "not yet supported" in str(exc_info.value).lower(), (
-        f"Expected a clear rejection message, got: {exc_info.value}"
+    result = _connect_accounts_interactively(
+        None,  # type: ignore[arg-type]  # tmux unused — mocked
+        root_dir=root_dir,
+        accounts=accounts,
+        available=available,
     )
+
+    assert "codex_user_example_com_2" in result
+    new_account = result["codex_user_example_com_2"]
+    assert new_account.account_name == "codex_user_example_com_2"
+    assert new_account.home == root_dir / "homes" / "codex_user_example_com_2"
+    assert new_account.home != first_home
+    assert new_account.home.exists()
+    assert not temp_home.exists()
 
 
 def test_launch_onboarding_experience_prepares_cockpit_before_attach(

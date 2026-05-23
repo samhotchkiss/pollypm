@@ -249,6 +249,62 @@ def _next_account_index(accounts: dict[str, ConnectedAccount], provider: Provide
     return len([account for account in accounts.values() if account.provider is provider]) + 1
 
 
+def _unique_account_name(base_name: str, accounts: dict[str, ConnectedAccount]) -> str:
+    account_name = base_name
+    n = 2
+    while account_name in accounts:
+        account_name = f"{base_name}_{n}"
+        n += 1
+    return account_name
+
+
+def _finalize_connected_account_home(
+    *,
+    root_dir: Path,
+    account: ConnectedAccount,
+    account_name: str,
+) -> ConnectedAccount:
+    if account.provider is ProviderKind.CLAUDE:
+        final_home = account.home
+    else:
+        final_home = (
+            _promote_onboarding_home(
+                account.home,
+                _final_account_home(root_dir, account_name),
+            )
+            if account.home is not None
+            else None
+        )
+    return ConnectedAccount(
+        provider=account.provider,
+        email=account.email,
+        account_name=account_name,
+        home=final_home,
+    )
+
+
+def _store_connected_account(
+    *,
+    root_dir: Path,
+    accounts: dict[str, ConnectedAccount],
+    account: ConnectedAccount,
+) -> ConnectedAccount:
+    account_name = _unique_account_name(account.account_name, accounts)
+    if account_name != account.account_name:
+        logger.info(
+            "onboarding: account %s already exists; adding as %s",
+            account.account_name,
+            account_name,
+        )
+    final_account = _finalize_connected_account_home(
+        root_dir=root_dir,
+        account=account,
+        account_name=account_name,
+    )
+    accounts[account_name] = final_account
+    return final_account
+
+
 def _connect_accounts_interactively(
     tmux: TmuxClient,
     *,
@@ -267,40 +323,11 @@ def _connect_accounts_interactively(
             provider=provider,
             index=_next_account_index(accounts, provider),
         )
-        base_account_name = account.account_name
-        final_account_name = base_account_name
-        if base_account_name in accounts:
-            if provider is ProviderKind.CLAUDE:
-                # Claude auth is keyed to the home directory path in the macOS Keychain;
-                # the home stays in place (temp dir not promoted), so it is safe to give
-                # the second account a suffixed key while reusing the existing home path.
-                an = 2
-                while final_account_name in accounts:
-                    final_account_name = f"{base_account_name}_{an}"
-                    an += 1
-                logger.info(
-                    "onboarding: Claude account %s already exists; adding as %s",
-                    base_account_name,
-                    final_account_name,
-                )
-                account = ConnectedAccount(
-                    provider=account.provider,
-                    email=account.email,
-                    account_name=final_account_name,
-                    home=account.home,
-                )
-            else:
-                # For non-Claude providers the home has already been promoted to a path
-                # derived from the account name.  Suffix-bumping the key AFTER promotion
-                # would leave the new account pointing at the original home, violating
-                # account isolation.  Reject the duplicate until a full fix is shipped.
-                raise typer.BadParameter(
-                    f"Account {base_account_name!r} is already connected. "
-                    "Adding a second account with the same email address is not yet "
-                    "supported for non-Claude providers. Use a different email to add "
-                    "another account, or remove the existing one first."
-                )
-        accounts[final_account_name] = account
+        account = _store_connected_account(
+            root_dir=root_dir,
+            accounts=accounts,
+            account=account,
+        )
         typer.echo("")
         _render_connected_account(account, len(accounts))
         typer.echo("")
@@ -1151,10 +1178,7 @@ def _connect_account_via_tmux(
         final_home = home
         _prime_claude_home(final_home)
     else:
-        final_home = _promote_onboarding_home(
-            home,
-            _final_account_home(root_dir, _slugify_email(provider, email)),
-        )
+        final_home = home
 
     return ConnectedAccount(
         provider=provider,

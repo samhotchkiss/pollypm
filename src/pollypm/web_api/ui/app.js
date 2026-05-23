@@ -18,6 +18,8 @@
   const POLL_DASHBOARD_MS = 15000;
   const POLL_MESSAGES_MS = 5000;
   const MAX_MESSAGES = 50;
+  const SESSION_ISSUED_COOKIE = "pollypm-session-issued-at";
+  const SESSION_EXPIRY_WARNING_MS = 6 * 24 * 60 * 60 * 1000;
   const TASK_RAIL_LIMIT = 200;
   const AUDIT_LIMIT = 25;
 
@@ -29,6 +31,7 @@
     selectedSurface: null,
     selectedTaskKey: null,
     messageTimer: null,
+    sessionExpiryDismissed: false,
     auditExpanded: {},
     auditEntries: {},
     auditErrors: {},
@@ -86,6 +89,51 @@
       "`pm api regen-token` and send the value in an " +
       "`Authorization: Bearer …` header.";
     const layout = document.getElementById("layout") || document.body;
+    layout.parentNode.insertBefore(banner, layout);
+  }
+
+  function cookieValue(name) {
+    const prefix = name + "=";
+    const parts = document.cookie ? document.cookie.split(";") : [];
+    for (const rawPart of parts) {
+      const part = rawPart.trim();
+      if (part.indexOf(prefix) === 0) {
+        return decodeURIComponent(part.slice(prefix.length));
+      }
+    }
+    return "";
+  }
+
+  function maybeShowSessionExpiryBanner() {
+    if (state.sessionExpiryDismissed || $("session-expiry-banner")) return;
+    const issuedRaw = cookieValue(SESSION_ISSUED_COOKIE);
+    const issuedSeconds = Number.parseInt(issuedRaw, 10);
+    if (!Number.isFinite(issuedSeconds)) return;
+    const ageMs = Date.now() - issuedSeconds * 1000;
+    if (ageMs < SESSION_EXPIRY_WARNING_MS) return;
+
+    const banner = el("div", {
+      id: "session-expiry-banner",
+      class: "session-expiry-banner",
+    }, [
+      el("span", {
+        text: "Session expires soon; refresh page to renew.",
+      }),
+      el("button", {
+        type: "button",
+        class: "session-expiry-dismiss",
+        text: "Dismiss",
+        "aria-label": "Dismiss session expiry warning",
+      }),
+    ]);
+    const dismiss = banner.querySelector("button");
+    if (dismiss) {
+      dismiss.addEventListener("click", () => {
+        state.sessionExpiryDismissed = true;
+        banner.remove();
+      });
+    }
+    const layout = $("layout") || document.body;
     layout.parentNode.insertBefore(banner, layout);
   }
 
@@ -870,6 +918,7 @@
   }
 
   function init() {
+    maybeShowSessionExpiryBanner();
     wireSurfaceFilter();
     wireSendForm();
     wireStopAgentButton();

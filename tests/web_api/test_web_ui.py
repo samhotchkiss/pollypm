@@ -37,7 +37,11 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pollypm.cli_features.web_api import detect_tailscale_ip
-from pollypm.web_api.auth import SESSION_COOKIE_NAME, is_tailscale_ip
+from pollypm.web_api.auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_ISSUED_COOKIE_NAME,
+    is_tailscale_ip,
+)
 
 
 def _ui_get_with_peer(app, peer_ip: str, *, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -87,6 +91,10 @@ def test_ui_root_returns_html_and_sets_session_cookie(client: TestClient, token:
     assert response.headers["content-type"].startswith("text/html")
     cookie = response.cookies.get(SESSION_COOKIE_NAME)
     assert cookie == token, "session cookie should mirror on-disk token"
+    issued = response.cookies.get(SESSION_ISSUED_COOKIE_NAME)
+    assert issued is not None and issued.isdigit(), (
+        "session issue-time cookie should be readable by JS for expiry warnings"
+    )
 
 
 # -------- P0 #1: cookie issuance gating ---------------------------------
@@ -201,6 +209,15 @@ def test_ui_static_css_served(client: TestClient) -> None:
     body = response.text
     # Sanity-check that the palette wired through (not an empty file).
     assert "--info" in body or "#5b8aff" in body
+
+
+def test_ui_app_js_warns_when_session_cookie_is_near_expiry(client: TestClient) -> None:
+    """The SPA has a day-6 warning path based on the readable issue cookie."""
+    body = client.get("/ui/app.js").text
+    assert "pollypm-session-issued-at" in body
+    assert "SESSION_EXPIRY_WARNING_MS = 6 * 24 * 60 * 60 * 1000" in body
+    assert "Session expires soon; refresh page to renew." in body
+    assert "sessionExpiryDismissed" in body
 
 
 def test_health_reports_bearer_only_auth_mode(client: TestClient) -> None:

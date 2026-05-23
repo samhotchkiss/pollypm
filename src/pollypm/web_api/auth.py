@@ -57,6 +57,7 @@ _TAILSCALE_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 
 # Cookie name used by ``GET /ui/`` to seed the browser session.
 SESSION_COOKIE_NAME = "pollypm-session"
+SESSION_ISSUED_COOKIE_NAME = "pollypm-session-issued-at"
 
 
 def is_tailscale_ip(host: str | None) -> bool:

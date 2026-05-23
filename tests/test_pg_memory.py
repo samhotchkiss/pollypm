@@ -42,6 +42,39 @@ def test_pg_memory_record_get_roundtrip(pg_schema_pool):
     assert fetched.importance == 4
 
 
+def test_pg_memory_record_repairs_skewed_id_sequence(pg_schema_pool):
+    """A dumped explicit id should not wedge future memory writes."""
+    _apply_initial_migrations(pg_schema_pool)
+    from pollypm.storage.pg_memory import record_memory_entry
+
+    with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO memory_entries (
+                id, scope, kind, title, body, tags, source, file_path,
+                summary_path, created_at, updated_at
+            )
+            VALUES
+                (1, 'alpha', 'note', 'dumped-1', '', '[]', 'restore', '', '', now(), now()),
+                (2, 'alpha', 'note', 'dumped-2', '', '[]', 'restore', '', '', now(), now())
+            """
+        )
+
+    record = record_memory_entry(
+        scope="alpha",
+        kind="note",
+        title="after skew",
+        body="",
+        tags=[],
+        source="manual",
+        file_path="",
+        summary_path="",
+        pool=pg_schema_pool,
+    )
+
+    assert record.entry_id == 3
+
+
 def test_pg_memory_list_filters(pg_schema_pool):
     """list_memory_entries filters by scope/kind/type/scope_tier."""
     _apply_initial_migrations(pg_schema_pool)

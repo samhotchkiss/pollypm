@@ -3,11 +3,36 @@
 End-to-end tests for the v0 web UI shipped in PR #2065
 (`src/pollypm/web_api/ui/`). Covers:
 
-- cookie auth (`pollypm-session` set by `GET /ui/`)
+- cookie auth (`pollypm-session` minted by `GET /ui/` for trusted
+  callers only — loopback, verified tailnet peers, or a valid bearer
+  header — verified positively AND with negative cookie-isolation case)
 - surface rail rendering + selection
 - send-message flow against `POST /api/v1/chat/{session}/send`
 - edge cases (409 unsafe_mid_tool, 503 service_unavailable, empty list)
 - keyboard handling (Enter to send, plus TODO probes for the V1 UI)
+- mobile viewport smoke checks (360x800) — phone-over-Tailscale is an
+  advertised access mode for the v0 UI
+
+## Auth model under test
+
+Per `src/pollypm/web_api/auth.py` (merged in #2065), the API accepts
+three credential modes:
+
+1. `Authorization: Bearer <token>` header — any client.
+2. `pollypm-session` cookie — minted by `GET /ui/` for browsers.
+3. Tailscale CGNAT peer (`100.64.0.0/10`) — only when the daemon was
+   built with `tailnet_trust_enabled=True` (i.e. `pm serve` bound to a
+   verified Tailscale interface).
+
+`GET /ui/` is itself gated: the `Set-Cookie` header is only emitted
+for loopback callers, verified tailnet peers, or callers that present
+a valid bearer token. Untrusted callers still receive the HTML but no
+cookie — the SPA then surfaces a 401 on its first `/api/` call.
+
+`tests/auth.spec.ts` exercises the loopback-bootstrap path positively
+(Set-Cookie present, cookie HttpOnly, SameSite=Lax) and the negative
+cookie-isolation invariant (a fresh `APIRequestContext` with no cookie
+gets a hard 401, never 200/403).
 
 ## Prereqs
 
@@ -64,14 +89,28 @@ POLLYPM_BASE_URL=http://100.x.y.z:8765 npx playwright test
 This means the suite is safe to run while you're using PollyPM yourself:
 the only requests that touch live state are read-only `GET` calls.
 
+## Projects
+
+- `chromium` — Desktop Chrome, default development viewport.
+- `mobile-chrome` — Pixel 5 user-agent forced to a 360x800 viewport
+  (typical narrow Android portrait). Run with
+  `npx playwright test --project=mobile-chrome` to target it
+  specifically; the default `npx playwright test` runs both.
+
 ## Known limitations / TODOs
 
 - `Shift+Enter` newline and `j/k` surface navigation are marked
   `test.fixme` — V0 input is `<input type=text>` and the rail has no
   keyboard nav. Specs stay in place so the V1 UI work picks them up.
-- No mobile viewport project yet; V0 layout is desktop-only.
 - No Firefox/WebKit projects yet; per the V0 PR scope we ship Chromium
   only.
+- Non-loopback negative auth case (e.g. a LAN device hitting `/ui/`
+  and getting NO Set-Cookie) is verified at the FastAPI layer in
+  `tests/web_api/test_web_ui.py` (search for `_no_cookie_from_lan`,
+  `_no_cookie_minted_from_cgnat_when_trust_disabled`,
+  `_no_cookie_with_invalid_bearer`); reproducing it from Playwright
+  would require spoofing TCP source IP, which isn't worth the harness
+  complexity for the same invariant.
 
 ## Debugging tips
 

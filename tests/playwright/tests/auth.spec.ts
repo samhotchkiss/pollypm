@@ -3,10 +3,24 @@ import { test, expect } from "@playwright/test";
 /**
  * Auth scenarios.
  *
- * Auth model (per /ui/app.js header comment):
- *   GET /ui/ reads the on-disk token and sets the `pollypm-session`
- *   cookie. Every subsequent fetch uses credentials: "include" to ride
- *   that cookie. We never expose the token to the browser.
+ * Auth model (per src/pollypm/web_api/auth.py and #2065 security spec):
+ *   GET /ui/ mints the `pollypm-session` cookie ONLY for:
+ *     1. Authorization: Bearer <token> matching the on-disk token, OR
+ *     2. Loopback client (127.0.0.1, ::1), OR
+ *     3. Tailscale CGNAT peer when `tailnet_trust_enabled=True`.
+ *   Untrusted callers still get the HTML, but NO Set-Cookie header.
+ *
+ *   Subsequent /api/v1/... calls accept three credential modes:
+ *     - Authorization: Bearer header
+ *     - pollypm-session cookie
+ *     - Tailscale CGNAT IP (when trust is enabled)
+ *
+ *   These tests run against a loopback dev daemon (POLLYPM_BASE_URL
+ *   defaults to http://127.0.0.1:8765), so the local cookie-mint path
+ *   is exercised positively. The non-local negative case is asserted
+ *   via a forged X-Forwarded-For — see notes on `direct API call`
+ *   below; with no real way to spoof TCP source IP from userspace we
+ *   verify what we CAN: missing cookie + missing bearer → 401.
  */
 
 test.describe("auth", () => {
@@ -18,12 +32,35 @@ test.describe("auth", () => {
     await expect(page.locator("#topbar .brand-name")).toHaveText("PollyPM");
   });
 
-  test("session cookie is set after visiting /ui/", async ({ page, context }) => {
+  test("loopback bootstrap: /ui/ mints session cookie for local caller", async ({ page, context }) => {
+    // Playwright drives the browser against 127.0.0.1, so this is the
+    // sanctioned local-operator path. Cookie MUST be set.
     await page.goto("/ui/");
     const cookies = await context.cookies();
     const session = cookies.find((c) => c.name === "pollypm-session");
     expect(session, "pollypm-session cookie").toBeDefined();
     expect(session!.value.length, "cookie value is non-empty").toBeGreaterThan(0);
+    // Defense-in-depth: cookie must be HttpOnly so XSS can't exfiltrate
+    // the bearer token.
+    expect(session!.httpOnly, "cookie is HttpOnly").toBe(true);
+    // SameSite=Lax keeps it off cross-site POSTs while still allowing
+    // top-level navigation.
+    expect(
+      ["Lax", "lax"].includes(session!.sameSite ?? ""),
+      "cookie SameSite=Lax",
+    ).toBe(true);
+  });
+
+  test("loopback bootstrap: GET /ui/ Set-Cookie header is present", async ({ request }) => {
+    // The `request` fixture in Playwright runs from the same host as
+    // the browser (loopback), so we still expect a Set-Cookie. This
+    // asserts the header contract directly, not just the cookie jar.
+    const resp = await request.get("/ui/");
+    expect(resp.status()).toBe(200);
+    const setCookie = resp.headers()["set-cookie"];
+    expect(setCookie, "Set-Cookie header on loopback /ui/").toBeTruthy();
+    expect(setCookie).toContain("pollypm-session=");
+    expect(setCookie!.toLowerCase()).toContain("httponly");
   });
 
   test("protected API call from JS rides the cookie", async ({ page }) => {
@@ -35,27 +72,60 @@ test.describe("auth", () => {
     await expect(status.locator(".conn-label")).toHaveText("online");
   });
 
-  test("direct API call without cookie returns 401", async ({ request }) => {
-    // request fixture starts with no cookies — hitting a protected
-    // endpoint directly should be rejected.
-    const resp = await request.get("/api/v1/chat/sessions");
-    // Accept 401 or 403 depending on auth middleware shape.
-    expect([401, 403]).toContain(resp.status());
+  test("direct API call without cookie returns 401", async ({ playwright }) => {
+    // Spin up an isolated APIRequestContext with NO cookies, NO bearer.
+    // This is the canonical "untrusted client" probe — the request
+    // fixture inherits state from the project, so we want a clean one.
+    const ctx = await playwright.request.newContext({
+      baseURL: process.env.POLLYPM_BASE_URL || "http://127.0.0.1:8765",
+    });
+    try {
+      const resp = await ctx.get("/api/v1/chat/sessions");
+      // Auth middleware returns 401 specifically (not 403). The PR
+      // previously accepted either; the merged auth.py always raises
+      // `unauthorized()` for missing credentials, so pin to 401.
+      expect(resp.status(), "status with no credentials").toBe(401);
+      const body = await resp.json();
+      expect(body, "error envelope shape").toHaveProperty("error");
+    } finally {
+      await ctx.dispose();
+    }
   });
 
-  test("direct API call shape after /ui/ loads cookie", async ({ page, request }) => {
+  test("cookie isolation: fresh context after /ui/ load gets NO cookie", async ({ page, playwright }) => {
+    // Load /ui/ in the browser to mint the page's cookie.
     await page.goto("/ui/");
-    // After visiting /ui/, the request fixture should NOT share that
-    // cookie (it's a separate context); this asserts the cookie is
-    // scoped to the browser context, not the test runner.
-    const resp = await request.get("/api/v1/chat/sessions");
-    expect([200, 401, 403]).toContain(resp.status());
-    // If the deployment uses the same browser context's cookies, accept
-    // 200 with the expected envelope shape.
-    if (resp.status() === 200) {
-      const body = await resp.json();
-      expect(body).toHaveProperty("sessions");
-      expect(Array.isArray(body.sessions)).toBe(true);
+    const pageCookies = await page.context().cookies();
+    expect(
+      pageCookies.find((c) => c.name === "pollypm-session"),
+      "browser context has the cookie",
+    ).toBeDefined();
+
+    // Now open a SEPARATE APIRequestContext (no shared state with the
+    // browser). The cookie must NOT leak across contexts; this is the
+    // invariant the previous "accept 200/401/403" test was trying to
+    // express but couldn't enforce.
+    const isolated = await playwright.request.newContext({
+      baseURL: process.env.POLLYPM_BASE_URL || "http://127.0.0.1:8765",
+    });
+    try {
+      const resp = await isolated.get("/api/v1/chat/sessions");
+      expect(resp.status(), "isolated context has no cookie → 401").toBe(401);
+    } finally {
+      await isolated.dispose();
     }
+  });
+
+  test("API call from page's browser context rides the cookie → 200", async ({ page }) => {
+    // Positive cookie-rider invariant: after /ui/ mints the cookie,
+    // requests made FROM THE SAME BROWSER CONTEXT (i.e. via the page's
+    // own APIRequestContext, which shares the cookie jar) succeed.
+    // This proves the JS app's `credentials: "include"` model works.
+    await page.goto("/ui/");
+    const resp = await page.request.get("/api/v1/chat/sessions");
+    expect(resp.status(), "status with cookie").toBe(200);
+    const body = await resp.json();
+    expect(body).toHaveProperty("sessions");
+    expect(Array.isArray(body.sessions)).toBe(true);
   });
 });

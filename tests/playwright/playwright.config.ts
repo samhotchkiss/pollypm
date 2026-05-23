@@ -37,6 +37,20 @@ export default defineConfig({
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
     },
+    {
+      // Mobile coverage — #2065 advertises phone-over-Tailscale access,
+      // and the v0 fixed-rail layout has known reflow issues at narrow
+      // widths. This project pins a 360x800 viewport (typical Android
+      // phone in portrait) so layout regressions are caught here
+      // instead of in production on Sam's phone.
+      name: "mobile-chrome",
+      use: {
+        ...devices["Pixel 5"],
+        // Pixel 5's default is 393x851; force a tighter 360x800 so we
+        // also catch overflow on smaller Android viewports.
+        viewport: { width: 360, height: 800 },
+      },
+    },
   ],
   // Uncomment to have Playwright start `pm serve` itself.
   // webServer: {

@@ -171,6 +171,21 @@ class ProjectStateCacheEntry:
     # folds alerts into the entry at compute time so the read path is
     # authoritative.
     actionable_key: str | None = None
+    # #2049 follow-up (Codex blocker on PR #2085): stamp whether the
+    # alert snapshot used to compute ``rail_state`` / ``actionable_key``
+    # was successfully read. ``_open_alerts_for`` previously turned every
+    # supervisor/store/open-alerts failure into an empty list, which
+    # meant a transient refresher-side alert read failure could install
+    # a no-alert WORKING/NONE rollup; a later render whose
+    # ``supervisor.open_alerts()`` succeeds would still serve that
+    # stale-from-failure entry and hide the actionable RED alert. When
+    # this flag is ``False`` the cache fast-path
+    # (:meth:`_maybe_cache_route_rollups`) MUST decline — the entry
+    # can't speak to the alert state, so falling through to the direct
+    # path is the only way to honour the live alert read. Defaults to
+    # ``True`` so legacy / hand-rolled fixtures (and the success path)
+    # serve normally.
+    alerts_snapshot_valid: bool = True
 
     # ── awaits-user list (the expensive one) ───────────────────────
     awaits_user_count: int = 0

@@ -148,7 +148,9 @@ def compute_entry_for_project(
     # Best-effort: on any failure we degrade to "no alerts," which
     # matches the pre-fix workaround's worst-case (no RED bump) rather
     # than crashing the refresh.
-    actionable_alert_ids = _actionable_alert_ids_for(project_key, config)
+    actionable_alert_ids, alerts_valid = _actionable_alert_ids_for(
+        project_key, config,
+    )
     state, glyph, detail, rail_rollup, session_names = _categorize_and_rollup(
         project_key=project_key,
         config=config,
@@ -185,6 +187,13 @@ def compute_entry_for_project(
         # 6th tuple slot. Empty actionable alerts produce ``None`` to
         # match ``rollup_project_state``'s direct-path return.
         actionable_key=rail_rollup[5] if rail_rollup else None,
+        # #2049 follow-up (Codex blocker on PR #2085): stamp whether the
+        # alert read succeeded. When ``False`` the cache fast-path must
+        # decline so the direct path's live ``supervisor.open_alerts()``
+        # read can populate the RED bump; the refresher's
+        # rail_state/actionable_key would otherwise hide an alert that
+        # the live read can now see.
+        alerts_snapshot_valid=alerts_valid,
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
         latest_heartbeat_by_session=latest_heartbeat_by_session,
@@ -345,8 +354,8 @@ def _compute_workspace_entry(config: Any) -> ProjectStateCacheEntry:
 
 def _actionable_alert_ids_for(
     project_key: str, config: Any,
-) -> frozenset[str]:
-    """Return the per-project actionable-task-alert ids.
+) -> tuple[frozenset[str], bool]:
+    """Return ``(actionable_task_alert_ids, alerts_snapshot_valid)``.
 
     #2049 — folds the live alert set into the cached entry's rail
     rollup so the cache fast-path can serve a rollup that matches the
@@ -356,21 +365,35 @@ def _actionable_alert_ids_for(
     actionable alert (the PR #2026 workaround) which killed the cache
     benefit during the most common rail state.
 
-    Best-effort: every failure path returns ``frozenset()`` so a broken
-    store / supervisor falls back to "no alerts." That matches the
-    legacy fallthrough's no-RED-bump behaviour rather than crashing
-    the refresh.
+    #2049 follow-up (Codex blocker on PR #2085): callers need to
+    distinguish "no alerts" (success → empty set, valid=True) from
+    "alert read failed" (exception → empty set, valid=False). The
+    refresher stamps the validity flag onto the entry so
+    :meth:`cockpit_rail._maybe_cache_route_rollups` declines the
+    fast-path when alerts couldn't be read — a later render whose
+    ``supervisor.open_alerts()`` succeeds will then see the live alert
+    instead of the stale-from-failure WORKING/NONE rollup. The id-set
+    is still returned (empty on failure) so the rollup compute path
+    has a non-None argument; the validity flag is the source of truth.
+
+    The returned ids reflect the failure-degrade contract: a failed
+    alert read → empty set so the rollup doesn't bump to RED off a
+    half-read snapshot. ``actionable_alert_task_ids`` failures are
+    treated as failures too (valid=False) — same rationale.
     """
 
     try:
         from pollypm.cockpit_project_state import actionable_alert_task_ids
     except Exception:  # noqa: BLE001
-        return frozenset()
+        return frozenset(), False
 
-    alerts = _open_alerts_for(config)
+    alerts, alerts_valid = _open_alerts_for(config)
+    if not alerts_valid:
+        return frozenset(), False
     try:
-        return actionable_alert_task_ids(
-            alerts, project_key=project_key,
+        return (
+            actionable_alert_task_ids(alerts, project_key=project_key),
+            True,
         )
     except Exception:  # noqa: BLE001
         logger.warning(
@@ -378,38 +401,45 @@ def _actionable_alert_ids_for(
             project_key,
             exc_info=True,
         )
-        return frozenset()
+        return frozenset(), False
 
 
-def _open_alerts_for(config: Any) -> list[Any]:
-    """Return the workspace's open alerts, or ``[]`` on any failure.
+def _open_alerts_for(config: Any) -> tuple[list[Any], bool]:
+    """Return ``(open_alerts, valid)``.
 
     Reads :meth:`Supervisor.open_alerts` — the same source the cockpit
     direct path uses (cockpit_rail constructs a supervisor and reads
     ``supervisor.open_alerts()`` per render). The lazy import keeps
     the leaf ``state_cache`` package light.
 
-    Construction is best-effort and read-only. Supervisor construction
-    can fail on first call (e.g. backend pool not yet warm during cold
-    start) — every failure path degrades to ``[]`` so a refresh tick
-    never hard-fails on the alert overlay; we just lose the RED-bump
-    for that one refresh cycle.
+    #2049 follow-up (Codex blocker on PR #2085): every failure path
+    returns ``([], False)`` — the empty list is for callers that need
+    to keep computing a rollup without crashing, the ``False`` is the
+    signal the refresher stamps onto
+    :attr:`ProjectStateCacheEntry.alerts_snapshot_valid`. The cache
+    fast-path declines on ``False`` so a transient supervisor-side
+    failure doesn't install a no-alert rollup that masks a live RED
+    alert on the next render.
+
+    Construction failures: supervisor construction can fail on cold
+    start (backend pool not warm, etc.); these are real read failures,
+    not "no alerts," and are reported as such.
     """
 
     try:
         from pollypm.supervisor import Supervisor
     except Exception:  # noqa: BLE001
-        return []
+        return [], False
     supervisor = None
     try:
         supervisor = Supervisor(config, readonly_state=True)
-        return list(supervisor.open_alerts())
+        return list(supervisor.open_alerts()), True
     except Exception:  # noqa: BLE001
         logger.warning(
             "state_cache: supervisor.open_alerts() failed",
             exc_info=True,
         )
-        return []
+        return [], False
     finally:
         # ``Supervisor`` opens a StateStore handle on construction; the
         # leaf state_cache module shouldn't leak it across refresh ticks.

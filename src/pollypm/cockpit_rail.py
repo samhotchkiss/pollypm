@@ -2102,6 +2102,14 @@ class CockpitRouter:
         alert-present cases. ``alerts`` is still accepted so the
         signature matches the direct path; the cache fast-path
         ignores it and reads the entry directly.
+
+        #2049 follow-up (Codex blocker on PR #2085): when the
+        refresher's alert read itself failed (transient supervisor /
+        store failure), the entry stamps
+        ``alerts_snapshot_valid = False`` and the fast-path declines
+        so the live alerts argument drives the direct-path rollup
+        instead of serving a stale no-alert entry that would hide a
+        live RED alert.
         """
 
         try:
@@ -2147,6 +2155,16 @@ class CockpitRouter:
             rail_state = getattr(entry, "rail_state", None)
             if rail_state is None:
                 # Refresher hasn't filled in rail fields yet — defer.
+                return None
+            # #2049 follow-up (Codex blocker on PR #2085): if the
+            # refresher's alert read failed, the entry's rail_state /
+            # actionable_key were computed without alert overlay
+            # (``_open_alerts_for`` returns ``([], False)`` on any
+            # supervisor/store failure). Serving that entry would hide
+            # an actionable RED alert from a later render whose
+            # ``supervisor.open_alerts()`` succeeds. Decline so the
+            # direct path can run with the live alerts argument.
+            if not getattr(entry, "alerts_snapshot_valid", True):
                 return None
             rollups[project_key] = ProjectStateRollup(
                 state=rail_state,

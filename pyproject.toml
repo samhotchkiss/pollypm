@@ -105,6 +105,11 @@ pollypm = [
   "defaults/demo/**/*",
   "work/flows/*.yaml",
   "agents/*.md",
+  # v0 web UI (Phase 7) — vanilla HTML/JS/CSS served by FastAPI
+  # StaticFiles. No build step; ship the source files as-is.
+  "web_api/ui/*.html",
+  "web_api/ui/*.js",
+  "web_api/ui/*.css",
 ]
 
 [tool.pytest.ini_options]

@@ -721,6 +721,215 @@ def test_audit_responses_document_corrupt_archives_skipped() -> None:
         )
 
 
+def test_openapi_documents_three_auth_modes() -> None:
+    """Pin the round-8 (#2065) auth-contract fix.
+
+    The static OpenAPI contract previously advertised the API as
+    ``loopback by default`` with only ``bearerAuth`` declared at the
+    document level. The shipped runtime accepts three credential
+    modes: bearer header, ``pollypm-session`` cookie, and a
+    credential-free tailnet-peer mode (only when the server was
+    constructed with ``tailnet_trust_enabled=True``).
+
+    This test fails if anyone reverts the contract back to a
+    bearer-only / loopback-default story.
+    """
+    contract = _load_contract()
+
+    # 1. cookieAuth security scheme exists and is an apiKey-in-cookie
+    #    named pollypm-session (matching the runtime cookie name).
+    schemes = (
+        contract.get("components", {}).get("securitySchemes", {})
+    )
+    assert "bearerAuth" in schemes, "bearerAuth scheme missing"
+    cookie_scheme = schemes.get("cookieAuth")
+    assert cookie_scheme is not None, (
+        "cookieAuth security scheme missing — round-8 #2065 fix."
+    )
+    assert cookie_scheme.get("type") == "apiKey", (
+        f"cookieAuth must be type apiKey, got {cookie_scheme.get('type')!r}"
+    )
+    assert cookie_scheme.get("in") == "cookie", (
+        f"cookieAuth must be in=cookie, got {cookie_scheme.get('in')!r}"
+    )
+    assert cookie_scheme.get("name") == "pollypm-session", (
+        "cookieAuth name must match the runtime cookie "
+        "(pollypm-session); got "
+        f"{cookie_scheme.get('name')!r}"
+    )
+
+    # 2. Global security list allows ANY of: bearer, cookie, or
+    #    credential-free (empty entry — OpenAPI's way of marking
+    #    anonymous access for the tailnet-trust mode).
+    security = contract.get("security", [])
+    assert isinstance(security, list), "top-level security must be a list"
+    requires_bearer = any(
+        isinstance(entry, dict) and "bearerAuth" in entry
+        for entry in security
+    )
+    requires_cookie = any(
+        isinstance(entry, dict) and "cookieAuth" in entry
+        for entry in security
+    )
+    allows_anonymous = any(
+        isinstance(entry, dict) and len(entry) == 0
+        for entry in security
+    )
+    assert requires_bearer, "security list must offer bearerAuth"
+    assert requires_cookie, (
+        "security list must offer cookieAuth (round-8 #2065 fix)."
+    )
+    assert allows_anonymous, (
+        "security list must include an empty {} entry to model the "
+        "credential-free tailnet-peer mode (round-8 #2065 fix)."
+    )
+
+    # 3. Top-level description must enumerate all three modes so
+    #    generated-client readers see the full auth story.
+    description = (contract.get("info", {}).get("description") or "").lower()
+    assert "bearer" in description, (
+        "info.description must mention the bearer mode."
+    )
+    assert "cookie" in description or "pollypm-session" in description, (
+        "info.description must mention the session-cookie mode."
+    )
+    assert "tailnet" in description or "tailscale" in description, (
+        "info.description must mention the tailnet-trust mode."
+    )
+
+    # 4. The old "loopback by default" / bearer-only framing must NOT
+    #    survive — that was the round-7 → round-8 regression Codex
+    #    flagged.
+    servers = contract.get("servers", [])
+    for server in servers:
+        server_desc = (server.get("description") or "").lower()
+        assert "loopback by default" not in server_desc, (
+            "server description still says 'loopback by default' — "
+            "the runtime auto-binds Tailscale when available "
+            "(round-8 #2065 fix)."
+        )
+
+
+def test_runtime_openapi_documents_three_auth_modes() -> None:
+    """Pin the round-11 (#2065) runtime-side auth-contract fix.
+
+    Round 8 fixed the static ``docs/api/openapi.yaml`` to enumerate
+    three credential modes (bearer / cookie / credential-free tailnet
+    peer). Round 11 (Codex 03:48 UTC) caught that the runtime
+    ``/openapi.json`` still only advertised ``bearerAuth`` because
+    ``_attach_security_scheme()`` in ``src/pollypm/web_api/app.py``
+    overwrote ``components.securitySchemes`` with a bearer-only
+    block and ``security`` with ``[{"bearerAuth": []}]``.
+
+    Generated clients that hit the live ``/api/v1/openapi.json`` for
+    discovery would therefore not know the cookie or tailnet-trust
+    modes existed — exactly the drift the round-8 fix was supposed
+    to close.
+
+    Mirrors :func:`test_openapi_documents_three_auth_modes` on the
+    auto-generated FastAPI doc.
+    """
+    from pollypm.config import (
+        AccountConfig,
+        MemorySettings,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectSettings,
+    )
+    from pollypm.models import ProviderKind, RuntimeKind
+    from pollypm.web_api import create_app
+
+    base = Path(__file__).resolve().parent
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="P", root_dir=base, tmux_session="t",
+            workspace_root=base, base_dir=base / ".pollypm",
+            logs_dir=base / ".pollypm/logs",
+            snapshots_dir=base / ".pollypm/snapshots",
+            state_db=base / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(
+            controller_account="codex_primary",
+            open_permissions_by_default=False,
+            failover_enabled=False,
+            failover_accounts=[],
+            heartbeat_backend="local",
+            scheduler_backend="inline",
+            lease_timeout_minutes=30,
+        ),
+        accounts={"codex_primary": AccountConfig(
+            name="codex_primary", provider=ProviderKind.CODEX,
+            email="codex@example.com", runtime=RuntimeKind.LOCAL,
+            home=base / ".pollypm/homes/codex_primary",
+        )},
+        sessions={},
+        projects={},
+        memory=MemorySettings(backend="file"),
+    )
+    app = create_app(config=config, token_path=base / "tmp-token")
+    schema = app.openapi()
+
+    # 1. Both bearerAuth AND cookieAuth must be declared on the
+    #    runtime doc.
+    schemes = schema.get("components", {}).get("securitySchemes", {})
+    assert "bearerAuth" in schemes, (
+        "Runtime /openapi.json missing bearerAuth scheme "
+        "(#2065 round-11)."
+    )
+    cookie_scheme = schemes.get("cookieAuth")
+    assert cookie_scheme is not None, (
+        "Runtime /openapi.json missing cookieAuth scheme — "
+        "_attach_security_scheme() must mirror the static YAML "
+        "(#2065 round-11)."
+    )
+    assert cookie_scheme.get("type") == "apiKey", (
+        "cookieAuth must be type apiKey, got "
+        f"{cookie_scheme.get('type')!r}"
+    )
+    assert cookie_scheme.get("in") == "cookie", (
+        f"cookieAuth must be in=cookie, got {cookie_scheme.get('in')!r}"
+    )
+    assert cookie_scheme.get("name") == "pollypm-session", (
+        "cookieAuth name must match the runtime cookie "
+        "(pollypm-session); got "
+        f"{cookie_scheme.get('name')!r}"
+    )
+
+    # 2. Top-level security list must enumerate all three modes:
+    #    bearer, cookie, AND a credential-free entry for the
+    #    tailnet-trust path.
+    security = schema.get("security", [])
+    assert isinstance(security, list), (
+        "Runtime security must be a list"
+    )
+    requires_bearer = any(
+        isinstance(entry, dict) and "bearerAuth" in entry
+        for entry in security
+    )
+    requires_cookie = any(
+        isinstance(entry, dict) and "cookieAuth" in entry
+        for entry in security
+    )
+    allows_anonymous = any(
+        isinstance(entry, dict) and len(entry) == 0
+        for entry in security
+    )
+    assert requires_bearer, (
+        "Runtime security list must offer bearerAuth "
+        "(#2065 round-11)."
+    )
+    assert requires_cookie, (
+        "Runtime security list must offer cookieAuth — "
+        "_attach_security_scheme() previously set bearer-only "
+        "(#2065 round-11)."
+    )
+    assert allows_anonymous, (
+        "Runtime security list must include an empty {} entry to "
+        "model the credential-free tailnet-peer mode "
+        "(#2065 round-11)."
+    )
+
+
 def test_implementation_openapi_validates_as_31() -> None:
     """The auto-generated doc must itself be a valid OpenAPI 3.x doc."""
     # Re-read straight off the FastAPI app so we don't depend on the

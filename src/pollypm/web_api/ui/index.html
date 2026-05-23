@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PollyPM</title>
+<link rel="stylesheet" href="/ui/styles.css" />
+</head>
+<body>
+<header id="topbar">
+  <div class="brand">
+    <span class="brand-mark">◆</span>
+    <span class="brand-name">PollyPM</span>
+    <span class="brand-tag">v0 web</span>
+  </div>
+  <div id="conn-status" class="conn-status conn-unknown" title="Connection status">
+    <span class="conn-dot"></span>
+    <span class="conn-label">connecting…</span>
+  </div>
+</header>
+
+<main id="layout">
+  <aside id="surface-rail" aria-label="Chat surfaces">
+    <h2 class="rail-title">Surfaces</h2>
+    <ul id="surface-list" class="surface-list">
+      <li class="surface-empty">loading…</li>
+    </ul>
+  </aside>
+
+  <section id="message-pane" aria-label="Messages">
+    <header class="pane-header">
+      <h2 id="pane-title">Select a surface</h2>
+      <span id="pane-meta" class="pane-meta"></span>
+    </header>
+    <div id="message-list" class="message-list" aria-live="polite">
+      <div class="message-empty">No surface selected.</div>
+    </div>
+    <form id="send-form" class="send-form" autocomplete="off">
+      <input
+        id="send-input"
+        class="send-input"
+        type="text"
+        name="text"
+        placeholder="Message the selected surface…"
+        disabled
+        aria-label="Send message"
+      />
+      <button id="send-button" class="send-button" type="submit" disabled>Send</button>
+    </form>
+  </section>
+
+  <aside id="dashboard-rail" aria-label="Dashboard">
+    <h2 class="rail-title">Dashboard</h2>
+    <div id="dashboard-rollups" class="dashboard-rollups">
+      <div class="rollup-empty">loading…</div>
+    </div>
+  </aside>
+</main>
+
+<script src="/ui/app.js" defer></script>
+</body>
+</html>

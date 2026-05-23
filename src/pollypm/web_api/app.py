@@ -21,16 +21,21 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, AsyncIterator
 
-from fastapi import Depends, FastAPI
+from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.web_api.auth import (
+    SESSION_COOKIE_NAME,
+    _extract_token,
+    is_tailscale_ip,
     make_bearer_auth_dependency,
     make_sse_auth_dependency,
 )
+from pollypm.web_api.token import DEFAULT_TOKEN_PATH, load_token
 from pollypm.web_api.errors import (
     APIError,
     handle_api_error,
@@ -241,6 +246,7 @@ def create_app(
     *,
     config: PollyPMConfig,
     token_path: Path | None = None,
+    tailnet_trust_enabled: bool = False,
 ) -> FastAPI:
     """Build a FastAPI app for ``pm serve``.
 
@@ -252,6 +258,16 @@ def create_app(
         Override the bearer-token file location. Defaults to
         ``~/.pollypm/api-token`` per spec §3. Tests pass a tmp path
         so the user's real token never surfaces.
+    tailnet_trust_enabled:
+        When ``True``, the auth dependency and the ``/ui/`` cookie gate
+        treat a request from the Tailscale CGNAT range
+        (``100.64.0.0/10``) as authenticated even without a bearer or
+        cookie. ``pm serve`` only enables this when it actually bound
+        to a verified Tailscale IPv4 — an explicit
+        ``--host 0.0.0.0 --allow-remote`` keeps the default ``False``,
+        so a CGNAT-source peer on the public interface still needs a
+        credential. Default ``False`` (closed by default; tests and
+        legacy callers stay strict).
     """
     # FastAPI's default ``openapi_url`` is public, but the spec
     # (§3) lists only ``/health`` as auth-exempt. Disable the default
@@ -335,11 +351,15 @@ def create_app(
     # Health is exempt from auth per spec §3.
     app.include_router(health_routes.router, prefix=API_V1_PREFIX)
 
-    auth_dependency = make_bearer_auth_dependency(token_path)
+    auth_dependency = make_bearer_auth_dependency(
+        token_path, tailnet_trust_enabled=tailnet_trust_enabled,
+    )
     auth_deps = [Depends(auth_dependency)]
     # SSE has its own auth dependency that also accepts ``?token=``
     # (browser EventSource cannot set custom headers — see spec §4).
-    sse_auth_dependency = make_sse_auth_dependency(token_path)
+    sse_auth_dependency = make_sse_auth_dependency(
+        token_path, tailnet_trust_enabled=tailnet_trust_enabled,
+    )
     sse_auth_deps = [Depends(sse_auth_dependency)]
 
     app.include_router(projects_routes.router, prefix=API_V1_PREFIX, dependencies=auth_deps)
@@ -398,6 +418,17 @@ def create_app(
         dependencies=auth_deps,
     )
 
+    # v0 web UI (Phase 7) — static SPA at ``/ui/`` with a cookie-bridge
+    # entry point that injects the on-disk token as the
+    # ``pollypm-session`` cookie. The static files (app.js, styles.css)
+    # are served raw; the entry route is custom so it can set the
+    # cookie + return the HTML in one round-trip.
+    _mount_web_ui(
+        app,
+        token_path=token_path,
+        tailnet_trust_enabled=tailnet_trust_enabled,
+    )
+
     # ``security: bearerAuth`` declared at the document level so
     # generated clients carry the correct Auth scheme.
     _attach_security_scheme(app)
@@ -419,10 +450,28 @@ def create_app(
 def _attach_security_scheme(app: FastAPI) -> None:
     """Inject the OpenAPI ``securitySchemes`` block.
 
-    FastAPI's auto-generated OpenAPI doesn't add bearer auth unless
-    we wire it through ``OAuth2PasswordBearer`` or override
+    FastAPI's auto-generated OpenAPI doesn't add any auth schemes
+    unless we wire them through ``OAuth2PasswordBearer`` or override
     ``openapi_schema``. The simplest path is to customize the
     schema once after first generation.
+
+    The runtime accepts three credential modes (see
+    ``docs/web-api-spec.md`` §3 and the static
+    ``docs/api/openapi.yaml``):
+
+    1. ``bearerAuth`` — ``Authorization: Bearer <token>`` header,
+       token sourced from ``~/.pollypm/api-token``.
+    2. ``cookieAuth`` — ``pollypm-session`` cookie minted by
+       ``GET /ui/`` for loopback peers, verified tailnet peers, or
+       callers presenting a valid bearer header. Same on-disk token,
+       constant-time comparison.
+    3. Credential-free tailnet-peer mode (empty ``{}`` entry in the
+       security list) — only honoured when the app was constructed
+       with ``tailnet_trust_enabled=True``.
+
+    The runtime ``/openapi.json`` must mirror that three-mode story
+    so generated clients reading the live endpoint see the same auth
+    contract as readers of the static YAML (#2065).
     """
     base_openapi = app.openapi
 
@@ -431,19 +480,49 @@ def _attach_security_scheme(app: FastAPI) -> None:
             return app.openapi_schema
         schema = base_openapi()
         schema.setdefault("components", {})
-        schema["components"].setdefault("securitySchemes", {})
-        schema["components"]["securitySchemes"]["bearerAuth"] = {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "opaque",
-            "description": (
-                "Token from `~/.pollypm/api-token`. Generated on first "
-                "`pm serve` startup; rotated via `pm api regen-token`."
-            ),
+        # Replace any auto-detected scheme block wholesale: we want the
+        # runtime doc to advertise exactly the same scheme set as the
+        # static contract.
+        schema["components"]["securitySchemes"] = {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "opaque",
+                "description": (
+                    "Bearer token from `~/.pollypm/api-token`. "
+                    "Generated on first `pm serve` startup; rotated "
+                    "via `pm api regen-token`. Always accepted. "
+                    "See `docs/web-api-spec.md` §3."
+                ),
+            },
+            "cookieAuth": {
+                "type": "apiKey",
+                "in": "cookie",
+                "name": "pollypm-session",
+                "description": (
+                    "Session cookie minted by `GET /ui/` for loopback "
+                    "peers, verified tailnet peers (when "
+                    "`tailnet_trust_enabled=True`), or callers "
+                    "presenting a valid bearer header. The cookie "
+                    "value is the same on-disk token as `bearerAuth`; "
+                    "comparison is constant-time. LAN clients receive "
+                    "HTML without `Set-Cookie` and 401 on the first "
+                    "API call. See `docs/web-api-spec.md` §3."
+                ),
+            },
         }
         # Default security applies to every operation; ``/health``
         # opts out via the route definition (security: []).
-        schema["security"] = [{"bearerAuth": []}]
+        # The empty ``{}`` entry models the credential-free
+        # tailnet-peer mode (OpenAPI's canonical way of saying
+        # "no credentials required"); it does NOT mean every caller
+        # is anonymous — the runtime still gates on
+        # ``tailnet_trust_enabled`` + a verified peer IP.
+        schema["security"] = [
+            {"bearerAuth": []},
+            {"cookieAuth": []},
+            {},
+        ]
         # Drop the security requirement from ``/health`` so the
         # generated doc matches the runtime behaviour.
         for path, ops in schema.get("paths", {}).items():
@@ -455,6 +534,128 @@ def _attach_security_scheme(app: FastAPI) -> None:
         return schema
 
     app.openapi = _custom_openapi  # type: ignore[assignment]
+
+
+def _mount_web_ui(
+    app: FastAPI,
+    *,
+    token_path: Path | None,
+    tailnet_trust_enabled: bool = False,
+) -> None:
+    """Mount the v0 web UI static assets + cookie-bridge entry route.
+
+    Layout:
+
+    - ``GET /ui/`` returns ``index.html`` and sets the
+      ``pollypm-session`` cookie from the on-disk token, so subsequent
+      ``fetch(..., {credentials: 'include'})`` calls authenticate
+      without the user ever seeing the token.
+    - ``GET /ui/{path}`` (e.g. ``app.js``, ``styles.css``) is served by
+      :class:`StaticFiles` from the ``ui/`` directory next to this
+      module. No auth on the static assets themselves — the bytes are
+      not sensitive and gating them behind cookie auth would break the
+      ``GET /ui/`` boot (browser fetches ``app.js`` before the cookie
+      round-trips on slow links). The API endpoints those assets call
+      remain auth-gated.
+    - ``GET /ui`` (no trailing slash) → 307 to ``/ui/`` so the cookie
+      gets set even if the operator types the short form.
+    """
+    ui_dir = Path(__file__).parent / "ui"
+    if not ui_dir.exists():
+        # Defensive: an installed wheel without the ui/ data directory
+        # would 404 on /ui/, which is fine but logging makes the cause
+        # discoverable. The app still boots and the JSON API works.
+        logger.warning(
+            "web UI directory missing at %s; /ui/ will 404", ui_dir,
+        )
+        return
+
+    index_path = ui_dir / "index.html"
+
+    @app.get("/ui", include_in_schema=False)
+    def _ui_root_redirect() -> Response:
+        # 307 preserves method + the spec for "the trailing slash form
+        # is canonical" without altering verbs.
+        return Response(status_code=307, headers={"Location": "/ui/"})
+
+    @app.get("/ui/", include_in_schema=False)
+    def _ui_index(
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        # Load the token at request time (not app-build time) so a
+        # ``pm api regen-token`` rotation flows into the cookie on the
+        # next page load without an app restart.
+        resolved_token_path = token_path or DEFAULT_TOKEN_PATH
+        token_value = load_token(resolved_token_path)
+        response = FileResponse(index_path, media_type="text/html")
+
+        # Cookie issuance is credential issuance — gate it behind a
+        # proven local-operator path so a LAN device (or anyone who
+        # can reach this port from a network we don't trust) can't
+        # GET /ui/ and walk away with the bearer token via
+        # Set-Cookie. Three acceptable signals:
+        #
+        # 1. Authorization: Bearer <token> matches the on-disk token
+        #    (operator pasted it via curl / scripted boot).
+        # 2. Loopback client (127.0.0.1, ::1) — local operator on
+        #    the Mac itself.
+        # 3. Tailscale CGNAT peer — operator hitting /ui/ from a
+        #    tailnet device, but **only when ``tailnet_trust_enabled``
+        #    is True** (i.e. ``pm serve`` actually bound to a verified
+        #    Tailscale interface). On an explicit
+        #    ``--host 0.0.0.0 --allow-remote`` deploy the flag is
+        #    False, so a CGNAT-source peer no longer earns a cookie:
+        #    RFC 6598 shared address space is also used by some ISP
+        #    CGNAT setups and must not be trusted on the public
+        #    interface.
+        #
+        # Everything else (LAN device, public-facing deploy by
+        # accident, spoofed source IP through a misconfigured proxy)
+        # gets the HTML but NO cookie. The SPA surfaces a 401 on its
+        # first /api/ call so the operator knows to access via
+        # loopback or tailnet. See spec doc:
+        # docs/web-ui-2065-security-spec.md (decision d-ii).
+        client_host = request.client.host if request.client else None
+        is_loopback = client_host in ("127.0.0.1", "::1")
+        is_tailnet = tailnet_trust_enabled and is_tailscale_ip(client_host)
+        bearer_token = _extract_token(authorization)
+        valid_bearer = False
+        if bearer_token is not None and token_value is not None:
+            from secrets import compare_digest
+
+            valid_bearer = compare_digest(bearer_token, token_value)
+
+        if token_value and (is_loopback or is_tailnet or valid_bearer):
+            # ``HttpOnly`` so JS can't read the token; ``SameSite=Lax``
+            # so cross-tab navigation still carries it; ``Secure=False``
+            # because the v0 deploy is loopback/Tailscale HTTP. When
+            # the operator puts this behind TLS they should set
+            # ``Secure=True`` via a reverse proxy.
+            response.set_cookie(
+                key=SESSION_COOKIE_NAME,
+                value=token_value,
+                httponly=True,
+                samesite="lax",
+                secure=False,
+                path="/",
+                max_age=60 * 60 * 24 * 7,  # 7 days
+            )
+        # If the token file doesn't exist yet, or the caller isn't on
+        # a trusted path, we still serve the HTML — the SPA will
+        # surface a 401 the first time it hits /api/ and the operator
+        # will know to access from loopback / Tailscale (or to run
+        # `pm api regen-token`).
+        return response
+
+    # Static assets served raw. ``html=False`` keeps StaticFiles from
+    # hijacking the bare ``/ui/`` path (we've already taken that route
+    # above with the cookie-setting handler).
+    app.mount(
+        "/ui",
+        StaticFiles(directory=str(ui_dir), html=False),
+        name="ui-static",
+    )
 
 
 __all__ = ["API_V1_PREFIX", "create_app"]

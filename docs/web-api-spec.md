@@ -116,13 +116,35 @@ or hosted Postgres).
 
 ## 3. Authentication
 
-### Bearer token
+### Credential modes
 
-Every request (except `GET /api/v1/health`) must carry:
+Every request (except `GET /api/v1/health`) must satisfy one of the
+following three credential modes. They are tried in order by the daemon's
+auth dependency (`src/pollypm/web_api/auth.py`):
 
-```
-Authorization: Bearer <token>
-```
+1. **Bearer header** — `Authorization: Bearer <token>` matching the
+   on-disk token at `~/.pollypm/api-token` (mode 0600). Always accepted.
+   This is the canonical mode for non-browser clients (cockpit CLI,
+   scripts, curl).
+2. **`pollypm-session` cookie** — minted by `GET /ui/` and then sent
+   automatically by the browser on every subsequent `/api/v1/*` request.
+   The cookie value is the same on-disk token; it is compared with the
+   same constant-time check as the header. `GET /ui/` only issues the
+   cookie when the caller is a loopback peer (`127.0.0.1` / `::1`), a
+   verified tailnet peer (CGNAT-range source *and* the app was built with
+   `tailnet_trust_enabled=True`), or already presented a valid bearer
+   header. LAN clients receive the HTML without `Set-Cookie` and get
+   `401` on their first API call.
+3. **Credential-free tailnet peer** — accepted *only* when the app was
+   constructed with `tailnet_trust_enabled=True`, which `pm serve` sets
+   automatically when `detect_tailscale_ip()` returns a verified
+   Tailscale IPv4 and uvicorn binds that interface. Without that flag
+   (loopback bind, explicit `--host`, `--allow-remote`), CGNAT-source
+   peers fall back to bearer or cookie like any other client.
+
+See [`docs/web-ui-2065-security-spec.md`](web-ui-2065-security-spec.md)
+for the ADR-level decision rationale (LAN exposure, CGNAT spoofing,
+credential-issuance gating).
 
 ### SSE escape hatch (`?token=`)
 
@@ -149,9 +171,21 @@ into proxy logs / browser history for routine traffic. See `auth.py`
 
 - Single-user, personal-use. No multi-tenant separation.
 - The token is a simple shared secret; loss equals full access.
-- TLS is the operator's responsibility — `pm serve` defaults to
-  binding `127.0.0.1` and refuses non-loopback binds without
-  `--allow-remote`.
+- TLS is the operator's responsibility. `pm serve` auto-detects
+  Tailscale on startup: if `tailscale ip -4` returns an IPv4 the
+  daemon binds that tailnet interface (tailnet mode,
+  `tailnet_trust_enabled=True`); otherwise it falls back to
+  `127.0.0.1` (loopback mode, `tailnet_trust_enabled=False`). Pass
+  `--host <addr>` to override the detected bind; an explicit
+  `--host` **always** stays in untrusted mode
+  (`tailnet_trust_enabled=False`, every request needs a bearer token
+  or session cookie), unconditionally — even if the address matches
+  the detected Tailscale IPv4. The auto-detect path is the only way
+  to enable `tailnet_trust_enabled=True`. `--allow-remote` is no
+  longer required for the auto-detected tailnet bind, but is still
+  required for explicit non-loopback overrides such as
+  `--host 0.0.0.0`. The legacy `--tailscale` flag is a no-op kept for
+  back-compat; auto-detection covers the same path.
 - Out of scope: OAuth, JWT, role-based access, audit logging of API
   callers (the frontend developer is the same human as the cockpit
   user).

@@ -2624,8 +2624,13 @@ class Supervisor:
                 return
         try:
             from pollypm.capacity import account_needs_proactive_rollover
+            used_threshold = getattr(
+                self.config.pollypm, "failover_usage_threshold_pct", 85,
+            )
+            remaining_threshold = max(0, 100 - int(used_threshold))
             needs_roll, probe = account_needs_proactive_rollover(
                 self.config, self.store, launch.account.name,
+                threshold_pct=remaining_threshold,
             )
         except Exception:  # noqa: BLE001
             logger.warning(

@@ -53,6 +53,7 @@ def test_load_example_config(tmp_path: Path) -> None:
     assert config.pollypm.open_permissions_by_default is True
     assert config.pollypm.failover_enabled is True
     assert config.pollypm.failover_accounts == ["claude_primary"]
+    assert config.pollypm.failover_usage_threshold_pct == 85
     assert config.pollypm.lease_timeout_minutes == 30
     assert config.memory.backend == "file"
     assert set(config.accounts) == {"codex_primary", "claude_primary"}
@@ -83,7 +84,32 @@ def test_example_config_documents_storage_block(tmp_path: Path) -> None:
     config_path = tmp_path / "pollypm.toml"
     config_path.write_text(rendered)
     config = load_config(config_path)
-    assert config.storage.backend == "sqlite"  # default until uncommented
+    assert config.storage.backend == "postgres"
+
+
+def test_failover_usage_threshold_round_trips(tmp_path: Path) -> None:
+    config = PollyPMConfig(
+        project=ProjectSettings(root_dir=tmp_path),
+        pollypm=PollyPMSettings(
+            controller_account="claude_primary",
+            failover_usage_threshold_pct=72,
+        ),
+        accounts={
+            "claude_primary": AccountConfig(
+                name="claude_primary",
+                provider=ProviderKind.CLAUDE,
+            )
+        },
+        sessions={},
+        projects={},
+    )
+    config_path = tmp_path / "pollypm.toml"
+
+    write_config(config, config_path)
+    loaded = load_config(config_path)
+
+    assert loaded.pollypm.failover_usage_threshold_pct == 72
+    assert "failover_usage_threshold_pct = 72" in config_path.read_text()
 
 
 def test_write_example_config_uses_fresh_install_session_name(tmp_path: Path) -> None:

@@ -4049,6 +4049,77 @@ def test_cockpit_router_ensure_layout_swap_preserves_pane_count(tmp_path: Path) 
     assert state["right_pane_id"] == "%1"
 
 
+def test_static_list_panes_cache_stamps_after_call_not_before(monkeypatch, tmp_path: Path) -> None:
+    """#1967 — when ``list_panes`` takes longer than the cache TTL, two
+    back-to-back static-route clicks must still collapse onto a single
+    ``list_panes`` subprocess.
+
+    Pre-fix, ``_route_supervisor_free_static`` captured ``t_start``
+    BEFORE the slow ``list_panes`` call and stored that pre-call
+    timestamp in ``_static_list_panes_cache``. With a 0.5s TTL, a
+    ``list_panes`` that took longer than 0.5s produced a cache entry
+    that was already expired the moment it was written — so the very
+    next click paid the same slow cost again, defeating the
+    burst-collapsing cache. The fix stamps the cache with the
+    completion timestamp so the TTL clock starts when the entry
+    becomes available, not before.
+    """
+    import time
+
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text(
+        f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n"
+    )
+
+    list_pane_calls: list[str] = []
+
+    class SlowTmux:
+        # Sleep slightly longer than ``_STATIC_LIST_PANES_TTL_SECONDS``
+        # (0.5s) so a pre-call timestamp would expire before being read.
+        # Kept tight (0.6s) to keep total wall-clock under 1s.
+        _SLEEP = 0.6
+
+        def list_panes(self, target: str):
+            list_pane_calls.append(target)
+            time.sleep(self._SLEEP)
+            return []
+
+    class StubWindowManager:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def try_show_static_fast(self, *_args, **_kwargs):
+            return None
+
+        def show_static(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                ok=True,
+                state=SimpleNamespace(
+                    right_pane_id=None, mounted_session=None,
+                ),
+                actions=(),
+                postcondition=SimpleNamespace(errors=(), right_pane_id=None),
+            )
+
+    router = CockpitRouter(config_path)
+    router.tmux = SlowTmux()  # type: ignore[assignment]
+    monkeypatch.setattr("pollypm.cockpit_rail.CockpitWindowManager", StubWindowManager)
+    # Avoid timing-warn log spam in the captured output; the threshold
+    # check isn't what we're testing.
+    monkeypatch.setattr(router, "_maybe_log_route_step", lambda *a, **k: None)
+
+    router._route_supervisor_free_static("inbox")
+    router._route_supervisor_free_static("inbox")
+
+    cockpit_calls = [t for t in list_pane_calls if t.endswith(":PollyPM")]
+    assert len(cockpit_calls) == 1, (
+        "expected the cache to collapse two back-to-back static-route "
+        "clicks onto one list_panes subprocess even when list_panes "
+        f"takes longer than the TTL, got {len(cockpit_calls)} calls: "
+        f"{cockpit_calls}"
+    )
+
+
 def test_cockpit_router_routes_idle_project_to_detail_pane(monkeypatch, tmp_path: Path) -> None:
     calls: dict[str, object] = {}
     (tmp_path / "pollypm.toml").write_text(f"[project]\nname = \"PollyPM\"\ntmux_session = \"pollypm\"\nbase_dir = \"{tmp_path / '.pollypm'}\"\n")

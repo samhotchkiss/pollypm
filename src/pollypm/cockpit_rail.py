@@ -3444,7 +3444,18 @@ class CockpitRouter:
                 panes = self.tmux.list_panes(window_target)
             except Exception:  # noqa: BLE001
                 panes = None
-            self._static_list_panes_cache[window_target] = (t_start, panes)
+            # #1967 — stamp the cache with the *completion* timestamp,
+            # not ``t_start``. When ``list_panes`` takes longer than
+            # ``_STATIC_LIST_PANES_TTL_SECONDS`` (e.g. a slow/contended
+            # tmux server), using the pre-call ``t_start`` produces an
+            # entry that is already expired the moment it's written —
+            # so the very next click pays the same slow subprocess
+            # cost, defeating the burst-collapsing cache. The route
+            # timing log below still uses ``t_start`` because it
+            # measures user-perceived step duration, not freshness.
+            self._static_list_panes_cache[window_target] = (
+                time.monotonic(), panes,
+            )
         self._maybe_log_route_step("list_panes", key, t_start)
         if has_mount_state:
             if panes is None:

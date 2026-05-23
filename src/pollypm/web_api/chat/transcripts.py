@@ -439,6 +439,212 @@ def parse_events_jsonl(
     return envelopes
 
 
+# Tail-read chunk progression for ``parse_events_jsonl_tail`` (issue
+# #2070). 64KB is enough to cover ~200 average lines, which satisfies
+# the common ``?limit=50`` cockpit poll without re-reading. If the
+# requested envelope count isn't met we widen to 256KB, then 1MB,
+# then give up and fall through to the full forward parse. The
+# progression is deliberately short — three attempts is enough to
+# absorb the long-tail of multi-kilobyte tool_result payloads without
+# silently re-reading the whole file in a loop.
+_TAIL_CHUNK_PROGRESSION = (64 * 1024, 256 * 1024, 1024 * 1024)
+
+
+def parse_events_jsonl_tail(
+    events_path: Path,
+    *,
+    limit: int,
+    actor_fallback: str = "agent",
+) -> list[MessageEnvelope]:
+    """Return roughly the last ``limit`` envelopes by tail-reading the file.
+
+    Optimization for the cold-path miss of the mtime cache (issue #2069
+    composes with this — that cache covers steady-state polls; tail-
+    read covers the first switch + every post-write call where the
+    file has changed). The default ``parse_events_jsonl`` forward-
+    readlines the entire archive even when the caller only wants the
+    last ``?limit=50`` envelopes; for operator transcripts running to
+    thousands of lines this dominates first-load latency (issue #2070).
+
+    Strategy:
+
+    1. Seek ``chunk`` bytes from EOF (start 64KB) and read forward.
+    2. Drop the first partial line (we almost certainly seeked into
+       the middle of one) UNLESS we landed at byte 0 (whole file fits
+       in one chunk).
+    3. Parse the remaining lines forward, mirroring
+       :func:`parse_events_jsonl` line-by-line.
+    4. If we got fewer than ``limit`` valid envelopes AND we haven't
+       hit byte 0, widen to the next chunk size (64KB → 256KB → 1MB)
+       and retry. After the last chunk size still falls short, fall
+       through to the full forward parse and slice — the file is
+       legitimately small or sparsely populated.
+    5. ``UnicodeDecodeError`` or any other parse exception bails to
+       the full forward parser (multi-line / pretty-printed events
+       can confuse a chunk-boundary read; the forward parser handles
+       those at line granularity).
+
+    Cache composition: a hit against ``_PARSE_CACHE`` short-circuits
+    even cheaper than the tail read, so we check it first. We do NOT
+    populate the cache from this path — the tail returns a partial
+    list, and seeding the cache with a partial list would corrupt
+    subsequent full-history reads.
+
+    Returns ``[]`` for missing files (matches ``parse_events_jsonl``).
+    """
+    if limit <= 0:
+        return []
+    if not events_path.exists():
+        return []
+
+    # Cache lookup first — the mtime cache holds the FULL parse, which
+    # is strictly more accurate than what tail-read can synthesize.
+    cached_mtime: float | None = None
+    try:
+        cached_mtime = events_path.stat().st_mtime
+    except OSError:
+        cached_mtime = None
+    if cached_mtime is not None:
+        cached = _PARSE_CACHE.get(events_path)
+        if (
+            cached is not None
+            and cached[0] == cached_mtime
+            and cached[2] == actor_fallback
+        ):
+            # Tail of the cached list. Defensive copy: downstream
+            # callers sort/filter in place.
+            return list(cached[1][-limit:])
+
+    source_key = hashlib.blake2b(
+        str(events_path).encode("utf-8"), digest_size=4,
+    ).hexdigest()
+
+    try:
+        file_size = events_path.stat().st_size
+    except OSError as exc:
+        logger.warning(
+            "chat.transcripts: tail stat failed for %s: %s",
+            events_path, exc,
+        )
+        return parse_events_jsonl(
+            events_path, actor_fallback=actor_fallback,
+        )[-limit:]
+
+    if file_size == 0:
+        return []
+
+    for chunk_size in _TAIL_CHUNK_PROGRESSION:
+        try:
+            envelopes = _parse_tail_chunk(
+                events_path,
+                file_size=file_size,
+                chunk_size=chunk_size,
+                source_key=source_key,
+                actor_fallback=actor_fallback,
+            )
+        except (UnicodeDecodeError, OSError) as exc:
+            # Chunk-boundary read landed inside a multi-byte sequence
+            # or the file went away mid-read — fall back to the full
+            # forward parser which reads with ``errors="ignore"`` and
+            # tolerates partial reads.
+            logger.debug(
+                "chat.transcripts: tail-read fell back for %s (%s)",
+                events_path, exc,
+            )
+            return parse_events_jsonl(
+                events_path, actor_fallback=actor_fallback,
+            )[-limit:]
+        if envelopes is None:
+            # Sentinel: chunk parse hit a defensive bailout (e.g. a
+            # malformed-but-not-skipped line). Treat the same as a
+            # decode error and use the forward parser.
+            return parse_events_jsonl(
+                events_path, actor_fallback=actor_fallback,
+            )[-limit:]
+        if len(envelopes) >= limit:
+            return envelopes[-limit:]
+        if chunk_size >= file_size:
+            # We read the whole file already — no point widening.
+            return envelopes[-limit:]
+
+    # Exhausted the chunk progression without satisfying ``limit``.
+    # Fall through to the forward parser — the file is large but
+    # sparsely populated with valid envelopes (lots of dropped
+    # token_usage / malformed lines).
+    return parse_events_jsonl(
+        events_path, actor_fallback=actor_fallback,
+    )[-limit:]
+
+
+def _parse_tail_chunk(
+    events_path: Path,
+    *,
+    file_size: int,
+    chunk_size: int,
+    source_key: str,
+    actor_fallback: str,
+) -> list[MessageEnvelope] | None:
+    """Read ``chunk_size`` bytes from EOF, parse the lines, return envelopes.
+
+    Returns ``None`` to signal "give up, use the forward parser"
+    (e.g. multi-line JSON event broken across the seek boundary).
+    Raises ``UnicodeDecodeError`` / ``OSError`` on read failure — the
+    caller catches and falls back.
+    """
+    seek_offset = max(0, file_size - chunk_size)
+    with events_path.open("rb") as handle:
+        handle.seek(seek_offset)
+        raw = handle.read()
+    # Decode strictly so a mid-codepoint seek raises and the caller
+    # falls back. The forward parser uses ``errors="ignore"`` for
+    # fault tolerance, but here we'd rather bail than emit garbled
+    # text from a half-codepoint at the chunk head.
+    text = raw.decode("utf-8")
+
+    # Drop the first partial line unless we landed at byte 0 — the
+    # seek almost certainly bisected a line.
+    if seek_offset > 0:
+        newline_idx = text.find("\n")
+        if newline_idx < 0:
+            # No newline in the chunk at all — single huge line we
+            # can't tail-parse safely. Bail to the forward parser.
+            return None
+        # The byte AFTER the newline is the first complete line.
+        first_line_byte = seek_offset + len(
+            text[: newline_idx + 1].encode("utf-8"),
+        )
+        text = text[newline_idx + 1 :]
+    else:
+        first_line_byte = 0
+
+    envelopes: list[MessageEnvelope] = []
+    cursor = first_line_byte
+    for line in text.splitlines(keepends=True):
+        line_offset = cursor
+        cursor += len(line.encode("utf-8"))
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            logger.debug(
+                "chat.transcripts: skipping malformed tail line in %s @ %d",
+                events_path, line_offset,
+            )
+            continue
+        if not isinstance(event, dict):
+            continue
+        converted = _event_to_envelopes(
+            event,
+            offset=line_offset,
+            source_key=source_key,
+            actor_fallback=actor_fallback,
+        )
+        envelopes.extend(converted)
+    return envelopes
+
+
 def _event_to_envelopes(
     event: dict[str, Any],
     *,
@@ -969,5 +1175,6 @@ __all__ = [
     "is_archive_stale",
     "lookup_transcript_path",
     "parse_events_jsonl",
+    "parse_events_jsonl_tail",
     "resolve_transcript_path",
 ]

@@ -128,8 +128,36 @@ def _seed_cache(
     monkeypatch: pytest.MonkeyPatch,
     entries: dict[str, ProjectStateCacheEntry],
 ) -> ProjectStateCache:
+    # #2051 (Codex review): the cache-read boundary now requires the
+    # synthetic ``__workspace__`` entry to be present. Auto-seed an
+    # entry whose ``config_identity`` matches the FIRST stamped entry
+    # in ``entries`` so cross-config tests still exercise the identity
+    # guard (the workspace sentinel rides the same stamp). Tests that
+    # specifically want to omit the sentinel pass an explicit entry.
     cache = ProjectStateCache(refresh_fn=lambda k: None)
-    for key, entry in entries.items():
+    seeded = dict(entries)
+    if "__workspace__" not in seeded and seeded:
+        # Pick the first entry's stamp so cross-identity-mismatch tests
+        # don't have a workspace sentinel that masks the rejection.
+        sample = next(iter(seeded.values()))
+        identity = getattr(sample, "config_identity", "") or ""
+        seeded["__workspace__"] = ProjectStateCacheEntry(
+            project_key="__workspace__",
+            project_path=Path("/tmp/__workspace__"),
+            tracked=False,
+            state=None,
+            glyph="",
+            detail="",
+            rail_state=None,
+            rail_badge=None,
+            rail_sort_rank=0,
+            rail_reason="",
+            approvals_pending=0,
+            awaits_user_count=0,
+            awaits_user_items=(),
+            config_identity=identity,
+        )
+    for key, entry in seeded.items():
         cache._install_for_test(key, entry)
     monkeypatch.setattr("pollypm.state_cache.is_enabled", lambda: True)
     monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)

@@ -164,10 +164,28 @@ def _seed_cache(
     Avoids spinning up the real refresher (which would tail the audit
     log dir and run the full per-project compute). The cache itself
     is the real class; only its entries are pre-baked.
+
+    #2051 (Codex review): the cache-read boundary now treats a snapshot
+    missing the synthetic ``__workspace__`` entry as INCOMPLETE and
+    falls through to the direct sweep. Most parity tests assume the
+    fast-path is taken, so we auto-seed an empty ``__workspace__``
+    entry when the caller hasn't provided one. Tests that need to
+    exercise the absent-sentinel guard pass an explicit
+    ``__workspace__`` key (or use the dedicated fall-through tests
+    below).
     """
 
     cache = ProjectStateCache(refresh_fn=lambda k: None)
-    for key, entry in entries.items():
+    seeded = dict(entries)
+    if "__workspace__" not in seeded and seeded:
+        # Auto-seed an empty workspace sentinel so the fast-path stays
+        # available; callers that want the absent-sentinel behavior
+        # explicitly pass ``"__workspace__": <entry>`` or omit it via
+        # the dedicated test in TestPr2026ReviewBlocker3WorkspaceRootFallthrough.
+        seeded["__workspace__"] = _entry(
+            "__workspace__", state=None, items=[],
+        )
+    for key, entry in seeded.items():
         cache._install_for_test(key, entry)
     monkeypatch.setattr("pollypm.state_cache.is_enabled", lambda: True)
     monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
@@ -1598,12 +1616,21 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         # Per-project + workspace-root counts both contribute.
         assert counted == 2
 
-    def test_no_workspace_entry_still_serves_per_project_via_cache(
+    def test_no_workspace_entry_falls_through_to_direct_sweep(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Snapshot without a ``__workspace__`` entry — the cache
-        still serves per-project items from the fast-path. Absent
-        workspace entry contributes 0 to the union/count.
+        """Snapshot without a ``__workspace__`` entry — the cache MUST
+        fall through to the direct sweep (Codex review of #2051).
+
+        Inverted from the original ``…_still_serves_per_project_via_cache``
+        test which pinned the OPPOSITE behavior. The invariant is:
+        a snapshot missing the synthetic ``__workspace__`` sentinel is
+        an INCOMPLETE cache, not a proven-empty workspace inbox.
+        Serving the per-project items alone would silently drop any
+        workspace-root awaits-user rows the sentinel was supposed to
+        carry. Producers that bypass the audit-event invalidation path
+        (message-store alert/notification writes today) MUST be picked
+        up by the direct sweep.
         """
 
         monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
@@ -1611,27 +1638,91 @@ class TestPr2026ReviewBlocker3WorkspaceRootFallthrough:
         per_project = [
             _inbox_item(project="alpha", source="task", ident="alpha/1"),
         ]
-        entries = {
-            "alpha": _entry(
-                "alpha", state=ProjectState.WAITING, items=per_project,
-            ),
-        }
-        _seed_cache(monkeypatch, entries)
+        # Critically: no ``__workspace__`` entry. Build the cache by
+        # hand to bypass ``_seed_cache``'s auto-sentinel — this test
+        # exists precisely to exercise the absent-sentinel guard.
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry("alpha", state=ProjectState.WAITING, items=per_project),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
 
-        # Sampler-off so divergence comparator can't masquerade as a
-        # fall-through.
         cockpit_inbox._AWAITS_USER_DIVERGENCE_COUNTER = DivergenceCounter()
         direct_called = {"n": 0}
+        # Simulate the worst case: the workspace-root sweep finds a row
+        # the cache snapshot has no idea about.
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-missed",
+        )
 
         def _direct(_cfg: Any) -> list[Any]:
             direct_called["n"] += 1
-            return list(per_project)
+            return list(per_project) + [workspace_root]
 
         monkeypatch.setattr(
             cockpit_inbox, "_pm_inbox_awaits_user_list_uncached", _direct,
         )
         cockpit_inbox._AWAITS_USER_CACHE.clear()
         result = cockpit_inbox.pm_inbox_awaits_user_list(config)
-        assert direct_called["n"] == 0
-        assert len(result) == 1
+        # Direct sweep MUST have run — the cache-read boundary refused
+        # the incomplete snapshot.
+        assert direct_called["n"] == 1
+        ids = {
+            getattr(item, "message_id", None)
+            or getattr(item, "task_id", None)
+            for item in result
+        }
+        # The workspace-root row the cache missed is now in the result.
+        assert "ws-root-missed" in ids
+        assert "alpha/1" in ids
 
+    def test_no_workspace_entry_count_falls_through_to_direct_sweep(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Count helper mirrors the list-helper guard (Codex review of #2051).
+
+        Snapshot without ``__workspace__`` → fall through to the direct
+        sweep so the rail badge can't silently drop a workspace-root
+        row.
+        """
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        config = _make_config(["alpha"], tmp_path)
+        per_project = [
+            _inbox_item(project="alpha", source="task", ident="alpha/1"),
+        ]
+        # Same hand-rolled bypass as the sibling list test — auto-seed
+        # would mask the absent-sentinel behavior we're pinning.
+        cache = ProjectStateCache(refresh_fn=lambda k: None)
+        cache._install_for_test(
+            "alpha",
+            _entry("alpha", state=ProjectState.WAITING, items=per_project),
+        )
+        monkeypatch.setattr(
+            "pollypm.state_cache.is_enabled", lambda: True,
+        )
+        monkeypatch.setattr("pollypm.state_cache.get_cache", lambda: cache)
+
+        direct_called = {"n": 0}
+        workspace_root = _inbox_item(
+            project="inbox", source="message", ident="ws-root-missed-count",
+        )
+
+        def _direct(_cfg: Any) -> list[Any]:
+            direct_called["n"] += 1
+            return list(per_project) + [workspace_root]
+
+        monkeypatch.setattr(
+            cockpit_inbox,
+            "_pm_inbox_awaits_user_list_uncached",
+            _direct,
+        )
+        cockpit_inbox._AWAITS_USER_CACHE.clear()
+        counted = cockpit_inbox._count_inbox_tasks_for_label(config)
+        # Direct sweep ran via the list fall-through; count == 2.
+        assert direct_called["n"] >= 1
+        assert counted == 2

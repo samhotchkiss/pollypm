@@ -244,6 +244,9 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
       serve cross-config data when project keys overlap; the
       config-identity stamp catches this).
     * Any tracked project is missing from the snapshot (partial cache).
+    * The synthetic ``__workspace__`` entry is absent (#2051 — missing
+      sentinel is an incomplete cache, not a proven-empty workspace
+      inbox; Codex review of #2051).
     * Any unexpected exception (defensive — broken cache must never
       crash the rail badge).
 
@@ -307,12 +310,22 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     # project's items are included.
     if not known_projects.issubset(snapshot.keys()):
         return None
+    # #2051 (Codex review): the synthetic ``__workspace__`` entry is now
+    # authoritative for workspace-root awaits-user rows (scope IN ('',
+    # 'inbox')). If it's absent from the snapshot we MUST treat that as
+    # an incomplete cache, not a proven-empty workspace inbox — message-
+    # store writes (alerts, notifications) and `pm notify` rows can land
+    # before the refresher's initial full-refresh stamps the sentinel,
+    # and not every workspace-root producer emits an invalidating audit
+    # event. Falling through to the direct sweep is the safety net.
+    from pollypm.state_cache.refresh_impl import WORKSPACE_PROJECT_KEY
+    if WORKSPACE_PROJECT_KEY not in snapshot:
+        return None
     cached_items: list[object] = []
-    # #2051: the synthetic ``__workspace__`` entry carries workspace-root
+    # The synthetic ``__workspace__`` entry carries workspace-root
     # awaits-user items (messages with ``scope IN ('', 'inbox')`` that
     # don't belong to any tracked project). Union them first so the
     # returned list mirrors the direct sweep's content.
-    from pollypm.state_cache.refresh_impl import WORKSPACE_PROJECT_KEY
     workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
     if workspace_entry is not None:
         for item in getattr(workspace_entry, "awaits_user_items", ()) or ():
@@ -517,6 +530,13 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     :data:`pollypm.state_cache.refresh_impl.WORKSPACE_PROJECT_KEY`).
     The earlier workspace-root probe + forced fall-through were
     removed; the cache is now authoritative for those rows too.
+
+    Codex review of #2051: when the synthetic ``__workspace__`` entry
+    is ABSENT from the snapshot, the cache is incomplete (the sentinel
+    has not been refreshed yet, or the refresher has not seen an event
+    that touched workspace-root rows). Return ``None`` so the caller
+    falls back to the direct sweep — serving zero would silently drop
+    real workspace-root work.
     """
 
     try:
@@ -553,11 +573,19 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     # direct path so the badge stays correct during the boot-time gap.
     if not known_projects.issubset(snapshot.keys()):
         return None
-    total = 0
-    # #2051: pull the workspace-root awaits-user count off the
-    # synthetic ``__workspace__`` entry. Absent entry (cold workspace
-    # path, or sentinel never refreshed) contributes 0.
+    # #2051 (Codex review): a snapshot missing the synthetic
+    # ``__workspace__`` entry is an incomplete cache, NOT a proven-empty
+    # workspace inbox. Without the sentinel we cannot prove that no
+    # workspace-root awaits-user rows exist, so we MUST fall through to
+    # the direct sweep. See the sibling guard in
+    # :func:`_maybe_cache_route_awaits_user`.
     from pollypm.state_cache.refresh_impl import WORKSPACE_PROJECT_KEY
+    if WORKSPACE_PROJECT_KEY not in snapshot:
+        return None
+    total = 0
+    # Pull the workspace-root awaits-user count off the synthetic
+    # ``__workspace__`` entry. An entry that's present but empty
+    # contributes 0; an absent entry is handled by the guard above.
     workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
     if workspace_entry is not None:
         total += int(getattr(workspace_entry, "awaits_user_count", 0) or 0)

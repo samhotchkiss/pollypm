@@ -44,6 +44,7 @@ from pollypm.web_api.chat import (
     enumerate_chat_surfaces,
     is_archive_stale,
     parse_events_jsonl,
+    parse_events_jsonl_tail,
 )
 from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.routes._deps import ConfigDep
@@ -62,6 +63,14 @@ router = APIRouter(tags=["Chat"])
 # Spec §2.2: ``limit`` default 100, cap 500.
 DEFAULT_MESSAGE_LIMIT = 100
 MAX_MESSAGE_LIMIT = 500
+
+# Issue #2070: ``desc`` + small-limit + no-cursor + ``source=auto`` is
+# the common cockpit-poll shape. For requests under this threshold we
+# tail-read the JSONL archive instead of forward-readlining the full
+# file. The forward parser stays authoritative for ``asc``, cursor
+# paging, ``include_thinking``-style large-window queries, and the
+# strict ``source=jsonl`` validation path.
+TAIL_READ_LIMIT_THRESHOLD = 200
 
 
 SourceMode = Literal["auto", "jsonl", "capture"]
@@ -510,11 +519,23 @@ def _load_envelopes(
     surface: ChatSurface,
     *,
     source: SourceMode,
+    tail_hint: int | None = None,
 ) -> tuple[list[MessageEnvelope], str | None, Path | None]:
     """Return ``(envelopes, transcript_source, transcript_path)``.
 
     ``transcript_source`` is one of ``"jsonl"`` / ``"capture"`` /
     ``None`` (no transcript yet, spec §4.8).
+
+    ``tail_hint`` (issue #2070): when set to a small positive integer,
+    the ``source=auto`` JSONL branch uses ``parse_events_jsonl_tail``
+    instead of the full forward parse. The hint is the smallest number
+    of envelopes the caller would consider returning (the route uses
+    ``limit + 1`` so ``has_more`` can still detect overflow). Strict
+    ``source=jsonl`` callers ignore the hint — they want the
+    authoritative full parse so unreadable-archive errors propagate
+    cleanly. The hint must be paired with ``direction=desc`` + no
+    cursor + small ``limit`` at the call site (the helper doesn't
+    re-check those conditions).
 
     NOTE: thinking-block filtering is no longer plumbed through this
     helper. The authoritative ``parse_events_jsonl`` on main does not
@@ -559,10 +580,23 @@ def _load_envelopes(
     # source == "auto" — prefer JSONL, fall back to capture when the
     # archive is missing or stale (spec §4.7).
     if archive is not None and not is_archive_stale(archive):
-        envelopes = parse_events_jsonl(
-            archive,
-            actor_fallback=actor_fallback,
-        )
+        if tail_hint is not None and tail_hint > 0:
+            # Issue #2070: short cockpit polls only need the last N
+            # envelopes; tail-read keeps cold-path latency proportional
+            # to the request size instead of the full archive size.
+            # The parser falls back to the forward parse on any
+            # decode/parse failure, so semantics match the forward
+            # path for malformed archives.
+            envelopes = parse_events_jsonl_tail(
+                archive,
+                limit=tail_hint,
+                actor_fallback=actor_fallback,
+            )
+        else:
+            envelopes = parse_events_jsonl(
+                archive,
+                actor_fallback=actor_fallback,
+            )
         if envelopes:
             return envelopes, "jsonl", archive
         # Empty result on a fresh (non-stale) archive could be a
@@ -857,8 +891,25 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
     surface = _find_surface(config, session_name)
     since_dt = _parse_since(since)
 
+    # Issue #2070: tail-read only when the request shape is safe —
+    # ``direction=desc`` returns the newest N envelopes (which live at
+    # the file tail), no ``since_id`` cursor (paging beyond the head
+    # walks into older history the tail can't see), small ``limit``
+    # (large ``limit`` defeats the optimization), and ``source=auto``
+    # (strict ``source=jsonl`` wants the full parse so OSError
+    # propagates cleanly). The pad of ``+1`` lets the route's
+    # ``has_more`` detection still fire on the boundary.
+    tail_hint: int | None = None
+    if (
+        source == "auto"
+        and direction == "desc"
+        and since_id is None
+        and limit <= TAIL_READ_LIMIT_THRESHOLD
+    ):
+        tail_hint = limit + 1
+
     envelopes, transcript_source, transcript_path = _load_envelopes(
-        surface, source=source,
+        surface, source=source, tail_hint=tail_hint,
     )
 
     rows, has_more, next_cursor = _apply_filters_and_paginate(

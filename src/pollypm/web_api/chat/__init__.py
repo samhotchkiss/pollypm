@@ -43,6 +43,7 @@ from pollypm.web_api.chat.transcripts import (
     STALE_THRESHOLD_SECONDS,
     is_archive_stale,
     parse_events_jsonl,
+    parse_events_jsonl_tail,
     resolve_transcript_path,
 )
 
@@ -59,6 +60,7 @@ __all__ = [
     "enumerate_worker_surfaces",
     "is_archive_stale",
     "parse_events_jsonl",
+    "parse_events_jsonl_tail",
     "resolve_transcript_path",
     "synthesize_capture_id",
 ]

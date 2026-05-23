@@ -34,6 +34,7 @@ from pollypm.web_api.chat import (
     STALE_THRESHOLD_SECONDS,
     is_archive_stale,
     parse_events_jsonl,
+    parse_events_jsonl_tail,
     resolve_transcript_path,
 )
 from pollypm.web_api.chat import transcripts as transcripts_module
@@ -780,6 +781,220 @@ def test_parse_cache_lru_evicts_oldest_when_full(tmp_path: Path) -> None:
     assert len(transcripts_module._PARSE_CACHE) == transcripts_module._PARSE_CACHE_MAX
     assert oldest_path not in transcripts_module._PARSE_CACHE
     assert overflow in transcripts_module._PARSE_CACHE
+
+
+# ---------------------------------------------------------------------------
+# Tail-read fast path (issue #2070)
+#
+# The cockpit polls ``?limit=50&direction=desc`` every few seconds.
+# Before tail-read, the parser forward-readlined the full archive
+# every call — for 2,800-line operator transcripts the cost dominated
+# poll latency. ``parse_events_jsonl_tail`` reads from EOF in chunks
+# so cost scales with the requested limit, not the file size.
+# ---------------------------------------------------------------------------
+
+
+def _write_user_turn_lines(path: Path, count: int) -> None:
+    """Write ``count`` single-line user_turn events to ``path``.
+
+    Each event payload is unique so the test can verify ordering
+    (event index encoded in the text).
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        for idx in range(count):
+            handle.write(
+                json.dumps(_claude_event("user_turn", text=f"line-{idx}"))
+                + "\n",
+            )
+
+
+def test_parse_tail_returns_last_n_envelopes(tmp_path: Path) -> None:
+    """Tail of a 1k-line archive matches ``parse_events_jsonl(...)[-N:]``."""
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_user_turn_lines(events_path, 1000)
+
+    tail = parse_events_jsonl_tail(events_path, limit=50)
+    full_tail = parse_events_jsonl(events_path)[-50:]
+
+    # Clear the cache so the next assertion isn't comparing a tail
+    # against a cached full parse from above (the tail short-circuits
+    # to cache when populated).
+    assert len(tail) == 50
+    assert [env.text for env in tail] == [env.text for env in full_tail]
+    # Last envelope is the newest line we wrote.
+    assert tail[-1].text == "line-999"
+    assert tail[0].text == "line-950"
+
+
+def test_parse_tail_handles_file_smaller_than_chunk(tmp_path: Path) -> None:
+    """Whole-file fits in the first chunk: still returns the last N."""
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_user_turn_lines(events_path, 10)
+
+    tail = parse_events_jsonl_tail(events_path, limit=5)
+    assert [env.text for env in tail] == [f"line-{i}" for i in range(5, 10)]
+
+
+def test_parse_tail_limit_exceeds_file_returns_all(tmp_path: Path) -> None:
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_user_turn_lines(events_path, 3)
+
+    tail = parse_events_jsonl_tail(events_path, limit=50)
+    assert [env.text for env in tail] == ["line-0", "line-1", "line-2"]
+
+
+def test_parse_tail_missing_file_returns_empty(tmp_path: Path) -> None:
+    transcripts_module._parse_cache_clear()
+    assert parse_events_jsonl_tail(tmp_path / "missing.jsonl", limit=50) == []
+
+
+def test_parse_tail_empty_file_returns_empty(tmp_path: Path) -> None:
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    events_path.write_text("")
+    assert parse_events_jsonl_tail(events_path, limit=50) == []
+
+
+def test_parse_tail_zero_limit_returns_empty(tmp_path: Path) -> None:
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_user_turn_lines(events_path, 5)
+    assert parse_events_jsonl_tail(events_path, limit=0) == []
+
+
+def test_parse_tail_uses_mtime_cache_when_populated(tmp_path: Path) -> None:
+    """A populated mtime cache short-circuits the tail-read."""
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_user_turn_lines(events_path, 200)
+
+    # Populate the cache by calling the full parser.
+    parse_events_jsonl(events_path)
+    assert events_path in transcripts_module._PARSE_CACHE
+
+    # Tail should now read from the cached list, not the disk.
+    tail = parse_events_jsonl_tail(events_path, limit=10)
+    assert len(tail) == 10
+    assert tail[-1].text == "line-199"
+
+
+def test_parse_tail_does_not_populate_mtime_cache(tmp_path: Path) -> None:
+    """Tail returns a partial slice — caching it would poison the cache."""
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    _write_user_turn_lines(events_path, 100)
+
+    parse_events_jsonl_tail(events_path, limit=10)
+    assert events_path not in transcripts_module._PARSE_CACHE
+
+
+def test_parse_tail_falls_back_for_pretty_printed_event(tmp_path: Path) -> None:
+    """Pretty-printed JSON (multi-line event) trips the defensive fallback.
+
+    The tail parser is line-oriented (one JSON object per line). A
+    pretty-printed event spans multiple lines, so ``json.loads`` on
+    each line raises ``JSONDecodeError`` — the tail parser then sees
+    fewer than ``limit`` envelopes and either widens or falls back to
+    the forward parser. The forward parser also sees those lines as
+    malformed (the ingestor never emits pretty-printed events), but
+    the surrounding single-line events are still recovered. The
+    contract under test is "no exception escapes" — the route never
+    sees a parser crash for an oddly-shaped archive.
+    """
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    # Mix single-line + pretty-printed events. The pretty-printed
+    # block exercises the chunk-boundary code path: it spans multiple
+    # lines, none of which parse as standalone JSON.
+    pretty_event = json.dumps(
+        _claude_event("user_turn", text="pretty"),
+        indent=2,
+    )
+    single_lines = [
+        json.dumps(_claude_event("user_turn", text=f"good-{idx}"))
+        for idx in range(20)
+    ]
+    body = "\n".join(single_lines[:10]) + "\n" + pretty_event + "\n" + (
+        "\n".join(single_lines[10:]) + "\n"
+    )
+    events_path.write_text(body)
+
+    # Must not raise.
+    tail = parse_events_jsonl_tail(events_path, limit=5)
+    # The 5 most-recent valid envelopes are the last 5 good lines.
+    assert [env.text for env in tail] == [
+        f"good-{idx}" for idx in range(15, 20)
+    ]
+
+
+def test_parse_tail_falls_back_for_single_huge_line(tmp_path: Path) -> None:
+    """A single line larger than 1MB defeats the chunk progression.
+
+    The tail parser bails to the forward parser when even the largest
+    chunk lands inside one line (no newline in the chunk window).
+    """
+    transcripts_module._parse_cache_clear()
+    events_path = tmp_path / "events.jsonl"
+    # 1.5MB of single-line text (no newlines) — larger than the
+    # widest chunk in ``_TAIL_CHUNK_PROGRESSION``.
+    huge = "x" * (1_500_000)
+    events_path.write_text(huge + "\n")
+    # No valid envelopes, but must not raise.
+    tail = parse_events_jsonl_tail(events_path, limit=10)
+    assert tail == []
+
+
+def test_parse_tail_perf_beats_full_parse_on_10k_archive(tmp_path: Path) -> None:
+    """Tail must be ≥50× faster than the full forward parse on a 10k file.
+
+    The mtime cache is cleared between calls so we're comparing
+    cold-path cost (the exact case the optimization targets).
+    """
+    events_path = tmp_path / "events.jsonl"
+    _write_user_turn_lines(events_path, 10_000)
+
+    # Warm Python's I/O caches by reading the file once before
+    # measuring. The OS page cache makes the second read deterministic
+    # — we're measuring CPU + parse cost, not first-touch I/O.
+    transcripts_module._parse_cache_clear()
+    parse_events_jsonl(events_path)
+
+    # Cold-path full parse: cache cleared, must re-read + re-translate
+    # the entire file.
+    transcripts_module._parse_cache_clear()
+    full_start = time.perf_counter()
+    full_envelopes = parse_events_jsonl(events_path)
+    full_elapsed = time.perf_counter() - full_start
+    assert len(full_envelopes) == 10_000
+
+    # Cold-path tail: same cleared cache, must return the same final
+    # 50 envelopes as ``full_envelopes[-50:]``.
+    transcripts_module._parse_cache_clear()
+    tail_start = time.perf_counter()
+    tail_envelopes = parse_events_jsonl_tail(events_path, limit=50)
+    tail_elapsed = time.perf_counter() - tail_start
+    assert len(tail_envelopes) == 50
+    assert [env.text for env in tail_envelopes] == [
+        env.text for env in full_envelopes[-50:]
+    ]
+
+    # Issue #2070 acceptance: tail wall-clock under 5ms.
+    assert tail_elapsed < 0.005, (
+        f"tail took {tail_elapsed * 1000:.2f}ms — expected <5ms"
+    )
+    # And at least 50× faster than the full parse. We compare ratios
+    # rather than absolute times so the test stays robust on slower
+    # CI machines (full parse scales with file size; tail does not).
+    speedup = full_elapsed / max(tail_elapsed, 1e-9)
+    assert speedup >= 50.0, (
+        f"speedup was {speedup:.1f}× — expected ≥50× "
+        f"(full {full_elapsed * 1000:.2f}ms vs tail "
+        f"{tail_elapsed * 1000:.2f}ms)"
+    )
 
 
 # ---------------------------------------------------------------------------

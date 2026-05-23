@@ -1238,8 +1238,10 @@ def test_include_subagents_does_not_poison_cache_for_subsequent_default_request(
     # archive. The cached envelopes are the same objects we just
     # enriched; if the enrichment was in-place they would still carry
     # ``subagent_transcript`` and leak it into the next request.
-    assert parent_archive.resolve() in _PARSE_CACHE
-    cached_mtime, cached_envelopes, _ = _PARSE_CACHE[parent_archive.resolve()]
+    assert (parent_archive.resolve(), False) in _PARSE_CACHE
+    cached_mtime, cached_envelopes, _ = _PARSE_CACHE[
+        (parent_archive.resolve(), False)
+    ]
     assert cached_mtime == initial_mtime
     for env in cached_envelopes:
         assert "subagent_transcript" not in (env.metadata or {}), (

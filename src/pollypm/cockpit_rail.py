@@ -2160,10 +2160,11 @@ class CockpitRouter:
             # refresher's alert read failed, the entry's rail_state /
             # actionable_key were computed without alert overlay
             # (``_open_alerts_for`` returns ``([], False)`` on any
-            # supervisor/store failure). Serving that entry would hide
-            # an actionable RED alert from a later render whose
-            # ``supervisor.open_alerts()`` succeeds. Decline so the
-            # direct path can run with the live alerts argument.
+            # ``pollypm.storage.pg_alerts.open_alerts`` failure).
+            # Serving that entry would hide an actionable RED alert
+            # from a later direct-path render whose own
+            # ``supervisor.open_alerts()`` read succeeds. Decline so
+            # the direct path can run with the live alerts argument.
             if not getattr(entry, "alerts_snapshot_valid", True):
                 return None
             rollups[project_key] = ProjectStateRollup(

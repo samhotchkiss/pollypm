@@ -198,10 +198,10 @@ class StateCacheRefresher:
         # to pre-fetch the workspace-wide actionable-alert snapshot
         # ONCE per sweep (``_initial_full_refresh`` /
         # ``_worker_once``). Without this each per-project refresh
-        # would call ``_open_alerts_for(config)`` — Supervisor
-        # construction + open_alerts read — N times per sweep, all
-        # under the cache lock. With it, every sweep that touches >1
-        # project pays for exactly one alert read.
+        # would call ``_open_alerts_for(config)`` —
+        # ``pollypm.storage.pg_alerts.open_alerts`` read — N times per
+        # sweep, all under the cache lock. With it, every sweep that
+        # touches >1 project pays for exactly one alert read.
         self._config_provider = config_provider
         self._positions: dict[Path, _Position] = {}
         self._stop_event = threading.Event()
@@ -271,8 +271,9 @@ class StateCacheRefresher:
         PR #2085 round-2 boundary fix: workspace-wide alert snapshot
         is fetched ONCE before the per-project loop and threaded
         through every ``cache.refresh`` call. Without this, a
-        workspace with N projects paid N × Supervisor construction
-        per sweep — all under the cache lock.
+        workspace with N projects paid N ×
+        ``pollypm.storage.pg_alerts.open_alerts`` reads per sweep —
+        all under the cache lock.
         """
 
         keys = self._candidate_keys()
@@ -436,10 +437,10 @@ class StateCacheRefresher:
         """Return kwargs to plumb through every refresh in one sweep.
 
         PR #2085 round-2 boundary fix: ``_open_alerts_for(config)``
-        constructs a :class:`Supervisor` + reads ``open_alerts()`` —
-        a workspace-wide read. When the sweep touches >1 project,
+        reads :func:`pollypm.storage.pg_alerts.open_alerts` — a
+        workspace-wide query. When the sweep touches >1 project,
         doing this once and passing the result through reduces the
-        per-sweep cost from N × Supervisor reads to 1.
+        per-sweep cost from N × pg_alerts reads to 1.
 
         Single-project sweeps (drain has one key, single-project
         event-triggered refreshes) skip the pre-fetch — the

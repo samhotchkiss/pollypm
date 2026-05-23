@@ -6797,6 +6797,16 @@ class PollyInboxApp(App[None]):
         replies: list = []
         rollup_items_raw: list = []
         fetch_error: str | None = None
+        # #1969 (Codex review on PR #2077): the plan-review detail path
+        # has TWO more disk/storage helpers that ran on the UI thread
+        # before this refactor — ``_plan_content_for_review`` (loads
+        # config + reads the canonical plan markdown off disk) and
+        # ``_plan_review_discussion_marker_exists`` (opens the work
+        # service and runs ``get_context``). Precompute both here on the
+        # worker thread so the applier consumes pure data and never
+        # touches the filesystem or the store.
+        plan_content_precomputed: str | None = None
+        discussion_marker_precomputed: bool | None = None
         try:
             task = svc.get(task_id)
             replies = svc.list_replies(task_id)
@@ -6804,6 +6814,45 @@ class PollyInboxApp(App[None]):
                 svc.get_context(task_id, entry_type="rollup_item")
                 if _task_is_rollup(task) else []
             )
+            task_labels_for_precompute = list(
+                getattr(task, "labels", []) or []
+            )
+            if "plan_review" in task_labels_for_precompute:
+                plan_review_meta_pre = _extract_plan_review_meta(
+                    task_labels_for_precompute,
+                )
+                try:
+                    plan_content_precomputed = _plan_content_for_review(
+                        plan_review_meta_pre,
+                        getattr(self, "config_path", None),
+                    )
+                except Exception:  # noqa: BLE001
+                    plan_content_precomputed = None
+                # Mirror the label-hint short-circuit: only resolve the
+                # discussion-marker store lookup when the reply thread
+                # doesn't already prove the round-trip.
+                requester_for_round_trip = (
+                    (task.roles or {}).get("requester", "user")
+                    if hasattr(task, "roles") else "user"
+                )
+                try:
+                    replies_round_trip = _plan_review_has_round_trip(
+                        replies, requester=requester_for_round_trip,
+                    )
+                except Exception:  # noqa: BLE001
+                    replies_round_trip = False
+                if replies_round_trip:
+                    discussion_marker_precomputed = True
+                else:
+                    try:
+                        marker_existing = svc.get_context(
+                            task_id,
+                            entry_type=_PLAN_REVIEW_DISCUSSION_ENTRY_TYPE,
+                            limit=1,
+                        )
+                        discussion_marker_precomputed = bool(marker_existing)
+                    except Exception:  # noqa: BLE001
+                        discussion_marker_precomputed = False
         except Exception as exc:  # noqa: BLE001
             fetch_error = str(exc)
         finally:
@@ -6832,6 +6881,7 @@ class PollyInboxApp(App[None]):
             self.call_from_thread(
                 self._apply_hydrated_detail,
                 task_id, item, task, replies, rollup_items_raw, review_block,
+                plan_content_precomputed, discussion_marker_precomputed,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -6852,19 +6902,31 @@ class PollyInboxApp(App[None]):
         replies: list,
         rollup_items_raw: list,
         review_block: str | None,
+        plan_content_precomputed: str | None = None,
+        discussion_marker_precomputed: bool | None = None,
     ) -> None:
         """UI-thread applier for ``_hydrate_detail_worker``.
 
         Mirrors the back half of ``_render_detail`` but consumes the
         pre-fetched payload instead of doing IO inline. Stale-guard
         first so we never paint data over a row the user moved off.
+
+        ``plan_content_precomputed`` and ``discussion_marker_precomputed``
+        are populated by the worker for plan-review rows so the section
+        builder + label-hint applier never reach for the filesystem or
+        the work store on the UI loop (Codex review on PR #2077).
         """
         if self._hydration_target_is_stale(task_id):
             return
         self._set_reply_mode_for_task()
-        sections = self._detail_build_sections(task)
+        sections = self._detail_build_sections(
+            task, plan_content_precomputed=plan_content_precomputed,
+        )
         self._detail_append_thread(sections, replies)
-        self._detail_apply_label_hints(task, task_id, item, replies)
+        self._detail_apply_label_hints(
+            task, task_id, item, replies,
+            discussion_marker_precomputed=discussion_marker_precomputed,
+        )
         if review_block:
             sections.append("")
             sections.append("[dim]── review artifact ──[/dim]")
@@ -7822,8 +7884,21 @@ class PollyInboxApp(App[None]):
             except Exception:  # noqa: BLE001
                 pass
 
-    def _detail_build_sections(self, task) -> list[str]:
-        """Build the section list (header + meta + triage + body)."""
+    def _detail_build_sections(
+        self,
+        task,
+        *,
+        plan_content_precomputed: str | None = None,
+    ) -> list[str]:
+        """Build the section list (header + meta + triage + body).
+
+        When ``plan_content_precomputed`` is provided, the plan-review
+        body branch uses it directly instead of calling
+        ``_plan_content_for_review`` (which loads config + reads the
+        plan markdown off disk). The off-UI-loop hydration worker
+        (#1969 / PR #2077) passes this so plan-review formatting on the
+        Textual loop is pure.
+        """
         from pollypm.tz import format_relative
 
         updated_iso = (
@@ -7879,13 +7954,19 @@ class PollyInboxApp(App[None]):
         # Users on a remote TUI cannot click through to a local file.
         _task_labels_for_body = list(getattr(task, "labels", []) or [])
         if "plan_review" in _task_labels_for_body:
-            _plan_review_meta_for_body = _extract_plan_review_meta(
-                _task_labels_for_body,
-            )
-            _plan_text_for_body = _plan_content_for_review(
-                _plan_review_meta_for_body,
-                getattr(self, "config_path", None),
-            )
+            if plan_content_precomputed is not None:
+                # Hot path from the off-UI-loop hydration worker — the
+                # worker already loaded the plan content off disk so the
+                # applier never re-enters the file/config IO here.
+                _plan_text_for_body = plan_content_precomputed
+            else:
+                _plan_review_meta_for_body = _extract_plan_review_meta(
+                    _task_labels_for_body,
+                )
+                _plan_text_for_body = _plan_content_for_review(
+                    _plan_review_meta_for_body,
+                    getattr(self, "config_path", None),
+                )
             if _plan_text_for_body:
                 sections.append(
                     _md_to_rich(_escape_body(_plan_text_for_body))
@@ -7916,9 +7997,23 @@ class PollyInboxApp(App[None]):
             sections.append(_md_to_rich(_escape_body(entry.text)))
 
     def _detail_apply_label_hints(
-        self, task, task_id: str, item, replies: list,
+        self,
+        task,
+        task_id: str,
+        item,
+        replies: list,
+        *,
+        discussion_marker_precomputed: bool | None = None,
     ) -> None:
-        """Update the hint bar + state caches based on label-driven affordances."""
+        """Update the hint bar + state caches based on label-driven affordances.
+
+        When ``discussion_marker_precomputed`` is provided, the
+        plan-review round-trip resolution uses it directly instead of
+        opening a work service and running ``get_context`` on the UI
+        thread (Codex review on PR #2077). The off-UI-loop hydration
+        worker passes the precomputed boolean so this method stays
+        pure UI-state mutation on the Textual loop.
+        """
         # Improvement-proposal detection (#275). Proposal items carry a
         # ``proposal`` label; when present, swap the hint bar for the
         # accept/reject keybindings. The body itself already embeds the
@@ -7937,13 +8032,20 @@ class PollyInboxApp(App[None]):
         if _is_plan_review:
             meta = _extract_plan_review_meta(_labels)
             self._plan_review_meta[task_id] = meta
-            round_trip = _plan_review_has_round_trip(
-                replies, requester=(task.roles or {}).get("requester", "user"),
-            )
-            if not round_trip:
-                round_trip = self._plan_review_discussion_marker_exists(
-                    item, task_id,
+            if discussion_marker_precomputed is not None:
+                # Worker pre-resolved the round-trip (reply heuristic
+                # OR the store-backed discussion marker) so the applier
+                # never opens a work service on the UI loop.
+                round_trip = bool(discussion_marker_precomputed)
+            else:
+                round_trip = _plan_review_has_round_trip(
+                    replies,
+                    requester=(task.roles or {}).get("requester", "user"),
                 )
+                if not round_trip:
+                    round_trip = self._plan_review_discussion_marker_exists(
+                        item, task_id,
+                    )
             self._plan_review_round_trip[task_id] = round_trip
             self._update_hint_for_plan_review(
                 fast_track=meta.get("fast_track", False),

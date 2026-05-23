@@ -331,3 +331,237 @@ def test_apply_hydrated_detail_renders_when_selection_still_matches(
     assert "header" in painted
     assert "review artifact" in painted
     assert "review-text" in painted
+
+
+# ---------------------------------------------------------------------------
+# Plan-review precomputed-payload invariants (Codex review on PR #2077)
+# ---------------------------------------------------------------------------
+
+
+def test_plan_review_hydration_precomputes_disk_and_store_lookups_off_ui_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Plan-review hydration must NOT call ``_plan_content_for_review``
+    or ``_plan_review_discussion_marker_exists`` from the UI-thread
+    applier — both have to be precomputed inside the worker so
+    ``_apply_hydrated_detail`` stays pure formatting.
+
+    Regression for the Codex review comment on PR #2077: even after
+    #1969 deferred the work-service open + task fetch, the
+    plan-review detail still leaked filesystem (canonical plan
+    markdown load + config load) and store (work-service
+    ``get_context``) calls into the section-builder + label-hint
+    applier when the worker callback ran.
+    """
+    from pollypm import cockpit_ui as cockpit_ui_module
+    from pollypm.cockpit_ui import PollyInboxApp
+
+    app = _make_inbox_app(tmp_path)
+    app._selected_task_id = "proj/plan-task-1"
+    app._pending_detail_hydration_task_id = "proj/plan-task-1"
+
+    item = SimpleNamespace(
+        task_id="proj/plan-task-1",
+        project="proj",
+        description="plan body",
+        title="Plan review",
+        labels=["plan_review", "project:proj"],
+        roles={"requester": "user"},
+    )
+    app._item_for_id = lambda _id: item  # type: ignore[method-assign]
+    app._project_key_is_unknown = lambda _key: False  # type: ignore[method-assign]
+    monkeypatch.setattr(
+        "pollypm.cockpit_ui.is_task_inbox_entry",
+        lambda _item: True,
+    )
+
+    plan_task = SimpleNamespace(
+        task_id="proj/plan-task-1",
+        title="Plan review",
+        description="plan body",
+        project="proj",
+        priority=SimpleNamespace(value="normal"),
+        labels=["plan_review", "project:proj"],
+        roles={"requester": "user"},
+        updated_at=None,
+        created_at=None,
+        triage_bucket="action",
+    )
+
+    # Work service: ``get_context`` is invoked from the worker for
+    # both the rollup-items branch (skipped — task is not a rollup)
+    # and the discussion-marker branch (the precompute we're verifying
+    # lives off the UI loop). Mock returns [] so the marker resolves
+    # to False without raising.
+    svc = MagicMock()
+    svc.get.return_value = plan_task
+    svc.list_replies.return_value = []
+    svc.get_context.return_value = []
+    app._resolve_inbox_svc = lambda *_a, **_kw: svc  # type: ignore[method-assign]
+    app._render_inline_review_artifact = lambda _task: None  # type: ignore[method-assign]
+
+    # Avoid the rollup branch entirely.
+    monkeypatch.setattr(
+        "pollypm.cockpit_ui._task_is_rollup", lambda _t: False,
+    )
+
+    # Counter-stubs for the two helpers Codex flagged. We assert these
+    # are touched ONLY during the worker run (not during the applier).
+    plan_content_calls: list[tuple] = []
+
+    def fake_plan_content_for_review(meta, config_path):
+        plan_content_calls.append((dict(meta or {}), config_path))
+        return "## plan body precomputed off UI loop"
+
+    # ``_plan_content_for_review`` is imported into ``cockpit_ui`` at
+    # module load time — patch the binding callers actually resolve.
+    monkeypatch.setattr(
+        cockpit_ui_module,
+        "_plan_content_for_review",
+        fake_plan_content_for_review,
+    )
+
+    discussion_marker_calls: list[tuple] = []
+
+    def fake_discussion_marker_exists(_self, _item, _task_id):
+        discussion_marker_calls.append((_item, _task_id))
+        return False
+
+    monkeypatch.setattr(
+        PollyInboxApp,
+        "_plan_review_discussion_marker_exists",
+        fake_discussion_marker_exists,
+    )
+
+    # Capture the payload the worker dispatches to the applier so we
+    # can replay it without going through ``call_from_thread``.
+    dispatches: list[tuple] = []
+    app.call_from_thread = lambda fn, *a, **kw: dispatches.append((fn, a, kw))  # type: ignore[method-assign]
+
+    # --- WORKER PHASE -----------------------------------------------------
+    app._hydrate_detail_worker("proj/plan-task-1")
+
+    # Worker must have precomputed the plan content off the UI loop.
+    assert len(plan_content_calls) == 1, (
+        "expected _plan_content_for_review to fire exactly once — "
+        "from the worker thread, precomputing the plan body for the "
+        "applier"
+    )
+    # Worker must have precomputed the discussion-marker via the work
+    # service — replies are empty so the round-trip heuristic fell
+    # through to the store lookup. The worker uses ``svc.get_context``
+    # directly (not the helper method on the app) to avoid re-opening
+    # a second work service, so we assert the svc surface here AND
+    # confirm the helper method itself was NEVER reached on either
+    # the worker OR the applier path.
+    marker_get_context_calls = [
+        call for call in svc.get_context.call_args_list
+        if call.kwargs.get("entry_type") == "plan_review_discussed"
+    ]
+    assert len(marker_get_context_calls) == 1, (
+        "expected exactly one svc.get_context call with the plan-"
+        "review discussion entry-type — the worker's precompute"
+    )
+    assert discussion_marker_calls == [], (
+        "the dedicated _plan_review_discussion_marker_exists helper "
+        "must NOT be invoked from either the worker or the applier "
+        "(the worker calls svc.get_context directly to avoid opening "
+        "a second work service)"
+    )
+
+    # Exactly one dispatch — the success-path applier — with the
+    # precomputed plan content + discussion-marker bool in the
+    # positional payload.
+    assert len(dispatches) == 1
+    fn, args, _ = dispatches[0]
+    assert fn == app._apply_hydrated_detail
+    # Positional layout: task_id, item, task, replies, rollup, review_block,
+    # plan_content_precomputed, discussion_marker_precomputed
+    assert args[0] == "proj/plan-task-1"
+    assert args[6] == "## plan body precomputed off UI loop"
+    assert args[7] is False
+
+    # --- APPLIER PHASE ----------------------------------------------------
+    # Reset counters so the next phase's assertions only see calls
+    # made by the applier itself.
+    plan_content_calls.clear()
+    discussion_marker_calls.clear()
+    svc.get_context.reset_mock()
+
+    # Stub helpers the applier reaches that aren't relevant to the
+    # disk/store invariant we're asserting. We replace the section
+    # builder + label-hint applier with capture-stubs so we can
+    # assert the precomputed payload reached them — and so the
+    # underlying ``_format_sender`` / ``_resolve_pm_target`` chain
+    # (which expects more attrs than this SimpleNamespace carries)
+    # does not run inside the unit test.
+    build_section_calls: list[dict] = []
+
+    def fake_build_sections(_task, **kwargs):
+        build_section_calls.append(kwargs)
+        return ["[plan-review-header]", kwargs.get("plan_content_precomputed", "")]
+
+    app._detail_build_sections = fake_build_sections  # type: ignore[method-assign]
+
+    label_hint_calls: list[dict] = []
+
+    def fake_label_hints(_task, _task_id, _item, _replies, **kwargs):
+        label_hint_calls.append(kwargs)
+        # Mirror the real applier's round-trip state write so we can
+        # assert the precomputed bool flowed through, not a re-lookup.
+        marker = kwargs.get("discussion_marker_precomputed")
+        if marker is not None:
+            app._plan_review_round_trip[_task_id] = bool(marker)
+
+    app._detail_apply_label_hints = fake_label_hints  # type: ignore[method-assign]
+
+    app._render_rollup_items = MagicMock()  # type: ignore[method-assign]
+    app.query_one = MagicMock(side_effect=Exception("no UI in unit test"))  # type: ignore[method-assign]
+    app._set_reply_mode_for_task = MagicMock()  # type: ignore[method-assign]
+
+    # Replay the worker's payload synchronously — this is what
+    # ``call_from_thread`` would do on the UI loop.
+    fn(*args)
+
+    # CRITICAL: neither disk nor store helper is touched during the
+    # applier. All the plan-review content + round-trip state came
+    # from the precomputed payload.
+    assert plan_content_calls == [], (
+        "_plan_content_for_review fired during _apply_hydrated_detail "
+        "— plan-review hydration is leaking filesystem IO back onto "
+        "the Textual UI loop"
+    )
+    assert discussion_marker_calls == [], (
+        "_plan_review_discussion_marker_exists fired during "
+        "_apply_hydrated_detail — plan-review hydration is leaking "
+        "work-service IO back onto the Textual UI loop"
+    )
+    marker_get_context_calls_during_apply = [
+        call for call in svc.get_context.call_args_list
+        if call.kwargs.get("entry_type") == "plan_review_discussed"
+    ]
+    assert marker_get_context_calls_during_apply == [], (
+        "svc.get_context for the plan-review discussion marker fired "
+        "during the applier — the worker's precompute is being "
+        "bypassed"
+    )
+
+    # The applier forwarded the precomputed payload into the section
+    # builder + label-hint applier.
+    assert len(build_section_calls) == 1
+    assert (
+        build_section_calls[0].get("plan_content_precomputed")
+        == "## plan body precomputed off UI loop"
+    )
+    assert len(label_hint_calls) == 1
+    assert label_hint_calls[0].get("discussion_marker_precomputed") is False
+
+    # Applier produced output and surfaced the precomputed plan body
+    # in the rendered detail pane.
+    assert len(app._detail_writes) == 1
+    painted = app._detail_writes[0]
+    assert "plan body precomputed off UI loop" in painted
+
+    # Round-trip state was set from the precomputed bool (False here:
+    # no replies, store-marker absent), not by re-running the lookup.
+    assert app._plan_review_round_trip.get("proj/plan-task-1") is False

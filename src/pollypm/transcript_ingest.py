@@ -255,8 +255,29 @@ def _normalize_claude_line(
                 )
             )
     elif line_type == "assistant":
-        text = _extract_text(content or message)
-        if text:
+        # Walk Anthropic content blocks in provider order so the
+        # emitted events match the block sequence. This is the
+        # contract the parser-internal THINKING envelope relies on
+        # (issue #2048, PR #2079 review): when content is
+        # ``[thinking, text]`` the consumer must see ``thinking``
+        # BEFORE the ``assistant_turn``, otherwise replay tooling
+        # and UI grouping reverse the provider order.
+        #
+        # Contiguous ``text`` blocks coalesce into a single
+        # ``assistant_turn`` payload (mirrors :func:`_extract_text`
+        # joining with ``\n``) so the existing wire shape for the
+        # text-only case is unchanged. ``thinking`` / ``tool_use``
+        # / ``tool_result`` blocks flush any pending text run
+        # first so position is faithful.
+        text_run: list[str] = []
+
+        def _flush_text_run() -> None:
+            if not text_run:
+                return
+            joined = "\n".join(text_run).strip()
+            text_run.clear()
+            if not joined:
+                return
             events.append(
                 _event_base(
                     event_type="assistant_turn",
@@ -269,9 +290,114 @@ def _normalize_claude_line(
                     source_offset=source_offset,
                     cwd=cwd,
                     model_name=model_name,
-                    payload={"text": text},
+                    payload={"text": joined},
                 )
             )
+
+        if isinstance(content, list):
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type")
+                if item_type == "text":
+                    text_value = item.get("text")
+                    if isinstance(text_value, str) and text_value:
+                        text_run.append(text_value)
+                elif item_type == "thinking":
+                    # Anthropic thinking blocks ship as
+                    # ``{"type": "thinking", "thinking": "<text>",
+                    #   "signature": "<opaque>"}`` (extended
+                    # thinking). Preserve the block verbatim under
+                    # ``payload`` so downstream consumers (chat
+                    # API, replay tooling) can render it without
+                    # re-fetching the raw JSONL. See GitHub #2048
+                    # for the envelope contract.
+                    _flush_text_run()
+                    thinking_text = item.get("thinking")
+                    if not isinstance(thinking_text, str):
+                        thinking_text = ""
+                    events.append(
+                        _event_base(
+                            event_type="thinking",
+                            session_id=session_id,
+                            account_name=account_name,
+                            provider=account.provider.value,
+                            project_key=project_key,
+                            timestamp=timestamp,
+                            source_path=source_path,
+                            source_offset=source_offset,
+                            cwd=cwd,
+                            model_name=model_name,
+                            payload={
+                                "text": thinking_text,
+                                "signature": item.get("signature") or "",
+                                "raw": item,
+                            },
+                        )
+                    )
+                elif item_type == "tool_use":
+                    _flush_text_run()
+                    events.append(
+                        _event_base(
+                            event_type="tool_call",
+                            session_id=session_id,
+                            account_name=account_name,
+                            provider=account.provider.value,
+                            project_key=project_key,
+                            timestamp=timestamp,
+                            source_path=source_path,
+                            source_offset=source_offset,
+                            cwd=cwd,
+                            model_name=model_name,
+                            payload=item,
+                        )
+                    )
+                elif item_type == "tool_result":
+                    _flush_text_run()
+                    events.append(
+                        _event_base(
+                            event_type="tool_result",
+                            session_id=session_id,
+                            account_name=account_name,
+                            provider=account.provider.value,
+                            project_key=project_key,
+                            timestamp=timestamp,
+                            source_path=source_path,
+                            source_offset=source_offset,
+                            cwd=cwd,
+                            model_name=model_name,
+                            payload=item,
+                        )
+                    )
+            _flush_text_run()
+        else:
+            # Non-list content (string or dict) — preserve the
+            # legacy single ``assistant_turn`` emission for shapes
+            # that never carried thinking / tool blocks.
+            text = _extract_text(content or message)
+            if text:
+                events.append(
+                    _event_base(
+                        event_type="assistant_turn",
+                        session_id=session_id,
+                        account_name=account_name,
+                        provider=account.provider.value,
+                        project_key=project_key,
+                        timestamp=timestamp,
+                        source_path=source_path,
+                        source_offset=source_offset,
+                        cwd=cwd,
+                        model_name=model_name,
+                        payload={"text": text},
+                    )
+                )
+
+        # Token usage is metadata about the message envelope, not
+        # a content block. Emit it AFTER the content walk so it
+        # follows the assistant content in normalized order —
+        # callers that group by message can still associate it
+        # with the preceding ``assistant_turn`` / ``thinking``
+        # cluster via ``session_id`` + ``source_offset``.
         usage = message.get("usage")
         if isinstance(usage, dict):
             total_tokens = usage.get("total_tokens")
@@ -296,72 +422,6 @@ def _normalize_claude_line(
                         payload={"usage": usage, "total_tokens": int(total_tokens)},
                     )
                 )
-        if isinstance(content, list):
-            for item in content:
-                if not isinstance(item, dict):
-                    continue
-                if item.get("type") == "tool_use":
-                    events.append(
-                        _event_base(
-                            event_type="tool_call",
-                            session_id=session_id,
-                            account_name=account_name,
-                            provider=account.provider.value,
-                            project_key=project_key,
-                            timestamp=timestamp,
-                            source_path=source_path,
-                            source_offset=source_offset,
-                            cwd=cwd,
-                            model_name=model_name,
-                            payload=item,
-                        )
-                    )
-                elif item.get("type") == "tool_result":
-                    events.append(
-                        _event_base(
-                            event_type="tool_result",
-                            session_id=session_id,
-                            account_name=account_name,
-                            provider=account.provider.value,
-                            project_key=project_key,
-                            timestamp=timestamp,
-                            source_path=source_path,
-                            source_offset=source_offset,
-                            cwd=cwd,
-                            model_name=model_name,
-                            payload=item,
-                        )
-                    )
-                elif item.get("type") == "thinking":
-                    # Anthropic thinking blocks ship as
-                    # ``{"type": "thinking", "thinking": "<text>",
-                    #   "signature": "<opaque>"}`` (extended thinking).
-                    # Preserve the block verbatim under ``payload`` so
-                    # downstream consumers (chat API, replay tooling)
-                    # can render it without re-fetching the raw JSONL.
-                    # See GitHub #2048 for the envelope contract.
-                    thinking_text = item.get("thinking")
-                    if not isinstance(thinking_text, str):
-                        thinking_text = ""
-                    events.append(
-                        _event_base(
-                            event_type="thinking",
-                            session_id=session_id,
-                            account_name=account_name,
-                            provider=account.provider.value,
-                            project_key=project_key,
-                            timestamp=timestamp,
-                            source_path=source_path,
-                            source_offset=source_offset,
-                            cwd=cwd,
-                            model_name=model_name,
-                            payload={
-                                "text": thinking_text,
-                                "signature": item.get("signature") or "",
-                                "raw": item,
-                            },
-                        )
-                    )
     elif line_type == "error":
         events.append(
             _event_base(

@@ -236,6 +236,125 @@ def test_thinking_cache_does_not_leak_between_flag_values(tmp_path: Path) -> Non
     ]
 
 
+def test_include_thinking_preserves_content_block_order_via_ingestor(
+    tmp_path: Path,
+) -> None:
+    """Full pipeline preserves Anthropic content-block order.
+
+    Codex review on PR #2079: for a raw Claude assistant message
+    whose ``content`` is ``[thinking, text]``, the normalized
+    events must surface in ``[thinking, assistant_turn, ...]``
+    order so :func:`parse_events_jsonl` with
+    ``include_thinking=True`` returns envelopes that match the
+    provider block sequence — i.e. the THINKING envelope BEFORE
+    the TEXT envelope. The previous implementation flushed the
+    flattened text first then walked content for thinking,
+    reversing the order.
+    """
+    # Late imports keep the heavy ``sync_transcripts_once`` import
+    # off the module path used by the parser-only tests above.
+    from pollypm.models import (
+        AccountConfig,
+        KnownProject,
+        PollyPMConfig,
+        PollyPMSettings,
+        ProjectKind,
+        ProjectSettings,
+        ProviderKind,
+        SessionConfig,
+    )
+    from pollypm.transcript_ingest import sync_transcripts_once
+
+    project_root = tmp_path / "repo"
+    project_root.mkdir()
+    config = PollyPMConfig(
+        project=ProjectSettings(
+            name="pollypm",
+            root_dir=project_root,
+            base_dir=project_root / ".pollypm",
+            logs_dir=project_root / ".pollypm/logs",
+            snapshots_dir=project_root / ".pollypm/snapshots",
+            state_db=project_root / ".pollypm/state.db",
+        ),
+        pollypm=PollyPMSettings(controller_account="claude_main"),
+        accounts={
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+                home=project_root / ".pollypm/homes/claude_main",
+            ),
+        },
+        sessions={
+            "heartbeat": SessionConfig(
+                name="heartbeat",
+                role="heartbeat-supervisor",
+                provider=ProviderKind.CLAUDE,
+                account="claude_main",
+                cwd=project_root,
+            ),
+        },
+        projects={
+            "demo": KnownProject(
+                key="demo",
+                path=project_root,
+                name="Demo",
+                kind=ProjectKind.GIT,
+            ),
+        },
+    )
+
+    claude_file = (
+        config.accounts["claude_main"].home
+        / ".claude/projects/demo/session-pipeline.jsonl"
+    )
+    claude_file.parent.mkdir(parents=True, exist_ok=True)
+    claude_file.write_text(
+        json.dumps(
+            {
+                "timestamp": "2026-05-23T00:00:00Z",
+                "type": "assistant",
+                "sessionId": "session-pipeline",
+                "cwd": str(project_root),
+                "message": {
+                    "model": "claude-opus-4-7",
+                    "content": [
+                        {
+                            "type": "thinking",
+                            "thinking": "think first",
+                            "signature": "sig-pipeline",
+                        },
+                        {"type": "text", "text": "answer second"},
+                    ],
+                    "usage": {"total_tokens": 4},
+                },
+            }
+        )
+        + "\n"
+    )
+
+    sync_transcripts_once(config)
+
+    events_path = (
+        project_root / ".pollypm/transcripts/session-pipeline/events.jsonl"
+    )
+    _parse_cache_clear()
+    envelopes = parse_events_jsonl(
+        events_path, actor_fallback="Polly", include_thinking=True,
+    )
+
+    # Provider order ``[thinking, text]`` must survive end-to-end:
+    # the parser surfaces THINKING before TEXT so UI grouping and
+    # replay tooling can rely on the normalized stream matching the
+    # provider content array.
+    assert [env.type for env in envelopes] == [
+        ParserInternalType.THINKING,
+        MessageType.TEXT,
+    ]
+    assert envelopes[0].text == "think first"
+    assert envelopes[0].metadata["signature"] == "sig-pipeline"
+    assert envelopes[1].text == "answer second"
+
+
 # ---------------------------------------------------------------------------
 # Tool use / tool result pairing
 # ---------------------------------------------------------------------------

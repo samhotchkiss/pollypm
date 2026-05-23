@@ -752,11 +752,30 @@ ingestor used for Claude:
   **any** provider whose ingestor lags the live pane — not a
   provider-specific code path.
 
-Codex envelope `type` is currently always `text` because the Codex
-`_normalize_codex_line` path emits text-shaped events for chat-visible
-entries (its tool calls aren't structured the way Claude Code's are).
-If you need structured tool envelopes today, use a Claude session.
-This is an ingestor-shape limitation, not a transport difference.
+Codex envelopes are **not** restricted to `type=text`. The
+`_normalize_codex_line` path emits structured `event_type="tool_call"`
+and `event_type="tool_result"` events for Codex tool payloads
+(`src/pollypm/transcript_ingest.py`), and `parse_events_jsonl`
+converts those into `MessageType.TOOL_USE` and
+`MessageType.TOOL_RESULT` envelopes (`web_api/chat/transcripts.py`)
+the same way it does for Claude. `GET /messages` source selection is
+provider-agnostic, and so is the envelope-type coverage: Codex chat
+text surfaces as `type=text`, Codex tool calls as `type=tool_use`,
+and Codex tool results as `type=tool_result`.
+
+The remaining provider difference is **metadata richness**, not
+message-type coverage. The Claude tool branches extract a fully-typed
+`tool_use_id`, parsed `tool_input`, formatted summary, `is_error`,
+and structured `content` blocks. The Codex tool branches are
+best-effort: `tool_name` is derived from whichever of `name`/`tool`/
+`type` the payload exposes, `tool_input` is the raw payload, the
+result `tool_use_id` is left empty, and the rendered `text` is a
+short summary (`[<tool_name>]` for calls, an extracted text blob for
+results) with the original payload preserved under
+`metadata.tool_input` / `metadata.content`. If you need fully-typed
+tool envelopes, prefer a Claude session; if you only need to know a
+tool ran and roughly what it returned, the Codex envelopes carry
+that today.
 
 > Historical note: earlier drafts of this spec described an automatic
 > `provider == "codex" → tmux capture-pane` fallback. That was never

@@ -324,29 +324,24 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     )
     if WORKSPACE_PROJECT_KEY not in snapshot:
         return None
-    # #2051 round-3 (Codex review): bounded-staleness guard. Once the
-    # refresher has installed an EMPTY ``__workspace__`` entry (no
-    # workspace-root awaits-user rows at snapshot time), the absent-
-    # sentinel guard above stops firing — yet message-store writes
-    # (alerts, notifications, `pm notify`) can still land after that
-    # refresh without emitting an invalidating audit event, leaving the
-    # empty entry stale. Treat a present-but-empty workspace entry as
-    # NOT-AUTHORITATIVE and fall through to the direct sweep.
-    #
-    # #2051 round-4 (Codex review): the same staleness reasoning applies
-    # to NON-EMPTY sentinels. ``PgStore.close_message`` /
-    # ``PgStore.clear_alert`` / ``service_api.v1.clear_alert`` can close
-    # workspace-root rows AFTER the refresher computed the entry — those
-    # paths write a ``messages``-table event, not a state-cache audit
-    # event, so the refresher never sees the close and the cached
-    # items / count stay stale until the next full refresh. The TTL
-    # below caps that staleness window. Trade-off: workspaces with
-    # genuinely zero root-level awaits-user rows pay the direct-sweep
-    # cost on every call (empty case); workspaces with stable non-empty
-    # workspace-root rows hit the direct sweep at most once per TTL
+    # #2051 round-4 (Codex review): bounded-staleness guard via TTL.
+    # ``PgStore.close_message`` / ``PgStore.clear_alert`` /
+    # ``service_api.v1.clear_alert`` can close workspace-root rows
+    # AFTER the refresher computed the entry — those paths write a
+    # ``messages``-table event, not a state-cache audit event, so the
+    # refresher never sees the close and the cached items / count stay
+    # stale until the next full refresh. The TTL below caps that
+    # staleness window. Workspaces with stable workspace-root rows
+    # (empty or non-empty) hit the direct sweep at most once per TTL
     # window. Per-project entries still benefit from the full cache.
     # Full audit-event wiring for the message-store close/clear paths
     # is deferred past v1 RC.
+    #
+    # #2051 round-5 (Codex review): the round-3 empty-sentinel
+    # always-fall-through was removed. The TTL guard alone covers the
+    # staleness invariant — a fresh empty sentinel serves zero
+    # workspace items as the fast path (which is the steady state for
+    # most workspaces); a stale empty sentinel falls through below.
     import time as _ws_time
     workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
     workspace_items = (
@@ -354,10 +349,10 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
         if workspace_entry is not None
         else ()
     )
-    if not workspace_items:
-        return None
     workspace_refreshed_at = float(
         getattr(workspace_entry, "computed_at", 0.0) or 0.0
+        if workspace_entry is not None
+        else 0.0
     )
     if (
         _ws_time.monotonic() - workspace_refreshed_at
@@ -368,7 +363,8 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     # The synthetic ``__workspace__`` entry carries workspace-root
     # awaits-user items (messages with ``scope IN ('', 'inbox')`` that
     # don't belong to any tracked project). Union them first so the
-    # returned list mirrors the direct sweep's content.
+    # returned list mirrors the direct sweep's content. A fresh empty
+    # sentinel contributes zero items here (round-5 fast path).
     for item in workspace_items:
         cached_items.append(item)
     for project_key, entry in snapshot.items():
@@ -626,22 +622,19 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     )
     if WORKSPACE_PROJECT_KEY not in snapshot:
         return None
-    # #2051 round-3 (Codex review): bounded-staleness guard mirroring
-    # the list helper. A present-but-empty ``__workspace__`` entry
-    # (``awaits_user_count == 0``) is NOT treated as authoritative —
-    # message-store writes that bypass audit-event invalidation can
-    # land after the sentinel was last refreshed, leaving the zero
-    # stale. Fall through to the direct sweep so the rail badge can't
-    # under-report.
+    # #2051 round-4 (Codex review): bounded-staleness guard via TTL.
+    # ``PgStore.close_message`` / ``PgStore.clear_alert`` /
+    # ``service_api.v1.clear_alert`` close workspace-root rows without
+    # emitting a state-cache audit event, so a positive cached count
+    # can over-report after a close. The TTL below caps that staleness
+    # window so the rail badge can't show a closed row indefinitely.
+    # See ``_maybe_cache_route_awaits_user`` for the full rationale.
     #
-    # #2051 round-4 (Codex review): the same staleness reasoning applies
-    # to a positive cached count. ``PgStore.close_message`` /
-    # ``PgStore.clear_alert`` / ``service_api.v1.clear_alert`` close
-    # workspace-root rows without emitting a state-cache audit event,
-    # so a positive cached count can over-report after a close. The
-    # TTL below caps that staleness window so the rail badge can't
-    # show a closed row indefinitely. See
-    # ``_maybe_cache_route_awaits_user`` for the full rationale.
+    # #2051 round-5 (Codex review): the round-3 empty-sentinel
+    # always-fall-through was removed. The TTL guard alone covers the
+    # staleness invariant — a fresh empty sentinel serves count 0 as
+    # the fast path (steady state for most workspaces); a stale
+    # sentinel of any count falls through below.
     import time as _ws_time
     workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
     workspace_count = (
@@ -649,10 +642,10 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
         if workspace_entry is not None
         else 0
     )
-    if workspace_count <= 0:
-        return None
     workspace_refreshed_at = float(
         getattr(workspace_entry, "computed_at", 0.0) or 0.0
+        if workspace_entry is not None
+        else 0.0
     )
     if (
         _ws_time.monotonic() - workspace_refreshed_at
@@ -661,8 +654,8 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
         return None
     total = 0
     # Pull the workspace-root awaits-user count off the synthetic
-    # ``__workspace__`` entry. Authoritative when non-zero (the empty
-    # case fell through above).
+    # ``__workspace__`` entry. Authoritative within the TTL window
+    # (which caps the staleness from message-store closes/clears).
     total += workspace_count
     for project_key, entry in snapshot.items():
         if project_key == WORKSPACE_PROJECT_KEY:

@@ -12,8 +12,13 @@ tmp config / tmp token paths.
 
 from __future__ import annotations
 
+import concurrent.futures
 import logging
+import threading
+import time
+from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import AsyncIterator
 
 from fastapi import Depends, FastAPI
 from fastapi.exceptions import RequestValidationError
@@ -52,6 +57,100 @@ logger = logging.getLogger(__name__)
 API_V1_PREFIX = "/api/v1"
 
 
+# Doctor run/fix work runs in a dedicated thread pool so a slow check
+# (network probe, blocked filesystem, wedged subprocess) trips the
+# route's wall-clock timeout without hanging the request thread. The
+# pool + its single-flight / last-report locks live on ``app.state``
+# and are owned by the lifespan context below: startup creates them,
+# shutdown cancels in-flight work and waits briefly for the pool to
+# drain. Previously these were module-level globals in
+# ``routes/doctor.py``; that left timed-out worker threads alive past
+# ``pm serve`` shutdown with no FastAPI hook to call
+# ``shutdown(cancel_futures=True)`` (Codex round-5 on #2058).
+_DOCTOR_MAX_WORKERS = 2
+_DOCTOR_THREAD_PREFIX = "doctor"
+# Bound on the post-shutdown wait for in-flight doctor workers. Doctor
+# work is a mix of fast checks and bounded fixes; in practice the
+# longest checks are bounded by ``DEFAULT_RUN_TIMEOUT_SECONDS`` (25s).
+# We don't block app teardown for that long — a timed-out worker by
+# definition has overrun its budget, so we cancel queued work, wait
+# briefly for cooperative completion, and log a warning if anything is
+# still alive after the grace period. The worker keeps running until it
+# returns naturally (Python stdlib has no safe way to interrupt
+# arbitrary blocking code) but it no longer holds the FastAPI app's
+# shutdown hostage.
+_DOCTOR_SHUTDOWN_GRACE_S = 5.0
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """FastAPI lifespan that owns the doctor executor + locks.
+
+    Startup attaches the following attributes to ``app.state`` so the
+    doctor routes resolve them via ``request.app.state`` rather than
+    reaching into module-level globals:
+
+    - ``doctor_executor``: shared ``ThreadPoolExecutor`` for check /
+      fix / verify work. ``max_workers=2`` matches the per-request
+      ``--fix`` single-flight: one slot for fix, one for parallel
+      read-only checks. Larger fan-out is gratuitous (doctor is an
+      operator surface, not a hot path).
+    - ``doctor_fix_lock``: serializes ``fix=true`` runs across the
+      app. Held by the request that wins, released by the worker's
+      done-callback when the future truly terminates (not when the
+      HTTP request returns — Codex round-4 on #2058).
+    - ``doctor_last_report_lock``: guards the in-memory cache slot
+      for ``GET /doctor/report``.
+    - ``doctor_last_report``: the cache slot itself
+      (``tuple[DoctorReport, float] | None``).
+
+    Shutdown cancels not-yet-started futures, then calls
+    ``executor.shutdown(wait=False, cancel_futures=True)`` so the
+    teardown doesn't block on a wedged check. We then wait up to
+    :data:`_DOCTOR_SHUTDOWN_GRACE_S` for cooperative completion and
+    log a warning if any worker is still alive (the v1 RC tradeoff:
+    we can't kill the thread, but we can refuse to block on it).
+    """
+    app.state.doctor_executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=_DOCTOR_MAX_WORKERS,
+        thread_name_prefix=_DOCTOR_THREAD_PREFIX,
+    )
+    app.state.doctor_fix_lock = threading.Lock()
+    app.state.doctor_last_report_lock = threading.Lock()
+    app.state.doctor_last_report = None
+    try:
+        yield
+    finally:
+        executor = app.state.doctor_executor
+        try:
+            # ``cancel_futures=True`` drops anything still queued;
+            # ``wait=False`` so a wedged in-flight worker can't block
+            # FastAPI teardown indefinitely (the v1 RC tradeoff
+            # documented in routes/doctor.py:_await_with_budget).
+            executor.shutdown(wait=False, cancel_futures=True)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "lifespan: doctor executor shutdown raised", exc_info=True,
+            )
+        # Best-effort wait for the worker threads to finish naturally.
+        # If they don't, log + leak rather than hang the app teardown.
+        deadline = time.monotonic() + _DOCTOR_SHUTDOWN_GRACE_S
+        try:
+            workers = list(getattr(executor, "_threads", []) or [])
+        except Exception:  # noqa: BLE001
+            workers = []
+        while time.monotonic() < deadline and any(t.is_alive() for t in workers):
+            time.sleep(0.05)
+        still_running = [t for t in workers if t.is_alive()]
+        if still_running:
+            logger.warning(
+                "lifespan: doctor executor: %d worker(s) still running after "
+                "%.1fs grace; leaking thread(s) past app teardown",
+                len(still_running),
+                _DOCTOR_SHUTDOWN_GRACE_S,
+            )
+
+
 def create_app(
     *,
     config: PollyPMConfig,
@@ -78,6 +177,11 @@ def create_app(
         docs_url=None,  # we serve OpenAPI via the spec endpoint
         redoc_url=None,
         openapi_url=None,
+        # Lifespan owns the doctor ThreadPoolExecutor + single-flight
+        # fix lock + last-report cache so they're cleanly torn down on
+        # app exit (Codex round-5 on #2058). Routes read them off
+        # ``request.app.state`` rather than module-level globals.
+        lifespan=_lifespan,
     )
 
     # CORS for the separate-repo frontend. The spec (§10) shows the

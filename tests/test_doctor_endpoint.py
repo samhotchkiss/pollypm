@@ -16,7 +16,7 @@ registry / runner so the suite never touches the user's real machine
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import pytest
 from fastapi.testclient import TestClient
@@ -115,10 +115,15 @@ def auth_headers(token: tuple[Path, str]) -> dict[str, str]:
 
 @pytest.fixture(autouse=True)
 def reset_last_report() -> Any:
-    """Clear the process-local last-report cache between tests."""
-    doctor_routes._reset_last_report()
+    """No-op shim — the last-report cache is per-app, owned by lifespan.
+
+    The ``client`` fixture below builds a fresh app each test whose
+    lifespan starts with ``app.state.doctor_last_report = None``, so
+    cross-test bleed is impossible. Kept as an empty autouse fixture so
+    the signature stays stable for any test that explicitly references
+    it (Codex round-5 on PR #2058).
+    """
     yield
-    doctor_routes._reset_last_report()
 
 
 @pytest.fixture
@@ -128,8 +133,17 @@ def app(config, token):
 
 
 @pytest.fixture
-def client(app) -> TestClient:
-    return TestClient(app)
+def client(app) -> Iterator[TestClient]:
+    """TestClient wired through ``with`` so the FastAPI lifespan fires.
+
+    Lifespan owns the doctor ThreadPoolExecutor + single-flight fix
+    lock + last-report cache on ``app.state`` (Codex round-5 on
+    #2058). Without the ``with`` block, ``TestClient`` skips
+    startup/shutdown and the run endpoint would 503 on the missing
+    executor.
+    """
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 # ---------------------------------------------------------------------------
@@ -465,7 +479,7 @@ def test_apply_fixes_hang_returns_504_within_budget(
 
 
 def test_fix_retry_after_504_returns_busy_while_first_still_running(
-    client, auth_headers, patch_registry, monkeypatch,
+    client, app, auth_headers, patch_registry, monkeypatch,
 ):
     """After a 504 from a hung fix, an immediate retry must 409, not start a second fix.
 
@@ -554,12 +568,15 @@ def test_fix_retry_after_504_returns_busy_while_first_still_running(
     assert body["error"]["code"] == "conflict"
     assert "in progress" in body["error"]["message"].lower()
 
-    # Wait for the worker's done callback to release the lock before the
-    # next test runs (otherwise we leak across the suite).
+    # Wait for the worker's done callback to release the per-app lock
+    # before the next test runs (otherwise we leak across the suite).
+    # The lock lives on ``app.state.doctor_fix_lock`` (Codex round-5 on
+    # PR #2058) — pre-round-5 this was a module-level global.
+    fix_lock = app.state.doctor_fix_lock
     deadline = _time.monotonic() + 5.0
     while _time.monotonic() < deadline:
-        if doctor_routes._FIX_OPERATION_LOCK.acquire(blocking=False):
-            doctor_routes._FIX_OPERATION_LOCK.release()
+        if fix_lock.acquire(blocking=False):
+            fix_lock.release()
             break
         _time.sleep(0.05)
     else:
@@ -701,23 +718,29 @@ def test_run_rejected_for_non_default_config(
 
     token_path, _value = token
     app = create_app(config=cfg, token_path=token_path)
-    custom_client = TestClient(app)
 
     patch_registry([_check("alpha", _ok("alpha"))])
 
-    resp = custom_client.post(
-        "/api/v1/doctor/run",
-        headers=auth_headers,
-        json={"check": "alpha", "fix": True},
-    )
-    assert resp.status_code == 400
-    body = resp.json()
-    assert body["error"]["code"] == "invalid_request"
-    assert "default config" in body["error"]["message"].lower()
+    # ``with`` so the FastAPI lifespan attaches the doctor executor /
+    # locks (Codex round-5 on PR #2058) — otherwise the run endpoint
+    # would 503 on the missing executor, masking the 400 we're
+    # asserting.
+    with TestClient(app) as custom_client:
+        resp = custom_client.post(
+            "/api/v1/doctor/run",
+            headers=auth_headers,
+            json={"check": "alpha", "fix": True},
+        )
+        assert resp.status_code == 400
+        body = resp.json()
+        assert body["error"]["code"] == "invalid_request"
+        assert "default config" in body["error"]["message"].lower()
 
-    # Also covers GET endpoints.
-    resp_checks = custom_client.get("/api/v1/doctor/checks", headers=auth_headers)
-    assert resp_checks.status_code == 400
+        # Also covers GET endpoints.
+        resp_checks = custom_client.get(
+            "/api/v1/doctor/checks", headers=auth_headers,
+        )
+        assert resp_checks.status_code == 400
 
 
 def test_run_requires_auth(client, patch_registry):
@@ -769,3 +792,184 @@ def test_run_with_no_body_defaults_to_run_all(client, auth_headers, patch_regist
     body = response.json()
     assert [c["name"] for c in body["checks"]] == ["alpha", "beta"]
     assert body["passed"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Codex round-5 regressions (refs #2058) — app-scoped doctor executor
+# ---------------------------------------------------------------------------
+
+
+def test_doctor_executor_app_scoped(config, token) -> None:
+    """Two ``create_app`` instances get independent doctor executors / locks.
+
+    Pins the module-globals → ``app.state`` migration: the executor,
+    single-flight fix lock, and last-report cache must be per-app so
+    one ``pm serve`` invocation can't share a wedged worker slot (or
+    deadlock the fix lock) with a sibling FastAPI app in the same
+    process (tests, embedded uses). Previously the module-level
+    ``_DOCTOR_EXECUTOR`` / ``_FIX_OPERATION_LOCK`` were shared across
+    every app in the process — Codex round-5 on PR #2058.
+    """
+    token_path, _value = token
+    app_a = create_app(config=config, token_path=token_path)
+    app_b = create_app(config=config, token_path=token_path)
+
+    with TestClient(app_a), TestClient(app_b):
+        # Distinct executor + locks + cache slot per app.
+        assert app_a.state.doctor_executor is not app_b.state.doctor_executor
+        assert app_a.state.doctor_fix_lock is not app_b.state.doctor_fix_lock
+        assert (
+            app_a.state.doctor_last_report_lock
+            is not app_b.state.doctor_last_report_lock
+        )
+
+        # Holding app_a's fix lock must not affect app_b's.
+        assert app_a.state.doctor_fix_lock.acquire(blocking=False)
+        try:
+            assert app_b.state.doctor_fix_lock.acquire(blocking=False), (
+                "app_b fix lock leaked from app_a — locks are not per-app"
+            )
+            app_b.state.doctor_fix_lock.release()
+        finally:
+            app_a.state.doctor_fix_lock.release()
+
+        # Poking app_a's last-report slot must not leak into app_b.
+        sentinel = object()
+        app_a.state.doctor_last_report = sentinel  # type: ignore[assignment]
+        assert app_b.state.doctor_last_report is None
+
+
+def test_doctor_timed_out_worker_logged_on_late_completion(
+    client, auth_headers, patch_registry, monkeypatch, caplog,
+) -> None:
+    """A 504 from a hung check still emits a log line when the worker finishes.
+
+    Codex round-5 on PR #2058: pre-fix, a timed-out doctor worker was
+    abandoned silently — the operator had no signal that the
+    underlying check eventually returned (or raised). The done-callback
+    on every submitted future now logs the late completion outcome.
+    """
+    import logging
+    import threading
+    import time as _time
+
+    patch_registry([_check("alpha", _ok("alpha"))])
+
+    release = threading.Event()
+    in_flight = threading.Event()
+
+    def hanging_run_checks(checks):  # type: ignore[no-untyped-def]
+        in_flight.set()
+        # Hang past the 1s budget; release lets the worker finish so
+        # the done-callback fires before we assert on the log.
+        release.wait(timeout=10.0)
+        return DoctorReport()
+
+    monkeypatch.setattr(doctor_routes, "run_checks", hanging_run_checks)
+
+    with caplog.at_level(logging.INFO, logger="pollypm.web_api.routes.doctor"):
+        t0 = _time.monotonic()
+        response = client.post(
+            "/api/v1/doctor/run",
+            headers=auth_headers,
+            json={"check": "alpha"},
+            params={"timeout_seconds": 1},
+        )
+        elapsed = _time.monotonic() - t0
+        assert response.status_code == 504, response.json()
+        assert elapsed < 5.0, f"504 took {elapsed:.1f}s; should be near 1s budget"
+        assert in_flight.is_set(), "worker never entered run_checks"
+
+        # Release the worker; the done-callback should log the late
+        # completion once the future resolves.
+        release.set()
+
+        # Wait up to 5s for the done-callback log line to land.
+        deadline = _time.monotonic() + 5.0
+        late_completion_msg = "check worker completed"
+        while _time.monotonic() < deadline:
+            if any(
+                late_completion_msg in record.getMessage()
+                for record in caplog.records
+            ):
+                break
+            _time.sleep(0.05)
+        else:
+            pytest.fail(
+                "expected a 'check worker completed' log line after "
+                f"the timed-out worker finished. Records seen: "
+                f"{[r.getMessage() for r in caplog.records]}"
+            )
+
+
+def test_doctor_app_teardown_returns_promptly_with_running_worker(
+    config, token, auth_headers, patch_registry, monkeypatch,
+) -> None:
+    """App teardown completes promptly even with a wedged in-flight check.
+
+    Codex round-5 on PR #2058: the prior module-level executor had no
+    shutdown hook, so ``pm serve`` exit left worker threads alive past
+    teardown with no log line. The lifespan now calls
+    ``shutdown(wait=False, cancel_futures=True)`` and waits at most
+    :data:`pollypm.web_api.app._DOCTOR_SHUTDOWN_GRACE_S` for cooperative
+    drain — a hung worker is logged + leaked, not waited on.
+
+    This test fires a slow check that we abandon via 504, then exits
+    the lifespan and asserts the whole teardown completed in well
+    under 10s even though the worker is still alive. The wedged
+    thread is released afterwards so it doesn't linger across the
+    suite.
+    """
+    import threading
+    import time as _time
+
+    token_path, _value = token
+    app = create_app(config=config, token_path=token_path)
+
+    patch_registry([_check("alpha", _ok("alpha"))])
+
+    release = threading.Event()
+    in_flight = threading.Event()
+
+    def hanging_run_checks(checks):  # type: ignore[no-untyped-def]
+        in_flight.set()
+        # Hang well past the grace period; lifespan must NOT wait on us.
+        release.wait(timeout=30.0)
+        return DoctorReport()
+
+    monkeypatch.setattr(doctor_routes, "run_checks", hanging_run_checks)
+
+    teardown_t0: list[float] = []
+    teardown_elapsed: list[float] = []
+
+    with TestClient(app) as test_client:
+        resp = test_client.post(
+            "/api/v1/doctor/run",
+            headers=auth_headers,
+            json={"check": "alpha"},
+            params={"timeout_seconds": 1},
+        )
+        assert resp.status_code == 504, resp.json()
+        assert in_flight.is_set(), "worker never entered run_checks"
+        teardown_t0.append(_time.monotonic())
+
+    # Lifespan has exited.
+    teardown_elapsed.append(_time.monotonic() - teardown_t0[0])
+
+    # Release the leaked worker so it doesn't linger across the suite.
+    release.set()
+
+    # Should be ~5s (the documented grace), and definitely under 10s.
+    # Pre-fix (no lifespan / no shutdown hook) the worker thread is
+    # still alive but the app teardown returns instantly — what
+    # actually changed is that we now LOG the leak and explicitly
+    # cancel queued work. Verify the grace bound holds either way.
+    assert teardown_elapsed[0] < 10.0, (
+        f"app teardown took {teardown_elapsed[0]:.1f}s with a wedged "
+        f"worker; must be bounded by the grace period."
+    )
+
+    # Executor should have been marked shut down by the lifespan.
+    assert app.state.doctor_executor._shutdown is True, (
+        "lifespan did not shut down the doctor executor"
+    )

@@ -14,12 +14,13 @@ thin adapter over :mod:`pollypm.doctor` — it never re-implements the
 check registry or runner; that lives in the canonical doctor module the
 CLI and cockpit both consume.
 
-The "last report" cache is process-local (held in module state via the
-``_LAST_REPORT`` slot). The CLI persists doctor output to disk under
-``~/.pollypm`` already, but the API surface is intentionally
-in-memory: spec §7.1 only asks for the *last-run* report, and tying
-to disk would couple the API to the CLI's file layout. Tests can reset
-the cache via :func:`_reset_last_report` so cases don't leak state.
+The "last report" cache is per-app (held on ``app.state`` via the
+``doctor_last_report`` slot, owned by the FastAPI lifespan). The CLI
+persists doctor output to disk under ``~/.pollypm`` already, but the
+API surface is intentionally in-memory: spec §7.1 only asks for the
+*last-run* report, and tying to disk would couple the API to the
+CLI's file layout. Each ``create_app`` call gets its own slot, so
+test instances don't cross-contaminate (Codex round-5 on PR #2058).
 """
 
 from __future__ import annotations
@@ -30,7 +31,7 @@ import threading
 import time
 from typing import Annotated, Any, Callable, TypeVar
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 from pydantic import BaseModel, Field
 
 from pollypm.config import DEFAULT_CONFIG_PATH
@@ -45,7 +46,13 @@ from pollypm.doctor import (
     _auto_fix_supported,  # type: ignore[attr-defined]
     _registered_checks,  # type: ignore[attr-defined]
 )
-from pollypm.web_api.errors import APIError, conflict, invalid_request, not_found
+from pollypm.web_api.errors import (
+    APIError,
+    conflict,
+    invalid_request,
+    not_found,
+    service_unavailable,
+)
 from pollypm.web_api.routes._deps import ConfigDep
 
 logger = logging.getLogger(__name__)
@@ -146,71 +153,168 @@ class DoctorRunResponse(DoctorReportResponse):
 
 
 # ---------------------------------------------------------------------------
-# Last-report cache (process-local; spec §7.1)
+# App-scoped state accessors (spec §7.1)
+#
+# The doctor executor, single-flight fix lock, and last-report cache
+# all live on ``app.state``, owned by the FastAPI lifespan in
+# :mod:`pollypm.web_api.app`. Previously these were module-level
+# globals; that left timed-out worker threads alive past ``pm serve``
+# shutdown with no FastAPI hook to call ``shutdown(cancel_futures=True)``
+# (Codex round-5 on PR #2058). Tying them to the app makes the
+# executor lifecycle-managed, makes the locks per-app (so test
+# instances don't cross-contaminate), and lets the lifespan emit
+# observability for in-flight workers at teardown.
 # ---------------------------------------------------------------------------
 
 
-_LAST_REPORT_LOCK = threading.Lock()
-_LAST_REPORT: tuple[DoctorReport, float] | None = None
+def _get_executor(request: Request) -> concurrent.futures.ThreadPoolExecutor:
+    """Resolve the doctor executor from app-level state.
+
+    Raises ``service_unavailable`` if the lifespan didn't fire — only
+    possible when ``TestClient`` is used outside a ``with`` block.
+    """
+    executor = getattr(request.app.state, "doctor_executor", None)
+    if executor is None:  # pragma: no cover — only hit if lifespan didn't run
+        raise service_unavailable(
+            "doctor executor is not initialized",
+            hint=(
+                "The FastAPI lifespan didn't run; ensure ``create_app`` "
+                "is invoked through the standard ASGI server (uvicorn) "
+                "or a TestClient context manager (``with TestClient(app)``)."
+            ),
+        )
+    return executor
 
 
-# Operation-level single-flight lock for ``POST /doctor/run`` when
-# ``fix=true``. ``_LAST_REPORT_LOCK`` above only guards the cache slot;
-# without this second lock, two concurrent callers can each invoke
-# ``apply_fixes`` on the same filesystem/session/storage state and
-# interleave the post-fix verify writes (Codex round-1 P0 on PR #2058).
-# Acquired non-blocking — a second concurrent ``fix=true`` returns a
-# typed 409 ``busy`` rather than queueing behind the first.
-#
-# Round-4 (Codex on PR #2058): the lock is released by a
-# :meth:`concurrent.futures.Future.add_done_callback` registered when
-# the fix work is submitted (see :func:`_release_fix_lock_on_done`), not
-# by the HTTP request's ``finally`` block. If the request times out (504)
-# the worker thread is still alive inside ``apply_fixes``; releasing the
-# lock at HTTP-return time would let an immediate retry start a second
-# concurrent fix on shared state.
-_FIX_OPERATION_LOCK = threading.Lock()
+def _get_fix_lock(request: Request) -> threading.Lock:
+    """Resolve the single-flight ``fix=true`` lock from app-level state.
+
+    Acquired non-blocking in the run endpoint; released by the worker's
+    done-callback when the future truly terminates (Codex round-4 on
+    PR #2058 — not when the HTTP request returns 504).
+    """
+    lock = getattr(request.app.state, "doctor_fix_lock", None)
+    if lock is None:  # pragma: no cover — only hit if lifespan didn't run
+        raise service_unavailable(
+            "doctor fix lock is not initialized",
+            hint=(
+                "The FastAPI lifespan didn't run; ensure ``create_app`` "
+                "is invoked through the standard ASGI server."
+            ),
+        )
+    return lock
 
 
-def _release_fix_lock_on_done(_future: concurrent.futures.Future[Any]) -> None:
-    """Release :data:`_FIX_OPERATION_LOCK` when the fix worker terminates.
+def _release_fix_lock_factory(
+    lock: threading.Lock,
+) -> Callable[[concurrent.futures.Future[Any]], None]:
+    """Build a done-callback that releases ``lock`` when the future terminates.
 
-    Registered via :meth:`concurrent.futures.Future.add_done_callback`
-    on the fix future. Runs synchronously in whichever thread sets the
-    future's result (the worker thread on normal completion / exception).
-    The lock release MUST NOT raise — if it did, the future's result
-    would be silently corrupted; we defensively swallow + log instead.
+    The done-callback also logs the late completion (success or
+    exception) so a timed-out fix that finishes minutes later is
+    observable in the server log rather than silently disappearing
+    (Codex round-5 on PR #2058: timed-out workers were unowned).
+
+    The release MUST NOT raise — if it did, the future's result would
+    be silently corrupted by ``concurrent.futures``; we defensively
+    swallow + log instead.
+    """
+
+    def _callback(future: concurrent.futures.Future[Any]) -> None:
+        # Observability first: log whether the worker eventually
+        # succeeded, raised, or was cancelled. Cheap and gives the
+        # operator a paper trail for the timed-out → late-completion
+        # path that round-5 flagged.
+        try:
+            if future.cancelled():
+                logger.info("doctor: fix worker cancelled before completion")
+            elif future.exception() is not None:
+                logger.warning(
+                    "doctor: fix worker terminated with exception: %s",
+                    future.exception(),
+                )
+            else:
+                logger.info("doctor: fix worker completed (late or in-budget)")
+        except Exception:  # noqa: BLE001 — never raise from a done-callback
+            logger.exception("doctor: error inspecting fix-future result")
+
+        try:
+            lock.release()
+        except RuntimeError:
+            # Lock wasn't held (e.g. test harness already released it).
+            # Log but don't propagate — the done-callback contract
+            # forbids raising.
+            logger.warning(
+                "doctor: fix lock already released when fix worker terminated"
+            )
+
+    return _callback
+
+
+def _log_check_worker_outcome(
+    future: concurrent.futures.Future[Any],
+) -> None:
+    """Done-callback for ``fix=false`` futures — log late completion.
+
+    Codex round-5 (PR #2058): a timed-out ``fix=false`` worker is
+    abandoned by ``_await_with_budget`` and finishes silently. The
+    operator has no way to know whether the underlying check ever
+    returned. This callback logs the eventual outcome so late
+    completions / exceptions surface in the server log. It does NOT
+    interact with any lock — the read path doesn't take one.
     """
     try:
-        _FIX_OPERATION_LOCK.release()
-    except RuntimeError:
-        # Lock wasn't held (e.g. test harness already released it). Log
-        # but don't propagate — the done-callback contract forbids
-        # raising.
-        logger.warning(
-            "doctor: _FIX_OPERATION_LOCK already released when fix worker terminated"
-        )
+        if future.cancelled():
+            logger.info("doctor: check worker cancelled before completion")
+        elif future.exception() is not None:
+            logger.warning(
+                "doctor: check worker terminated with exception: %s",
+                future.exception(),
+            )
+        else:
+            logger.info("doctor: check worker completed (late or in-budget)")
+    except Exception:  # noqa: BLE001 — never raise from a done-callback
+        logger.exception("doctor: error inspecting check-future result")
 
 
-def _record_last_report(report: DoctorReport) -> float:
-    """Stash ``report`` as the last-run report. Returns the timestamp."""
+def _record_last_report(request: Request, report: DoctorReport) -> float:
+    """Stash ``report`` as the last-run report on app state. Returns the timestamp."""
     ts = time.time()
-    global _LAST_REPORT
-    with _LAST_REPORT_LOCK:
-        _LAST_REPORT = (report, ts)
+    lock = getattr(request.app.state, "doctor_last_report_lock", None)
+    if lock is None:  # pragma: no cover — only hit if lifespan didn't run
+        raise service_unavailable(
+            "doctor last-report cache is not initialized",
+        )
+    with lock:
+        request.app.state.doctor_last_report = (report, ts)
     return ts
 
 
-def _read_last_report() -> tuple[DoctorReport, float] | None:
-    with _LAST_REPORT_LOCK:
-        return _LAST_REPORT
+def _read_last_report(
+    request: Request,
+) -> tuple[DoctorReport, float] | None:
+    lock = getattr(request.app.state, "doctor_last_report_lock", None)
+    if lock is None:  # pragma: no cover — only hit if lifespan didn't run
+        return None
+    with lock:
+        return getattr(request.app.state, "doctor_last_report", None)
 
 
-def _reset_last_report() -> None:
-    """Test hook — clears the module-level cache between cases."""
-    global _LAST_REPORT
-    with _LAST_REPORT_LOCK:
-        _LAST_REPORT = None
+def _reset_last_report(request: Request | None = None) -> None:
+    """Test hook — clears the per-app last-report cache between cases.
+
+    Accepts an optional ``request`` for symmetry with the read helpers.
+    When called without one (legacy test entrypoint) this is a no-op:
+    each test fixture now builds a fresh app whose lifespan starts
+    with ``doctor_last_report = None``.
+    """
+    if request is None:
+        return
+    lock = getattr(request.app.state, "doctor_last_report_lock", None)
+    if lock is None:  # pragma: no cover
+        return
+    with lock:
+        request.app.state.doctor_last_report = None
 
 
 # ---------------------------------------------------------------------------
@@ -326,7 +430,7 @@ def _fix_busy_error() -> APIError:
 
     Doctor fixes touch shared state (filesystem, tmux sessions, the
     Postgres heartbeat tables); we serialize the run+fix+verify
-    sequence with :data:`_FIX_OPERATION_LOCK`. Callers that race a
+    sequence with ``app.state.doctor_fix_lock``. Callers that race a
     second ``fix=true`` request get an immediate 409 ``busy`` rather
     than blocking on the lock or running fixes a second time.
     """
@@ -408,35 +512,32 @@ def _select_checks(name: str | None) -> list[Check]:
 #
 # Round-3 (Codex on PR #2058) flagged the prior per-request executor as a
 # DoS vector: each timeout abandoned a worker thread, so a client retrying
-# a stuck check could accumulate unbounded background workers. Switching
-# to a single module-level pool caps the number of in-flight (or leaked)
-# doctor workers at ``max_workers``. When all slots are saturated by hung
-# workers, new ``submit`` calls queue — but in practice ``fix=true`` is
-# single-flighted by :data:`_FIX_OPERATION_LOCK` (one fix at a time) and
-# ``fix=false`` runs are read-only / fast, so 2 slots is more than enough
-# for the v1 RC surface. Tuning lives here if we ever need more.
-_DOCTOR_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=2,
-    thread_name_prefix="doctor",
-)
-
+# a stuck check could accumulate unbounded background workers. The
+# round-3 fix capped that with a single module-level pool. Round-5
+# (Codex on PR #2058) flagged that *the module-level pool itself* was
+# unowned by app lifecycle, so timed-out workers had no shutdown story
+# and pm serve exit left them alive. The executor now lives on
+# ``app.state.doctor_executor``, created by the FastAPI lifespan in
+# ``web_api/app.py`` and explicitly torn down on shutdown. Routes
+# resolve it via :func:`_get_executor`.
 
 _T = TypeVar("_T")
 
 
 def _submit_doctor_work(
+    executor: concurrent.futures.ThreadPoolExecutor,
     fn: Callable[..., _T],
     *args: Any,
     **kwargs: Any,
 ) -> concurrent.futures.Future[_T]:
-    """Submit ``fn`` to the shared doctor executor.
+    """Submit ``fn`` to ``executor``.
 
-    Factored out of :func:`_run_with_budget` so the ``fix=true`` path
-    in :func:`run_doctor_endpoint` can own the future lifecycle (it
+    Factored out so the ``fix=true`` path in
+    :func:`run_doctor_endpoint` can own the future lifecycle (it
     needs to attach a lock-release callback that fires when the worker
     *really* terminates, not when the HTTP request times out).
     """
-    return _DOCTOR_EXECUTOR.submit(fn, *args, **kwargs)
+    return executor.submit(fn, *args, **kwargs)
 
 
 def _await_with_budget(
@@ -457,10 +558,16 @@ def _await_with_budget(
     On overrun we raise a typed 504 ``timeout`` immediately — the worker
     thread is *not* cancelled (Python stdlib has no safe way to interrupt
     arbitrary blocking code) and is allowed to finish in the background,
-    eating its slot in :data:`_DOCTOR_EXECUTOR` until it returns. The
+    eating its slot in the app's doctor executor until it returns. The
     HTTP caller sees the 504 within the budget; the leaked thread is the
     accepted v1 RC tradeoff (Codex round-1 P0 on PR #2058). The shared
     pool bounds the total number of leaks (Codex round-3 P0 on PR #2058).
+    The lifespan (Codex round-5 P0 on PR #2058) emits a warning if any
+    such worker is still alive at app shutdown so the operator has a
+    paper trail. Callers attach an ``add_done_callback`` (see
+    :func:`_log_check_worker_outcome` and
+    :func:`_release_fix_lock_factory`) so late completion / exception
+    surfaces in the server log even after the HTTP request returned 504.
 
     ``name`` is used purely for the 504 message; the caller supplies the
     user-facing check name (or ``None`` for "all checks").
@@ -486,19 +593,21 @@ def _await_with_budget(
 
 
 def _run_with_budget(
+    executor: concurrent.futures.ThreadPoolExecutor,
     fn: Callable[..., _T],
     *args: Any,
     budget_s: float,
     name: str | None = None,
     **kwargs: Any,
 ) -> _T:
-    """Submit ``fn`` to the doctor pool and await it under ``budget_s``.
+    """Submit ``fn`` to ``executor`` and await it under ``budget_s``.
 
     Convenience wrapper for callers that don't need to own the future
     (the ``fix=false`` path). The ``fix=true`` path submits + awaits
     explicitly so it can attach a lock-release callback to the future.
     """
-    future = _submit_doctor_work(fn, *args, **kwargs)
+    future = _submit_doctor_work(executor, fn, *args, **kwargs)
+    future.add_done_callback(_log_check_worker_outcome)
     return _await_with_budget(future, budget_s=budget_s, name=name)
 
 
@@ -601,17 +710,19 @@ def list_doctor_checks_endpoint(config: ConfigDep) -> DoctorChecksResponse:
     summary="Return the last-run doctor report",
     operation_id="getDoctorReport",
 )
-def get_doctor_report_endpoint(config: ConfigDep) -> DoctorReportResponse:
-    """GET /api/v1/doctor/report — the most-recent in-process report.
+def get_doctor_report_endpoint(
+    config: ConfigDep, request: Request,
+) -> DoctorReportResponse:
+    """GET /api/v1/doctor/report — the most-recent in-app report.
 
-    Returns 404 ``not_found`` when no doctor run has happened yet in
-    this process — callers should ``POST /doctor/run`` first. This is
-    intentionally in-memory; the on-disk cache the CLI keeps is not
-    plumbed through (spec §7.1 deliberately scopes "last report" to
-    the API's own surface).
+    Returns 404 ``not_found`` when no doctor run has happened yet
+    against *this app* — callers should ``POST /doctor/run`` first.
+    The cache is per-app (lives on ``request.app.state``), so two
+    sibling apps in the same process keep independent reports
+    (Codex round-5 on PR #2058).
     """
     _reject_non_default_config(config)
-    cached = _read_last_report()
+    cached = _read_last_report(request)
     if cached is None:
         raise not_found(
             "No doctor report cached yet",
@@ -629,6 +740,7 @@ def get_doctor_report_endpoint(config: ConfigDep) -> DoctorReportResponse:
 )
 def run_doctor_endpoint(
     config: ConfigDep,
+    request: Request,
     body: DoctorRunRequest | None = None,
     timeout_seconds: Annotated[
         float,
@@ -659,22 +771,25 @@ def run_doctor_endpoint(
     capped at ``timeout_seconds``; overrun → 504 ``timeout``.
 
     When ``fix=true`` the run+fix+verify sequence is serialized via
-    :data:`_FIX_OPERATION_LOCK`; concurrent ``fix=true`` callers get
-    a typed 409 ``busy`` (Codex round-1 P0).
+    the per-app ``doctor_fix_lock``; concurrent ``fix=true`` callers
+    get a typed 409 ``busy`` (Codex round-1 P0). Worker lifecycle is
+    owned by the FastAPI lifespan (Codex round-5 on PR #2058).
     """
     _reject_non_default_config(config)
     payload = body or DoctorRunRequest()
 
     selected = _select_checks(payload.check)
+    executor = _get_executor(request)
 
     fixes_applied: list[dict[str, Any]] = []
     if payload.fix:
+        fix_lock = _get_fix_lock(request)
         # Single-flight gate for ``fix=true``. Acquire non-blocking so a
         # second concurrent caller returns 409 immediately rather than
         # queueing behind the in-flight fix. ``fix=false`` is read-only
         # for our purposes (each check has its own internal locks) and
         # is allowed to overlap.
-        if not _FIX_OPERATION_LOCK.acquire(blocking=False):
+        if not fix_lock.acquire(blocking=False):
             raise _fix_busy_error()
 
         # Round-4 (Codex on PR #2058): the lock MUST be held until the
@@ -694,8 +809,15 @@ def run_doctor_endpoint(
         # already done at registration time; otherwise it runs in the
         # worker thread once the result is set. Either way, the lock is
         # released exactly once when the work is truly complete.
-        future = _submit_doctor_work(_run_full_fix_under_budget, selected)
-        future.add_done_callback(_release_fix_lock_on_done)
+        #
+        # Round-5 (Codex on PR #2058): the callback also logs the
+        # eventual outcome (success / exception / cancel) so a
+        # timed-out fix that finishes late is observable in the
+        # server log rather than disappearing silently.
+        future = _submit_doctor_work(
+            executor, _run_full_fix_under_budget, selected,
+        )
+        future.add_done_callback(_release_fix_lock_factory(fix_lock))
         # Round-3 (Codex on PR #2058): the entire run+apply+verify
         # sequence is wrapped in one budget so a hanging
         # ``apply_fixes`` can't escape the timeout contract. The
@@ -709,13 +831,14 @@ def run_doctor_endpoint(
         )
     else:
         report = _run_with_budget(
+            executor,
             run_checks,
             selected,
             budget_s=timeout_seconds,
             name=payload.check,
         )
 
-    generated_at = _record_last_report(report)
+    generated_at = _record_last_report(request, report)
     base = _build_report_response(report, generated_at=generated_at)
     return DoctorRunResponse(
         generated_at=base.generated_at,
@@ -739,7 +862,8 @@ __all__ = [
     "DoctorReportResponse",
     "DoctorRunRequest",
     "DoctorRunResponse",
-    "_FIX_OPERATION_LOCK",
+    "_get_executor",
+    "_get_fix_lock",
     "_reset_last_report",
     "get_doctor_report_endpoint",
     "list_doctor_checks_endpoint",

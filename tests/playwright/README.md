@@ -81,13 +81,19 @@ POLLYPM_BASE_URL=http://100.x.y.z:8765 npx playwright test
 | Spec | Hits real daemon | Notes |
 |------|------------------|-------|
 | `auth.spec.ts` | yes | Verifies the real cookie handshake. |
-| `surfaces.spec.ts` | partial | Real `/sessions` for live data, route stubs for the empty-state case. |
-| `send_message.spec.ts` | no (route-stubbed) | We never actually send keystrokes to a real tmux pane. |
-| `edge_cases.spec.ts` | no (route-stubbed) | 409/503 responses are simulated. |
-| `keyboard.spec.ts` | no (route-stubbed) | |
+| `surfaces.spec.ts` | partial | Real `/sessions` + `/dashboard` for live data; route stubs for the empty-state, 500, and stubbed-messages cases. |
+| `send_message.spec.ts` | no (route-stubbed) | Stubs `/api/v1/dashboard`, `/api/v1/chat/sessions`, `/messages*`, and `/send`. We never deliver keystrokes to a real tmux pane. |
+| `edge_cases.spec.ts` | no (route-stubbed) | Stubs `/api/v1/dashboard` + `/api/v1/chat/*`. 409/503 responses are simulated. |
+| `keyboard.spec.ts` | no (route-stubbed) | Stubs `/api/v1/dashboard` + `/api/v1/chat/*`. |
 
-This means the suite is safe to run while you're using PollyPM yourself:
-the only requests that touch live state are read-only `GET` calls.
+Concretely, the "no (route-stubbed)" specs install a `beforeEach`
+that mocks `/api/v1/dashboard` (the UI fires this on init for the
+right-rail rollups) plus all `/api/v1/chat/*` traffic. They still
+load the real `/ui/` HTML + static assets and go through the cookie
+bootstrap, but no mutating endpoint and no live `/chat/sessions` /
+`/dashboard` read leaks into the daemon. That makes the suite safe
+to run while you're using PollyPM yourself, and removes the
+fullyParallel timing coupling to live dashboard/session work.
 
 ## Projects
 

@@ -69,6 +69,10 @@ def bootstrap_builtin_briefings(config: PollyPMConfig) -> None:
         from pollypm.plugins_builtin.morning_briefing.inbox import (
             list_briefings as _list_briefings,
         )
+        from pollypm.plugins_builtin.morning_briefing.plugin import (
+            _MORNING_BRIEFING_DESCRIPTION,
+            _morning_is_available,
+        )
         from pollypm.plugins_builtin.morning_briefing.render_facade import (
             MorningBriefingRenderProvider,
         )
@@ -82,9 +86,16 @@ def bootstrap_builtin_briefings(config: PollyPMConfig) -> None:
         return
 
     register_briefing_provider(_list_briefings)
+    # Pass description AND is_available so the registry mirrors the
+    # plugin host's ``_initialize`` registration (Codex round-13 on
+    # #2059: without ``is_available`` the registry's
+    # ``_default_is_available`` returns True unconditionally, so the
+    # per-request ``[plugins].disabled`` gate never runs in production).
     register_briefing_render_provider(
         MORNING_BRIEFING_TYPE_NAME,
         MorningBriefingRenderProvider(),
+        description=_MORNING_BRIEFING_DESCRIPTION,
+        is_available=_morning_is_available,
     )
 
 

@@ -1450,21 +1450,15 @@ def test_disabled_morning_plugin_per_request(
     3. WITHOUT restart, GET /api/v1/briefings →
        ``morning.available=false``; POST regenerate → 503.
     """
-    # Make sure the morning render provider IS registered (the test
-    # fixture for ``api_config`` does not set ``[plugins].disabled``,
-    # so ``create_app`` will install the provider).
+    # Exercise the REAL bootstrap path (no ``_REGISTRY`` monkeypatch —
+    # Codex round-13 on #2059: monkeypatching ``br._REGISTRY`` masked the
+    # missing ``is_available`` kwarg in ``bootstrap_builtin_briefings``
+    # because the route's legacy ``_morning_available`` always re-checked
+    # config. With the registry as single source of truth the kwarg must
+    # flow through bootstrap).
     from pollypm.briefings_registry import register_briefing_render_provider
-    from pollypm.web_api.routes import briefings as br
+    from pollypm.web_api.routes import briefings as br  # noqa: F401
     from pollypm.web_api.routes._deps import _config_provider
-
-    # Restore canonical adapter in case a sibling test mutated it.
-    br._REGISTRY["morning"] = br._BriefingAdapter(
-        name="morning",
-        description="Daily morning briefing — canonical adapter (test restore)",
-        available=br._morning_available,
-        render_last=br._morning_render_last,
-        regenerate=br._morning_regenerate,
-    )
 
     app = create_app(config=api_config, token_path=token_path)
     try:
@@ -1710,3 +1704,116 @@ def test_regenerate_request_schema_declares_additional_properties_false() -> Non
     runtime_schema = RegenerateRequest.model_json_schema()
     assert static_schema.get("additionalProperties") is False
     assert runtime_schema.get("additionalProperties") is False
+
+
+# ---------------------------------------------------------------------------
+# Codex round-13 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_bootstrap_briefings_passes_is_available_callback(
+    api_config: PollyPMConfig,
+) -> None:
+    """``bootstrap_builtin_briefings`` must pass ``is_available`` AND
+    ``description`` through to ``register_briefing_render_provider``.
+
+    Codex round-13 on #2059: without ``is_available`` the registry's
+    ``_default_is_available`` returns ``True`` unconditionally and the
+    per-request ``[plugins].disabled`` gate never runs in production —
+    even though the plugin's own ``_initialize`` (which only runs when
+    the full plugin host boots, NOT in ``pm serve``) wires the adapter
+    correctly. This pin captures the kwargs the bootstrap forwards.
+    """
+    from pollypm import briefings_bootstrap as bb
+
+    captured: dict[str, object] = {}
+
+    def _capture(name, provider, *, description="", is_available=None):
+        captured["name"] = name
+        captured["provider"] = provider
+        captured["description"] = description
+        captured["is_available"] = is_available
+
+    # Patch on the bootstrap module — it imports the symbol by name.
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(bb, "register_briefing_render_provider", _capture)
+        bb.bootstrap_builtin_briefings(api_config)
+
+    assert captured.get("name") == "morning"
+    assert captured.get("is_available") is not None, (
+        "bootstrap_builtin_briefings did not pass is_available — the "
+        "per-request plugin-disable gate will not run in production."
+    )
+    assert callable(captured["is_available"])
+    assert captured.get("description"), (
+        "bootstrap_builtin_briefings did not pass a non-empty "
+        "description — GET /briefings will surface an empty blurb."
+    )
+
+
+def test_disabled_morning_plugin_via_bootstrap_path(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+) -> None:
+    """Production bootstrap + disabled config ⇒ ``morning.available=false``.
+
+    End-to-end companion to
+    :func:`test_bootstrap_briefings_passes_is_available_callback`:
+    drives the registry through the real bootstrap (no monkeypatch on
+    ``br._REGISTRY``) and asserts the per-request disable gate
+    downgrades availability. Round-12 head fails this because
+    ``bootstrap_builtin_briefings`` omitted the ``is_available`` kwarg
+    so the registry's default-True adapter swallowed the disabled flag.
+    """
+    from pollypm.briefings_registry import register_briefing_render_provider
+    from pollypm.web_api.routes._deps import _config_provider
+
+    app = create_app(config=api_config, token_path=token_path)
+    try:
+        with TestClient(app) as client:
+            # Baseline: enabled config registers via bootstrap.
+            response = client.get("/api/v1/briefings", headers=auth_headers)
+            assert response.status_code == 200, response.json()
+            morning = next(
+                entry for entry in response.json()["types"]
+                if entry["name"] == "morning"
+            )
+            assert morning["available"] is True
+
+            # Flip [plugins].disabled per request — same registry slot.
+            disabled_config = PollyPMConfig(
+                project=api_config.project,
+                pollypm=api_config.pollypm,
+                accounts=api_config.accounts,
+                sessions=api_config.sessions,
+                projects=api_config.projects,
+                memory=api_config.memory,
+                plugins=PluginSettings(disabled=("morning_briefing",)),
+            )
+            app.dependency_overrides[_config_provider] = lambda: disabled_config
+
+            response = client.get("/api/v1/briefings", headers=auth_headers)
+            assert response.status_code == 200, response.json()
+            morning = next(
+                entry for entry in response.json()["types"]
+                if entry["name"] == "morning"
+            )
+            assert morning["available"] is False, (
+                "Production bootstrap path failed to wire is_available — "
+                "per-request plugin-disable gate did not flip availability."
+            )
+
+            # Render + regenerate also 503 through the registry-driven adapter.
+            response = client.post(
+                "/api/v1/briefings/morning/regenerate",
+                json={},
+                headers=auth_headers,
+            )
+            assert response.status_code == 503, response.json()
+            assert response.json()["error"]["code"] == "service_unavailable"
+    finally:
+        register_briefing_render_provider("morning", None)

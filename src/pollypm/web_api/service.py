@@ -30,7 +30,7 @@ import psycopg_pool
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
-from pollypm.work.inbox_view import is_inbox_task
+from pollypm.work.inbox_view import is_inbox_task, is_inbox_task_identity
 from pollypm.web_api.errors import (
     APIError,
     not_found,
@@ -1849,6 +1849,15 @@ def patch_task(
 _ALREADY_ARCHIVED_STATUSES: frozenset[str] = frozenset({"done", "cancelled"})
 
 
+def _inbox_already_archived(item_id: str, status: str) -> APIError:
+    return APIError(
+        status_code=409,
+        code="invalid_state",
+        message=f"Inbox item {item_id} is already {status}; cannot archive.",
+        hint="Items in a terminal state cannot be re-archived.",
+    )
+
+
 def _project_key_from_inbox_id(item_id: str) -> str:
     """Pull the project key off an inbox item id (``project/n``).
 
@@ -1930,6 +1939,14 @@ def archive_inbox_item(
             # cannot drift open relative to the read surface (Codex
             # round-5 blocker on #2060).
             if not is_inbox_task(src_task, svc):
+                status = getattr(
+                    src_task.work_status, "value", str(src_task.work_status)
+                )
+                if (
+                    status in _ALREADY_ARCHIVED_STATUSES
+                    and is_inbox_task_identity(src_task, svc)
+                ):
+                    raise _inbox_already_archived(item_id, status)
                 raise not_found(f"Inbox item not found: {item_id}")
             # Run the strict transition FIRST so the reason note is
             # only persisted on a successful archive (#2060 round-4
@@ -1946,10 +1963,11 @@ def archive_inbox_item(
             except InvalidTransitionError as exc:
                 # The atomic UPDATE asserted the row was non-terminal;
                 # losing the race means another caller archived first.
+                message = str(exc)
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
-                    message=str(exc) or (
+                    message=message or (
                         f"Inbox item {item_id} is already terminal."
                     ),
                     hint="Items in a terminal state cannot be re-archived.",

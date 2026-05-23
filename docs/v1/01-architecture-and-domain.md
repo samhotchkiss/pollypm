@@ -116,7 +116,7 @@ The tmux layer manages the execution surface:
 - **Pane logging**: `tmux pipe-pane` streams all pane output to log files
 - **Pane capture**: `tmux capture-pane` takes point-in-time snapshots for health analysis
 - **Lease model**: Tracks whether automation or a human currently owns input to each pane
-- **Session lifecycle**: The single tmux session is created on `pm up` and torn down on `pm down`
+- **Session lifecycle**: The cockpit and storage-closet tmux sessions are created on `pm up` and torn down on `pm down`
 
 ### State Store
 

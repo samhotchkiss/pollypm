@@ -872,6 +872,7 @@ def _build_login_shell(
         from pollypm.acct.registry import get_provider
 
         parts.append(get_provider(provider.value).logout_command())
+        parts.append('printf "\\nPollyPM: logout-complete\\n"')
     parts.append(_login_command(provider, interactive=interactive, preferences=preferences))
     if return_to_caller:
         parts.append('printf "\\nPollyPM: login window complete. Returning to onboarding...\\n"')
@@ -916,6 +917,17 @@ def _detect_email_from_pane(provider: ProviderKind, pane_text: str) -> str | Non
     return get_provider(provider.value).detect_email_from_pane(pane_text)
 
 
+def _post_logout_marker_seen(pane_text: str) -> bool:
+    """Return True once the shell has printed the post-logout sentinel.
+
+    ``_build_login_shell`` emits ``PollyPM: logout-complete`` immediately after
+    the provider's ``logout_command()`` when ``force_fresh_auth=True``.  Polling
+    gates home-file / email detection on this marker so stale credentials that
+    existed *before* logout cannot be mistaken for fresh-login completion.
+    """
+    return "PollyPM: logout-complete" in pane_text
+
+
 def _login_completion_marker_seen(pane_text: str, provider: ProviderKind | None = None) -> bool:
     """Dispatch the pane-marker check to the provider package.
 
@@ -946,18 +958,27 @@ def _wait_for_login_completion(
 ) -> tuple[bool, str]:
     deadline = time.monotonic() + timeout_seconds
     last_pane = ""
+    # post_logout_seen starts True when there is no logout step to wait for
+    # (force_fresh_auth=False means the shell never prints the sentinel), so
+    # the gate below is open immediately in that case.
+    post_logout_seen = not force_fresh_auth
     while time.monotonic() < deadline:
         try:
             last_pane = tmux.capture_pane(target, lines=200)
         except Exception:  # noqa: BLE001
             last_pane = ""
 
+        if not post_logout_seen and _post_logout_marker_seen(last_pane):
+            post_logout_seen = True
+
         if _login_completion_marker_seen(last_pane, provider):
             return True, last_pane
 
         if _detect_email_from_pane(provider, last_pane):
             return True, last_pane
-        if (allow_existing_auth_shortcut or force_fresh_auth) and _detect_account_email(provider, home):
+
+        gate_open = allow_existing_auth_shortcut or (force_fresh_auth and post_logout_seen)
+        if gate_open and _detect_account_email(provider, home):
             return True, last_pane
 
         time.sleep(poll_interval)

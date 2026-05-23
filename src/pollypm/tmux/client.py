@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re as _re
 import shlex
 import subprocess
 from dataclasses import dataclass
@@ -37,8 +38,6 @@ class TmuxPane:
     pane_left: int
     pane_width: int
 
-
-import re as _re
 
 # Safe characters for tmux session/window names
 _NAME_RE = _re.compile(r"^[a-zA-Z0-9_.-]+$")
@@ -98,7 +97,7 @@ class TmuxClient:
                 capture_output=True,
                 timeout=effective_timeout,
             )
-        except subprocess.TimeoutExpired as exc:
+        except subprocess.TimeoutExpired:
             # When the tmux server itself is wedged (Sam's screenshot
             # 2026-04-26 14:08), even tiny calls like ``has-session``
             # block past the 15s timeout and raise. ``check=False``
@@ -526,12 +525,21 @@ class TmuxClient:
             return []
         return [line.strip() for line in result.stdout.splitlines() if line.strip()]
 
-    def list_windows(self, name: str) -> list[TmuxWindow]:
+    def list_windows(
+        self, name: str, *, timeout: int | None = None
+    ) -> list[TmuxWindow]:
         fmt = (
             "#{session_name}\t#{window_index}\t#{window_name}\t#{window_active}\t#{pane_id}\t"
             "#{pane_current_command}\t#{pane_current_path}\t#{pane_dead}\t#{pane_pid}"
         )
-        result = self.run("list-windows", "-t", self._exact_target(name), "-F", fmt)
+        result = self.run(
+            "list-windows",
+            "-t",
+            self._exact_target(name),
+            "-F",
+            fmt,
+            timeout=timeout,
+        )
         windows: list[TmuxWindow] = []
         for line in result.stdout.splitlines():
             parts = line.split("\t", 8)

@@ -14,6 +14,7 @@ skipped — these tests are self-contained.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -27,8 +28,15 @@ from pollypm.config import (
     PollyPMSettings,
     ProjectSettings,
 )
-from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
+from pollypm.models import (
+    KnownProject,
+    ProjectKind,
+    ProviderKind,
+    RuntimeKind,
+    SessionConfig,
+)
 from pollypm.web_api import create_app, ensure_token
+from pollypm.web_api.auth import SESSION_COOKIE_NAME
 from pollypm.web_api.chat.envelope import (
     MessageEnvelope,
     MessageRole,
@@ -322,6 +330,53 @@ def test_sessions_endpoint_surfaces_window_state(
     assert op["window"]["window_name"] == "operator"
     assert op["window"]["pane_id"] == "%99"
     assert op["transcript"]["source"] is None  # no archive in this fixture
+
+
+def test_sessions_endpoint_cookie_auth_uses_bounded_tmux_probe(
+    client, auth_headers, config, workspace, monkeypatch,
+):
+    class SlowTmuxClient:
+        timeout: int | None = None
+
+        def list_windows(self, name: str, *, timeout: int | None = None):
+            self.timeout = timeout
+            raise subprocess.TimeoutExpired(
+                cmd=["tmux", "list-windows", "-t", name],
+                timeout=timeout,
+            )
+
+    tmux = SlowTmuxClient()
+    token = auth_headers["Authorization"].removeprefix("Bearer ")
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=workspace,
+        project="myproj",
+        window_name="pm-operator",
+    )
+    monkeypatch.setattr(
+        chat_messages_routes, "_build_tmux_client", lambda: tmux,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_work_service_stub",
+        lambda _config, **_kw: None,
+    )
+
+    boot = client.get("/ui/", headers=auth_headers)
+    assert boot.status_code == 200
+    assert boot.cookies.get(SESSION_COOKIE_NAME) == token
+
+    response = client.get("/api/v1/chat/sessions")
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [session["session_name"] for session in body["sessions"]] == [
+        "operator",
+    ]
+    assert body["sessions"][0]["window"]["present"] is False
+    assert tmux.timeout == 1
 
 
 def test_sessions_endpoint_requires_bearer_auth(client, patch_registry):

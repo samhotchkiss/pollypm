@@ -168,7 +168,13 @@ def test_ui_no_cookie_with_invalid_bearer(app, token: str) -> None:
 def test_ui_index_contains_required_anchors(client: TestClient) -> None:
     """The HTML must carry the IDs ``app.js`` queries for."""
     html = client.get("/ui/").text
-    for anchor in ("surface-list", "message-list", "send-input", "send-button"):
+    for anchor in (
+        "surface-list",
+        "message-list",
+        "send-input",
+        "stop-agent-button",
+        "send-button",
+    ):
         assert f'id="{anchor}"' in html, f"missing anchor #{anchor} in index.html"
     # The cookie-based credentials assumption is baked into app.js; the
     # HTML must reference it so cache-busting / rename doesn't silently
@@ -210,6 +216,24 @@ def test_ui_static_css_served(client: TestClient) -> None:
     body = response.text
     # Sanity-check that the palette wired through (not an empty file).
     assert "--info" in body or "#5b8aff" in body
+
+
+def test_health_reports_bearer_only_auth_mode(client: TestClient) -> None:
+    """Default app health reports the closed-by-default auth posture."""
+    response = client.get("/api/v1/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["auth_mode"] == "bearer_only"
+    assert body["tailnet_trust_enabled"] is False
+
+
+def test_health_reports_tailnet_trust_mode(tailnet_app) -> None:
+    """Tailnet-bound app health reports credential-free tailnet trust."""
+    response = TestClient(tailnet_app).get("/api/v1/health")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["auth_mode"] == "tailnet_trust"
+    assert body["tailnet_trust_enabled"] is True
 
 
 def test_auth_via_cookie_works(client: TestClient, token: str) -> None:
@@ -823,6 +847,25 @@ def test_styles_have_mobile_media_query(client: TestClient) -> None:
     assert "@media (max-width: 768px)" in body, (
         "expected mobile/tablet media query for phone Tailscale users"
     )
+
+
+# -------- Section 9: surface rail filter --------------------------------
+
+
+def test_ui_surface_filter_input_rendered(client: TestClient) -> None:
+    """The web UI renders a search input above the surface rail."""
+    body = client.get("/ui/").text
+    assert 'id="surface-filter"' in body
+    assert 'type="search"' in body
+    assert 'aria-label="Filter surfaces"' in body
+
+
+def test_ui_app_js_filters_surfaces_case_insensitive(client: TestClient) -> None:
+    """Surface filtering is client-side and case-insensitive."""
+    body = client.get("/ui/app.js").text
+    assert "state.surfaceFilter" in body
+    assert ".toLowerCase().includes(filter)" in body
+    assert 'addEventListener("input"' in body
 
 
 # -------- Round-4: renderDashboard ↔ real /dashboard schema -------------

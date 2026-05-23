@@ -175,6 +175,28 @@ def _is_plan_review_label(task: Task) -> bool:
     return any(label == "plan_review" for label in labels)
 
 
+def is_inbox_task_identity(
+    task: Task,
+    service: _FlowLookup,
+    *,
+    flow_cache: dict[tuple[str, int], FlowTemplate] | None = None,
+) -> bool:
+    """Return True if ``task`` has the non-status inbox identity.
+
+    This intentionally ignores terminal status. Write endpoints use it
+    only after the normal :func:`is_inbox_task` predicate rejects a
+    terminal row, so they can distinguish "already archived inbox item"
+    from "ordinary task that never belonged to the inbox" without
+    duplicating membership rules.
+    """
+    if _roles_match_user(task):
+        return True
+    if _is_plan_review_label(task):
+        return True
+    cache = flow_cache if flow_cache is not None else {}
+    return _current_node_is_human(task, service, flow_cache=cache)
+
+
 def is_inbox_task(
     task: Task,
     service: _FlowLookup,
@@ -193,12 +215,7 @@ def is_inbox_task(
     """
     if getattr(task, "work_status", None) in TERMINAL_STATUSES:
         return False
-    if _roles_match_user(task):
-        return True
-    if _is_plan_review_label(task):
-        return True
-    cache = flow_cache if flow_cache is not None else {}
-    return _current_node_is_human(task, service, flow_cache=cache)
+    return is_inbox_task_identity(task, service, flow_cache=flow_cache)
 
 
 # ---------------------------------------------------------------------------

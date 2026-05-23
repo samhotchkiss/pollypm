@@ -30,6 +30,8 @@
     sseFailures: 0,
     sseRetryTimer: null,
     lastEventId: null,
+    surfaceMidStream: {},
+    surfaceFilter: "",
   };
 
   // ----- DOM helpers ------------------------------------------------------
@@ -82,6 +84,16 @@
       "`Authorization: Bearer …` header.";
     const layout = document.getElementById("layout") || document.body;
     layout.parentNode.insertBefore(banner, layout);
+  }
+
+  function showToast(level, text) {
+    const toast = document.createElement("div");
+    toast.className = "toast toast-" + level;
+    toast.textContent = text;
+    document.body.appendChild(toast);
+    setTimeout(() => {
+      if (toast.parentNode) toast.parentNode.removeChild(toast);
+    }, 4000);
   }
 
   // ----- fetch wrapper ----------------------------------------------------
@@ -137,13 +149,25 @@
   function renderSurfaces() {
     const list = $("surface-list");
     list.innerHTML = "";
+    const filter = state.surfaceFilter.trim().toLowerCase();
+    const surfaces = filter
+      ? state.surfaces.filter((s) => (
+        String(s.session_name || "").toLowerCase().includes(filter)
+      ))
+      : state.surfaces;
     if (state.surfaces.length === 0) {
       list.appendChild(
         el("li", { class: "surface-empty", text: "no surfaces registered" }),
       );
       return;
     }
-    for (const s of state.surfaces) {
+    if (surfaces.length === 0) {
+      list.appendChild(
+        el("li", { class: "surface-empty", text: "no matching surfaces" }),
+      );
+      return;
+    }
+    for (const s of surfaces) {
       const dotClass =
         s.window && s.window.pane_dead
           ? "surface-dot dead"
@@ -190,8 +214,29 @@
     $("pane-meta").textContent = "";
     $("send-input").disabled = false;
     $("send-button").disabled = false;
+    updateStopAgentButton();
     renderSurfaces();
     loadHistory(name);
+  }
+
+  function messageLooksMidStream(message) {
+    const text = String(message && message.text ? message.text : "")
+      .toLowerCase();
+    return (
+      text.includes("esc to interrupt")
+      || text.includes("working (")
+      || text.includes("unsafe_mid_tool")
+    );
+  }
+
+  function updateStopAgentButton() {
+    const btn = $("stop-agent-button");
+    if (!btn) return;
+    const active = Boolean(
+      state.selectedSurface && state.surfaceMidStream[state.selectedSurface],
+    );
+    btn.hidden = !active;
+    btn.disabled = !active;
   }
 
   // ----- history (center) ------------------------------------------------
@@ -217,6 +262,10 @@
     if (data.transcript_source) meta.push("src=" + data.transcript_source);
     $("pane-meta").textContent = meta.join(" · ");
     const msgs = Array.isArray(data.messages) ? data.messages.slice() : [];
+    state.surfaceMidStream[data.session_name] = (
+      msgs.length > 0 && messageLooksMidStream(msgs[0])
+    );
+    updateStopAgentButton();
     if (msgs.length === 0) {
       list.appendChild(
         el("div", { class: "message-empty", text: "no messages yet" }),
@@ -248,6 +297,7 @@
     list.appendChild(
       el("div", { class: "error-banner", text: "history error: " + err.message }),
     );
+    updateStopAgentButton();
   }
 
   // ----- send (bottom) ---------------------------------------------------
@@ -262,6 +312,15 @@
     });
     // Refresh after a short delay so the new line shows up.
     setTimeout(() => loadHistory(name), 400);
+  }
+
+  async function interruptSurface(name) {
+    if (!name) return;
+    const path = API + "/sessions/" + encodeURIComponent(name) + "/interrupt";
+    await apiFetch(path, { method: "POST" });
+    state.surfaceMidStream[name] = false;
+    updateStopAgentButton();
+    showToast("ok", "sent interrupt to " + name);
   }
 
   // ----- dashboard rollups (right rail) ----------------------------------
@@ -522,8 +581,33 @@
     });
   }
 
+  function wireStopAgentButton() {
+    const btn = $("stop-agent-button");
+    if (!btn) return;
+    btn.addEventListener("click", () => {
+      const name = state.selectedSurface;
+      if (!name || btn.disabled) return;
+      btn.disabled = true;
+      interruptSurface(name).catch((err) => {
+        btn.disabled = false;
+        showToast("error", "interrupt failed: " + err.message);
+      });
+    });
+  }
+
+  function wireSurfaceFilter() {
+    const input = $("surface-filter");
+    if (!input) return;
+    input.addEventListener("input", () => {
+      state.surfaceFilter = input.value || "";
+      renderSurfaces();
+    });
+  }
+
   function init() {
+    wireSurfaceFilter();
     wireSendForm();
+    wireStopAgentButton();
     setStatus("warn", "connecting…");
     loadSurfaces();
     pollDashboard();
@@ -541,6 +625,7 @@
     loadSurfaces: loadSurfaces,
     loadHistory: loadHistory,
     sendMessage: sendMessage,
+    interruptSurface: interruptSurface,
     pollDashboard: pollDashboard,
     startEventStream: startEventStream,
     startFallbackPolling: startFallbackPolling,

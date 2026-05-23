@@ -4095,6 +4095,18 @@ components:
             Paired with `_truncated_by_deadline` so a truncated
             response reports how far it got across live + rotated
             logs. (Codex P0 finding, PR #2062 round 4.)
+        _corrupt_archives_skipped:
+          type: integer
+          default: 0
+          minimum: 0
+          description: |
+            Count of rotated `.gz` archives skipped during this query
+            due to truncation, corruption, or read errors
+            (`EOFError`, `gzip.BadGzipFile`, `zlib.error`). The query
+            continues over the live log + other archives best-effort
+            instead of letting the exception escape as a 500. Non-zero
+            means at least one archive needs operator attention.
+            (Codex round-7 finding, PR #2062.)
 
     AuditStatsResponse:
       type: object
@@ -4138,3 +4150,13 @@ components:
             Paired with `_truncated_by_deadline` so a truncated
             response reports how far it got across live + rotated
             logs. (Codex P0 finding, PR #2062 round 6.)
+        _corrupt_archives_skipped:
+          type: integer
+          default: 0
+          minimum: 0
+          description: |
+            Same semantics as in `AuditGrepResponse`: count of rotated
+            `.gz` archives skipped during this aggregation due to
+            truncation, corruption, or read errors. Non-zero means at
+            least one archive needs operator attention. (Codex round-7
+            finding, PR #2062.)

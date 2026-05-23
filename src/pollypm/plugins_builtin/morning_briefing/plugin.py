@@ -22,7 +22,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from pollypm.briefings_registry import register_briefing_provider
+from pollypm.briefings_registry import (
+    register_briefing_provider,
+    register_briefing_render_provider,
+)
 from pollypm.plugin_api.v1 import (
     Capability,
     JobHandlerAPI,
@@ -37,6 +40,9 @@ from pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick import (
 from pollypm.plugins_builtin.morning_briefing.inbox import (
     briefing_sweep_handler,
     list_briefings,
+)
+from pollypm.plugins_builtin.morning_briefing.render_facade import (
+    MorningBriefingRenderProvider,
 )
 
 
@@ -77,16 +83,25 @@ def _register_handlers(api: JobHandlerAPI) -> None:
 
 
 def _initialize(api: PluginAPI) -> None:
-    """Wire the briefing-inbox provider for core dashboard reads.
+    """Wire the briefing-inbox provider AND render facade for core surfaces.
 
     The dashboard surfaces briefings through
     :func:`pollypm.briefings_registry.list_briefings` so core never
     imports from this plugin. We register the real implementation here
     during plugin initialize; with the plugin disabled the dashboard
     sees no provider and renders without a briefing banner (#1363).
+
+    The Web API additionally renders / regenerates briefings through
+    :func:`pollypm.briefings_registry.get_briefing_render_provider`.
+    We install the morning render facade here so the API never imports
+    ``plugins_builtin.morning_briefing`` directly (#2059 round-9).
     """
-    del api  # unused — the dashboard reads briefings off the filesystem
+    del api  # unused — both seams are accessed through the registry
     register_briefing_provider(list_briefings)
+    register_briefing_render_provider(
+        MorningBriefingRenderProvider.type_name,
+        MorningBriefingRenderProvider(),
+    )
 
 
 def _register_roster(api: RosterAPI) -> None:

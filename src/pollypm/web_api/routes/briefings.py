@@ -11,17 +11,21 @@ calls for a small, sync-only surface in this PR: long-running renders
 exceed a 30 s budget and return ``504 timeout`` (§2.7 / §9.2 third
 bullet). ``?async=true`` + a job registry is deferred to Phase 2.5.
 
-The route is a thin adapter over the existing briefing seam:
+The route is a thin adapter over the briefing registry seams:
 
-- :func:`pollypm.briefings_registry.list_briefings` powers the discovery
-  endpoint (presence of a registered provider implies the type is
-  available).
-- :func:`pollypm.plugins_builtin.morning_briefing.inbox.list_briefings`
-  + :func:`pollypm.plugins_builtin.morning_briefing.inbox.read_briefing`
-  back the render endpoint (newest cached entry on disk).
-- :func:`pollypm.plugins_builtin.morning_briefing.handlers.briefing_tick.fire_briefing`
-  is the regenerate hook, wrapped in a thread-pool timeout so a slow
-  provider surfaces as ``504 timeout`` rather than hanging the request.
+- :func:`pollypm.briefings_registry.list_briefings` powers availability
+  for the discovery endpoint (presence of a registered provider implies
+  the type is available).
+- :func:`pollypm.briefings_registry.get_briefing_render_provider` returns
+  the plugin-installed render adapter for ``{type_name}`` — the route
+  consumes its :class:`BriefingArtifact` outputs and never imports the
+  plugin tree directly (Codex round-9 on #2059: previously
+  ``pollypm.plugins_builtin.morning_briefing.inbox`` /
+  ``handlers.briefing_tick`` / ``settings`` / ``state`` were imported
+  here, which violated the documented core boundary).
+- The regenerate path wraps the provider call in a thread-pool timeout
+  so a slow provider surfaces as ``504 timeout`` rather than hanging
+  the request.
 
 Only one briefing type (``morning``) ships built-in today; the registry
 seam is honored so a future plugin can register additional types
@@ -192,144 +196,136 @@ class _BriefingAdapter:
         return self._regenerate(config, body)
 
 
-def _morning_available(config: Any) -> bool:  # noqa: ARG001 — registry is module-level
-    """Return True iff the morning-briefing plugin is registered.
+# Plugin name the morning briefing type is gated on. Kept as a route
+# module constant (rather than importing from
+# ``pollypm.briefings_bootstrap``) because this module's only contract
+# with the bootstrap is the registry's render-provider slot — we don't
+# want the route taking a hard dep on the bootstrap module.
+_MORNING_BRIEFING_PLUGIN_NAME = "morning_briefing"
+_MORNING_BRIEFING_TYPE_NAME = "morning"
 
-    The :mod:`pollypm.briefings_registry` seam holds the active provider
-    callable; ``None`` means the plugin tree isn't loaded (config didn't
-    enable the plugin, or ``[plugins].disabled`` includes
-    ``morning_briefing``) and the type is reported as ``available=false``
-    so clients know not to attempt regenerate. Uses the public
-    :func:`is_briefing_provider_registered` helper instead of reaching
-    into the module-private slot (Codex round-3 on PR #2059).
+
+def _artifact_to_response(
+    type_name: str,
+    artifact: Any,
+) -> BriefingResponse:
+    """Translate a registry :class:`BriefingArtifact` into the wire model."""
+    return BriefingResponse(
+        type=type_name,
+        generated_at=_parse_iso(artifact.generated_at or ""),
+        date_local=artifact.date_local or None,
+        mode=artifact.mode,
+        markdown=artifact.markdown,
+        metadata=dict(artifact.metadata or {}),
+    )
+
+
+def _morning_available(config: Any) -> bool:
+    """Return True iff the morning-briefing render provider is usable now.
+
+    Two gates:
+
+    1. ``config.plugins.disabled`` must not contain ``morning_briefing``.
+       This is the **per-request** disable check (Codex round-9 on
+       #2059): ``create_app`` reloads config every request (#2056),
+       so an operator editing ``pollypm.toml`` mid-run must see
+       ``available=false`` without restart even if the registry slot
+       is still populated from startup.
+    2. A render provider must be registered for the ``morning`` type
+       (the ``morning_briefing`` plugin's ``initialize`` hook /
+       :mod:`pollypm.briefings_bootstrap` installs it).
+
+    Both gates also indirectly cover the legacy
+    ``is_briefing_provider_registered`` semantics: when the plugin
+    bootstrap saw a disabled config it clears the registry slot, so
+    requirement (2) fails too. We check (1) explicitly so a request
+    that arrives between a config edit and the next bootstrap call
+    (in practice never happens — bootstrap runs at startup only —
+    but the contract should not depend on that ordering) still
+    reports correctly.
     """
-    from pollypm.briefings_registry import is_briefing_provider_registered
+    from pollypm.briefings_registry import (
+        get_briefing_render_provider,
+        is_plugin_disabled_in_config,
+    )
 
-    return is_briefing_provider_registered()
+    if is_plugin_disabled_in_config(config, _MORNING_BRIEFING_PLUGIN_NAME):
+        return False
+    return get_briefing_render_provider(_MORNING_BRIEFING_TYPE_NAME) is not None
 
 
 def _morning_render_last(config: Any) -> BriefingResponse | None:
-    """Read the newest morning briefing off disk (spec §9.1 ``last``)."""
-    from pollypm.plugins_builtin.morning_briefing import inbox as _inbox
+    """Read the newest morning briefing via the registered render provider.
 
-    base_dir = config.project.base_dir
-    entries = _inbox.list_briefings(base_dir, status="all", limit=1)
-    if not entries:
-        return None
-    entry = entries[0]
-    read = _inbox.read_briefing(base_dir, entry.date_local)
-    if read is None:
-        # The metadata json existed during list_briefings but the body
-        # disappeared between calls (rare — atomic-write replaces both;
-        # treat as missing so the caller can regenerate).
-        return None
-    _entry, markdown = read
-    return BriefingResponse(
-        type="morning",
-        generated_at=_parse_iso(_entry.created_at),
-        date_local=_entry.date_local,
-        mode=_entry.mode or None,
-        markdown=markdown,
-        metadata={
-            "status": _entry.status,
-            "pinned": _entry.pinned,
-            "yesterday": _entry.yesterday,
-            "priorities": list(_entry.priorities),
-            "watch": list(_entry.watch),
-            **dict(_entry.meta),
-        },
+    Honors the per-request plugin-disable check first (Codex round-9 on
+    #2059): a config flip to ``[plugins].disabled = ["morning_briefing"]``
+    must make render return ``None`` immediately, even if the registry
+    slot still references the previously-installed provider. The route
+    layer translates ``None`` into 404 / 503 per its existing rules.
+    """
+    from pollypm.briefings_registry import (
+        get_briefing_render_provider,
+        is_plugin_disabled_in_config,
     )
+
+    if is_plugin_disabled_in_config(config, _MORNING_BRIEFING_PLUGIN_NAME):
+        return None
+    provider = get_briefing_render_provider(_MORNING_BRIEFING_TYPE_NAME)
+    if provider is None:
+        return None
+    artifact = provider.render_last(config)
+    if artifact is None:
+        return None
+    return _artifact_to_response(_MORNING_BRIEFING_TYPE_NAME, artifact)
 
 
 def _morning_regenerate(config: Any, body: RegenerateRequest) -> BriefingResponse:
-    """Force-fire the morning briefing pipeline (spec §9.1 ``regenerate``).
+    """Force-fire the morning briefing via the registered render provider.
 
-    Mirrors ``pm briefing now`` (see
-    :mod:`pollypm.plugins_builtin.morning_briefing.cli`): runs the full
-    gather → synthesize → emit chain and writes to the inbox. The
-    ``project`` body field is rejected with 400 for the morning type —
-    morning briefings are whole-workspace only today (Phase 2 round-1
-    Codex feedback on #2059: the field used to be silently ignored,
-    which let a client think they'd narrowed scope when they hadn't).
+    Per-request plugin-disable check runs first (Codex round-9 on
+    #2059) — a disabled config returns 503 without ever calling into
+    the provider. ``ValueError`` from the provider (the morning
+    briefing's signal that ``project`` narrowing is not supported) is
+    translated into a typed 400; any other provider exception becomes
+    a 503 ``service_unavailable``.
     """
-    from pollypm.plugins_builtin.morning_briefing.handlers import (
-        briefing_tick as _tick,
+    from pollypm.briefings_registry import (
+        get_briefing_render_provider,
+        is_plugin_disabled_in_config,
     )
-    from pollypm.plugins_builtin.morning_briefing.settings import (
-        load_briefing_settings,
-    )
-    from pollypm.plugins_builtin.morning_briefing.state import load_state
-    from pollypm.config import DEFAULT_CONFIG_PATH, resolve_config_path
-    from pollypm.tz import get_timezone
 
-    if body.project is not None:
+    if is_plugin_disabled_in_config(config, _MORNING_BRIEFING_PLUGIN_NAME):
+        raise service_unavailable(
+            f"{_MORNING_BRIEFING_PLUGIN_NAME} is disabled in [plugins].disabled",
+            hint=(
+                "Remove `morning_briefing` from [plugins].disabled and "
+                "re-trigger; or rely on the next briefing tick."
+            ),
+        )
+    provider = get_briefing_render_provider(_MORNING_BRIEFING_TYPE_NAME)
+    if provider is None:
+        raise service_unavailable(
+            "morning briefing provider is not registered",
+            hint=(
+                "Enable the morning_briefing plugin and restart pm serve."
+            ),
+        )
+
+    try:
+        artifact = provider.regenerate(config, project=body.project)
+    except ValueError as exc:
+        # Spec §9.2: provider signals "project narrowing not supported"
+        # via ValueError. Translate to a typed 400 with the route's
+        # canonical hint (clients should omit `project` for morning).
         raise invalid_request(
-            "project-scoped morning briefings are not implemented",
+            str(exc) or "project-scoped morning briefings are not implemented",
             hint=(
                 "Omit the `project` field — the morning briefing is "
                 "always whole-workspace. Per-project briefings will land "
                 "with the plugin-contributed briefing types."
             ),
-        )
-
-    base_dir = config.project.base_dir
-    project_root = config.project.root_dir
-
-    # ``load_briefing_settings`` reads ``[briefing]`` overrides off the
-    # toml. Prefer the path the running ``pm serve`` actually loaded
-    # (``config.config_path``) so a non-default ``--config`` flag is
-    # honored. Falling back to ``DEFAULT_CONFIG_PATH`` keeps the path
-    # working in tests that construct ``PollyPMConfig`` directly without
-    # touching disk. (Codex round-1 P0 on #2059: the old code always
-    # read ``DEFAULT_CONFIG_PATH``, so ``pm serve --config /tmp/foo``
-    # would write into ``foo``'s ``base_dir`` while honoring the
-    # default global TOML's briefing hour/timezone/quiet-mode.)
-    config_path = getattr(config, "config_path", None) or DEFAULT_CONFIG_PATH
-    settings = load_briefing_settings(resolve_config_path(config_path))
-
-    fallback_tz = getattr(config.pollypm, "timezone", "") or ""
-    timezone = get_timezone(fallback_tz)
-    now_local = datetime.now(timezone)
-
-    state = load_state(base_dir)
-
-    result = _tick.fire_briefing(
-        project_root=project_root,
-        base_dir=base_dir,
-        settings=settings,
-        now_local=now_local,
-        state=state,
-        config=config,
-        emit_to_inbox=True,
-    )
-    if not isinstance(result, dict) or not result.get("fired"):
-        reason = (
-            str(result.get("reason"))
-            if isinstance(result, dict) else "unknown"
-        )
-        raise service_unavailable(
-            f"briefing regenerate did not fire ({reason})",
-            hint=(
-                "Check the morning_briefing plugin logs; the gather / "
-                "synthesize stage declined to produce a draft."
-            ),
-        )
-    draft = result.get("draft") or {}
-    return BriefingResponse(
-        type="morning",
-        generated_at=now_local.astimezone(UTC),
-        date_local=str(draft.get("date_local") or ""),
-        mode=str(draft.get("mode") or "") or None,
-        markdown=str(draft.get("markdown") or ""),
-        metadata={
-            "emitted_to_inbox": bool(result.get("emitted", False)),
-            "yesterday": draft.get("yesterday"),
-            "priorities": list(draft.get("priorities") or []),
-            "watch": list(draft.get("watch") or []),
-            "quiet_mode": bool(result.get("quiet_mode", False)),
-            **dict(draft.get("meta") or {}),
-        },
-    )
+        ) from exc
+    return _artifact_to_response(_MORNING_BRIEFING_TYPE_NAME, artifact)
 
 
 _REGISTRY: dict[str, _BriefingAdapter] = {

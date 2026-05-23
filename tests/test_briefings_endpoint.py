@@ -1299,3 +1299,155 @@ def test_briefings_pm_serve_process_exits_with_wedged_worker(
         f"child took {elapsed:.1f}s; the wedged worker should not "
         f"have blocked interpreter exit past the lifespan grace."
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex round-9 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_web_api_does_not_import_plugins_builtin_directly() -> None:
+    """The Web API must consume briefings only through the registry seam.
+
+    Codex round-9 on #2059: previously ``web_api/app.py`` and
+    ``web_api/routes/briefings.py`` imported
+    ``pollypm.plugins_builtin.morning_briefing`` internals directly,
+    violating the core boundary documented at
+    ``briefings_registry.py:10-16`` and ``cli.py:201-207`` (``cli.py``
+    is the only sanctioned core → ``plugins_builtin`` edge for the
+    CLI; ``briefings_bootstrap.py`` is the matching sanctioned edge
+    for the Web API).
+
+    Greps every Python file under ``src/pollypm/web_api/`` and asserts
+    none of them imports ``pollypm.plugins_builtin``.
+    """
+    import re
+
+    web_api_root = Path(__file__).resolve().parent.parent / "src" / "pollypm" / "web_api"
+    assert web_api_root.is_dir(), web_api_root
+
+    # Match both ``from pollypm.plugins_builtin.X import ...`` and
+    # ``import pollypm.plugins_builtin.X``.
+    pattern = re.compile(
+        r"^\s*(?:from|import)\s+pollypm\.plugins_builtin\b",
+        re.MULTILINE,
+    )
+    offenders: list[tuple[Path, int, str]] = []
+    for path in sorted(web_api_root.rglob("*.py")):
+        text = path.read_text()
+        for match in pattern.finditer(text):
+            line_no = text[: match.start()].count("\n") + 1
+            offenders.append((path, line_no, match.group(0).strip()))
+
+    assert not offenders, (
+        "Web API modules must not import from pollypm.plugins_builtin "
+        "directly — go through pollypm.briefings_registry / "
+        "pollypm.briefings_bootstrap. Offenders:\n"
+        + "\n".join(f"  {p}:{ln}  {line}" for p, ln, line in offenders)
+    )
+
+
+def test_disabled_morning_plugin_per_request(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+) -> None:
+    """Plugin disablement must take effect per request, not per restart.
+
+    Codex round-9 on #2059: ``create_app`` reloads config every
+    request (Codex round-2 on #2056) but ``_wire_briefings_provider``
+    used to run only at startup, so flipping
+    ``[plugins].disabled = ["morning_briefing"]`` in ``pollypm.toml``
+    mid-run kept reporting ``morning.available=true`` (and 200 from
+    render/regenerate) until ``pm serve`` restarted. The fix:
+    ``_morning_available`` / ``_morning_render_last`` /
+    ``_morning_regenerate`` each call
+    :func:`pollypm.briefings_registry.is_plugin_disabled_in_config`
+    against the per-request ``ConfigDep`` config.
+
+    Test:
+    1. Build app with morning enabled — assert ``available=true``.
+    2. Override ``ConfigDep`` to return a config with
+       ``morning_briefing`` disabled.
+    3. WITHOUT restart, GET /api/v1/briefings →
+       ``morning.available=false``; POST regenerate → 503.
+    """
+    # Make sure the morning render provider IS registered (the test
+    # fixture for ``api_config`` does not set ``[plugins].disabled``,
+    # so ``create_app`` will install the provider).
+    from pollypm.briefings_registry import register_briefing_render_provider
+    from pollypm.web_api.routes import briefings as br
+    from pollypm.web_api.routes._deps import _config_provider
+
+    # Restore canonical adapter in case a sibling test mutated it.
+    br._REGISTRY["morning"] = br._BriefingAdapter(
+        name="morning",
+        description="Daily morning briefing — canonical adapter (test restore)",
+        available=br._morning_available,
+        render_last=br._morning_render_last,
+        regenerate=br._morning_regenerate,
+    )
+
+    app = create_app(config=api_config, token_path=token_path)
+    try:
+        with TestClient(app) as client:
+            # 1) Baseline: morning enabled → available=true
+            response = client.get("/api/v1/briefings", headers=auth_headers)
+            assert response.status_code == 200, response.json()
+            morning = next(
+                entry for entry in response.json()["types"]
+                if entry["name"] == "morning"
+            )
+            assert morning["available"] is True, (
+                "Morning provider was not wired at app startup — test "
+                "setup is wrong (need the bootstrap to install the "
+                "render provider)."
+            )
+
+            # 2) Flip [plugins].disabled on the per-request config
+            # WITHOUT touching the registry. The route's per-request
+            # disable check must downgrade availability immediately.
+            disabled_config = PollyPMConfig(
+                project=api_config.project,
+                pollypm=api_config.pollypm,
+                accounts=api_config.accounts,
+                sessions=api_config.sessions,
+                projects=api_config.projects,
+                memory=api_config.memory,
+                plugins=PluginSettings(disabled=("morning_briefing",)),
+            )
+            app.dependency_overrides[_config_provider] = lambda: disabled_config
+
+            # 3) GET /api/v1/briefings → morning.available=false
+            response = client.get("/api/v1/briefings", headers=auth_headers)
+            assert response.status_code == 200, response.json()
+            morning = next(
+                entry for entry in response.json()["types"]
+                if entry["name"] == "morning"
+            )
+            assert morning["available"] is False, (
+                "morning_briefing was added to [plugins].disabled "
+                "mid-run but the API still reports available=true — "
+                "the per-request plugin-disable check is not running."
+            )
+
+            # POST regenerate → 503 service_unavailable
+            response = client.post(
+                "/api/v1/briefings/morning/regenerate",
+                json={},
+                headers=auth_headers,
+            )
+            assert response.status_code == 503, response.json()
+            assert response.json()["error"]["code"] == "service_unavailable"
+
+            # Render (GET /api/v1/briefings/morning) also 503s — the
+            # availability gate fails the same way.
+            response = client.get(
+                "/api/v1/briefings/morning", headers=auth_headers,
+            )
+            assert response.status_code == 503, response.json()
+            assert response.json()["error"]["code"] == "service_unavailable"
+    finally:
+        # Drop the global render provider so sibling tests start clean.
+        register_briefing_render_provider("morning", None)

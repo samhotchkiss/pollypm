@@ -110,10 +110,55 @@ test.describe("send message", () => {
     await stubMessages(page);
     await page.goto("/ui/");
     await expect(page.locator("#send-input")).toBeDisabled();
+    await expect(page.locator("#stop-agent-button")).toBeHidden();
     await expect(page.locator("#send-button")).toBeDisabled();
     await page.locator("li[data-session='operator']").click();
     await expect(page.locator("#send-input")).toBeEnabled();
     await expect(page.locator("#send-button")).toBeEnabled();
+  });
+
+  test("stop-agent button interrupts mid-stream surface", async ({ page }) => {
+    await stubSurfaces(page);
+    await page.route("**/api/v1/chat/operator/messages*", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          session_name: "operator",
+          surface_type: "operator",
+          transcript_source: "capture",
+          messages: [
+            {
+              id: "m1",
+              ts: "2026-05-23T00:00:00Z",
+              role: "assistant",
+              actor: "Polly",
+              type: "text",
+              text: "Working (0s · esc to interrupt)",
+              metadata: {},
+            },
+          ],
+        }),
+      }),
+    );
+    let interrupted = false;
+    await page.route("**/api/v1/sessions/operator/interrupt", (route, req) => {
+      interrupted = req.method() === "POST";
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ ok: true, message: "sent Escape to operator" }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.locator("li[data-session='operator']").click();
+    const stop = page.locator("#stop-agent-button");
+    await expect(stop).toBeVisible();
+    await stop.click();
+    await expect.poll(() => interrupted).toBe(true);
+    await expect(page.locator(".toast")).toContainText("sent interrupt");
+    await expect(stop).toBeHidden();
   });
 
   test("empty / whitespace-only text does not POST", async ({ page }) => {

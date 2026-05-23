@@ -321,15 +321,35 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     from pollypm.state_cache.refresh_impl import WORKSPACE_PROJECT_KEY
     if WORKSPACE_PROJECT_KEY not in snapshot:
         return None
+    # #2051 round-3 (Codex review): bounded-staleness guard. Once the
+    # refresher has installed an EMPTY ``__workspace__`` entry (no
+    # workspace-root awaits-user rows at snapshot time), the absent-
+    # sentinel guard above stops firing — yet message-store writes
+    # (alerts, notifications, `pm notify`) can still land after that
+    # refresh without emitting an invalidating audit event, leaving the
+    # empty entry stale. Treat a present-but-empty workspace entry as
+    # NOT-AUTHORITATIVE and fall through to the direct sweep. A non-
+    # empty entry is trusted: the refresher just computed it and the
+    # items are real. Cost: workspaces with genuinely zero root-level
+    # awaits-user rows pay the direct-sweep cost on every call (per-
+    # project entries still benefit from the rest of the cache). Full
+    # audit-event wiring for workspace-root producers is deferred past
+    # v1 RC.
+    workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
+    workspace_items = (
+        getattr(workspace_entry, "awaits_user_items", ()) or ()
+        if workspace_entry is not None
+        else ()
+    )
+    if not workspace_items:
+        return None
     cached_items: list[object] = []
     # The synthetic ``__workspace__`` entry carries workspace-root
     # awaits-user items (messages with ``scope IN ('', 'inbox')`` that
     # don't belong to any tracked project). Union them first so the
     # returned list mirrors the direct sweep's content.
-    workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
-    if workspace_entry is not None:
-        for item in getattr(workspace_entry, "awaits_user_items", ()) or ():
-            cached_items.append(item)
+    for item in workspace_items:
+        cached_items.append(item)
     for project_key, entry in snapshot.items():
         if project_key == WORKSPACE_PROJECT_KEY:
             continue
@@ -582,13 +602,27 @@ def _maybe_cache_count_awaits_user(config) -> int | None:
     from pollypm.state_cache.refresh_impl import WORKSPACE_PROJECT_KEY
     if WORKSPACE_PROJECT_KEY not in snapshot:
         return None
+    # #2051 round-3 (Codex review): bounded-staleness guard mirroring
+    # the list helper. A present-but-empty ``__workspace__`` entry
+    # (``awaits_user_count == 0``) is NOT treated as authoritative —
+    # message-store writes that bypass audit-event invalidation can
+    # land after the sentinel was last refreshed, leaving the zero
+    # stale. Fall through to the direct sweep so the rail badge can't
+    # under-report. See ``_maybe_cache_route_awaits_user`` for the full
+    # rationale and trade-offs.
+    workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
+    workspace_count = (
+        int(getattr(workspace_entry, "awaits_user_count", 0) or 0)
+        if workspace_entry is not None
+        else 0
+    )
+    if workspace_count <= 0:
+        return None
     total = 0
     # Pull the workspace-root awaits-user count off the synthetic
-    # ``__workspace__`` entry. An entry that's present but empty
-    # contributes 0; an absent entry is handled by the guard above.
-    workspace_entry = snapshot.get(WORKSPACE_PROJECT_KEY)
-    if workspace_entry is not None:
-        total += int(getattr(workspace_entry, "awaits_user_count", 0) or 0)
+    # ``__workspace__`` entry. Authoritative when non-zero (the empty
+    # case fell through above).
+    total += workspace_count
     for project_key, entry in snapshot.items():
         if project_key == WORKSPACE_PROJECT_KEY:
             continue

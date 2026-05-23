@@ -15,13 +15,18 @@ import { test, expect } from "@playwright/test";
  *     - pollypm-session cookie
  *     - Tailscale CGNAT IP (when trust is enabled)
  *
- *   These tests run against a loopback dev daemon (POLLYPM_BASE_URL
- *   defaults to http://127.0.0.1:8765), so the local cookie-mint path
- *   is exercised positively. The non-local negative case is asserted
- *   via a forged X-Forwarded-For — see notes on `direct API call`
- *   below; with no real way to spoof TCP source IP from userspace we
- *   verify what we CAN: missing cookie + missing bearer → 401.
+ *   These tests are written for a loopback dev daemon (POLLYPM_BASE_URL
+ *   defaults to http://127.0.0.1:8765), where the local cookie-mint
+ *   path is exercised positively and the "no cookie + no bearer → 401"
+ *   negative path is enforceable. When POLLYPM_BASE_URL points at a
+ *   tailnet CGNAT address (100.x.y.z), the peer IP itself is a valid
+ *   credential, so the negative tests below skip — the product is
+ *   behaving correctly in that environment, just not in a way the
+ *   "missing cookie" probe can falsify.
  */
+
+const BASE_URL = process.env.POLLYPM_BASE_URL || "http://127.0.0.1:8765";
+const IS_TAILNET = /\/\/100\.\d+\.\d+\.\d+/.test(BASE_URL);
 
 test.describe("auth", () => {
   test("GET /ui/ loads and serves index.html", async ({ page }) => {
@@ -73,11 +78,15 @@ test.describe("auth", () => {
   });
 
   test("direct API call without cookie returns 401", async ({ playwright }) => {
+    test.skip(
+      IS_TAILNET,
+      "Tailscale-trusted base URL accepts unauthenticated requests via peer IP; auth negative tests are loopback-only",
+    );
     // Spin up an isolated APIRequestContext with NO cookies, NO bearer.
     // This is the canonical "untrusted client" probe — the request
     // fixture inherits state from the project, so we want a clean one.
     const ctx = await playwright.request.newContext({
-      baseURL: process.env.POLLYPM_BASE_URL || "http://127.0.0.1:8765",
+      baseURL: BASE_URL,
     });
     try {
       const resp = await ctx.get("/api/v1/chat/sessions");
@@ -93,6 +102,10 @@ test.describe("auth", () => {
   });
 
   test("cookie isolation: fresh context after /ui/ load gets NO cookie", async ({ page, playwright }) => {
+    test.skip(
+      IS_TAILNET,
+      "Tailscale-trusted base URL accepts unauthenticated requests via peer IP; auth negative tests are loopback-only",
+    );
     // Load /ui/ in the browser to mint the page's cookie.
     await page.goto("/ui/");
     const pageCookies = await page.context().cookies();
@@ -106,7 +119,7 @@ test.describe("auth", () => {
     // invariant the previous "accept 200/401/403" test was trying to
     // express but couldn't enforce.
     const isolated = await playwright.request.newContext({
-      baseURL: process.env.POLLYPM_BASE_URL || "http://127.0.0.1:8765",
+      baseURL: BASE_URL,
     });
     try {
       const resp = await isolated.get("/api/v1/chat/sessions");

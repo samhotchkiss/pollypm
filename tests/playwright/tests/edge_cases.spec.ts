@@ -137,6 +137,13 @@ test.describe("edge cases", () => {
   });
 
   test("connection badge reflects HTTP failures", async ({ page }) => {
+    // The conn-status badge reflects the union of read-endpoint health.
+    // beforeEach() above stubs /api/v1/dashboard as a successful 200, and
+    // app.js fires loadSurfaces() + pollDashboard() in parallel on init.
+    // If only /chat/sessions fails, the successful dashboard response can
+    // win the race and flip the badge back to conn-ok. To assert the
+    // failure-surfacing contract deterministically, override BOTH read
+    // endpoints to fail in this specific test.
     await page.route("**/api/v1/chat/sessions", (route) =>
       route.fulfill({
         status: 500,
@@ -144,7 +151,17 @@ test.describe("edge cases", () => {
         body: JSON.stringify({ error: { code: "internal", message: "x" } }),
       }),
     );
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({ error: { code: "internal", message: "x" } }),
+      }),
+    );
     await page.goto("/ui/");
-    await expect(page.locator("#conn-status")).toHaveClass(/conn-warn|conn-error/);
+    await expect(page.locator("#conn-status")).toHaveClass(
+      /conn-warn|conn-error/,
+      { timeout: 5000 },
+    );
   });
 });

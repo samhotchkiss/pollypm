@@ -1680,6 +1680,14 @@ paths:
         `?safety=force` bypasses BOTH the mid-turn check and the
         probe-unknown check.
 
+        `?force=true` or `{"force": true}` bypasses a human-held
+        session lease only. It does not bypass the mid-turn safety
+        gate; combine with `?safety=force` only when the operator
+        intentionally wants both overrides.
+
+        Returns `409 session_leased` when the session is leased to
+        another owner and `force` was not requested.
+
         Returns `503 daemon_unavailable` when the supervisor or tmux
         session service can't be constructed, when no account can be
         resolved for the session, or when `restart_session` raises.
@@ -1695,6 +1703,28 @@ paths:
             mid-turn; `force` bypasses the mid-turn gate. `loose` is
             treated like `strict` for this verb (no warn-and-proceed
             semantics defined yet).
+        - in: query
+          name: force
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Bypass a human-held session lease. This does not bypass the
+            mid-turn safety probe; use `safety=force` for that.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force:
+                  type: boolean
+                  default: false
+                  description: |
+                    Bypass a human-held session lease. This does not
+                    bypass the mid-turn safety probe; use
+                    `safety=force` for that.
       responses:
         "200":
           description: Restart completed.
@@ -1708,9 +1738,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: |
-            Refused because the agent is mid-turn
-            (`code=unsafe_mid_turn`). Re-issue with `?safety=force` to
-            override.
+            One of:
+            * `code=unsafe_mid_turn` — refused because the agent is
+              mid-turn. Re-issue with `?safety=force` to override.
+            * `code=session_leased` — refused because the session is
+              leased to another owner. Re-issue with `?force=true` or
+              `{"force": true}` to override the lease.
           content:
             application/json:
               schema:

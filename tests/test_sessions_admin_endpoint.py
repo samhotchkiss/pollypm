@@ -36,6 +36,7 @@ from pollypm.models import (
     RuntimeKind,
     SessionConfig,
 )
+from pollypm.session_leases import SessionLeaseConflictError
 from pollypm.web_api import create_app, ensure_token
 from pollypm.web_api.routes import sessions_admin as sessions_admin_routes
 
@@ -236,9 +237,11 @@ class _FakeSupervisor:
         *,
         restart_raises: Exception | None = None,
         effective_account: str | None = None,
+        lease_owner: str | None = None,
     ) -> None:
         self.restart_raises = restart_raises
         self.effective_account = effective_account
+        self.lease_owner = lease_owner
         self.restart_calls: list[dict[str, Any]] = []
 
     def get_session_runtime(self, name: str) -> Any:  # noqa: ARG002
@@ -251,13 +254,25 @@ class _FakeSupervisor:
         return SimpleNamespace(effective_account=self.effective_account)
 
     def restart_session(
-        self, session_name: str, account_name: str, *, failure_type: str,
+        self,
+        session_name: str,
+        account_name: str,
+        *,
+        failure_type: str,
+        force: bool = False,
     ) -> None:
         self.restart_calls.append({
             "session_name": session_name,
             "account_name": account_name,
             "failure_type": failure_type,
+            "force": force,
         })
+        if self.lease_owner is not None and not force:
+            raise SessionLeaseConflictError(
+                session_name=session_name,
+                owner=self.lease_owner,
+                action="restart",
+            )
         if self.restart_raises is not None:
             raise self.restart_raises
 
@@ -604,6 +619,7 @@ def test_restart_routes_through_supervisor_facade(
     assert call["session_name"] == "operator"
     assert call["account_name"] == "claude_primary"
     assert call["failure_type"] == "api_restart"
+    assert call["force"] is False
 
 
 def test_restart_prefers_effective_account_over_configured(
@@ -730,6 +746,60 @@ def test_restart_force_overrides_mid_turn(
     assert response.status_code == 200, response.text
     assert len(sup.restart_calls) == 1
     assert sup.restart_calls[0]["session_name"] == "operator"
+
+
+def test_restart_lease_conflict_returns_409_session_leased(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_strict_probe, patch_supervisor,
+):
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_strict_probe(mid_turn=False)
+    sup = patch_supervisor(_FakeSupervisor(lease_owner="human"))
+    response = client.post(
+        "/api/v1/sessions/operator/restart", headers=auth_headers,
+    )
+    assert response.status_code == 409
+    body = response.json()
+    assert body["error"]["code"] == "session_leased"
+    assert "force" in body["error"]["hint"]
+    assert len(sup.restart_calls) == 1
+    assert sup.restart_calls[0]["force"] is False
+
+
+def test_restart_query_force_bypasses_lease_conflict(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_strict_probe, patch_supervisor,
+):
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_strict_probe(mid_turn=False)
+    sup = patch_supervisor(_FakeSupervisor(lease_owner="human"))
+    response = client.post(
+        "/api/v1/sessions/operator/restart?force=true",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    assert len(sup.restart_calls) == 1
+    assert sup.restart_calls[0]["force"] is True
+
+
+def test_restart_body_force_bypasses_lease_conflict(
+    client, auth_headers, patch_heartbeat, patch_tmux_windows,
+    patch_strict_probe, patch_supervisor,
+):
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator"])
+    patch_strict_probe(mid_turn=False)
+    sup = patch_supervisor(_FakeSupervisor(lease_owner="human"))
+    response = client.post(
+        "/api/v1/sessions/operator/restart",
+        headers=auth_headers,
+        json={"force": True},
+    )
+    assert response.status_code == 200, response.text
+    assert len(sup.restart_calls) == 1
+    assert sup.restart_calls[0]["force"] is True
 
 
 def test_restart_404_unknown_session(

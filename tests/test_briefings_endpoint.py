@@ -1828,7 +1828,7 @@ def test_bootstrap_clears_registry_on_morning_import_failure(
     api_config: PollyPMConfig,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Failed bootstrap import must clear any pre-existing registration.
+    """Failed bootstrap import must replace stale provider with a known-disabled stub.
 
     Codex round-14 on #2059: the ``except`` path used to only log and
     return, leaving a stale provider (from an earlier app instance, a
@@ -1837,15 +1837,25 @@ def test_bootstrap_clears_registry_on_morning_import_failure(
     reporting ``morning.available=true`` against the stale provider
     while the operator saw only the warning in logs.
 
-    This test pre-registers a stub, forces the morning_briefing
-    inbox import to raise during bootstrap, and asserts the registry
-    has been cleared for BOTH the inbox-list provider and the
-    render-provider slot.
+    Codex round-15 on #2059 tightened the contract: instead of clearing
+    the render slot (which makes ``morning`` look like an UNKNOWN
+    briefing type — 404), the except path now installs a stub whose
+    ``is_available`` returns False so the type stays DISCOVERABLE via
+    ``GET /briefings`` (with ``available=false``) and render/regenerate
+    return a typed 503 ``service_unavailable``.
+
+    This test pre-registers a working stub, forces the morning_briefing
+    inbox import to raise during bootstrap, and asserts:
+    - The inbox-list provider slot is cleared (dashboard banner gone).
+    - The render slot holds a replacement provider whose
+      ``is_available`` returns ``False`` (so ``morning`` is known-
+      disabled, not unknown).
     """
     from pollypm import briefings_bootstrap as bb
     from pollypm.briefings_registry import (
         BriefingArtifact,
         get_briefing_render_provider,
+        get_briefing_render_registration,
         is_briefing_provider_registered,
         register_briefing_provider,
         register_briefing_render_provider,
@@ -1873,7 +1883,9 @@ def test_bootstrap_clears_registry_on_morning_import_failure(
 
     try:
         assert is_briefing_provider_registered() is True
-        assert get_briefing_render_provider("morning") is not None
+        prior = get_briefing_render_provider("morning")
+        assert prior is not None
+        assert isinstance(prior, _StubRenderProvider)
 
         # Force the import inside the bootstrap try-block to raise. The
         # try block imports from ``pollypm.plugins_builtin.morning_briefing.inbox``
@@ -1900,22 +1912,145 @@ def test_bootstrap_clears_registry_on_morning_import_failure(
                 inbox_mod.list_briefings = original_list  # type: ignore[attr-defined]
             sys.modules.pop("pollypm.plugins_builtin.morning_briefing.inbox", None)
 
-        # Both registry slots must be empty — the stale stub MUST NOT
-        # survive a failed bootstrap.
+        # The inbox-list provider must be cleared (dashboard banner gone).
         assert is_briefing_provider_registered() is False, (
             "bootstrap import failure left a stale inbox-list provider "
-            "installed; GET /briefings would keep reporting "
-            "morning.available=true against the wrong provider."
+            "installed; the dashboard would keep rendering the banner "
+            "against a stale provider."
         )
-        assert get_briefing_render_provider("morning") is None, (
-            "bootstrap import failure left a stale render provider "
-            "installed; render/regenerate would run against the wrong "
+
+        # The render slot must hold the replacement stub (NOT the
+        # original stale provider, and NOT cleared to None).
+        replacement = get_briefing_render_provider("morning")
+        assert replacement is not None, (
+            "bootstrap import failure cleared the render slot — "
+            "``morning`` will now appear as an UNKNOWN briefing type "
+            "(404) instead of known-but-disabled (Codex round-15)."
+        )
+        assert not isinstance(replacement, _StubRenderProvider), (
+            "bootstrap import failure left the stale stub provider in "
+            "place; render/regenerate would run against the wrong "
             "provider after the operator saw a warning in logs."
+        )
+
+        # The replacement's is_available must return False so the route
+        # layer's discovery / render / regenerate paths all surface
+        # ``morning`` as known-but-unavailable.
+        registration = get_briefing_render_registration("morning")
+        assert registration is not None
+        assert registration.is_available(api_config) is False, (
+            "bootstrap import-failure stub must report "
+            "is_available=False so GET /briefings shows morning as "
+            "known-disabled and render/regenerate return 503."
         )
     finally:
         # Belt-and-suspenders cleanup for the rest of the suite.
         register_briefing_provider(None)
         register_briefing_render_provider("morning", None)
+
+
+# ---------------------------------------------------------------------------
+# Codex round-15 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_disabled_morning_still_listed_as_unavailable_via_bootstrap(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+) -> None:
+    """Disabled-startup config keeps ``morning`` discoverable as unavailable.
+
+    Codex round-15 on #2059: when the operator starts ``pm serve`` with
+    ``[plugins].disabled = ["morning_briefing"]`` and no prior provider
+    has been registered, the old bootstrap branch cleared BOTH the
+    inbox-list slot and the render slot. ``GET /briefings`` returned an
+    empty list and ``GET/POST /briefings/morning`` returned 404
+    ``not_found`` — operators could not distinguish "built-in disabled"
+    from "typo in URL", and clients lost the rollback signal entirely.
+
+    The fix registers a known-disabled stub render provider in the
+    disabled branch so ``morning`` stays in the discovery response
+    (``available=false``) and render/regenerate return a typed 503
+    ``service_unavailable``.
+
+    This test reproduces the fresh-disabled-startup path that none of
+    the round-3/13 tests covered (they either pre-seeded
+    ``br._REGISTRY["morning"]`` or flipped the per-request config
+    AFTER bootstrap had wired the enabled provider):
+    1. Clear BOTH ``br._REGISTRY`` and the global render registry so
+       no stale provider can mask the bug.
+    2. Build ``create_app()`` with ``PluginSettings(disabled=("morning_briefing",))``.
+    3. Assert GET /briefings lists morning with available=false.
+    4. Assert GET /briefings/morning -> 503 (NOT 404).
+    5. Assert POST /briefings/morning/regenerate -> 503 (NOT 404).
+    """
+    from pollypm.briefings_registry import (
+        register_briefing_provider,
+        register_briefing_render_provider,
+    )
+
+    # 1) Clear all registry state — fresh process simulation.
+    briefings_routes._REGISTRY.pop("morning", None)
+    register_briefing_provider(None)
+    register_briefing_render_provider("morning", None)
+
+    # 2) Build the app with morning_briefing disabled from the start.
+    api_config.plugins = PluginSettings(disabled=("morning_briefing",))
+    app = create_app(config=api_config, token_path=token_path)
+
+    try:
+        with TestClient(app) as client:
+            # 3) GET /briefings — morning is listed with available=false.
+            response = client.get("/api/v1/briefings", headers=auth_headers)
+            assert response.status_code == 200, response.json()
+            types = response.json()["types"]
+            morning_entries = [t for t in types if t["name"] == "morning"]
+            assert len(morning_entries) == 1, (
+                "disabled-startup bootstrap dropped ``morning`` from the "
+                "discovery response — operators cannot distinguish "
+                "'built-in disabled' from 'typo in URL'. Listed: "
+                f"{[t['name'] for t in types]}"
+            )
+            assert morning_entries[0]["available"] is False, (
+                "disabled-startup bootstrap listed ``morning`` as "
+                "available=true — the per-request plugin-disable gate "
+                "did not fire on the stub registration."
+            )
+            assert morning_entries[0]["description"], (
+                "disabled-startup bootstrap registered ``morning`` with "
+                "an empty description — clients render a blank blurb."
+            )
+
+            # 4) GET /briefings/morning — typed 503, NOT 404.
+            response = client.get(
+                "/api/v1/briefings/morning", headers=auth_headers
+            )
+            assert response.status_code == 503, (
+                f"GET /briefings/morning on a disabled-startup app "
+                f"returned {response.status_code} (expected 503). "
+                f"Body: {response.json()}"
+            )
+            assert response.json()["error"]["code"] == "service_unavailable"
+
+            # 5) POST /briefings/morning/regenerate — typed 503, NOT 404.
+            response = client.post(
+                "/api/v1/briefings/morning/regenerate",
+                json={},
+                headers=auth_headers,
+            )
+            assert response.status_code == 503, (
+                f"POST /briefings/morning/regenerate on a disabled-"
+                f"startup app returned {response.status_code} "
+                f"(expected 503). Body: {response.json()}"
+            )
+            assert response.json()["error"]["code"] == "service_unavailable"
+    finally:
+        # Restore registry state for sibling tests.
+        register_briefing_provider(None)
+        register_briefing_render_provider("morning", None)
+        briefings_routes._REGISTRY.pop("morning", None)
 
 
 def test_regenerate_request_docstring_says_morning_rejects_project() -> None:

@@ -292,7 +292,24 @@ def register_web_api_commands(app: typer.Typer) -> None:
                     err=True,
                 )
 
-        if tailscale and tailscale_ip is None and bind_mode != "tailscale":
+        # Only emit the detection-failure warning when detection was
+        # actually attempted (i.e. the auto-detect branch above ran).
+        # Codex round-13 on #2065: when the operator passes ``--host``
+        # explicitly, the explicit branch sets ``bind_mode == "explicit"``
+        # and leaves ``tailscale_ip`` at None WITHOUT calling
+        # ``detect_tailscale_ip()``. Falling through to the original
+        # "tailscale ip -4 returned no IP" warning in that case is a
+        # lie — detection never ran — and the "Falling back to
+        # loopback-only" tail is doubly wrong because the bind honors
+        # the explicit host. Emit a distinct, accurate warning instead.
+        if tailscale and bind_mode == "explicit":
+            typer.echo(
+                "Warning: --tailscale ignored because --host was "
+                "provided explicitly. Auto-detect path is the only "
+                "way to enable tailnet_trust.",
+                err=True,
+            )
+        elif tailscale and tailscale_ip is None and bind_mode != "tailscale":
             typer.echo(
                 "Warning: --tailscale passed but `tailscale ip -4` "
                 "returned no IP (binary missing, not logged in, or no "

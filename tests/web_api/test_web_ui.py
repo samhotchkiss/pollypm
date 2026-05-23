@@ -761,6 +761,44 @@ def test_pm_serve_with_explicit_host_skips_tailscale_detection(
     assert captured["create_app_kwargs"]["tailnet_trust_enabled"] is False
 
 
+def test_warning_does_not_falsely_fire_on_explicit_host_with_tailscale_flag(
+    api_config, token_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Round-13 #2065: ``--host X --tailscale`` must NOT lie about detection.
+
+    The earlier warning gate fired whenever ``tailscale_ip is None`` and
+    ``--tailscale`` was passed. But the explicit-host branch (round-9)
+    never calls ``detect_tailscale_ip()`` — it just leaves
+    ``tailscale_ip`` at None. So the warning's "Falling back to
+    loopback-only" tail was doubly wrong: detection never ran, and the
+    server is honoring the explicit host, not falling back.
+
+    Drive the CLI with ``--host 127.0.0.1 --tailscale`` and confirm the
+    misleading "Falling back to loopback-only" text never appears.
+    """
+    result, _captured = _run_serve_command(
+        api_config,
+        token_path,
+        monkeypatch,
+        # detect_result is irrelevant here because the explicit-host
+        # branch must skip detect_tailscale_ip entirely (see round-9
+        # test above). Pass None so a regression that re-introduced the
+        # detect call would still trip the old warning gate.
+        detect_result=None,
+        extra_args=["--host", "127.0.0.1", "--tailscale"],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Falling back to loopback-only" not in result.output, (
+        "Round-13 #2065: --host explicit + --tailscale must not emit "
+        "the loopback-fallback warning — detection was never attempted "
+        f"and the bind honored the explicit host. Got: {result.output!r}"
+    )
+    assert "`tailscale ip -4` returned no IP" not in result.output, (
+        "The detection-failure warning fired even though "
+        "detect_tailscale_ip was never called (explicit --host branch)."
+    )
+
+
 # -------- P1: mobile CSS -----------------------------------------------
 
 

@@ -159,6 +159,35 @@ class ProjectStateCacheEntry:
     rail_reason: str = ""
     approvals_pending: int = 0
     plan_blocked: bool = False
+    # #2049 — ``actionable_key`` is the rail-route id
+    # (``project:<key>:issues``) that ``rollup_project_state`` returns
+    # when an alerted task drives the rollup. Stored on the entry so the
+    # cache fast-path can serve a rollup that matches the direct path
+    # even when a live ``stuck_on_task:`` / ``no_session_for_assignment:``
+    # alert is present. Without this field the alert overlay had to be
+    # re-applied at read time (which requires task-status info the entry
+    # didn't carry) — the PR #2026 workaround declined the cache for any
+    # render with a tracked-project actionable alert. The refresher now
+    # folds alerts into the entry at compute time so the read path is
+    # authoritative.
+    actionable_key: str | None = None
+    # #2049 follow-up (Codex blocker on PR #2085): stamp whether the
+    # alert snapshot used to compute ``rail_state`` / ``actionable_key``
+    # was successfully read. ``_open_alerts_for`` routes through
+    # ``pollypm.storage.pg_alerts.open_alerts`` and returns
+    # ``([], False)`` on any read failure; previously the empty list
+    # was indistinguishable from a real "no alerts" result, which
+    # meant a transient refresher-side alert read failure could
+    # install a no-alert WORKING/NONE rollup. A later render whose
+    # own alert read succeeds would still serve that
+    # stale-from-failure entry and hide the actionable RED alert.
+    # When this flag is ``False`` the cache fast-path
+    # (:meth:`_maybe_cache_route_rollups`) MUST decline — the entry
+    # can't speak to the alert state, so falling through to the direct
+    # path is the only way to honour the live alert read. Defaults to
+    # ``True`` so legacy / hand-rolled fixtures (and the success path)
+    # serve normally.
+    alerts_snapshot_valid: bool = True
 
     # ── awaits-user list (the expensive one) ───────────────────────
     awaits_user_count: int = 0

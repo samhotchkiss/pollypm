@@ -215,14 +215,16 @@ def test_singleton_wires_project_keys_provider_for_initial_refresh(
     from pollypm.state_cache.entry import empty_entry
     monkeypatch.setattr(
         "pollypm.state_cache.compute_entry_for_project",
-        lambda project_key, config: empty_entry(project_key),
+        lambda project_key, config, **kwargs: empty_entry(project_key),
     )
     # ``build_refresh_fn`` is imported into ``__init__`` at module
     # load — replace it on the module namespace so the singleton wiring
-    # picks up the stub.
+    # picks up the stub. Accept ``**kwargs`` because PR #2085 round-2's
+    # sweep-level pre-fetch plumbs ``alerts_snapshot`` through every
+    # multi-project refresh.
     monkeypatch.setattr(
         "pollypm.state_cache.build_refresh_fn",
-        lambda provider: (lambda key: empty_entry(key)),
+        lambda provider: (lambda key, **kwargs: empty_entry(key)),
     )
 
     cache = get_cache()
@@ -335,7 +337,7 @@ def test_singleton_provider_degrades_gracefully_on_config_failure(
     from pollypm.state_cache.entry import empty_entry
     monkeypatch.setattr(
         "pollypm.state_cache.build_refresh_fn",
-        lambda provider: (lambda key: empty_entry(key)),
+        lambda provider: (lambda key, **kwargs: empty_entry(key)),
     )
 
     cache = get_cache()

@@ -5,7 +5,7 @@
 The shipped Move A behavior diverges from the original design in two places. This section is the source of truth; the original sections below are kept for historical context but should be read as superseded where they conflict.
 
 - `latest_heartbeat_by_session` is reserved on `ProjectStateCacheEntry` but NOT populated. Rail heartbeat sites read `pollypm.storage.pg_heartbeats.latest_heartbeat` directly via `CockpitRouter._latest_heartbeat_cached`. Bulk prefetch + cache invalidation deferred to [#2050](https://github.com/samhotchkiss/pollypm/issues/2050).
-- `_maybe_cache_route_rollups` declines (returns `None`) when any tracked project has a live actionable alert — cache cannot recompute the alert-to-rollup contract. Tracked in [#2049](https://github.com/samhotchkiss/pollypm/issues/2049).
+- Actionable-alert overlay is now folded into the cache: the refresher reads alerts via the `pollypm.storage.pg_alerts.open_alerts` facade (through `_open_alerts_for`) and stamps `ProjectStateCacheEntry.actionable_key` plus an `alerts_snapshot_valid` flag. `_maybe_cache_route_rollups` serves cached rollups when `alerts_snapshot_valid is True`, and declines (falls through to the direct path) only when the snapshot was marked invalid — i.e., the refresher's alert read failed and the entry can't speak to the live alert state. Closed by PR [#2085](https://github.com/samhotchkiss/pollypm/pull/2085) ([#2049](https://github.com/samhotchkiss/pollypm/issues/2049)).
 
 ### Workspace-root inbox is now cache-routed (#2051 — closed by PR #2078)
 
@@ -15,6 +15,14 @@ The third drift item from the original list (workspace-root inbox not represente
 - The refresher's project-keys provider always includes the sentinel, so the synthetic entry is computed on boot and on every full pass. `StateCacheRefresher._dispatch_event` invalidates `__workspace__` on every event in `_INVALIDATING_EVENTS` so workspace-root invalidations never lag the per-project ones.
 - The earlier `has_workspace_root_open_messages` probe and the forced fall-through it gated are **removed**. `_maybe_cache_route_awaits_user` / `_maybe_cache_count_awaits_user` now union the `__workspace__` entry with the per-project entries directly; the cache is authoritative for workspace-root rows.
 - The sentinel carries a **bounded-staleness TTL** (`WORKSPACE_ENTRY_TTL_SECONDS = 10s`). Several message-store paths (`PgStore.close_message`, `PgStore.clear_alert`, `service_api.v1.clear_alert`) mutate workspace-root awaits-user rows without emitting a state-cache audit event, so the refresher doesn't see those closes. The TTL caps the staleness window — once the sentinel ages past the TTL, the cache-read boundary falls through to the direct sweep. Full audit-event wiring for the message-store close/clear paths is deferred past v1 RC; the TTL is a documented bounded-staleness window, not an invariant.
+
+### Actionable alert overlay is cached (#2049 — closed by PR #2085)
+
+The second drift item from the original list (`_maybe_cache_route_rollups` declines on any live actionable alert) is closed by PR #2085. The shipped behavior:
+
+- `compute_entry_for_project` reads the workspace-wide alert snapshot via `pollypm.storage.pg_alerts.open_alerts` (through `_open_alerts_for`) and folds the per-project `actionable_task_alert_ids` into `rollup_project_state` at refresh time. The resulting `rail_state` / `rail_badge` / `rail_reason` / `actionable_key` already account for the live alert overlay.
+- New `ProjectStateCacheEntry.actionable_key` field carries the alert-driven issues-route id; new `alerts_snapshot_valid` flag records whether the refresher's alert read succeeded. `_maybe_cache_route_rollups` serves the cached rollup when `alerts_snapshot_valid is True` and declines only when the refresher couldn't read the alert state (degraded entry).
+- Sweep-level pre-fetch: `StateCacheRefresher` reads the workspace alert snapshot ONCE per multi-project sweep and threads `alerts_snapshot=(alerts, valid)` through each per-project `compute_entry_for_project` call. Single-project event-driven refreshes call without the kwarg and fall back to a per-project read, preserving the failure-degrade contract.
 
 Design document for issue [#1664](https://github.com/samhotchkiss/pollypm/issues/1664).
 Status: **implemented** (2026-05-20) — PR 1 #2000, PR 2 #2016, PR 3 #2026, PR 4 #2029.

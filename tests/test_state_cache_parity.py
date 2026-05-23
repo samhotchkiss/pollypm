@@ -131,6 +131,7 @@ def _entry(
     rail_sort_rank: int = 0,
     rail_reason: str = "",
     approvals_pending: int = 0,
+    actionable_key: str | None = None,
     glyph: str = "",
     detail: str = "",
     latest_heartbeat_by_session: dict[str, Any] | None = None,
@@ -155,6 +156,7 @@ def _entry(
         rail_sort_rank=rail_sort_rank,
         rail_reason=rail_reason,
         approvals_pending=approvals_pending,
+        actionable_key=actionable_key,
         awaits_user_count=len(items),
         awaits_user_items=tuple(items),
         latest_heartbeat_by_session=dict(latest_heartbeat_by_session or {}),
@@ -1353,12 +1355,19 @@ class TestProjectCategorizationsNoTtl:
 # ── PR #2026 review blockers — fall-through regression tests ────────
 
 
-class TestPr2026ReviewBlocker1ActionableAlertFallthrough:
-    """Blocker 1: cache fast-path MUST defer when a live actionable
-    task alert exists, because the direct ``rollup_project_state``
-    folds alerts into ``rail_state`` / ``badge`` / ``reason`` /
-    ``actionable_key`` and the cache entry's ``rail_*`` fields were
-    computed without alert state.
+class TestActionableAlertCachedRollupParity:
+    """#2049: the refresher folds ``actionable_alert_task_ids`` into
+    the cached entry's rail rollup at compute time, so the cache
+    fast-path serves a rollup that matches the direct path even when
+    a live ``stuck_on_task:<project>/<n>`` /
+    ``no_session_for_assignment:<project>/<n>`` alert is present.
+
+    Inverts the original PR #2026 "fall-through" contract (kept under
+    the original class for archaeology): the cache MUST NOT decline
+    just because an alert exists — :func:`compute_entry_for_project`
+    is responsible for ensuring ``entry.rail_state`` /
+    ``entry.rail_badge`` / ``entry.rail_reason`` / ``entry.actionable_key``
+    already reflect the alert overlay.
     """
 
     def _router(self, tmp_path: Path):
@@ -1374,11 +1383,11 @@ class TestPr2026ReviewBlocker1ActionableAlertFallthrough:
         )
         return CockpitRouter(config_path)
 
-    def test_actionable_alert_forces_cache_fallthrough(
+    def test_actionable_alert_served_from_cache(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
     ) -> None:
-        """Cached base state WORKING, live actionable alert exists →
-        the cache MUST decline so the direct path can paint RED.
+        """A live actionable alert is reflected by the cached rollup
+        (refresher folded it in) — the fast-path no longer declines.
         """
 
         from pollypm.cockpit_project_state import ProjectRailState
@@ -1387,30 +1396,35 @@ class TestPr2026ReviewBlocker1ActionableAlertFallthrough:
         router = self._router(tmp_path)
         config = _make_config(["alpha"], tmp_path)
 
-        # Cache entry says WORKING / NONE — no idea about the alert.
+        # Cache entry was computed by the refresher AFTER folding in
+        # ``stuck_on_task:alpha/1`` — RED + issues-route actionable_key.
         entries = {
             "alpha": _entry(
                 "alpha", state=ProjectState.WORKING, items=[],
-                rail_state=ProjectRailState.WORKING,
-                rail_badge=None,
+                rail_state=ProjectRailState.RED,
+                rail_badge="🔴",
                 rail_sort_rank=0,
-                rail_reason="worker active",
+                rail_reason="operational alert needs review",
                 approvals_pending=0,
+                actionable_key="project:alpha:issues",
             ),
         }
         _seed_cache(monkeypatch, entries)
 
-        # Live actionable alert for alpha/1 — should turn alpha RED.
+        # Live alert still passed in (matches the direct-path
+        # signature); the cache reads the entry, not the alert list.
         alert = SimpleNamespace(
             alert_type="stuck_on_task:alpha/1",
             severity="high",
             message="stuck",
         )
+        rollups = router._maybe_cache_route_rollups(config, alerts=[alert])
 
-        # Cache fast-path declines (the gate fires).
-        assert (
-            router._maybe_cache_route_rollups(config, alerts=[alert]) is None
-        )
+        assert rollups is not None
+        assert rollups["alpha"].state is ProjectRailState.RED
+        assert rollups["alpha"].badge == "🔴"
+        assert rollups["alpha"].actionable_key == "project:alpha:issues"
+        assert rollups["alpha"].reason == "operational alert needs review"
 
     def test_no_alert_still_uses_cache_fast_path(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
@@ -1437,6 +1451,297 @@ class TestPr2026ReviewBlocker1ActionableAlertFallthrough:
         assert rollups["alpha"].state is ProjectRailState.WORKING
         # No alerts → actionable_key is None (matches direct path).
         assert rollups["alpha"].actionable_key is None
+
+
+class TestActionableAlertRefresherParity:
+    """#2049: parity between cached + direct paths for a project with
+    a live ``stuck_on_task:`` actionable alert.
+
+    Drives :func:`compute_entry_for_project` and :func:`rollup_project_state`
+    directly so the comparison doesn't depend on cockpit_rail's
+    consumer plumbing — what we're pinning is that the cache stores
+    the same rail_state/badge/reason/actionable_key the direct path
+    computes.
+    """
+
+    def test_refresher_folds_stuck_on_task_alert_into_entry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        from pollypm.cockpit_project_state import (
+            ProjectRailState,
+            rollup_project_state,
+        )
+        from pollypm.state_cache import refresh_impl
+
+        project_key = "alpha"
+        # One in_progress task (not in waiting_on_user) so the alert
+        # bumps the rollup to RED via the non-user-waiting branch.
+        task = SimpleNamespace(
+            task_id=f"{project_key}/1",
+            project=project_key,
+            task_number=1,
+            work_status="in_progress",
+            current_node_id="working",
+            owner="worker",
+            actor_type="agent",
+        )
+        alert = SimpleNamespace(
+            alert_type=f"stuck_on_task:{project_key}/1",
+            severity="warning",
+            message="stuck",
+        )
+
+        # Direct path the cockpit takes: rollup with alert overlay.
+        direct = rollup_project_state(
+            project_key,
+            [task],
+            actionable_task_alert_ids=frozenset([f"{project_key}/1"]),
+        )
+        assert direct.state is ProjectRailState.RED
+        assert direct.actionable_key == f"project:{project_key}:issues"
+
+        # Cached path: stub the refresher's task + alert sources so we
+        # can drive ``compute_entry_for_project`` synchronously.
+        monkeypatch.setattr(
+            refresh_impl,
+            "_open_alerts_for",
+            lambda config: ([alert], True),
+        )
+
+        # Drive ``_categorize_and_rollup`` directly with the same task,
+        # which exercises the alert-id wiring without spinning up the
+        # full work-service slice machinery.
+        from pollypm.dashboard.categorization import ProjectState as _PS
+
+        def _fake_categorize_and_rollup(**kwargs: Any):
+            assert kwargs["actionable_alert_task_ids"] == frozenset(
+                [f"{project_key}/1"],
+            )
+            rollup = rollup_project_state(
+                project_key,
+                [task],
+                actionable_task_alert_ids=kwargs["actionable_alert_task_ids"],
+            )
+            return (
+                _PS.WORKING,
+                "",
+                "",
+                (
+                    rollup.state,
+                    rollup.badge,
+                    rollup.sort_rank,
+                    rollup.reason,
+                    rollup.approvals_pending,
+                    rollup.actionable_key,
+                ),
+                [],
+            )
+
+        monkeypatch.setattr(
+            refresh_impl,
+            "_categorize_and_rollup",
+            _fake_categorize_and_rollup,
+        )
+        monkeypatch.setattr(
+            refresh_impl, "_awaits_user_items_for", lambda key, config: [],
+        )
+
+        config = _make_config([project_key], tmp_path)
+        entry = refresh_impl.compute_entry_for_project(project_key, config)
+
+        # Parity: cached entry mirrors the direct rollup.
+        assert entry.rail_state is direct.state
+        assert entry.rail_badge == direct.badge
+        assert entry.rail_sort_rank == direct.sort_rank
+        assert entry.rail_reason == direct.reason
+        assert entry.actionable_key == direct.actionable_key
+        # Success path stamps the snapshot as valid so the cache
+        # fast-path is allowed to serve this entry.
+        assert entry.alerts_snapshot_valid is True
+
+
+class TestActionableAlertSnapshotValidity:
+    """#2049 follow-up (Codex blocker on PR #2085): a transient
+    refresher-side alert read failure must not let the cache fast-path
+    serve a no-alert WORKING/NONE rollup.
+
+    Pre-fix: ``_open_alerts_for`` turned every supervisor / store /
+    open-alerts failure into ``[]``. ``compute_entry_for_project``
+    happily folded that empty set into the rail rollup and the
+    resulting entry passed through ``_maybe_cache_route_rollups`` like
+    any other. A later render whose ``supervisor.open_alerts()``
+    succeeds would still serve that stale-from-failure entry and hide
+    the actionable RED alert.
+
+    Post-fix: ``_open_alerts_for`` returns ``(alerts, valid)``; on any
+    failure ``valid=False`` propagates up to the entry's
+    ``alerts_snapshot_valid`` field; ``_maybe_cache_route_rollups``
+    declines when that flag is ``False`` so the direct path's live
+    ``supervisor.open_alerts()`` read drives the rollup.
+    """
+
+    def _router(self, tmp_path: Path):
+        from pollypm.cockpit_rail import CockpitRouter
+
+        config_path = tmp_path / "pollypm.toml"
+        config_path.write_text(
+            "[project]\n"
+            'name = "PollyPM"\n'
+            f'root_dir = "{tmp_path}"\n'
+            'tmux_session = "pollypm"\n'
+            f'base_dir = "{tmp_path / ".pollypm"}"\n'
+        )
+        return CockpitRouter(config_path)
+
+    def test_open_alerts_failure_marks_entry_invalid(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """A failing pg-alerts read → ``alerts_snapshot_valid=False``.
+
+        Drives :func:`compute_entry_for_project` with a pg-alerts
+        facade that raises and asserts the resulting entry stamps
+        invalidity onto itself rather than silently producing a
+        no-alert entry.
+
+        PR #2085 round-3: ``_open_alerts_for`` no longer constructs a
+        Supervisor — it reads through
+        :func:`pollypm.storage.pg_alerts.open_alerts`. The patch
+        target follows; the validity contract is unchanged.
+        """
+
+        from pollypm.dashboard.categorization import ProjectState as _PS
+        from pollypm.state_cache import refresh_impl
+
+        project_key = "alpha"
+
+        def _exploding_open_alerts(**kwargs: Any) -> list[Any]:
+            raise RuntimeError("transient store failure")
+
+        # Patch the lazy import inside _open_alerts_for. Importing the
+        # pg_alerts module first lets us monkeypatch its open_alerts
+        # attribute; refresh_impl does a fresh ``from pollypm.storage
+        # import pg_alerts`` on every call so the patch is picked up.
+        import pollypm.storage.pg_alerts as pg_alerts_mod
+        monkeypatch.setattr(
+            pg_alerts_mod, "open_alerts", _exploding_open_alerts,
+        )
+
+        # Short-circuit the heavy categorize/rollup path: the
+        # validity-flag plumbing is what we're testing, not the
+        # work-service slice. We assert below that the rollup is
+        # computed against an EMPTY alert set (the failure-degrade
+        # contract) — what changes is the validity flag on the entry.
+        seen_alert_ids: dict[str, frozenset[str]] = {}
+
+        def _fake_categorize_and_rollup(**kwargs: Any):
+            seen_alert_ids["ids"] = kwargs["actionable_alert_task_ids"]
+            return (_PS.IDLE, "", "", None, [])
+
+        monkeypatch.setattr(
+            refresh_impl,
+            "_categorize_and_rollup",
+            _fake_categorize_and_rollup,
+        )
+        monkeypatch.setattr(
+            refresh_impl, "_awaits_user_items_for", lambda key, config: [],
+        )
+
+        config = _make_config([project_key], tmp_path)
+        entry = refresh_impl.compute_entry_for_project(project_key, config)
+
+        # Failure degrades to "no alert ids" so the rollup compute
+        # doesn't crash, but the entry stamps invalidity so readers
+        # know not to trust the no-alert outcome.
+        assert seen_alert_ids["ids"] == frozenset()
+        assert entry.alerts_snapshot_valid is False
+
+    def test_cache_fast_path_declines_on_invalid_snapshot(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """``_maybe_cache_route_rollups`` returns ``None`` when the
+        cached entry's alert snapshot is marked invalid.
+
+        Without this guard a transient refresher-side alert read
+        failure would install a no-alert WORKING/NONE rollup that
+        survives until the next refresh tick — masking a live RED
+        alert from any render that happens in between.
+        """
+
+        from pollypm.cockpit_project_state import ProjectRailState
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        config = _make_config(["alpha"], tmp_path)
+
+        # Entry looks healthy (WORKING, no alert) but was computed
+        # against a failed alert read — the validity stamp is the only
+        # signal the cache has.
+        entries = {
+            "alpha": _entry(
+                "alpha", state=ProjectState.WORKING, items=[],
+                rail_state=ProjectRailState.WORKING,
+                rail_badge=None,
+                rail_reason="worker active",
+            ),
+        }
+        # Hand-rolled _entry() defaults to alerts_snapshot_valid=True;
+        # rebuild the entry with the failure flag set so we exercise
+        # the new decline branch.
+        invalid_entry = ProjectStateCacheEntry(
+            project_key="alpha",
+            project_path=entries["alpha"].project_path,
+            tracked=True,
+            state=entries["alpha"].state,
+            rail_state=entries["alpha"].rail_state,
+            rail_badge=entries["alpha"].rail_badge,
+            rail_reason=entries["alpha"].rail_reason,
+            alerts_snapshot_valid=False,
+        )
+        _seed_cache(monkeypatch, {"alpha": invalid_entry})
+
+        # A live alert exists at render time; if the cache served the
+        # entry it would silently hide this from the rail rollup.
+        live_alert = SimpleNamespace(
+            alert_type="stuck_on_task:alpha/1",
+            severity="high",
+            message="stuck",
+        )
+        result = router._maybe_cache_route_rollups(
+            config, alerts=[live_alert],
+        )
+        assert result is None  # fall through to direct path
+
+    def test_valid_snapshot_still_serves_from_cache(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+    ) -> None:
+        """Sanity: the validity flag only declines on ``False``.
+
+        The healthy path (alert read succeeded; entry stamped valid)
+        continues to serve from the cache as before so the fast-path
+        is not regressed for the overwhelming-majority case.
+        """
+
+        from pollypm.cockpit_project_state import ProjectRailState
+
+        monkeypatch.setenv("POLLYPM_STATE_CACHE", "1")
+        router = self._router(tmp_path)
+        config = _make_config(["alpha"], tmp_path)
+
+        entry = ProjectStateCacheEntry(
+            project_key="alpha",
+            project_path=Path("/tmp/alpha"),
+            tracked=True,
+            state=ProjectState.WORKING,
+            rail_state=ProjectRailState.WORKING,
+            rail_badge=None,
+            rail_reason="worker active",
+            alerts_snapshot_valid=True,
+        )
+        _seed_cache(monkeypatch, {"alpha": entry})
+
+        result = router._maybe_cache_route_rollups(config, alerts=[])
+        assert result is not None
+        assert result["alpha"].state is ProjectRailState.WORKING
 
 
 class TestPr2026ReviewBlocker2HeartbeatNoStale:

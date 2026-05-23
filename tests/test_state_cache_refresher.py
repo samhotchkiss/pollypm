@@ -412,6 +412,147 @@ class TestWorkspaceRootInvalidation:
         # Both keys refreshed by the workspace-scoped invalidation.
         assert cache.version("__workspace__") == 2
         assert cache.version("alpha") == 2
+def test_full_refresh_calls_open_alerts_once_per_sweep(
+    audit_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """PR #2085 round-2 boundary fix.
+
+    A workspace-wide sweep must read the actionable-alert snapshot
+    ONCE per sweep, not once per project. Pre-fix
+    ``_open_alerts_for`` was called inside every per-project
+    ``compute_entry_for_project`` call — N projects × Supervisor
+    construction + open_alerts read, all under the cache lock.
+
+    This test wires a refresh function that forwards
+    ``alerts_snapshot`` through to ``compute_entry_for_project``-
+    shaped logic and asserts the sweep-level pre-fetch threads the
+    snapshot through every per-project refresh — counter increments
+    EXACTLY once for an N=3 sweep.
+    """
+
+    from pollypm.state_cache import refresh_impl
+
+    open_alerts_calls = {"n": 0}
+
+    def _counting_open_alerts(config: object) -> tuple[list[object], bool]:
+        open_alerts_calls["n"] += 1
+        return [], True
+
+    monkeypatch.setattr(refresh_impl, "_open_alerts_for", _counting_open_alerts)
+
+    seen_kwargs: list[dict[str, object]] = []
+
+    def _recording_refresh(key: str, **kwargs: object):
+        seen_kwargs.append(kwargs)
+        return empty_entry(key)
+
+    cache = ProjectStateCache(refresh_fn=_recording_refresh)
+    refresher = StateCacheRefresher(
+        cache,
+        audit_dir=audit_dir,
+        project_keys=lambda: ["alpha", "beta", "gamma"],
+        config_provider=lambda: object(),
+    )
+
+    refresher._initial_full_refresh()  # noqa: SLF001
+
+    # Three project keys, one alert read — the boundary contract.
+    assert open_alerts_calls["n"] == 1
+    assert len(seen_kwargs) == 3
+    for kwargs in seen_kwargs:
+        assert "alerts_snapshot" in kwargs
+        assert kwargs["alerts_snapshot"] == ([], True)
+
+
+def test_worker_once_calls_open_alerts_once_per_sweep(
+    audit_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The worker drain path obeys the same N→1 boundary as the
+    initial full refresh — invalidating three projects in one tick
+    must result in exactly one workspace alert read.
+    """
+
+    from pollypm.state_cache import refresh_impl
+
+    open_alerts_calls = {"n": 0}
+
+    def _counting_open_alerts(config: object) -> tuple[list[object], bool]:
+        open_alerts_calls["n"] += 1
+        return [], True
+
+    monkeypatch.setattr(refresh_impl, "_open_alerts_for", _counting_open_alerts)
+
+    seen_kwargs: list[dict[str, object]] = []
+
+    def _recording_refresh(key: str, **kwargs: object):
+        seen_kwargs.append(kwargs)
+        return empty_entry(key)
+
+    cache = ProjectStateCache(refresh_fn=_recording_refresh)
+    # Seed the cache so workspace-scope invalidation (or direct
+    # ``invalidate(key)`` calls) can drain three keys in one tick.
+    for key in ("alpha", "beta", "gamma"):
+        cache._install_for_test(key, empty_entry(key))  # noqa: SLF001
+        cache.invalidate(key)
+
+    refresher = StateCacheRefresher(
+        cache,
+        audit_dir=audit_dir,
+        config_provider=lambda: object(),
+    )
+
+    refresher._worker_once()  # noqa: SLF001
+
+    # Three drained keys, one alert read.
+    assert open_alerts_calls["n"] == 1
+    assert len(seen_kwargs) == 3
+
+
+def test_single_project_sweep_skips_prefetch(
+    audit_dir: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One-project sweeps must NOT pay the sweep pre-fetch overhead.
+
+    Boundary contract: the pre-fetch only saves work when N > 1.
+    For a single-project drain (the common event-triggered case),
+    skipping the pre-fetch lets ``compute_entry_for_project`` do its
+    own on-demand read — identical cost to the pre-PR behaviour and
+    keeps the failure-degrade contract intact.
+    """
+
+    from pollypm.state_cache import refresh_impl
+
+    open_alerts_calls = {"n": 0}
+
+    def _counting_open_alerts(config: object) -> tuple[list[object], bool]:
+        open_alerts_calls["n"] += 1
+        return [], True
+
+    monkeypatch.setattr(refresh_impl, "_open_alerts_for", _counting_open_alerts)
+
+    seen_kwargs: list[dict[str, object]] = []
+
+    def _recording_refresh(key: str, **kwargs: object):
+        seen_kwargs.append(kwargs)
+        return empty_entry(key)
+
+    cache = ProjectStateCache(refresh_fn=_recording_refresh)
+    cache._install_for_test("alpha", empty_entry("alpha"))  # noqa: SLF001
+    cache.invalidate("alpha")
+
+    refresher = StateCacheRefresher(
+        cache,
+        audit_dir=audit_dir,
+        config_provider=lambda: object(),
+    )
+
+    refresher._worker_once()  # noqa: SLF001
+
+    # Single-key drain → sweep pre-fetch skipped, refresh function
+    # called without ``alerts_snapshot`` (the per-project path will
+    # do its own read).
+    assert open_alerts_calls["n"] == 0
+    assert seen_kwargs == [{}]
 
 
 def test_concurrent_writes_and_reads_during_tail(audit_dir: Path) -> None:

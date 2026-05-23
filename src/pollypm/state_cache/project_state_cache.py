@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import logging
 import threading
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from pollypm.state_cache.entry import ProjectStateCacheEntry, empty_entry
 
@@ -38,7 +38,13 @@ __all__ = ["ProjectStateCache", "RefreshFn"]
 # audit-event → recomputed entry. Kept as a callable injection point
 # (rather than a hard import of the per-project query) so PR 2 can
 # swap the real implementation in without touching the cache class.
-RefreshFn = Callable[[str], Optional[ProjectStateCacheEntry]]
+#
+# The callable accepts ``(project_key, **kwargs)`` so sweep-level
+# callers (``StateCacheRefresher._worker_once`` /
+# ``_initial_full_refresh``) can plumb a pre-fetched
+# ``alerts_snapshot`` through one refresh sweep — see
+# :meth:`ProjectStateCache.refresh` for the boundary contract.
+RefreshFn = Callable[..., Optional[ProjectStateCacheEntry]]
 
 
 def _default_refresh(project_key: str) -> Optional[ProjectStateCacheEntry]:
@@ -143,7 +149,9 @@ class ProjectStateCache:
                 return
             self._pending.add(project_key)
 
-    def refresh(self, project_key: str) -> ProjectStateCacheEntry | None:
+    def refresh(
+        self, project_key: str, **refresh_kwargs: Any,
+    ) -> ProjectStateCacheEntry | None:
         """Recompute and atomically install the entry for ``project_key``.
 
         Calls the injected :data:`RefreshFn`; on success the new
@@ -152,6 +160,16 @@ class ProjectStateCache:
         or raises) the existing entry is left in place and the
         pending flag is cleared (failures don't loop indefinitely;
         the next invalidation re-enqueues).
+
+        ``refresh_kwargs`` (PR #2085 round-2 boundary fix): the
+        sweep-level refresher (``StateCacheRefresher._worker_once`` /
+        ``_initial_full_refresh``) pre-fetches workspace-wide reads
+        (e.g. the actionable-alert snapshot) once per sweep and
+        plumbs them through here. Backward-compatible: when no
+        kwargs are passed (single-project event-triggered refreshes,
+        test callers) the underlying refresh function is called with
+        just ``project_key`` so legacy refresh fns
+        (``lambda k: empty_entry(k)``) still work.
         """
 
         with self._lock:
@@ -160,7 +178,10 @@ class ProjectStateCache:
             # will re-enqueue.
             self._pending.discard(project_key)
             try:
-                entry = self._refresh_fn(project_key)
+                if refresh_kwargs:
+                    entry = self._refresh_fn(project_key, **refresh_kwargs)
+                else:
+                    entry = self._refresh_fn(project_key)
             except Exception:  # noqa: BLE001 — refresher MUST be best-effort
                 logger.exception(
                     "state_cache: refresh failed for %s", project_key,

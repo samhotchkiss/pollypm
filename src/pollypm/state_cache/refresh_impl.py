@@ -72,7 +72,7 @@ ConfigProvider = Callable[[], Any]
 
 def build_refresh_fn(
     config_provider: ConfigProvider,
-) -> Callable[[str], ProjectStateCacheEntry | None]:
+) -> Callable[..., ProjectStateCacheEntry | None]:
     """Return a :data:`RefreshFn` bound to ``config_provider``.
 
     The returned closure is the callable :class:`ProjectStateCache`
@@ -87,9 +87,18 @@ def build_refresh_fn(
     The PR #2026 v3 fast-path-disable workaround on
     ``cockpit_rail._latest_heartbeat_cached`` is reverted in tandem so
     rail reads serve from the snapshot again.
+
+    PR #2085 round-2 boundary fix: ``**kwargs`` are forwarded into
+    :func:`compute_entry_for_project` so a sweep-level
+    ``alerts_snapshot`` pre-fetched by
+    :class:`StateCacheRefresher` is used in place of a per-project
+    ``_open_alerts_for`` call. Single-project event-triggered
+    refreshes call without kwargs and continue to fetch on demand.
     """
 
-    def _refresh(project_key: str) -> ProjectStateCacheEntry | None:
+    def _refresh(
+        project_key: str, **kwargs: Any,
+    ) -> ProjectStateCacheEntry | None:
         try:
             config = config_provider()
         except Exception:  # noqa: BLE001
@@ -100,13 +109,16 @@ def build_refresh_fn(
                 exc_info=True,
             )
             return empty_entry(project_key)
-        return compute_entry_for_project(project_key, config)
+        return compute_entry_for_project(project_key, config, **kwargs)
 
     return _refresh
 
 
 def compute_entry_for_project(
-    project_key: str, config: Any,
+    project_key: str,
+    config: Any,
+    *,
+    alerts_snapshot: tuple[list[Any], bool] | None = None,
 ) -> ProjectStateCacheEntry:
     """Recompute the entry for ``project_key`` against ``config``.
 
@@ -131,6 +143,14 @@ def compute_entry_for_project(
     fast-path can union it with per-project entries without affecting
     rail / dashboard consumers (which iterate over tracked project
     keys and ignore extras).
+
+    PR #2085 round-2 boundary fix: ``alerts_snapshot`` lets the
+    sweep-level refresher pre-fetch the workspace-wide alert read
+    once and plumb the ``(alerts, valid)`` tuple through every
+    per-project compute. When ``None`` (single-project event-driven
+    refreshes, tests) the helper falls back to one
+    ``_open_alerts_for(config)`` call so legacy single-project paths
+    behave identically.
     """
 
     if project_key == WORKSPACE_PROJECT_KEY:
@@ -141,11 +161,27 @@ def compute_entry_for_project(
     tracked = bool(getattr(project, "tracked", True)) if project else False
 
     awaits_user_items = _awaits_user_items_for(project_key, config)
+    # #2049 — workspace-wide alert fetch, filtered to this project's
+    # actionable task alerts. ``rollup_project_state`` consumes the
+    # filtered set; folding it in here means the cached ``rail_*``
+    # fields match the direct path even when a live alert is present.
+    # Best-effort: on any failure we degrade to "no alerts," which
+    # matches the pre-fix workaround's worst-case (no RED bump) rather
+    # than crashing the refresh.
+    #
+    # PR #2085 round-2: if the sweep-level refresher pre-fetched the
+    # workspace alert snapshot, reuse it (collapses N
+    # ``pg_alerts.open_alerts`` reads per sweep to 1). Otherwise fall
+    # back to the per-project read.
+    actionable_alert_ids, alerts_valid = _actionable_alert_ids_for(
+        project_key, config, alerts_snapshot=alerts_snapshot,
+    )
     state, glyph, detail, rail_rollup, session_names = _categorize_and_rollup(
         project_key=project_key,
         config=config,
         tracked=tracked,
         awaits_user_items=list(awaits_user_items),
+        actionable_alert_task_ids=actionable_alert_ids,
     )
 
     # #2050: bulk-prefetch heartbeats for every session known to this
@@ -172,6 +208,17 @@ def compute_entry_for_project(
         rail_sort_rank=rail_rollup[2] if rail_rollup else 0,
         rail_reason=rail_rollup[3] if rail_rollup else "",
         approvals_pending=rail_rollup[4] if rail_rollup else 0,
+        # #2049 — alert-driven actionable_key (issues-route id) is the
+        # 6th tuple slot. Empty actionable alerts produce ``None`` to
+        # match ``rollup_project_state``'s direct-path return.
+        actionable_key=rail_rollup[5] if rail_rollup else None,
+        # #2049 follow-up (Codex blocker on PR #2085): stamp whether the
+        # alert read succeeded. When ``False`` the cache fast-path must
+        # decline so the direct path's live ``supervisor.open_alerts()``
+        # read can populate the RED bump; the refresher's
+        # rail_state/actionable_key would otherwise hide an alert that
+        # the live read can now see.
+        alerts_snapshot_valid=alerts_valid,
         awaits_user_count=len(awaits_user_items),
         awaits_user_items=tuple(awaits_user_items),
         latest_heartbeat_by_session=latest_heartbeat_by_session,
@@ -330,29 +377,144 @@ def _compute_workspace_entry(config: Any) -> ProjectStateCacheEntry:
     )
 
 
+def _actionable_alert_ids_for(
+    project_key: str,
+    config: Any,
+    *,
+    alerts_snapshot: tuple[list[Any], bool] | None = None,
+) -> tuple[frozenset[str], bool]:
+    """Return ``(actionable_task_alert_ids, alerts_snapshot_valid)``.
+
+    #2049 — folds the live alert set into the cached entry's rail
+    rollup so the cache fast-path can serve a rollup that matches the
+    direct path even when a ``stuck_on_task:<project>/<n>`` or
+    ``no_session_for_assignment:<project>/<n>`` alert is present.
+    Pre-fix the cache declined for any render with a tracked-project
+    actionable alert (the PR #2026 workaround) which killed the cache
+    benefit during the most common rail state.
+
+    #2049 follow-up (Codex blocker on PR #2085): callers need to
+    distinguish "no alerts" (success → empty set, valid=True) from
+    "alert read failed" (exception → empty set, valid=False). The
+    refresher stamps the validity flag onto the entry so
+    :meth:`cockpit_rail._maybe_cache_route_rollups` declines the
+    fast-path when alerts couldn't be read — a later render whose
+    ``supervisor.open_alerts()`` succeeds will then see the live alert
+    instead of the stale-from-failure WORKING/NONE rollup. The id-set
+    is still returned (empty on failure) so the rollup compute path
+    has a non-None argument; the validity flag is the source of truth.
+
+    The returned ids reflect the failure-degrade contract: a failed
+    alert read → empty set so the rollup doesn't bump to RED off a
+    half-read snapshot. ``actionable_alert_task_ids`` failures are
+    treated as failures too (valid=False) — same rationale.
+
+    PR #2085 round-2 boundary fix: ``alerts_snapshot`` is the
+    workspace-wide ``(alerts, valid)`` pair the sweep-level refresher
+    pre-fetches once and threads through every per-project compute.
+    When provided we skip the per-project ``_open_alerts_for`` call
+    entirely — that's where the N×pg-alerts-read perf cost lived
+    (one pg round-trip per project). When ``None`` we fall back to
+    the on-demand read so single-project event-triggered refreshes
+    keep working unchanged.
+    """
+
+    try:
+        from pollypm.cockpit_project_state import actionable_alert_task_ids
+    except Exception:  # noqa: BLE001
+        return frozenset(), False
+
+    if alerts_snapshot is not None:
+        alerts, alerts_valid = alerts_snapshot
+    else:
+        alerts, alerts_valid = _open_alerts_for(config)
+    if not alerts_valid:
+        return frozenset(), False
+    try:
+        return (
+            actionable_alert_task_ids(alerts, project_key=project_key),
+            True,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_cache: actionable_alert_task_ids failed for %s",
+            project_key,
+            exc_info=True,
+        )
+        return frozenset(), False
+
+
+def _open_alerts_for(config: Any) -> tuple[list[Any], bool]:
+    """Return ``(open_alerts, valid)``.
+
+    Reads :func:`pollypm.storage.pg_alerts.open_alerts` — the canonical
+    pg facade for the cluster-B ``messages``-table alert read. This is
+    the same row source the cockpit's direct path ultimately queries
+    (via ``self._msg_store.query_messages(type='alert', state='open')``
+    on the unified Store); going to the facade directly keeps the leaf
+    ``state_cache`` package free of the broad runtime supervisor and
+    legacy sqlite-state boundary — see
+    ``tests/test_state_cache_no_sqlite_imports.py`` for the pinned
+    invariant (PR #2085 round-3 Codex blocker).
+
+    The lazy import keeps the leaf ``state_cache`` package light.
+
+    #2049 follow-up (Codex blocker on PR #2085): every failure path
+    returns ``([], False)`` — the empty list is for callers that need
+    to keep computing a rollup without crashing, the ``False`` is the
+    signal the refresher stamps onto
+    :attr:`ProjectStateCacheEntry.alerts_snapshot_valid`. The cache
+    fast-path declines on ``False`` so a transient read failure
+    doesn't install a no-alert rollup that masks a live RED alert on
+    the next render.
+
+    Pool / cold-start failures: the pg pool can fail to warm on cold
+    start; these are real read failures (not "no alerts") and are
+    reported as such.
+    """
+
+    try:
+        from pollypm.storage import pg_alerts
+    except Exception:  # noqa: BLE001
+        return [], False
+    try:
+        return list(pg_alerts.open_alerts(config=config)), True
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "state_cache: pg_alerts.open_alerts() failed",
+            exc_info=True,
+        )
+        return [], False
+
+
 def _categorize_and_rollup(
     *,
     project_key: str,
     config: Any,
     tracked: bool,
     awaits_user_items: list[Any],
+    actionable_alert_task_ids: frozenset[str] = frozenset(),
 ) -> tuple[
     Any, str, str,
-    tuple[Any, Any, int, str, int] | None,
+    tuple[Any, Any, int, str, int, str | None] | None,
     list[str],
 ]:
     """Run ``categorize_project`` + ``rollup_project_state`` for one project.
 
     Returns ``(state, glyph, detail, rollup_tuple_or_None, session_names)``.
     The rollup tuple is ``(rail_state, rail_badge, sort_rank, reason,
-    approvals_pending)`` — kept positional so the caller can ``zip``
-    it into the entry fields without a second import of the rollup
-    types here. ``session_names`` is every tmux session this project
-    is known to drive (canonical ``architect_<key>`` /
-    ``plan_gate-<key>`` / ``worker_<key>`` plus the per-task
-    ``worker_<key>/<n>`` rows the live worker_sessions table reports)
-    — passed to :func:`_fetch_latest_heartbeats` for the heartbeat
-    prefetch (#2050).
+    approvals_pending, actionable_key)`` — kept positional so the
+    caller can ``zip`` it into the entry fields without a second
+    import of the rollup types here. ``session_names`` is every tmux
+    session this project is known to drive (canonical
+    ``architect_<key>`` / ``plan_gate-<key>`` / ``worker_<key>`` plus
+    the per-task ``worker_<key>/<n>`` rows the live worker_sessions
+    table reports) — passed to :func:`_fetch_latest_heartbeats` for
+    the heartbeat prefetch (#2050).
+
+    #2049: takes ``actionable_alert_task_ids`` so the rail rollup
+    folds in the alert overlay (RED bump for non-user-waiting alerted
+    tasks, alert-driven ``actionable_key``) at compute time.
 
     Failures degrade silently — a broken work-service drops the
     project to IDLE (or PAUSED when not tracked) with no rollup and an
@@ -447,13 +609,18 @@ def _categorize_and_rollup(
         except Exception:  # noqa: BLE001
             project_tasks = []
         try:
-            rollup = rollup_project_state(project_key, project_tasks)
+            rollup = rollup_project_state(
+                project_key,
+                project_tasks,
+                actionable_task_alert_ids=actionable_alert_task_ids,
+            )
             rollup_tuple = (
                 rollup.state,
                 rollup.badge,
                 rollup.sort_rank,
                 rollup.reason,
                 rollup.approvals_pending,
+                rollup.actionable_key,
             )
         except Exception:  # noqa: BLE001
             logger.warning(

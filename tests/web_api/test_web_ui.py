@@ -810,6 +810,25 @@ def test_styles_have_mobile_media_query(client: TestClient) -> None:
     )
 
 
+# -------- Section 9: surface rail filter --------------------------------
+
+
+def test_ui_surface_filter_input_rendered(client: TestClient) -> None:
+    """The web UI renders a search input above the surface rail."""
+    body = client.get("/ui/").text
+    assert 'id="surface-filter"' in body
+    assert 'type="search"' in body
+    assert 'aria-label="Filter surfaces"' in body
+
+
+def test_ui_app_js_filters_surfaces_case_insensitive(client: TestClient) -> None:
+    """Surface filtering is client-side and case-insensitive."""
+    body = client.get("/ui/app.js").text
+    assert "state.surfaceFilter" in body
+    assert ".toLowerCase().includes(filter)" in body
+    assert 'addEventListener("input"' in body
+
+
 # -------- Round-4: renderDashboard ↔ real /dashboard schema -------------
 
 

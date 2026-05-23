@@ -22,7 +22,10 @@ test.describe("surfaces", () => {
         const items = document.querySelectorAll(
           "#surface-list li[data-session]",
         ).length;
-        if (items > 0) return true;
+        const tasks = document.querySelectorAll(
+          "#surface-list li[data-task]",
+        ).length;
+        if (items > 0 || tasks > 0) return true;
         const empty = document.querySelector(
           "#surface-list .surface-empty",
         ) as HTMLElement | null;
@@ -113,6 +116,13 @@ test.describe("surfaces", () => {
             },
           ],
         }),
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
       }),
     );
     await page.goto("/ui/");
@@ -224,6 +234,69 @@ test.describe("surfaces", () => {
     await expect(page.locator("#pane-title")).toHaveText("Select a surface");
     await expect(page.locator("#send-input")).toBeDisabled();
     await expect(page.locator("#send-button")).toBeDisabled();
+  });
+
+  test("task surfaces render in a separate rail group", async ({ page }) => {
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              task_id: "task-queued",
+              project: "demo",
+              task_number: 4,
+              title: "Queued rail item",
+              work_status: "queued",
+              type: "task",
+              priority: "normal",
+              assignee: "agent-1",
+              updated_at: "2026-05-23T00:00:00Z",
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/tasks/demo/4", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          task_id: "task-queued",
+          project: "demo",
+          task_number: 4,
+          title: "Queued rail item",
+          work_status: "queued",
+          type: "task",
+          priority: "normal",
+          assignee: "agent-1",
+          updated_at: "2026-05-23T00:00:00Z",
+          description: "Visible task detail",
+          relationships: {},
+          transitions: [],
+          executions: [],
+        }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    await expect(page.locator("#surface-list .surface-group")).toHaveText([
+      "Tasks",
+    ]);
+    await page.locator("li[data-task='demo/4']").click();
+    await expect(page.locator("#pane-title")).toHaveText("demo/4");
+    await expect(page.locator("#send-input")).toBeDisabled();
+    await expect(page.locator("#message-list")).toContainText(
+      "Visible task detail",
+    );
   });
 
   test("audit panel expands and queries current surface scope", async ({ page }) => {

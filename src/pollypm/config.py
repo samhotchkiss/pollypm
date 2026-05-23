@@ -616,13 +616,20 @@ def _parse_storage_settings(
     Recognised keys:
 
     * ``backend`` — entry-point name under ``pollypm.store_backend``.
-      Defaults to ``"postgres"`` after the #1737 cutover (issue #1939);
-      ``"sqlite"`` remains registered for explicit opt-in.
+      Defaults to ``"postgres"`` after the #1737 cutover (issue #1939).
+      ``"sqlite"`` is pytest-only for the store backend: production
+      configs that set ``backend = "sqlite"`` (or supply a
+      ``sqlite://`` URL) fail loudly when the resolver hits
+      :func:`pollypm.store.registry.register_backend`, which hard-
+      rejects sqlite registration outside a pytest process (refs
+      #1971, #1970).
     * ``url`` — SQLAlchemy URL. When empty/missing on the sqlite
-      backend, the resolver derives ``sqlite:///<project.state_db>`` so
-      first-run users don't have to think about connection strings. On
-      the postgres backend an empty ``url`` lets the pg pool resolve
-      the DSN itself (``[storage.pg].dsn`` / ``POLLYPM_PG_DSN``).
+      backend, the resolver derives ``sqlite:///<project.state_db>``
+      for the benefit of the pytest suite; in production this
+      derivation still flows into the registry guard, which raises.
+      On the postgres backend an empty ``url`` lets the pg pool
+      resolve the DSN itself (``[storage.pg].dsn`` /
+      ``POLLYPM_PG_DSN``).
 
     Missing section yields defaults. Fat-fingered value types (non-str)
     silently fall back to defaults — a broken ``[storage]`` block must
@@ -639,12 +646,19 @@ def _parse_storage_settings(
         url_raw = ""
     url_stripped = url_raw.strip()
     if not url_stripped and backend_raw.strip().lower() == "sqlite":
-        # Sqlite-only fallback: derive from the already-resolved state_db
-        # path so the legacy escape hatch keeps working without explicit
-        # URLs. The postgres backend reads its DSN from ``[storage.pg]``
-        # (or ``POLLYPM_PG_DSN``); leaving ``url`` empty lets the pool
-        # resolver pick it up rather than fabricating a sqlite URL on a
-        # postgres install (issue #1939).
+        # Sqlite URL derivation for the pytest suite: the conftest
+        # fixtures set ``backend = "sqlite"`` without spelling out a
+        # URL, so we synthesize one from the already-resolved
+        # ``state_db`` path. In production this branch is reachable
+        # but inert — :func:`pollypm.store.registry.register_backend`
+        # hard-rejects sqlite outside a pytest process (refs #1971,
+        # #1970), so a production config with ``backend = "sqlite"``
+        # fails loudly at store resolution rather than silently
+        # binding to the synthesized URL. The postgres backend reads
+        # its DSN from ``[storage.pg]`` (or ``POLLYPM_PG_DSN``);
+        # leaving ``url`` empty lets the pool resolver pick it up
+        # rather than fabricating a sqlite URL on a postgres install
+        # (issue #1939).
         url_stripped = f"sqlite:///{project.state_db.resolve()}"
 
     # ``[storage.pg]`` subsection (issue #1737, Slice A). Missing /

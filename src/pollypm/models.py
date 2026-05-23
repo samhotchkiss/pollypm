@@ -391,13 +391,21 @@ class StorageSettings:
     :func:`pollypm.store.registry.get_store`.
 
     ``backend`` — entry-point name. ``"postgres"`` is the canonical
-    default after the #1737 cutover (issue #1939); ``"sqlite"`` remains
-    registered for explicit opt-in (tests, legacy migration). Third-party
-    packages can register additional names.
+    default after the #1737 cutover (issue #1939). ``"sqlite"`` is
+    pytest-only for the store backend:
+    :func:`pollypm.store.registry.register_backend` hard-rejects
+    sqlite registration outside a pytest process, so production
+    configs that set ``backend = "sqlite"`` fail loudly at store
+    resolution rather than silently activating a legacy code path
+    (refs #1971, #1970). Third-party packages can register additional
+    names via the ``pollypm.store_backend`` entry-point group.
     ``url`` — SQLAlchemy URL passed to the backend constructor. Empty
     string means "use the backend's own default" — for ``postgres`` that
     is the DSN resolved by :func:`pollypm.storage.pg_pool.resolve_dsn`;
-    for ``sqlite`` it derives ``sqlite:///<resolved-state-db-path>``.
+    for ``sqlite`` the config parser derives
+    ``sqlite:///<resolved-state-db-path>`` for the benefit of the
+    pytest suite (production configs still hit the registry guard
+    described above).
 
     ``pg`` / ``embedding`` — sub-section knobs for the Postgres backend
     (#1737, Slice A). Defaults are safe to read regardless of backend

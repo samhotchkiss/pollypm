@@ -731,12 +731,57 @@ work could serialize POSTs per-session via a daemon-side lock.
 
 ### 5.12 Codex sessions (non-Claude)
 
-PollyPM also drives Codex (per memory: the `codex-fixer` tmux
-session). Codex doesn't write the Claude Code JSONL shape, so the
-server detects Codex via `SessionConfig.provider` and falls back to
-`tmux capture-pane` automatically. Envelope `type` is always `text`
-(Codex's tool calls aren't structured the way Claude Code's are). If
-you need structured tool data, use a Claude session.
+PollyPM also drives Codex (e.g. the `codex-fixer` tmux session).
+Codex doesn't write the Claude Code JSONL shape, but the server does
+**not** treat it as a provider-keyed capture-pane special case.
+Instead, Codex transcripts are normalized natively by the same
+ingestor used for Claude:
+
+- `TranscriptIngestor` (`src/pollypm/transcript_ingest.py`) dispatches
+  per-account by `account.provider`: Claude lines go through
+  `_normalize_claude_line`, Codex lines go through
+  `_normalize_codex_line`. Both paths emit the same normalized
+  `events.jsonl` envelope shape that `GET /messages` reads.
+- The route's source selection in
+  `chat_messages.py::_load_envelopes` is **provider-agnostic**. It
+  prefers the JSONL archive under `source=auto` and only falls
+  through to `tmux capture-pane` when the archive is stale or
+  unreadable (the §5.7 staleness rule). There is no `provider ==
+  "codex"` short-circuit.
+- The capture-pane fallback is therefore a freshness safety net for
+  **any** provider whose ingestor lags the live pane — not a
+  provider-specific code path.
+
+Codex envelopes are **not** restricted to `type=text`. The
+`_normalize_codex_line` path emits structured `event_type="tool_call"`
+and `event_type="tool_result"` events for Codex tool payloads
+(`src/pollypm/transcript_ingest.py`), and `parse_events_jsonl`
+converts those into `MessageType.TOOL_USE` and
+`MessageType.TOOL_RESULT` envelopes (`web_api/chat/transcripts.py`)
+the same way it does for Claude. `GET /messages` source selection is
+provider-agnostic, and so is the envelope-type coverage: Codex chat
+text surfaces as `type=text`, Codex tool calls as `type=tool_use`,
+and Codex tool results as `type=tool_result`.
+
+The remaining provider difference is **metadata richness**, not
+message-type coverage. The Claude tool branches extract a fully-typed
+`tool_use_id`, parsed `tool_input`, formatted summary, `is_error`,
+and structured `content` blocks. The Codex tool branches are
+best-effort: `tool_name` is derived from whichever of `name`/`tool`/
+`type` the payload exposes, `tool_input` is the raw payload, the
+result `tool_use_id` is left empty, and the rendered `text` is a
+short summary (`[<tool_name>]` for calls, an extracted text blob for
+results) with the original payload preserved under
+`metadata.tool_input` / `metadata.content`. If you need fully-typed
+tool envelopes, prefer a Claude session; if you only need to know a
+tool ran and roughly what it returned, the Codex envelopes carry
+that today.
+
+> Historical note: earlier drafts of this spec described an automatic
+> `provider == "codex" → tmux capture-pane` fallback. That was never
+> implemented — the native Codex JSONL normalizer is the primary path,
+> and capture-pane remains the staleness-only fallback documented in
+> §5.7. Reconciled in [#2053](https://github.com/samhotchkiss/pollypm/issues/2053).
 
 ---
 

@@ -168,11 +168,14 @@ def unregister_backend(name: str) -> None:
 def _resolve_backend_factory(name: str) -> Callable[..., "Store"] | None:
     """Return the factory callable for ``name`` or ``None``.
 
-    Checks the in-process registry first (tests / opt-in prod
-    callers), then falls back to the installed
-    ``pollypm.store_backend`` entry-point group. Returning ``None``
-    lets the caller raise :class:`StoreBackendNotFound` with the
-    full list of available names attached.
+    Checks the in-process registry first (pytest-only for the
+    ``sqlite`` backend — :func:`register_backend` hard-rejects
+    ``name == "sqlite"`` outside a pytest process, so production
+    sqlite registration is not possible via this map), then falls
+    back to the installed ``pollypm.store_backend`` entry-point
+    group. Returning ``None`` lets the caller raise
+    :class:`StoreBackendNotFound` with the full list of available
+    names attached.
     """
     factory = _REGISTERED_BACKENDS.get(name)
     if factory is not None:

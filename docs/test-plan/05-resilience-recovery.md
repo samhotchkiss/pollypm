@@ -17,13 +17,32 @@
 
 If any of these would affect the operator's real workload, STOP. Move to a test environment.
 
-Suggested snapshot before starting:
+Suggested snapshot before starting (best-effort):
 ```bash
-# State you can restore later
+# State you can restore later. Snapshot is best-effort, not transactional —
+# events.jsonl + audit.jsonl + pollypm.toml may have mid-write inconsistencies.
+# Acceptable for a test environment; do not rely on it for production restore.
 cp -r ~/.pollypm /tmp/pollypm-pre-05-snapshot
 pg_dump pollypm > /tmp/pollypm-pre-05-snapshot.sql
 git -C /Users/sam/dev/pollypm rev-parse HEAD > /tmp/pollypm-pre-05-snapshot.sha
 ```
+
+**If you want a clean, transactionally-consistent snapshot:** stop the daemon first.
+
+```bash
+# Stop everything that writes to ~/.pollypm
+tmux send-keys -t pm-serve:serve C-c
+# Wait for pm cockpit to exit cleanly (or kill its pane)
+sleep 5
+# Snapshot
+cp -r ~/.pollypm /tmp/pollypm-pre-05-snapshot
+pg_dump pollypm > /tmp/pollypm-pre-05-snapshot.sql
+git -C /Users/sam/dev/pollypm rev-parse HEAD > /tmp/pollypm-pre-05-snapshot.sha
+# Restart
+tmux send-keys -t pm-serve:serve 'pm serve' Enter
+```
+
+Either is fine for a test environment. Pick the live-snapshot if you don't mind the test pass starting with a clean restart not being the first observation; pick the running-snapshot if losing the absolute latest events.jsonl bytes is acceptable.
 
 Setup:
 ```bash
@@ -280,6 +299,72 @@ Cookie has 7-day Max-Age. There's no silent refresh — at expiry, the UI fails 
 **Currently no banner.** This is a known gap. Verify by manually expiring the cookie (set client clock forward, or wait 7 days).
 
 **Pass:** cookie expiry triggers a clean error state, not a crash. File `magic-gap:cookie-expiry-banner` for the UX improvement.
+
+### 5.5.3 Claude subscription failover
+
+**This is a release-gate scenario.** PollyPM's agents run on Claude subscriptions; the operator's primary subscription will hit its monthly limit, and the system must transition to a backup subscription without:
+- Manual operator intervention.
+- Dropped in-flight messages.
+- A multi-minute outage.
+- Confusing the architect / advisor / worker about who they are or what they were doing.
+
+The operator's day-in-the-life assumes this works — if the primary hits its limit at 4pm and the architect goes dark for an hour, that's a failure mode the test plan must catch before ship.
+
+**Setup (per §00.6):** confirm a backup Claude subscription is configured. If not, this scenario can't run and the failover behavior is unverifiable — file `magic-gap:no-failover-sub` and STOP.
+
+**Trigger options (pick whichever PollyPM supports):**
+
+```bash
+# Option A — synthetic limit-reached
+# If pollypm has a configuration knob to mark the primary sub as "over limit":
+pm sub set-status primary --status over-limit
+# (Replace with the actual CLI if it differs; check `pm --help` or src/pollypm/sub*.py)
+
+# Option B — revoke the primary token mid-conversation
+# Identify the primary token, regenerate it OR temporarily blacklist it via a non-destructive override
+pm config set claude.primary.token "invalid-rotation-test"
+
+# Option C — wait for an organic limit hit
+# Only viable late in the month; rate-limit a session deliberately
+```
+
+After triggering, observe:
+
+1. **Detection.** The system notices the primary is rejecting requests within one tool call / one assistant turn.
+2. **Failover.** It switches to the backup subscription within ~30 seconds.
+3. **Continuity.** An in-flight conversation (e.g., architect mid-planning) continues without operator intervention. The next assistant turn lands.
+4. **Notification.** The operator sees a clear "failed over to backup" signal — in the UI, inbox, or audit log. NOT silent.
+5. **Cost / quota visibility.** The operator can tell which subscription is now active and roughly how much headroom remains. Without this, they'll get surprised again when the backup also hits limit.
+
+**Pass criteria:**
+- Failover completes in < 60s from trigger.
+- No `429 / 529` errors leak to the operator's UI.
+- The architect / advisor / worker session does NOT restart or lose context.
+- An audit event `account.failover.<primary→backup>` (or equivalent) lands in `~/.pollypm/audit/`.
+- The Web UI shows the active account, not silently swapping it under the hood.
+
+**Fail to file:**
+- `bug:failover-silent` if failover happens but the operator can't tell.
+- `bug:failover-context-loss` if the agent restarts / loses memory across the transition.
+- `bug:failover-stuck` if requests keep hitting the primary after the limit.
+- `magic-gap:failover-no-quota-headroom` if the backup is active but the operator has no way to see how much capacity it has.
+
+**Restore after testing:**
+```bash
+pm sub set-status primary --status active  # or whatever resets the override
+# Verify
+pm sub list
+```
+
+### 5.5.4 Backup subscription also hits limit (rare but catastrophic)
+
+What happens when BOTH the primary and backup are over limit? Trigger both. Expected behavior:
+- Agents pause cleanly with a "no available subscription" message.
+- The operator sees this immediately in their inbox.
+- No in-flight task is lost; the task state becomes `blocked` with a clear reason.
+- When either subscription is restored, agents resume from where they were.
+
+**Pass:** graceful degradation, no data loss, clear operator messaging. **Fail:** silent hang, crashed sessions, or lost task state.
 
 ---
 

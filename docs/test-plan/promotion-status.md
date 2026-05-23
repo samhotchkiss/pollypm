@@ -82,7 +82,10 @@ Use this tracker while executing the ship-readiness plan. Promote manual checks 
 | 5.3 DB drop / reconnect | — | — | ☐ | — | toxiproxy-style integration |
 | 5.4 Pause-marker enforcement | — | — | partial | tests/test_session_paused_marker_wiring.py | extend with §5.4 cells |
 | 5.4.5 Malformed marker fail-closed | — | — | partial | tests/test_session_paused_marker_wiring.py | already covers basic case |
-| 5.5 Token rotation | — | — | ☐ | — | Playwright |
+| 5.5.1 Bearer token rotation | — | — | ☐ | — | Playwright |
+| 5.5.2 Cookie expiry | — | — | manual | — | hard to automate (7-day timer) |
+| 5.5.3 Claude subscription failover | — | — | ☐ | — | **release-gate scenario** — integration test against synthetic limit-reached |
+| 5.5.4 Both subscriptions exhausted | — | — | ☐ | — | integration test — agents pause cleanly, task → blocked |
 | 5.6 Network partition | — | — | manual quarterly | — | chaos |
 | 5.7 Resource exhaustion | — | — | manual quarterly | — | chaos |
 | 5.8 Data corruption recovery | — | — | ☐ | — | pytest (truncate, orphan, rotation) |

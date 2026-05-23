@@ -166,6 +166,30 @@ If any of these change during the run (e.g., operator regens config), §04 resul
 
 If you cannot tell which model a session uses, file `bug:model-version-opaque` — being unable to identify the model is itself a release blocker for an agent product.
 
+**Subscription / account inventory:**
+PollyPM is configured with at least one Claude subscription (the primary) and should also have a backup. Capture both so §5.5.3 failover testing can verify the transition.
+
+```bash
+# Inspect the configured Claude accounts (path depends on pollypm.toml shape):
+grep -E 'claude|anthropic|account|api_key' ~/.pollypm/pollypm.toml | head -20
+
+# Or via programmatic inspection (preferred — find the canonical accessor):
+.venv/bin/python -c "
+from pollypm.config import load_config
+c = load_config()
+# Look for the accounts/subscriptions structure on the config
+print('claude accounts:', getattr(c, 'claude_accounts', None) or getattr(c, 'accounts', None))
+" 2>/dev/null
+```
+
+Record:
+- Primary Claude subscription identifier (account name or token tail, not the full token).
+- Backup Claude subscription identifier.
+- Which is currently active.
+- The failover trigger (manual? limit-based? error-based?).
+
+If no backup is configured, file `magic-gap:no-failover-sub` against the next sprint — graceful failover is in scope for ship-readiness per the operator's day-in-the-life.
+
 ## 0.7 Performance environment baseline
 
 Before running qualitative sections, capture the environment that all later performance numbers depend on:

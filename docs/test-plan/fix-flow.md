@@ -10,6 +10,16 @@ Use `agent-personas.md` to decide whether the actor is operating as testing agen
 
 **Issues and PRs move between `needs-codex` and `needs-claude`; the tagged agent implements, then hands off to the other agent for review, approval, and merge. No self-merge.**
 
+## Both agents are required
+
+The protocol assumes Codex AND Claude are both available. There is no single-agent fallback. If Codex's watcher is not responding (off-hours, throttled, misconfigured, anything), ship-readiness work pauses until it's restored.
+
+Operator-merges-everything is NOT an authorized fallback — the cross-agent review is the integrity check. Bypassing it defeats the protocol.
+
+The only exception: the operator may merge when explicitly resolving a `mixed-agent-authors` PR or when the test plan finds the protocol itself is broken and needs a manual fix.
+
+Claude-side capacity has a built-in failover (see `05-resilience-recovery.md::§5.5.3 Claude subscription failover` — when the primary subscription hits its limit, PollyPM transitions to a backup). The protocol stays functional through that transition because Claude's identity to PollyPM (and to GitHub) doesn't change — only the underlying API account does.
+
 ## Visual sequence (one happy path)
 
 ```
@@ -299,6 +309,17 @@ Before merging, the reviewer must check creator labels:
 ### A. Reviewer approves and merges
 
 The reviewer agent approves and merges only if the creator label permits it. The ownership label is gone because the PR is `MERGED`. You're done.
+
+**Post-merge sync (every agent runs this after a merge they observe):**
+
+```bash
+cd /Users/sam/dev/pollypm
+git fetch origin --prune
+git checkout main
+git pull --ff-only origin main
+```
+
+This keeps every working copy on a current `main` so the next operation doesn't accidentally branch off stale state. Run this after any merge — yours OR another agent's — before starting the next piece of work. If `git pull --ff-only` fails, something diverged; investigate before pushing or branching further.
 
 ### B. Reviewer requests changes
 

@@ -215,11 +215,12 @@ Output:
 
 1. Land A findings first; all branches record the same baseline SHA.
 2. Codex D/G open PRs with `needs-claude` + `codex-created`; Claude reviews, approves, and merges if green.
-3. Codex E/F open PRs with `needs-claude` + `codex-created`; Claude reviews, approves, and merges if green.
+3. Codex E/F/H open PRs with `needs-claude` + `codex-created`; Claude reviews, approves, and merges if green.
 4. Claude backend/test-plan fixes open PRs with `needs-codex` + `claude-created`; Codex reviews, approves, and merges if green.
 5. Backend fixes from B/C land separately before UI depends on them.
-6. After each merge, rerun §07 smoke.
-7. Before ship/no-ship, run §06 M-scale once on merged main.
+6. **After every merge, every agent syncs local main** (per `fix-flow.md` post-merge sync block): `git fetch origin --prune && git checkout main && git pull --ff-only origin main`. This is non-optional — it's how parallel lanes avoid diverging.
+7. After each merge, rerun §07 smoke.
+8. Before ship/no-ship, run §06 M-scale once on merged main.
 
 ---
 

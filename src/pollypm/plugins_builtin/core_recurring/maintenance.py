@@ -18,6 +18,10 @@ from .shared import (
 
 logger = logging.getLogger(__name__)
 
+_PROACTIVE_FAILOVER_ACTIVE_ALERT = "proactive_failover_active"
+_PROACTIVE_FAILOVER_NO_CAPACITY_ALERT = "proactive_failover_no_capacity"
+_PROACTIVE_FAILOVER_FAILED_ALERT = "proactive_failover_failed"
+
 
 def capacity_probe_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Probe capacity for every configured account."""
@@ -33,13 +37,24 @@ def account_usage_refresh_handler(payload: dict[str, Any]) -> dict[str, Any]:
     """Refresh cached usage snapshots for configured accounts."""
     from pollypm.account_usage_sampler import refresh_all_account_usage
 
+    config_path = _resolve_config_path(payload)
     account_names = payload.get("accounts")
     if not isinstance(account_names, list):
         account_names = None
     samples = refresh_all_account_usage(
-        _resolve_config_path(payload),
+        config_path,
         account_names=account_names,
     )
+    config = _load_config(payload)
+    msg_store = _open_msg_store(config)
+    try:
+        proactive = _run_proactive_controller_failover(
+            config_path,
+            config,
+            msg_store=msg_store,
+        )
+    finally:
+        _close_msg_store(msg_store)
     return {
         "sampled": len(samples),
         "accounts": {
@@ -50,7 +65,320 @@ def account_usage_refresh_handler(payload: dict[str, Any]) -> dict[str, Any]:
             }
             for sample in samples
         },
+        "proactive_failover": proactive,
     }
+
+
+def _run_proactive_controller_failover(
+    config_path: Path,
+    config: Any,
+    *,
+    msg_store: Any | None,
+    switcher: Any | None = None,
+) -> dict[str, Any]:
+    """Apply the soft controller failover decision after usage refresh."""
+    from pollypm.capacity import evaluate_proactive_controller_failover
+
+    current_account = _current_operator_account(config)
+    decision = evaluate_proactive_controller_failover(
+        config,
+        None,
+        current_account=current_account,
+    )
+    return _apply_proactive_controller_failover(
+        config_path,
+        config,
+        decision,
+        msg_store=msg_store,
+        switcher=switcher,
+    )
+
+
+def _current_operator_account(config: Any) -> str:
+    session = _operator_session(config)
+    if session is None:
+        return str(getattr(getattr(config, "pollypm", None), "controller_account", "") or "")
+    try:
+        from pollypm.storage.pg_sessions import get_session_runtime
+
+        runtime = get_session_runtime(session.name)
+    except Exception:  # noqa: BLE001
+        runtime = None
+    effective = getattr(runtime, "effective_account", None) if runtime is not None else None
+    if effective:
+        return str(effective)
+    return str(getattr(session, "account", "") or getattr(config.pollypm, "controller_account", "") or "")
+
+
+def _operator_session(config: Any) -> Any | None:
+    sessions = getattr(config, "sessions", {}) or {}
+    if "operator" in sessions:
+        return sessions["operator"]
+    for session in sessions.values():
+        if getattr(session, "role", "") == "operator-pm":
+            return session
+    return None
+
+
+def _apply_proactive_controller_failover(
+    config_path: Path,
+    config: Any,
+    decision: Any,
+    *,
+    msg_store: Any | None,
+    switcher: Any | None = None,
+) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "action": decision.action,
+        "from": decision.current_account,
+        "to": decision.selected_account,
+        "reason": decision.reason,
+        "threshold": decision.threshold_pct,
+        "candidates_evaluated": decision.candidates_evaluated,
+    }
+    if decision.action == "none":
+        if (
+            decision.current_account != decision.primary_account
+            and decision.selected_account == decision.current_account
+        ):
+            _clear_proactive_failover_alerts(
+                msg_store,
+                alert_types=(
+                    _PROACTIVE_FAILOVER_NO_CAPACITY_ALERT,
+                    _PROACTIVE_FAILOVER_FAILED_ALERT,
+                ),
+            )
+            _upsert_proactive_failover_active_alert(msg_store, decision)
+        else:
+            _clear_proactive_failover_alerts(msg_store)
+        return summary
+
+    if decision.action == "alert":
+        _clear_proactive_failover_alerts(
+            msg_store,
+            alert_types=(
+                _PROACTIVE_FAILOVER_ACTIVE_ALERT,
+                _PROACTIVE_FAILOVER_FAILED_ALERT,
+            ),
+        )
+        _upsert_proactive_failover_no_capacity_alert(
+            msg_store,
+            (
+                f"Primary account {decision.primary_account} is at or above "
+                f"{decision.threshold_pct}% usage, but no failover account is below "
+                "that threshold."
+            ),
+        )
+        _append_proactive_failover_event(
+            msg_store,
+            from_account=decision.primary_account,
+            to_account=None,
+            reason=decision.reason,
+            threshold=decision.threshold_pct,
+            current_account=decision.current_account,
+        )
+        return summary
+
+    target = decision.selected_account
+    operator = _operator_session(config)
+    if target is None or operator is None:
+        summary["error"] = "No operator session or selected account available"
+        _upsert_proactive_failover_failed_alert(msg_store, summary["error"])
+        return summary
+
+    try:
+        _switch_operator_account(
+            config_path,
+            operator.name,
+            target,
+            switcher=switcher,
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary["error"] = str(exc)
+        _upsert_proactive_failover_failed_alert(
+            msg_store,
+            f"Proactive controller failover to {target} failed: {exc}",
+        )
+        return summary
+
+    _clear_proactive_failover_alerts(
+        msg_store,
+        alert_types=(
+            _PROACTIVE_FAILOVER_NO_CAPACITY_ALERT,
+            _PROACTIVE_FAILOVER_FAILED_ALERT,
+        ),
+    )
+    if target == decision.primary_account:
+        _clear_proactive_failover_alerts(
+            msg_store,
+            alert_types=(_PROACTIVE_FAILOVER_ACTIVE_ALERT,),
+        )
+    else:
+        _upsert_proactive_failover_active_alert(msg_store, decision)
+    _append_proactive_failover_event(
+        msg_store,
+        from_account=(
+            decision.primary_account
+            if decision.action == "switch"
+            else decision.current_account
+        ),
+        to_account=target,
+        reason=decision.reason,
+        threshold=decision.threshold_pct,
+        current_account=decision.current_account,
+    )
+    summary["applied"] = True
+    return summary
+
+
+def _switch_operator_account(
+    config_path: Path,
+    session_name: str,
+    account_name: str,
+    *,
+    switcher: Any | None,
+) -> None:
+    if switcher is not None:
+        switcher(session_name, account_name)
+        return
+    from pollypm.service_api import PollyPMService
+
+    PollyPMService(config_path).switch_session_account(session_name, account_name)
+
+
+def _append_proactive_failover_event(
+    msg_store: Any | None,
+    *,
+    from_account: str,
+    to_account: str | None,
+    reason: str,
+    threshold: int,
+    current_account: str,
+) -> None:
+    if msg_store is None:
+        return
+    try:
+        msg_store.append_event(
+            scope="pollypm",
+            sender="account.failover",
+            subject="account.failover.proactive",
+            payload={
+                "from": from_account,
+                "to": to_account,
+                "reason": reason,
+                "threshold": threshold,
+                "current": current_account,
+                "message": (
+                    f"Proactive account failover {from_account} -> "
+                    f"{to_account or 'none'} ({reason}, threshold={threshold}%)"
+                ),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "account.usage_refresh: failed to append proactive failover event",
+            exc_info=True,
+        )
+
+
+def _upsert_proactive_failover_active_alert(
+    msg_store: Any | None,
+    decision: Any,
+) -> None:
+    if msg_store is None:
+        return
+    try:
+        msg_store.upsert_alert(
+            "pollypm",
+            _PROACTIVE_FAILOVER_ACTIVE_ALERT,
+            "info",
+            (
+                f"Primary account {decision.primary_account} is at or above "
+                f"{decision.threshold_pct}% usage; operator is using "
+                f"{decision.selected_account or decision.current_account}."
+            ),
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "account.usage_refresh: failed to upsert proactive failover "
+            "active alert",
+            exc_info=True,
+        )
+
+
+def _upsert_proactive_failover_no_capacity_alert(
+    msg_store: Any | None,
+    message: str,
+) -> None:
+    if msg_store is None:
+        return
+    try:
+        msg_store.upsert_alert(
+            "pollypm",
+            _PROACTIVE_FAILOVER_NO_CAPACITY_ALERT,
+            "warn",
+            message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "account.usage_refresh: failed to upsert proactive failover alert",
+            exc_info=True,
+        )
+
+
+def _upsert_proactive_failover_failed_alert(
+    msg_store: Any | None,
+    message: str,
+) -> None:
+    if msg_store is None:
+        return
+    try:
+        msg_store.upsert_alert(
+            "pollypm",
+            _PROACTIVE_FAILOVER_FAILED_ALERT,
+            "warn",
+            message,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "account.usage_refresh: failed to upsert proactive failover "
+            "failure alert",
+            exc_info=True,
+        )
+
+
+def _clear_proactive_failover_alerts(
+    msg_store: Any | None,
+    *,
+    alert_types: tuple[str, ...] = (
+        _PROACTIVE_FAILOVER_ACTIVE_ALERT,
+        _PROACTIVE_FAILOVER_NO_CAPACITY_ALERT,
+        _PROACTIVE_FAILOVER_FAILED_ALERT,
+    ),
+) -> None:
+    if msg_store is None:
+        return
+    for alert_type in alert_types:
+        try:
+            msg_store.clear_alert(
+                "pollypm",
+                alert_type,
+                who_cleared="auto:account.usage_refresh",
+            )
+        except TypeError:
+            try:
+                msg_store.clear_alert("pollypm", alert_type)
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "account.usage_refresh: clear proactive failover alert "
+                    "failed",
+                    exc_info=True,
+                )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "account.usage_refresh: clear proactive failover alert failed",
+                exc_info=True,
+            )
 
 
 def transcript_ingest_handler(payload: dict[str, Any]) -> dict[str, Any]:

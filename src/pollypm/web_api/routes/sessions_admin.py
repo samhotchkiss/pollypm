@@ -141,6 +141,7 @@ from pollypm.session_paused import (
 from pollypm.session_paused import (
     save_paused_names as _save_paused_names,
 )
+from pollypm.session_leases import SessionLeaseConflictError
 from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.models import ActionResult
 from pollypm.web_api.routes._deps import ConfigDep
@@ -242,6 +243,18 @@ class SessionDetail(BaseModel):
     is_turn_active: bool = False
 
 
+class RestartSessionRequest(BaseModel):
+    """Optional body for ``POST /sessions/{name}/restart``."""
+
+    force: bool = Field(
+        default=False,
+        description=(
+            "Bypass a human-held session lease. This does not bypass the "
+            "mid-turn safety probe; use safety=force for that."
+        ),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Typed errors (spec §10.3)
 # ---------------------------------------------------------------------------
@@ -292,6 +305,18 @@ def _unsafe_mid_turn_unknown(name: str, detail: str) -> APIError:
         hint=(
             "Retry once the tmux service is healthy, or pass "
             "?safety=force to override the probe (destructive)."
+        ),
+    )
+
+
+def _session_leased(name: str, detail: str) -> APIError:
+    return APIError(
+        status_code=409,
+        code="session_leased",
+        message=f"Cannot restart {name!r}: {detail}.",
+        hint=(
+            "Wait for the lease holder to release the session, or pass "
+            "?force=true / {\"force\": true} to override the lease."
         ),
     )
 
@@ -972,6 +997,7 @@ def get_session_endpoint(name: str, config: ConfigDep) -> SessionDetail:
 def restart_session_endpoint(
     name: str,
     config: ConfigDep,
+    body: RestartSessionRequest | None = None,
     safety: Annotated[SafetyMode, Query(
         description=(
             "Safety gate. 'strict' (default) refuses restart while the "
@@ -980,6 +1006,12 @@ def restart_session_endpoint(
             "restart (no warning-emit semantics defined yet)."
         ),
     )] = "strict",
+    force: Annotated[bool, Query(
+        description=(
+            "Bypass a human-held session lease. This does not bypass the "
+            "mid-turn safety probe; use safety=force for that."
+        ),
+    )] = False,
 ) -> ActionResult:
     """POST /api/v1/sessions/{name}/restart — facade-driven relaunch.
 
@@ -994,6 +1026,8 @@ def restart_session_endpoint(
     * **404** ``not_found`` if the session isn't configured.
     * **409** ``unsafe_mid_turn`` if strict-mode and the agent is
       actively streaming a turn.
+    * **409** ``session_leased`` if the session is leased to another
+      owner and ``force`` was not requested.
     * **503** ``unsafe_mid_turn_unknown`` if strict-mode and the
       mid-turn safety probe itself failed (fail-closed — Codex PR
       #2061 P0 #2).
@@ -1001,6 +1035,7 @@ def restart_session_endpoint(
       can't be constructed, or if ``restart_session`` raises.
     """
     session = _find_session(config, name)
+    force_restart = force or (body.force if body is not None else False)
 
     # Safety gate (Codex PR #2061 P0 #2 + rounds 6+7). Strict mode (the
     # default) fails *closed* — a probe that cannot answer "is this
@@ -1074,8 +1109,16 @@ def restart_session_endpoint(
 
         try:
             supervisor.restart_session(
-                name, account_name, failure_type="api_restart",
+                name,
+                account_name,
+                failure_type="api_restart",
+                force=force_restart,
             )
+        except SessionLeaseConflictError as exc:
+            logger.debug(
+                "restart_session lease conflict for %s", name, exc_info=True,
+            )
+            raise _session_leased(name, str(exc)) from exc
         except KeyError as exc:
             # ``Supervisor.restart_session`` raises ``KeyError`` for an
             # unknown account; surface as 503 because the API contract is

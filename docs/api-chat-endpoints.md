@@ -368,6 +368,11 @@ It does **not** bypass pane/window validation: `409 pane_invalid`,
 | 400 | `invalid_request` | Catch-all for body-shape problems: missing `text` when `answer_to` is unset; `answer_to` set but no `selections`/`text`/`notes` supplied; etc. The message body identifies the specific problem. |
 | 422 | `validation_error` | FastAPI Pydantic rejection — malformed JSON, wrong field types, `safety` not in `{strict, loose, force}`, etc. Default FastAPI envelope shape (`{"detail": [...]}`). |
 
+Smoke tests should not expect `window_missing` for a nonexistent
+`session_name`: that request fails before tmux resolution and returns
+`404 session_unknown`. Use a configured session with its tmux window
+stopped to exercise `503 window_missing`.
+
 **Curl examples:**
 
 ```bash

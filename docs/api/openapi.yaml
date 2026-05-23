@@ -391,6 +391,32 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /projects/{key}/unpause:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Projects]
+      operationId: unpauseProject
+      summary: Unpause a project (set tracked=true)
+      description: |
+        Alias for `POST /projects/{key}/resume`. Flips
+        `KnownProject.tracked=true` and re-renders the global TOML.
+        Idempotent — a second call against an already-tracked project
+        returns 200 with the same snapshot and skips the disk write.
+      responses:
+        "200":
+          description: Project unpaused (or already was).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /projects/{key}/archive:
     parameters:
       - $ref: "#/components/parameters/ProjectKey"
@@ -823,6 +849,15 @@ paths:
         `ask_user` envelope, `selections[]` must match one of the
         question's option labels exactly; `notes` are appended
         after the selections joined by newlines.
+      parameters:
+        - in: query
+          name: safety
+          schema:
+            type: string
+            enum: [strict, loose, force]
+          description: |
+            Optional query-string safety override. When present, this
+            takes precedence over the JSON body `safety` field.
       requestBody:
         required: true
         content:
@@ -1680,6 +1715,14 @@ paths:
         `?safety=force` bypasses BOTH the mid-turn check and the
         probe-unknown check.
 
+        `?force=true` or `{"force": true}` bypasses a human-held
+        session lease only. It does not bypass the mid-turn safety
+        gate; combine with `?safety=force` only when the operator
+        intentionally wants both overrides.
+
+        Returns `409 session_leased` when the session is leased to
+        another owner and `force` was not requested.
+
         Returns `503 daemon_unavailable` when the supervisor or tmux
         session service can't be constructed, when no account can be
         resolved for the session, or when `restart_session` raises.
@@ -1695,6 +1738,28 @@ paths:
             mid-turn; `force` bypasses the mid-turn gate. `loose` is
             treated like `strict` for this verb (no warn-and-proceed
             semantics defined yet).
+        - in: query
+          name: force
+          schema:
+            type: boolean
+            default: false
+          description: |
+            Bypass a human-held session lease. This does not bypass the
+            mid-turn safety probe; use `safety=force` for that.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                force:
+                  type: boolean
+                  default: false
+                  description: |
+                    Bypass a human-held session lease. This does not
+                    bypass the mid-turn safety probe; use
+                    `safety=force` for that.
       responses:
         "200":
           description: Restart completed.
@@ -1708,9 +1773,12 @@ paths:
           $ref: "#/components/responses/NotFound"
         "409":
           description: |
-            Refused because the agent is mid-turn
-            (`code=unsafe_mid_turn`). Re-issue with `?safety=force` to
-            override.
+            One of:
+            * `code=unsafe_mid_turn` — refused because the agent is
+              mid-turn. Re-issue with `?safety=force` to override.
+            * `code=session_leased` — refused because the session is
+              leased to another owner. Re-issue with `?force=true` or
+              `{"force": true}` to override the lease.
           content:
             application/json:
               schema:
@@ -2606,7 +2674,7 @@ components:
     # ---- Health -----------------------------------------------------
     HealthResponse:
       type: object
-      required: [status, version, schema_version, started_at]
+      required: [status, version, schema_version, started_at, auth_mode, tailnet_trust_enabled]
       properties:
         status:
           type: string
@@ -2620,6 +2688,13 @@ components:
         started_at:
           type: string
           format: date-time
+        auth_mode:
+          type: string
+          enum: [tailnet_trust, bearer_only]
+          description: Authentication posture for this server process.
+        tailnet_trust_enabled:
+          type: boolean
+          description: Whether Tailscale CGNAT peers are accepted without bearer or cookie credentials.
 
     DoctorCheck:
       type: object

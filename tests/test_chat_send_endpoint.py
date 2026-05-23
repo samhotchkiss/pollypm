@@ -525,11 +525,18 @@ def test_ended_worker_session_returns_404(
 # ---------------------------------------------------------------------------
 
 
-def test_unknown_session_returns_404(
+def test_unknown_session_returns_404_session_unknown_not_window_missing(
     client: TestClient,
     auth_headers: dict[str, str],
     patched_tmux: type[FakeTmuxClient],  # noqa: ARG001
 ) -> None:
+    """Unknown names fail at the registry layer, not tmux resolution.
+
+    ``window_missing`` is reserved for a registered chat surface whose
+    tmux window is absent. A name that is neither a configured session
+    nor an active worker should stay ``session_unknown`` so clients can
+    distinguish typos from runtime process loss.
+    """
     response = client.post(
         "/api/v1/chat/nope/send",
         json={"text": "hello"},
@@ -822,6 +829,28 @@ def test_safety_force_bypasses_mid_tool(
     response = client.post(
         "/api/v1/chat/operator/send",
         json={"text": "hello", "safety": "force"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200
+
+
+def test_safety_force_query_param_bypasses_mid_tool(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    patched_tmux: type[FakeTmuxClient],
+    monkeypatch: pytest.MonkeyPatch,
+    project_root: Path,
+    workspace_root: Path,
+) -> None:
+    _set_storage_closet_windows(patched_tmux, ["pm-operator"])
+    _patch_heartbeat_age(monkeypatch, 0.5)  # also fresh heartbeat
+    _write_events_jsonl(
+        project_root, "session-open", _assistant_with_open_tool(),
+        cwd=workspace_root,
+    )
+    response = client.post(
+        "/api/v1/chat/operator/send?safety=force",
+        json={"text": "hello"},
         headers=auth_headers,
     )
     assert response.status_code == 200

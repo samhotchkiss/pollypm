@@ -345,6 +345,12 @@ safety gates only. Pane and window existence + liveness errors
 `safety=loose` keeps the mid-tool gate but allows mid-stream sends
 with a response header.
 
+Smoke tests should distinguish the two address-resolution failures:
+use an unregistered `session_name` to assert `404 session_unknown`, and
+use a registered session whose tmux window is absent to assert
+`503 window_missing`. A nonexistent session never reaches the tmux
+window probe.
+
 Explicit `pane` (including `pane=0`) always validates via
 `list_panes()` and routes to the indexed target (`session:window.N`);
 only an omitted `pane` falls back to the window-level (active-pane)

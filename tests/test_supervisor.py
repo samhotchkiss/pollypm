@@ -28,6 +28,7 @@ from pollypm.models import (
     SessionConfig,
     SessionLaunchSpec,
 )
+from pollypm.session_leases import SessionLeaseConflictError
 from pollypm.supervisor import (
     Supervisor,
     _extract_claude_model_name,
@@ -2518,6 +2519,53 @@ def test_restart_session_skips_recovery_prompt_for_heartbeat(
     runtime = supervisor.store.get_session_runtime("heartbeat")
     assert runtime is not None
     assert runtime.status == "healthy"
+
+
+def test_restart_session_rejects_conflicting_lease_by_default(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    supervisor.claim_lease("operator", "human", "manual takeover")
+    monkeypatch.setattr(
+        supervisor.session_service.tmux, "has_session", lambda _name: False,
+    )
+
+    try:
+        supervisor.restart_session(
+            "operator", "claude_controller", failure_type="api_restart",
+        )
+    except SessionLeaseConflictError as exc:
+        assert exc.owner == "human"
+        assert "currently leased to human" in str(exc)
+    else:
+        raise AssertionError("expected restart to fail while human lease is active")
+
+
+def test_restart_session_force_bypasses_conflicting_lease(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    supervisor.claim_lease("operator", "human", "manual takeover")
+    monkeypatch.setattr(
+        supervisor.session_service.tmux, "has_session", lambda _name: False,
+    )
+    launched: list[str] = []
+    monkeypatch.setattr(
+        supervisor, "launch_session", lambda name: launched.append(name),
+    )
+
+    supervisor.restart_session(
+        "operator",
+        "claude_controller",
+        failure_type="api_restart",
+        force=True,
+    )
+
+    assert launched == ["operator"]
 
 
 def test_identity_preamble_threads_project_persona_for_architect() -> None:

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
 from pollypm.audit.log import SCHEMA_VERSION
 from pollypm.web_api.models import HealthResponse
@@ -44,10 +44,17 @@ _STARTED_AT = datetime.now(timezone.utc)
     summary="Liveness + version info",
     operation_id="getHealth",
 )
-def get_health() -> HealthResponse:
+def get_health(request: Request) -> HealthResponse:
+    tailnet_trust_enabled = bool(
+        getattr(request.app.state, "tailnet_trust_enabled", False)
+    )
     return HealthResponse(
         status="ok",
         version=_server_version(),
         schema_version=SCHEMA_VERSION,
         started_at=_STARTED_AT,
+        auth_mode=(
+            "tailnet_trust" if tailnet_trust_enabled else "bearer_only"
+        ),
+        tailnet_trust_enabled=tailnet_trust_enabled,
     )

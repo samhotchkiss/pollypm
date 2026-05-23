@@ -8,6 +8,7 @@ Implements:
 - ``GET /api/v1/projects/{key}/plan`` — structured plan body.
 - ``POST /api/v1/projects/{key}/pause`` — mark project ``tracked=false``.
 - ``POST /api/v1/projects/{key}/resume`` — mark project ``tracked=true``.
+- ``POST /api/v1/projects/{key}/unpause`` — alias for ``resume``.
 - ``POST /api/v1/projects/{key}/archive`` — remove project from config
   (per spec §6.2; source data on disk is untouched).
 - ``POST /api/v1/projects/{key}/init-guide`` — seed a project-local
@@ -21,6 +22,7 @@ from typing import Annotated, Literal
 from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field
 
+from pollypm.config import PollyPMConfig
 from pollypm.web_api.errors import not_found
 from pollypm.web_api.models import (
     ActionResult,
@@ -213,6 +215,28 @@ def resume_project_endpoint(
     key: str,
     config: ConfigDep,
 ) -> Project:
+    return _resume_project(config, key)
+
+
+@router.post(
+    "/projects/{key}/unpause",
+    response_model=Project,
+    summary="Unpause a project (set tracked=true)",
+    operation_id="unpauseProject",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project not registered."},
+        "503": {"description": "Backing store unreachable (failed to persist)."},
+    },
+)
+def unpause_project_endpoint(
+    key: str,
+    config: ConfigDep,
+) -> Project:
+    return _resume_project(config, key)
+
+
+def _resume_project(config: PollyPMConfig, key: str) -> Project:
     # Idempotency lives in ``set_project_tracked`` (Codex round 2 on
     # #2063): deciding "already tracked" against the long-lived
     # ``ConfigDep`` snapshot was returning 200 with a stale value when

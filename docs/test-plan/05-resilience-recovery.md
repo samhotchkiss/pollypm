@@ -292,15 +292,7 @@ pm api regen-token
 - UI shows auth error.
 - Refresh `/ui/`: new cookie issued, UI recovers.
 
-### 5.5.2 Cookie expiry approach
-
-Cookie has 7-day Max-Age. There's no silent refresh — at expiry, the UI fails until refresh.
-
-**Currently no banner.** This is a known gap. Verify by manually expiring the cookie (set client clock forward, or wait 7 days).
-
-**Pass:** cookie expiry triggers a clean error state, not a crash. File `magic-gap:cookie-expiry-banner` for the UX improvement.
-
-### 5.5.3 Claude subscription failover
+### 5.5.2 Claude subscription failover
 
 **This is a release-gate scenario.** PollyPM's agents run on Claude subscriptions; the operator's primary subscription will hit its monthly limit, and the system must transition to a backup subscription without:
 - Manual operator intervention.
@@ -356,7 +348,7 @@ pm sub set-status primary --status active  # or whatever resets the override
 pm sub list
 ```
 
-### 5.5.4 Backup subscription also hits limit (rare but catastrophic)
+### 5.5.3 Backup subscription also hits limit (rare but catastrophic)
 
 What happens when BOTH the primary and backup are over limit? Trigger both. Expected behavior:
 - Agents pause cleanly with a "no available subscription" message.

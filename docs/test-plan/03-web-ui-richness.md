@@ -278,40 +278,9 @@ pm api regen-token
 
 ## 3.9 Magic-feel checks
 
-**These are the hardest to verify but the most important.** They are also the easiest to fake. Below are measurable scenarios that capture "feels magical" in a way that another tester could repeat.
+**These are the hardest to verify but the most important.** Self-evaluation by the testing agent produces optimistic results — the agent knows too much about the system to fairly simulate a new user. Use the "I wish I could…" log instead; it captures real friction the testing agent encounters without pretending to be someone else.
 
-### 3.9.1 Cold-operator scenario (measurable)
-
-Seed the system with a specific situation, then ask a fresh operator to act.
-
-**Setup:**
-```bash
-# Create 3 tasks. One stuck (kill its worker pane afterward).
-T1=$(pm task create --project pollypm "magic-feel-stuck" --json | jq -r .task_id)
-T2=$(pm task create --project pollypm "magic-feel-fresh" --json | jq -r .task_id)
-T3=$(pm task create --project pollypm "magic-feel-review" --json | jq -r .task_id)
-pm task queue "$T1"; pm task queue "$T2"; pm task queue "$T3"
-sleep 90  # let them claim
-
-# Kill the worker on T1's pane to make it "stuck"
-tmux kill-window -t pollypm:worker_pollypm
-sleep 180  # cascade detection window
-```
-
-**Test:** open `/ui/` in a fresh incognito tab. Find a willing tester who has never used PollyPM (or simulate by ignoring everything you know).
-
-Without reading docs or asking questions, the tester must:
-1. Identify which of the three tasks is "the one that needs attention." (Expected: T1, the stuck one.)
-2. Take an action on that task (e.g., view its detail, retry, reassign — any deliberate action).
-
-**Measure:**
-- Time from page-load to action: **must be < 60s.**
-- Did they pick the right task? (Yes / no.)
-- Did they need to drop to `pm doctor`, `pm task get`, or the TUI to figure it out? (No = pass.)
-
-**Pass:** all three measures green. If <60s but they picked wrong task, file `magic-gap:wrong-attention`. If >60s, file `magic-gap:dashboard-not-anticipating`.
-
-### 3.9.2 The "I wish I could…" log
+### 3.9.1 The "I wish I could…" log
 
 Sit with the system as a user for 30 minutes. Keep a notebook open. Every time you think "I wish I could…", "huh, why doesn't it…", or "I had to drop to CLI for…", write it down.
 
@@ -322,11 +291,13 @@ These are the magic-gap candidates. After 30 minutes, each one becomes a `magic-
 
 **Pass:** the list captured at least 3 specific wishes (a list of 0 means you didn't push hard enough; a list of 20 means the magic gap is large).
 
-The bar: **a user who's never seen PollyPM should be able to sit down at the Web UI and accomplish their first task — without reading docs.** Test §3.9.1 enforces this.
+The bar from `operator-day-in-the-life.md`: **a user who has been using PollyPM should never need to drop to TUI / CLI / `pm doctor` to understand their daily state.** Every "I had to drop to X" is a magic-gap issue.
+
+True cold-operator testing (someone who has never seen PollyPM) is out of scope for this plan — it's covered by the separate onboarding test suite.
 
 ---
 
-## 3.9.3 TUI parity — measurable via Textual pilot
+## 3.9.2 TUI parity — measurable via Textual pilot
 
 For TUI interactions, manual stopwatching is unreliable. Use Textual's `pilot` harness to drive cockpit interactions in a test context.
 

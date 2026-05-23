@@ -193,7 +193,7 @@ This plan exists to support a binary decision. Use these criteria to convert jou
 - Any §02 triple-witness scenario shows drift between pane, archive, and REST.
 - Any §03 click breaks the 1-second rule.
 - Any §05 fail-closed scenario fails open (e.g., malformed pause marker silently allows recovery).
-- §5.5.3 Claude subscription failover does not happen automatically, or loses session context.
+- §5.5.2 Claude subscription failover does not happen automatically, or loses session context.
 - Any §06 M-scale endpoint p95 above budget, or any payload above budget.
 - Any §04 auth-marker false-positive (unmarked impostor actioned) or false-negative (legitimate marker refused).
 - Any unresolved `bug:` issue on the §07 path.

@@ -2,6 +2,8 @@
 
 Use this tracker while executing the ship-readiness plan. Promote manual checks when they catch regressions that would plausibly ship without automation. Retire checks that never find signal.
 
+**Source of truth:** journals are append-only and authoritative for a specific session's results. This file is a **rolling snapshot** — the latest meaningful result across sessions, plus the current promotion state. After each session, the tester walks their journal and pushes the relevant updates into the rows below. If this file and a journal disagree, the latest-dated journal wins. The tracker is regenerable from journals (manually).
+
 **Result column legend:** `pass` / `fail` / `flake` / `partial` / `—` (not yet run).
 
 **Promoted column legend:** `☐` (manual only) / `▶` (in progress) / `✓` (automated).
@@ -56,8 +58,8 @@ Use this tracker while executing the ship-readiness plan. Promote manual checks 
 | 3.6 Bidirectional sync | — | — | ☐ | — | Playwright + tmux harness |
 | 3.7 Daemon-down behavior | — | — | ☐ | — | Playwright + injected daemon kill |
 | 3.8 Auth boundary | — | — | ☐ | — | curl integration + Playwright |
-| 3.9 Magic-feel | — | — | manual forever | — | cold-operator scenario + "I wish" log |
-| 3.9.3 TUI pilot parity | — | — | ☐ | — | Textual pilot harness |
+| 3.9.1 Magic-feel "I wish" log | — | — | manual forever | — | 30-min sit + journal capture |
+| 3.9.2 TUI pilot parity | — | — | ☐ | — | Textual pilot harness |
 | 3.10 Mobile-specific UX | — | — | ☐ + manual | — | mobile-chrome + real phone |
 
 ## §04 Agent Behavior
@@ -83,9 +85,8 @@ Use this tracker while executing the ship-readiness plan. Promote manual checks 
 | 5.4 Pause-marker enforcement | — | — | partial | tests/test_session_paused_marker_wiring.py | extend with §5.4 cells |
 | 5.4.5 Malformed marker fail-closed | — | — | partial | tests/test_session_paused_marker_wiring.py | already covers basic case |
 | 5.5.1 Bearer token rotation | — | — | ☐ | — | Playwright |
-| 5.5.2 Cookie expiry | — | — | manual | — | hard to automate (7-day timer) |
-| 5.5.3 Claude subscription failover | — | — | ☐ | — | **release-gate scenario** — integration test against synthetic limit-reached |
-| 5.5.4 Both subscriptions exhausted | — | — | ☐ | — | integration test — agents pause cleanly, task → blocked |
+| 5.5.2 Claude subscription failover | — | — | ☐ | — | **release-gate scenario** — integration test against synthetic limit-reached |
+| 5.5.3 Both subscriptions exhausted | — | — | ☐ | — | integration test — agents pause cleanly, task → blocked |
 | 5.6 Network partition | — | — | manual quarterly | — | chaos |
 | 5.7 Resource exhaustion | — | — | manual quarterly | — | chaos |
 | 5.8 Data corruption recovery | — | — | ☐ | — | pytest (truncate, orphan, rotation) |

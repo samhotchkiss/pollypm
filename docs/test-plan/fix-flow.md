@@ -18,7 +18,7 @@ Operator-merges-everything is NOT an authorized fallback — the cross-agent rev
 
 The only exception: the operator may merge when explicitly resolving a `mixed-agent-authors` PR or when the test plan finds the protocol itself is broken and needs a manual fix.
 
-Claude-side capacity has a built-in failover (see `05-resilience-recovery.md::§5.5.3 Claude subscription failover` — when the primary subscription hits its limit, PollyPM transitions to a backup). The protocol stays functional through that transition because Claude's identity to PollyPM (and to GitHub) doesn't change — only the underlying API account does.
+Claude-side capacity has a built-in failover (see `05-resilience-recovery.md::§5.5.2 Claude subscription failover` — when the primary subscription hits its limit, PollyPM transitions to a backup). The protocol stays functional through that transition because Claude's identity to PollyPM (and to GitHub) doesn't change — only the underlying API account does.
 
 ## Visual sequence (one happy path)
 

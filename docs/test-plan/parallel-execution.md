@@ -250,6 +250,22 @@ When to stop and ask:
 
 ---
 
+## Contract-gap interrupts
+
+Parallel execution assumes the API contracts B and C validate are correct. When they're not, Codex code-creation lanes have to know fast so they don't build on a broken foundation.
+
+When a Claude validation lane (B or C) discovers a blocking contract gap:
+
+1. **File an issue immediately** with severity `contract-gap`. Label `needs-codex` if the fix is mechanical (e.g., add a missing response field), `needs-claude` if it requires architectural judgment.
+2. **Tag the affected Codex lane(s) in the issue body** — e.g., "blocks lane D Task detail drawer," "blocks lane G click-rule spec."
+3. **The tagged lane pauses** at the next clean commit boundary (push what's done, comment "paused on #N until contract gap resolved"). Do NOT continue building on the broken contract.
+4. **The contract fix goes through normal fix-flow** — author, review, merge.
+5. **Post-merge sync** (per fix-flow): the paused lane fetches main, rebases its branch, resumes.
+
+If multiple Codex lanes block on the same contract, fix the contract once; all lanes resume after.
+
+If a Codex lane is HALF-done when a contract gap lands and the half-done work is now invalid: rebase, drop the invalid commits, redo against the corrected contract. Do NOT try to preserve work that was built on a broken assumption.
+
 ## Stop conditions
 
 Stop parallel work and regroup if:
@@ -259,3 +275,4 @@ Stop parallel work and regroup if:
 - Any Codex UI path requires hiding a backend bug with frontend-only logic.
 - M-scale §06 fails in a way that changes architecture, not just implementation.
 - A lane needs to violate `architecture-guardrails.md` to make progress quickly.
+- Three or more lanes are paused on contract-gap interrupts at the same time — that's a sign the upstream contracts are broader than expected and the order of B/C work should be re-prioritized to land contract clarity first.

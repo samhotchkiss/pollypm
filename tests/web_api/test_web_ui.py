@@ -202,6 +202,21 @@ def test_ui_static_js_served(client: TestClient) -> None:
     assert "sendMessage" in body
 
 
+def test_ui_app_js_uses_sse_refresh_with_polling_fallback(
+    client: TestClient,
+) -> None:
+    """The SPA refresh loop is driven by ``/events`` with a bounded fallback."""
+    body = client.get("/ui/app.js").text
+    assert "EventSource" in body
+    assert 'API + "/events"' in body
+    assert "SSE_FAILURE_LIMIT" in body
+    assert "startFallbackPolling" in body
+    assert "handleSseEvent" in body
+    assert "POLL_MESSAGES_MS" not in body
+    assert "POLL_DASHBOARD_MS" not in body
+    assert "setInterval(pollDashboard" not in body
+
+
 def test_ui_static_css_served(client: TestClient) -> None:
     """``GET /ui/styles.css`` returns the dark-theme stylesheet."""
     response = client.get("/ui/styles.css")

@@ -6190,6 +6190,10 @@ class PollyInboxApp(App[None]):
         self._tasks: list = []
         self._selected_task_id: str | None = None
         self._selected_row_key: str | None = None
+        # #1969 — tracks the most-recent deferred-hydration dispatch so
+        # a worker callback whose target row was navigated away from
+        # can drop its result without re-painting stale data.
+        self._pending_detail_hydration_task_id: str | None = None
         self._unread_ids: set[str] = set()
         self._session_read_ids: set[str] = set()
         self._replies_by_task: dict[str, list] = {}
@@ -6681,42 +6685,252 @@ class PollyInboxApp(App[None]):
         self._update_status(total=total, shown=len(visible))
 
     def _schedule_deferred_detail_hydration(self, task_id: str) -> None:
-        """Defer ``_render_detail`` onto the next event-loop tick.
+        """Defer detail hydration onto a worker thread (#1969).
 
-        #1959 perf — the inbox initial-load completion callback runs on
-        the UI thread; calling ``_render_detail`` synchronously inside
-        that callback blocks first-paint on a work-service open + task
-        + replies + context fetch. Showing a "Loading…" placeholder and
-        scheduling the hydration via ``set_timer(0)`` lets the list
-        paint immediately; the timer fires in the next event-loop tick
-        and runs the same code path against the same task_id. If the
-        user has navigated away by then we skip hydration.
+        #1959 first deferred ``_render_detail`` by one event-loop tick
+        via ``set_timer(0)``, but the actual hydration callback still
+        ran synchronously on the UI thread — opening a work service,
+        calling ``svc.get`` / ``svc.list_replies`` / ``svc.get_context``,
+        then loading the inline review artifact off disk. On a project
+        with a cold sqlite cache that easily costs 100-400ms of blocked
+        keypresses while the j/k cursor input piles up behind the
+        Textual loop.
+
+        The fix (#1969) paints a "Loading…" placeholder synchronously
+        and runs the IO-heavy fetch on ``run_worker(thread=True)`` —
+        the same pattern ``_initial_load_sync`` already uses. The
+        worker hands its result back via ``call_from_thread`` to a
+        stale-guarded UI-thread applier; if the user navigated away
+        mid-fetch the result is discarded.
         """
         try:
             self.detail.update("[dim]Loading detail…[/dim]")
         except Exception:  # noqa: BLE001
             pass
 
-        def _hydrate() -> None:
-            # Cancellable / stale-result guard: only hydrate if the user
-            # is still on this row (no navigation away during the gap).
-            if self._selected_task_id != task_id:
-                return
+        # Remember which task the most-recent dispatch covers — the
+        # applier re-checks this in addition to ``_selected_task_id``
+        # so a queued-then-superseded worker callback can't paint stale
+        # data over a freshly-selected row.
+        self._pending_detail_hydration_task_id = task_id
+
+        try:
+            self.run_worker(
+                lambda: self._hydrate_detail_worker(task_id),
+                thread=True,
+                exclusive=True,
+                group="inbox_detail_hydrate",
+            )
+        except Exception:  # noqa: BLE001
+            # No event loop / worker dispatch failure (unit tests,
+            # teardown) — fall back to the synchronous path so the
+            # user isn't stranded on the placeholder.
             try:
-                self._render_detail(task_id)
+                if self._selected_task_id == task_id:
+                    self._render_detail(task_id)
             except Exception:  # noqa: BLE001
                 pass
 
+    def _hydrate_detail_worker(self, task_id: str) -> None:
+        """Off-thread fetch for the inbox detail pane (#1969).
+
+        Resolves task + replies + rollup items + inline review
+        artifact off the UI loop, then dispatches the apply step back
+        via ``call_from_thread``. All branches re-check the stale
+        guard before scheduling UI mutations: if the user navigated
+        away (``_selected_task_id`` no longer matches ``task_id``, or
+        a newer hydration dispatch superseded ours), the result is
+        discarded silently.
+        """
+        if self._selected_task_id != task_id:
+            return
+        if getattr(self, "_pending_detail_hydration_task_id", None) != task_id:
+            return
         try:
-            self.set_timer(0, _hydrate)
+            item = self._item_for_id(task_id)
         except Exception:  # noqa: BLE001
-            # Defensive: if the timer can't be scheduled (shutdown), fall
-            # back to the synchronous path so the user isn't stranded on
-            # the placeholder.
+            item = None
+        if item is None:
             try:
-                self._render_detail(task_id)
+                self.call_from_thread(
+                    self._apply_hydrated_detail_missing, task_id,
+                )
             except Exception:  # noqa: BLE001
                 pass
+            return
+        if not is_task_inbox_entry(item):
+            try:
+                self.call_from_thread(
+                    self._apply_hydrated_detail_message, task_id, item,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        # Mirrors ``_detail_fetch_task_data`` but without any UI side
+        # effects — those run on the applier thread once we re-check
+        # the stale guard. We also pre-resolve the inline review
+        # artifact here because ``load_task_review_artifact`` is the
+        # other disk-hitting call ``_render_detail`` made on the UI
+        # loop pre-#1969.
+        project_key = task_id.split("/", 1)[0] if "/" in task_id else None
+        is_workspace = (
+            project_key is None
+            or project_key in {"inbox", "workspace", "[workspace]"}
+            or self._project_key_is_unknown(project_key)
+        )
+        try:
+            svc = self._resolve_inbox_svc(item, task_id)
+        except Exception:  # noqa: BLE001
+            svc = None
+        if svc is None:
+            try:
+                self.call_from_thread(
+                    self._apply_hydrated_detail_unresolved,
+                    task_id, item, is_workspace,
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        task = None
+        replies: list = []
+        rollup_items_raw: list = []
+        fetch_error: str | None = None
+        try:
+            task = svc.get(task_id)
+            replies = svc.list_replies(task_id)
+            rollup_items_raw = (
+                svc.get_context(task_id, entry_type="rollup_item")
+                if _task_is_rollup(task) else []
+            )
+        except Exception as exc:  # noqa: BLE001
+            fetch_error = str(exc)
+        finally:
+            try:
+                svc.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+        if fetch_error is not None or task is None:
+            try:
+                self.call_from_thread(
+                    self._apply_hydrated_detail_error,
+                    task_id, fetch_error or "task unavailable",
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+
+        review_block: str | None = None
+        try:
+            review_block = self._render_inline_review_artifact(task)
+        except Exception:  # noqa: BLE001
+            review_block = None
+
+        try:
+            self.call_from_thread(
+                self._apply_hydrated_detail,
+                task_id, item, task, replies, rollup_items_raw, review_block,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _hydration_target_is_stale(self, task_id: str) -> bool:
+        """Return True if a queued hydration callback should be dropped."""
+        if self._selected_task_id != task_id:
+            return True
+        if getattr(self, "_pending_detail_hydration_task_id", None) != task_id:
+            return True
+        return False
+
+    def _apply_hydrated_detail(
+        self,
+        task_id: str,
+        item,
+        task,
+        replies: list,
+        rollup_items_raw: list,
+        review_block: str | None,
+    ) -> None:
+        """UI-thread applier for ``_hydrate_detail_worker``.
+
+        Mirrors the back half of ``_render_detail`` but consumes the
+        pre-fetched payload instead of doing IO inline. Stale-guard
+        first so we never paint data over a row the user moved off.
+        """
+        if self._hydration_target_is_stale(task_id):
+            return
+        self._set_reply_mode_for_task()
+        sections = self._detail_build_sections(task)
+        self._detail_append_thread(sections, replies)
+        self._detail_apply_label_hints(task, task_id, item, replies)
+        if review_block:
+            sections.append("")
+            sections.append("[dim]── review artifact ──[/dim]")
+            sections.append(review_block)
+        try:
+            self.detail.update("\n".join(sections))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self._render_rollup_items(rollup_items_raw)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.query_one("#inbox-detail-scroll", VerticalScroll).scroll_home(
+                animate=False,
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_hydrated_detail_missing(self, task_id: str) -> None:
+        if self._hydration_target_is_stale(task_id):
+            return
+        try:
+            self.detail.update("[red]Inbox item is no longer available.[/red]")
+        except Exception:  # noqa: BLE001
+            pass
+        self._clear_rollup_items()
+        self._set_reply_mode_for_task()
+
+    def _apply_hydrated_detail_message(self, task_id: str, item) -> None:
+        if self._hydration_target_is_stale(task_id):
+            return
+        try:
+            self._render_message_detail(item)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _apply_hydrated_detail_unresolved(
+        self, task_id: str, item, is_workspace: bool,
+    ) -> None:
+        if self._hydration_target_is_stale(task_id):
+            return
+        if is_workspace:
+            try:
+                self._render_message_detail(item)
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        try:
+            self.detail.update(
+                "[#f0c45a]This task lives in a project that is not "
+                "currently registered with PollyPM. Add the project from "
+                "the project picker to load its details here.[/#f0c45a]"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        self._clear_rollup_items()
+
+    def _apply_hydrated_detail_error(self, task_id: str, error: str) -> None:
+        if self._hydration_target_is_stale(task_id):
+            return
+        try:
+            self.detail.update(f"[red]Error loading task: {error}[/red]")
+        except Exception:  # noqa: BLE001
+            pass
+        self._clear_rollup_items()
 
     def _update_status(self, *, total: int, shown: int) -> None:
         """Render the bottom counter strip — folds in active filters.

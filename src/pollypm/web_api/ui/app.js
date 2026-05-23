@@ -15,14 +15,21 @@
   "use strict";
 
   const API = "/api/v1";
-  const POLL_DASHBOARD_MS = 15000;
-  const POLL_MESSAGES_MS = 5000;
+  const FALLBACK_POLL_MS = 15000;
+  const SSE_RETRY_MS = 30000;
+  const SSE_FAILURE_LIMIT = 3;
+  const PUSH_REFRESH_DEBOUNCE_MS = 150;
   const MAX_MESSAGES = 50;
 
   const state = {
     surfaces: [],
     selectedSurface: null,
-    messageTimer: null,
+    eventSource: null,
+    fallbackTimer: null,
+    pushRefreshTimer: null,
+    sseFailures: 0,
+    sseRetryTimer: null,
+    lastEventId: null,
   };
 
   // ----- DOM helpers ------------------------------------------------------
@@ -185,7 +192,6 @@
     $("send-button").disabled = false;
     renderSurfaces();
     loadHistory(name);
-    schedulePoll();
   }
 
   // ----- history (center) ------------------------------------------------
@@ -401,13 +407,103 @@
     );
   }
 
-  // ----- timers -----------------------------------------------------------
+  // ----- push refresh / fallback polling ---------------------------------
 
-  function schedulePoll() {
-    if (state.messageTimer) clearInterval(state.messageTimer);
-    state.messageTimer = setInterval(() => {
-      if (state.selectedSurface) loadHistory(state.selectedSurface);
-    }, POLL_MESSAGES_MS);
+  function refreshFromPush() {
+    pollDashboard();
+    loadSurfaces();
+    if (state.selectedSurface) loadHistory(state.selectedSurface);
+  }
+
+  function refreshFromFallback() {
+    pollDashboard();
+    if (state.selectedSurface) loadHistory(state.selectedSurface);
+  }
+
+  function requestPushRefresh() {
+    if (state.pushRefreshTimer !== null) return;
+    state.pushRefreshTimer = setTimeout(() => {
+      state.pushRefreshTimer = null;
+      refreshFromPush();
+    }, PUSH_REFRESH_DEBOUNCE_MS);
+  }
+
+  function startFallbackPolling() {
+    if (state.fallbackTimer !== null) return;
+    refreshFromFallback();
+    state.fallbackTimer = setInterval(refreshFromFallback, FALLBACK_POLL_MS);
+  }
+
+  function stopFallbackPolling() {
+    if (state.fallbackTimer === null) return;
+    clearInterval(state.fallbackTimer);
+    state.fallbackTimer = null;
+  }
+
+  function closeEventStream() {
+    if (!state.eventSource) return;
+    state.eventSource.close();
+    state.eventSource = null;
+  }
+
+  function eventStreamUrl() {
+    if (!state.lastEventId) return API + "/events";
+    return API + "/events?since=" + encodeURIComponent(state.lastEventId);
+  }
+
+  function handleSseEvent(ev) {
+    state.sseFailures = 0;
+    if (ev && ev.lastEventId) {
+      state.lastEventId = ev.lastEventId;
+    } else if (ev && ev.data) {
+      try {
+        const data = JSON.parse(ev.data);
+        if (data && data.ts) state.lastEventId = data.ts;
+      } catch (e) { /* ignore malformed event payloads */ }
+    }
+    requestPushRefresh();
+  }
+
+  function scheduleEventStreamRetry() {
+    if (state.sseRetryTimer !== null) return;
+    state.sseRetryTimer = setTimeout(() => {
+      state.sseRetryTimer = null;
+      startEventStream();
+    }, SSE_RETRY_MS);
+  }
+
+  function startEventStream() {
+    if (!("EventSource" in window)) {
+      startFallbackPolling();
+      return;
+    }
+
+    if (state.sseRetryTimer !== null) {
+      clearTimeout(state.sseRetryTimer);
+      state.sseRetryTimer = null;
+    }
+    closeEventStream();
+
+    const source = new window.EventSource(eventStreamUrl());
+    state.eventSource = source;
+    source.onopen = () => {
+      if (state.eventSource !== source) return;
+      state.sseFailures = 0;
+      stopFallbackPolling();
+      setStatus("ok", "online");
+    };
+    source.addEventListener("audit", handleSseEvent);
+    source.onmessage = handleSseEvent;
+    source.onerror = () => {
+      if (state.eventSource !== source) return;
+      state.sseFailures += 1;
+      setStatus("warn", "SSE reconnecting");
+      if (state.sseFailures >= SSE_FAILURE_LIMIT) {
+        closeEventStream();
+        startFallbackPolling();
+        scheduleEventStreamRetry();
+      }
+    };
   }
 
   // ----- wire-up ----------------------------------------------------------
@@ -431,8 +527,8 @@
     setStatus("warn", "connecting…");
     loadSurfaces();
     pollDashboard();
+    startEventStream();
     setInterval(loadSurfaces, 30000);
-    setInterval(pollDashboard, POLL_DASHBOARD_MS);
   }
 
   // Expose for tests / debugging. ``renderDashboard`` is exported so
@@ -446,6 +542,9 @@
     loadHistory: loadHistory,
     sendMessage: sendMessage,
     pollDashboard: pollDashboard,
+    startEventStream: startEventStream,
+    startFallbackPolling: startFallbackPolling,
+    handleSseEvent: handleSseEvent,
     renderDashboard: renderDashboard,
     state: state,
   };

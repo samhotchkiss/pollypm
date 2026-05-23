@@ -122,6 +122,103 @@ test.describe("surfaces", () => {
     );
   });
 
+  test("SSE audit event refreshes dashboard and selected history", async ({ page }) => {
+    let dashboardRequests = 0;
+    let messageRequests = 0;
+    let eventResponses = 0;
+    let releaseEvent: (() => void) | null = null;
+    const eventGate = new Promise<void>((resolve) => {
+      releaseEvent = resolve;
+    });
+
+    await page.route("**/api/v1/dashboard", (route) => {
+      dashboardRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          rollups: { message_count_24h: dashboardRequests },
+          daemon_status: "up",
+          active_sessions: [],
+          recent_messages: [],
+          projects: [],
+          generated_at: "2026-05-23T00:00:00Z",
+          scoped_fields: [],
+        }),
+      });
+    });
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          sessions: [
+            {
+              session_name: "operator",
+              surface_type: "operator",
+              persona: "polly",
+              project: "pollypm",
+              window: { present: true, pane_dead: false },
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/chat/operator/messages*", (route) => {
+      messageRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          session_name: "operator",
+          surface_type: "operator",
+          transcript_source: "jsonl",
+          messages: [
+            {
+              role: "assistant",
+              actor: "codex",
+              ts: "2026-05-23T00:00:00Z",
+              type: "message",
+              text: "refresh " + messageRequests,
+            },
+          ],
+        }),
+      });
+    });
+    await page.route("**/api/v1/events**", async (route) => {
+      await eventGate;
+      eventResponses += 1;
+      if (eventResponses > 1) {
+        return route.fulfill({
+          status: 200,
+          contentType: "text/event-stream",
+          body: "",
+        });
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body:
+          "event: audit\n" +
+          "id: 2026-05-23T00:00:01Z\n" +
+          'data: {"ts":"2026-05-23T00:00:01Z","event":"message"}\n\n',
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.locator("li[data-session='operator']").click();
+    await expect.poll(() => dashboardRequests).toBeGreaterThanOrEqual(1);
+    await expect.poll(() => messageRequests).toBe(1);
+
+    releaseEvent!();
+
+    await expect.poll(() => dashboardRequests).toBeGreaterThanOrEqual(2);
+    await expect.poll(() => messageRequests).toBeGreaterThanOrEqual(2);
+    await expect(page.locator("#message-list .message-text")).toContainText(
+      "refresh",
+    );
+  });
+
   test("initial center-pane state shows 'Select a surface'", async ({ page }) => {
     await page.goto("/ui/");
     await expect(page.locator("#pane-title")).toHaveText("Select a surface");

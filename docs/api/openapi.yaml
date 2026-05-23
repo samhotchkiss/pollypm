@@ -2002,10 +2002,17 @@ paths:
         rotation-aware file walker so live `.jsonl` + gzipped
         `.gz` archives are searched together.
 
-        Filters apply in cheap→expensive order: substring/regex
-        first against the raw JSONL line, then exact `event_type`
-        match, then `since` cutoff. The response is capped at `limit`
-        matches (default 100, max 1000 per spec §8.3).
+        Filters apply in cheap→expensive order (Codex round-10
+        reorder, PR #2062): JSON decode, then exact `event_type`
+        match, then `ts` parse, then `since` cutoff, then
+        `pattern` substring/regex match on the raw line. The
+        pattern runs LAST so the `safe_regex=true` per-line
+        wall-clock budget is only spent on rows already inside the
+        requested `since` window — this ordering is part of the
+        safety/performance contract for regex mode (paired with the
+        `safe_regex` + `since` requirement and `deadline_seconds`
+        bound). The response is capped at `limit` matches (default
+        100, max 1000 per spec §8.3).
 
         `pattern` is a LITERAL substring by default; pass
         `safe_regex=true` to interpret it as a Python `re.search`

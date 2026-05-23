@@ -319,7 +319,14 @@ def grep_audit_endpoint(
 
     Streams the rotation-aware target files (live ``.jsonl`` + ``.gz``
     archives newest-first) and applies filters in cheap→expensive
-    order: substring/regex first, then ``event_type``, then ``since``.
+    order (Codex round-10 reorder, PR #2062): JSON decode → exact
+    ``event_type`` match → ``ts`` parse → ``since`` cutoff →
+    ``pattern`` substring/regex match on the raw line. The pattern
+    runs LAST so the ``safe_regex=true`` per-line wall-clock budget
+    is only spent on rows already inside the requested ``since``
+    window — this ordering is part of the safety/performance
+    contract for regex mode (paired with the ``safe_regex`` +
+    ``since`` requirement and ``deadline_seconds`` bound below).
     The response is capped at ``limit`` matches; the spec leaves
     cursor pagination to a follow-up PR (always returns
     ``next_cursor=null`` today).

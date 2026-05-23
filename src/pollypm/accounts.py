@@ -503,25 +503,83 @@ def list_cached_account_statuses(config_path: Path) -> list[AccountStatus]:
     return items
 
 
-def add_account_via_login(config_path: Path, provider: ProviderKind) -> tuple[str, str]:
+def add_account_via_login(
+    config_path: Path,
+    provider: ProviderKind,
+    *,
+    email_hint: str | None = None,
+) -> tuple[str, str]:
+    """Add a new provider account by running an interactive login.
+
+    ``email_hint`` lets the caller supply the email up-front. Required for
+    Claude Max plans on CLI 2.x: ``claude auth status --json`` returns
+    ``email: null`` for Max subscribers, so ``_detect_account_email`` falls
+    back to a sentinel like ``claude.ai:max`` that is NOT unique per account.
+    Without a hint, two Max plans would collide and share a Keychain entry.
+    """
     config = load_config(config_path)
     tmux = create_tmux_client()
+
+    if email_hint is not None:
+        normalized_hint = email_hint.strip().lower()
+        if not normalized_hint or "@" not in normalized_hint:
+            raise typer.BadParameter(
+                f"--email must be a valid email address (got {email_hint!r})."
+            )
+        email_hint = normalized_hint
 
     existing = [account for account in config.accounts.values() if account.provider is provider]
     next_index = len(existing) + 1
     agent_homes = GLOBAL_CONFIG_DIR / "agent_homes"
     agent_homes.mkdir(parents=True, exist_ok=True)
     home = agent_homes / f"{provider.value}_{next_index}"
+    # Force a fresh login flow. Without this, the macOS Keychain auto-fills
+    # the new home from the existing logged-in session, so "Add Claude"
+    # would silently create a duplicate of the operator's primary account.
     _run_login_window(
         tmux,
         provider=provider,
         home=home,
         window_label=f"add-{provider.value}-{next_index}",
+        allow_existing_auth_shortcut=False,
+        force_fresh_auth=True,
     )
 
-    email = _detect_account_email(provider, home)
-    if email is None:
-        raise typer.BadParameter(f"Could not detect the logged-in email for the new {provider.value} account.")
+    detected_email = _detect_account_email(provider, home)
+    if detected_email is None:
+        raise typer.BadParameter(
+            f"Could not detect the logged-in email for the new {provider.value} account."
+        )
+
+    # `_detect_account_email` returns a sentinel like "claude.ai:max" for
+    # Claude Max plans on CLI 2.x (which expose loggedIn:true with
+    # email:null). The sentinel is not unique per account — every Max plan
+    # returns the same string — so it cannot be used as the account key.
+    detected_is_sentinel = ":" in detected_email and "@" not in detected_email
+
+    if email_hint is not None:
+        if not detected_is_sentinel and email_hint != detected_email:
+            # Detection returned a real email but the hint disagrees — this is
+            # a mismatch. The hint is only valid as a fallback for Max-plan
+            # sentinels. A disagreement here means either the wrong account
+            # was logged in or the hint is mistyped.
+            raise typer.BadParameter(
+                f"Email hint {email_hint!r} does not match detected logged-in "
+                f"email {detected_email!r}. The hint is for Claude Max plans "
+                f"(where detection returns no email). Remove the --email flag, "
+                f"or re-log in as the intended account."
+            )
+        email = email_hint
+    elif detected_is_sentinel:
+        raise typer.BadParameter(
+            f"Could not derive a unique email for the new {provider.value} "
+            f"account (detected sentinel: {detected_email!r}). Claude Max "
+            f"plans on CLI 2.x do not expose the email via `claude auth "
+            f"status`. Re-run with --email <your_email> to identify this "
+            f"account explicitly."
+        )
+    else:
+        email = detected_email
 
     base_key = _slugify_email(provider, email)
     key = base_key

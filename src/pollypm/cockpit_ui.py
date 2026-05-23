@@ -102,6 +102,9 @@ from pollypm.cockpit_settings_account_reassign import (  # noqa: F401  (re-expor
 from pollypm.cockpit_settings_confirm import (  # noqa: F401  (re-exported)
     _SettingsConfirmModal,
 )
+from pollypm.cockpit_settings_email_prompt import (  # noqa: F401  (re-exported)
+    _SettingsEmailPromptModal,
+)
 from pollypm.cockpit_inbox_rollup_item import (  # noqa: F401  (re-exported)
     _RollupItem,
 )
@@ -5676,8 +5679,43 @@ class PollySettingsPaneApp(App[None]):
         remover = getattr(self.service, "remove_account", None)
         if adder is None or remover is None:
             return
+        if provider is ProviderKind.CLAUDE:
+            # Claude Max plans on CLI 2.x report loggedIn:true with
+            # email:null, so detection alone can't disambiguate two Max
+            # plans. Prompt the operator for the email up-front; pass it
+            # to the service as email_hint.
+            self.push_screen(
+                _SettingsEmailPromptModal(
+                    title="Add Claude account",
+                    prompt=(
+                        "Enter the email for this Claude account. Required "
+                        "for Max plans (CLI 2.x exposes loggedIn but not the "
+                        "email). The login window opens after you confirm."
+                    ),
+                    confirm_label="Add",
+                ),
+                lambda email: self._complete_add_account(
+                    provider, email, adder, remover
+                ),
+            )
+            return
+        self._complete_add_account(provider, None, adder, remover)
+
+    def _complete_add_account(
+        self,
+        provider: ProviderKind,
+        email_hint: str | None,
+        adder,
+        remover,
+    ) -> None:
+        if provider is ProviderKind.CLAUDE and not email_hint:
+            # Operator cancelled the email modal.
+            return
         try:
-            key, email = adder(provider)
+            if email_hint is not None:
+                key, email = adder(provider, email_hint=email_hint)
+            else:
+                key, email = adder(provider)
             self._selected_account_key = key
             self._record_undo(
                 f"add account {key}",

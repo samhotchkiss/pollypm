@@ -230,10 +230,15 @@ def _probe_account_usage(config_path: Path, account: str):
     return probe_account_usage(config_path, account)
 
 
-def _add_account_via_login(config_path: Path, provider_kind: ProviderKind):
+def _add_account_via_login(
+    config_path: Path,
+    provider_kind: ProviderKind,
+    *,
+    email: str | None = None,
+):
     from pollypm.accounts import add_account_via_login
 
-    return add_account_via_login(config_path, provider_kind)
+    return add_account_via_login(config_path, provider_kind, email_hint=email)
 
 
 def _relogin_account(config_path: Path, account: str):
@@ -608,11 +613,21 @@ def worktrees(
 
 def add_account(
     provider: str = typer.Argument(..., help="Provider to add: codex or claude."),
+    email: str | None = typer.Option(
+        None,
+        "--email",
+        help=(
+            "Email to use as the account key. Required for Claude Max plans "
+            "on CLI 2.x which expose loggedIn:true but email:null."
+        ),
+    ),
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
 ) -> None:
     provider_kind = ProviderKind(provider.lower())
-    key, email = _add_account_via_login(config_path, provider_kind)
-    typer.echo(f"Added {email} as {key}")
+    key, resolved_email = _add_account_via_login(
+        config_path, provider_kind, email=email
+    )
+    typer.echo(f"Added {resolved_email} as {key}")
 
 def relogin(
     account: str = typer.Argument(..., help="Account key or email."),

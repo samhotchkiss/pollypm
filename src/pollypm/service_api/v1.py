@@ -610,9 +610,21 @@ class PollyPMService:
         supervisor.ensure_heartbeat_schedule()
         return supervisor.config.pollypm.controller_account
 
-    def add_account(self, provider: ProviderKind) -> tuple[str, str]:
-        """Drive the provider login flow and register a new account."""
-        return add_account_via_login(self.config_path, provider)
+    def add_account(
+        self,
+        provider: ProviderKind,
+        *,
+        email_hint: str | None = None,
+    ) -> tuple[str, str]:
+        """Drive the provider login flow and register a new account.
+
+        ``email_hint`` lets callers (CLI ``--email`` flag, future TUI modal)
+        supply the email up-front. Required for Claude Max plans which return
+        ``email: null`` from ``claude auth status --json``.
+        """
+        return add_account_via_login(
+            self.config_path, provider, email_hint=email_hint
+        )
 
     def relogin_account(self, identifier: str) -> tuple[str, str]:
         """Re-run the login flow for an existing account to refresh credentials."""

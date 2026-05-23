@@ -940,6 +940,7 @@ def _wait_for_login_completion(
     provider: ProviderKind,
     home: Path,
     allow_existing_auth_shortcut: bool = True,
+    force_fresh_auth: bool = False,
     timeout_seconds: int = 300,
     poll_interval: float = 1.0,
 ) -> tuple[bool, str]:
@@ -956,7 +957,7 @@ def _wait_for_login_completion(
 
         if _detect_email_from_pane(provider, last_pane):
             return True, last_pane
-        if allow_existing_auth_shortcut and _detect_account_email(provider, home):
+        if (allow_existing_auth_shortcut or force_fresh_auth) and _detect_account_email(provider, home):
             return True, last_pane
 
         time.sleep(poll_interval)
@@ -1065,6 +1066,7 @@ def _run_login_window(
             provider=provider,
             home=home,
             allow_existing_auth_shortcut=allow_existing_auth_shortcut,
+            force_fresh_auth=force_fresh_auth,
         )
         if current_window is not None:
             tmux.select_window(f"{current_tmux}:{current_window}")
@@ -1104,6 +1106,7 @@ def _run_login_window(
             provider=provider,
             home=home,
             allow_existing_auth_shortcut=allow_existing_auth_shortcut,
+            force_fresh_auth=force_fresh_auth,
         )
         watch_result["completed"] = completed
         watch_result["pane_text"] = pane_text

@@ -114,3 +114,72 @@ def test_run_login_window_cancelled_attach_returns_cleanly_to_caller(tmp_path: P
 
     assert calls["attached"] == "pollypm-login-onboard-codex-1"
     assert calls["killed"] == "pollypm-login-onboard-codex-1"
+
+
+def test_wait_for_login_completion_force_fresh_auth_uses_email_detection(monkeypatch, tmp_path):
+    """With force_fresh_auth=True, detection of an email at the new home
+    counts as completion even though allow_existing_auth_shortcut=False.
+    This unblocks the Claude REPL case where the printf marker only fires
+    after the user exits the REPL — which they shouldn't have to do."""
+    from pollypm.onboarding import _wait_for_login_completion
+    from pollypm.models import ProviderKind
+
+    home = tmp_path / "home"
+    home.mkdir()
+
+    # Pane never contains the marker and never contains an email.
+    class FakeTmux:
+        def capture_pane(self, target, lines):
+            return "Welcome back, Sam!"  # claude REPL post-auth content
+
+    monkeypatch.setattr(
+        "pollypm.onboarding._detect_account_email",
+        lambda provider, h: "backup@example.com",
+    )
+
+    completed, pane = _wait_for_login_completion(
+        FakeTmux(),
+        target="dummy",
+        provider=ProviderKind.CLAUDE,
+        home=home,
+        allow_existing_auth_shortcut=False,
+        force_fresh_auth=True,
+        timeout_seconds=5,
+        poll_interval=0.1,
+    )
+    assert completed is True
+
+
+def test_wait_for_login_completion_without_force_fresh_does_not_short_circuit(monkeypatch, tmp_path):
+    """Without force_fresh_auth, and with allow_existing_auth_shortcut=False,
+    email detection alone does NOT trigger completion — protects against
+    Keychain-inherited sessions being mistaken for fresh login."""
+    from pollypm.onboarding import _wait_for_login_completion
+    from pollypm.models import ProviderKind
+
+    home = tmp_path / "home"
+    home.mkdir()
+
+    class FakeTmux:
+        def capture_pane(self, target, lines):
+            return "Welcome"
+
+    monkeypatch.setattr(
+        "pollypm.onboarding._detect_account_email",
+        lambda provider, h: "leaked@example.com",
+    )
+
+    monkeypatch.setattr("pollypm.onboarding.time.sleep", lambda seconds: None)
+
+    # Should time out (return False) — neither marker nor force_fresh signal.
+    completed, _pane = _wait_for_login_completion(
+        FakeTmux(),
+        target="dummy",
+        provider=ProviderKind.CLAUDE,
+        home=home,
+        allow_existing_auth_shortcut=False,
+        force_fresh_auth=False,
+        timeout_seconds=0.01,
+        poll_interval=0,
+    )
+    assert completed is False

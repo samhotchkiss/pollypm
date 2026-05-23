@@ -1430,16 +1430,20 @@ def test_pause_is_idempotent(
     assert "already" in msg
 
 
-def test_pause_response_labels_marker_informational(
+def test_pause_response_labels_marker_partial_enforcement(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
 ):
-    """PR #2061 P0 #3: pause must NOT imply daemon-side enforcement.
+    """PR #2081: pause response must spell out PARTIAL enforcement.
 
-    The supervisor / recovery / dispatch loops don't consume the
-    pause marker yet. The response body must surface that fact so an
-    operator knows they have *tagged* the session, not quiesced the
-    daemon. Until the loops learn to consult the marker, this is the
-    contract we keep — narrow the API rather than mislead.
+    PR ``feat/sessions-pause-marker-wire-loops-1-3`` wired the marker
+    into the recovery loops (``no_session_spawn``,
+    ``Supervisor.maybe_recover_session``), but the remaining dispatch /
+    cockpit / heartbeat loops still don't consume it (tracked under
+    #2068). The response body must surface BOTH sides — which loops
+    honor the marker and which don't — so an operator knows exactly
+    what they have quiesced. "Informational only" used to be the
+    contract; now the correct word is "honored by recovery loops",
+    plus a NOT-yet caveat for the rest.
     """
     patch_heartbeat({})
     patch_tmux_windows(["operator"])
@@ -1449,14 +1453,22 @@ def test_pause_response_labels_marker_informational(
     assert response.status_code == 200, response.text
     body = response.json()
     msg = (body.get("message") or "").lower()
-    assert "informational" in msg, msg
+    # Recovery side: must positively call out that the loops HONOR the
+    # marker (else operators still think it's a pure tag).
+    assert "honored" in msg or "honor" in msg, msg
+    assert "recovery" in msg, msg
+    # Remaining-gaps side: must keep flagging what DOES NOT yet
+    # consume the marker so operators don't over-trust pause.
     assert "do not" in msg or "does not" in msg or "not yet" in msg, msg
+    # #2068 is the follow-up ticket — must be referenced so the gap is
+    # discoverable from the response without grepping docs.
+    assert "#2068" in msg or "2068" in msg, msg
 
 
-def test_resume_response_labels_marker_informational(
+def test_resume_response_labels_marker_partial_enforcement(
     client, auth_headers, patch_heartbeat, patch_tmux_windows,
 ):
-    """Same P0 #3 contract on the resume side."""
+    """Same PR #2081 contract on the resume side."""
     patch_heartbeat({})
     patch_tmux_windows(["operator"])
     # Pause then resume to hit the "clear" branch.
@@ -1466,7 +1478,10 @@ def test_resume_response_labels_marker_informational(
     )
     assert response.status_code == 200, response.text
     msg = (response.json().get("message") or "").lower()
-    assert "informational" in msg, msg
+    assert "honored" in msg or "honor" in msg, msg
+    assert "recovery" in msg, msg
+    assert "do not" in msg or "does not" in msg or "not yet" in msg, msg
+    assert "#2068" in msg or "2068" in msg, msg
 
 
 def test_resume_happy_path(

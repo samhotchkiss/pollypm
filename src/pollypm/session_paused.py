@@ -1,14 +1,37 @@
-"""Shared pause-marker reader for ``<base_dir>/paused-sessions.json``.
+"""Shared pause-marker reader/writer for ``<base_dir>/paused-sessions.json``.
 
-The POST ``/api/v1/sessions/{name}/pause`` route writes the marker file
-(see :mod:`pollypm.web_api.routes.sessions_admin`); this module is the
-single read-side helper that the supervisor / recovery / dispatch loops
-consult so the marker is honoured uniformly. Until this module landed
-the marker was informational only — wiring it into every loop is tracked
-under issue #2068.
+This module owns the on-disk pause-marker contract end-to-end:
 
-The on-disk shape (a JSON list of session names) is owned by
-``sessions_admin`` — this module only reads. The reader is best-effort:
+* The filename constant (``_PAUSE_MARKER_FILENAME``) and the
+  config-derived path helper (``_pause_marker_path``).
+* The read helpers (``load_paused_names`` / ``is_paused``) consumed by
+  the supervisor / recovery loops AND the sessions-admin GET surface.
+* The write helpers (``save_paused_names`` / ``pause_marker_lock``)
+  consumed by ``POST /api/v1/sessions/{name}/pause`` and ``resume``.
+
+Centralising both sides here is deliberate: the route module used to
+keep its own ``_PAUSE_MARKER_FILENAME`` / ``_pause_marker_path`` copies
+and the recovery loops keyed off a separate constant, so a rename or a
+shape change risked silent drift between the writer and every reader
+(Codex PR #2081 round 1 blocker 2 — "two owners of the marker recreate
+exactly the drift risk the shared helper is supposed to remove").
+
+Recovery wiring status (#2068)
+------------------------------
+
+PR ``feat/sessions-pause-marker-wire-loops-1-3`` wires the marker into
+loops 1–3:
+
+* :func:`pollypm.recovery.no_session_spawn.auto_recover_no_session_alerts`
+  (loop 1) and :meth:`pollypm.supervisor.Supervisor.maybe_recover_session`
+  (loops 2 + 3) BOTH consult ``is_paused`` / ``skip_if_paused`` and
+  yield with an audit event when the marker is set.
+
+Remaining dispatch / cockpit / heartbeat loops still treat the marker
+as informational and are tracked as the next slice under #2068.
+
+The on-disk shape is a JSON list of session names sitting next to
+``state.db`` in the project's ``base_dir``. The reader is best-effort:
 a missing file, malformed JSON, or unreadable bytes collapse to "no
 sessions paused" so a paused marker on a different project / partial
 write can never crash the loops it gates.
@@ -18,12 +41,19 @@ from __future__ import annotations
 
 import json
 import logging
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
 
+# Filename of the project-scoped pause marker. One JSON file per
+# project; the document is a list of paused session names. Sitting in
+# the project's ``base_dir`` keeps it next to ``state.db`` /
+# ``audit.jsonl`` so storage hygiene already covers it. Owned here
+# (the shared module) — sessions_admin imports rather than redeclaring
+# (Codex PR #2081 round 1 blocker 2).
 _PAUSE_MARKER_FILENAME = "paused-sessions.json"
 
 
@@ -46,9 +76,6 @@ def _pause_marker_path(config: Any) -> Path | None:
 def load_paused_names(config: Any) -> set[str]:
     """Read the pause marker; empty set on missing / malformed file.
 
-    Mirrors the reader in :mod:`pollypm.web_api.routes.sessions_admin`
-    (which was the original home of this helper before issue #2068
-    pulled it out so the loops could share a single source of truth).
     Best-effort: filesystem / JSON errors degrade to an empty set with
     a debug log line — the goal is to never break a recovery loop on a
     flaky read.
@@ -71,6 +98,67 @@ def is_paused(config: Any, session_name: str) -> bool:
     if not session_name:
         return False
     return session_name in load_paused_names(config)
+
+
+def save_paused_names(config: Any, names: set[str] | list[str]) -> None:
+    """Atomically write the pause marker. Raises ``OSError`` on failure.
+
+    Used by ``POST /api/v1/sessions/{name}/pause`` and ``resume``. The
+    write is a tmp+rename so concurrent readers always see either the
+    pre- or post-write document, never a partial JSON blob. Raises
+    ``RuntimeError`` if the supplied config has no ``project.base_dir``
+    — the route layer translates that to a 503 ``daemon_unavailable``
+    response.
+
+    ``names`` may be any iterable of strings; the on-disk shape is a
+    sorted JSON list (stable for diff'ing across writes).
+    """
+    path = _pause_marker_path(config)
+    if path is None:
+        raise RuntimeError(
+            "no base_dir on config; pause marker has nowhere to live",
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    payload = sorted(set(names))
+    tmp.write_text(json.dumps(payload, indent=2) + "\n")
+    tmp.replace(path)
+
+
+@contextmanager
+def pause_marker_lock(config: Any):
+    """Serialise pause/resume read-modify-write across concurrent callers.
+
+    Takes an ``fcntl.flock`` on a sibling ``.lock`` file in the same
+    directory as the marker. Best-effort on platforms without
+    ``fcntl`` (Windows): degrades to a no-op lock since the marker
+    write is still atomic via tmp+rename — only the read-modify-write
+    window is unprotected.
+
+    Yields the marker ``Path`` (or ``None`` when there is no base_dir
+    on the config — caller will hit the same "no path" failure from
+    :func:`save_paused_names` anyway).
+    """
+    path = _pause_marker_path(config)
+    if path is None:
+        yield None
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = path.with_suffix(path.suffix + ".lock")
+    try:
+        import fcntl  # type: ignore[import-not-found]
+    except ImportError:
+        yield path
+        return
+    fh = open(lock_path, "a+")  # noqa: SIM115 — closed in finally
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield path
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 # Audit-event constants. The supervisor / recovery loops emit
@@ -173,5 +261,7 @@ __all__ = [
     "PAUSE_SKIP_EVENT_TYPE",
     "is_paused",
     "load_paused_names",
+    "pause_marker_lock",
+    "save_paused_names",
     "skip_if_paused",
 ]

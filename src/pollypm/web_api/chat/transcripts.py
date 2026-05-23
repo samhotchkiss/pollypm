@@ -290,6 +290,31 @@ def is_archive_stale(
     return (current - mtime) > threshold_seconds
 
 
+# mtime-keyed cache for ``parse_events_jsonl`` (issue #2069).
+#
+# The history endpoint polls every ~5s and the parse body forward-
+# readline's the full archive each call (operator transcripts hit
+# ~2,800 lines quickly). When the file hasn't been touched since the
+# last parse we can return the cached envelopes instead of re-parsing.
+#
+# Cache key is the ``Path`` instance the caller passed (resolution
+# left to the caller — the chat surfaces always pass the same Path).
+# Cache value is ``(mtime, envelopes, actor_fallback)`` so a caller
+# changing ``actor_fallback`` (different surface persona on the same
+# archive) doesn't get a stale fallback baked into the envelopes.
+#
+# Insertion-ordered dict + ``next(iter(...))`` gives us LRU-by-
+# insertion eviction without an extra dependency. The cap (100) is
+# generous given each entry is one events.jsonl per chat surface.
+_PARSE_CACHE: dict[Path, tuple[float, list[MessageEnvelope], str]] = {}
+_PARSE_CACHE_MAX = 100
+
+
+def _parse_cache_clear() -> None:
+    """Drop every cached parse result. Test-only helper."""
+    _PARSE_CACHE.clear()
+
+
 def parse_events_jsonl(
     events_path: Path,
     *,
@@ -317,7 +342,16 @@ def parse_events_jsonl(
     callers can map an unreadable archive to a typed 503
     ``archive_unreadable`` instead of silently returning ``200`` with
     an empty list (round-5 blocker 2). The chat-messages route catches
-    the propagated ``OSError`` and translates it.
+    the propagated ``OSError`` and translates it. ``strict=True``
+    callers also skip the mtime cache so validation paths always see a
+    fresh parse.
+
+    Caching (issue #2069): for ``strict=False`` callers we memoize on
+    ``(events_path, mtime, actor_fallback)``. The history endpoint
+    polls every few seconds and the underlying read forward-readlines
+    the full archive each call; with operator transcripts running into
+    the thousands of lines this dominates poll latency. When the file
+    mtime is unchanged the cached envelopes are returned directly.
 
     NOTE: provider ``thinking`` blocks are not surfaced — the
     transcript ingestor does not currently preserve them. Tracking the
@@ -326,6 +360,31 @@ def parse_events_jsonl(
     envelopes: list[MessageEnvelope] = []
     if not events_path.exists():
         return envelopes
+    # Cache lookup happens BEFORE the heavy parse. We stat once up
+    # front; ``strict=True`` callers skip the cache so validation paths
+    # always see a fresh parse + propagated OSError.
+    cache_eligible = not strict
+    cached_mtime: float | None = None
+    if cache_eligible:
+        try:
+            cached_mtime = events_path.stat().st_mtime
+        except OSError:
+            # Stat failure mirrors the existing fail-soft posture —
+            # fall through to the normal parse path so any OSError is
+            # logged with the same context as before.
+            cached_mtime = None
+        if cached_mtime is not None:
+            cached = _PARSE_CACHE.get(events_path)
+            if (
+                cached is not None
+                and cached[0] == cached_mtime
+                and cached[2] == actor_fallback
+            ):
+                # Defensive copy: callers downstream sort/filter the
+                # list in-place (see _apply_filters_and_paginate's
+                # ``indexed.sort``), so handing them the cached list
+                # directly would corrupt the cache on the next hit.
+                return list(cached[1])
     source_key = hashlib.blake2b(
         str(events_path).encode("utf-8"), digest_size=4,
     ).hexdigest()
@@ -366,6 +425,17 @@ def parse_events_jsonl(
             events_path, exc,
         )
         return envelopes
+    if cache_eligible and cached_mtime is not None:
+        # Evict oldest insertion before storing the new entry. Python
+        # dicts preserve insertion order so ``next(iter(...))`` gives
+        # us the oldest key without an auxiliary structure. Pop the
+        # current key first (if present) so re-stores refresh ordering.
+        _PARSE_CACHE.pop(events_path, None)
+        if len(_PARSE_CACHE) >= _PARSE_CACHE_MAX:
+            _PARSE_CACHE.pop(next(iter(_PARSE_CACHE)))
+        # Store a fresh list so test/in-place mutations on the
+        # returned copy don't bleed back into the cache.
+        _PARSE_CACHE[events_path] = (cached_mtime, list(envelopes), actor_fallback)
     return envelopes
 
 

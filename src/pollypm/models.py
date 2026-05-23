@@ -143,6 +143,7 @@ class PollyPMSettings:
     open_permissions_by_default: bool = True
     failover_enabled: bool = False
     failover_accounts: list[str] = field(default_factory=list)
+    failover_usage_threshold_pct: int = 85
     heartbeat_backend: str = "local"
     scheduler_backend: str = "inline"
     lease_timeout_minutes: int = 30

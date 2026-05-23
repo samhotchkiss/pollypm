@@ -319,6 +319,28 @@ Probes run:
 - On the configured `refresh_schedule`
 - After any launch failure
 
+### Proactive Controller Failover
+
+The account usage refresh sweep also protects the configured primary controller
+account before it is fully exhausted. `[pollypm].failover_usage_threshold_pct`
+defaults to `85`. When `failover_enabled = true` and the primary controller
+account's cached `used_pct` is at or above that threshold, PollyPM switches the
+operator session to the first configured `failover_accounts` entry whose
+`used_pct` is still below the threshold. The configured
+`controller_account` remains the primary source of truth; the soft swap is held
+as a session-runtime effective-account override so the next sweep can switch
+back to the primary when its usage drops below the threshold after reset.
+
+Successful soft swaps emit an `account.failover.proactive` audit event and
+raise a low-severity `proactive_failover_active` cockpit alert while the
+operator is running on the failover account. Returning to the primary clears
+that active alert.
+
+If every failover account is also at or above the threshold, the sweep raises a
+`proactive_failover_no_capacity` alert and emits an
+`account.failover.proactive` event with `reason =
+"no_failover_account_below_threshold"` instead of failing silently.
+
 ### Failure Classification
 
 When an account fails, PollyPM classifies the failure to determine the correct response.

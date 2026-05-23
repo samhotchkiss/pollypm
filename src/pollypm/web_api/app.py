@@ -450,10 +450,28 @@ def create_app(
 def _attach_security_scheme(app: FastAPI) -> None:
     """Inject the OpenAPI ``securitySchemes`` block.
 
-    FastAPI's auto-generated OpenAPI doesn't add bearer auth unless
-    we wire it through ``OAuth2PasswordBearer`` or override
+    FastAPI's auto-generated OpenAPI doesn't add any auth schemes
+    unless we wire them through ``OAuth2PasswordBearer`` or override
     ``openapi_schema``. The simplest path is to customize the
     schema once after first generation.
+
+    The runtime accepts three credential modes (see
+    ``docs/web-api-spec.md`` §3 and the static
+    ``docs/api/openapi.yaml``):
+
+    1. ``bearerAuth`` — ``Authorization: Bearer <token>`` header,
+       token sourced from ``~/.pollypm/api-token``.
+    2. ``cookieAuth`` — ``pollypm-session`` cookie minted by
+       ``GET /ui/`` for loopback peers, verified tailnet peers, or
+       callers presenting a valid bearer header. Same on-disk token,
+       constant-time comparison.
+    3. Credential-free tailnet-peer mode (empty ``{}`` entry in the
+       security list) — only honoured when the app was constructed
+       with ``tailnet_trust_enabled=True``.
+
+    The runtime ``/openapi.json`` must mirror that three-mode story
+    so generated clients reading the live endpoint see the same auth
+    contract as readers of the static YAML (#2065).
     """
     base_openapi = app.openapi
 
@@ -462,19 +480,49 @@ def _attach_security_scheme(app: FastAPI) -> None:
             return app.openapi_schema
         schema = base_openapi()
         schema.setdefault("components", {})
-        schema["components"].setdefault("securitySchemes", {})
-        schema["components"]["securitySchemes"]["bearerAuth"] = {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "opaque",
-            "description": (
-                "Token from `~/.pollypm/api-token`. Generated on first "
-                "`pm serve` startup; rotated via `pm api regen-token`."
-            ),
+        # Replace any auto-detected scheme block wholesale: we want the
+        # runtime doc to advertise exactly the same scheme set as the
+        # static contract.
+        schema["components"]["securitySchemes"] = {
+            "bearerAuth": {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "opaque",
+                "description": (
+                    "Bearer token from `~/.pollypm/api-token`. "
+                    "Generated on first `pm serve` startup; rotated "
+                    "via `pm api regen-token`. Always accepted. "
+                    "See `docs/web-api-spec.md` §3."
+                ),
+            },
+            "cookieAuth": {
+                "type": "apiKey",
+                "in": "cookie",
+                "name": "pollypm-session",
+                "description": (
+                    "Session cookie minted by `GET /ui/` for loopback "
+                    "peers, verified tailnet peers (when "
+                    "`tailnet_trust_enabled=True`), or callers "
+                    "presenting a valid bearer header. The cookie "
+                    "value is the same on-disk token as `bearerAuth`; "
+                    "comparison is constant-time. LAN clients receive "
+                    "HTML without `Set-Cookie` and 401 on the first "
+                    "API call. See `docs/web-api-spec.md` §3."
+                ),
+            },
         }
         # Default security applies to every operation; ``/health``
         # opts out via the route definition (security: []).
-        schema["security"] = [{"bearerAuth": []}]
+        # The empty ``{}`` entry models the credential-free
+        # tailnet-peer mode (OpenAPI's canonical way of saying
+        # "no credentials required"); it does NOT mean every caller
+        # is anonymous — the runtime still gates on
+        # ``tailnet_trust_enabled`` + a verified peer IP.
+        schema["security"] = [
+            {"bearerAuth": []},
+            {"cookieAuth": []},
+            {},
+        ]
         # Drop the security requirement from ``/health`` so the
         # generated doc matches the runtime behaviour.
         for path, ops in schema.get("paths", {}).items():

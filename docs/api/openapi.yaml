@@ -391,6 +391,32 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /projects/{key}/unpause:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Projects]
+      operationId: unpauseProject
+      summary: Unpause a project (set tracked=true)
+      description: |
+        Alias for `POST /projects/{key}/resume`. Flips
+        `KnownProject.tracked=true` and re-renders the global TOML.
+        Idempotent — a second call against an already-tracked project
+        returns 200 with the same snapshot and skips the disk write.
+      responses:
+        "200":
+          description: Project unpaused (or already was).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Project"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /projects/{key}/archive:
     parameters:
       - $ref: "#/components/parameters/ProjectKey"

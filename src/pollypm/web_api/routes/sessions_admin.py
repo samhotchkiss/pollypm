@@ -123,6 +123,9 @@ from pollypm.session_health import (
 from pollypm.session_health import (
     storage_session_name as _shared_storage_session_name,
 )
+from pollypm.session_paused import (
+    load_paused_names as _load_paused_names,
+)
 from pollypm.web_api.errors import APIError, service_unavailable
 from pollypm.web_api.models import ActionResult
 from pollypm.web_api.routes._deps import ConfigDep
@@ -316,21 +319,6 @@ def _pause_marker_path(config: Any) -> Path | None:
     if base_dir is None:
         return None
     return Path(base_dir) / _PAUSE_MARKER_FILENAME
-
-
-def _load_paused_names(config: Any) -> set[str]:
-    """Read the pause marker; empty set on missing / malformed file."""
-    path = _pause_marker_path(config)
-    if path is None or not path.exists():
-        return set()
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, ValueError):
-        logger.debug("pause marker unreadable: %s", path, exc_info=True)
-        return set()
-    if not isinstance(data, list):
-        return set()
-    return {str(name) for name in data if isinstance(name, str)}
 
 
 def _write_paused_names(config: Any, names: set[str]) -> None:

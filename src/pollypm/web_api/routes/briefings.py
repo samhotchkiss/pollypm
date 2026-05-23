@@ -542,13 +542,44 @@ def regenerate_briefing_endpoint(
     # the executor's thread, so cleanup happens whether the request
     # 504'd or returned normally. Wrapped in its own try so a bookkeeping
     # exception can never propagate into the worker's result.
-    def _clear_inflight(fut: concurrent.futures.Future[Any]) -> None:
+    #
+    # We also observe ``future.exception()`` / completion here so that
+    # late terminal state — after the HTTP client already saw 504 — is
+    # logged. Without this, a provider that fails minutes after the 504
+    # is operationally invisible (Codex round-5 on #2059). We log the
+    # type/scope + repr(exc) only; the adapter is responsible for
+    # ensuring its exception message does not leak secrets.
+    inflight_key_log = inflight_key
+
+    def _on_regenerate_done(fut: concurrent.futures.Future[Any]) -> None:
         with inflight_lock:
             current = inflight.get(inflight_key)
             if current is fut:
                 inflight.pop(inflight_key, None)
+        try:
+            if fut.cancelled():
+                logger.info(
+                    "briefing regenerate %r cancelled", inflight_key_log,
+                )
+                return
+            exc = fut.exception()
+        except concurrent.futures.CancelledError:
+            logger.info(
+                "briefing regenerate %r cancelled", inflight_key_log,
+            )
+            return
+        if exc is not None:
+            logger.warning(
+                "briefing regenerate %r failed after worker completed: %r",
+                inflight_key_log,
+                exc,
+            )
+        else:
+            logger.info(
+                "briefing regenerate %r completed", inflight_key_log,
+            )
 
-    future.add_done_callback(_clear_inflight)
+    future.add_done_callback(_on_regenerate_done)
 
     try:
         return future.result(timeout=timeout_seconds)

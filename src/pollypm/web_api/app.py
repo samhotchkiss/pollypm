@@ -208,12 +208,15 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
 
     Shutdown cancels not-yet-started futures for each executor, then
     calls ``executor.shutdown(wait=False, cancel_futures=True)`` so
-    the teardown doesn't block on a wedged worker. We then wait up to
-    the configured grace for cooperative completion and evict any
-    survivors from ``concurrent.futures._threads_queues`` so the
-    stdlib's ``_python_exit`` atexit hook can't join them and hold
-    the interpreter open (the v1 RC tradeoff: we can't kill the
-    thread, but we can refuse to block on it).
+    the teardown doesn't block on a wedged worker (a running
+    ``ThreadPoolExecutor`` worker cannot be cancelled — ``wait=True``
+    would hang ``pm serve`` shutdown on a wedged provider; Codex
+    round-5 on #2059). We then wait up to the configured grace for
+    cooperative completion and evict any survivors from
+    ``concurrent.futures._threads_queues`` so the stdlib's
+    ``_python_exit`` atexit hook can't join them and hold the
+    interpreter open (the v1 RC tradeoff: we can't kill the thread,
+    but we can refuse to block on it).
     """
     # Daemon-thread executor so a wedged worker doesn't keep the
     # interpreter alive past app shutdown. ``executor.shutdown(wait=
@@ -286,10 +289,15 @@ def _shutdown_daemon_executor(
 
     1. ``shutdown(wait=False, cancel_futures=True)`` drops queued
        futures and releases lifespan immediately. A wedged in-flight
-       worker can't block FastAPI teardown — the v1 RC tradeoff
-       documented in routes/doctor.py:_await_with_budget and mirrored
-       for briefings on #2059.
+       worker can't block FastAPI teardown — a running
+       ``ThreadPoolExecutor`` worker cannot be cancelled, so
+       ``wait=True`` would block teardown forever on a wedged provider
+       (Codex round-5 on #2059, mirroring the doctor pattern from
+       #2058).
     2. Best-effort grace wait so cooperative workers can finish.
+       ``_threads`` is a private but stable attribute on
+       ``ThreadPoolExecutor`` (CPython 3.9+); used here purely as a
+       liveness probe so we don't ``join`` (which would block).
     3. Survivors are popped from
        ``concurrent.futures._threads_queues`` so the stdlib's
        ``_python_exit`` atexit hook can't join them and keep

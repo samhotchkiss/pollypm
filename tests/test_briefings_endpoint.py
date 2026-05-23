@@ -21,10 +21,12 @@ touch pg, git, or any LLM call.
 
 from __future__ import annotations
 
+import threading
 import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
@@ -885,3 +887,190 @@ def test_briefings_inflight_isolated_per_app(
         # Poking app_a's in-flight map must not leak into app_b.
         app_a.state.briefing_inflight[("morning", "")] = object()  # type: ignore[assignment]
         assert ("morning", "") not in app_b.state.briefing_inflight
+
+
+# ---------------------------------------------------------------------------
+# Codex round-5 regressions (refs #2059)
+# ---------------------------------------------------------------------------
+
+
+def test_briefings_app_teardown_bounded_with_running_worker(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """App teardown returns promptly even with a wedged regenerate worker.
+
+    Codex round-5 P0: previously ``_lifespan`` called
+    ``executor.shutdown(wait=True, cancel_futures=True)`` — but
+    ``cancel_futures=True`` only cancels QUEUED work; a worker already
+    inside ``adapter.regenerate`` cannot be cancelled, so teardown
+    would hang until the slow provider returned. The bounded-shutdown
+    fix caps the wait at ``_BRIEFING_REGEN_SHUTDOWN_DEADLINE_S`` (5 s)
+    and logs a warning if any worker is still alive.
+    """
+    from pollypm.web_api.routes import briefings as br
+
+    # Signal so we know the worker actually started before we exit
+    # the lifespan context (otherwise the test is just measuring queue
+    # cancellation, not the running-worker path).
+    worker_started = threading.Event()
+    release_worker = threading.Event()
+
+    def _available(_config) -> bool:
+        return True
+
+    def _slow_regenerate(_config, _body: RegenerateRequest) -> BriefingResponse:
+        worker_started.set()
+        # Block well past the bounded-shutdown deadline so we exercise
+        # the "leak + warn" branch, not the "drained in time" branch.
+        release_worker.wait(timeout=60.0)
+        return _make_response(
+            type_name="morning",
+            markdown="released after deadline",
+        )
+
+    monkeypatch.setitem(
+        br._REGISTRY,
+        "morning",
+        _BriefingAdapter(
+            name="morning",
+            description="bounded-shutdown test",
+            available=_available,
+            render_last=lambda _c: None,
+            regenerate=_slow_regenerate,
+        ),
+    )
+
+    app = create_app(config=api_config, token_path=token_path)
+
+    teardown_start: list[float] = []
+    teardown_end: list[float] = []
+
+    try:
+        with caplog.at_level("WARNING", logger="pollypm.web_api.app"):
+            with TestClient(app) as client:
+                response = client.post(
+                    "/api/v1/briefings/morning/regenerate?timeout_seconds=1",
+                    json={},
+                    headers=auth_headers,
+                )
+                assert response.status_code == 504, response.json()
+
+                # Confirm the worker actually got scheduled and is running
+                # — otherwise we'd be testing the queue-cancel path.
+                assert worker_started.wait(timeout=5.0), (
+                    "slow regenerate worker never started"
+                )
+
+                teardown_start.append(time.monotonic())
+            # TestClient context exit triggered lifespan shutdown.
+            teardown_end.append(time.monotonic())
+
+        # The whole teardown must return within ~10 s — bounded by the
+        # 5 s shutdown deadline plus headroom. Before this fix it would
+        # wait for the full release_worker.wait timeout (60 s).
+        assert teardown_end and teardown_start
+        elapsed = teardown_end[0] - teardown_start[0]
+        assert elapsed < 10.0, (
+            f"app teardown took {elapsed:.2f}s with a running worker; "
+            "expected bounded shutdown to return within ~5s"
+        )
+
+        # And the leak warning should have been logged.
+        leak_logs = [
+            r for r in caplog.records
+            if "still running at shutdown" in r.getMessage()
+        ]
+        assert leak_logs, (
+            "expected lifespan to log a warning about leaked worker(s); "
+            f"got: {[r.getMessage() for r in caplog.records]}"
+        )
+    finally:
+        # Always release the worker so the leaked thread can exit and
+        # not hang test-process teardown.
+        release_worker.set()
+
+
+def test_briefings_late_failure_logged(
+    api_config: PollyPMConfig,
+    token_path: Path,
+    token: str,  # noqa: ARG001 — fixture forces token write
+    auth_headers: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Late worker failure after a 504 is observable via the logger.
+
+    Codex round-5 P1: the done callback only popped the in-flight
+    entry; it never inspected ``future.exception()``. If a provider
+    raised after the client already saw 504, operators had no
+    diagnostic. The wired-up ``_on_regenerate_done`` now logs a
+    warning with the scope key + repr of the exception.
+    """
+    from pollypm.web_api.routes import briefings as br
+
+    worker_done = threading.Event()
+
+    def _available(_config) -> bool:
+        return True
+
+    def _failing_regenerate(_config, _body: RegenerateRequest) -> BriefingResponse:
+        try:
+            # Long enough that the HTTP request 504s first.
+            time.sleep(1.5)
+            raise RuntimeError("herald exploded after timeout")
+        finally:
+            worker_done.set()
+
+    monkeypatch.setitem(
+        br._REGISTRY,
+        "morning",
+        _BriefingAdapter(
+            name="morning",
+            description="late-failure test",
+            available=_available,
+            render_last=lambda _c: None,
+            regenerate=_failing_regenerate,
+        ),
+    )
+
+    app = create_app(config=api_config, token_path=token_path)
+
+    with caplog.at_level("WARNING", logger="pollypm.web_api.routes.briefings"):
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/v1/briefings/morning/regenerate?timeout_seconds=1",
+                json={},
+                headers=auth_headers,
+            )
+            assert response.status_code == 504, response.json()
+
+            # Wait for the worker to actually finish (with its raise),
+            # plus a small grace so the done-callback runs on the
+            # executor thread.
+            assert worker_done.wait(timeout=5.0), (
+                "failing regenerate worker never completed"
+            )
+            time.sleep(0.2)
+
+        # Done-callback should have observed the exception and logged it.
+        late_logs = [
+            r for r in caplog.records
+            if "failed after worker completed" in r.getMessage()
+        ]
+        assert late_logs, (
+            "expected late-failure log line; got: "
+            f"{[r.getMessage() for r in caplog.records]}"
+        )
+        # And the scope identifier should appear in the message.
+        assert any(
+            "morning" in r.getMessage() and "herald exploded" in r.getMessage()
+            for r in late_logs
+        ), (
+            f"expected scope + exception repr in log; got: "
+            f"{[r.getMessage() for r in late_logs]}"
+        )

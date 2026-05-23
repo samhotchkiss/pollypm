@@ -731,12 +731,38 @@ work could serialize POSTs per-session via a daemon-side lock.
 
 ### 5.12 Codex sessions (non-Claude)
 
-PollyPM also drives Codex (per memory: the `codex-fixer` tmux
-session). Codex doesn't write the Claude Code JSONL shape, so the
-server detects Codex via `SessionConfig.provider` and falls back to
-`tmux capture-pane` automatically. Envelope `type` is always `text`
-(Codex's tool calls aren't structured the way Claude Code's are). If
-you need structured tool data, use a Claude session.
+PollyPM also drives Codex (e.g. the `codex-fixer` tmux session).
+Codex doesn't write the Claude Code JSONL shape, but the server does
+**not** treat it as a provider-keyed capture-pane special case.
+Instead, Codex transcripts are normalized natively by the same
+ingestor used for Claude:
+
+- `TranscriptIngestor` (`src/pollypm/transcript_ingest.py`) dispatches
+  per-account by `account.provider`: Claude lines go through
+  `_normalize_claude_line`, Codex lines go through
+  `_normalize_codex_line`. Both paths emit the same normalized
+  `events.jsonl` envelope shape that `GET /messages` reads.
+- The route's source selection in
+  `chat_messages.py::_load_envelopes` is **provider-agnostic**. It
+  prefers the JSONL archive under `source=auto` and only falls
+  through to `tmux capture-pane` when the archive is stale or
+  unreadable (the §5.7 staleness rule). There is no `provider ==
+  "codex"` short-circuit.
+- The capture-pane fallback is therefore a freshness safety net for
+  **any** provider whose ingestor lags the live pane — not a
+  provider-specific code path.
+
+Codex envelope `type` is currently always `text` because the Codex
+`_normalize_codex_line` path emits text-shaped events for chat-visible
+entries (its tool calls aren't structured the way Claude Code's are).
+If you need structured tool envelopes today, use a Claude session.
+This is an ingestor-shape limitation, not a transport difference.
+
+> Historical note: earlier drafts of this spec described an automatic
+> `provider == "codex" → tmux capture-pane` fallback. That was never
+> implemented — the native Codex JSONL normalizer is the primary path,
+> and capture-pane remains the staleness-only fallback documented in
+> §5.7. Reconciled in [#2053](https://github.com/samhotchkiss/pollypm/issues/2053).
 
 ---
 

@@ -1665,3 +1665,48 @@ def test_regenerate_request_schema_forbids_extras() -> None:
         "``model_config = {'extra': 'forbid'}`` on the Pydantic "
         "model so the static YAML and the request validator agree."
     )
+
+
+def test_regenerate_request_forbids_extras_runtime() -> None:
+    """Direct ``model_validate`` rejects unknown keys.
+
+    Codex round-11/12 on #2059 reported the HTTP-level
+    ``test_regenerate_rejects_unknown_field`` test as insufficient —
+    they wanted a direct ``RegenerateRequest.model_validate({...})``
+    regression that does not depend on FastAPI's request pipeline. The
+    HTTP envelope test stays (it covers the full 422 surface); this
+    pins the underlying Pydantic config so a future drift to
+    ``extra='ignore'`` or ``extra='allow'`` fails here even if FastAPI
+    swallows the violation upstream.
+    """
+    from pydantic import ValidationError
+
+    with pytest.raises(ValidationError) as excinfo:
+        RegenerateRequest.model_validate({"projectt": "myproj"})
+    # ``extra_forbidden`` is the Pydantic v2 error type — pin it so a
+    # regression to ``extra='allow'`` (which would emit a different
+    # error class or none at all) trips here.
+    assert any(
+        err.get("type") == "extra_forbidden" for err in excinfo.value.errors()
+    ), excinfo.value.errors()
+
+
+def test_regenerate_request_schema_declares_additional_properties_false() -> None:
+    """Static + runtime ``additionalProperties: false`` parity.
+
+    Codex round-11/12 wanted the parity assertion stated as a
+    standalone test (rather than tucked inside
+    ``test_regenerate_request_schema_forbids_extras``) so a YAML-only
+    or runtime-only drift produces a clearly labelled failure.
+    """
+    import yaml
+
+    contract_path = (
+        Path(__file__).resolve().parent.parent
+        / "docs" / "api" / "openapi.yaml"
+    )
+    contract = yaml.safe_load(contract_path.read_text())
+    static_schema = contract["components"]["schemas"]["RegenerateBriefingRequest"]
+    runtime_schema = RegenerateRequest.model_json_schema()
+    assert static_schema.get("additionalProperties") is False
+    assert runtime_schema.get("additionalProperties") is False

@@ -559,26 +559,30 @@ def iter_matching_events(
     substring) should be supplied — both ``None`` means "match every
     line." Supplying both is allowed (regex wins) but discouraged.
 
-    Filters apply in cheap→expensive order:
+    Filters apply in cheap→expensive order. Codex round-10 (PR #2062)
+    reordered so the bounded-regex pattern only runs on rows inside
+    the requested ``since`` window — old pathological rows can no
+    longer drain the request deadline:
 
-    1. ``literal`` / ``pattern`` substring or regex match on the raw
-       line.
-    2. JSON decode.
-    3. ``event_type``: exact ``.event`` field match (string equality,
+    1. JSON decode.
+    2. ``event_type``: exact ``.event`` field match (string equality,
        NOT regex).
-    4. ``ts`` parse — rows whose ``ts`` field is missing, non-string,
+    3. ``ts`` parse — rows whose ``ts`` field is missing, non-string,
        or fails ISO-8601 parsing are dropped and counted under
        ``stats["malformed_rows_skipped"]`` (Codex round-3 finding,
        PR #2062). Both ``since`` filtering AND ``/audit/stats`` totals
        go through this gate so a malformed archived row can't inflate
        the count.
-    5. ``since``: drop events whose parsed ``ts`` is older than the
+    4. ``since``: drop events whose parsed ``ts`` is older than the
        cutoff. Parsed as ``datetime`` objects so a record like
        ``2026-05-21T01:00:00+02:00`` (≡ ``2026-05-20T23:00:00Z``) is
        correctly excluded by ``since=2026-05-21T00:00:00Z`` — earlier
        round-2 code did a raw-string lex compare here, which let
        lex-greater-but-time-earlier rows through (timezone offsets
        sort wrong; malformed strings passed through entirely).
+    5. ``literal`` / ``pattern`` substring or regex match on the raw
+       line. For the bounded (HTTP) regex path this runs LAST so the
+       per-line wall-clock budget is only spent on in-window rows.
 
     Malformed JSON lines are skipped silently — the live audit log can
     have a truncated tail mid-write and we don't want one bad line to
@@ -649,33 +653,18 @@ def iter_matching_events(
                         stats["lines_scanned"] = (
                             stats.get("lines_scanned", 0) + 1
                         )
-                    # Cheap reject — literal substring is much cheaper
-                    # than regex and immune to catastrophic backtracking.
-                    if literal:
-                        if literal not in stripped:
-                            continue
-                    elif session is not None:
-                        # Codex round-5: pass remaining request budget so
-                        # the worker poll (including first-line startup
-                        # grace) can't outrun the request-level deadline.
-                        matched, timed_out = session.search(
-                            stripped, max_wall_clock_s=remaining_budget
-                        )
-                        if timed_out:
-                            if stats is not None:
-                                stats["pattern_timeouts"] = (
-                                    stats.get("pattern_timeouts", 0) + 1
-                                )
-                            continue
-                        if not matched:
-                            continue
-                    elif pattern is not None and pattern.pattern:
-                        # Trusted-caller path (CLI / in-process callers
-                        # that opted out of bounded_regex). The operator
-                        # owns the pattern; if it backtracks they can
-                        # Ctrl+C.
-                        if not pattern.search(stripped):
-                            continue
+                    # Codex round-10 (PR #2062): parse + window-filter
+                    # BEFORE running the line-level pattern. The bounded
+                    # regex path advertises ``since`` as the work bound
+                    # (see ``grep_audit_endpoint`` + openapi prose); if
+                    # the regex runs first, a wall of old pathological
+                    # no-match rows at the front of the live log can
+                    # spend the entire deadline_seconds budget on rows
+                    # that ``since`` would have rejected anyway. The
+                    # JSON decode + ts parse are cheap (microseconds)
+                    # next to a single per-line regex timeout (~100 ms),
+                    # so the reorder is a win for the literal/trusted
+                    # paths too — it just moves a cheap gate earlier.
                     try:
                         record = json.loads(stripped)
                     except json.JSONDecodeError:
@@ -701,7 +690,39 @@ def iter_matching_events(
                             )
                         continue
                     if since is not None and parsed_ts < since:
+                        # Outside the requested window — skip BEFORE
+                        # spending the per-line regex budget on a row
+                        # the caller never asked about.
                         continue
+                    # In-window: now run the line-level pattern. Cheap
+                    # reject (``literal``) first — substring is much
+                    # cheaper than regex and immune to catastrophic
+                    # backtracking.
+                    if literal:
+                        if literal not in stripped:
+                            continue
+                    elif session is not None:
+                        # Codex round-5: pass remaining request budget so
+                        # the worker poll (including first-line startup
+                        # grace) can't outrun the request-level deadline.
+                        matched, timed_out = session.search(
+                            stripped, max_wall_clock_s=remaining_budget
+                        )
+                        if timed_out:
+                            if stats is not None:
+                                stats["pattern_timeouts"] = (
+                                    stats.get("pattern_timeouts", 0) + 1
+                                )
+                            continue
+                        if not matched:
+                            continue
+                    elif pattern is not None and pattern.pattern:
+                        # Trusted-caller path (CLI / in-process callers
+                        # that opted out of bounded_regex). The operator
+                        # owns the pattern; if it backtracks they can
+                        # Ctrl+C.
+                        if not pattern.search(stripped):
+                            continue
                     yield record
     finally:
         if session is not None:

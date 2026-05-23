@@ -1286,3 +1286,101 @@ def test_audit_stats_request_deadline_truncates_large_scan(
     assert 1 <= body.get("_lines_scanned", 0) < total_rows, body
     # Every row was outside ``since=24h`` so no aggregation is reported.
     assert body["total"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Round-10 guardrail (Codex review on PR #2062): the bounded-regex path
+# advertises ``since`` as the work bound — but ``iter_matching_events`` was
+# running the pattern against the raw line BEFORE parsing ``ts`` and applying
+# the ``since`` cutoff. That meant ``safe_regex=true&since=24h`` could spend
+# the full ``deadline_seconds`` on pathological no-match rows that the
+# ``since`` window would have rejected anyway. The reorder (parse + window
+# filter BEFORE regex) is what this test pins.
+# ---------------------------------------------------------------------------
+def test_audit_grep_regex_skips_old_rows_before_pattern(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bounded regex must only run on rows inside the ``since`` window.
+
+    Pre-round-10 the walker burned the per-line regex budget on every
+    row that hit the file — including old archived rows that the
+    ``since`` cutoff would have dropped on the next gate. With a
+    pathological pattern + tight ``deadline_seconds`` that meant a
+    wall of old rows at the front of the log could exhaust the request
+    deadline before the walker ever reached a fresh in-window row.
+
+    Setup mirrors the Codex finding shape:
+      - 100 OLDER rows (timestamp pre-dates ``since``) sitting in
+        front of the in-window slice.
+      - 5 IN-WINDOW rows the caller actually asked about.
+      - ``safe_regex=true`` with a pattern that, under the old order,
+        would be evaluated against all 105 raw lines.
+
+    The contract pin: the bounded regex session's ``search`` MUST be
+    invoked at most ``in_window_rows`` times (5), not the full 105.
+    On the pre-round-10 head the counter hits 100+ and the test fails.
+    """
+    from pollypm.audit import query as audit_query
+
+    # In-window window cutoff: anything older than 1 h ago is dropped.
+    now = datetime.now(timezone.utc)
+    old_ts = (now - timedelta(days=30)).isoformat()
+    fresh_ts = (now - timedelta(minutes=5)).isoformat()
+
+    old_rows = [
+        _make_event(subject=f"old-{i}", ts=old_ts) for i in range(100)
+    ]
+    fresh_rows = [
+        _make_event(subject=f"fresh-{i}", ts=fresh_ts) for i in range(5)
+    ]
+    _write_jsonl(
+        _per_project_log(project_root),
+        # Old rows FIRST so under the old (regex-before-since) order the
+        # walker spends its full deadline on them before ever reaching
+        # the in-window slice.
+        old_rows + fresh_rows,
+    )
+
+    # Count every call into the bounded-regex session. We don't care
+    # whether it matched — only whether the walker reached it at all.
+    # If the reorder works, ``search`` runs only on in-window rows.
+    call_count = {"n": 0}
+    real_search = audit_query._BoundedRegexSession.search
+
+    def counting_search(self, line, *, max_wall_clock_s=None):  # type: ignore[no-untyped-def]
+        call_count["n"] += 1
+        return real_search(self, line, max_wall_clock_s=max_wall_clock_s)
+
+    monkeypatch.setattr(
+        audit_query._BoundedRegexSession, "search", counting_search
+    )
+
+    response = client.get(
+        "/api/v1/audit/grep",
+        params={
+            "project": "myproj",
+            # Simple, non-pathological pattern — the test is about WHICH
+            # rows the regex runs on, not about ReDoS handling. Matches
+            # nothing (subjects start with ``old-``/``fresh-``).
+            "pattern": "no-such-substring",
+            "safe_regex": "true",
+            "since": "1h",
+        },
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    # No subject matches the pattern → empty result set is expected.
+    assert body["events"] == []
+    # The contract: regex evaluated only on in-window rows (5), not on
+    # the 100 older rows the ``since`` window already excludes.
+    # Pre-round-10 the counter is 105; post-round-10 it's <= 5.
+    assert call_count["n"] <= len(fresh_rows), (
+        f"bounded regex ran on {call_count['n']} rows; "
+        f"since=1h should have limited it to <= {len(fresh_rows)} "
+        f"(old rows must be filtered BEFORE the pattern)"
+    )

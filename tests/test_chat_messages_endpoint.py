@@ -774,6 +774,132 @@ def test_messages_endpoint_emits_thinking_envelopes_when_include_thinking_true(
     assert thinking_msg["metadata"]["signature"] == "opaque"
 
 
+def test_messages_endpoint_include_thinking_surfaces_under_default_curl(
+    client, auth_headers, patch_registry, tmp_path,
+):
+    """Regression for #2160: the user-facing default curl
+
+        GET /api/v1/chat/<name>/messages?include_thinking=true&limit=200
+
+    must return at least one ``type:thinking`` envelope when the
+    archive contains any, even when the archive is large enough that
+    the route's tail-read optimization (issue #2070) would otherwise
+    activate.
+
+    Wave 4A verified that #2208's stale-archive fix did not reach the
+    user-facing path: 39/39 sessions returned zero thinking under the
+    default curl. Root cause: when ``limit <= 200`` + ``direction=desc``
+    + ``source=auto``, the route set ``tail_hint = limit + 1`` and
+    used :func:`parse_events_jsonl_tail`, which reads only the last
+    ~``chunk_size`` bytes of the file. Thinking events written earlier
+    in a long conversation were silently dropped from the response.
+
+    This test exercises the exact user-facing shape (default
+    direction=desc, ``limit=200``) against a multi-thousand-line
+    archive whose thinking block falls outside the tail-read window
+    but inside the desc-200 page by timestamp. Before the fix the
+    response is text-only; after the fix the thinking envelope is
+    surfaced alongside the recent turns.
+    """
+    import json as _json
+
+    archive = tmp_path / "events.jsonl"
+    events: list[dict[str, Any]] = []
+    # The thinking block lives at the HEAD of the file (model-side
+    # reasoning at the start of a long task). Its timestamp is
+    # arranged so it falls inside the desc-200 page when a full
+    # forward parse is used — i.e., a working response includes it.
+    events.append({
+        "timestamp": "2026-05-21T20:00:00Z",
+        "event_type": "thinking",
+        "session_id": "s",
+        "account_name": "claude_main",
+        "provider": "claude",
+        "project_key": "myproj",
+        "source_path": "/tmp/raw.jsonl",
+        "source_offset": 0,
+        "cwd": "/tmp/repo",
+        "model_name": "claude-opus-4-7",
+        "payload": {
+            "text": "Hidden reasoning the user opted in to see.",
+            "signature": "opt-in-sig",
+            "raw": {
+                "type": "thinking",
+                "thinking": "Hidden reasoning the user opted in to see.",
+                "signature": "opt-in-sig",
+            },
+        },
+    })
+    # Push the archive past the 1 MB tail-read ceiling so the
+    # tail-read path NEVER reaches byte 0 (where the thinking lives).
+    # Each padding event is ~5 KB so 250+ events comfortably exceeds
+    # 1 MB. Their timestamps are OLDER than the thinking event's so
+    # they don't crowd the desc-200 page out from under it.
+    big_pad = "y" * 5000
+    for i in range(250):
+        events.append({
+            "timestamp": f"2026-05-21T10:{i // 60:02d}:{i % 60:02d}Z",
+            "event_type": "assistant_turn",
+            "session_id": "s",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": i + 1,
+            "cwd": "/tmp/repo",
+            "model_name": "claude-opus-4-7",
+            "payload": {"text": f"old pad turn {i} {big_pad}"},
+        })
+    # Recent text turns at the file tail. These DO appear in the
+    # tail-read window (so tail-read returns 30+ envelopes from this
+    # bunch) and they all have NEWER timestamps than the padding —
+    # but older than the thinking. After full-parse desc-sort the
+    # thinking is the newest envelope of all 281 in the file.
+    for i in range(30):
+        events.append({
+            "timestamp": f"2026-05-21T19:{i:02d}:00Z",
+            "event_type": "assistant_turn",
+            "session_id": "s",
+            "account_name": "claude_main",
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": 251 + i,
+            "cwd": "/tmp/repo",
+            "model_name": "claude-opus-4-7",
+            "payload": {"text": f"recent turn {i}"},
+        })
+    archive.write_text("\n".join(_json.dumps(ev) for ev in events) + "\n")
+    # Sanity: file must exceed the largest tail-read chunk (1 MB)
+    # so the thinking at byte 0 is never inside the tail window.
+    assert archive.stat().st_size > 1_100_000
+    patch_registry([_surface(
+        "operator", SurfaceType.OPERATOR, persona="Polly",
+        transcript_path=archive,
+    )])
+    from pollypm.web_api.chat.transcripts import _parse_cache_clear
+    _parse_cache_clear()
+    # Default direction is ``desc`` and limit=200 — the exact shape
+    # the cockpit / users send. Before the fix the route would
+    # tail-read only the last ~64 KB (~250-300 short envelopes worth)
+    # and drop the thinking block that lived just ahead of that window.
+    response = client.get(
+        "/api/v1/chat/operator/messages?include_thinking=true&limit=200",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["transcript_source"] == "jsonl"
+    types = [m["type"] for m in body["messages"]]
+    assert "thinking" in types, (
+        f"expected at least one thinking envelope, got types={set(types)} "
+        f"(count={len(types)}); regression for #2160"
+    )
+    thinking_msgs = [m for m in body["messages"] if m["type"] == "thinking"]
+    assert thinking_msgs[0]["text"] == "Hidden reasoning the user opted in to see."
+    assert thinking_msgs[0]["metadata"]["signature"] == "opt-in-sig"
+
+
 def test_messages_endpoint_include_thinking_reaches_ingested_surface_archive(
     client, auth_headers, config, project_root, monkeypatch,
 ):

@@ -27,6 +27,7 @@ from typing import Any
 
 from pollypm.models import PollyPMConfig, SessionConfig
 from pollypm.projects import project_transcripts_dir
+from pollypm.session_health import storage_session_name
 from pollypm.work.session_manager import task_window_name
 from pollypm.web_api.chat.transcripts import (
     build_session_index,
@@ -242,6 +243,7 @@ def enumerate_config_surfaces(
     request even when multiple surfaces share it.
     """
     surfaces: list[ChatSurface] = []
+    tmux_session = storage_session_name(config.project.tmux_session)
     for session_name, session in (config.sessions or {}).items():
         if not session.enabled:
             continue
@@ -264,7 +266,7 @@ def enumerate_config_surfaces(
             window_state = tmux_state_cache[window_name]
         else:
             window_state = TmuxWindowState(
-                tmux_session=config.project.tmux_session,
+                tmux_session=tmux_session,
                 window_name=window_name,
                 present=False,
             )
@@ -313,6 +315,7 @@ def enumerate_worker_surfaces(
         )
         return []
     surfaces: list[ChatSurface] = []
+    tmux_session = storage_session_name(config.project.tmux_session)
     for record in records or []:
         project = getattr(record, "task_project", "") or ""
         task_number = getattr(record, "task_number", 0)
@@ -337,7 +340,7 @@ def enumerate_worker_surfaces(
             window_state = tmux_state_cache[window_name]
         else:
             window_state = TmuxWindowState(
-                tmux_session=config.project.tmux_session,
+                tmux_session=tmux_session,
                 window_name=window_name,
                 present=False,
                 pane_id=getattr(record, "pane_id", None),
@@ -447,7 +450,8 @@ def _build_tmux_state_cache(
     list_windows = getattr(tmux_client, "list_windows", None)
     if not callable(list_windows):
         return cache
-    target = config.project.tmux_session
+    base = getattr(config.project, "tmux_session", "") or ""
+    target = storage_session_name(base)
     try:
         try:
             windows = list_windows(target, timeout=_TMUX_DISCOVERY_TIMEOUT_SECONDS)

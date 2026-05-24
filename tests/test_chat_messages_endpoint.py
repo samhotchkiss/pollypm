@@ -432,7 +432,7 @@ def test_messages_endpoint_returns_envelopes_for_known_session(
     assert body["surface_type"] == "operator"
     assert body["persona"] == "Polly"
     assert body["transcript_source"] == "jsonl"
-    assert body["transcript_path"] == str(archive)
+    assert "transcript_path" not in body
     assert [m["id"] for m in body["messages"]] == ["msg_1", "msg_2"]
     assert body["has_more"] is False
     assert body["next_cursor"] is None
@@ -472,7 +472,7 @@ def test_messages_endpoint_empty_when_no_transcript_yet(
     body = response.json()
     assert body["messages"] == []
     assert body["transcript_source"] is None
-    assert body["transcript_path"] is None
+    assert "transcript_path" not in body
 
 
 # ---------------------------------------------------------------------------
@@ -844,7 +844,7 @@ def test_messages_endpoint_source_capture_uses_tmux_fallback(
         headers=auth_headers,
     ).json()
     assert body["transcript_source"] == "capture"
-    assert body["transcript_path"] is None
+    assert "transcript_path" not in body
     assert [m["id"] for m in body["messages"]] == ["cap_1", "cap_2"]
 
 
@@ -1610,7 +1610,7 @@ def test_messages_endpoint_jsonl_uses_real_parser_no_typeerror(
     assert response.status_code == 200, response.text
     body = response.json()
     assert body["transcript_source"] == "jsonl"
-    assert body["transcript_path"] == str(archive)
+    assert "transcript_path" not in body
     assert len(body["messages"]) == 1
     assert body["messages"][0]["text"] == "hello from real parser"
     assert body["messages"][0]["type"] == "text"

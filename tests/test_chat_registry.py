@@ -80,7 +80,7 @@ def _build_config(
             logs_dir=project_root / ".pollypm/logs",
             snapshots_dir=project_root / ".pollypm/snapshots",
             state_db=project_root / ".pollypm/state.db",
-            tmux_session="storage-closet",
+            tmux_session="pollypm",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts={
@@ -426,7 +426,7 @@ def test_tmux_client_populates_window_present_and_pane_id(tmp_path: Path) -> Non
     })
     tmux = _StubTmuxClient([
         TmuxWindow(
-            session="storage-closet",
+            session="pollypm-storage-closet",
             index=1,
             name="pm-operator",
             active=True,
@@ -439,8 +439,8 @@ def test_tmux_client_populates_window_present_and_pane_id(tmp_path: Path) -> Non
     surfaces = enumerate_chat_surfaces(config, tmux_client=tmux)
     assert surfaces[0].window.present is True
     assert surfaces[0].window.pane_id == "%17"
-    assert surfaces[0].window.tmux_session == "storage-closet"
-    assert tmux.list_calls == ["storage-closet"]
+    assert surfaces[0].window.tmux_session == "pollypm-storage-closet"
+    assert tmux.list_calls == ["pollypm-storage-closet"]
 
 
 def test_window_present_false_when_tmux_returns_no_window(tmp_path: Path) -> None:
@@ -486,7 +486,7 @@ def test_pane_dead_propagates_from_tmux(tmp_path: Path) -> None:
     })
     tmux = _StubTmuxClient([
         TmuxWindow(
-            session="storage-closet",
+            session="pollypm-storage-closet",
             index=1,
             name="pm-operator",
             active=False,
@@ -573,7 +573,7 @@ def test_two_surfaces_sharing_cwd_resolve_to_correct_transcripts(
             logs_dir=project_root / ".pollypm/logs",
             snapshots_dir=project_root / ".pollypm/snapshots",
             state_db=project_root / ".pollypm/state.db",
-            tmux_session="storage-closet",
+            tmux_session="pollypm",
         ),
         pollypm=PollyPMSettings(controller_account="claude_main"),
         accounts=accounts,

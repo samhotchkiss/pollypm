@@ -1857,7 +1857,13 @@ _TIER1_HEALERS: dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
-def _operator_dedup_key(rule: str, project: str, subject: str) -> str:
+def _operator_dedup_key(
+    rule: str,
+    project: str,
+    subject: str,
+    *,
+    finding_key: str = "",
+) -> str:
     """Stable dedup key for tier-3 inbox rows.
 
     Hash-folded so the inbox's ``--dedup-key`` collapses repeated
@@ -1865,6 +1871,8 @@ def _operator_dedup_key(rule: str, project: str, subject: str) -> str:
     Mirrors :func:`pollypm.audit.watchdog.watchdog_alert_session_name`
     in spirit but lives on the inbox side.
     """
+    if finding_key:
+        return f"watchdog-operator:{rule}:{project}:{finding_key}"
     safe_subject = (subject or "").replace("/", "_").replace(" ", "_") or "_"
     return f"watchdog-operator:{rule}:{project}:{safe_subject}"
 
@@ -1928,7 +1936,10 @@ def _maybe_dispatch_to_operator(
         body = finding.message or finding.rule
 
     dedup_key = _operator_dedup_key(
-        finding.rule, finding.project, finding.subject,
+        finding.rule,
+        finding.project,
+        finding.subject,
+        finding_key=dedup_hash,
     )
     subject_text = (
         finding.message

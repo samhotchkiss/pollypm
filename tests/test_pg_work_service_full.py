@@ -1204,6 +1204,56 @@ def test_claim_from_wrong_state_raises(pg_service):
         pg_service.claim(task.task_id, actor="alice")
 
 
+def test_reopen_cancelled_task_returns_to_clean_queue(pg_service):
+    from pollypm.work.models import ExecutionStatus, WorkStatus
+
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="alice")
+    pg_service.cancel(task.task_id, actor="user", reason="mistake")
+
+    reopened = pg_service.reopen(
+        task.task_id, actor="user", reason="undo mistaken cancel"
+    )
+
+    assert reopened.work_status is WorkStatus.QUEUED
+    assert reopened.assignee is None
+    assert reopened.current_node_id is None
+
+    with pg_service._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT from_state, to_state, reason FROM work_transitions "
+            "WHERE task_project = %s AND task_number = %s "
+            "ORDER BY id DESC LIMIT 1",
+            (task.project, task.task_number),
+        )
+        assert cur.fetchone() == (
+            WorkStatus.CANCELLED.value,
+            WorkStatus.QUEUED.value,
+            "undo mistaken cancel",
+        )
+        cur.execute(
+            "SELECT COUNT(*) FROM work_node_executions "
+            "WHERE task_project = %s AND task_number = %s "
+            "AND status = %s",
+            (
+                task.project,
+                task.task_number,
+                ExecutionStatus.ACTIVE.value,
+            ),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_reopen_rejects_non_cancelled_task(pg_service):
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    with pytest.raises(InvalidTransitionError):
+        pg_service.reopen(task.task_id, actor="user")
+
+
 def test_hold_from_in_progress(pg_service):
     from pollypm.work.models import WorkStatus
 

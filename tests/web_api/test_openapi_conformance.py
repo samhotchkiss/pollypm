@@ -209,6 +209,7 @@ def test_static_yaml_does_not_advertise_idempotency_or_ifmatch_on_tasks() -> Non
         "/tasks/{project}/{n}/queue",
         "/tasks/{project}/{n}/claim",
         "/tasks/{project}/{n}/cancel",
+        "/tasks/{project}/{n}/reopen",
         "/tasks/{project}/{n}/reassign",
     ]
     for path in task_post_paths:
@@ -313,6 +314,7 @@ def test_static_yaml_declares_503_on_task_write_paths() -> None:
         "/tasks/{project}/{n}/queue",
         "/tasks/{project}/{n}/claim",
         "/tasks/{project}/{n}/cancel",
+        "/tasks/{project}/{n}/reopen",
         "/tasks/{project}/{n}/reassign",
     ]
     paths = contract.get("paths", {})
@@ -394,6 +396,7 @@ def test_task_write_endpoints_document_503() -> None:
         "/api/v1/tasks/{project}/{n}/queue",
         "/api/v1/tasks/{project}/{n}/claim",
         "/api/v1/tasks/{project}/{n}/cancel",
+        "/api/v1/tasks/{project}/{n}/reopen",
         "/api/v1/tasks/{project}/{n}/reassign",
     ]
     for path in post_paths:
@@ -713,6 +716,20 @@ def test_task_reassign_request_schema_forbids_extras() -> None:
         "``model_config = {'extra': 'forbid'}`` on the Pydantic "
         "model so the static YAML and the request validator agree."
     )
+
+
+def test_task_reopen_request_schema_forbids_extras() -> None:
+    """Pin ``TaskReopenRequest`` extras=forbid in runtime + static YAML."""
+    from pollypm.web_api.models import TaskReopenRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskReopenRequest"]
+    assert static_schema.get("additionalProperties") is False
+
+    runtime_schema = TaskReopenRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False
+
+
 def test_audit_responses_document_corrupt_archives_skipped() -> None:
     """Pin the round-7 diagnostic field on both audit response schemas.
 

@@ -322,7 +322,8 @@ callers rely on, including `created_by`, `skip_gates`, and `entry_type`.
 | `claim` | task_id, actor, skip_gates? | Task | Atomic: activate first flow node, set role-derived `assignee`, record `actor` as `claimed_by_session`, and set `work_status=in_progress`. Task must be `queued`. |
 | `next` | agent?, project? | Task? | Return the highest-priority queued+unblocked task, optionally filtered by project. Does not claim it. |
 | `update` | task_id, fields... | Task | Update mutable fields (title, description, priority, labels, roles). Cannot change work_status directly. |
-| `cancel` | task_id, actor, reason | Task | Move any non-terminal task to `cancelled`. |
+| `cancel` | task_id, actor, reason | Task | Move any non-terminal task to `cancelled`; operator surfaces must confirm before cancelling `in_progress` work. |
+| `reopen` | task_id, actor, reason? | Task | Move `cancelled` back to `queued`, clearing live claim fields while preserving transition history. |
 | `hold` | task_id, actor, reason? | Task | Move `in_progress` or `queued` task to `on_hold`. |
 | `resume` | task_id, actor | Task | Move `on_hold` task back to `queued`. |
 

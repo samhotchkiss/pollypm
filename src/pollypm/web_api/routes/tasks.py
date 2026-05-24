@@ -11,8 +11,8 @@ plan/code-review state machine. ``approve`` / ``reject`` follow once
 the wedge is in.
 
 Phase 2 surface #3 (#1548 spec §5.3 + §5.4) adds the remaining
-task-state-mutation verbs: ``/claim``, ``/cancel``, ``/reassign``
-and the ``PATCH`` edit surface. Each new handler returns
+task-state-mutation verbs: ``/claim``, ``/cancel``, ``/reopen``,
+``/reassign`` and the ``PATCH`` edit surface. Each new handler returns
 ``TaskActionResult = {ok, message, task: TaskDetail}`` so clients
 refresh state in one round-trip (spec §5.3 wrapper).
 """
@@ -35,6 +35,7 @@ from pollypm.web_api.models import (
     TaskListWarning,
     TaskPatchRequest,
     TaskReassignRequest,
+    TaskReopenRequest,
 )
 from pollypm.web_api.routes._deps import ConfigDep
 from pollypm.web_api.service import (
@@ -46,6 +47,7 @@ from pollypm.web_api.service import (
     patch_task,
     queue_task,
     reassign_task,
+    reopen_task,
 )
 
 router = APIRouter(tags=["Tasks"])
@@ -271,13 +273,49 @@ def cancel_task_endpoint(
     n: int,
     config: ConfigDep,
     body: TaskCancelRequest | None = None,
+    force: Annotated[
+        bool,
+        Query(
+            description=(
+                "Confirm cancellation of an in-progress task. Without "
+                "force, active-worker cancellation returns 409."
+            )
+        ),
+    ] = False,
 ) -> TaskActionResult:
     if project not in config.projects:
         raise not_found(f"Project not registered: {project}")
     reason = body.reason if body is not None else None
-    task = cancel_task(config, project, n, reason=reason)
+    task = cancel_task(config, project, n, reason=reason, force=force)
     return TaskActionResult(
         ok=True, message=f"cancelled {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/reopen",
+    response_model=TaskActionResult,
+    summary="Reopen a cancelled task",
+    operation_id="reopenTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Task is not cancelled."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def reopen_task_endpoint(
+    project: str,
+    n: int,
+    config: ConfigDep,
+    body: TaskReopenRequest | None = None,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    reason = body.reason if body is not None else None
+    task = reopen_task(config, project, n, reason=reason)
+    return TaskActionResult(
+        ok=True, message=f"reopened {task.task_id}", task=task
     )
 
 
@@ -373,7 +411,8 @@ def patch_task_endpoint(
     # lifecycle call — leaving labels/metadata committed while the
     # status write 409s. Refuse the combined shape up front; clients
     # should send one PATCH per concern, or use the dedicated
-    # ``/queue`` / ``/cancel`` / ``/claim`` / ``/reassign`` endpoints
+    # ``/queue`` / ``/cancel`` / ``/reopen`` / ``/claim`` /
+    # ``/reassign`` endpoints
     # for status changes. Rejecting BEFORE any work-service call
     # guarantees no partial commit.
     if body.status is not None and (
@@ -388,7 +427,7 @@ def patch_task_endpoint(
                 "Send separate PATCH requests (one for status, one "
                 "for the other fields), or use the dedicated status "
                 "endpoints (POST /tasks/{project}/{n}/queue, /cancel, "
-                "/claim, /reassign)."
+                "/reopen, /claim, /reassign)."
             ),
         )
     task = patch_task(

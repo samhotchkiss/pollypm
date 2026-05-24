@@ -196,6 +196,12 @@ class WorkService(Protocol):
         """Move any non-terminal task to ``cancelled``."""
         ...
 
+    def reopen(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        """Move a ``cancelled`` task back to ``queued``."""
+        ...
+
     def hold(self, task_id: str, actor: str, reason: str | None = None) -> Task:
         """Move an ``in_progress`` or ``queued`` task to ``on_hold``."""
         ...

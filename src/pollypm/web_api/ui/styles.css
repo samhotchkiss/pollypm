@@ -326,6 +326,28 @@ section#message-pane {
   color: var(--text-body);
   overflow-wrap: anywhere;
 }
+.task-detail-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 12px;
+}
+.task-action-button {
+  border: 1px solid var(--border-line);
+  background: var(--bg-elevated);
+  color: var(--text-body);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.task-action-button:hover {
+  border-color: var(--accent);
+  color: var(--text-heading-bright);
+}
+.task-action-button.danger {
+  border-color: rgba(239, 68, 68, 0.45);
+  color: #fecaca;
+}
 
 .audit-panel {
   margin-top: 14px;

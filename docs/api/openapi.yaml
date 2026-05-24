@@ -1137,7 +1137,7 @@ paths:
 
         Clients that need to change status alongside other fields
         must send separate PATCH requests, or use the dedicated
-        status endpoints (`/queue`, `/cancel`, `/claim`,
+        status endpoints (`/queue`, `/cancel`, `/reopen`, `/claim`,
         `/reassign`). `status` values without a direct PATCH→lifecycle
         map (e.g. `in_progress`, `review`) raise `422
         validation_error` with a hint pointing to the dedicated
@@ -1275,10 +1275,20 @@ paths:
       description: |
         Moves any non-terminal task to `cancelled` and emits the
         cancel-cascade (dependents get an `_on_cancelled` breadcrumb).
+        Cancelling an `in_progress` task without `force=true` returns
+        `409 confirmation_required` so clients must confirm the active
+        worker interruption explicitly. `force=true` is the automation
+        escape hatch after that confirmation.
         Cancelling a terminal (done/cancelled) task returns `409
         invalid_state`. `Idempotency-Key` and `If-Match` are
         intentionally NOT accepted — no replay cache or version-token
         enforcement exists yet (#2064 round-1, mirrors #2060).
+      parameters:
+        - name: force
+          in: query
+          required: false
+          schema: { type: boolean, default: false }
+          description: Confirm cancellation of an in-progress task.
       requestBody:
         required: false
         content:
@@ -1288,6 +1298,42 @@ paths:
       responses:
         "200":
           description: Task transitioned to `cancelled`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/reopen:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: reopenTask
+      summary: Reopen a cancelled task
+      description: |
+        Moves a `cancelled` task back to `queued`, clears the live
+        assignee/current-node claim fields, and preserves history in
+        `work_transitions`. Any active node execution is abandoned so
+        the next claim starts a fresh visit instead of reusing stale
+        in-flight state.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskReopenRequest"
+      responses:
+        "200":
+          description: Task transitioned to `queued`.
           content:
             application/json:
               schema:
@@ -3752,6 +3798,16 @@ components:
         `src/pollypm/web_api/models.py`). Unknown keys surface as a
         `422 validation_error` instead of being silently dropped
         (#2064 round-12).
+
+    TaskReopenRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          description: |
+            Optional explanation; absent reasons collapse to
+            "reopened via API" in the audit row.
 
     TaskReassignRequest:
       type: object

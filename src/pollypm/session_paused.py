@@ -5,8 +5,8 @@ This module owns the on-disk pause-marker contract end-to-end:
 * The filename constant (``_PAUSE_MARKER_FILENAME``) and the
   config-derived path helper (``_pause_marker_path``).
 * The read helpers (``load_paused_state`` / ``load_paused_names`` /
-  ``is_paused``) consumed by the supervisor / recovery loops AND the
-  sessions-admin GET surface.
+  ``pause_status_from_state`` / ``is_paused``) consumed by the
+  supervisor / recovery loops AND the sessions-admin GET surface.
 * The write helpers (``save_paused_names`` / ``pause_marker_lock``)
   consumed by ``POST /api/v1/sessions/{name}/pause`` and ``resume``.
 
@@ -20,16 +20,19 @@ exactly the drift risk the shared helper is supposed to remove").
 Recovery wiring status (#2068)
 ------------------------------
 
-PR ``feat/sessions-pause-marker-wire-loops-1-3`` wires the marker into
-loops 1–3:
+The marker is consumed through ``skip_if_paused`` at the narrow loop
+chokepoints wired so far:
 
 * :func:`pollypm.recovery.no_session_spawn.auto_recover_no_session_alerts`
-  (loop 1) and :meth:`pollypm.supervisor.Supervisor.maybe_recover_session`
-  (loops 2 + 3) BOTH consult ``is_paused`` / ``skip_if_paused`` and
-  yield with an audit event when the marker is set.
+  and :meth:`pollypm.supervisor.Supervisor.maybe_recover_session`.
+* :meth:`pollypm.supervisor.Supervisor.restart_session` and
+  ``create_session_window`` / ``launch_session``.
+* ``LocalHeartbeatBackend`` per-session processing and heartbeat API
+  session-message sends.
+* ``task_assignment_notify.notify`` assignment dispatch.
 
-Remaining dispatch / cockpit / heartbeat loops still treat the marker
-as informational and are tracked as the next slice under #2068.
+Direct/manual cockpit and chat sends remain explicit operator actions
+unless they route through one of those daemon-loop chokepoints.
 
 Marker states
 -------------
@@ -51,10 +54,11 @@ state emits a throttled ``session.pause.marker_unreadable`` audit
 event and a one-time stderr warning so the operator can repair the
 marker; the transition back out emits ``session.pause.marker_restored``.
 
-For the read-only sessions-admin GET surface we keep the legacy
-"best-effort empty set" behaviour via :func:`load_paused_names` so a
-stale marker on disk does not 500 the dashboard; the GET path surfaces
-``paused`` purely as a presentational signal.
+For the read-only sessions-admin GET surface, callers use
+:func:`load_paused_state` plus :func:`pause_status_from_state` so a stale
+marker on disk does not 500 the dashboard but still fails closed in the
+payload: every row reports ``paused=True`` with
+``paused_reason="marker_unreadable"``.
 
 Audit-event spam (PR #2081 round 2 — Codex finding 1)
 -----------------------------------------------------
@@ -129,6 +133,7 @@ PAUSE_SKIP_EVENT_TYPE = "session.pause.skip"
 # :data:`PAUSE_MARKER_RESTORED_EVENT_TYPE` and reset the throttle.
 PAUSE_MARKER_UNREADABLE_EVENT_TYPE = "session.pause.marker_unreadable"
 PAUSE_MARKER_RESTORED_EVENT_TYPE = "session.pause.marker_restored"
+UNREADABLE_PAUSED_REASON = "marker_unreadable"
 
 
 # --- Marker state ---------------------------------------------------
@@ -269,11 +274,10 @@ def load_paused_state(config: Any) -> MarkerState:
 def load_paused_names(config: Any) -> set[str]:
     """Read the pause marker; empty set on missing / malformed file.
 
-    Best-effort variant retained for the read-only dashboard surface
-    (``GET /api/v1/sessions`` via ``SessionInfo.paused``) and for
-    tests that still want the legacy ``set[str]`` shape. The route
-    pause/resume endpoints now go through :func:`load_paused_state`
-    for their read-modify-write paths.
+    Best-effort variant retained for legacy/tests that still want the
+    ``set[str]`` shape. The sessions-admin GET surface and the route
+    pause/resume endpoints now go through :func:`load_paused_state` so
+    unreadable markers do not fail open.
 
     An unreadable marker collapses to an empty set HERE — recovery
     callers must use :func:`load_paused_state` / :func:`is_paused`
@@ -285,6 +289,26 @@ def load_paused_names(config: Any) -> set[str]:
     if state.kind == "ok":
         return set(state.names)
     return set()
+
+
+def pause_status_from_state(
+    state: MarkerState,
+    session_name: str,
+) -> tuple[bool, str | None]:
+    """Return wire-facing pause status for ``session_name``.
+
+    This is the shared read-side projection used by UI/API callers that
+    already loaded the discriminated marker state. It keeps the
+    fail-closed unreadable-marker semantics in one place without
+    re-reading or reparsing the marker for every row.
+    """
+    if not session_name:
+        return False, None
+    if state.kind == "unreadable":
+        return True, UNREADABLE_PAUSED_REASON
+    if state.kind == "ok":
+        return session_name in state.names, None
+    return False, None
 
 
 def is_paused(config: Any, session_name: str) -> bool:
@@ -303,13 +327,11 @@ def is_paused(config: Any, session_name: str) -> bool:
     """
     if not session_name:
         return False
-    state = load_paused_state(config)
-    if state.kind == "absent":
-        return False
-    if state.kind == "ok":
-        return session_name in state.names
-    # ``unreadable`` — fail closed: every session is treated as paused.
-    return True
+    paused, _reason = pause_status_from_state(
+        load_paused_state(config),
+        session_name,
+    )
+    return paused
 
 
 def save_paused_names(config: Any, names: set[str] | list[str]) -> None:
@@ -862,9 +884,11 @@ __all__ = [
     "PAUSE_MARKER_UNREADABLE_THROTTLE_SECONDS",
     "PAUSE_SKIP_EVENT_TYPE",
     "PAUSE_SKIP_THROTTLE_SECONDS",
+    "UNREADABLE_PAUSED_REASON",
     "is_paused",
     "load_paused_names",
     "load_paused_state",
+    "pause_status_from_state",
     "pause_marker_lock",
     "save_paused_names",
     "skip_if_paused",

@@ -1,6 +1,6 @@
-"""Issue #2068 — sessions-admin pause marker wired into recovery loops.
+"""Issue #2068 — sessions-admin pause marker wired into daemon loops.
 
-Covers the **partial** wiring in PR ``feat/sessions-pause-marker-wire-loops-1-3``:
+Covers the partial wiring now present:
 
 1. ``pollypm.session_paused`` reader contract (``is_paused`` /
    ``load_paused_names`` / ``skip_if_paused``).
@@ -9,9 +9,11 @@ Covers the **partial** wiring in PR ``feat/sessions-pause-marker-wire-loops-1-3`
 3. ``pollypm.supervisor.Supervisor.maybe_recover_session`` honours the
    marker — no policy-recommendation / restart side effects when the
    session is paused.
+4. Direct supervisor relaunch/window creation and heartbeat
+   per-session processing honour the same shared helper.
 
-Remaining loops (core_recurring / cockpit_rail / heartbeats) are
-tracked under #2068 as follow-ups and are NOT exercised here.
+Remaining direct/manual cockpit and chat sends are explicit operator
+actions unless routed through those daemon-loop chokepoints.
 """
 
 from __future__ import annotations
@@ -129,10 +131,9 @@ def test_load_paused_names_handles_malformed_json(
     config_with_base_dir: _FakeConfig,
 ) -> None:
     """``load_paused_names`` keeps its best-effort empty-set degrade for
-    the GET surface — the read-side helper must not raise on a corrupt
-    marker. Recovery callers go through :func:`is_paused` /
-    :func:`load_paused_state` instead, which fail CLOSED (covered
-    below)."""
+    legacy set-shaped callers. Recovery/API callers go through
+    :func:`is_paused` / :func:`load_paused_state` instead, which fail
+    CLOSED (covered below)."""
     from pollypm.session_paused import (
         _reset_skip_throttle_for_tests, load_paused_names,
     )
@@ -141,8 +142,8 @@ def test_load_paused_names_handles_malformed_json(
     (config_with_base_dir.project.base_dir / "paused-sessions.json").write_text(
         "{not json}"
     )
-    # The route-side load remains empty so the GET dashboard does not
-    # 500; the safety story sits on ``is_paused`` (see below).
+    # The legacy set-shaped load remains empty; fail-closed callers use
+    # ``load_paused_state`` / ``is_paused`` instead.
     assert load_paused_names(config_with_base_dir) == set()
 
 
@@ -1177,3 +1178,140 @@ def test_supervisor_maybe_recover_session_proceeds_when_not_paused(
         )
     # Confirms the apply path was entered (append_event called).
     assert reached_policy
+
+
+def test_supervisor_restart_session_skips_paused_session(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """Direct relaunch facade yields before lease / tmux side effects."""
+    from pollypm.supervisor import Supervisor
+
+    _write_marker(config_with_base_dir, ["operator"])
+
+    @dataclass
+    class _FakeSession:
+        name: str
+
+    @dataclass
+    class _FakeLaunch:
+        session: _FakeSession
+        window_name: str = "operator"
+
+    launch = _FakeLaunch(session=_FakeSession(name="operator"))
+    store = _FakeStore()
+    sup = Supervisor.__new__(Supervisor)
+    sup.config = config_with_base_dir
+    sup._msg_store = store
+    sup._launch_by_session = lambda _name: launch  # type: ignore[method-assign]
+    sup._assert_lease_available = (  # type: ignore[method-assign]
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("lease check should not run when paused")
+        )
+    )
+
+    sup.restart_session(
+        "operator", "claude_primary", failure_type="missing_window",
+    )
+
+    assert len(store.kw_events) == 1
+    event = store.kw_events[0]
+    assert event["sender"] == "session.pause.skip"
+    assert event["payload"]["loop"] == "supervisor.restart_session"
+
+
+def test_supervisor_launch_session_skips_unreadable_marker(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """Unreadable marker suppresses launch/window creation fail-closed."""
+    from pollypm.supervisor import Supervisor
+
+    marker = config_with_base_dir.project.base_dir / "paused-sessions.json"
+    marker.write_text("{not json}")
+
+    @dataclass
+    class _FakeSession:
+        name: str
+
+    @dataclass
+    class _FakeLaunch:
+        session: _FakeSession
+        window_name: str = "operator"
+
+    launch = _FakeLaunch(session=_FakeSession(name="operator"))
+    store = _FakeStore()
+    sup = Supervisor.__new__(Supervisor)
+    sup.config = config_with_base_dir
+    sup._msg_store = store
+    sup._launch_by_session = lambda _name: launch  # type: ignore[method-assign]
+    sup._window_map = lambda: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("window creation should not inspect tmux when paused")
+    )
+
+    result = sup.launch_session("operator")
+
+    assert result is launch
+    assert len(store.kw_events) == 1
+    event = store.kw_events[0]
+    assert event["sender"] == "session.pause.skip"
+    assert event["payload"]["loop"] == "supervisor.create_session_window"
+
+
+def test_heartbeat_process_session_skips_paused_session(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """Heartbeat per-session processing yields before observations/recovery."""
+    from pollypm.heartbeats.base import HeartbeatSessionContext
+    from pollypm.heartbeats.local import LocalHeartbeatBackend
+
+    _write_marker(config_with_base_dir, ["operator"])
+    store = _FakeStore()
+
+    class _Supervisor:
+        config = config_with_base_dir
+        msg_store = store
+
+        def get_session_runtime(self, _session_name: str) -> None:
+            return None
+
+    class _Api:
+        supervisor = _Supervisor()
+
+        def record_observation(self, _context) -> None:  # noqa: ANN001
+            raise AssertionError("heartbeat observation should be skipped")
+
+        def recover_session(
+            self,
+            *_args,
+            **_kwargs,
+        ) -> None:
+            raise AssertionError("heartbeat recovery should be skipped")
+
+    context = HeartbeatSessionContext(
+        session_name="operator",
+        role="operator-pm",
+        project_key="demo",
+        provider="claude",
+        account_name="claude_primary",
+        cwd=str(config_with_base_dir.project.root_dir),
+        tmux_session="pollypm-storage-closet",
+        window_name="operator",
+        source_path="",
+        source_bytes=0,
+        transcript_delta="",
+        pane_text="",
+        snapshot_path=None,
+        snapshot_hash="",
+        pane_id=None,
+        pane_command=None,
+        pane_dead=False,
+        window_present=True,
+        previous_log_bytes=None,
+        previous_snapshot_hash=None,
+    )
+
+    LocalHeartbeatBackend()._process_session(_Api(), context)
+
+    assert len(store.kw_events) == 1
+    event = store.kw_events[0]
+    assert event["sender"] == "session.pause.skip"
+    assert event["payload"]["loop"] == "heartbeat.local.process_session"

@@ -23,12 +23,10 @@ Endpoints
   field on ``GET /api/v1/sessions`` rows; the ``status`` field is
   unaffected (Codex PR #2061 round 2 — pause must NEVER mask the
   real runtime-health classification). **Partial enforcement**:
-  the recovery loops
-  (:func:`pollypm.recovery.no_session_spawn.auto_recover_no_session_alerts`,
-  :meth:`pollypm.supervisor.Supervisor.maybe_recover_session`) HONOR
-  this marker and yield with an audit event. The remaining dispatch
-  / cockpit / heartbeat loops do NOT yet consume it — tracked under
-  #2068. Idempotent.
+  recovery/relaunch, heartbeat per-session, heartbeat send, and
+  task-assignment dispatch chokepoints honor this marker and yield
+  with an audit event. Some direct/manual cockpit and chat sends
+  remain explicit operator actions. Idempotent.
 - ``POST   /api/v1/sessions/{name}/resume``    — remove the marker.
   Idempotent.
 
@@ -67,14 +65,12 @@ Design notes
   ``?async`` to Phase 2.5.
 
 * **Pause / resume — partial enforcement.** The pause marker is
-  HONORED by the recovery loops (``no_session_spawn.auto_recover``
-  + ``Supervisor.maybe_recover_session`` — covering the auto-spawn
-  loop and both the policy-driven and health-sweep recovery paths)
-  as of PR ``feat/sessions-pause-marker-wire-loops-1-3``. Those
-  loops emit a ``session.pause.skip`` audit event and yield without
-  acting. The remaining dispatch / cockpit / heartbeat loops still
-  treat the marker as informational; closing those gaps is tracked
-  under #2068. The marker is exposed as a *separate* ``paused:
+  HONORED by the recovery/relaunch, heartbeat per-session, heartbeat
+  send, and task-assignment dispatch chokepoints wired under #2068.
+  Those loops emit a ``session.pause.skip`` audit event and yield
+  without acting. Direct/manual cockpit and chat sends remain explicit
+  operator actions unless they route through those loop chokepoints.
+  The marker is exposed as a *separate* ``paused:
   bool`` field on the ``SessionInfo`` row rather than as a value of
   ``status`` (Codex PR #2061 round 2). Folding it into ``status``
   was incoherent: a paused-but-missing session would report
@@ -130,13 +126,13 @@ from pollypm.session_health import (
     storage_session_name as _shared_storage_session_name,
 )
 from pollypm.session_paused import (
-    load_paused_names as _load_paused_names,
-)
-from pollypm.session_paused import (
     load_paused_state as _load_paused_state,
 )
 from pollypm.session_paused import (
     pause_marker_lock as _pause_marker_lock,
+)
+from pollypm.session_paused import (
+    pause_status_from_state as _pause_status_from_state,
 )
 from pollypm.session_paused import (
     save_paused_names as _save_paused_names,
@@ -189,12 +185,11 @@ class SessionInfo(BaseModel):
     # Operator-intent marker (Codex PR #2061 round 2). Remains a
     # separate boolean from ``status`` so a paused-but-missing or
     # paused-but-stale session still reports its true runtime health.
-    # Partial enforcement today: the recovery loops
-    # (``no_session_spawn.auto_recover_no_session_alerts`` and
-    # ``Supervisor.maybe_recover_session``) honor this marker and skip
-    # respawn when set. The dispatch / cockpit / heartbeat loops do
-    # NOT yet consume it — that wiring is tracked under #2068.
     paused: bool = False
+    # Only set when the marker itself is unreadable. Intentional pause
+    # does not carry a reason; clean running rows are null/absent
+    # depending on the client serializer.
+    paused_reason: Literal["marker_unreadable"] | None = None
 
 
 class SessionsListResponse(BaseModel):
@@ -425,22 +420,22 @@ def _storage_session_name(config: Any) -> str:
 # :mod:`pollypm.session_paused` (Codex PR #2081 round 1 blocker 2 — the
 # read-side recovery loops and the write-side route MUST share these,
 # or a rename / shape change would silently desync them). Imported as
-# ``_load_paused_names`` / ``_save_paused_names`` / ``_pause_marker_lock``
-# at the top of this module.
+# ``_load_paused_state`` / ``_pause_status_from_state`` /
+# ``_save_paused_names`` / ``_pause_marker_lock`` at the top of this
+# module.
 
 
 # Operator-facing message appended to pause/resume responses. The
-# marker is now PARTIALLY enforced — the recovery loops
-# (no_session_spawn + Supervisor.maybe_recover_session) honour it, but
-# the dispatch / cockpit / heartbeat loops still treat it as
-# informational. Spelling out which side is which keeps an operator
-# from over- OR under-trusting the call: pausing is not a full daemon
-# quiesce yet, but it is no longer a pure tag either.
+# marker is PARTIALLY enforced through the daemon-loop chokepoints
+# wired under #2068. Spelling out the remaining manual-action caveat
+# keeps an operator from over- OR under-trusting the call: pausing is
+# not a full daemon quiesce for every direct send path, but it is no
+# longer a pure tag either.
 _PAUSE_PARTIAL_ENFORCEMENT_NOTE = (
-    "pause marker is HONORED by recovery loops "
-    "(no_session_spawn, Supervisor.maybe_recover_session) but the "
-    "dispatch / cockpit / heartbeat loops do NOT yet consume it — "
-    "tracked under #2068. The marker is visible via "
+    "pause marker is HONORED by recovery/relaunch, heartbeat "
+    "per-session processing, and task-assignment dispatch paths wired "
+    "under #2068. Some direct/manual cockpit and chat send surfaces are "
+    "not yet treated as daemon-loop dispatch. The marker is visible via "
     "GET /api/v1/sessions on the separate `paused` field."
 )
 
@@ -457,6 +452,7 @@ def _build_session_info(
     storage_session: str,
     windows: dict[str, Any],
     paused: bool,
+    paused_reason: str | None = None,
 ) -> SessionInfo:
     """Construct a :class:`SessionInfo` row for one configured session.
 
@@ -495,6 +491,7 @@ def _build_session_info(
         auth_token_present=auth_token_present,
         enabled=bool(getattr(session, "enabled", True)),
         paused=paused,
+        paused_reason=paused_reason,  # type: ignore[arg-type]
     )
 
 
@@ -844,28 +841,36 @@ def list_sessions_endpoint(config: ConfigDep) -> SessionsListResponse:
     Returns one row per configured (and enabled) session. ``status``
     is the pure runtime-health classification (``healthy`` / ``stale``
     / ``missing`` / ``unknown``) and follows the same thresholds the
-    CLI uses. ``paused`` is a separate informational boolean drawn
-    from the pause marker (see :func:`_load_paused_names`) and does
-    NOT influence ``status`` — see :func:`_classify_status` for why.
+    CLI uses. ``paused`` is a separate operator-intent / fail-closed
+    boolean drawn from the pause marker and does NOT influence
+    ``status`` — see :func:`_classify_status` for why. If the marker
+    exists but cannot be read, the endpoint still returns 200 and
+    marks every row ``paused=True`` with
+    ``paused_reason="marker_unreadable"``.
     """
     storage_session = _storage_session_name(config)
     windows = _list_storage_closet_windows(storage_session)
-    paused = _load_paused_names(config)
+    pause_state = _load_paused_state(config)
     raw_sessions = getattr(config, "sessions", None) or {}
     sessions = sorted(
         (s for s in raw_sessions.values() if getattr(s, "enabled", True)),
         key=lambda s: s.name,
     )
-    rows = [
-        _build_session_info(
-            config=config,
-            session=session,
-            storage_session=storage_session,
-            windows=windows,
-            paused=session.name in paused,
+    rows = []
+    for session in sessions:
+        paused, paused_reason = _pause_status_from_state(
+            pause_state, session.name,
         )
-        for session in sessions
-    ]
+        rows.append(
+            _build_session_info(
+                config=config,
+                session=session,
+                storage_session=storage_session,
+                windows=windows,
+                paused=paused,
+                paused_reason=paused_reason,
+            )
+        )
     return SessionsListResponse(sessions=rows)
 
 
@@ -968,13 +973,15 @@ def get_session_endpoint(name: str, config: ConfigDep) -> SessionDetail:
     session = _find_session(config, name)
     storage_session = _storage_session_name(config)
     windows = _list_storage_closet_windows(storage_session)
-    paused = name in _load_paused_names(config)
+    pause_state = _load_paused_state(config)
+    paused, paused_reason = _pause_status_from_state(pause_state, name)
     info = _build_session_info(
         config=config,
         session=session,
         storage_session=storage_session,
         windows=windows,
         paused=paused,
+        paused_reason=paused_reason,
     )
     window_name = session.window_name or session.name
     window = windows.get(window_name)
@@ -1205,8 +1212,8 @@ def interrupt_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     "/sessions/{name}/pause",
     response_model=ActionResult,
     summary=(
-        "Tag a session as paused (recovery loops honor the marker; "
-        "dispatch/cockpit/heartbeat loops do not yet — #2068)"
+        "Tag a session as paused (daemon loop chokepoints honor the marker; "
+        "some manual send surfaces remain explicit actions — #2068)"
     ),
     operation_id="pauseSession",
     responses={
@@ -1230,13 +1237,11 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     """POST /api/v1/sessions/{name}/pause — write the pause marker.
 
     **Partial enforcement.** The pause marker is HONORED by the
-    recovery loops
-    (:func:`pollypm.recovery.no_session_spawn.auto_recover_no_session_alerts`
-    and :meth:`pollypm.supervisor.Supervisor.maybe_recover_session`,
-    covering loop 1 + loops 2/3 via the shared apply path); those
-    loops emit a ``session.pause.skip`` audit event and yield. The
-    remaining dispatch / cockpit / heartbeat loops do NOT yet
-    consume the marker — closing those gaps is tracked under #2068.
+    recovery/relaunch, heartbeat per-session, heartbeat send, and
+    task-assignment dispatch chokepoints wired under #2068; those
+    loops emit a ``session.pause.skip`` audit event and yield. Some
+    direct/manual cockpit and chat send surfaces remain explicit
+    operator actions.
     The response ``message`` spells this out so operators know which
     loops they have quiesced and which still act.
 
@@ -1312,7 +1317,7 @@ def pause_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
     response_model=ActionResult,
     summary=(
         "Clear the pause marker (recovery loops resume immediately; "
-        "dispatch/cockpit/heartbeat loops were never paused — #2068)"
+        "wired daemon-loop chokepoints resume immediately — #2068)"
     ),
     operation_id="resumeSession",
     responses={
@@ -1336,9 +1341,9 @@ def resume_session_endpoint(name: str, config: ConfigDep) -> ActionResult:
 
     Idempotent inverse of :func:`pause_session_endpoint`. The same
     partial-enforcement caveat applies: clearing the marker lifts
-    the yield in the recovery loops immediately, but the remaining
-    dispatch / cockpit / heartbeat loops were never honouring it in
-    the first place (tracked under #2068).
+    the yield in the wired daemon-loop chokepoints immediately. Some
+    direct/manual cockpit and chat send surfaces remain explicit
+    operator actions.
     """
     _find_session(config, name)  # 404 if unknown
     try:

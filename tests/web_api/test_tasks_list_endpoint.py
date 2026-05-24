@@ -17,6 +17,8 @@ state across runs.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 import pytest
 
 from pollypm.work.factory import create_work_service
@@ -74,6 +76,32 @@ def _seed_untracked_project(api_config, workspace_root, key: str = "paused"):
     return project_root
 
 
+def _parse_api_datetime(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _stamp_task_timing(
+    pg_schema_pool,
+    *,
+    project: str,
+    task_number: int,
+    created_at: datetime,
+    state: str,
+    state_entered_at: datetime,
+) -> None:
+    with pg_schema_pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE work_tasks SET created_at = %s, updated_at = %s "
+            "WHERE project = %s AND task_number = %s",
+            (created_at, state_entered_at, project, task_number),
+        )
+        cur.execute(
+            "UPDATE work_transitions SET created_at = %s "
+            "WHERE task_project = %s AND task_number = %s AND to_state = %s",
+            (state_entered_at, project, task_number, state),
+        )
+
+
 def test_list_tasks_returns_all_projects(
     api_config, client, auth_headers, project_root, workspace_root
 ) -> None:
@@ -93,12 +121,48 @@ def test_list_tasks_returns_all_projects(
     assert titles == ["My A", "My B", "Second A"]
     assert body["total"] == 3
     assert body["has_more"] is False
+    for item in body["items"]:
+        assert item["created_at"] is not None
+        assert item["state_entered_at"] is not None
+        assert isinstance(item["age_seconds"], int)
+        assert isinstance(item["dwell_seconds"], int)
+        assert item["age_seconds"] >= item["dwell_seconds"] >= 0
     # ``next_cursor`` is absent when no more pages remain.
     assert body.get("next_cursor") is None
     # Every item carries the cross-project ``project`` field so the
     # client can disambiguate without re-querying.
     projects = {item["project"] for item in body["items"]}
     assert projects == {"myproj", "second"}
+
+
+def test_list_tasks_timing_uses_latest_transition(
+    api_config, client, auth_headers, project_root, pg_schema_pool
+) -> None:
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(svc, project="myproj", title="Queued timing")
+        svc.queue(task.task_id, actor="tester")
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    created_at = now - timedelta(hours=3)
+    state_entered_at = now - timedelta(minutes=7)
+    _stamp_task_timing(
+        pg_schema_pool,
+        project="myproj",
+        task_number=task.task_number,
+        created_at=created_at,
+        state="queued",
+        state_entered_at=state_entered_at,
+    )
+
+    response = client.get("/api/v1/tasks?project=myproj", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    [item] = response.json()["items"]
+    assert item["work_status"] == "queued"
+    assert _parse_api_datetime(item["created_at"]) == created_at
+    assert _parse_api_datetime(item["state_entered_at"]) == state_entered_at
+    assert item["age_seconds"] > item["dwell_seconds"]
 
 
 def test_list_tasks_project_filter(

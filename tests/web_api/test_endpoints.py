@@ -211,6 +211,11 @@ def test_get_task_detail_renders_full_record(api_config, client, auth_headers, p
     assert body["title"] == "Detail"
     assert body["description"] == "hello"
     assert body["task_id"] == task.task_id
+    assert body["created_at"] is not None
+    assert body["state_entered_at"] is not None
+    assert isinstance(body["age_seconds"], int)
+    assert isinstance(body["dwell_seconds"], int)
+    assert body["age_seconds"] >= body["dwell_seconds"] >= 0
     assert "transitions" in body
     assert "executions" in body
     assert "relationships" in body

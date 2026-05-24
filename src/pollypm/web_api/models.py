@@ -164,6 +164,10 @@ class TaskSummary(BaseModel):
     claimed_by_session: str | None = None
     current_node_id: str | None = None
     plan_version: int | None = None
+    created_at: datetime | None = None
+    state_entered_at: datetime | None = None
+    dwell_seconds: int | None = None
+    age_seconds: int | None = None
     updated_at: datetime | None = None
 
 
@@ -266,7 +270,6 @@ class TaskDetail(TaskSummary):
     total_input_tokens: int | None = None
     total_output_tokens: int | None = None
     session_count: int | None = None
-    created_at: datetime | None = None
     created_by: str | None = None
     plan: Plan | None = None
 

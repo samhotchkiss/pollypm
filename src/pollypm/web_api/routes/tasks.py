@@ -128,7 +128,7 @@ def list_tasks_endpoint(
             )
 
     try:
-        items, next_cursor, warnings = list_all_tasks(
+        items, next_cursor, warnings, total = list_all_tasks(
             config,
             project=project,
             statuses=status,
@@ -153,6 +153,8 @@ def list_tasks_endpoint(
 
     return TaskListResponse(
         items=items,
+        total=total,
+        has_more=next_cursor is not None,
         next_cursor=next_cursor,
         warnings=warnings or None,
     )

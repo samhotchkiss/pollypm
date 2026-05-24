@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,10 +36,14 @@ from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
 from pollypm.web_api import create_app, ensure_token
 from pollypm.web_api.errors import APIError
 from pollypm.web_api.models import (
+    InboxItem,
     TaskDetail,
     TaskRelationships,
+    TaskSummary,
 )
 from pollypm.web_api.routes import inbox as inbox_routes
+from pollypm.web_api.routes import projects as project_routes
+from pollypm.web_api.routes import tasks as task_routes
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +176,87 @@ def _make_task_detail(
         created_at=datetime(2026, 5, 20, 9, 0, 0, tzinfo=timezone.utc),
         created_by="tester",
     )
+
+
+def _make_task_summary(*, task_id: str = "myproj/1") -> TaskSummary:
+    project, num = task_id.split("/", 1)
+    return TaskSummary(
+        task_id=task_id,
+        project=project,
+        task_number=int(num),
+        title="Task",
+        work_status="queued",
+        type="task",
+        priority="normal",
+        updated_at=datetime(2026, 5, 20, 9, 0, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_list_inbox_response_includes_counts(
+    client, auth_headers, monkeypatch,
+) -> None:
+    now = datetime(2026, 5, 20, 9, 0, 0, tzinfo=timezone.utc)
+    item = InboxItem(
+        id="myproj/1",
+        project="myproj",
+        type="message",
+        state="open",
+        subject="Inbox item",
+        owner="pm",
+        thread_id="myproj/1",
+        created_at=now,
+        updated_at=now,
+    )
+
+    def fake_list_inbox(*_args, **_kwargs):
+        return SimpleNamespace(
+            items=[item],
+            total=3,
+            has_more=True,
+            unread_count=2,
+            next_cursor="myproj/1",
+        )
+
+    monkeypatch.setattr(inbox_routes, "list_inbox", fake_list_inbox)
+
+    response = client.get("/api/v1/inbox?limit=1", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert body["has_more"] is True
+    assert body["unread_count"] == 2
+    assert body["next_cursor"] == "myproj/1"
+
+
+def test_task_list_responses_include_counts(
+    client, auth_headers, monkeypatch,
+) -> None:
+    summary = _make_task_summary()
+
+    def fake_list_all_tasks(*_args, **_kwargs):
+        return [summary], "cursor-1", [], 4
+
+    def fake_list_project_tasks(*_args, **_kwargs):
+        return [summary], None, 1
+
+    monkeypatch.setattr(task_routes, "list_all_tasks", fake_list_all_tasks)
+    monkeypatch.setattr(
+        project_routes, "list_project_tasks", fake_list_project_tasks,
+    )
+
+    flat = client.get("/api/v1/tasks?limit=1", headers=auth_headers)
+    project = client.get("/api/v1/projects/myproj/tasks", headers=auth_headers)
+
+    assert flat.status_code == 200, flat.text
+    flat_body = flat.json()
+    assert flat_body["total"] == 4
+    assert flat_body["has_more"] is True
+    assert flat_body["next_cursor"] == "cursor-1"
+    assert project.status_code == 200, project.text
+    project_body = project.json()
+    assert project_body["total"] == 1
+    assert project_body["has_more"] is False
 
 
 # ---------------------------------------------------------------------------
@@ -2020,3 +2106,191 @@ def test_inbox_item_type_uses_exact_plan_review_label() -> None:
         "equality (#2060)."
     )
     assert entry.type == "message"
+
+
+# ---------------------------------------------------------------------------
+# Inbox read filters / thread visibility (#2209, #2205, #2212, #2215)
+# ---------------------------------------------------------------------------
+
+
+class _ReadInboxTask:
+    def __init__(
+        self,
+        n: int,
+        *,
+        title: str | None = None,
+        status=None,
+        kind=None,
+        labels: list[str] | None = None,
+        updated_at: datetime | None = None,
+    ) -> None:
+        from pollypm.inbox.kind import InboxItemKind
+        from pollypm.work.models import WorkStatus
+
+        self.task_id = f"myproj/{n}"
+        self.project = "myproj"
+        self.task_number = n
+        self.title = title or f"inbox {n}"
+        self.description = f"body {n}"
+        self.flow_template_id = "chat"
+        self.flow_template_version = 1
+        self.labels = labels or []
+        self.roles = {"requester": "user", "operator": "pm"}
+        self.current_node_id = None
+        self.work_status = status or WorkStatus.IN_PROGRESS
+        self.kind = kind or InboxItemKind.LEGACY
+        self.created_at = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
+        self.updated_at = updated_at or self.created_at
+
+
+class _ReadInboxSvc:
+    def __init__(self, tasks: list[_ReadInboxTask]) -> None:
+        self.tasks = tasks
+        self.candidate_calls: list[dict] = []
+        self.list_tasks_calls = 0
+        self.replies: list = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def list_inbox_candidate_tasks(self, **kwargs):
+        self.candidate_calls.append(dict(kwargs))
+        limit = kwargs.get("limit")
+        rows = list(self.tasks)
+        if limit is not None:
+            rows = rows[: int(limit)]
+        return rows
+
+    def list_tasks(self, **kwargs):  # pragma: no cover - regression guard
+        self.list_tasks_calls += 1
+        raise AssertionError("bounded inbox path must use candidate helper")
+
+    def latest_snoozes_bulk(self, keys):
+        return {}
+
+    def get_flow(self, name, project=None):
+        return None
+
+    def get(self, item_id):
+        for task in self.tasks:
+            if task.task_id == item_id:
+                return task
+        from pollypm.work.service_support import TaskNotFoundError
+
+        raise TaskNotFoundError(item_id)
+
+    def list_replies(self, task_id):
+        return list(self.replies)
+
+
+def _install_read_inbox_svc(monkeypatch, svc: _ReadInboxSvc) -> None:
+    def fake_factory(*, config, project_key, project_path):
+        return svc
+
+    monkeypatch.setattr(
+        "pollypm.work.factory.create_work_service", fake_factory,
+    )
+
+
+def test_list_inbox_state_closed_returns_archived_task(
+    client, auth_headers, monkeypatch,
+) -> None:
+    from pollypm.inbox.kind import InboxItemKind
+    from pollypm.work.models import WorkStatus
+
+    svc = _ReadInboxSvc([
+        _ReadInboxTask(
+            1,
+            title="Archived inbox thread",
+            status=WorkStatus.DONE,
+            kind=InboxItemKind.LEGACY,
+        )
+    ])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get("/api/v1/inbox?state=closed", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["myproj/1"]
+    assert body["items"][0]["state"] == "closed"
+    assert svc.candidate_calls[0]["state_filter"] == "closed"
+
+
+def test_list_inbox_type_filter_matches_structured_kind(
+    client, auth_headers, monkeypatch,
+) -> None:
+    from pollypm.inbox.kind import InboxItemKind
+
+    svc = _ReadInboxSvc([
+        _ReadInboxTask(
+            1, title="Approval", kind=InboxItemKind.APPROVAL_REQUEST,
+        ),
+        _ReadInboxTask(
+            2, title="Manual", kind=InboxItemKind.MANUAL_DECISION,
+        ),
+    ])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get(
+        "/api/v1/inbox?type=approval_request", headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["subject"] for item in body["items"]] == ["Approval"]
+    assert body["items"][0]["type"] == "approval_request"
+    assert body["items"][0]["metadata"]["kind"] == "approval_request"
+    assert svc.candidate_calls[0]["type_filter"] == "approval_request"
+
+
+def test_list_inbox_limit_passes_bounded_candidate_limit(
+    client, auth_headers, monkeypatch,
+) -> None:
+    tasks = [
+        _ReadInboxTask(
+            i,
+            updated_at=datetime(2026, 5, 22, 12, i, tzinfo=timezone.utc),
+        )
+        for i in range(1, 20)
+    ]
+    svc = _ReadInboxSvc(tasks)
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get("/api/v1/inbox?limit=10", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["items"]) == 10
+    assert body["next_cursor"] is not None
+    assert svc.candidate_calls[0]["limit"] == 11
+    assert svc.list_tasks_calls == 0
+
+
+def test_inbox_detail_messages_include_reply_context(
+    client, auth_headers, monkeypatch,
+) -> None:
+    class _Reply:
+        def __init__(self, actor: str, text: str, minute: int) -> None:
+            self.actor = actor
+            self.text = text
+            self.entry_type = "reply"
+            self.timestamp = datetime(
+                2026, 5, 22, 12, minute, tzinfo=timezone.utc,
+            )
+
+    svc = _ReadInboxSvc([_ReadInboxTask(1, title="Thread with replies")])
+    svc.replies = [
+        _Reply("operator", "first reply", 1),
+        _Reply("pm", "second reply", 2),
+    ]
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get("/api/v1/inbox/myproj/1", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [m["body"] for m in body["messages"]] == [
+        "first reply",
+        "second reply",
+    ]
+    assert [m["sender"] for m in body["messages"]] == ["operator", "pm"]

@@ -450,7 +450,8 @@ A triaged item in `<project>/.pollypm/inbox/`. Mirrors the inbox
 plugin's item shape (see `docs/v1/09-inbox-and-threads.md`).
 
 Fields: `id`, `project`, `type` (`message`, `plan_review`,
-`blocking_question`, `alert`, ...), `state` (`open`, `threaded`,
+`blocking_question`, `alert`, or a structured inbox `kind` value such
+as `approval_request` / `manual_decision`), `state` (`open`, `threaded`,
 `waiting-on-pa`, `waiting-on-pm`, `resolved`, `closed`), `subject`,
 `preview`, `owner` (`pm` / `pa` / `worker`), `created_at`,
 `updated_at`, `thread_id` (nullable), `metadata` (sidecar labels),

@@ -526,6 +526,116 @@ class PgWorkService:
             tasks = [task for task in tasks if task.blocked == blocked]
         return tasks
 
+    def list_inbox_candidate_tasks(
+        self,
+        *,
+        project: str | None = None,
+        type_filter: str | None = None,
+        state_filter: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[Task]:
+        """Return task rows that can belong to the API/cockpit inbox.
+
+        This is intentionally a candidate query: SQL applies cheap indexed
+        state/type/identity predicates and the caller still runs the canonical
+        :mod:`pollypm.work.inbox_view` predicate for flow-node semantics.
+        Keeping the limit in this service method prevents ``GET /inbox`` from
+        reading every task just to serve a small first page.
+        """
+        where: list[str] = []
+        params: list[object] = []
+        if project is not None:
+            where.append("project = %s")
+            params.append(project)
+
+        state = (state_filter or "").strip().lower()
+        terminal_values = sorted(s.value for s in TERMINAL_STATUSES)
+        if state in {"closed", "resolved", "archived"}:
+            where.append("work_status = ANY(%s)")
+            params.append(terminal_values)
+        elif state == "waiting-on-pm":
+            where.append("work_status = %s")
+            params.append(WorkStatus.REVIEW.value)
+        elif state == "open":
+            where.append("work_status <> ALL(%s)")
+            params.append(terminal_values + [WorkStatus.REVIEW.value])
+        elif state in {"threaded", "waiting-on-pa"}:
+            where.append("FALSE")
+        else:
+            where.append("work_status <> ALL(%s)")
+            params.append(terminal_values)
+
+        wanted_type = (type_filter or "").strip()
+        if wanted_type:
+            if wanted_type in {"plan_review", InboxItemKind.PLAN_REVIEW_PENDING.value}:
+                where.append("(kind = %s OR labels ? %s)")
+                params.extend([InboxItemKind.PLAN_REVIEW_PENDING.value, "plan_review"])
+            elif wanted_type == "blocking_question":
+                where.append("labels ? %s")
+                params.append("blocking_question")
+            elif wanted_type == "alert":
+                where.append("kind = %s")
+                params.append(InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value)
+            elif wanted_type == "message":
+                where.append(
+                    "(kind = %s AND NOT (labels ? %s) AND NOT (labels ? %s))"
+                )
+                params.extend(
+                    [InboxItemKind.LEGACY.value, "plan_review", "blocking_question"]
+                )
+            else:
+                where.append("kind = %s")
+                params.append(wanted_type)
+
+        where.append(
+            "("
+            "roles ? 'user' "
+            "OR EXISTS ("
+            "SELECT 1 FROM jsonb_each_text(work_tasks.roles) AS role(k, v) "
+            "WHERE role.v = 'user'"
+            ") "
+            "OR labels ? 'plan_review' "
+            "OR current_node_id IS NOT NULL"
+            ")"
+        )
+
+        clause = " WHERE " + " AND ".join(where)
+        order_limit = " ORDER BY updated_at DESC, project ASC, task_number DESC"
+        if limit is not None:
+            order_limit += " LIMIT %s"
+            params.append(int(limit))
+        if offset is not None:
+            order_limit += " OFFSET %s"
+            params.append(int(offset))
+        sql = (
+            "SELECT project, task_number, project_key, title, type, labels, "
+            "work_status, flow_template_id, flow_template_version, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
+            "description, acceptance_criteria, constraints, relevant_files, "
+            "parent_project, parent_task_number, "
+            "supersedes_project, supersedes_task_number, "
+            "plan_version, predecessor_task_id, kind, "
+            "roles, external_refs, "
+            "created_at, created_by, updated_at "
+            "FROM work_tasks" + clause + order_limit
+        )
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+        keys = [(str(r[0]), int(r[1])) for r in rows]
+        rels_by_key = self._load_relationships_bulk(keys)
+        return [
+            self._row_to_task(
+                row,
+                relationships=rels_by_key.get(
+                    (str(row[0]), int(row[1])), None
+                ),
+            )
+            for row in rows
+        ]
+
     def _row_to_task(
         self,
         row: tuple,

@@ -18,6 +18,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -30,8 +31,15 @@ import psycopg_pool
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
-from pollypm.work.inbox_snooze import is_snooze_active as _is_snooze_active
-from pollypm.work.inbox_view import is_inbox_task, is_inbox_task_identity
+from pollypm.work import inbox_snooze as _inbox_snooze
+from pollypm.work.inbox_view import (
+    inbox_item_type_for_task,
+    inbox_state_for_task,
+    inbox_task_matches_type,
+    is_archived_inbox_task,
+    is_inbox_task,
+    is_inbox_task_identity,
+)
 from pollypm.web_api.errors import (
     APIError,
     not_found,
@@ -67,6 +75,18 @@ from pollypm.work.cancel_safety import (
 )
 
 logger = logging.getLogger(__name__)
+
+_is_snooze_active = _inbox_snooze.is_snooze_active
+_parse_snooze_until = _inbox_snooze.parse_snooze_until
+
+
+@dataclass(frozen=True)
+class InboxListPage:
+    items: list[APIInboxItem]
+    next_cursor: str | None
+    total: int
+    has_more: bool
+    unread_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -1129,7 +1149,7 @@ def list_project_tasks(
     status: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APITaskSummary], str | None]:
+) -> tuple[list[APITaskSummary], str | None, int]:
     """Page of task summaries with cursor-based pagination.
 
     The cursor is the integer ``task_number`` of the last item in the
@@ -1139,7 +1159,7 @@ def list_project_tasks(
     """
     project = config.projects.get(project_key)
     if project is None:
-        return [], None
+        return [], None, 0
 
     cursor_n: int | None = None
     if cursor is not None:
@@ -1161,13 +1181,14 @@ def list_project_tasks(
         ) as svc:
             tasks = svc.list_tasks(project=project_key, work_status=status)
             tasks.sort(key=lambda t: getattr(t, "task_number", 0))
+            total = len(tasks)
             if cursor_n is not None:
                 tasks = [t for t in tasks if getattr(t, "task_number", 0) > cursor_n]
             page = tasks[:limit]
             next_cursor: str | None = None
             if len(tasks) > limit and page:
                 next_cursor = str(getattr(page[-1], "task_number", 0))
-            return [_task_to_summary(t) for t in page], next_cursor
+            return [_task_to_summary(t) for t in page], next_cursor, total
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "list_tasks: backing store error for %s: %s",
@@ -1203,7 +1224,7 @@ def list_all_tasks(
     include_untracked: bool = False,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]]]:
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]], int]:
     """Cross-project flat task list (spec §5.1 / Phase 6 P0).
 
     The default scoped view iterates tracked projects, calls
@@ -1234,7 +1255,7 @@ def list_all_tasks(
       duplicate rows / infinite loops under concurrent updates
       (PR #2067 Codex round 1, P0 #3).
 
-    Returns ``(page, next_cursor, warnings)``. ``warnings`` contains
+    Returns ``(page, next_cursor, warnings, total)``. ``warnings`` contains
     either per-project backing-store failures
     (``{"project": <key>, "error": <code>}``) or the tracked-scope
     filter warning (``{"code": "untracked_filtered", ...}``). An
@@ -1413,7 +1434,7 @@ def _page_task_summaries(
     limit: int,
     cursor: str | None,
     warnings: list[dict[str, object]],
-) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]]]:
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]], int]:
     # Newest-first ordering is the most useful default for cross-
     # project list views (cockpit "what changed recently?"). Tasks
     # without ``updated_at`` sort to the end via the epoch fallback so
@@ -1442,12 +1463,13 @@ def _page_task_summaries(
             # and force the client to restart explicitly.
             raise StaleCursorError(cursor)
 
+    total = len(summaries)
     page = summaries[cursor_idx : cursor_idx + limit]
     next_cursor: str | None = None
     if cursor_idx + limit < len(summaries) and page:
         tail = page[-1]
         next_cursor = f"{(tail.updated_at or epoch).isoformat()}|{tail.task_id}"
-    return page, next_cursor, warnings
+    return page, next_cursor, warnings, total
 
 
 def get_task_detail(
@@ -3322,18 +3344,37 @@ def list_inbox(
     state_filter: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APIInboxItem], str | None]:
+) -> InboxListPage:
     """Aggregate inbox view across one or all projects.
 
     Mirrors :func:`pollypm.cockpit_inbox.render_inbox_panel` at a
     coarser granularity — the API only exposes the typed shape per
     spec §7. Projects with no inbox state contribute nothing.
     """
-    items = _collect_inbox_items(config, project=project)
-    if type_filter is not None:
-        items = [i for i in items if i.type == type_filter]
-    if state_filter is not None:
-        items = [i for i in items if i.state == state_filter]
+    # Preserve the first-page hot path from #2205: fetch only enough
+    # candidates to render the page plus one sentinel, then run the
+    # full scan separately for exact metadata fields required by the
+    # response contract (#2231). Cursor pages already require the full
+    # ordered set to locate the cursor.
+    candidate_limit = None if cursor is not None else limit + 1
+    items, candidate_unread_count, candidate_complete = _collect_inbox_items(
+        config,
+        project=project,
+        type_filter=type_filter,
+        state_filter=state_filter,
+        limit=candidate_limit,
+    )
+    if candidate_limit is None or candidate_complete:
+        metric_items = items
+        unread_count = candidate_unread_count
+    else:
+        metric_items, unread_count, _ = _collect_inbox_items(
+            config,
+            project=project,
+            type_filter=type_filter,
+            state_filter=state_filter,
+            limit=None,
+        )
     items.sort(key=lambda item: item.updated_at, reverse=True)
 
     cursor_idx = 0
@@ -3342,16 +3383,51 @@ def list_inbox(
             if item.id == cursor:
                 cursor_idx = idx + 1
                 break
+    total = len(metric_items)
     page = items[cursor_idx : cursor_idx + limit]
     next_cursor: str | None = None
     if cursor_idx + limit < len(items) and page:
         next_cursor = page[-1].id
-    return page, next_cursor
+    return InboxListPage(
+        items=page,
+        next_cursor=next_cursor,
+        total=total,
+        has_more=next_cursor is not None,
+        unread_count=unread_count,
+    )
 
 
 def get_inbox_item(config: PollyPMConfig, item_id: str) -> APIInboxItemDetail | None:
-    items = _collect_inbox_items(config, project=None)
-    target = next((item for item in items if item.id == item_id), None)
+    if "/" not in item_id:
+        return None
+    project_key = item_id.split("/", 1)[0]
+    project = config.projects.get(project_key)
+    if project is None:
+        return None
+    try:
+        from pollypm.work.service_support import TaskNotFoundError
+
+        with _open_work_service_readonly(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                task = svc.get(item_id)
+            except TaskNotFoundError:
+                return None
+            target = _task_to_inbox_item(
+                task, svc, flow_cache={}, include_closed=True,
+            )
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "get_inbox_item: backing store error for %s: %s",
+            item_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while reading {item_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
     if target is None:
         return None
     messages = _load_inbox_messages(config, target)
@@ -3372,8 +3448,13 @@ def get_inbox_item(config: PollyPMConfig, item_id: str) -> APIInboxItemDetail | 
 
 
 def _collect_inbox_items(
-    config: PollyPMConfig, *, project: str | None
-) -> list[APIInboxItem]:
+    config: PollyPMConfig,
+    *,
+    project: str | None,
+    type_filter: str | None = None,
+    state_filter: str | None = None,
+    limit: int | None = None,
+) -> tuple[list[APIInboxItem], int, bool]:
     """Load inbox items from the work-service for the requested projects.
 
     "Inbox" here = chat-flow tasks + plan-review tasks. Mirrors the
@@ -3382,6 +3463,8 @@ def _collect_inbox_items(
     address it.
     """
     out: list[APIInboxItem] = []
+    unread_count = 0
+    complete = True
     keys: Iterable[str]
     if project is not None:
         keys = (project,) if project in config.projects else ()
@@ -3389,13 +3472,25 @@ def _collect_inbox_items(
         keys = config.projects.keys()
 
     now = datetime.now(timezone.utc)
+    include_closed = _state_filter_requests_closed(state_filter)
     for key in keys:
         proj = config.projects[key]
         try:
             with _open_work_service_readonly(
                 config=config, project_key=key, project_path=proj.path
             ) as svc:
-                tasks = svc.list_tasks(project=key)
+                tasks = _list_inbox_candidate_tasks(
+                    svc,
+                    project=key,
+                    type_filter=type_filter,
+                    state_filter=state_filter,
+                    limit=limit,
+                )
+                if limit is not None and len(tasks) >= limit:
+                    complete = False
+                read_marker_numbers = _task_numbers_with_context_entry(
+                    svc, project=key, entry_type="read", tasks=tasks,
+                )
                 # Snooze visibility (#2060): the snooze write helper
                 # persists ``entry_type='snooze'`` rows whose text
                 # encodes the wake-up time. Items whose latest snooze
@@ -3423,9 +3518,21 @@ def _collect_inbox_items(
                 for task in tasks:
                     if task.task_id in snoozed_ids:
                         continue
-                    entry = _task_to_inbox_item(task, svc, flow_cache=flow_cache)
-                    if entry is not None:
-                        out.append(entry)
+                    if not inbox_task_matches_type(task, type_filter):
+                        continue
+                    entry = _task_to_inbox_item(
+                        task,
+                        svc,
+                        flow_cache=flow_cache,
+                        include_closed=include_closed,
+                    )
+                    if entry is None:
+                        continue
+                    if not _inbox_item_matches_state(entry, state_filter):
+                        continue
+                    out.append(entry)
+                    if _task_number(task) not in read_marker_numbers:
+                        unread_count += 1
         except _BACKING_STORE_ERRORS as exc:
             # Backing-store failure on a single project: log loudly,
             # skip that project but keep building the aggregate. We
@@ -3440,7 +3547,99 @@ def _collect_inbox_items(
                 exc_info=True,
             )
             continue
-    return out
+    return out, unread_count, complete
+
+
+def _task_number(task) -> int:
+    value = getattr(task, "task_number", None)
+    if value is not None:
+        return int(value)
+    return int(str(getattr(task, "task_id")).split("/", 1)[1])
+
+
+def _task_numbers_with_context_entry(
+    svc,
+    *,
+    project: str,
+    entry_type: str,
+    tasks,
+) -> set[int]:
+    bulk = getattr(svc, "task_numbers_with_context_entry", None)
+    if callable(bulk):
+        return set(bulk(project=project, entry_type=entry_type))
+
+    marked: set[int] = set()
+    for task in tasks:
+        try:
+            entries = svc.get_context(
+                task.task_id, entry_type=entry_type, limit=1,
+            )
+        except Exception:  # noqa: BLE001 - metrics should not hide inbox rows
+            logger.debug(
+                "inbox: context marker lookup failed for %s",
+                getattr(task, "task_id", "<unknown>"),
+                exc_info=True,
+            )
+            continue
+        if entries:
+            marked.add(_task_number(task))
+    return marked
+
+
+_CLOSED_INBOX_STATE_FILTERS: frozenset[str] = frozenset(
+    {"closed", "resolved", "archived"}
+)
+
+
+def _state_filter_requests_closed(state_filter: str | None) -> bool:
+    return (
+        state_filter is not None
+        and str(state_filter).strip().lower() in _CLOSED_INBOX_STATE_FILTERS
+    )
+
+
+def _inbox_item_matches_state(
+    item: APIInboxItem, state_filter: str | None,
+) -> bool:
+    if state_filter is None:
+        return item.state != "closed"
+    wanted = str(state_filter).strip().lower()
+    if wanted in _CLOSED_INBOX_STATE_FILTERS:
+        return item.state == "closed"
+    return item.state == wanted
+
+
+def _list_inbox_candidate_tasks(
+    svc,
+    *,
+    project: str,
+    type_filter: str | None,
+    state_filter: str | None,
+    limit: int | None,
+):
+    """Ask the work-service for a bounded inbox-candidate page.
+
+    Pg exposes ``list_inbox_candidate_tasks`` so state/type predicates and
+    limits land in SQL. Older fakes/backends fall back to ``list_tasks`` with
+    the same limit when their signature accepts it.
+    """
+    optimized = getattr(svc, "list_inbox_candidate_tasks", None)
+    if callable(optimized):
+        return optimized(
+            project=project,
+            type_filter=type_filter,
+            state_filter=state_filter,
+            limit=limit,
+        )
+
+    kwargs: dict[str, object] = {"project": project}
+    if limit is not None:
+        kwargs["limit"] = limit
+    try:
+        return svc.list_tasks(**kwargs)
+    except TypeError:
+        kwargs.pop("limit", None)
+        return svc.list_tasks(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -3581,10 +3780,25 @@ class _NoFlowLookup:
         return None
 
 
-def _task_to_inbox_item(task, svc=None, flow_cache=None) -> APIInboxItem | None:
-    if not _is_inbox_member(task, svc, flow_cache=flow_cache):
+def _task_to_inbox_item(
+    task,
+    svc=None,
+    flow_cache=None,
+    *,
+    include_closed: bool = False,
+) -> APIInboxItem | None:
+    is_member = _is_inbox_member(task, svc, flow_cache=flow_cache)
+    if not is_member:
+        if not include_closed:
+            return None
+        flow_lookup = svc if svc is not None else _NoFlowLookup()
+        if not is_archived_inbox_task(
+            task, flow_lookup, flow_cache=flow_cache,
+        ):
+            return None
+    state = _inbox_state_from_task(task)
+    if state == "closed" and not include_closed:
         return None
-    flow = (getattr(task, "flow_template_id", "") or "").lower()
     labels = [str(lbl) for lbl in (getattr(task, "labels", []) or [])]
     # Exact-equality on ``plan_review`` (NOT substring) so labels like
     # ``not_plan_review`` / ``planning`` cannot get classified as
@@ -3592,17 +3806,15 @@ def _task_to_inbox_item(task, svc=None, flow_cache=None) -> APIInboxItem | None:
     # :func:`pollypm.work.inbox_view._is_plan_review_label` predicate
     # the write gate uses — Codex round-6 blocker 3 on PR #2060.
     is_plan_review = any(lbl == "plan_review" for lbl in labels)
-    is_chat = flow == "chat"
-    item_type = "plan_review" if is_plan_review and not is_chat else "message"
-    state = _inbox_state_from_task(task)
-    if state == "closed":
-        return None
+    item_type = inbox_item_type_for_task(task)
     body = task.description or ""
     preview = body.strip().splitlines()[0] if body.strip() else None
     metadata: dict[str, Any] = {
         "task_id": task.task_id,
         "labels": labels,
         "flow_template_id": task.flow_template_id,
+        "kind": getattr(getattr(task, "kind", None), "value", None)
+        or str(getattr(task, "kind", "legacy") or "legacy"),
     }
     if is_plan_review:
         metadata["judgment_calls"] = _extract_judgment_calls(body)
@@ -3622,17 +3834,7 @@ def _task_to_inbox_item(task, svc=None, flow_cache=None) -> APIInboxItem | None:
 
 
 def _inbox_state_from_task(task) -> str:
-    status = getattr(task, "work_status", None)
-    value = getattr(status, "value", str(status)) if status else ""
-    if value in {"done", "cancelled"}:
-        return "closed"
-    if value == "review":
-        return "waiting-on-pm"
-    if value in {"in_progress", "queued", "draft"}:
-        return "open"
-    if value in {"blocked", "on_hold", "rework"}:
-        return "open"
-    return "open"
+    return inbox_state_for_task(task)
 
 
 def _inbox_owner_for_task(task) -> str:
@@ -3646,7 +3848,7 @@ def _inbox_owner_for_task(task) -> str:
 
 
 def _load_inbox_messages(config: PollyPMConfig, item: APIInboxItem) -> list[APIInboxMessage]:
-    """Pull the context-log entries that drive an inbox thread."""
+    """Pull reply context entries that drive an inbox thread."""
     project = config.projects.get(item.project)
     if project is None:
         return []
@@ -3656,7 +3858,12 @@ def _load_inbox_messages(config: PollyPMConfig, item: APIInboxItem) -> list[APII
         with _open_work_service_readonly(
             config=config, project_key=item.project, project_path=project.path
         ) as svc:
-            entries = svc.get_context(item.id) or []
+            list_replies = getattr(svc, "list_replies", None)
+            if callable(list_replies):
+                entries = list_replies(item.id) or []
+            else:
+                entries = svc.get_context(item.id, entry_type="reply") or []
+                entries = list(reversed(entries))
     except Exception as exc:  # noqa: BLE001
         logger.debug("inbox: get_context failed for %s: %s", item.id, exc)
         return out

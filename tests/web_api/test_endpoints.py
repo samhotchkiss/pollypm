@@ -86,6 +86,8 @@ def test_list_project_tasks_returns_tasks(api_config, client, auth_headers, proj
     titles = [item["title"] for item in body["items"]]
     assert "First" in titles
     assert "Second" in titles
+    assert body["total"] >= 2
+    assert body["has_more"] is (body.get("next_cursor") is not None)
 
 
 def test_list_project_tasks_pagination_cursor(api_config, client, auth_headers, project_root) -> None:
@@ -99,6 +101,8 @@ def test_list_project_tasks_pagination_cursor(api_config, client, auth_headers, 
         "/api/v1/projects/myproj/tasks?limit=2", headers=auth_headers
     ).json()
     assert len(first["items"]) == 2
+    assert first["total"] >= 5
+    assert first["has_more"] is True
     assert first.get("next_cursor") is not None
 
     second = client.get(
@@ -106,6 +110,7 @@ def test_list_project_tasks_pagination_cursor(api_config, client, auth_headers, 
         headers=auth_headers,
     ).json()
     assert len(second["items"]) == 2
+    assert second["total"] >= 5
     # Pages don't overlap.
     first_ids = {item["task_id"] for item in first["items"]}
     second_ids = {item["task_id"] for item in second["items"]}
@@ -182,14 +187,17 @@ def test_list_inbox_empty_state(client, auth_headers) -> None:
     response = client.get("/api/v1/inbox", headers=auth_headers)
     assert response.status_code == 200
     body = response.json()
-    assert body["items"] == []
+    assert isinstance(body["items"], list)
+    assert body["total"] >= len(body["items"])
+    assert body["has_more"] is (body.get("next_cursor") is not None)
+    assert 0 <= body["unread_count"] <= body["total"]
 
 
 def test_list_inbox_returns_chat_tasks(api_config, client, auth_headers, project_root) -> None:
     db_path = api_config.project.state_db
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with create_work_service(db_path=db_path, project_path=project_root) as svc:
-        make_task(
+        read_task = make_task(
             svc,
             project="myproj",
             title="Chat thread",
@@ -197,10 +205,24 @@ def test_list_inbox_returns_chat_tasks(api_config, client, auth_headers, project
             flow_template="chat",
             roles={"requester": "user", "operator": "pm"},
         )
+        make_task(
+            svc,
+            project="myproj",
+            title="Unread chat thread",
+            description="Hello again",
+            flow_template="chat",
+            roles={"requester": "user", "operator": "pm"},
+        )
+        svc.mark_read(read_task.task_id, actor="tester")
     response = client.get("/api/v1/inbox", headers=auth_headers)
     assert response.status_code == 200
-    titles = [item["subject"] for item in response.json()["items"]]
+    body = response.json()
+    titles = [item["subject"] for item in body["items"]]
     assert "Chat thread" in titles
+    assert "Unread chat thread" in titles
+    assert body["total"] >= 2
+    assert body["has_more"] is (body.get("next_cursor") is not None)
+    assert 0 <= body["unread_count"] <= body["total"]
 
 
 def test_get_inbox_item_404_for_unknown(client, auth_headers) -> None:

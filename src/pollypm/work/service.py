@@ -107,6 +107,24 @@ class WorkService(Protocol):
         """Query tasks with optional filters."""
         ...
 
+    def list_inbox_candidate_tasks(
+        self,
+        *,
+        project: str | None = None,
+        type_filter: str | None = None,
+        state_filter: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[Task]:
+        """Query a bounded page of task rows that can belong to the inbox.
+
+        Implementations should push cheap state/type/limit predicates into
+        storage, then callers run the canonical inbox-view predicate before
+        exposing rows. This keeps API pagination from full-scanning the work
+        table while preserving service ownership of storage rules.
+        """
+        ...
+
     def queue(self, task_id: str, actor: str, skip_gates: bool = False) -> Task:
         """Move a task from ``draft`` to ``queued``.
 

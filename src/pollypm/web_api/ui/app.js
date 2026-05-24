@@ -18,6 +18,7 @@
   const FALLBACK_POLL_MS = 15000;
   const SSE_RETRY_MS = 30000;
   const SSE_FAILURE_LIMIT = 3;
+  const SSE_STABLE_OPEN_MS = 5000;
   const PUSH_REFRESH_DEBOUNCE_MS = 150;
   const MAX_MESSAGES = 50;
   const SESSION_ISSUED_COOKIE = "pollypm-session-issued-at";
@@ -36,6 +37,7 @@
     eventSource: null,
     fallbackTimer: null,
     pushRefreshTimer: null,
+    sseStableOpenTimer: null,
     surfacesInFlight: false,
     surfacesRefreshQueued: false,
     dashboardInFlight: false,
@@ -1028,10 +1030,49 @@
     state.fallbackTimer = null;
   }
 
-  function closeEventStream() {
-    if (!state.eventSource) return;
+  function clearSseStableOpenTimer() {
+    if (state.sseStableOpenTimer === null) return;
+    clearTimeout(state.sseStableOpenTimer);
+    state.sseStableOpenTimer = null;
+  }
+
+  function eventSourceIsOpen(source) {
+    if (!source || typeof source.readyState !== "number") return true;
+    const openState = (
+      typeof window.EventSource === "function"
+      && typeof window.EventSource.OPEN === "number"
+    ) ? window.EventSource.OPEN : 1;
+    return source.readyState === openState;
+  }
+
+  function suspendFallbackAfterStableOpen(source) {
+    clearSseStableOpenTimer();
+    state.sseStableOpenTimer = setTimeout(() => {
+      state.sseStableOpenTimer = null;
+      if (state.eventSource !== source) return;
+      if (!eventSourceIsOpen(source)) {
+        startFallbackPolling();
+        return;
+      }
+      stopFallbackPolling();
+    }, SSE_STABLE_OPEN_MS);
+  }
+
+  function resumeFallbackForUnhealthyStream() {
+    clearSseStableOpenTimer();
+    startFallbackPolling();
+  }
+
+  function closeEventStream(options) {
+    const resumeFallback = !options || options.resumeFallback !== false;
+    clearSseStableOpenTimer();
+    if (!state.eventSource) {
+      if (resumeFallback) startFallbackPolling();
+      return;
+    }
     state.eventSource.close();
     state.eventSource = null;
+    if (resumeFallback) startFallbackPolling();
   }
 
   function eventStreamUrl() {
@@ -1070,14 +1111,22 @@
       clearTimeout(state.sseRetryTimer);
       state.sseRetryTimer = null;
     }
-    closeEventStream();
+    closeEventStream({ resumeFallback: false });
+    startFallbackPolling();
 
-    const source = new window.EventSource(eventStreamUrl());
+    let source;
+    try {
+      source = new window.EventSource(eventStreamUrl());
+    } catch (err) {
+      setStatus("warn", "SSE unavailable");
+      scheduleEventStreamRetry();
+      return;
+    }
     state.eventSource = source;
     source.onopen = () => {
       if (state.eventSource !== source) return;
       state.sseFailures = 0;
-      stopFallbackPolling();
+      suspendFallbackAfterStableOpen(source);
       setStatus("ok", "online");
     };
     source.addEventListener("audit", handleSseEvent);
@@ -1085,10 +1134,10 @@
     source.onerror = () => {
       if (state.eventSource !== source) return;
       state.sseFailures += 1;
+      resumeFallbackForUnhealthyStream();
       setStatus("warn", "SSE reconnecting");
       if (state.sseFailures >= SSE_FAILURE_LIMIT) {
         closeEventStream();
-        startFallbackPolling();
         scheduleEventStreamRetry();
       }
     };
@@ -1142,7 +1191,6 @@
     wireStopAgentButton();
     setStatus("warn", "connecting…");
     loadSurfaces();
-    pollDashboard();
     startEventStream();
     setInterval(loadSurfaces, 30000);
   }

@@ -44,11 +44,16 @@ test.describe("surfaces", () => {
     await page.addInitScript(() => {
       const instances: any[] = [];
       class MockEventSource {
+        static CONNECTING = 0;
+        static OPEN = 1;
+        static CLOSED = 2;
+
         url: string;
-        listeners: Record<string, EventListenerOrEventListenerObject>;
+        listeners: Record<string, EventListenerOrEventListenerObject[]>;
         onopen: ((event: Event) => void) | null;
         onmessage: ((event: MessageEvent) => void) | null;
         onerror: ((event: Event) => void) | null;
+        readyState: number;
         closed: boolean;
 
         constructor(url: string) {
@@ -57,10 +62,12 @@ test.describe("surfaces", () => {
           this.onopen = null;
           this.onmessage = null;
           this.onerror = null;
+          this.readyState = MockEventSource.CONNECTING;
           this.closed = false;
           instances.push(this);
           setTimeout(() => {
             if (!this.closed && typeof this.onopen === "function") {
+              this.readyState = MockEventSource.OPEN;
               this.onopen(new Event("open"));
             }
           }, 0);
@@ -70,16 +77,79 @@ test.describe("surfaces", () => {
           type: string,
           handler: EventListenerOrEventListenerObject,
         ) {
-          this.listeners[type] = handler;
+          const handlers = this.listeners[type] || [];
+          handlers.push(handler);
+          this.listeners[type] = handlers;
+        }
+
+        removeEventListener(
+          type: string,
+          handler: EventListenerOrEventListenerObject,
+        ) {
+          const handlers = this.listeners[type] || [];
+          this.listeners[type] = handlers.filter((item) => item !== handler);
+        }
+
+        dispatch(type: string, event: Event) {
+          for (const handler of this.listeners[type] || []) {
+            if (typeof handler === "function") {
+              handler.call(this, event);
+            } else {
+              handler.handleEvent(event);
+            }
+          }
+          if (type === "message" && typeof this.onmessage === "function") {
+            this.onmessage(event as MessageEvent);
+          }
+        }
+
+        emit(type: string, data: string, lastEventId: string) {
+          const event = new MessageEvent(type, {
+            data,
+            lastEventId,
+          });
+          this.dispatch(type, event);
+        }
+
+        fail() {
+          if (this.closed) return;
+          this.readyState = MockEventSource.CONNECTING;
+          if (typeof this.onerror === "function") {
+            this.onerror(new Event("error"));
+          }
         }
 
         close() {
           this.closed = true;
+          this.readyState = MockEventSource.CLOSED;
         }
       }
 
       (window as any).__pollypmEventSources = instances;
       (window as any).EventSource = MockEventSource as any;
+    });
+  }
+
+  async function emitAuditEvent(
+    page: import("@playwright/test").Page,
+    index: number,
+  ) {
+    await page.evaluate((eventIndex) => {
+      const source = (window as any).__pollypmEventSources[0];
+      const seconds = String(eventIndex).padStart(2, "0");
+      const ts = `2026-05-23T00:00:${seconds}Z`;
+      source.emit(
+        "audit",
+        JSON.stringify({ ts, event: "message" }),
+        ts,
+      );
+    }, index);
+  }
+
+  async function failEventSource(page: import("@playwright/test").Page) {
+    await page.evaluate(() => {
+      const source = (window as any).__pollypmEventSources[0];
+      source.fail();
     });
   }
 
@@ -302,6 +372,87 @@ test.describe("surfaces", () => {
     await expect(page.locator("#message-list .message-text")).toContainText(
       "refresh",
     );
+  });
+
+  test("healthy SSE uses push refreshes without fallback dashboard ticks", async ({ page }) => {
+    await page.clock.install({ time: new Date("2026-05-23T00:00:00Z") });
+    await installHealthyEventSource(page);
+    await stubEmptySessions(page);
+    await stubEmptyTasks(page);
+
+    let dashboardRequests = 0;
+    await page.route("**/api/v1/dashboard", (route) => {
+      dashboardRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(dashboardRequests)),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.clock.runFor(1);
+    await expect.poll(() => dashboardRequests).toBe(1);
+
+    await page.clock.runFor(5001);
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as any).PollyPM.state.fallbackTimer),
+      )
+      .toBeNull();
+
+    await emitAuditEvent(page, 1);
+    await page.clock.runFor(151);
+    await expect.poll(() => dashboardRequests).toBe(2);
+
+    await page.clock.runFor(45000);
+    expect(dashboardRequests).toBe(2);
+
+    await emitAuditEvent(page, 2);
+    await page.clock.runFor(151);
+    await expect.poll(() => dashboardRequests).toBe(3);
+
+    await page.clock.runFor(30000);
+    expect(dashboardRequests).toBe(3);
+  });
+
+  test("SSE error resumes dashboard fallback polling immediately", async ({ page }) => {
+    await page.clock.install({ time: new Date("2026-05-23T00:00:00Z") });
+    await installHealthyEventSource(page);
+    await stubEmptySessions(page);
+    await stubEmptyTasks(page);
+
+    let dashboardRequests = 0;
+    await page.route("**/api/v1/dashboard", (route) => {
+      dashboardRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(dashboardRequests)),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.clock.runFor(1);
+    await expect.poll(() => dashboardRequests).toBe(1);
+
+    await page.clock.runFor(5001);
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as any).PollyPM.state.fallbackTimer),
+      )
+      .toBeNull();
+
+    await failEventSource(page);
+    await expect.poll(() => dashboardRequests).toBe(2);
+    await expect
+      .poll(() =>
+        page.evaluate(() => (window as any).PollyPM.state.fallbackTimer),
+      )
+      .not.toBeNull();
+
+    await page.clock.runFor(15000);
+    await expect.poll(() => dashboardRequests).toBe(3);
   });
 
   test("dashboard refreshes coalesce while a request is in flight", async ({ page }) => {

@@ -1,0 +1,13 @@
+id: worker-task-execution-plan
+role: worker
+session_template: worker_<project>
+prompt: |
+  For a task with acceptance criteria and targeted tests, explain the first
+  three concrete actions you would take before marking it ready for review.
+assertions:
+  must_contain_at_least:
+    - bullets_count: 3
+  must_match_regex:
+    - "(?i)(acceptance|criteria|tests|review)"
+  response_category: action
+timeout_seconds: 90

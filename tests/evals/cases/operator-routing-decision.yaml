@@ -1,0 +1,12 @@
+id: operator-routing-decision
+role: operator
+session_template: operator
+prompt: |
+  Architect just proposed cleanup of the work-table. Should I pause projects first?
+assertions:
+  must_match_regex:
+    - "(?i)(pause|defer|architect|advisor|risk)"
+  must_not_match_regex:
+    - "(?i)i am happy to help"
+  response_category: action
+timeout_seconds: 90

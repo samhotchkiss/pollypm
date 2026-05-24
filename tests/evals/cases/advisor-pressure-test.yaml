@@ -1,0 +1,14 @@
+id: advisor-pressure-test
+role: advisor
+session_template: advisor_<project>
+prompt: |
+  The architect proposes making the eval harness the next priority.
+  Pressure-test this. What's the biggest risk? What's a cheaper alternative?
+assertions:
+  must_match_regex:
+    - "(?i)(risk|concern)"
+    - "(?i)cheaper alternative"
+  must_not_match_regex:
+    - "(?i)i agree completely"
+  response_category: critique
+timeout_seconds: 90

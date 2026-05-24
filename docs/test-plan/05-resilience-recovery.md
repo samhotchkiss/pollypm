@@ -17,32 +17,27 @@
 
 If any of these would affect the operator's real workload, STOP. Move to a test environment.
 
-Suggested snapshot before starting (best-effort):
+Suggested targeted snapshot before starting (best-effort):
 ```bash
 # State you can restore later. Snapshot is best-effort, not transactional —
 # events.jsonl + audit.jsonl + pollypm.toml may have mid-write inconsistencies.
 # Acceptable for a test environment; do not rely on it for production restore.
-cp -r ~/.pollypm /tmp/pollypm-pre-05-snapshot
+SNAPSHOT=/tmp/pollypm-pre-05-snapshot
+rm -rf "$SNAPSHOT"
+mkdir -p "$SNAPSHOT"
 pg_dump pollypm > /tmp/pollypm-pre-05-snapshot.sql
 git -C /Users/sam/dev/pollypm rev-parse HEAD > /tmp/pollypm-pre-05-snapshot.sha
+for path in \
+  ~/.pollypm/paused-sessions.json \
+  ~/.pollypm/pollypm.toml \
+  ~/.pollypm/audit \
+  ~/.pollypm/briefings
+do
+  [ -e "$path" ] && cp -R "$path" "$SNAPSHOT/"
+done
 ```
 
-**If you want a clean, transactionally-consistent snapshot:** stop the daemon first.
-
-```bash
-# Stop everything that writes to ~/.pollypm
-tmux send-keys -t pm-serve:serve C-c
-# Wait for pm cockpit to exit cleanly (or kill its pane)
-sleep 5
-# Snapshot
-cp -r ~/.pollypm /tmp/pollypm-pre-05-snapshot
-pg_dump pollypm > /tmp/pollypm-pre-05-snapshot.sql
-git -C /Users/sam/dev/pollypm rev-parse HEAD > /tmp/pollypm-pre-05-snapshot.sha
-# Restart
-tmux send-keys -t pm-serve:serve 'pm serve' Enter
-```
-
-Either is fine for a test environment. Pick the live-snapshot if you don't mind the test pass starting with a clean restart not being the first observation; pick the running-snapshot if losing the absolute latest events.jsonl bytes is acceptable.
+This intentionally avoids copying the full `~/.pollypm` tree: `agent_homes/`, `artifacts/`, and transcript caches can be tens of gigabytes and are not the destructive surface for these scenarios. If you need a clean, transactionally-consistent database snapshot, stop the daemon before `pg_dump`, then restart it after the dump finishes.
 
 Setup:
 ```bash

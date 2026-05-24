@@ -113,6 +113,10 @@ EVENT_DAEMON_REAPED = "daemon.reaped"
 # problem (OOM, leak, crash-loop) that needs investigation, not just
 # trust in the supervisor.
 EVENT_DAEMON_REVIVED = "daemon.revived"
+# #2185 — emitted by ``pm serve`` startup when a prior serve PID file
+# exists and differs from the current process. This is the launchd
+# KeepAlive breadcrumb for serve respawns/crash recoveries.
+EVENT_DAEMON_SERVE_RESPAWN = "daemon.serve.respawn"
 # #1398 — plan task evolution. ``plan.version_incremented`` fires when
 # a plan task is refined in place (same task_id, version bump);
 # ``plan.successor_created`` fires when a replan creates a new task
@@ -1012,6 +1016,7 @@ __all__ = [
     "EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED",
     "EVENT_DAEMON_REAPED",
     "EVENT_DAEMON_REVIVED",
+    "EVENT_DAEMON_SERVE_RESPAWN",
     "EVENT_WATCHDOG_OPERATOR_TIER4_DISPATCHED",
     "EVENT_TIER4_PROMOTED",
     "EVENT_TIER4_ACTION",

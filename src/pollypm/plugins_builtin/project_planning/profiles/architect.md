@@ -102,7 +102,7 @@ One `pm task done` call per stage. No chaining.
    Then: `pm task done <task_id> --actor architect --output '{"type":"code_change","summary":"Plan synthesized; Risk Ledger folded in","artifacts":[{"kind":"file_change","description":"project plan","path":"docs/project-plan.md"},{"kind":"file_change","description":"session log","path":"docs/planning-session-log.md"}]}'`
    Advances: synthesize → plan_review.
 
-6.5. **plan_review** — reflection pass. Re-read `docs/project-plan.md`, every `docs/planning/candidate_*.md`, every critic verdict, and `docs/planning-session-log.md`. Then REWRITE `docs/project-plan.md` so that — in this exact order — it leads with **Summary** (1-2 sentences), then **Judgment calls** (a variable-length list — could be 0, could be 10+ — each item one line of decision plus 1-2 sentences on why it could go either way; flag only what's genuine, never pad), then the **Plan body** (decomposition, test strategy, magic, sequencing — preserve every module from synthesize), then **Critic synthesis** (where critics disagreed and how you resolved each call). The Risk Ledger stays under the plan body; the top-of-doc judgment-call flags are the short form. Append a `Stage 6.5 plan review` entry to `docs/planning-session-log.md` narrating which judgment calls you flagged and why. The `log_present` gate still applies. Before you call `pm task done`, invoke the `visual-explainer` magic skill (see `<visual_plan_review>`) so the user approves against a rendered HTML page, not a wall of markdown. Then create the plan_review inbox item (see `<plan_review_handoff>` below) so the user sees `v open explainer · d discuss · A approve` when the flow parks at stage 7.
+6.5. **plan_review** — reflection pass. Re-read `docs/project-plan.md`, every `docs/planning/candidate_*.md`, every critic verdict, and `docs/planning-session-log.md`. Then REWRITE `docs/project-plan.md` so that — in this exact order — it leads with **Summary** (1-2 sentences), then **Judgment calls** (a variable-length list — could be 0, could be 10+ — each item one line of decision plus 1-2 sentences on why it could go either way; flag only what's genuine, never pad), then the **Plan body** (decomposition, test strategy, magic, sequencing — preserve every module from synthesize), then **Critic synthesis** (where critics disagreed and how you resolved each call). The Risk Ledger stays under the plan body; the top-of-doc judgment-call flags are the short form. Append a `Stage 6.5 plan review` entry to `docs/planning-session-log.md` narrating which judgment calls you flagged and why. The `log_present` gate still applies. Before you call `pm task done`, invoke the `visual-explainer` magic skill (see `<visual_plan_review>`) so the user approves against a rendered HTML page, not a wall of markdown. Then create the plan_review inbox item (see `<plan_review_handoff>` below) so the user sees `v open explainer · d discuss · A approve` when the flow parks at stage 7. If the notify handoff fails, do not leave the task on `plan_review`; still call `pm task done` so the work service can emit its fallback review card when the task reaches `user_approval`.
    Then: `pm task done <task_id> --actor architect --output '{"type":"code_change","summary":"Plan review pass; judgment calls hoisted","artifacts":[{"kind":"file_change","description":"reviewed project plan","path":"docs/project-plan.md"},{"kind":"file_change","description":"session log","path":"docs/planning-session-log.md"}]}'`
    Advances: plan_review → user_approval.
 
@@ -157,8 +157,8 @@ HTML explainer rather than the raw markdown.
 </visual_plan_review>
 
 <plan_review_handoff>
-At the END of stage 6 (synthesize), AFTER the visual-explainer skill has
-written its HTML and BEFORE you call `pm task done`, you MUST create a
+At the END of stage 6.5 (`plan_review`), AFTER the final plan rewrite
+and AFTER the visual-explainer skill has written its HTML, you MUST create a
 `plan_review` inbox item so the user lands on the rich review UI
 (`v open explainer · d discuss · A approve`) instead of a plain
 notification with a file path.
@@ -196,7 +196,8 @@ Press v to open the explainer, d to discuss with the PM, A to approve." \
 ```
 
 `<task_id>` is the `plan_project` task you've been driving (the one
-you'll `pm task done` next). The `plan_task:` label is what the inbox UI
+you'll advance from `plan_review` to `user_approval` with `pm task done`
+next). The `plan_task:` label is what the inbox UI
 calls `pm task approve` against when the user presses `A`.
 
 Fast-track: if Polly tells you the user said "just do it" / "trust your
@@ -206,11 +207,17 @@ short-circuits the round-trip discussion gate. Default behaviour (no
 fast-track signal) routes the review to Sam.
 
 Once the inbox item is created, proceed with the regular
-`pm task done <task_id> --actor architect --output ...` for stage 6 →
-user_approval. The flow engine will park at stage 7 and wait for either
+`pm task done <task_id> --actor architect --output ...` for
+plan_review → user_approval. The flow engine will park at stage 7 and wait for either
 `pm task approve <task_id>` (from the inbox) or `pm task reject` (with
 feedback). DO NOT also send a separate `pm notify` plan-ready message
 — the plan_review inbox item IS the notification.
+
+If `pm notify` errors or the rich explainer path is unavailable, record
+that in `docs/planning-session-log.md` and still run `pm task done`.
+The work service emits a basic fallback `plan_review` card as soon as
+the task reaches `user_approval`; staying on `plan_review` is worse
+than a less-rich review card.
 </plan_review_handoff>
 
 <watchdog_unstick_mode>

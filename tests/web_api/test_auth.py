@@ -10,6 +10,12 @@ Covers spec §3:
 
 from __future__ import annotations
 
+from pollypm.web_api.auth import (
+    SESSION_COOKIE_NAME,
+    SESSION_COOKIE_TTL_SECONDS,
+    is_valid_session_cookie,
+    mint_session_cookie,
+)
 from pollypm.web_api.token import regenerate_token
 
 
@@ -51,6 +57,49 @@ def test_request_with_malformed_header_returns_401_unauthorized(client) -> None:
 def test_valid_token_allows_request(client, auth_headers) -> None:
     response = client.get("/api/v1/projects", headers=auth_headers)
     assert response.status_code == 200
+
+
+def test_session_cookie_mint_is_opaque_unique_and_valid(token: str) -> None:
+    first = mint_session_cookie(token, issued_at=1_000)
+    second = mint_session_cookie(token, issued_at=1_000)
+
+    assert first != second
+    assert first != token
+    assert token not in first
+    assert is_valid_session_cookie(first, token, now=1_000) is True
+    assert is_valid_session_cookie(second, token, now=1_000) is True
+
+
+def test_session_cookie_rejects_tampering_rotation_and_expiry(token: str) -> None:
+    cookie = mint_session_cookie(token, issued_at=1_000, nonce="fixed-nonce")
+    version, issued_at, nonce, signature = cookie.split(".")
+
+    assert (
+        is_valid_session_cookie(
+            f"{version}.{issued_at}.{nonce}-tampered.{signature}",
+            token,
+            now=1_000,
+        )
+        is False
+    )
+    assert is_valid_session_cookie(cookie, f"{token}-rotated", now=1_000) is False
+    assert (
+        is_valid_session_cookie(
+            cookie,
+            token,
+            now=1_000 + SESSION_COOKIE_TTL_SECONDS + 1,
+        )
+        is False
+    )
+
+
+def test_raw_bearer_token_is_not_valid_session_cookie(client, token: str) -> None:
+    response = client.get(
+        "/api/v1/projects",
+        headers={"Cookie": f"{SESSION_COOKIE_NAME}={token}"},
+    )
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_token"
 
 
 def test_rotated_token_invalidates_previous(client, auth_headers, token_path) -> None:
@@ -101,3 +150,22 @@ def test_sse_accepts_token_via_query_param(client, token, monkeypatch) -> None:
     # the header-only auth dependency.
     response = client.get(f"/api/v1/projects?token={token}")
     assert response.status_code == 401
+
+
+def test_sse_accepts_signed_session_cookie(client, token: str, monkeypatch) -> None:
+    """The browser EventSource path rides the same signed UI cookie."""
+    monkeypatch.setattr("pollypm.web_api.sse.KEEPALIVE_INTERVAL_S", 0.1)
+    monkeypatch.setattr("pollypm.web_api.sse.TAIL_POLL_INTERVAL_S", 0.02)
+    monkeypatch.setattr("pollypm.web_api.sse.MAX_STREAM_DURATION_S", 0.5)
+
+    boot = client.get("/ui/", headers={"Authorization": f"Bearer {token}"})
+    assert boot.status_code == 200
+    cookie = boot.cookies.get(SESSION_COOKIE_NAME)
+    assert cookie is not None
+    assert cookie != token
+
+    with client.stream("GET", "/api/v1/events") as response:
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/event-stream")
+        for _ in response.iter_raw():
+            break

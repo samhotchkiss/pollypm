@@ -6,16 +6,18 @@ that must match the contents of the token file
 (``~/.pollypm/api-token`` by default).
 
 The dependency reads the token fresh from disk on each request so a
-``pm api regen-token`` rotation invalidates outstanding sessions
-immediately — there's no in-memory cache to flush. Personal-use volume
-makes that trivially cheap (one ``open + read`` per request).
+``pm api regen-token`` rotation invalidates outstanding bearer tokens
+and browser sessions immediately — there's no in-memory cache to flush.
+Personal-use volume makes that trivially cheap (one ``open + read`` per
+request).
 
 V0 web UI (Phase 7) extends the auth dependency with two additional
 acceptance modes for browser-driven sessions:
 
-- ``pollypm-session`` cookie — set by ``GET /ui/`` from the on-disk
-  token, so the browser never has to paste / type the token. Same
-  comparison rules as the header (constant-time, rotation invalidates).
+- ``pollypm-session`` cookie — set by ``GET /ui/`` as a per-browser
+  opaque session value signed with the current on-disk token, so the
+  browser never has to paste / type the bearer token. Rotation
+  invalidates the signature.
 - Tailscale CGNAT trust — request ``client.host`` inside the Tailscale
   CGNAT range (``100.64.0.0/10``) is allowed without either credential,
   **but only when the app was built with ``tailnet_trust_enabled=True``**.
@@ -29,10 +31,10 @@ acceptance modes for browser-driven sessions:
 Loopback (``127.0.0.1``, ``::1``) is not auto-trusted by the API auth
 dependency itself — a local process without the bearer token still
 receives 401 from ``/api/v1/...``. However, ``GET /ui/`` deliberately
-mints a ``pollypm-session`` cookie from the on-disk token for any
-loopback caller (and for tailnet callers when the flag above is on) as
-a convenience for the local-operator workflow: a browser on the same
-machine shouldn't have to paste a bearer to view the cockpit. See
+mints a signed ``pollypm-session`` cookie for any loopback caller (and
+for tailnet callers when the flag above is on) as a convenience for the
+local-operator workflow: a browser on the same machine shouldn't have to
+paste a bearer to view the cockpit. See
 ``docs/web-ui-2065-security-spec.md`` decision **d-ii** for the
 signed-off trade-off — loopback-cookie-mint is an explicit local-
 operator bypass, not an oversight.
@@ -40,7 +42,12 @@ operator bypass, not an oversight.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import ipaddress
+import secrets
+import time
 from pathlib import Path
 
 from fastapi import Cookie, Header, Query, Request
@@ -58,6 +65,9 @@ _TAILSCALE_CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
 # Cookie name used by ``GET /ui/`` to seed the browser session.
 SESSION_COOKIE_NAME = "pollypm-session"
 SESSION_ISSUED_COOKIE_NAME = "pollypm-session-issued-at"
+SESSION_COOKIE_TTL_SECONDS = 60 * 60 * 24 * 7
+_SESSION_COOKIE_VERSION = "v1"
+_SESSION_COOKIE_MAX_CLOCK_SKEW_SECONDS = 300
 
 
 def is_tailscale_ip(host: str | None) -> bool:
@@ -108,6 +118,78 @@ def _extract_token(header_value: str | None) -> str | None:
     return value or None
 
 
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+
+def _session_cookie_signature(api_token: str, payload: str) -> str:
+    return _b64url(
+        hmac.new(
+            api_token.encode("utf-8"),
+            payload.encode("utf-8"),
+            hashlib.sha256,
+        ).digest()
+    )
+
+
+def mint_session_cookie(
+    api_token: str,
+    *,
+    issued_at: int | None = None,
+    nonce: str | None = None,
+) -> str:
+    """Return a per-browser opaque session cookie value.
+
+    The raw bearer token never goes into the browser cookie. Instead we
+    sign ``version.issued_at.nonce`` with the current API token as the
+    HMAC key. Since validation reloads the API token from disk on every
+    request, ``pm api regen-token`` invalidates existing browser
+    sessions without a server-side registry.
+    """
+    issued = int(time.time() if issued_at is None else issued_at)
+    session_nonce = nonce or secrets.token_urlsafe(32)
+    payload = f"{_SESSION_COOKIE_VERSION}.{issued}.{session_nonce}"
+    signature = _session_cookie_signature(api_token, payload)
+    return f"{payload}.{signature}"
+
+
+def is_valid_session_cookie(
+    cookie_value: str,
+    api_token: str,
+    *,
+    now: int | None = None,
+) -> bool:
+    """Validate a ``pollypm-session`` cookie against the current API token."""
+    parts = cookie_value.split(".")
+    if len(parts) != 4:
+        return False
+    version, issued_raw, nonce, signature = parts
+    if version != _SESSION_COOKIE_VERSION or not nonce or not signature:
+        return False
+    try:
+        issued_at = int(issued_raw)
+    except ValueError:
+        return False
+
+    current = int(time.time() if now is None else now)
+    if issued_at > current + _SESSION_COOKIE_MAX_CLOCK_SKEW_SECONDS:
+        return False
+    if current - issued_at > SESSION_COOKIE_TTL_SECONDS:
+        return False
+
+    payload = ".".join(parts[:3])
+    expected = _session_cookie_signature(api_token, payload)
+    from secrets import compare_digest
+
+    return compare_digest(signature, expected)
+
+
+def _invalid_session_cookie():
+    return invalid_token(
+        "Session cookie is invalid or expired. Reload /ui/ to refresh it."
+    )
+
+
 def make_bearer_auth_dependency(
     token_path: Path | None = None,
     *,
@@ -120,7 +202,7 @@ def make_bearer_auth_dependency(
 
     Accepts three credential modes (in order):
     1. ``Authorization: Bearer <token>`` header.
-    2. ``pollypm-session`` cookie (web UI).
+    2. Signed ``pollypm-session`` cookie (web UI).
     3. Tailscale CGNAT client IP (no credential needed) — **only when
        ``tailnet_trust_enabled`` is True**.
 
@@ -143,16 +225,14 @@ def make_bearer_auth_dependency(
             default=None, alias=SESSION_COOKIE_NAME,
         ),
     ) -> str:
-        # Determine which credential the caller supplied. We compare
-        # against the on-disk token for both header and cookie modes;
-        # only the Tailscale path skips the comparison entirely.
-        provided: str | None = _extract_token(authorization)
-        from_cookie = False
-        if provided is None and session_cookie:
-            provided = session_cookie.strip() or None
-            from_cookie = provided is not None
+        # Determine which credential the caller supplied. Bearer tokens
+        # compare directly against the on-disk token; session cookies are
+        # signed per-browser values validated with that token as the key.
+        # Only the Tailscale path skips token loading entirely.
+        bearer_token = _extract_token(authorization)
+        cookie_token = session_cookie.strip() if session_cookie else None
 
-        if provided is None:
+        if bearer_token is None and not cookie_token:
             # No credential at all — check Tailscale fallback before
             # rejecting. ``request.client`` is ``None`` for ASGI
             # transports without a peer (rare; treat as unauthenticated).
@@ -175,17 +255,20 @@ def make_bearer_auth_dependency(
         # it's free.
         from secrets import compare_digest
 
-        if not compare_digest(provided, expected):
-            # A stale cookie deserves a clearer hint than the raw
-            # ``invalid_token`` message — the operator likely rotated
-            # the token and the browser is still sending the old one.
-            if from_cookie:
-                raise invalid_token(
-                    "Session cookie does not match the current token. "
-                    "Reload /ui/ to refresh the cookie from disk."
-                )
-            raise invalid_token()
-        return provided
+        if bearer_token is not None:
+            if not compare_digest(bearer_token, expected):
+                raise invalid_token()
+            return bearer_token
+
+        if cookie_token and is_valid_session_cookie(cookie_token, expected):
+            return cookie_token
+
+        if cookie_token:
+            # A stale / tampered / legacy raw-token cookie deserves a
+            # clearer hint than the raw ``invalid_token`` message.
+            raise _invalid_session_cookie()
+
+        raise unauthorized()
 
     return _dependency
 
@@ -224,12 +307,14 @@ def make_sse_auth_dependency(
         ),
     ) -> str:
         provided = _extract_token(authorization)
+        from_cookie = False
         if provided is None:
             # Fall back to the query-string escape hatch.
             if token:
                 provided = token.strip() or None
         if provided is None and session_cookie:
             provided = session_cookie.strip() or None
+            from_cookie = provided is not None
         if provided is None:
             client_host = request.client.host if request.client else None
             if tailnet_trust_enabled and is_tailscale_ip(client_host):
@@ -243,6 +328,11 @@ def make_sse_auth_dependency(
             )
         from secrets import compare_digest
 
+        if from_cookie:
+            if is_valid_session_cookie(provided, expected):
+                return provided
+            raise _invalid_session_cookie()
+
         if not compare_digest(provided, expected):
             raise invalid_token()
         return provided
@@ -252,8 +342,11 @@ def make_sse_auth_dependency(
 
 __all__ = [
     "SESSION_COOKIE_NAME",
+    "SESSION_COOKIE_TTL_SECONDS",
     "_extract_token",
     "is_tailscale_ip",
+    "is_valid_session_cookie",
     "make_bearer_auth_dependency",
     "make_sse_auth_dependency",
+    "mint_session_cookie",
 ]

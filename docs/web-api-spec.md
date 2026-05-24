@@ -148,13 +148,14 @@ auth dependency (`src/pollypm/web_api/auth.py`):
    scripts, curl).
 2. **`pollypm-session` cookie** — minted by `GET /ui/` and then sent
    automatically by the browser on every subsequent `/api/v1/*` request.
-   The cookie value is the same on-disk token; it is compared with the
-   same constant-time check as the header. `GET /ui/` only issues the
-   cookie when the caller is a loopback peer (`127.0.0.1` / `::1`), a
-   verified tailnet peer (CGNAT-range source *and* the app was built with
-   `tailnet_trust_enabled=True`), or already presented a valid bearer
-   header. LAN clients receive the HTML without `Set-Cookie` and get
-   `401` on their first API call.
+   The cookie is an opaque per-browser session value signed with the
+   current on-disk API token; the raw bearer token is not stored in the
+   cookie, and token rotation invalidates existing browser sessions.
+   `GET /ui/` only issues the cookie when the caller is a loopback peer
+   (`127.0.0.1` / `::1`), a verified tailnet peer (CGNAT-range source
+   *and* the app was built with `tailnet_trust_enabled=True`), or already
+   presented a valid bearer header. LAN clients receive the HTML without
+   `Set-Cookie` and get `401` on their first API call.
 3. **Credential-free tailnet peer** — accepted *only* when the app was
    constructed with `tailnet_trust_enabled=True`, which `pm serve` sets
    automatically when `detect_tailscale_ip()` returns a verified

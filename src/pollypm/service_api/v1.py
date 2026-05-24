@@ -658,6 +658,43 @@ class PollyPMService:
         """Rebind a session to a different configured account."""
         self.load_supervisor().switch_session_account(session_name, account_name)
 
+    def restart_session(
+        self,
+        session_name: str,
+        *,
+        account_name: str | None = None,
+        force: bool = False,
+    ) -> dict[str, str]:
+        """Restart a configured session, optionally on a runtime account override.
+
+        This is the operator-facing service facade for one-session recovery.
+        It does not edit ``pollypm.toml``; an explicit ``account_name`` is
+        recorded as the session runtime's effective account by
+        :meth:`Supervisor.restart_session`.
+        """
+        supervisor = self.load_supervisor()
+        launch = supervisor.launch_by_session(session_name)
+        target_account = account_name or launch.session.account
+        account = supervisor.config.accounts.get(target_account)
+        if account is None:
+            known = ", ".join(sorted(supervisor.config.accounts)) or "<none>"
+            raise KeyError(
+                f"Unknown account: {target_account} "
+                f"(known accounts: {known})"
+            )
+        supervisor.restart_session(
+            session_name,
+            target_account,
+            failure_type="manual_relaunch",
+            force=force,
+        )
+        return {
+            "session_name": session_name,
+            "account": target_account,
+            "provider": account.provider.value,
+            "status": "restarted",
+        }
+
     def schedule_job(
         self,
         *,

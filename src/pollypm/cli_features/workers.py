@@ -23,6 +23,7 @@ def _worker_start_impl(
     prompt: str | None,
     role: str,
     agent_profile: str | None,
+    account: str | None,
     config_path: Path,
 ) -> None:
     if role == "worker":
@@ -67,6 +68,11 @@ def _worker_start_impl(
     # ``plugins_builtin/task_assignment_notify/resolver.py`` so the
     # two stay in sync.
     supervisor = cli_mod._load_supervisor(config_path)
+    if account is not None and account not in supervisor.config.accounts:
+        known = ", ".join(sorted(supervisor.config.accounts)) or "<none>"
+        raise typer.BadParameter(
+            f"Unknown account: {account} (known accounts: {known})"
+        )
     existing = next(
         (
             session
@@ -75,14 +81,26 @@ def _worker_start_impl(
         ),
         None,
     )
-    session = existing or cli_mod.create_worker_session(
-        config_path,
-        project_key=project_key,
-        prompt=prompt,
-        role=role,
-        agent_profile=agent_profile,
-    )
-    cli_mod.launch_worker_session(config_path, session.name)
+    if existing is not None:
+        session = existing
+        if account is not None:
+            supervisor.restart_session(
+                session.name,
+                account,
+                failure_type="manual_relaunch",
+            )
+        else:
+            cli_mod.launch_worker_session(config_path, session.name)
+    else:
+        session = cli_mod.create_worker_session(
+            config_path,
+            project_key=project_key,
+            prompt=prompt,
+            role=role,
+            agent_profile=agent_profile,
+            account_name=account,
+        )
+        cli_mod.launch_worker_session(config_path, session.name)
     refreshed = cli_mod._load_supervisor(config_path)
     launch = next(
         item for item in refreshed.plan_launches()
@@ -286,9 +304,18 @@ def register_worker_commands(app: typer.Typer) -> None:
                 "profile if one exists."
             ),
         ),
+        account: str | None = typer.Option(
+            None,
+            "--account",
+            help=(
+                "Configured account to use. Existing role sessions are "
+                "restarted with a runtime override; new sessions are "
+                "created on this account."
+            ),
+        ),
         config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
     ) -> None:
-        _worker_start_impl(project_key, prompt, role, agent_profile, config_path)
+        _worker_start_impl(project_key, prompt, role, agent_profile, account, config_path)
 
     @app.command("switch-provider")
     def switch_provider(

@@ -206,17 +206,21 @@ def is_account_runtime_unavailable(value: str | None) -> bool:
 
     Mirrors the canonical list used by ``Supervisor._account_is_viable``
     (auth_broken / exhausted / provider_outage / blocked) but also
-    tolerates the hyphenated ``"auth-broken"`` form so legacy rows or
-    UI-driven writes still match.
+    tolerates capacity/auth hyphen and underscore variants so legacy rows
+    or UI-driven writes still match.
     """
     if value is None:
         return False
     return value in {
         "auth_broken",
         "auth-broken",
+        "capacity-exhausted",
+        "capacity_exhausted",
         "exhausted",
         "provider_outage",
         "blocked",
+        "signed-out",
+        "throttled",
     }
 
 

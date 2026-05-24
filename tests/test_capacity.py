@@ -138,7 +138,10 @@ class TestHealthToState:
     def test_known_states(self) -> None:
         assert _health_to_state("healthy") == CapacityState.HEALTHY
         assert _health_to_state("capacity-exhausted") == CapacityState.EXHAUSTED
+        assert _health_to_state("capacity_exhausted") == CapacityState.EXHAUSTED
+        assert _health_to_state("exhausted") == CapacityState.EXHAUSTED
         assert _health_to_state("auth-broken") == CapacityState.AUTH_BROKEN
+        assert _health_to_state("auth_broken") == CapacityState.AUTH_BROKEN
 
     def test_unknown_state(self) -> None:
         assert _health_to_state("something-weird") == CapacityState.UNKNOWN
@@ -435,6 +438,38 @@ class TestSelectFailoverAccount:
         assert decision.should_failover
         # Should prefer claude_backup (same provider, non-controller)
         assert decision.selected_account == "claude_backup"
+
+    def test_selects_first_healthy_account_in_failover_order(self, tmp_path: Path) -> None:
+        config = _config(tmp_path)
+        config.pollypm.failover_accounts = ["codex_main", "claude_backup"]
+        store = _store(tmp_path)
+        store.upsert_account_runtime(
+            account_name="claude_main",
+            provider="claude",
+            status="capacity-exhausted",
+            reason="rate limited",
+        )
+        store.upsert_account_usage(
+            account_name="codex_main",
+            provider="codex",
+            plan="pro",
+            health="healthy",
+            usage_summary="80% left",
+            raw_text="",
+        )
+        store.upsert_account_usage(
+            account_name="claude_backup",
+            provider="claude",
+            plan="max",
+            health="healthy",
+            usage_summary="50% left",
+            raw_text="",
+        )
+
+        decision = select_failover_account(config, store, "claude_main")
+
+        assert decision.should_failover
+        assert decision.selected_account == "codex_main"
 
     def test_selects_different_provider_when_same_unavailable(self, tmp_path: Path) -> None:
         config = _config(tmp_path)

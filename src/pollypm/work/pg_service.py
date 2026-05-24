@@ -1253,10 +1253,22 @@ class PgWorkService:
         + audit row, then cascades :meth:`_check_auto_unblock` so any
         dependents this task was blocking get a chance to drop back to
         QUEUED.
+
+        Refuses ``cancelled`` (and any other terminal state) with
+        :class:`InvalidTransitionError` — mirrors the sqlite leaf in
+        :func:`pollypm.work.service_transitions.mark_done`. Without
+        this guard, the Web API's ``POST /tasks/.../done`` would
+        happily resurrect a cancelled task as ``done``, which is the
+        bug #2137 verification surfaced.
         """
         task = self.get(task_id)
         if task.work_status == WorkStatus.DONE:
             return task
+        if task.work_status in TERMINAL_STATUSES:
+            raise InvalidTransitionError(
+                f"Cannot mark done task in terminal state "
+                f"'{task.work_status.value}'."
+            )
         result = self._simple_transition(
             task_id,
             from_state=task.work_status,
@@ -1272,6 +1284,71 @@ class PgWorkService:
                 exc_info=True,
             )
         return result
+
+    def force_review(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        """Force ``in_progress`` → ``review`` without running ``node_done``.
+
+        Web UI operator gesture for #2137: lets an operator mark work
+        ready for review from the Web UI without supplying a flow
+        ``work_output`` payload. The flow's ``node_done`` path remains
+        the canonical worker-driven transition; this is the bypass
+        equivalent of :meth:`mark_done` for ``review``.
+
+        Only legal from ``in_progress`` / ``rework`` — sources where
+        ``node_done`` would otherwise advance into a review node.
+        """
+        task = self.get(task_id)
+        if task.work_status not in (
+            WorkStatus.IN_PROGRESS,
+            WorkStatus.REWORK,
+        ):
+            raise InvalidTransitionError(
+                f"Cannot move task to 'review' from "
+                f"'{task.work_status.value}' state. Task must be in "
+                f"'in_progress' or 'rework' state."
+            )
+        return self._simple_transition(
+            task_id,
+            from_state=task.work_status,
+            to_state=WorkStatus.REVIEW,
+            actor=actor,
+            reason=reason,
+        )
+
+    def force_in_progress(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        """Force a non-terminal task into ``in_progress``.
+
+        Web UI operator gesture for #2137. Legal sources are
+        ``queued``, ``on_hold``, ``review``, ``rework``, ``blocked``;
+        terminal (``done`` / ``cancelled``) and ``draft`` are refused
+        with :class:`InvalidTransitionError`. ``on_hold`` callers
+        should normally use :meth:`resume` so the flow's current node
+        is respected; this method is the explicit override.
+        """
+        task = self.get(task_id)
+        if task.work_status not in (
+            WorkStatus.QUEUED,
+            WorkStatus.ON_HOLD,
+            WorkStatus.REVIEW,
+            WorkStatus.REWORK,
+            WorkStatus.BLOCKED,
+        ):
+            raise InvalidTransitionError(
+                f"Cannot move task to 'in_progress' from "
+                f"'{task.work_status.value}' state. Task must be in a "
+                f"non-terminal, non-draft state."
+            )
+        return self._simple_transition(
+            task_id,
+            from_state=task.work_status,
+            to_state=WorkStatus.IN_PROGRESS,
+            actor=actor,
+            reason=reason,
+        )
 
     def _simple_transition(
         self,

@@ -1363,6 +1363,281 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  # Lifecycle REST verbs (#2137) — done / approve / hold / rework /
+  # block / review / in_progress. Each mirrors the existing
+  # claim/cancel/reopen pattern: typed envelope on success
+  # (`TaskActionResult`), 404 for unknown project/task, 409
+  # `invalid_state` for illegal transitions, 422 for body / argument
+  # validation, 503 for backing-store outage.
+
+  /tasks/{project}/{n}/done:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: doneTask
+      summary: Force a task to done (operator bypass)
+      description: |
+        Maps to `PgWorkService.mark_done` — moves the task directly to
+        `done` without running the flow's `node_done` path. The
+        flow-respecting variant (`pm task done` with `--output`) is
+        the canonical worker hand-off; this endpoint is the Web UI
+        operator gesture for "mark this task done" without supplying
+        a `work_output` payload (#2137).
+
+        Terminal tasks (`done` / `cancelled`) raise
+        `409 invalid_state`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskDoneRequest"
+      responses:
+        "200":
+          description: Task transitioned to `done`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/approve:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: approveTask
+      summary: Approve a review-state task
+      description: |
+        Maps to `PgWorkService.approve`. Advances the review node to
+        `next_node`; if the target is terminal the task becomes
+        `done` and the cancel-cascade fires for dependents. Refuses
+        non-review tasks with `409 invalid_state`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskApproveRequest"
+      responses:
+        "200":
+          description: Task approved at the current review node.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/hold:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: holdTask
+      summary: Move a task to on_hold
+      description: |
+        Maps to `PgWorkService.hold`. Legal from
+        `in_progress` / `rework` / `review` / `queued`; other states
+        return `409 invalid_state`. Use `/in_progress` to bring a held
+        task back into work (`/in_progress` routes through the work
+        service's transition guard).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskHoldRequest"
+      responses:
+        "200":
+          description: Task transitioned to `on_hold`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/rework:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: reworkTask
+      summary: Reject a review-state task back to rework
+      description: |
+        Maps to `PgWorkService.reject`. Bounces the task back to the
+        review node's `reject_node` and flips status to `rework`.
+        Refuses non-review tasks with `409 invalid_state`. `reason`
+        is required by the work service; the request schema enforces
+        `minLength: 1` so a missing reason fails at request
+        validation with 422.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskReworkRequest"
+      responses:
+        "200":
+          description: Task bounced back to `rework`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/block:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: blockTask
+      summary: Mark a task blocked by another task
+      description: |
+        Maps to `PgWorkService.block`. Inserts a `blocks` dependency
+        edge from `blocker_task_id` to this task and flips status to
+        `blocked`. Refuses tasks outside `in_progress` / `review` with
+        `409 invalid_state`. Circular dependencies raise
+        `422 validation_error`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskBlockRequest"
+      responses:
+        "200":
+          description: Task transitioned to `blocked`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/review:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: reviewTask
+      summary: Force a task into review (operator bypass)
+      description: |
+        Maps to `PgWorkService.force_review`. Web UI operator gesture
+        for marking work ready for review without supplying a flow
+        `work_output` payload. Legal from `in_progress` / `rework`;
+        other states return `409 invalid_state`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskReviewRequest"
+      responses:
+        "200":
+          description: Task transitioned to `review`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /tasks/{project}/{n}/in_progress:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: inProgressTask
+      summary: Force a non-terminal task into in_progress
+      description: |
+        Maps to `PgWorkService.force_in_progress`. Legal from
+        `queued` / `on_hold` / `review` / `rework` / `blocked`;
+        terminal (`done` / `cancelled`) and `draft` are refused with
+        `409 invalid_state`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskInProgressRequest"
+      responses:
+        "200":
+          description: Task transitioned to `in_progress`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /tasks/{project}/{n}/reassign:
     parameters:
       - $ref: "#/components/parameters/ProjectKey2"
@@ -3864,6 +4139,109 @@ components:
         `src/pollypm/web_api/models.py`). Unknown keys surface as a
         `422 validation_error` instead of being silently dropped
         (#2064 round-12).
+
+    # Lifecycle REST verbs (#2137) — each mirrors the existing
+    # TaskClaimRequest shape: required `actor`, optional verb-specific
+    # extras, `additionalProperties: false` so misspelled keys surface
+    # as 422 instead of being silently dropped.
+
+    TaskDoneRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: Operator identity recorded on the done transition.
+
+    TaskApproveRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: Reviewer identity recorded on the approval transition.
+        reason:
+          type: string
+          description: Optional approval rationale.
+
+    TaskHoldRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: Operator identity recorded on the hold transition.
+        reason:
+          type: string
+          description: Optional hold reason.
+
+    TaskReworkRequest:
+      type: object
+      additionalProperties: false
+      required: [actor, reason]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: Reviewer identity recorded on the rejection.
+        reason:
+          type: string
+          minLength: 1
+          description: |
+            Required rejection rationale; the work-service refuses an
+            empty reason at `svc.reject(...)`. The request validator
+            also enforces `minLength: 1` so a missing reason surfaces
+            as 422 from the validator.
+
+    TaskBlockRequest:
+      type: object
+      additionalProperties: false
+      required: [actor, blocker_task_id]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: Operator identity recorded on the block transition.
+        blocker_task_id:
+          type: string
+          minLength: 1
+          description: |
+            ID of the task this one is blocked on (`project/n` form).
+            The work-service inserts a `blocks` dependency edge and
+            flips the task's status to `blocked`.
+
+    TaskReviewRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: |
+            Operator identity recorded on the transition. Forces an
+            `in_progress` (or `rework`) task into `review` without
+            requiring a flow `work_output` payload.
+
+    TaskInProgressRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: |
+            Operator identity recorded on the transition. Forces a
+            non-terminal task into `in_progress`. `on_hold` callers
+            should normally use `/resume`-style flows; this endpoint
+            is the explicit override (#2137).
 
     TaskPatchRequest:
       type: object

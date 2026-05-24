@@ -28,25 +28,39 @@ from pollypm.web_api.errors import APIError, invalid_request, not_found
 from pollypm.web_api.models import (
     ActionResult,
     TaskActionResult,
+    TaskApproveRequest,
+    TaskBlockRequest,
     TaskCancelRequest,
     TaskClaimRequest,
     TaskDetail,
+    TaskDoneRequest,
+    TaskHoldRequest,
+    TaskInProgressRequest,
     TaskListResponse,
     TaskPatchRequest,
     TaskReassignRequest,
     TaskReopenRequest,
+    TaskReviewRequest,
+    TaskReworkRequest,
 )
 from pollypm.web_api.routes._deps import ConfigDep
 from pollypm.web_api.service import (
     StaleCursorError,
+    approve_task,
+    block_task,
     cancel_task,
     claim_task,
+    done_task,
     get_task_detail,
+    hold_task,
+    in_progress_task,
     list_all_tasks,
     patch_task,
     queue_task,
     reassign_task,
     reopen_task,
+    review_task,
+    rework_task,
 )
 
 router = APIRouter(tags=["Tasks"])
@@ -447,4 +461,183 @@ def patch_task_endpoint(
     )
     return TaskActionResult(
         ok=True, message=f"patched {task.task_id}", task=task
+    )
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle REST verbs (#2137) — done / approve / hold / rework / block /
+# review / in_progress. Each mirrors the existing claim/cancel route
+# pattern: same auth (ConfigDep), same envelope (TaskActionResult), same
+# error shape (404 unknown project/task, 409 invalid_state, 422
+# validation, 503 backing-store). ``Idempotency-Key`` and ``If-Match``
+# are intentionally NOT declared (no replay cache, no version-token
+# enforcement yet — mirrors #2064 round-1 for the existing verbs).
+# ---------------------------------------------------------------------------
+
+
+_LIFECYCLE_RESPONSES = {
+    "401": {"description": "Missing or invalid bearer token."},
+    "404": {"description": "Project or task not found."},
+    "409": {"description": "Task is not in a state that permits this transition."},
+    "422": {"description": "Body validation / illegal transition argument."},
+    "503": {"description": "Backing store unavailable."},
+}
+
+
+@router.post(
+    "/tasks/{project}/{n}/done",
+    response_model=TaskActionResult,
+    summary="Force a task to done (operator bypass)",
+    operation_id="doneTask",
+    responses=_LIFECYCLE_RESPONSES,
+)
+def done_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskDoneRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = done_task(config, project, n, actor=body.actor)
+    return TaskActionResult(
+        ok=True, message=f"done {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/approve",
+    response_model=TaskActionResult,
+    summary="Approve a review-state task",
+    operation_id="approveTask",
+    responses=_LIFECYCLE_RESPONSES,
+)
+def approve_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskApproveRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = approve_task(
+        config, project, n, actor=body.actor, reason=body.reason
+    )
+    return TaskActionResult(
+        ok=True, message=f"approved {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/hold",
+    response_model=TaskActionResult,
+    summary="Move a task to on_hold",
+    operation_id="holdTask",
+    responses=_LIFECYCLE_RESPONSES,
+)
+def hold_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskHoldRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = hold_task(
+        config, project, n, actor=body.actor, reason=body.reason
+    )
+    return TaskActionResult(
+        ok=True, message=f"held {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/rework",
+    response_model=TaskActionResult,
+    summary="Reject a review-state task back to rework",
+    operation_id="reworkTask",
+    responses=_LIFECYCLE_RESPONSES,
+)
+def rework_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskReworkRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = rework_task(
+        config, project, n, actor=body.actor, reason=body.reason
+    )
+    return TaskActionResult(
+        ok=True, message=f"rework {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/block",
+    response_model=TaskActionResult,
+    summary="Mark a task blocked by another task",
+    operation_id="blockTask",
+    responses=_LIFECYCLE_RESPONSES,
+)
+def block_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskBlockRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = block_task(
+        config,
+        project,
+        n,
+        actor=body.actor,
+        blocker_task_id=body.blocker_task_id,
+    )
+    return TaskActionResult(
+        ok=True, message=f"blocked {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/review",
+    response_model=TaskActionResult,
+    summary="Force a task into review (operator bypass)",
+    operation_id="reviewTask",
+    responses=_LIFECYCLE_RESPONSES,
+)
+def review_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskReviewRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = review_task(config, project, n, actor=body.actor)
+    return TaskActionResult(
+        ok=True, message=f"review {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/in_progress",
+    response_model=TaskActionResult,
+    summary="Force a non-terminal task into in_progress",
+    operation_id="inProgressTask",
+    responses=_LIFECYCLE_RESPONSES,
+)
+def in_progress_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskInProgressRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = in_progress_task(config, project, n, actor=body.actor)
+    return TaskActionResult(
+        ok=True, message=f"in_progress {task.task_id}", task=task
     )

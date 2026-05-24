@@ -383,6 +383,107 @@ class TaskReassignRequest(BaseModel):
     actor: str = Field(min_length=1)
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle REST verbs (#2137) — done / approve / hold / rework / block /
+# review / in_progress. Each mirrors the existing claim/cancel pattern:
+# ``actor`` for the operator identity; optional ``reason`` recorded on the
+# transition row; ``extra='forbid'`` so misspelled keys surface as 422
+# instead of being silently dropped.
+# ---------------------------------------------------------------------------
+
+
+class TaskDoneRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/done``.
+
+    Operator "force done" gesture. Maps to
+    :meth:`PgWorkService.mark_done` — moves the task directly to
+    ``done`` without requiring a flow ``work_output``. The CLI path
+    (``pm task done``) uses :meth:`node_done` which advances via the
+    flow and requires an output payload; the Web UI exposes the
+    simpler bypass for operators.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+
+
+class TaskApproveRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/approve``."""
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+    reason: str | None = None
+
+
+class TaskHoldRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/hold``."""
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+    reason: str | None = None
+
+
+class TaskReworkRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/rework``.
+
+    Maps to :meth:`PgWorkService.reject` — bounces a review-state task
+    back to ``rework``. The work-service requires a non-empty
+    ``reason``; we enforce ``min_length=1`` on the wire so a missing
+    reason surfaces as 422 from the request validator instead of as a
+    work-service ``ValidationError``.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
+
+class TaskBlockRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/block``.
+
+    ``blocker_task_id`` names the task this one is blocked on
+    (``project/n`` format). The work-service inserts a ``blocks``
+    dependency edge and flips the task's status to ``blocked``.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+    blocker_task_id: str = Field(min_length=1)
+
+
+class TaskReviewRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/review``.
+
+    Forces an ``in_progress`` task into ``review`` without going
+    through ``node_done``. Useful when the operator wants to mark work
+    ready for review from the Web UI without supplying a flow
+    ``work_output`` payload.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+
+
+class TaskInProgressRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/in_progress``.
+
+    Forces a task into ``in_progress`` from a non-terminal state.
+    Maps to :meth:`PgWorkService.resume` when the source is
+    ``on_hold``; otherwise a direct transition via the work-service's
+    simple-transition helper.
+    """
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+
+
 class TaskPatchRequest(BaseModel):
     """Body for ``PATCH /tasks/{project}/{n}``.
 
@@ -647,9 +748,14 @@ __all__ = [
     "StorageEntry",
     "StorageReport",
     "TaskActionResult",
+    "TaskApproveRequest",
+    "TaskBlockRequest",
     "TaskCancelRequest",
     "TaskClaimRequest",
     "TaskDetail",
+    "TaskDoneRequest",
+    "TaskHoldRequest",
+    "TaskInProgressRequest",
     "TaskListFilteredWarning",
     "TaskListPartialFailureWarning",
     "TaskListResponse",
@@ -658,6 +764,8 @@ __all__ = [
     "TaskReassignRequest",
     "TaskReopenRequest",
     "TaskRelationships",
+    "TaskReviewRequest",
+    "TaskReworkRequest",
     "TaskSummary",
     "Transition",
     "ValidationErrorDetail",

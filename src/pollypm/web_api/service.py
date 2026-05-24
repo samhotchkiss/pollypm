@@ -175,11 +175,12 @@ def list_active_worker_sessions_strict(
     ``[]`` — there can't be any per-task workers without a project,
     so the caller treats that as a legitimate empty registry.
     """
-    project = getattr(config, "project", None)
-    if project is None:
+    project_filter = project
+    project_settings = getattr(config, "project", None)
+    if project_settings is None:
         return []
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
+    project_key = getattr(project_settings, "name", "")
+    project_path = getattr(project_settings, "root_dir", None)
     if not project_key or project_path is None:
         return []
     try:
@@ -192,7 +193,12 @@ def list_active_worker_sessions_strict(
             if not callable(list_fn):
                 return []
             try:
-                records = list_fn(project=project, active_only=True)
+                if project_filter is None:
+                    records = list_fn(active_only=True)
+                else:
+                    records = list_fn(
+                        project=project_filter, active_only=True
+                    )
             except TypeError:
                 records = list_fn(active_only=True)
             return list(records or [])
@@ -220,11 +226,12 @@ def list_active_worker_sessions(
     module at import time (and the consumer only needs duck-typed
     attribute access).
     """
-    project = getattr(config, "project", None)
-    if project is None:
+    project_filter = project
+    project_settings = getattr(config, "project", None)
+    if project_settings is None:
         return []
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
+    project_key = getattr(project_settings, "name", "")
+    project_path = getattr(project_settings, "root_dir", None)
     if not project_key or project_path is None:
         return []
     try:
@@ -238,7 +245,12 @@ def list_active_worker_sessions(
                 return []
             try:
                 try:
-                    records = list_fn(project=project, active_only=True)
+                    if project_filter is None:
+                        records = list_fn(active_only=True)
+                    else:
+                        records = list_fn(
+                            project=project_filter, active_only=True
+                        )
                 except TypeError:
                     records = list_fn(active_only=True)
             except Exception:  # noqa: BLE001

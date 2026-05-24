@@ -50,6 +50,7 @@ from pollypm.web_api.chat.registry import (
     TmuxWindowState,
 )
 from pollypm.web_api.routes import chat_messages as chat_messages_routes
+from pollypm.web_api import service as web_api_service
 
 
 # ---------------------------------------------------------------------------
@@ -188,6 +189,45 @@ def _all_four_surfaces(tp: Path | None = None) -> list[ChatSurface]:
         _surface("task-myproj-7", SurfaceType.WORKER, persona=None,
                  project="myproj", task_id=7, transcript_path=tp),
     ]
+
+
+def test_worker_session_facade_forwards_project_filter(
+    config: PollyPMConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    class FakeWorkService:
+        def list_worker_sessions(
+            self, *, project: str | None = None, active_only: bool = True
+        ) -> list[object]:
+            seen["project"] = project
+            seen["active_only"] = active_only
+            return []
+
+    class FakeWorkServiceContext:
+        def __enter__(self) -> FakeWorkService:
+            return FakeWorkService()
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+    monkeypatch.setattr(
+        web_api_service,
+        "_open_work_service_readonly",
+        lambda **_kwargs: FakeWorkServiceContext(),
+    )
+
+    assert web_api_service.list_active_worker_sessions_strict(
+        config, project="myproj"
+    ) == []
+    assert seen == {"project": "myproj", "active_only": True}
+
+    seen.clear()
+    assert web_api_service.list_active_worker_sessions(
+        config, project="other"
+    ) == []
+    assert seen == {"project": "other", "active_only": True}
 
 
 def _env(

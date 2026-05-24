@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import json
 import re
+import select
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -78,6 +80,36 @@ _PROJECT_OPTION = typer.Option(None, "--project", "-p", help="Project filter.")
 _JSON_OPTION = typer.Option(False, "--json", help="Output as JSON.")
 
 _TASK_NOT_FOUND_RE = re.compile(r"Task '([^']+)' not found\.")
+
+
+def _non_tty_confirmation(prompt: str) -> tuple[bool | None, bool]:
+    stream = sys.stdin
+    is_tty = getattr(stream, "isatty", lambda: False)
+    if is_tty():
+        return None, False
+    try:
+        stream.fileno()
+        ready, _, _ = select.select([stream], [], [], 0)
+    except (AttributeError, OSError, TypeError, ValueError):
+        return None, False
+    if not ready:
+        return None, True
+    typer.echo(f"{prompt} [y/N]: ", nl=False)
+    answer = stream.readline()
+    if not answer:
+        return None, True
+    return answer.strip().lower() in {"y", "yes"}, True
+
+
+def _confirm_active_cancel(prompt: str) -> bool | None:
+    piped_answer, handled_non_tty = _non_tty_confirmation(prompt)
+    if piped_answer is not None:
+        return piped_answer
+    if handled_non_tty:
+        return None
+    return typer.confirm(prompt, default=False)
+
+
 _INVALID_TASK_ID_RE = re.compile(r"Invalid task_id '([^']+)'\.")
 _REQUIRED_ROLE_RE = re.compile(
     r"Required role '([^']+)' not provided\. Flow '([^']+)' requires: \[(.*)\]"
@@ -1188,11 +1220,19 @@ def task_cancel(
             surface="cli",
             force=False,
         )
-        if not typer.confirm(
+        prompt = (
             f"Worker {active_assignee} currently working this task. "
-            "Cancel anyway?",
-            default=False,
-        ):
+            "Cancel anyway?"
+        )
+        confirmed = _confirm_active_cancel(prompt)
+        if confirmed is None:
+            typer.echo(
+                "Refusing to cancel in_progress task non-interactively. "
+                "Pass --force to confirm in scripts.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        if not confirmed:
             typer.echo("Aborted; task was not cancelled.", err=True)
             raise typer.Exit(code=1)
     task = _run(svc.cancel, task_id, actor, reason)

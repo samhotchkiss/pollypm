@@ -42,6 +42,7 @@ from pollypm.audit.watchdog import (
     scan_events,
 )
 from pollypm.work.models import WorkStatus
+from pollypm.work import plan_review_emit as plan_review_emit_module
 from pollypm.work.plan_review_emit import (
     PLAN_REVIEW_LABEL,
     PLAN_SHAPED_LABELS,
@@ -49,7 +50,9 @@ from pollypm.work.plan_review_emit import (
     emit_plan_review_for_task,
     is_plan_shaped_task,
     maybe_emit_plan_review_on_task_done,
+    maybe_emit_plan_review_on_user_approval,
     task_is_eligible_for_backstop,
+    task_is_pending_plan_approval,
 )
 
 
@@ -101,6 +104,57 @@ class _FakeSvc:
         number = self._next_task_number
         self._next_task_number += 1
         return _FakeCreatedTask(task_id=f"{project}/{number}")
+
+
+class _FakeSvcNoDbPath:
+    """Pg-shaped fake: no legacy ``_db_path`` attribute."""
+
+    def __init__(self, *, task: _FakeTask) -> None:
+        self._task = task
+        self.create_calls: list[dict[str, Any]] = []
+
+    def get(self, task_id: str) -> _FakeTask:
+        assert task_id == self._task.task_id
+        return self._task
+
+    def create(self, **kwargs: Any) -> _FakeCreatedTask:
+        self.create_calls.append(kwargs)
+        project = kwargs.get("project") or self._task.project
+        return _FakeCreatedTask(task_id=f"{project}/99")
+
+
+class _MemoryMessageStore:
+    """Small in-memory stand-in for the configured message store."""
+
+    def __init__(self) -> None:
+        self._messages: list[dict[str, Any]] = []
+        self._next_id = 1
+
+    def query_messages(self, *, scope: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self._messages if row.get("scope") == scope]
+
+    def enqueue_message(self, **kwargs: Any) -> int:
+        message_id = self._next_id
+        self._next_id += 1
+        row = {"id": message_id, **kwargs}
+        self._messages.append(row)
+        return message_id
+
+    def update_message(self, message_id: int, *, payload: dict[str, Any]) -> None:
+        for row in self._messages:
+            if row.get("id") == message_id:
+                row["payload"] = payload
+                return
+        raise KeyError(message_id)
+
+
+@pytest.fixture(autouse=True)
+def fake_message_store(monkeypatch: pytest.MonkeyPatch) -> _MemoryMessageStore:
+    """Keep plan-review emit tests off the operator's real message store."""
+    store = _MemoryMessageStore()
+    monkeypatch.setattr("pollypm.config.load_config", lambda: object())
+    monkeypatch.setattr("pollypm.store.get_store", lambda config: store)
+    return store
 
 
 @pytest.fixture
@@ -167,6 +221,28 @@ def test_eligibility_excludes_plan_project_flow() -> None:
     assert task_is_eligible_for_backstop(standard)
 
 
+def test_pending_plan_approval_requires_plan_project_user_node() -> None:
+    task = _FakeTask(
+        project="p",
+        task_number=1,
+        flow_template_id="plan_project",
+        work_status=WorkStatus.REVIEW,
+    )
+    task.current_node_id = "user_approval"
+    assert task_is_pending_plan_approval(task)
+
+    task.current_node_id = "plan_review"
+    assert not task_is_pending_plan_approval(task)
+
+    task.current_node_id = "user_approval"
+    task.work_status = WorkStatus.IN_PROGRESS
+    assert not task_is_pending_plan_approval(task)
+
+    task.work_status = WorkStatus.REVIEW
+    task.flow_template_id = "standard"
+    assert not task_is_pending_plan_approval(task)
+
+
 # ---------------------------------------------------------------------------
 # Part A — post-done hook + idempotence
 # ---------------------------------------------------------------------------
@@ -207,6 +283,29 @@ def test_emit_creates_message_and_task(db_path: Path) -> None:
         project="coffeeboardnm",
         plan_task_id="coffeeboardnm/1",
     )
+
+
+def test_emit_does_not_require_legacy_db_path(
+    fake_message_store: _MemoryMessageStore,
+) -> None:
+    """Pg services no longer carry sqlite's ``_db_path`` escape hatch."""
+    task = _FakeTask(
+        project="coffeeboardnm",
+        task_number=1,
+        labels=["poc-plan"],
+        flow_template_id="standard",
+        work_status=WorkStatus.DONE,
+    )
+    svc = _FakeSvcNoDbPath(task=task)
+
+    inbox_task_id = plan_review_emit_module.emit_plan_review_for_task(
+        svc=svc, task=task, actor="audit_watchdog", requester="user",
+    )
+
+    assert inbox_task_id == "coffeeboardnm/99"
+    assert len(fake_message_store._messages) == 1
+    assert len(svc.create_calls) == 1
+    assert fake_message_store._messages[0]["payload"]["task_id"] == "coffeeboardnm/99"
 
 
 def test_emit_is_idempotent(db_path: Path) -> None:
@@ -277,6 +376,39 @@ def test_maybe_emit_fires_for_standard_flow_plan(db_path: Path) -> None:
         project="coffeeboardnm",
         plan_task_id="coffeeboardnm/1",
     )
+
+
+def test_user_approval_emit_uses_plan_project_review_node(monkeypatch) -> None:
+    task = _FakeTask(
+        project="bikepath",
+        task_number=1,
+        flow_template_id="plan_project",
+        work_status=WorkStatus.REVIEW,
+    )
+    task.current_node_id = "user_approval"
+    svc = _FakeSvcNoDbPath(task=task)
+    calls: list[dict[str, Any]] = []
+
+    def fake_emit(**kwargs: Any) -> str:
+        calls.append(kwargs)
+        return "bikepath/99"
+
+    monkeypatch.setattr(
+        plan_review_emit_module,
+        "emit_plan_review_for_task",
+        fake_emit,
+    )
+
+    result = maybe_emit_plan_review_on_user_approval(
+        svc, task.task_id, "architect",
+    )
+
+    assert result == "bikepath/99"
+    assert calls[0]["svc"] is svc
+    assert calls[0]["task"] is task
+    assert calls[0]["actor"] == "architect"
+    assert calls[0]["requester"] == "user"
+    assert calls[0]["source"] == "user_approval"
 
 
 # ---------------------------------------------------------------------------

@@ -299,6 +299,47 @@ def test_plan_review_done_advances_to_user_approval_and_flips_to_review(
     assert result.work_status.value == "review"
 
 
+def test_plan_review_done_triggers_user_approval_handoff_backstop(
+    svc: PgWorkService,
+    project_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the canonical plan task parks at user_approval, workflow
+    code emits the fallback review card if the prompt-driven notify was
+    missed."""
+    task_id = _create_and_claim_plan_task(svc)
+    _advance_to(svc, task_id, "plan_review", project_root)
+    assert svc.get(task_id).current_node_id == "plan_review"
+
+    (project_root / "docs" / "project-plan.md").write_text(
+        "# Project plan\n\n## Summary\n\n## Judgment calls\n\n"
+        "## Plan body\n\n## Critic synthesis\n",
+        encoding="utf-8",
+    )
+    (project_root / "docs" / "planning-session-log.md").write_text(
+        "# Session log\n\n## Stage 6.5 plan review\nFlags hoisted.\n",
+        encoding="utf-8",
+    )
+
+    calls: list[tuple[object, str, str]] = []
+
+    def fake_emit(svc_arg, task_id_arg: str, actor_arg: str) -> None:
+        calls.append((svc_arg, task_id_arg, actor_arg))
+
+    monkeypatch.setattr(
+        "pollypm.work.plan_review_emit.maybe_emit_plan_review_on_user_approval",
+        fake_emit,
+    )
+
+    svc.node_done(
+        task_id,
+        "architect",
+        _done_output("plan_review", "docs/project-plan.md"),
+    )
+
+    assert calls == [(svc, task_id, "architect")]
+
+
 @pytest.mark.xfail(
     reason=(
         "PgWorkService._resolve_project_path looks up project via "
@@ -410,3 +451,16 @@ def test_architect_prompt_includes_stage_transitions_block() -> None:
     # HALT instruction at user_approval is load-bearing — without it
     # Archie might try to advance past the human touchpoint.
     assert "HALT" in text
+
+
+def test_architect_prompt_handoff_matches_plan_review_node() -> None:
+    """The handoff instructions must match the actual flow graph:
+    synthesize -> plan_review -> user_approval."""
+    text = ARCHITECT_PROFILE_PATH.read_text(encoding="utf-8")
+    handoff = text.split("<plan_review_handoff>", 1)[1].split(
+        "</plan_review_handoff>", 1
+    )[0]
+    assert "stage 6.5 (`plan_review`)" in handoff
+    assert "plan_review → user_approval" in handoff
+    assert "stage 6 →\nuser_approval" not in handoff
+    assert "still run `pm task done`" in handoff

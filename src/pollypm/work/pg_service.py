@@ -2731,6 +2731,25 @@ class PgWorkService:
             result, from_status.value, result.work_status.value
         )
         self._write_review_summary_after_transition(result)
+        if (
+            result.flow_template_id == "plan_project"
+            and result.current_node_id == "user_approval"
+            and result.work_status == WorkStatus.REVIEW
+        ):
+            try:
+                from pollypm.work.plan_review_emit import (
+                    maybe_emit_plan_review_on_user_approval,
+                )
+
+                maybe_emit_plan_review_on_user_approval(
+                    self, task_id, actor or "architect"
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "plan_review user_approval emit skipped for %s",
+                    task_id,
+                    exc_info=True,
+                )
         return result
 
     def _write_review_summary_after_transition(self, task: Task) -> None:

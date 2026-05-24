@@ -38,6 +38,13 @@ calls :func:`maybe_emit_plan_review_on_task_done` after the existing
 hook is no-op for the ``plan_project`` flow (its reflection node owns
 the canonical emit) and for tasks that already have an open
 plan_review row — both conditions are checked before any write.
+
+The pg work service also calls
+:func:`maybe_emit_plan_review_on_user_approval` when a ``plan_project``
+task advances from the architect-owned ``plan_review`` work node to the
+human ``user_approval`` review node. That makes the workflow own a
+fallback handoff instead of relying solely on the architect prompt to
+run ``pm notify`` perfectly.
 """
 
 from __future__ import annotations
@@ -79,6 +86,8 @@ _PLAN_OWNING_FLOWS: frozenset[str] = frozenset({
 # ``src/pollypm/plugins_builtin/project_planning/profiles/architect.md``.
 PLAN_REVIEW_LABEL = "plan_review"
 NOTIFY_LABEL = "notify"
+PLAN_PROJECT_FLOW_ID = "plan_project"
+PLAN_APPROVAL_NODE_ID = "user_approval"
 
 
 def is_plan_shaped_task(task: Any) -> bool:
@@ -117,13 +126,26 @@ def task_is_eligible_for_backstop(task: Any) -> bool:
     return True
 
 
+def task_is_pending_plan_approval(task: Any) -> bool:
+    """Return True when a plan_project task is parked for user approval."""
+    flow_id = getattr(task, "flow_template_id", "") or ""
+    if flow_id != PLAN_PROJECT_FLOW_ID:
+        return False
+    node_id = getattr(task, "current_node_id", None) or ""
+    if node_id != PLAN_APPROVAL_NODE_ID:
+        return False
+    status = getattr(task, "work_status", None)
+    status_value = getattr(status, "value", status)
+    return status_value == WorkStatus.REVIEW.value
+
+
 def _plan_task_label(task_id: str) -> str:
     return f"plan_task:{task_id}"
 
 
 def already_has_plan_review_message(
     *,
-    db_path: Path,
+    db_path: Path | None = None,
     project: str,
     plan_task_id: str,
 ) -> bool:
@@ -146,6 +168,7 @@ def already_has_plan_review_message(
     # backend (pg) singleton via ``get_store``. Do NOT close — the
     # store is process-wide. ``db_path`` is retained for source
     # compatibility but no longer drives backend dispatch.
+    _ = db_path
     try:
         from pollypm.config import load_config
         from pollypm.store import get_store
@@ -196,7 +219,11 @@ def already_has_plan_review_message(
     return False
 
 
-def _build_plan_review_body(plan_task_id: str) -> str:
+def _build_plan_review_body(
+    plan_task_id: str,
+    *,
+    source: str = "plan_review_emit",
+) -> str:
     """Render the body the architect normally writes via ``pm notify``.
 
     Mirrors ``profiles/architect.md`` plan_review_handoff template, minus
@@ -204,6 +231,14 @@ def _build_plan_review_body(plan_task_id: str) -> str:
     explainer — the user opens the project drilldown surface from #1401
     instead).
     """
+    if source == "user_approval":
+        return (
+            f"A project plan task ({plan_task_id}) is waiting at "
+            "user_approval.\n"
+            "\n"
+            "Open the project drilldown to read the plan and decide whether "
+            "to approve, request changes, or discuss with the PM."
+        )
     return (
         f"A plan task ({plan_task_id}) reached done without a "
         f"plan_review handoff (backstop emit, see #1511).\n"
@@ -238,6 +273,7 @@ def emit_plan_review_for_task(
     task: Any,
     actor: str = "audit_watchdog",
     requester: str = "user",
+    source: str = "plan_review_emit",
 ) -> str | None:
     """Create the ``plan_review`` message + inbox task for ``task``.
 
@@ -262,12 +298,7 @@ def emit_plan_review_for_task(
     if not plan_task_id or not project:
         return None
     db_path = getattr(svc, "_db_path", None)
-    if db_path is None:
-        logger.debug(
-            "plan_review_emit: svc has no _db_path, skipping for %s", plan_task_id,
-        )
-        return None
-    db_path = Path(db_path)
+    db_path = Path(db_path) if db_path is not None else None
 
     if already_has_plan_review_message(
         db_path=db_path, project=project, plan_task_id=plan_task_id,
@@ -275,7 +306,7 @@ def emit_plan_review_for_task(
         return None
 
     subject = f"Plan ready for review: {project}"
-    body = _build_plan_review_body(plan_task_id)
+    body = _build_plan_review_body(plan_task_id, source=source)
     target_label = _plan_task_label(plan_task_id)
     labels = [
         PLAN_REVIEW_LABEL,
@@ -323,7 +354,7 @@ def emit_plan_review_for_task(
                 "requester": requester,
                 "user_prompt": user_prompt,
                 "plan_task_id": plan_task_id,
-                "backstop_source": "plan_review_emit",
+                "backstop_source": source,
             },
             state="closed",  # mirrors session_runtime.notify for immediate tier
             kind=InboxItemKind.PLAN_REVIEW_PENDING.value,
@@ -393,7 +424,7 @@ def emit_plan_review_for_task(
                     "user_prompt": user_prompt,
                     "plan_task_id": plan_task_id,
                     "task_id": inbox_task_id,
-                    "backstop_source": "plan_review_emit",
+                    "backstop_source": source,
                 },
             )
         except Exception:  # noqa: BLE001
@@ -437,12 +468,46 @@ def maybe_emit_plan_review_on_task_done(
     )
 
 
+def maybe_emit_plan_review_on_user_approval(
+    svc: Any,
+    task_id: str,
+    actor: str,
+) -> str | None:
+    """Emit a fallback plan-review card when plan_project reaches user_approval.
+
+    The happy path is still the architect's explicit ``pm notify`` with
+    rich labels such as ``explainer:<path>``. This hook is the narrow
+    workflow backstop: when the canonical plan task is already parked at
+    the human approval node and no plan_review message exists, create the
+    basic review card so the operator approval loop is exercisable.
+    """
+    try:
+        task = svc.get(task_id)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "plan_review_emit: get(%s) failed for user_approval emit: %s",
+            task_id, exc, exc_info=True,
+        )
+        return None
+    if not task_is_pending_plan_approval(task):
+        return None
+    return emit_plan_review_for_task(
+        svc=svc,
+        task=task,
+        actor=actor or "architect",
+        requester="user",
+        source="user_approval",
+    )
+
+
 __all__ = [
     "PLAN_REVIEW_LABEL",
     "PLAN_SHAPED_LABELS",
     "already_has_plan_review_message",
     "emit_plan_review_for_task",
     "is_plan_shaped_task",
+    "maybe_emit_plan_review_on_user_approval",
     "maybe_emit_plan_review_on_task_done",
     "task_is_eligible_for_backstop",
+    "task_is_pending_plan_approval",
 ]

@@ -185,6 +185,38 @@ test.describe("surfaces", () => {
     );
   }
 
+  async function stubEmptyProjects(page: import("@playwright/test").Page) {
+    await page.route("**/api/v1/projects**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      }),
+    );
+  }
+
+  async function stubEmptyActivity(page: import("@playwright/test").Page) {
+    await page.route("**/api/v1/audit/stats**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          total: 0,
+          by_event: {},
+          by_severity: {},
+          since: "2026-05-21T00:00:00Z",
+        }),
+      }),
+    );
+    await page.route("**/api/v1/audit/grep**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ events: [], next_cursor: null }),
+      }),
+    );
+  }
+
   test("left rail renders surface list after load", async ({ page }) => {
     await page.goto("/ui/");
     const list = page.locator("#surface-list");
@@ -497,6 +529,8 @@ test.describe("surfaces", () => {
   test("surface refreshes coalesce while a request is in flight", async ({ page }) => {
     await installHealthyEventSource(page);
     await stubEmptyTasks(page);
+    await stubEmptyProjects(page);
+    await stubEmptyActivity(page);
 
     let dashboardRequests = 0;
     await page.route("**/api/v1/dashboard", (route) => {
@@ -541,6 +575,58 @@ test.describe("surfaces", () => {
     expect(sessionRequests).toBe(2);
   });
 
+  test("initial rail load requests sessions tasks and projects in parallel", async ({ page }) => {
+    await stubEmptyActivity(page);
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(0)),
+      }),
+    );
+
+    let releaseSessions: (() => void) | null = null;
+    const sessionsGate = new Promise<void>((resolve) => {
+      releaseSessions = resolve;
+    });
+    let sessionRequests = 0;
+    let taskRequests = 0;
+    let projectRequests = 0;
+
+    await page.route("**/api/v1/chat/sessions", async (route) => {
+      sessionRequests += 1;
+      await sessionsGate;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      });
+    });
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) => {
+      taskRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      });
+    });
+    await page.route("**/api/v1/projects**", (route) => {
+      projectRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await expect.poll(() => sessionRequests).toBe(1);
+    await expect.poll(() => taskRequests).toBe(1);
+    await expect.poll(() => projectRequests).toBe(1);
+    releaseSessions!();
+    await waitForSurfaceRailTerminal(page);
+  });
+
   test("initial center-pane state shows 'Select a surface'", async ({ page }) => {
     await page.goto("/ui/");
     await expect(page.locator("#pane-title")).toHaveText("Select a surface");
@@ -549,6 +635,8 @@ test.describe("surfaces", () => {
   });
 
   test("task surfaces render in a separate rail group", async ({ page }) => {
+    await stubEmptyProjects(page);
+    await stubEmptyActivity(page);
     await page.route("**/api/v1/chat/sessions", (route) =>
       route.fulfill({
         status: 200,
@@ -611,6 +699,223 @@ test.describe("surfaces", () => {
     );
   });
 
+  test("project switcher filters surfaces and shows urgency", async ({ page }) => {
+    await stubEmptyActivity(page);
+    let dashboardProject: string | null = null;
+    await page.route("**/api/v1/dashboard**", (route) => {
+      const url = new URL(route.request().url());
+      dashboardProject = url.searchParams.get("project");
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          rollups: { tracked_count: 2, open_inbox_count: 0, pending_plan_reviews: 0 },
+          daemon_status: "up",
+          active_sessions: [],
+          recent_messages: [],
+          projects: [],
+          generated_at: "2026-05-23T00:00:00Z",
+          scoped_fields: [],
+        }),
+      });
+    });
+    await page.route("**/api/v1/projects**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              key: "alpha",
+              name: "Alpha",
+              path: "/tmp/alpha",
+              tracked: true,
+              kind: "git",
+              glyph: "amber",
+              task_counts: { blocked: 2, queued: 1 },
+              open_inbox_count: 0,
+              pending_plan_review: false,
+              last_activity_at: "2026-05-23T00:00:00Z",
+            },
+            {
+              key: "beta",
+              name: "Beta",
+              path: "/tmp/beta",
+              tracked: true,
+              kind: "git",
+              glyph: "amber",
+              task_counts: { queued: 3 },
+              open_inbox_count: 0,
+              pending_plan_review: false,
+              last_activity_at: null,
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          sessions: [
+            {
+              session_name: "alpha-worker",
+              surface_type: "worker",
+              persona: "worker",
+              project: "alpha",
+              window: { present: true, pane_dead: false },
+            },
+            {
+              session_name: "beta-worker",
+              surface_type: "worker",
+              persona: "worker",
+              project: "beta",
+              window: { present: true, pane_dead: false },
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    const alpha = page.locator("li[data-project='alpha']");
+    await expect(alpha).toContainText("blocked");
+    await expect(alpha).toContainText("2 blocked");
+    await alpha.click();
+    await expect(page.locator("li[data-session='alpha-worker']")).toBeVisible();
+    await expect(page.locator("li[data-session='beta-worker']")).toHaveCount(0);
+    await expect.poll(() => dashboardProject).toBe("alpha");
+  });
+
+  test("task rail collapses duplicate watchdog-style entries", async ({ page }) => {
+    await stubEmptyProjects(page);
+    await stubEmptyActivity(page);
+    await stubEmptySessions(page);
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              task_id: "a",
+              project: "demo",
+              task_number: 1,
+              title: "Project demo has queued tasks but no activity",
+              work_status: "queued",
+              type: "task",
+              priority: "normal",
+            },
+            {
+              task_id: "b",
+              project: "demo",
+              task_number: 2,
+              title: "Project demo has queued tasks but no activity",
+              work_status: "queued",
+              type: "task",
+              priority: "normal",
+            },
+            {
+              task_id: "c",
+              project: "demo",
+              task_number: 3,
+              title: "Real follow-up",
+              work_status: "blocked",
+              type: "task",
+              priority: "high",
+            },
+          ],
+        }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    await expect(page.locator("li[data-task]")).toHaveCount(2);
+    await expect(page.locator("li[data-task='demo/1']")).toContainText("×2");
+  });
+
+  test("activity panel renders returning-operator digest", async ({ page }) => {
+    await stubEmptyProjects(page);
+    await stubEmptySessions(page);
+    await stubEmptyTasks(page);
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(0)),
+      }),
+    );
+    await page.route("**/api/v1/audit/stats**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          total: 3,
+          by_event: { "task.status_changed": 1, "plan.approved": 1 },
+          by_severity: { ok: 2, warn: 1 },
+          since: "2026-05-21T00:00:00Z",
+        }),
+      }),
+    );
+    await page.route("**/api/v1/audit/grep**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          events: [
+            {
+              schema: 1,
+              ts: "2026-05-23T00:00:00Z",
+              project: "demo",
+              event: "task.status_changed",
+              subject: "demo/7",
+              actor: "agent-1",
+              status: "ok",
+              metadata: { to_state: "done" },
+            },
+            {
+              schema: 1,
+              ts: "2026-05-23T00:01:00Z",
+              project: "demo",
+              event: "watchdog.warning",
+              subject: "demo",
+              actor: "polly",
+              status: "warn",
+              metadata: {},
+            },
+            {
+              schema: 1,
+              ts: "2026-05-23T00:02:00Z",
+              project: "demo",
+              event: "plan.approved",
+              subject: "demo/8",
+              actor: "sam",
+              status: "ok",
+              metadata: {},
+            },
+          ],
+          next_cursor: null,
+        }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    await expect(page.locator("#activity-summary")).toContainText("events");
+    await expect(page.locator("#activity-summary")).toContainText("3");
+    await expect(page.locator("#activity-summary")).toContainText("warnings");
+    await expect(page.locator("#activity-summary")).toContainText("decisions");
+    await expect(page.locator("#activity-feed")).toContainText("plan.approved");
+    await expect(page.locator("#activity-feed")).toContainText("watchdog.warning");
+  });
+
   test("audit panel expands and queries current surface scope", async ({ page }) => {
     await page.route("**/api/v1/chat/*/messages*", (route) =>
       route.fulfill({
@@ -642,8 +947,27 @@ test.describe("surfaces", () => {
         }),
       }),
     );
+    await page.route("**/api/v1/audit/stats**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          total: 0,
+          by_event: {},
+          by_severity: {},
+          since: "2026-05-21T00:00:00Z",
+        }),
+      }),
+    );
     await page.route("**/api/v1/audit/grep**", (route) => {
       const url = new URL(route.request().url());
+      if (!url.searchParams.get("pattern")) {
+        return route.fulfill({
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify({ events: [], next_cursor: null }),
+        });
+      }
       expect(url.searchParams.get("project")).toBe("demo");
       expect(url.searchParams.get("pattern")).toBe("demo/4");
       expect(url.searchParams.get("limit")).toBe("25");

@@ -13,6 +13,7 @@ the surface honest going forward.
 from __future__ import annotations
 
 import inspect
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -117,6 +118,104 @@ def test_mock_update_allows_assignee_and_external_refs(tmp_path) -> None:
     )
     assert updated.assignee == "olga"
     assert updated.external_refs == {"slack": "thread/abc"}
+
+
+def _create_mock_task(
+    svc: MockWorkService,
+    *,
+    project: str = "demo",
+    title: str = "inbox-ish task",
+):
+    return svc.create(
+        title=title,
+        type="task",
+        project=project,
+        flow_template="plan_project",
+        roles={"architect": "architect"},
+    )
+
+
+def test_mock_list_replies_returns_reply_context_oldest_first(tmp_path) -> None:
+    svc = MockWorkService(project_path=tmp_path)
+    task = _create_mock_task(svc)
+
+    svc.add_context(task.task_id, "system", "hidden note", entry_type="note")
+    svc.add_context(task.task_id, "user", "first", entry_type="reply")
+    svc.add_context(task.task_id, "user", "second", entry_type="reply")
+
+    replies = svc.list_replies(task.task_id)
+
+    assert [entry.text for entry in replies] == ["first", "second"]
+    assert {entry.entry_type for entry in replies} == {"reply"}
+
+
+def test_mock_bulk_list_replies_buckets_project_replies(tmp_path) -> None:
+    svc = MockWorkService(project_path=tmp_path)
+    first = _create_mock_task(svc, project="demo", title="first")
+    second = _create_mock_task(svc, project="demo", title="second")
+    other = _create_mock_task(svc, project="other", title="other")
+
+    svc.add_context(first.task_id, "user", "first-a", entry_type="reply")
+    svc.add_context(first.task_id, "user", "first-b", entry_type="reply")
+    svc.add_context(second.task_id, "system", "note", entry_type="note")
+    svc.add_context(second.task_id, "user", "second-a", entry_type="reply")
+    svc.add_context(other.task_id, "user", "other-a", entry_type="reply")
+
+    replies_by_number = svc.bulk_list_replies(project="demo")
+
+    assert sorted(replies_by_number) == [first.task_number, second.task_number]
+    assert [entry.text for entry in replies_by_number[first.task_number]] == [
+        "first-a",
+        "first-b",
+    ]
+    assert [entry.text for entry in replies_by_number[second.task_number]] == [
+        "second-a",
+    ]
+
+
+def test_mock_latest_snoozes_bulk_feeds_web_api_snooze_filter(
+    tmp_path,
+) -> None:
+    from pollypm.web_api.service import _active_snoozed_ids
+
+    now = datetime(2026, 6, 1, 12, tzinfo=timezone.utc)
+    svc = MockWorkService(project_path=tmp_path)
+    active = _create_mock_task(svc, title="active snooze")
+    expired = _create_mock_task(svc, title="expired latest snooze")
+    unsnoozed = _create_mock_task(svc, title="unsnoozed")
+
+    past = (now - timedelta(hours=1)).isoformat()
+    future = (now + timedelta(hours=1)).isoformat()
+    svc.add_context(
+        active.task_id,
+        "user",
+        f"until_iso={past}; older expired snooze",
+        entry_type="snooze",
+    )
+    svc.add_context(
+        active.task_id,
+        "user",
+        f"until_iso={future}; latest future snooze",
+        entry_type="snooze",
+    )
+    svc.add_context(
+        expired.task_id,
+        "user",
+        f"until_iso={future}; older future snooze",
+        entry_type="snooze",
+    )
+    svc.add_context(
+        expired.task_id,
+        "user",
+        f"until_iso={past}; latest expired snooze",
+        entry_type="snooze",
+    )
+
+    snoozed = _active_snoozed_ids(
+        svc, [active, expired, unsnoozed], now=now,
+    )
+
+    assert snoozed == {active.task_id}
 
 
 def test_concrete_impls_carry_every_protocol_method() -> None:

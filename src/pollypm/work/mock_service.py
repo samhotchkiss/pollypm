@@ -710,6 +710,43 @@ class MockWorkService:
             entries = entries[:limit]
         return entries
 
+    def list_replies(self, task_id: str) -> list[ContextEntry]:
+        """Return reply context entries oldest-first."""
+        entries = self.get_context(task_id, entry_type="reply")
+        entries.reverse()
+        return entries
+
+    def bulk_list_replies(self, *, project: str) -> dict[int, list[ContextEntry]]:
+        """Return project reply entries bucketed by task number."""
+        out: dict[int, list[ContextEntry]] = {}
+        for task_id, entries in self._context.items():
+            task_project, task_number = _parse_task_id(task_id)
+            if task_project != project:
+                continue
+            replies = [
+                deepcopy(entry)
+                for entry in entries
+                if entry.entry_type == "reply"
+            ]
+            if replies:
+                out[task_number] = replies
+        return out
+
+    def latest_snoozes_bulk(
+        self, task_keys: list[tuple[str, int]],
+    ) -> dict[tuple[str, int], ContextEntry]:
+        """Return the latest snooze context entry for each requested task."""
+        out: dict[tuple[str, int], ContextEntry] = {}
+        for project, task_number in task_keys:
+            task_id = f"{project}/{task_number}"
+            snoozes = [
+                entry for entry in self._context.get(task_id, [])
+                if entry.entry_type == "snooze"
+            ]
+            if snoozes:
+                out[(project, task_number)] = deepcopy(snoozes[-1])
+        return out
+
     # ------------------------------------------------------------------
     # Relationships
     # ------------------------------------------------------------------

@@ -1,0 +1,15 @@
+id: architect-planning-3-candidates
+role: architect
+session_template: architect_<project>
+prompt: |
+  What should be the next priority for PollyPM after the current sprint?
+  Give me 3 candidates with one-paragraph reasoning each.
+assertions:
+  must_contain_at_least:
+    - candidates_count: 3
+  must_match_regex:
+    - "(?i)(priority|next sprint)"
+  must_not_match_regex:
+    - "(?i)i am happy to help"
+  response_category: planning
+timeout_seconds: 90

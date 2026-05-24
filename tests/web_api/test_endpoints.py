@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import inspect
 import sqlite3
+from datetime import UTC, datetime
 
 import pytest
 
@@ -261,6 +262,138 @@ def test_get_project_plan_404_when_no_plan(client, auth_headers) -> None:
     body = response.json()
     assert body["error"]["code"] == "not_found"
     assert "hint" in body["error"]
+
+
+_PLAN_BODY = (
+    "# Project plan\n\n"
+    "## Summary\n"
+    "Ship the operator plan review surface.\n\n"
+    "## Judgment calls\n"
+    "- Keep approval in the work-service lifecycle\n\n"
+    "## Critic synthesis\n"
+    "No unresolved blockers.\n"
+)
+
+
+def _seed_active_plan_review(api_config, project_root):
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(
+            svc,
+            project="myproj",
+            title="Plan myproj",
+            description=_PLAN_BODY,
+            flow_template="plan_project",
+            roles={"architect": "architect"},
+            labels=["plan_review"],
+        )
+        now = datetime.now(UTC).isoformat()
+        if hasattr(svc, "_pool"):
+            with svc._pool.connection() as conn, conn.cursor() as cur:  # noqa: SLF001
+                cur.execute(
+                    """
+                    UPDATE work_tasks
+                    SET work_status = 'review',
+                        current_node_id = 'user_approval',
+                        assignee = 'human',
+                        updated_at = %s
+                    WHERE project = %s AND task_number = %s
+                    """,
+                    (now, task.project, task.task_number),
+                )
+                cur.execute(
+                    """
+                    INSERT INTO work_node_executions
+                        (task_project, task_number, node_id, visit, status, started_at)
+                    VALUES (%s, %s, 'user_approval', 1, 'active', %s)
+                    """,
+                    (task.project, task.task_number, now),
+                )
+                conn.commit()
+        else:
+            with sqlite3.connect(db_path) as conn:
+                conn.execute(
+                    """
+                    UPDATE work_tasks
+                    SET work_status = 'review',
+                        current_node_id = 'user_approval',
+                        assignee = 'human',
+                        updated_at = ?
+                    WHERE project = ? AND task_number = ?
+                    """,
+                    (now, task.project, task.task_number),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO work_node_executions
+                        (task_project, task_number, node_id, visit, status, started_at)
+                    VALUES (?, ?, 'user_approval', 1, 'active', ?)
+                    """,
+                    (task.project, task.task_number, now),
+                )
+    return task
+
+
+def test_get_project_plan_returns_user_approval_plan(
+    api_config, client, auth_headers, project_root
+) -> None:
+    task = _seed_active_plan_review(api_config, project_root)
+
+    response = client.get("/api/v1/projects/myproj/plan", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task_id"] == task.task_id
+    assert "operator plan review" in body["summary"]
+    assert body["judgment_calls"] == [
+        {"point": "Keep approval in the work-service lifecycle"}
+    ]
+
+
+def test_approve_project_plan_decides_active_review(
+    api_config, client, auth_headers, project_root
+) -> None:
+    task = _seed_active_plan_review(api_config, project_root)
+
+    response = client.post(
+        "/api/v1/projects/myproj/plan/approve",
+        headers=auth_headers,
+        json={"actor": "user", "note": "ship it"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["message"] == f"approved plan {task.task_id}"
+    assert body["task"]["task_id"] == task.task_id
+    assert body["task"]["work_status"] == "in_progress"
+    assert body["task"]["current_node_id"] == "emit"
+
+
+def test_reject_project_plan_requires_reason_and_bounces_to_rework(
+    api_config, client, auth_headers, project_root
+) -> None:
+    task = _seed_active_plan_review(api_config, project_root)
+
+    missing_reason = client.post(
+        "/api/v1/projects/myproj/plan/reject",
+        headers=auth_headers,
+        json={"actor": "user"},
+    )
+    assert missing_reason.status_code == 422
+
+    response = client.post(
+        "/api/v1/projects/myproj/plan/reject",
+        headers=auth_headers,
+        json={"actor": "user", "reason": "Needs a narrower scope"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["message"] == f"rejected plan {task.task_id}"
+    assert body["task"]["task_id"] == task.task_id
+    assert body["task"]["work_status"] == "rework"
+    assert body["task"]["current_node_id"] == "synthesize"
 
 
 def test_list_inbox_empty_state(client, auth_headers) -> None:

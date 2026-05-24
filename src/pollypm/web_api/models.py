@@ -252,6 +252,38 @@ class Plan(BaseModel):
     created_at: datetime
 
 
+class PlanApproveRequest(BaseModel):
+    """Body for ``POST /projects/{key}/plan/approve``."""
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(
+        default="user",
+        min_length=1,
+        description="Human/operator actor approving the plan review.",
+    )
+    note: str | None = Field(
+        default=None,
+        description="Optional approval note recorded on the review decision.",
+    )
+
+
+class PlanRejectRequest(BaseModel):
+    """Body for ``POST /projects/{key}/plan/reject``."""
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(
+        default="user",
+        min_length=1,
+        description="Human/operator actor rejecting the plan review.",
+    )
+    reason: str = Field(
+        min_length=1,
+        description="Required rejection reason recorded on the review decision.",
+    )
+
+
 class TaskDetail(TaskSummary):
     description: str
     acceptance_criteria: str | None = None
@@ -772,7 +804,9 @@ __all__ = [
     "InboxReplyRequest",
     "InboxSnoozeRequest",
     "Plan",
+    "PlanApproveRequest",
     "PlanJudgmentCall",
+    "PlanRejectRequest",
     "Project",
     "ProjectActivityEntry",
     "ProjectDrilldown",

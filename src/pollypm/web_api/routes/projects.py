@@ -27,19 +27,24 @@ from pollypm.web_api.errors import not_found
 from pollypm.web_api.models import (
     ActionResult,
     Plan,
+    PlanApproveRequest,
+    PlanRejectRequest,
     Project,
     ProjectDrilldown,
     ProjectListResponse,
+    TaskActionResult,
     TaskListResponse,
 )
 from pollypm.web_api.routes._deps import ConfigDep
 from pollypm.web_api.service import (
     archive_project,
+    approve_active_plan,
     get_active_plan,
     init_project_guide_for_role,
     list_project_tasks,
     list_projects,
     project_drilldown,
+    reject_active_plan,
     set_project_tracked,
 )
 
@@ -187,6 +192,73 @@ def get_project_plan_endpoint(
             hint="Plans appear here once a task reaches the user_approval node.",
         )
     return plan
+
+
+@router.post(
+    "/projects/{key}/plan/approve",
+    response_model=TaskActionResult,
+    summary="Approve the active project plan review",
+    operation_id="approveProjectPlan",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or active plan review not found."},
+        "409": {"description": "Active plan is not currently reviewable."},
+        "422": {"description": "Actor or review gates rejected the decision."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def approve_project_plan_endpoint(
+    key: str,
+    config: ConfigDep,
+    body: PlanApproveRequest | None = None,
+) -> TaskActionResult:
+    if key not in config.projects:
+        raise not_found(f"Project not registered: {key}")
+    decision = body or PlanApproveRequest()
+    task = approve_active_plan(
+        config,
+        key,
+        actor=decision.actor,
+        note=decision.note,
+    )
+    return TaskActionResult(
+        ok=True,
+        message=f"approved plan {task.task_id}",
+        task=task,
+    )
+
+
+@router.post(
+    "/projects/{key}/plan/reject",
+    response_model=TaskActionResult,
+    summary="Reject the active project plan review",
+    operation_id="rejectProjectPlan",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or active plan review not found."},
+        "409": {"description": "Active plan is not currently reviewable."},
+        "422": {"description": "Body validation or review gates rejected the decision."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def reject_project_plan_endpoint(
+    key: str,
+    body: PlanRejectRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if key not in config.projects:
+        raise not_found(f"Project not registered: {key}")
+    task = reject_active_plan(
+        config,
+        key,
+        actor=body.actor,
+        reason=body.reason,
+    )
+    return TaskActionResult(
+        ok=True,
+        message=f"rejected plan {task.task_id}",
+        task=task,
+    )
 
 
 # ---------------------------------------------------------------------------

@@ -13,6 +13,10 @@ from pollypm.config import PollyPMConfig, load_config
 
 logger = logging.getLogger(__name__)
 
+# Test seam for ``load_dashboard``. Kept lazy in production so importing
+# dashboard_data does not eagerly open the sqlite state module.
+StateStore = None
+
 
 # ANSI CSI/OSC escapes plus C0 control chars that can survive in a
 # tmux pane snapshot. ``readyring`` and friends in the cockpit Now
@@ -778,7 +782,11 @@ def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
     if is_pg_backend(config):
         data = gather(config, None)
         return config, data
-    from pollypm.storage.state import StateStore
+    global StateStore
+    if StateStore is None:
+        from pollypm.storage.state import StateStore as _StateStore
+
+        StateStore = _StateStore
 
     store = StateStore(config.project.state_db)
     try:
@@ -800,7 +808,10 @@ def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
     use_pg = is_pg_backend(config)
     if use_pg:
         from pollypm.storage.pg_alerts import open_alerts as pg_open_alerts
-        from pollypm.storage.pg_heartbeats import latest_heartbeat as pg_latest_heartbeat
+        from pollypm.storage.pg_heartbeats import (
+            latest_heartbeat as pg_latest_heartbeat,
+            latest_heartbeats_bulk as pg_latest_heartbeats_bulk,
+        )
         from pollypm.storage.pg_sessions import (
             list_session_runtimes as pg_list_session_runtimes,
             recent_events as pg_recent_events,
@@ -818,6 +829,22 @@ def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
         all_runtimes = []
     runtime_map = {rt.session_name: rt for rt in all_runtimes}
     launches = plan_launches_readonly(config, store)
+    heartbeat_map: dict[str, object] = {}
+    heartbeat_bulk_loaded = False
+    if use_pg and launches:
+        try:
+            heartbeat_map = pg_latest_heartbeats_bulk(
+                [launch.session.name for launch in launches],
+                config=config,
+            )
+            heartbeat_bulk_loaded = True
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "dashboard_data.gather: bulk heartbeat lookup failed; "
+                "falling back to per-session reads",
+                exc_info=True,
+            )
+            heartbeat_map = {}
 
     active: list[SessionActivity] = []
     for launch in launches:
@@ -828,7 +855,9 @@ def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
 
         # Get last snapshot path for description
         if use_pg:
-            hb = pg_latest_heartbeat(launch.session.name)
+            hb = heartbeat_map.get(launch.session.name)
+            if hb is None and not heartbeat_bulk_loaded:
+                hb = pg_latest_heartbeat(launch.session.name, config=config)
         elif store is not None:
             hb = store.latest_heartbeat(launch.session.name)  # type: ignore[attr-defined]
         else:

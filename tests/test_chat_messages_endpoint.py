@@ -14,6 +14,7 @@ skipped — these tests are self-contained.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -35,6 +36,7 @@ from pollypm.models import (
     RuntimeKind,
     SessionConfig,
 )
+from pollypm.projects import project_transcripts_dir
 from pollypm.web_api import create_app, ensure_token
 from pollypm.web_api.auth import SESSION_COOKIE_NAME
 from pollypm.web_api.chat.envelope import (
@@ -216,8 +218,16 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
     def install(surfaces: list[ChatSurface]) -> None:
         def fake(config, work_service=None, tmux_client=None):
             return list(surfaces)
+        def fake_find(config, session_name, work_service=None, tmux_client=None):
+            for surface in surfaces:
+                if surface.session_name == session_name:
+                    return surface
+            return None
         monkeypatch.setattr(
             chat_messages_routes, "enumerate_chat_surfaces", fake,
+        )
+        monkeypatch.setattr(
+            chat_messages_routes, "find_chat_surface", fake_find,
         )
         # Also stub the work-service stub factory so we never try to
         # open Postgres during these tests. (The route uses the
@@ -228,6 +238,11 @@ def patch_registry(monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setattr(
             chat_messages_routes,
             "_build_work_service_stub",
+            lambda _config, **_kw: None,
+        )
+        monkeypatch.setattr(
+            chat_messages_routes,
+            "_build_work_service_stub_strict",
             lambda _config, **_kw: None,
         )
         # Stop the route from constructing a real TmuxClient (spawning
@@ -436,6 +451,78 @@ def test_messages_endpoint_returns_envelopes_for_known_session(
     assert [m["id"] for m in body["messages"]] == ["msg_1", "msg_2"]
     assert body["has_more"] is False
     assert body["next_cursor"] is None
+
+
+def test_messages_endpoint_resolves_one_config_surface_without_full_enumeration(
+    client,
+    auth_headers,
+    config,
+    workspace,
+    project_root,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The message hot path must not build the whole session sidebar.
+
+    A single configured session can be resolved from ``config.sessions``
+    and that project's transcript index. Regressing to
+    ``enumerate_chat_surfaces`` would rescan every project transcript
+    root and reopen the worker facade before every message fetch.
+    """
+    transcript_dir = project_transcripts_dir(project_root) / "provider-session"
+    transcript_dir.mkdir(parents=True)
+    archive = transcript_dir / "events.jsonl"
+    archive.write_text(
+        json.dumps({
+            "timestamp": "2026-05-21T10:00:00Z",
+            "event_type": "assistant_turn",
+            "session_id": "provider-session",
+            "account_name": "codex_primary",
+            "provider": "codex",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": 0,
+            "cwd": str(workspace),
+            "model_name": "gpt-5",
+            "payload": {"text": "direct lookup"},
+        }) + "\n",
+        encoding="utf-8",
+    )
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CODEX,
+        account="codex_primary",
+        cwd=workspace,
+        project="myproj",
+        window_name="operator",
+    )
+    monkeypatch.setattr(chat_messages_routes, "_build_tmux_client", lambda: None)
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_work_service_stub_strict",
+        lambda *_args, **_kwargs: pytest.fail(
+            "non-worker lookup should not open work-service"
+        ),
+    )
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "enumerate_chat_surfaces",
+        lambda *_args, **_kwargs: pytest.fail(
+            "message lookup should not enumerate every surface"
+        ),
+    )
+
+    response = client.get(
+        "/api/v1/chat/operator/messages?source=jsonl&direction=asc",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["session_name"] == "operator"
+    assert [message["text"] for message in body["messages"]] == [
+        "direct lookup",
+    ]
 
 
 def test_messages_endpoint_404s_unknown_session(

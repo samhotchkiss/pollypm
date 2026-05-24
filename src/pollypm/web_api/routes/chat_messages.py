@@ -45,6 +45,7 @@ from pollypm.web_api.chat import (
     SurfaceType,
     capture_envelopes,
     enumerate_chat_surfaces,
+    find_chat_surface,
     is_archive_stale,
     parse_events_jsonl,
     parse_events_jsonl_tail,
@@ -319,7 +320,9 @@ def _build_work_service_stub(config: Any) -> Any | None:
     return _WorkerSessionStub(records)
 
 
-def _build_work_service_stub_strict(config: Any) -> Any | None:
+def _build_work_service_stub_strict(
+    config: Any, *, project: str | None = None
+) -> Any | None:
     """Strict variant: surfaces facade outages instead of swallowing them.
 
     Consumes the public
@@ -349,7 +352,7 @@ def _build_work_service_stub_strict(config: Any) -> Any | None:
             "list_active_worker_sessions_strict import failed"
         ) from exc
     try:
-        records = list_active_worker_sessions_strict(config)
+        records = list_active_worker_sessions_strict(config, project=project)
     except WorkServiceFacadeUnavailable as exc:
         raise _WorkerFacadeUnavailable(str(exc)) from exc
     if not records:
@@ -372,9 +375,17 @@ class _WorkerSessionStub:
         self._records = list(records)
 
     def list_worker_sessions(
-        self, *, active_only: bool = True,  # noqa: ARG002 — registry-API compat
+        self,
+        *,
+        active_only: bool = True,  # noqa: ARG002 — registry-API compat
+        project: str | None = None,
     ) -> list[Any]:
-        return list(self._records)
+        if project is None:
+            return list(self._records)
+        return [
+            record for record in self._records
+            if getattr(record, "task_project", None) == project
+        ]
 
 
 def _build_tmux_client() -> TmuxClient | None:
@@ -418,9 +429,20 @@ def _find_surface(
         include_workers = _is_worker_session(session_name)
     tmux_client = _build_tmux_client()
     work_service: Any | None = None
+    worker_project: str | None = None
     if include_workers:
+        parsed = parse_task_window_name(session_name)
+        worker_project = parsed[0] if parsed is not None else None
         try:
-            work_service = _build_work_service_stub_strict(config)
+            try:
+                work_service = _build_work_service_stub_strict(
+                    config, project=worker_project
+                )
+            except TypeError:
+                # Older tests / adapters predate the project-scoped
+                # keyword. Fall back to the original strict call shape;
+                # the registry still filters the returned records.
+                work_service = _build_work_service_stub_strict(config)
         except _WorkerFacadeUnavailable as exc:
             raise service_unavailable(
                 f"work-service unavailable; cannot resolve worker session "
@@ -430,14 +452,25 @@ def _find_surface(
                     "Retry shortly; check `pm sessions` / pg pool health."
                 ),
             ) from exc
+    surface = find_chat_surface(
+        config,
+        session_name,
+        work_service=work_service,
+        tmux_client=tmux_client,
+    )
+    if surface is not None and surface.session_name == session_name:
+        return surface
+    # Compatibility fallback for tests and unusual callers that patch the
+    # broad enumerator directly. The normal configured-session hot path
+    # returns above and never pays this workspace-wide scan.
     surfaces = enumerate_chat_surfaces(
         config,
         work_service=work_service,
         tmux_client=tmux_client,
     )
-    for surface in surfaces:
-        if surface.session_name == session_name:
-            return surface
+    for candidate in surfaces:
+        if candidate.session_name == session_name:
+            return candidate
     raise _session_unknown(session_name)
 
 

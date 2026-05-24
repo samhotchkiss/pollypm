@@ -893,6 +893,127 @@ def _walk_log_chain(live: Path) -> Iterable[Path]:
         yield archive
 
 
+_TAIL_READ_CHUNK_BYTES = 128 * 1024
+
+
+def _audit_obj_matches(
+    obj: dict[str, Any],
+    *,
+    project: str,
+    since: str | None,
+    event: str | None,
+) -> bool:
+    """Apply the read_events filters to a decoded audit object."""
+    if event is not None and obj.get("event") != event:
+        return False
+    if since is not None:
+        ts = str(obj.get("ts", ""))
+        if ts <= since:
+            return False
+    # Skip cross-project rows that snuck into a per-project file
+    # (shouldn't happen, but defensive — the per-project log only ever
+    # receives writes from one project's mutation hooks).
+    return not (obj.get("project") and obj.get("project") != project)
+
+
+def _decode_audit_line(raw: bytes | str) -> dict[str, Any] | None:
+    if isinstance(raw, bytes):
+        line = raw.decode("utf-8", errors="ignore").strip()
+    else:
+        line = raw.strip()
+    if not line:
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
+def _iter_live_log_lines_reverse(path: Path) -> Iterable[dict[str, Any]]:
+    """Yield decoded live-jsonl rows newest-first using bounded tail reads.
+
+    The project detail endpoint asks for the last 25 audit rows. Reading
+    a multi-megabyte audit log from the head just to slice ``[-25:]`` is
+    proportional to total project history, not the requested page size.
+    This iterator snapshots the file size, walks backward in chunks, and
+    yields complete JSONL rows from newest to oldest. A concurrently
+    appended partial tail line is treated the same way as the forward
+    reader treats malformed lines: skipped, never fatal.
+    """
+    try:
+        file_size = path.stat().st_size
+    except OSError as exc:
+        logger.warning("audit.read: stat failed for %s: %s", path, exc)
+        return
+    if file_size <= 0:
+        return
+
+    carry = b""
+    offset = file_size
+    try:
+        with path.open("rb") as fh:
+            while offset > 0:
+                read_size = min(_TAIL_READ_CHUNK_BYTES, offset)
+                offset -= read_size
+                fh.seek(offset)
+                data = fh.read(read_size) + carry
+                lines = data.splitlines()
+                if offset > 0:
+                    if lines:
+                        carry = lines[0]
+                        lines = lines[1:]
+                    else:
+                        carry = data
+                        continue
+                else:
+                    carry = b""
+                for raw in reversed(lines):
+                    obj = _decode_audit_line(raw)
+                    if obj is not None:
+                        yield obj
+    except OSError as exc:
+        logger.warning("audit.read: tail read failed for %s: %s", path, exc)
+
+
+def _iter_log_lines_reverse(path: Path) -> Iterable[dict[str, Any]]:
+    """Yield decoded rows newest-first for live or rotated audit files."""
+    if path.suffix == ".gz":
+        # Gzip streams are not efficiently seekable. This only runs when
+        # the live tail did not satisfy the requested limit, so it is a
+        # cold/rotation fallback rather than the hot path.
+        rows = list(_iter_log_lines(path))
+        for obj in reversed(rows):
+            yield obj
+        return
+    yield from _iter_live_log_lines_reverse(path)
+
+
+def _read_events_limited_tail(
+    live: Path,
+    project: str,
+    *,
+    limit: int,
+    event: str | None,
+) -> list[AuditEvent]:
+    """Read the newest ``limit`` matching rows without scanning history."""
+    if limit <= 0:
+        return []
+    events: list[AuditEvent] = []
+    for path in _walk_log_chain(live):
+        for obj in _iter_log_lines_reverse(path):
+            if not _audit_obj_matches(
+                obj, project=project, since=None, event=event
+            ):
+                continue
+            events.append(AuditEvent.from_dict(obj))
+            if len(events) >= limit:
+                events.sort(key=lambda e: e.ts)
+                return events
+    events.sort(key=lambda e: e.ts)
+    return events
+
+
 def read_events(
     project: str,
     *,
@@ -930,15 +1051,21 @@ def read_events(
       (post-filter, in chronological order).
 
     Returns a list (not a generator) because typical callers want
-    to count / slice / re-iterate. Audit logs are bounded — even a
-    chatty project lands in the low thousands per day — so loading
-    fully into memory is fine.
+    to count / slice / re-iterate. Limited tail reads skip the
+    full-history scan when no ``since`` filter is present; other
+    shapes keep the chronological full scan so rotated logs and
+    dedupe windows remain authoritative.
     """
     per_project = project_log_path(project_path)
     if per_project is not None and per_project.exists():
         live = per_project
     else:
         live = central_log_path(project)
+
+    if limit is not None and limit >= 0 and since is None:
+        return _read_events_limited_tail(
+            live, project, limit=limit, event=event
+        )
 
     # ``_walk_log_chain`` yields live first then archives newest-first.
     # Each file is a chronological run of records (older-first within
@@ -951,17 +1078,9 @@ def read_events(
     for path in _walk_log_chain(live):
         bucket: list[AuditEvent] = []
         for obj in _iter_log_lines(path):
-            if event is not None and obj.get("event") != event:
-                continue
-            if since is not None:
-                ts = str(obj.get("ts", ""))
-                if ts <= since:
-                    continue
-            # Skip cross-project rows that snuck into a per-project
-            # file (shouldn't happen, but defensive — the per-project
-            # log only ever receives writes from one project's
-            # mutation hooks).
-            if obj.get("project") and obj.get("project") != project:
+            if not _audit_obj_matches(
+                obj, project=project, since=since, event=event
+            ):
                 continue
             bucket.append(AuditEvent.from_dict(obj))
         per_file.append(bucket)

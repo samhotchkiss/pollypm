@@ -281,6 +281,62 @@ def _api_project(
     )
 
 
+def test_list_projects_uses_pg_bulk_task_snapshot(
+    config: PollyPMConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dashboard project rows should not open the work service per project."""
+    from types import SimpleNamespace
+
+    from pollypm.web_api import service as api_service
+
+    grouped = {
+        "myproj": [
+            SimpleNamespace(
+                project="myproj",
+                task_id="myproj/1",
+                work_status="review",
+                flow_template_id="plan_review",
+                labels=[],
+            ),
+            SimpleNamespace(
+                project="myproj",
+                task_id="myproj/2",
+                work_status="queued",
+                flow_template_id="chat",
+                labels=[],
+            ),
+        ],
+        "otherproj": [],
+    }
+
+    monkeypatch.setattr(
+        "pollypm.storage._backend_dispatch.is_pg_backend",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates._all_tasks_grouped_uncached",
+        lambda _config: grouped,
+    )
+    monkeypatch.setattr(
+        "pollypm.cockpit_pg_aggregates.all_tasks_for_project",
+        lambda rows, _config, key: list(rows.get(key, [])),
+    )
+    monkeypatch.setattr(
+        api_service,
+        "_open_work_service_readonly",
+        lambda **_kw: pytest.fail(
+            "pg project list should use one bulk task snapshot"
+        ),
+    )
+
+    items = api_service.list_projects(config)
+
+    by_key = {item.key: item for item in items}
+    assert by_key["myproj"].pending_plan_review is True
+    assert by_key["myproj"].open_inbox_count == 1
+    assert by_key["myproj"].task_counts["review"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------

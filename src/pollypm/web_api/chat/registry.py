@@ -28,6 +28,7 @@ from typing import Any
 from pollypm.models import PollyPMConfig, SessionConfig
 from pollypm.projects import project_transcripts_dir
 from pollypm.session_health import storage_session_name
+from pollypm.work.task_state import parse_task_window_name
 from pollypm.work.session_manager import task_window_name
 from pollypm.web_api.chat.transcripts import (
     build_session_index,
@@ -245,42 +246,16 @@ def enumerate_config_surfaces(
     surfaces: list[ChatSurface] = []
     tmux_session = storage_session_name(config.project.tmux_session)
     for session_name, session in (config.sessions or {}).items():
-        if not session.enabled:
-            continue
-        surface_type = _classify_session(session)
-        if surface_type is None:
-            continue
-        project_key = _project_key_for_session(config, session, surface_type)
-        project_root = _project_root_for_key(config, project_key)
-        persona = _persona_for_session(config, session, surface_type)
-        cwd = session.cwd if isinstance(session.cwd, Path) else Path(session.cwd or ".")
-        index = _build_session_index(project_root, session_index_cache)
-        transcript_path = lookup_transcript_path(
-            index,
-            cwd=str(cwd),
-            account_name=session.account,
-            provider=str(session.provider),
+        surface = _config_surface(
+            config,
+            session_name,
+            session,
+            tmux_session=tmux_session,
+            tmux_state_cache=tmux_state_cache,
+            session_index_cache=session_index_cache,
         )
-        window_name = session.window_name or session_name
-        if tmux_state_cache and window_name in tmux_state_cache:
-            window_state = tmux_state_cache[window_name]
-        else:
-            window_state = TmuxWindowState(
-                tmux_session=tmux_session,
-                window_name=window_name,
-                present=False,
-            )
-        surfaces.append(ChatSurface(
-            session_name=session_name,
-            surface_type=surface_type,
-            persona=persona,
-            project=project_key if surface_type != SurfaceType.OPERATOR else None,
-            window=window_state,
-            transcript_path=transcript_path,
-            cwd=cwd,
-            provider=str(session.provider),
-            auth_token_present=bool(session.auth_token),
-        ))
+        if surface is not None:
+            surfaces.append(surface)
     return surfaces
 
 
@@ -317,53 +292,179 @@ def enumerate_worker_surfaces(
     surfaces: list[ChatSurface] = []
     tmux_session = storage_session_name(config.project.tmux_session)
     for record in records or []:
-        project = getattr(record, "task_project", "") or ""
-        task_number = getattr(record, "task_number", 0)
-        if not project or not task_number:
-            continue
-        session_name = task_window_name(project, task_number)
-        project_root = _project_root_for_key(config, project)
-        worktree_path = (
-            Path(record.worktree_path) if record.worktree_path else None
+        surface = _worker_surface(
+            config,
+            record,
+            tmux_session=tmux_session,
+            tmux_state_cache=tmux_state_cache,
+            session_index_cache=session_index_cache,
         )
-        cwd_for_lookup = str(worktree_path) if worktree_path else None
-        provider_value = getattr(record, "provider", "") or ""
-        index = _build_session_index(project_root, session_index_cache)
-        transcript_path = lookup_transcript_path(
-            index,
-            cwd=cwd_for_lookup,
-            account_name=None,  # WorkerSessionRecord doesn't carry account
-            provider=provider_value or None,
-        )
-        window_name = session_name
-        if tmux_state_cache and window_name in tmux_state_cache:
-            window_state = tmux_state_cache[window_name]
-        else:
-            window_state = TmuxWindowState(
-                tmux_session=tmux_session,
-                window_name=window_name,
-                present=False,
-                pane_id=getattr(record, "pane_id", None),
-            )
-        surfaces.append(ChatSurface(
-            session_name=session_name,
-            surface_type=SurfaceType.WORKER,
-            persona=None,
-            project=project,
-            window=window_state,
-            transcript_path=transcript_path,
-            task_id=int(task_number),
-            cwd=worktree_path,
-            provider=provider_value,
-            auth_token_present=False,
-            worktree_path=worktree_path,
-        ))
+        if surface is not None:
+            surfaces.append(surface)
     return surfaces
+
+
+def find_chat_surface(
+    config: PollyPMConfig,
+    session_name: str,
+    *,
+    work_service: Any | None = None,
+    tmux_client: Any | None = None,
+) -> ChatSurface | None:
+    """Resolve one chat surface without enumerating the whole workspace.
+
+    ``GET /chat/{name}/messages`` is a single-session hot path. The
+    broad discovery helper intentionally scans all configured sessions
+    and worker rows so the sidebar can render everything, but doing that
+    before every transcript read makes message latency proportional to
+    workspace size. This resolver builds the same ``ChatSurface`` shape
+    for only the requested session.
+    """
+    tmux_state_cache = _build_tmux_state_cache(config, tmux_client)
+    session_index_cache: dict[Path, list] = {}
+
+    session = (config.sessions or {}).get(session_name)
+    if session is not None:
+        return _config_surface(
+            config,
+            session_name,
+            session,
+            tmux_session=storage_session_name(config.project.tmux_session),
+            tmux_state_cache=tmux_state_cache,
+            session_index_cache=session_index_cache,
+        )
+
+    parsed = parse_task_window_name(session_name)
+    if parsed is None or work_service is None:
+        return None
+    project, task_number = parsed
+    list_fn = getattr(work_service, "list_worker_sessions", None)
+    if not callable(list_fn):
+        return None
+    try:
+        try:
+            records = list_fn(project=project, active_only=True)
+        except TypeError:
+            records = list_fn(active_only=True)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("chat.registry: list_worker_sessions failed: %s", exc)
+        return None
+    for record in records or []:
+        if (
+            getattr(record, "task_project", "") == project
+            and int(getattr(record, "task_number", 0) or 0) == task_number
+        ):
+            return _worker_surface(
+                config,
+                record,
+                tmux_session=storage_session_name(config.project.tmux_session),
+                tmux_state_cache=tmux_state_cache,
+                session_index_cache=session_index_cache,
+            )
+    return None
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _config_surface(
+    config: PollyPMConfig,
+    session_name: str,
+    session: SessionConfig,
+    *,
+    tmux_session: str,
+    tmux_state_cache: dict[str, TmuxWindowState] | None,
+    session_index_cache: dict[Path, list] | None,
+) -> ChatSurface | None:
+    if not session.enabled:
+        return None
+    surface_type = _classify_session(session)
+    if surface_type is None:
+        return None
+    project_key = _project_key_for_session(config, session, surface_type)
+    project_root = _project_root_for_key(config, project_key)
+    persona = _persona_for_session(config, session, surface_type)
+    cwd = session.cwd if isinstance(session.cwd, Path) else Path(session.cwd or ".")
+    index = _build_session_index(project_root, session_index_cache)
+    transcript_path = lookup_transcript_path(
+        index,
+        cwd=str(cwd),
+        account_name=session.account,
+        provider=str(session.provider),
+    )
+    window_name = session.window_name or session_name
+    if tmux_state_cache and window_name in tmux_state_cache:
+        window_state = tmux_state_cache[window_name]
+    else:
+        window_state = TmuxWindowState(
+            tmux_session=tmux_session,
+            window_name=window_name,
+            present=False,
+        )
+    return ChatSurface(
+        session_name=session_name,
+        surface_type=surface_type,
+        persona=persona,
+        project=project_key if surface_type != SurfaceType.OPERATOR else None,
+        window=window_state,
+        transcript_path=transcript_path,
+        cwd=cwd,
+        provider=str(session.provider),
+        auth_token_present=bool(session.auth_token),
+    )
+
+
+def _worker_surface(
+    config: PollyPMConfig,
+    record: Any,
+    *,
+    tmux_session: str,
+    tmux_state_cache: dict[str, TmuxWindowState] | None,
+    session_index_cache: dict[Path, list] | None,
+) -> ChatSurface | None:
+    project = getattr(record, "task_project", "") or ""
+    task_number = getattr(record, "task_number", 0)
+    if not project or not task_number:
+        return None
+    session_name = task_window_name(project, task_number)
+    project_root = _project_root_for_key(config, project)
+    worktree_path = (
+        Path(record.worktree_path) if record.worktree_path else None
+    )
+    cwd_for_lookup = str(worktree_path) if worktree_path else None
+    provider_value = getattr(record, "provider", "") or ""
+    index = _build_session_index(project_root, session_index_cache)
+    transcript_path = lookup_transcript_path(
+        index,
+        cwd=cwd_for_lookup,
+        account_name=None,  # WorkerSessionRecord doesn't carry account
+        provider=provider_value or None,
+    )
+    window_name = session_name
+    if tmux_state_cache and window_name in tmux_state_cache:
+        window_state = tmux_state_cache[window_name]
+    else:
+        window_state = TmuxWindowState(
+            tmux_session=tmux_session,
+            window_name=window_name,
+            present=False,
+            pane_id=getattr(record, "pane_id", None),
+        )
+    return ChatSurface(
+        session_name=session_name,
+        surface_type=SurfaceType.WORKER,
+        persona=None,
+        project=project,
+        window=window_state,
+        transcript_path=transcript_path,
+        task_id=int(task_number),
+        cwd=worktree_path,
+        provider=provider_value,
+        auth_token_present=False,
+        worktree_path=worktree_path,
+    )
 
 
 def _classify_session(session: SessionConfig) -> SurfaceType | None:
@@ -502,4 +603,5 @@ __all__ = [
     "enumerate_chat_surfaces",
     "enumerate_config_surfaces",
     "enumerate_worker_surfaces",
+    "find_chat_surface",
 ]

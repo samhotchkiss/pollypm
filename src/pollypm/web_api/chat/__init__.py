@@ -37,6 +37,7 @@ from pollypm.web_api.chat.registry import (
     enumerate_chat_surfaces,
     enumerate_config_surfaces,
     enumerate_worker_surfaces,
+    find_chat_surface,
 )
 from pollypm.web_api.chat.tmux_capture import (
     capture_envelopes,
@@ -62,6 +63,7 @@ __all__ = [
     "enumerate_chat_surfaces",
     "enumerate_config_surfaces",
     "enumerate_worker_surfaces",
+    "find_chat_surface",
     "is_archive_stale",
     "parse_events_jsonl",
     "parse_events_jsonl_tail",

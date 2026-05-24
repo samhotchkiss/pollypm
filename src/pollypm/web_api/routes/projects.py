@@ -60,9 +60,72 @@ router = APIRouter(tags=["Projects"])
 def list_projects_endpoint(
     config: ConfigDep,
     tracked: Annotated[bool | None, Query(description="When true, returns only tracked projects.")] = None,
+    q: Annotated[
+        str | None,
+        Query(description="Filter projects by key, name, path, or persona."),
+    ] = None,
+    search: Annotated[
+        str | None,
+        Query(description="Alias for q."),
+    ] = None,
+    sort: Annotated[
+        Literal["name", "inbox_desc", "recent", "recent_desc", "urgency"] | None,
+        Query(description="Sort projects by name, inbox count, recency, or urgency."),
+    ] = None,
 ) -> ProjectListResponse:
     items = list_projects(config, tracked_only=bool(tracked))
+    needle = (q or search or "").strip().lower()
+    if needle:
+        items = [
+            item for item in items
+            if (
+                needle in item.key.lower()
+                or needle in item.name.lower()
+                or needle in item.path.lower()
+                or needle in (item.persona_name or "").lower()
+            )
+        ]
+    if sort == "name":
+        items.sort(key=lambda item: item.name.lower())
+    elif sort == "inbox_desc":
+        items.sort(key=lambda item: (-item.open_inbox_count, item.name.lower()))
+    elif sort in {"recent", "recent_desc"}:
+        items.sort(key=_project_recent_sort_key)
+    elif sort == "urgency":
+        items.sort(key=_project_urgency_sort_key)
     return ProjectListResponse(items=items)
+
+
+def _project_urgency_sort_key(project: Project) -> tuple[int, str]:
+    counts = project.task_counts or {}
+    if not project.tracked or project.glyph == "paused":
+        rank = 5
+    elif counts.get("blocked", 0) > 0 or counts.get("on_hold", 0) > 0:
+        rank = 0
+    elif counts.get("queued", 0) > 0 and (
+        counts.get("in_progress", 0) + counts.get("rework", 0)
+    ) == 0:
+        rank = 1
+    elif (
+        project.pending_plan_review
+        or project.open_inbox_count > 0
+        or counts.get("review", 0) > 0
+    ):
+        rank = 2
+    elif counts.get("in_progress", 0) > 0 or counts.get("rework", 0) > 0:
+        rank = 3
+    else:
+        rank = 4
+    return (rank, project.name.lower())
+
+
+def _project_recent_sort_key(project: Project) -> tuple[bool, float, str]:
+    when = project.last_activity_at
+    return (
+        when is None,
+        -(when.timestamp() if when is not None else 0),
+        project.name.lower(),
+    )
 
 
 @router.get(

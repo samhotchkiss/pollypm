@@ -68,9 +68,43 @@ async function stubDashboard(page: import("@playwright/test").Page) {
   );
 }
 
+async function stubProjects(page: import("@playwright/test").Page) {
+  await page.route("**/api/v1/projects**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    }),
+  );
+}
+
+async function stubActivity(page: import("@playwright/test").Page) {
+  await page.route("**/api/v1/audit/stats**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({
+        total: 0,
+        by_event: {},
+        by_severity: {},
+        since: "2026-05-21T00:00:00Z",
+      }),
+    }),
+  );
+  await page.route("**/api/v1/audit/grep**", (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ events: [], next_cursor: null }),
+    }),
+  );
+}
+
 test.describe("send message", () => {
   test.beforeEach(async ({ page }) => {
     await stubDashboard(page);
+    await stubProjects(page);
+    await stubActivity(page);
   });
 
   test("typing + clicking Send POSTs to /chat/{name}/send", async ({ page }) => {
@@ -110,6 +144,71 @@ test.describe("send message", () => {
     await input.fill("hello");
     await page.locator("#send-button").click();
     await expect(input).toHaveValue("");
+  });
+
+  test("local echo appears while send is in flight", async ({ page }) => {
+    await stubSurfaces(page);
+    await stubMessages(page);
+
+    let releaseSend: (() => void) | null = null;
+    const sendGate = new Promise<void>((resolve) => {
+      releaseSend = resolve;
+    });
+    await page.route("**/api/v1/chat/operator/send", async (route) => {
+      await sendGate;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ status: "queued" }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.locator("li[data-session='operator']").click();
+    await page.locator("#send-input").fill("optimistic hello");
+    await page.locator("#send-button").click();
+    await expect(page.locator(".message-local-echo")).toContainText(
+      "optimistic hello",
+    );
+    await expect(page.locator(".message-local-echo .message-type")).toHaveText(
+      "sending",
+    );
+    releaseSend!();
+    await expect(page.locator(".message-local-echo .message-type")).toHaveText(
+      "pending",
+    );
+  });
+
+  test("failed send leaves visible inline error", async ({ page }) => {
+    await stubSurfaces(page);
+    await stubMessages(page);
+    await page.route("**/api/v1/chat/operator/send", (route) =>
+      route.fulfill({
+        status: 500,
+        contentType: "application/json",
+        body: JSON.stringify({
+          error: {
+            code: "unsafe_mid_tool",
+            message: "Refusing to send while the agent has an open tool_use",
+          },
+        }),
+      }),
+    );
+
+    await page.goto("/ui/");
+    await page.locator("li[data-session='operator']").click();
+    await page.locator("#send-input").fill("blocked send");
+    await page.locator("#send-button").click();
+    await expect(page.locator(".message-local-echo")).toContainText(
+      "blocked send",
+    );
+    await expect(page.locator(".message-local-echo .message-type")).toHaveText(
+      "failed",
+    );
+    await expect(page.locator(".message-error")).toContainText(
+      "Refusing to send",
+    );
+    await expect(page.locator(".toast")).toContainText("send failed");
   });
 
   test("send is disabled until a surface is selected", async ({ page }) => {

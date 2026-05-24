@@ -548,6 +548,47 @@ class Supervisor:
         """Public read for the latest event of (scope, subject)."""
         return self._last_event_at(session_name, event_type)
 
+    # --- Cluster C heartbeat facade (#2136) -------------------------- #
+    # Health readers already use ``pollypm.storage.pg_heartbeats``. Keep
+    # supervisor/heartbeat writers on the same facade so ``pm sessions
+    # --health`` observes the rows the sweep records.
+
+    def record_heartbeat(
+        self,
+        *,
+        session_name: str,
+        tmux_window: str,
+        pane_id: str,
+        pane_command: str,
+        pane_dead: bool,
+        log_bytes: int,
+        snapshot_path: str,
+        snapshot_hash: str,
+    ) -> None:
+        from pollypm.storage.pg_heartbeats import record_heartbeat
+
+        record_heartbeat(
+            session_name=session_name,
+            tmux_window=tmux_window,
+            pane_id=pane_id,
+            pane_command=pane_command,
+            pane_dead=pane_dead,
+            log_bytes=log_bytes,
+            snapshot_path=snapshot_path,
+            snapshot_hash=snapshot_hash,
+            config=self.config,
+        )
+
+    def latest_heartbeat(self, session_name: str):
+        from pollypm.storage.pg_heartbeats import latest_heartbeat
+
+        return latest_heartbeat(session_name, config=self.config)
+
+    def recent_heartbeats(self, session_name: str, limit: int = 3):
+        from pollypm.storage.pg_heartbeats import recent_heartbeats
+
+        return recent_heartbeats(session_name, limit=limit, config=self.config)
+
     # --- Cluster D (leases) dispatch helpers -------------------------- #
     # Leases go through ``pollypm.storage.pg_leases``.
 
@@ -946,6 +987,14 @@ class Supervisor:
             "tmux_session": tmux_session,
         }
         payload.update(metadata)
+        payload.setdefault("target_session", launch.session.name)
+        payload.setdefault("target_task", "")
+        payload.setdefault(
+            "reason",
+            payload.get("failure_message")
+            or payload.get("failure_type")
+            or event,
+        )
         try:
             _audit_emit(
                 event=event,
@@ -2019,10 +2068,10 @@ class Supervisor:
                 log_bytes = launch.log_path.stat().st_size
             except (FileNotFoundError, OSError):
                 log_bytes = 0
-            previous = self.store.latest_heartbeat(session_key)
+            previous = self.latest_heartbeat(session_key)
             current_snapshot_hash = snapshot_hash(snapshot_content)
 
-            self.store.record_heartbeat(
+            self.record_heartbeat(
                 session_name=session_key,
                 tmux_window=window.name,
                 pane_id=window.pane_id,
@@ -3698,6 +3747,8 @@ class Supervisor:
                     "failure_type": failure_type,
                     "failure_message": failure_message,
                     "loop": "supervisor.maybe_recover_session",
+                    "target_session": launch.session.name,
+                    "reason": failure_message or failure_type,
                 },
             )
 
@@ -3926,20 +3977,26 @@ class Supervisor:
             )
             raise
         if spawned:
-            from pollypm.audit.log import EVENT_SESSION_SPAWN
-
-            self._emit_session_recovery_audit(
+            from pollypm.audit.log import (
+                EVENT_RECOVERY_SPAWN,
                 EVENT_SESSION_SPAWN,
-                launch,
-                status="ok",
-                actor="supervisor",
-                metadata={
-                    "failure_type": failure_type,
-                    "account": account_name,
-                    "provider": account.provider.value,
-                    "reason": "recovery_restart",
-                },
             )
+
+            recovery_metadata = {
+                "failure_type": failure_type,
+                "account": account_name,
+                "provider": account.provider.value,
+                "reason": "recovery_restart",
+                "target_session": session_name,
+            }
+            for event_type in (EVENT_RECOVERY_SPAWN, EVENT_SESSION_SPAWN):
+                self._emit_session_recovery_audit(
+                    event_type,
+                    launch,
+                    status="ok",
+                    actor="supervisor",
+                    metadata=recovery_metadata,
+                )
         # Inject recovery prompt so the agent knows what it was doing.
         # For role-scoped agents (reviewer / heartbeat) prepend an
         # identity reminder so a recovery that lands inside a noisy

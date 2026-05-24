@@ -158,7 +158,7 @@ class SupervisorHeartbeatAPI:
     def record_observation(self, context: HeartbeatSessionContext) -> None:
         if not context.window_present or context.snapshot_path is None:
             return
-        self.supervisor.store.record_heartbeat(
+        self.supervisor.record_heartbeat(
             session_name=context.session_name,
             tmux_window=context.window_name,
             pane_id=context.pane_id or "",
@@ -248,7 +248,10 @@ class SupervisorHeartbeatAPI:
         )
 
     def recent_snapshot_hashes(self, session_name: str, *, limit: int = 3) -> list[str]:
-        return [item.snapshot_hash for item in self.supervisor.store.recent_heartbeats(session_name, limit=limit)]
+        return [
+            item.snapshot_hash
+            for item in self.supervisor.recent_heartbeats(session_name, limit=limit)
+        ]
 
     def recover_session(self, session_name: str, *, failure_type: str, message: str) -> None:
         launch = self.supervisor.launch_by_session(session_name)
@@ -373,7 +376,7 @@ class SupervisorHeartbeatAPI:
                 else:
                     snapshot_path = str(raw_snapshot_path)
                     current_snapshot_hash = snapshot_hash(pane_text)
-            previous = self.supervisor.store.latest_heartbeat(launch.session.name)
+            previous = self.supervisor.latest_heartbeat(launch.session.name)
             contexts.append(
                 HeartbeatSessionContext(
                     session_name=launch.session.name,

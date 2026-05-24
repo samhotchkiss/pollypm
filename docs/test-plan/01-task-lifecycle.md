@@ -401,7 +401,13 @@ sleep 180  # 3 min — recovery loop interval + buffer
 1. Heartbeat tier detects missing pane within ~60s.
 2. Recovery loop (`auto_recover_no_session_alerts`) respawns `worker_pollypm`.
 3. New worker picks up `$TID` (or task gets re-queued + claimed).
-4. Audit log shows the cascade trail: `heartbeat.missing` → `recovery.spawn` → `task.reclaimed`.
+4. Audit log shows the cascade trail in `~/.pollypm/audit/<project>.jsonl`:
+   `heartbeat.missing` → `recovery.spawn` → `task.reclaimed`.
+   `heartbeat.missing` carries `target_session`, `reason`, and tmux window
+   metadata plus an empty `target_task` when no task is known;
+   `recovery.spawn` carries the replacement `target_session`, account,
+   provider, reason, and an empty `target_task`; `task.reclaimed` carries
+   `target_task`, `target_session`, and the stale-claim recovery reason.
 
 **If it doesn't recover:** the fix is in the cascade. Do NOT manually claim or dispatch. File `bug:cascade` with the missing audit events.
 

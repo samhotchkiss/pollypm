@@ -524,7 +524,7 @@ class PollyPMService:
         supervisor = self.load_supervisor()
         supervisor.require_session(session_name)
         launch = supervisor.launch_by_session(session_name)
-        supervisor.store.record_heartbeat(
+        supervisor.record_heartbeat(
             session_name=session_name,
             tmux_window=str(payload.get("tmux_window", launch.window_name)),
             pane_id=str(payload.get("pane_id", "")),
@@ -545,7 +545,7 @@ class PollyPMService:
             subject="heartbeat",
             payload={"message": "Recorded heartbeat snapshot"},
         )
-        record = supervisor.store.latest_heartbeat(session_name)
+        record = supervisor.latest_heartbeat(session_name)
         if record is None:
             raise RuntimeError(f"Heartbeat for {session_name} was not recorded")
         return record

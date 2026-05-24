@@ -197,6 +197,8 @@ class CoreRail:
             rail = HeartbeatRail.from_plugin_host(
                 state_db=self._config.project.state_db,
                 plugin_host=self._plugin_host,
+                config_path=getattr(self._config, "config_path", None),
+                config=self._config,
             )
             rail.start(start_workers=start_workers)
             self._heartbeat_rail = rail

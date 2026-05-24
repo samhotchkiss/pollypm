@@ -46,6 +46,18 @@ DEFAULT_WORKER_CONCURRENCY = 4
 DEFAULT_TICK_INTERVAL_SECONDS = 15.0
 
 
+_CONFIG_PATH_AWARE_PLUGINS = frozenset(
+    {
+        "advisor",
+        "core_recurring",
+        "downtime",
+        "memory_curator",
+        "morning_briefing",
+        "task_assignment_notify",
+    }
+)
+
+
 @dataclass(slots=True)
 class WorkerSettings:
     """Subset of ``pollypm.toml`` that controls the worker pool."""
@@ -87,6 +99,29 @@ def load_worker_settings(config_path: Path) -> WorkerSettings:
         poll_interval = 0.5
 
     return WorkerSettings(concurrency=concurrency, poll_interval=poll_interval)
+
+
+def _thread_config_path_into_roster(
+    roster: Roster,
+    registry: Any,
+    config_path: Path | None,
+) -> None:
+    """Thread the active config path into first-party cadence handlers."""
+    if config_path is None:
+        return
+    source_of = getattr(registry, "source_of", None)
+    if not callable(source_of):
+        return
+    config_path_value = str(Path(config_path))
+    for entry in roster.entries:
+        if "config_path" in entry.payload:
+            continue
+        try:
+            source = source_of(entry.handler_name)
+        except Exception:  # noqa: BLE001
+            source = None
+        if source in _CONFIG_PATH_AWARE_PLUGINS:
+            entry.payload["config_path"] = config_path_value
 
 
 class HeartbeatRail:
@@ -180,6 +215,7 @@ class HeartbeatRail:
 
         roster = plugin_host.build_roster()
         registry = plugin_host.job_handler_registry()
+        _thread_config_path_into_roster(roster, registry, config_path)
 
         # Fire the PluginAPI initialize hook now that roster + handler
         # registry are built — before the first heartbeat tick. Failures

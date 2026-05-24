@@ -1072,12 +1072,24 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
     # (strict ``source=jsonl`` wants the full parse so OSError
     # propagates cleanly). The pad of ``+1`` lets the route's
     # ``has_more`` detection still fire on the boundary.
+    #
+    # Issue #2160: also skip the tail when ``include_thinking=true``.
+    # Anthropic extended-thinking blocks usually land near the head of
+    # a long conversation (model-side reasoning at the start), not the
+    # tail. A ``?include_thinking=true&limit=200`` request against a
+    # multi-thousand-line archive would otherwise tail-read only the
+    # last ~200 envelopes and miss every earlier thinking block —
+    # which is exactly the user-facing failure mode #2160 reported
+    # (39/39 sessions returned zero thinking envelopes). The flag is
+    # explicit opt-in, so trading the tail-read optimization for
+    # actually-surfaced thinking is the right call.
     tail_hint: int | None = None
     if (
         source == "auto"
         and direction == "desc"
         and since_id is None
         and limit <= TAIL_READ_LIMIT_THRESHOLD
+        and not include_thinking
     ):
         tail_hint = limit + 1
 

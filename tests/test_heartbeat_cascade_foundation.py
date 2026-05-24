@@ -571,6 +571,23 @@ def test_queue_without_motion_fires_when_no_recent_activity(
     assert f.evidence["threshold_seconds"] == 600
 
 
+def test_queue_without_motion_silent_for_pollypm_meta_project(
+    now: datetime,
+) -> None:
+    cfg = WatchdogConfig(queue_motion_threshold_seconds=600)
+    queued = _StubTask(
+        project="pollypm",
+        task_number=2138,
+        work_status_str="queued",
+        executions=[],
+        updated_at=now - timedelta(hours=2),
+    )
+    findings = scan_events(
+        [], now=now, config=cfg, open_tasks=[queued], project="pollypm",
+    )
+    assert not any(f.rule == RULE_QUEUE_WITHOUT_MOTION for f in findings)
+
+
 def test_queue_without_motion_silent_when_recent_activity(
     now: datetime,
 ) -> None:

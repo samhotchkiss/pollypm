@@ -236,6 +236,14 @@ RULE_REJECTION_LOOP = "rejection_loop"
 RULE_STATE_DB_MISSING = "state_db_missing"
 RULE_QUEUE_WITHOUT_MOTION = "queue_without_motion"
 
+# #2138 — the pollypm meta-project is the control plane itself. Its
+# queued work can legitimately pause while the operator/codebase is in
+# flux, and routing that through queue_without_motion produced noisy
+# operator-dispatched loops rather than an actionable project finding.
+QUEUE_WITHOUT_MOTION_SUPPRESSED_PROJECTS: frozenset[str] = frozenset({
+    "pollypm",
+})
+
 # #1546 — tier classifications for the heartbeat cascade. Every Finding
 # carries a ``tier`` so the dispatcher can route without re-reading the
 # rule body:
@@ -2553,6 +2561,9 @@ def _queue_without_motion_probe(ctx: ProbeContext) -> list[Finding]:
     Evidence carries the affected task IDs and the most-recent activity
     timestamp so the prompt builder can hand structured signal upward.
     """
+    if ctx.project_key in QUEUE_WITHOUT_MOTION_SUPPRESSED_PROJECTS:
+        return []
+
     cutoff = ctx.now - timedelta(
         seconds=ctx.config.queue_motion_threshold_seconds,
     )

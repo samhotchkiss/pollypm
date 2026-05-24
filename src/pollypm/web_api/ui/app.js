@@ -20,6 +20,7 @@
   const SSE_FAILURE_LIMIT = 3;
   const SSE_STABLE_OPEN_MS = 5000;
   const PUSH_REFRESH_DEBOUNCE_MS = 150;
+  const FETCH_RETRY_MS = 3000;
   const MAX_MESSAGES = 50;
   const SESSION_ISSUED_COOKIE = "pollypm-session-issued-at";
   const SESSION_EXPIRY_WARNING_MS = 6 * 24 * 60 * 60 * 1000;
@@ -58,6 +59,7 @@
     dashboardRefreshQueued: false,
     historyInFlight: {},
     historyRefreshQueued: {},
+    fetchStates: {},
     sseFailures: 0,
     sseRetryTimer: null,
     lastEventId: null,
@@ -206,6 +208,108 @@
 
   // ----- fetch wrapper ----------------------------------------------------
 
+  function isAbortError(err) {
+    return err && (
+      err.name === "AbortError"
+      || err.message === "aborted"
+      || err.code === 20
+    );
+  }
+
+  function ensureFetchState(name) {
+    if (!state.fetchStates[name]) {
+      state.fetchStates[name] = {
+        name: name,
+        seq: 0,
+        stage: "idle",
+        controller: null,
+        timers: [],
+        retry: null,
+        label: name,
+        hasSettled: false,
+      };
+    }
+    return state.fetchStates[name];
+  }
+
+  function clearFetchTimers(fetchState) {
+    for (const timer of fetchState.timers) clearTimeout(timer);
+    fetchState.timers = [];
+  }
+
+  function beginFetchState(name, label, render, retry, opts) {
+    const options = opts || {};
+    const fetchState = ensureFetchState(name);
+    fetchState.seq += 1;
+    fetchState.stage = "loading";
+    fetchState.label = label;
+    fetchState.retry = retry;
+    fetchState.controller = new AbortController();
+    clearFetchTimers(fetchState);
+    const seq = fetchState.seq;
+    fetchState.timers.push(setTimeout(() => {
+      if (fetchState.seq !== seq) return;
+      fetchState.stage = "slow";
+      render();
+    }, FETCH_RETRY_MS));
+    if (!(options.preserveSettled && fetchState.hasSettled)) {
+      render();
+    }
+    return {
+      seq: seq,
+      signal: fetchState.controller.signal,
+    };
+  }
+
+  function finishFetchState(name, seq) {
+    const fetchState = ensureFetchState(name);
+    if (fetchState.seq !== seq) return false;
+    clearFetchTimers(fetchState);
+    fetchState.stage = "idle";
+    fetchState.controller = null;
+    fetchState.hasSettled = true;
+    return true;
+  }
+
+  function abortFetchState(name) {
+    const fetchState = ensureFetchState(name);
+    if (fetchState.controller) fetchState.controller.abort();
+    clearFetchTimers(fetchState);
+    fetchState.seq += 1;
+    fetchState.stage = "idle";
+    fetchState.controller = null;
+  }
+
+  function retryFetchState(name) {
+    const fetchState = ensureFetchState(name);
+    const retry = fetchState.retry;
+    abortFetchState(name);
+    if (retry) retry();
+  }
+
+  function loadingText(fetchState, fallback) {
+    if (!fetchState || fetchState.stage === "loading") return fallback;
+    return fetchState.label + " is taking longer than expected.";
+  }
+
+  function fetchAffordance(fetchName, tag, className, fallback) {
+    const fetchState = ensureFetchState(fetchName);
+    const children = [
+      document.createTextNode(loadingText(fetchState, fallback)),
+    ];
+    if (fetchState.stage === "slow") {
+      const retry = el("button", {
+        type: "button",
+        class: "fetch-retry",
+        text: "Retry",
+        "aria-label": "Retry loading " + fetchState.label,
+      });
+      retry.addEventListener("click", () => retryFetchState(fetchName));
+      children.push(retry);
+    }
+    return el(tag, { class: className + " fetch-state" }, children);
+  }
+
   async function apiFetch(path, opts) {
     const init = Object.assign({ credentials: "include" }, opts || {});
     init.headers = Object.assign(
@@ -216,6 +320,7 @@
     try {
       resp = await fetch(path, init);
     } catch (err) {
+      if (isAbortError(err)) throw err;
       setStatus("error", "offline");
       throw err;
     }
@@ -244,11 +349,13 @@
     return resp.json();
   }
 
-  async function apiJsonOptional(path) {
-    const resp = await fetch(path, {
-      credentials: "include",
-      headers: { "Accept": "application/json" },
-    });
+  async function apiJsonOptional(path, opts) {
+    const init = Object.assign({ credentials: "include" }, opts || {});
+    init.headers = Object.assign(
+      { "Accept": "application/json" },
+      init.headers || {},
+    );
+    const resp = await fetch(path, init);
     if (resp.status === 401) {
       setStatus("error", "auth required");
       showAuthGate();
@@ -281,22 +388,51 @@
     return API + "/projects" + (query ? "?" + query : "");
   }
 
-  async function loadSurfaces() {
+  async function loadSurfaces(opts) {
+    const force = opts && opts.force;
     if (state.surfacesInFlight) {
-      state.surfacesRefreshQueued = true;
-      return;
+      if (force) {
+        abortFetchState("surfaces");
+        state.surfacesInFlight = false;
+      } else {
+        state.surfacesRefreshQueued = true;
+        return;
+      }
     }
     state.surfacesInFlight = true;
     state.surfaceLoading = true;
     state.taskLoading = true;
+    const request = beginFetchState(
+      "surfaces",
+      "surfaces",
+      renderSurfacesLoading,
+      () => loadSurfaces({ force: true }),
+      { preserveSettled: true },
+    );
     renderSurfaces();
     try {
       const [sessionsResult, tasksResult, projectsResult] =
         await Promise.allSettled([
-          apiJson(API + "/chat/sessions"),
-          apiJsonOptional(API + "/tasks?limit=" + TASK_RAIL_LIMIT),
-          apiJsonOptional(projectListPath()),
+          apiJson(API + "/chat/sessions", { signal: request.signal }),
+          apiJsonOptional(
+            API + "/tasks?limit=" + TASK_RAIL_LIMIT,
+            { signal: request.signal },
+          ),
+          apiJsonOptional(projectListPath(), { signal: request.signal }),
         ]);
+
+      // If any leg aborted because a newer load took over, bail without
+      // mutating shared state — the newer load owns the render path.
+      if (
+        (sessionsResult.status === "rejected"
+          && isAbortError(sessionsResult.reason))
+        || (tasksResult.status === "rejected"
+          && isAbortError(tasksResult.reason))
+        || (projectsResult.status === "rejected"
+          && isAbortError(projectsResult.reason))
+      ) {
+        return;
+      }
 
       if (sessionsResult.status === "rejected") {
         state.surfaces = [];
@@ -308,6 +444,7 @@
           ? sessionsResult.reason
           : new Error(String(sessionsResult.reason));
         state.surfaceLoadError = err;
+        renderSurfaceError(err);
         renderProjects();
         return;
       }
@@ -345,6 +482,7 @@
     } finally {
       state.surfaceLoading = false;
       state.taskLoading = false;
+      if (!finishFetchState("surfaces", request.seq)) return;
       state.surfacesInFlight = false;
       renderSurfaces();
       if (state.surfacesRefreshQueued) {
@@ -352,6 +490,15 @@
         loadSurfaces();
       }
     }
+  }
+
+  function renderSurfacesLoading() {
+    const list = $("surface-list");
+    if (!list) return;
+    list.innerHTML = "";
+    list.appendChild(
+      fetchAffordance("surfaces", "li", "surface-empty", "loading..."),
+    );
   }
 
   function normalizeTaskSurface(task) {
@@ -1288,26 +1435,46 @@
     renderLocalEchoes(name);
   }
 
-  async function loadHistory(name) {
+  async function loadHistory(name, opts) {
     if (!name) return;
+    const force = opts && opts.force;
+    const fetchName = "history:" + name;
     if (state.historyInFlight[name]) {
-      state.historyRefreshQueued[name] = true;
-      return;
+      if (force) {
+        abortFetchState(fetchName);
+        state.historyInFlight[name] = false;
+      } else {
+        state.historyRefreshQueued[name] = true;
+        return;
+      }
     }
     state.historyInFlight[name] = true;
+    const request = beginFetchState(
+      fetchName,
+      "history",
+      () => {
+        if (state.selectedKind === "chat" && state.selectedSurface === name) {
+          renderHistoryLoading(fetchName);
+        }
+      },
+      () => loadHistory(name, { force: true }),
+      { preserveSettled: true },
+    );
     try {
       const path =
         API + "/chat/" + encodeURIComponent(name) + "/messages?limit="
         + MAX_MESSAGES + "&direction=desc";
-      const data = await apiJson(path);
+      const data = await apiJson(path, { signal: request.signal });
       if (state.selectedKind === "chat" && state.selectedSurface === name) {
         renderHistory(data);
       }
     } catch (err) {
+      if (isAbortError(err)) return;
       if (state.selectedKind === "chat" && state.selectedSurface === name) {
         renderHistoryError(err);
       }
     } finally {
+      if (!finishFetchState(fetchName, request.seq)) return;
       state.historyInFlight[name] = false;
       if (state.historyRefreshQueued[name]) {
         state.historyRefreshQueued[name] = false;
@@ -1316,6 +1483,15 @@
         }
       }
     }
+  }
+
+  function renderHistoryLoading(fetchName) {
+    const list = $("message-list");
+    list.innerHTML = "";
+    list.appendChild(
+      fetchAffordance(fetchName, "div", "message-empty", "loading history..."),
+    );
+    updateStopAgentButton();
   }
 
   function renderHistory(data) {
@@ -1897,23 +2073,39 @@
 
   // ----- dashboard rollups (right rail) ----------------------------------
 
-  async function pollDashboard() {
+  async function pollDashboard(opts) {
+    const force = opts && opts.force;
     if (state.dashboardInFlight) {
-      state.dashboardRefreshQueued = true;
-      return;
+      if (force) {
+        abortFetchState("dashboard");
+        state.dashboardInFlight = false;
+      } else {
+        state.dashboardRefreshQueued = true;
+        return;
+      }
     }
     state.dashboardInFlight = true;
+    const request = beginFetchState(
+      "dashboard",
+      "dashboard",
+      renderDashboardLoading,
+      () => pollDashboard({ force: true }),
+      { preserveSettled: true },
+    );
     try {
       const params = new URLSearchParams();
       if (state.selectedProject) params.set("project", state.selectedProject);
       const query = params.toString();
       const data = await apiJson(
         API + "/dashboard" + (query ? "?" + query : ""),
+        { signal: request.signal },
       );
       renderDashboard(data);
     } catch (err) {
+      if (isAbortError(err)) return;
       renderDashboardError(err);
     } finally {
+      if (!finishFetchState("dashboard", request.seq)) return;
       state.dashboardInFlight = false;
       if (state.dashboardRefreshQueued) {
         state.dashboardRefreshQueued = false;
@@ -1935,28 +2127,104 @@
     return scopedFields.indexOf(key) !== -1;
   }
 
-  function buildCard(label, value, cls, scoped, onClick) {
-    const labelText = scoped ? label + " (filtered)" : label;
-    const attrs = { class: "rollup-card " + (cls || "") };
-    if (onClick) {
-      attrs.role = "button";
-      attrs.tabindex = "0";
-      attrs.title = "Open " + label;
+  function renderDashboardLoading() {
+    const box = $("dashboard-rollups");
+    if (!box) return;
+    box.innerHTML = "";
+    box.appendChild(
+      fetchAffordance("dashboard", "div", "rollup-empty", "loading..."),
+    );
+  }
+
+  function renderDashboardDrilldown(card) {
+    $("pane-title").textContent = "Dashboard: " + card.label;
+    $("pane-meta").textContent = card.value;
+    $("send-input").disabled = true;
+    $("send-button").disabled = true;
+    updateStopAgentButton();
+    const list = $("message-list");
+    list.innerHTML = "";
+    const rows = [
+      ["Metric", card.label],
+      ["Value", card.value],
+    ];
+    if (card.detail) rows.push(["Context", card.detail]);
+    const children = [];
+    for (const row of rows) {
+      children.push(el("div", { class: "task-detail-row" }, [
+        el("span", { class: "task-detail-label", text: row[0] }),
+        el("span", { class: "task-detail-value", text: String(row[1]) }),
+      ]));
     }
-    const card = el("div", attrs, [
+    list.appendChild(el("div", { class: "task-detail dashboard-detail" }, children));
+  }
+
+  function firstSurfaceName(data) {
+    if (data && Array.isArray(data.active_sessions)) {
+      for (const item of data.active_sessions) {
+        const name = item && item.session_name;
+        if (name && state.surfaces.some((s) => s.session_name === name)) {
+          return name;
+        }
+      }
+      const firstActive = data.active_sessions.find((item) => item.session_name);
+      if (firstActive) return firstActive.session_name;
+    }
+    return state.surfaces.length > 0 ? state.surfaces[0].session_name : null;
+  }
+
+  function firstTaskKey(statuses) {
+    for (const task of state.taskSurfaces) {
+      if (!statuses || statuses.indexOf(task.work_status) !== -1) return task.key;
+    }
+    return null;
+  }
+
+  function dashboardCardAction(card, data) {
+    return () => {
+      if (card.target === "surface") {
+        const name = firstSurfaceName(data);
+        if (name && state.surfaces.some((s) => s.session_name === name)) {
+          selectSurface(name);
+          return;
+        }
+      }
+      if (card.target === "review-task") {
+        const key = firstTaskKey(["review", "queued", "rework", "blocked"]);
+        if (key) {
+          selectTask(key);
+          return;
+        }
+      }
+      if (card.target === "task") {
+        const key = firstTaskKey(null);
+        if (key) {
+          selectTask(key);
+          return;
+        }
+      }
+      renderDashboardDrilldown(card);
+    };
+  }
+
+  // Dashboard rail cards always render as buttons with a Playwright-friendly
+  // aria-label and route through `dashboardCardAction` for drill-down. PR
+  // #2266's `selectInbox` workflow remains reachable via the inbox surface
+  // rail entry; merging both click semantics into the same card produced
+  // ambiguous routing, so we standardize on the PR #2172 button shape here.
+  function buildCard(label, value, cls, scoped, action, detail) {
+    const labelText = scoped ? label + " (filtered)" : label;
+    const button = el("button", {
+      type: "button",
+      class: "rollup-card " + (cls || ""),
+      "aria-label": "Open dashboard detail for " + labelText + ": " + value,
+    }, [
       el("div", { class: "rollup-label", text: labelText }),
       el("div", { class: "rollup-value", text: String(value) }),
     ]);
-    if (onClick) {
-      card.addEventListener("click", onClick);
-      card.addEventListener("keydown", (ev) => {
-        if (ev.key === "Enter" || ev.key === " ") {
-          ev.preventDefault();
-          onClick();
-        }
-      });
-    }
-    return card;
+    button.addEventListener("click", action);
+    if (detail) button.setAttribute("title", detail);
+    return button;
   }
 
   function renderDashboard(data) {
@@ -1986,7 +2254,13 @@
         rollups.open_inbox_count + " items",
         "rollup-attention",
         isScoped(scopedFields, "rollups.open_inbox_count"),
-        () => selectInbox(),
+        dashboardCardAction({
+          label: "inbox",
+          value: rollups.open_inbox_count + " items",
+          target: "surface",
+          detail: "Opens an active chat surface when one is visible.",
+        }, data),
+        "Open an active chat surface",
       ));
     }
     if (typeof rollups.pending_plan_reviews === "number") {
@@ -1995,7 +2269,13 @@
         rollups.pending_plan_reviews + " waiting",
         "rollup-attention",
         isScoped(scopedFields, "rollups.pending_plan_reviews"),
-        () => selectInbox({ type: "plan_review" }),
+        dashboardCardAction({
+          label: "plan reviews",
+          value: rollups.pending_plan_reviews + " waiting",
+          target: "review-task",
+          detail: "Opens a visible task waiting on review when available.",
+        }, data),
+        "Open a review task",
       ));
     }
     if (typeof rollups.alert_count === "number") {
@@ -2006,6 +2286,13 @@
         // alert_count is intentionally global per DashboardRollups
         // docstring — never appears in scoped_fields, so no tag.
         false,
+        dashboardCardAction({
+          label: "alerts",
+          value: rollups.alert_count,
+          target: "detail",
+          detail: "Shows the current alert count.",
+        }, data),
+        "Show alert count",
       ));
     }
 
@@ -2023,6 +2310,13 @@
         sweeps + " sweeps / " + msgs + " msgs",
         "rollup-working",
         false,
+        dashboardCardAction({
+          label: "activity (24h)",
+          value: sweeps + " sweeps / " + msgs + " msgs",
+          target: "surface",
+          detail: "Opens an active chat surface when one is visible.",
+        }, data),
+        "Open an active chat surface",
       ));
     }
 
@@ -2034,6 +2328,13 @@
         data.daemon_status,
         up ? "rollup-working" : "rollup-blocked",
         false,
+        dashboardCardAction({
+          label: "daemon",
+          value: data.daemon_status,
+          target: "detail",
+          detail: "Shows daemon status.",
+        }, data),
+        "Show daemon status",
       ));
     }
 
@@ -2044,6 +2345,13 @@
         data.active_sessions.length,
         "",
         isScoped(scopedFields, "active_sessions"),
+        dashboardCardAction({
+          label: "active sessions",
+          value: data.active_sessions.length,
+          target: "surface",
+          detail: "Opens the first visible active chat surface.",
+        }, data),
+        "Open active session",
       ));
     }
 
@@ -2054,6 +2362,13 @@
         rollups.tracked_count,
         "",
         isScoped(scopedFields, "rollups.tracked_count"),
+        dashboardCardAction({
+          label: "projects tracked",
+          value: rollups.tracked_count,
+          target: "task",
+          detail: "Opens a visible task when available.",
+        }, data),
+        "Open a visible task",
       ));
     }
 

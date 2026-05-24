@@ -245,7 +245,17 @@ def _table_set(db_path: Path) -> set[str]:
 
 def _default_clone_path() -> Path:
     """Location of the dry-run clone (~/.pollypm/migration-check.db)."""
-    home = Path(os.environ.get("POLLYPM_HOME", str(GLOBAL_CONFIG_DIR)))
+    # Lazy import — pollypm.config pulls in a lot of optional deps, and
+    # this helper is on the ``pm migrate --check`` hot path that must
+    # survive partial installs (#2194). Falling back to ``Path.home() /
+    # ".pollypm"`` keeps the dry-run usable even if the config module
+    # cannot be imported.
+    try:
+        from pollypm.config import GLOBAL_CONFIG_DIR
+        default_home = str(GLOBAL_CONFIG_DIR)
+    except Exception:  # noqa: BLE001
+        default_home = str(Path.home() / ".pollypm")
+    home = Path(os.environ.get("POLLYPM_HOME", default_home))
     return home / "migration-check.db"
 
 
@@ -309,19 +319,36 @@ def _apply_all(db_path: Path) -> None:
     """Replay every migration idempotently by opening the existing writers.
 
     ``StateStore.__init__`` already replays ``_MIGRATIONS`` against the
-    DB; ``SQLiteWorkService.__init__`` (via ``create_work_tables``) does
-    the same for ``_WORK_MIGRATIONS``. We also mirror the applied set
-    into the unified ``schema_migrations`` audit table so operators have
-    a single pane of glass.
+    DB. The work-domain migrations live in ``_WORK_MIGRATIONS`` and used
+    to be applied via ``SQLiteWorkService.__init__`` — but post-sqlite-
+    ripout (#1971) ``create_work_service`` returns a PG-backed service
+    that ignores ``db_path`` and never touches the workspace state.db
+    (#2194). ``inspect()`` still reads ``work_schema_version`` from the
+    sqlite state.db, so a stale ``work_schema_version`` row keeps the
+    refuse-start gate firing forever even after ``pm migrate --apply``
+    claims success. Replay the work-domain migrations directly against
+    the state.db sqlite connection so the gate-tracked table actually
+    advances.
     """
     from pollypm.storage.state import StateStore
-    from pollypm.work import create_work_service
+    from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+    from pollypm.work.schema import create_work_tables
 
     with StateStore(db_path) as _store:
         pass
 
-    with create_work_service(db_path=db_path) as _svc:
-        pass
+    # #2194 — apply the work-domain migrations directly to the sqlite
+    # state.db. The state.db retains the legacy ``work_*`` tables from
+    # pre-pg installs; ``inspect()`` reads ``work_schema_version`` from
+    # here, so if this step is skipped the refuse-start gate fires
+    # forever.
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    try:
+        apply_workspace_pragmas(conn)
+        create_work_tables(conn)
+        conn.commit()
+    finally:
+        conn.close()
 
     _record_schema_migrations(db_path)
 

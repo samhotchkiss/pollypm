@@ -313,6 +313,7 @@ CREATE TABLE IF NOT EXISTS work_tasks (
     flow_template_version   int NOT NULL DEFAULT 1,
     current_node_id         text,
     assignee                text,
+    claimed_by_session      text,
     priority                text NOT NULL DEFAULT 'normal',
     requires_human_review   boolean NOT NULL DEFAULT false,
     description             text NOT NULL DEFAULT '',
@@ -775,6 +776,16 @@ ALTER TABLE IF EXISTS work_tasks
 
 
 # --------------------------------------------------------------------- #
+# 0006 — work_tasks.claimed_by_session breadcrumb for claim identity.
+# --------------------------------------------------------------------- #
+
+_MIGRATION_0006_WORK_TASKS_CLAIMED_BY_SESSION = """
+ALTER TABLE IF EXISTS work_tasks
+    ADD COLUMN IF NOT EXISTS claimed_by_session text;
+"""
+
+
+# --------------------------------------------------------------------- #
 # Migration list — forward-only, append-only.
 # --------------------------------------------------------------------- #
 
@@ -787,6 +798,11 @@ MIGRATIONS: list[tuple[int, str, str]] = [
     (3, "0003_account_columns_text", _MIGRATION_0003_ACCOUNT_COLUMNS_TEXT),
     (4, "0004_tier4_terminal_handoff", _MIGRATION_0004_TIER4_TERMINAL_HANDOFF),
     (5, "0005_work_tasks_reap_count", _MIGRATION_0005_WORK_TASKS_REAP_COUNT),
+    (
+        6,
+        "0006_work_tasks_claimed_by_session",
+        _MIGRATION_0006_WORK_TASKS_CLAIMED_BY_SESSION,
+    ),
 ]
 
 

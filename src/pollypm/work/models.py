@@ -266,6 +266,7 @@ class Task:
     flow_template_version: int = 1
     current_node_id: str | None = None
     assignee: str | None = None
+    claimed_by_session: str | None = None
     priority: Priority = Priority.NORMAL
     requires_human_review: bool = False
 

@@ -331,6 +331,7 @@ class MockWorkService:
 
         task.work_status = WorkStatus.IN_PROGRESS
         task.assignee = actor
+        task.claimed_by_session = actor
         task.current_node_id = start_node
         task.updated_at = now
 

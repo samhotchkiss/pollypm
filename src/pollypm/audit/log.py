@@ -56,6 +56,7 @@ SCHEMA_VERSION = 1
 # these strings. New events should follow ``noun.verb`` form.
 EVENT_TASK_CREATED = "task.created"
 EVENT_TASK_STATUS_CHANGED = "task.status_changed"
+EVENT_TASK_CLAIMED_BY_SESSION = "task.claimed_by_session"
 EVENT_TASK_DELETED = "task.deleted"
 EVENT_MARKER_CREATED = "marker.created"
 EVENT_MARKER_RELEASED = "marker.released"
@@ -968,6 +969,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "EVENT_TASK_CREATED",
     "EVENT_TASK_STATUS_CHANGED",
+    "EVENT_TASK_CLAIMED_BY_SESSION",
     "EVENT_TASK_DELETED",
     "EVENT_MARKER_CREATED",
     "EVENT_MARKER_RELEASED",

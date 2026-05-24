@@ -31,10 +31,12 @@ from pollypm.config import PollyPMConfig, load_config
 from pollypm.web_api.auth import (
     SESSION_ISSUED_COOKIE_NAME,
     SESSION_COOKIE_NAME,
+    SESSION_COOKIE_TTL_SECONDS,
     _extract_token,
     is_tailscale_ip,
     make_bearer_auth_dependency,
     make_sse_auth_dependency,
+    mint_session_cookie,
 )
 from pollypm.web_api.token import DEFAULT_TOKEN_PATH, load_token
 from pollypm.web_api.errors import (
@@ -546,10 +548,10 @@ def create_app(
     )
 
     # v0 web UI (Phase 7) — static SPA at ``/ui/`` with a cookie-bridge
-    # entry point that injects the on-disk token as the
-    # ``pollypm-session`` cookie. The static files (app.js, styles.css)
-    # are served raw; the entry route is custom so it can set the
-    # cookie + return the HTML in one round-trip.
+    # entry point that mints a signed ``pollypm-session`` cookie. The
+    # static files (app.js, styles.css) are served raw; the entry route
+    # is custom so it can set the cookie + return the HTML in one
+    # round-trip.
     _mount_web_ui(
         app,
         token_path=token_path,
@@ -613,10 +615,11 @@ def _attach_security_scheme(app: FastAPI) -> None:
 
     1. ``bearerAuth`` — ``Authorization: Bearer <token>`` header,
        token sourced from ``~/.pollypm/api-token``.
-    2. ``cookieAuth`` — ``pollypm-session`` cookie minted by
+    2. ``cookieAuth`` — signed ``pollypm-session`` cookie minted by
        ``GET /ui/`` for loopback peers, verified tailnet peers, or
-       callers presenting a valid bearer header. Same on-disk token,
-       constant-time comparison.
+       callers presenting a valid bearer header. The raw bearer token
+       is not stored in the cookie; token rotation invalidates the
+       signature.
     3. Credential-free tailnet-peer mode (empty ``{}`` entry in the
        security list) — only honoured when the app was constructed
        with ``tailnet_trust_enabled=True``.
@@ -655,11 +658,12 @@ def _attach_security_scheme(app: FastAPI) -> None:
                     "Session cookie minted by `GET /ui/` for loopback "
                     "peers, verified tailnet peers (when "
                     "`tailnet_trust_enabled=True`), or callers "
-                    "presenting a valid bearer header. The cookie "
-                    "value is the same on-disk token as `bearerAuth`; "
-                    "comparison is constant-time. LAN clients receive "
-                    "HTML without `Set-Cookie` and 401 on the first "
-                    "API call. See `docs/web-api-spec.md` §3."
+                    "presenting a valid bearer header. The cookie is "
+                    "an opaque per-browser session value signed with "
+                    "the current API token; the raw bearer token is "
+                    "not stored in the cookie. LAN clients receive HTML "
+                    "without `Set-Cookie` and 401 on the first API call. "
+                    "See `docs/web-api-spec.md` §3."
                 ),
             },
         }
@@ -698,10 +702,10 @@ def _mount_web_ui(
 
     Layout:
 
-    - ``GET /ui/`` returns ``index.html`` and sets the
-      ``pollypm-session`` cookie from the on-disk token, so subsequent
-      ``fetch(..., {credentials: 'include'})`` calls authenticate
-      without the user ever seeing the token.
+    - ``GET /ui/`` returns ``index.html`` and sets a signed
+      ``pollypm-session`` cookie, so subsequent ``fetch(...,
+      {credentials: 'include'})`` calls authenticate without the user
+      ever seeing the bearer token.
     - ``GET /ui/{path}`` (e.g. ``app.js``, ``styles.css``) is served by
       :class:`StaticFiles` from the ``ui/`` directory next to this
       module. No auth on the static assets themselves — the bytes are
@@ -736,8 +740,8 @@ def _mount_web_ui(
         authorization: str | None = Header(default=None),
     ) -> Response:
         # Load the token at request time (not app-build time) so a
-        # ``pm api regen-token`` rotation flows into the cookie on the
-        # next page load without an app restart.
+        # ``pm api regen-token`` rotation flows into the cookie signature
+        # on the next page load without an app restart.
         resolved_token_path = token_path or DEFAULT_TOKEN_PATH
         token_value = load_token(resolved_token_path)
         response = FileResponse(index_path, media_type="text/html")
@@ -745,7 +749,7 @@ def _mount_web_ui(
         # Cookie issuance is credential issuance — gate it behind a
         # proven local-operator path so a LAN device (or anyone who
         # can reach this port from a network we don't trust) can't
-        # GET /ui/ and walk away with the bearer token via
+        # GET /ui/ and walk away with a browser credential via
         # Set-Cookie. Three acceptable signals:
         #
         # 1. Authorization: Bearer <token> matches the on-disk token
@@ -784,23 +788,24 @@ def _mount_web_ui(
             # because the v0 deploy is loopback/Tailscale HTTP. When
             # the operator puts this behind TLS they should set
             # ``Secure=True`` via a reverse proxy.
+            issued_at = int(time.time())
             response.set_cookie(
                 key=SESSION_COOKIE_NAME,
-                value=token_value,
+                value=mint_session_cookie(token_value, issued_at=issued_at),
                 httponly=True,
                 samesite="lax",
                 secure=False,
                 path="/",
-                max_age=60 * 60 * 24 * 7,  # 7 days
+                max_age=SESSION_COOKIE_TTL_SECONDS,
             )
             response.set_cookie(
                 key=SESSION_ISSUED_COOKIE_NAME,
-                value=str(int(time.time())),
+                value=str(issued_at),
                 httponly=False,
                 samesite="lax",
                 secure=False,
                 path="/",
-                max_age=60 * 60 * 24 * 7,
+                max_age=SESSION_COOKIE_TTL_SECONDS,
             )
         # If the token file doesn't exist yet, or the caller isn't on
         # a trusted path, we still serve the HTML — the SPA will

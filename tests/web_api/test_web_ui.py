@@ -2,9 +2,8 @@
 
 Covers:
 
-- ``GET /ui/`` returns 200 + sets the ``pollypm-session`` cookie from
-  the on-disk token **only** for trusted callers (loopback / Tailscale
-  / valid bearer).
+- ``GET /ui/`` returns 200 + sets a signed ``pollypm-session`` cookie
+  **only** for trusted callers (loopback / Tailscale / valid bearer).
 - ``GET /ui/`` from a LAN client gets the HTML but no cookie, and a
   subsequent ``/api/`` call returns 401.
 - ``GET /ui/`` HTML carries the anchors the SPA needs
@@ -40,8 +39,10 @@ from pollypm.cli_features.web_api import detect_tailscale_ip
 from pollypm.web_api.auth import (
     SESSION_COOKIE_NAME,
     SESSION_ISSUED_COOKIE_NAME,
+    is_valid_session_cookie,
     is_tailscale_ip,
 )
+from pollypm.web_api.token import regenerate_token
 
 
 def _ui_get_with_peer(app, peer_ip: str, *, headers: dict[str, str] | None = None) -> httpx.Response:
@@ -76,6 +77,14 @@ def _api_get_with_peer(app, peer_ip: str, *, headers: dict[str, str] | None = No
     return asyncio.run(_probe())
 
 
+def _assert_signed_session_cookie(cookie: str | None, token: str) -> str:
+    assert cookie is not None
+    assert cookie != token, "session cookie must not mirror the bearer token"
+    assert token not in cookie, "session cookie must not contain the bearer token"
+    assert is_valid_session_cookie(cookie, token) is True
+    return cookie
+
+
 def test_ui_root_returns_html_and_sets_session_cookie(client: TestClient, token: str) -> None:
     """``GET /ui/`` returns the SPA HTML and seeds the session cookie.
 
@@ -90,7 +99,7 @@ def test_ui_root_returns_html_and_sets_session_cookie(client: TestClient, token:
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/html")
     cookie = response.cookies.get(SESSION_COOKIE_NAME)
-    assert cookie == token, "session cookie should mirror on-disk token"
+    _assert_signed_session_cookie(cookie, token)
     issued = response.cookies.get(SESSION_ISSUED_COOKIE_NAME)
     assert issued is not None and issued.isdigit(), (
         "session issue-time cookie should be readable by JS for expiry warnings"
@@ -119,14 +128,32 @@ def test_ui_cookie_set_from_loopback(app, token: str) -> None:
     """Loopback peer is trusted — cookie is issued."""
     resp = _ui_get_with_peer(app, "127.0.0.1")
     assert resp.status_code == 200
-    assert resp.cookies.get(SESSION_COOKIE_NAME) == token
+    _assert_signed_session_cookie(resp.cookies.get(SESSION_COOKIE_NAME), token)
 
 
 def test_ui_cookie_set_from_tailscale_peer(tailnet_app, token: str) -> None:
     """Tailscale CGNAT peer is trusted when tailnet trust is enabled."""
     resp = _ui_get_with_peer(tailnet_app, "100.64.0.5")
     assert resp.status_code == 200
-    assert resp.cookies.get(SESSION_COOKIE_NAME) == token
+    _assert_signed_session_cookie(resp.cookies.get(SESSION_COOKIE_NAME), token)
+
+
+def test_ui_mints_distinct_session_cookies_for_same_tailnet_peer(
+    tailnet_app, token: str,
+) -> None:
+    """Separate browser contexts behind one Tailscale IP get distinct cookies."""
+    first = _ui_get_with_peer(tailnet_app, "100.64.0.5")
+    second = _ui_get_with_peer(tailnet_app, "100.64.0.5")
+
+    first_cookie = _assert_signed_session_cookie(
+        first.cookies.get(SESSION_COOKIE_NAME),
+        token,
+    )
+    second_cookie = _assert_signed_session_cookie(
+        second.cookies.get(SESSION_COOKIE_NAME),
+        token,
+    )
+    assert first_cookie != second_cookie
 
 
 def test_ui_no_cookie_minted_from_cgnat_when_trust_disabled(
@@ -159,7 +186,7 @@ def test_ui_cookie_set_with_valid_bearer_header(app, token: str) -> None:
         headers={"Authorization": f"Bearer {token}"},
     )
     assert resp.status_code == 200
-    assert resp.cookies.get(SESSION_COOKIE_NAME) == token
+    _assert_signed_session_cookie(resp.cookies.get(SESSION_COOKIE_NAME), token)
 
 
 def test_ui_no_cookie_with_invalid_bearer(app, token: str) -> None:
@@ -263,9 +290,36 @@ def test_auth_via_cookie_works(client: TestClient, token: str) -> None:
     """
     boot = client.get("/ui/", headers={"Authorization": f"Bearer {token}"})
     assert boot.status_code == 200
-    assert boot.cookies.get(SESSION_COOKIE_NAME) == token
+    _assert_signed_session_cookie(boot.cookies.get(SESSION_COOKIE_NAME), token)
     response = client.get("/api/v1/projects")  # no headers — cookie only
     assert response.status_code == 200
+
+
+def test_rotated_token_invalidates_session_cookie(
+    client: TestClient,
+    auth_headers,
+    token_path: Path,
+) -> None:
+    """API token rotation invalidates the signed browser session cookie."""
+    boot = client.get("/ui/", headers=auth_headers)
+    assert boot.status_code == 200
+    assert client.get("/api/v1/projects").status_code == 200
+
+    new_token = regenerate_token(token_path)
+    response = client.get("/api/v1/projects")
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "invalid_token"
+
+    refreshed = client.get(
+        "/ui/",
+        headers={"Authorization": f"Bearer {new_token}"},
+    )
+    assert refreshed.status_code == 200
+    _assert_signed_session_cookie(
+        refreshed.cookies.get(SESSION_COOKIE_NAME),
+        new_token,
+    )
+    assert client.get("/api/v1/projects").status_code == 200
 
 
 def test_cgnat_trust_enabled_allows_credential_free_from_tailnet(

@@ -32,10 +32,12 @@ info:
        `~/.pollypm/api-token`. Always accepted; canonical mode for
        non-browser clients (cockpit CLI, scripts, curl). Modeled here as
        `bearerAuth`.
-    2. **Session cookie** — `pollypm-session=<token>`, minted by
-       `GET /ui/` only when the caller is a loopback peer, a verified
+    2. **Session cookie** — `pollypm-session=<opaque-session>`, minted
+       by `GET /ui/` only when the caller is a loopback peer, a verified
        tailnet peer (with `tailnet_trust_enabled=True`), or already
-       presented a valid bearer header. Modeled here as `cookieAuth`.
+       presented a valid bearer header. The cookie is signed with the
+       current API token, so token rotation invalidates browser sessions.
+       Modeled here as `cookieAuth`.
     3. **Credential-free tailnet peer** — accepted only when the server
        was constructed with `tailnet_trust_enabled=True`, which `pm
        serve` auto-sets when `detect_tailscale_ip()` returns a verified
@@ -2868,10 +2870,11 @@ components:
       description: |
         Session cookie minted by `GET /ui/` for loopback peers,
         verified tailnet peers (when `tailnet_trust_enabled=True`), or
-        callers presenting a valid bearer header. The cookie value is
-        the same on-disk token as `bearerAuth`; comparison is
-        constant-time. LAN clients receive HTML without `Set-Cookie`
-        and 401 on the first API call. See `docs/web-api-spec.md` §3.
+        callers presenting a valid bearer header. The cookie is an
+        opaque per-browser session value signed with the current API
+        token; the raw bearer token is not stored in the cookie. LAN
+        clients receive HTML without `Set-Cookie` and 401 on the first
+        API call. See `docs/web-api-spec.md` §3.
 
   parameters:
     ProjectKey:

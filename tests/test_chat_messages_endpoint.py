@@ -38,7 +38,7 @@ from pollypm.models import (
 )
 from pollypm.projects import project_transcripts_dir
 from pollypm.web_api import create_app, ensure_token
-from pollypm.web_api.auth import SESSION_COOKIE_NAME
+from pollypm.web_api.auth import SESSION_COOKIE_NAME, is_valid_session_cookie
 from pollypm.web_api.chat.envelope import (
     MessageEnvelope,
     MessageRole,
@@ -422,7 +422,10 @@ def test_sessions_endpoint_cookie_auth_uses_bounded_tmux_probe(
 
     boot = client.get("/ui/", headers=auth_headers)
     assert boot.status_code == 200
-    assert boot.cookies.get(SESSION_COOKIE_NAME) == token
+    cookie = boot.cookies.get(SESSION_COOKIE_NAME)
+    assert cookie != token
+    assert cookie is not None
+    assert is_valid_session_cookie(cookie, token) is True
 
     response = client.get("/api/v1/chat/sessions")
     assert response.status_code == 200, response.text

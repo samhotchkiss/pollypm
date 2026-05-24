@@ -91,10 +91,12 @@ order:
 
 1. `Authorization: Bearer <token>` header — always accepted, constant-time
    comparison against the on-disk token (`~/.pollypm/api-token`, mode 0600).
-   Token rotation via `pm api regen-token` invalidates outstanding sessions
-   on the next request because the dependency reads fresh from disk.
-2. `pollypm-session` cookie — same comparison rules as the header. A stale
-   cookie (from a pre-rotation session) returns a friendlier
+   Token rotation via `pm api regen-token` invalidates outstanding bearer
+   tokens on the next request because the dependency reads fresh from disk.
+2. `pollypm-session` cookie — an opaque per-browser session value signed
+   with the current on-disk token. The raw bearer token is not stored in
+   the cookie. A stale cookie (from a pre-rotation session), expired cookie,
+   tampered cookie, or legacy raw-token cookie returns a friendlier
    `invalid_token` message hinting at a `/ui/` reload.
 3. Credential-free Tailscale CGNAT trust — only when the app was built
    with `tailnet_trust_enabled=True`. Without that gate, a CGNAT-source

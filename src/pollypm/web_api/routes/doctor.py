@@ -48,7 +48,6 @@ from pollypm.doctor import (
 )
 from pollypm.web_api.errors import (
     APIError,
-    conflict,
     invalid_request,
     not_found,
     service_unavailable,
@@ -70,6 +69,7 @@ router = APIRouter(tags=["Doctor"])
 # the spec's 30s ceiling so the caller sees a typed 504 rather than the
 # generic uvicorn timeout.
 DEFAULT_RUN_TIMEOUT_SECONDS = 25.0
+DOCTOR_FIX_BUSY_RETRY_AFTER_SECONDS = 5
 
 
 # ---------------------------------------------------------------------------
@@ -431,15 +431,18 @@ def _fix_busy_error() -> APIError:
     Doctor fixes touch shared state (filesystem, tmux sessions, the
     Postgres heartbeat tables); we serialize the run+fix+verify
     sequence with ``app.state.doctor_fix_lock``. Callers that race a
-    second ``fix=true`` request get an immediate 409 ``busy`` rather
-    than blocking on the lock or running fixes a second time.
+    second ``fix=true`` request get an immediate 409 ``in_progress``
+    rather than blocking on the lock or running fixes a second time.
     """
-    return conflict(
-        "Doctor fix already in progress",
+    return APIError(
+        status_code=409,
+        code="in_progress",
+        message="Doctor fix already in progress",
         hint=(
             "Wait for the in-flight POST /doctor/run (fix=true) to complete, "
             "then retry. Doctor fixes are single-flight."
         ),
+        retry_after_seconds=DOCTOR_FIX_BUSY_RETRY_AFTER_SECONDS,
     )
 
 
@@ -737,6 +740,17 @@ def get_doctor_report_endpoint(
     response_model=DoctorRunResponse,
     summary="Run doctor checks (optionally with --fix)",
     operation_id="runDoctor",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Unknown doctor check."},
+        "409": {
+            "description": (
+                "A fix=true doctor run is already in progress; the error "
+                "body includes retry_after_seconds."
+            )
+        },
+        "504": {"description": "Run exceeded the timeout budget."},
+    },
 )
 def run_doctor_endpoint(
     config: ConfigDep,

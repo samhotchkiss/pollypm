@@ -500,7 +500,7 @@ def test_fix_retry_after_504_returns_busy_while_first_still_running(
          budget so the first POST times out with 504.
       2. Asserts the first request returns 504 within budget + slack.
       3. Fires a second POST while the worker is still blocked, asserts
-         it returns 409 ``conflict`` (NOT 504 from a second hang, which
+         it returns 409 ``in_progress`` (NOT 504 from a second hang, which
          is what round-3 would have produced).
       4. Releases the worker so the suite shuts down cleanly.
     """
@@ -543,7 +543,7 @@ def test_fix_retry_after_504_returns_busy_while_first_still_running(
     assert in_flight.is_set(), "test setup bug: worker never entered apply_fixes"
 
     # Second request fired immediately: the worker is still alive
-    # holding shared state, so the route MUST refuse with 409 busy
+    # holding shared state, so the route MUST refuse with 409 in_progress
     # rather than start a second concurrent fix (which would either
     # interleave mutations or — pre-fix — also hang for another 1s and
     # return a second 504).
@@ -565,8 +565,10 @@ def test_fix_retry_after_504_returns_busy_while_first_still_running(
         "a second concurrent fix while the first worker was still alive."
     )
     body = second.json()
-    assert body["error"]["code"] == "conflict"
+    assert body["error"]["code"] == "in_progress"
     assert "in progress" in body["error"]["message"].lower()
+    assert body["error"]["retry_after_seconds"] == 5
+    assert second.headers["retry-after"] == "5"
 
     # Wait for the worker's done callback to release the per-app lock
     # before the next test runs (otherwise we leak across the suite).
@@ -588,10 +590,10 @@ def test_run_fix_serialized_under_concurrency(
 ):
     """Two concurrent ``fix=true`` calls: one succeeds, one returns 409.
 
-    Single-flight is enforced via ``_FIX_OPERATION_LOCK`` on the
-    route module. We hold ``apply_fixes`` long enough for the second
+    Single-flight is enforced via ``app.state.doctor_fix_lock``.
+    We hold ``apply_fixes`` long enough for the second
     request to race in, then assert exactly one 200 and one 409
-    ``conflict`` (Codex round-1 P0 on PR #2058).
+    ``in_progress`` (Codex round-1 P0 on PR #2058).
     """
     import threading
 
@@ -645,7 +647,8 @@ def test_run_fix_serialized_under_concurrency(
 
     assert sorted(results) == [200, 409], f"expected one 200 + one 409, got {results}"
     busy_body = next(b for b, code in zip(bodies, results) if code == 409)
-    assert busy_body["error"]["code"] == "conflict"
+    assert busy_body["error"]["code"] == "in_progress"
+    assert busy_body["error"]["retry_after_seconds"] == 5
 
 
 def test_run_rejected_for_non_default_config(

@@ -177,8 +177,28 @@ def _print_token_location_only(token_path_hint: str) -> None:
 def register_web_api_commands(app: typer.Typer) -> None:
     """Mount the ``pm serve`` and ``pm api`` commands on the root app."""
 
-    @app.command(name="serve", help=_SERVE_HELP)
+    serve_app = typer.Typer(
+        help=_SERVE_HELP,
+        invoke_without_command=True,
+        no_args_is_help=False,
+    )
+
+    def _warn_launchctl_failure(
+        action: str,
+        result: subprocess.CompletedProcess[str] | None,
+    ) -> None:
+        if result is None or result.returncode == 0:
+            return
+        stderr = (result.stderr or "").strip()
+        detail = f": {stderr}" if stderr else ""
+        typer.echo(
+            f"Warning: launchctl {action} exited {result.returncode}{detail}",
+            err=True,
+        )
+
+    @serve_app.callback()
     def serve_command(
+        ctx: typer.Context,
         port: int = typer.Option(8765, "--port", "-p", help="TCP port to bind."),
         host: str | None = typer.Option(
             None,
@@ -225,6 +245,9 @@ def register_web_api_commands(app: typer.Typer) -> None:
             help="Override the bearer-token file location (defaults to ~/.pollypm/api-token).",
         ),
     ) -> None:
+        if ctx.invoked_subcommand is not None:
+            return
+
         from pollypm.web_api import create_app, ensure_token
 
         # Bind selection (spec doc decision a-default):
@@ -318,6 +341,17 @@ def register_web_api_commands(app: typer.Typer) -> None:
             )
 
         config = load_config(config_path)
+        try:
+            from pollypm.serve_launchd import record_serve_startup
+
+            base_dir = Path(getattr(config.project, "base_dir", config_path.parent))
+            record_serve_startup(base_dir=base_dir)
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "pm serve: startup PID/audit bookkeeping failed",
+                exc_info=True,
+            )
+
         token, generated = ensure_token(token_path)
         if generated:
             _print_token_once(token, generated=generated)
@@ -352,6 +386,57 @@ def register_web_api_commands(app: typer.Typer) -> None:
         typer.echo(f"[pm serve] http://{host}:{port}/api/v1/", err=True)
         uvicorn.run(app_instance, host=host, port=port, log_level="info")
 
+    @serve_app.command(
+        "install",
+        help="Install and load the macOS launchd agent for pm serve.",
+    )
+    def serve_install() -> None:
+        from pollypm.serve_launchd import install_launch_agent
+
+        result = install_launch_agent()
+        typer.echo(f"Installed {result.plist_path}")
+        _warn_launchctl_failure("load", result.launchctl_result)
+        typer.echo("Loaded com.pollypm.serve via launchctl.")
+
+    @serve_app.command(
+        "uninstall",
+        help="Unload and remove the macOS launchd agent for pm serve.",
+    )
+    def serve_uninstall() -> None:
+        from pollypm.serve_launchd import uninstall_launch_agent
+
+        result = uninstall_launch_agent()
+        if result.removed:
+            typer.echo(f"Removed {result.plist_path}")
+            _warn_launchctl_failure("unload", result.launchctl_result)
+        else:
+            typer.echo(f"No LaunchAgent plist found at {result.plist_path}")
+
+    @serve_app.command(
+        "stop",
+        help="Quiesce and unload the macOS launchd agent for pm serve.",
+    )
+    def serve_stop() -> None:
+        from pollypm.serve_launchd import quiesced_marker_path, stop_launch_agent
+
+        result = stop_launch_agent()
+        typer.echo(f"Wrote quiesce marker {quiesced_marker_path()}")
+        _warn_launchctl_failure("unload", result.launchctl_result)
+        typer.echo("Unloaded com.pollypm.serve via launchctl.")
+
+    @serve_app.command(
+        "start",
+        help="Clear quiesce marker and load the macOS launchd agent for pm serve.",
+    )
+    def serve_start() -> None:
+        from pollypm.serve_launchd import quiesced_marker_path, start_launch_agent
+
+        result = start_launch_agent()
+        typer.echo(f"Removed quiesce marker {quiesced_marker_path()}")
+        typer.echo(f"Installed {result.plist_path}")
+        _warn_launchctl_failure("load", result.launchctl_result)
+        typer.echo("Loaded com.pollypm.serve via launchctl.")
+
     @api_app.command(name="regen-token", help="Rotate the API bearer token.")
     def regen_token_command(
         token_path: Path | None = typer.Option(
@@ -370,6 +455,7 @@ def register_web_api_commands(app: typer.Typer) -> None:
         # Print to stdout so a script can capture it (`pm api regen-token > token`).
         typer.echo(token)
 
+    app.add_typer(serve_app, name="serve", help=_SERVE_HELP)
     app.add_typer(api_app, name="api", help=_API_HELP)
 
 

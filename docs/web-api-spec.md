@@ -87,6 +87,26 @@ is down, and vice versa.
   of truth, no cache invalidation problem, and the audit log
   guarantees ordering even with concurrent writers.
 
+### macOS launchd supervision
+
+Daily-driver installs should run `pm serve` under the user LaunchAgent
+`com.pollypm.serve`:
+
+- `pm serve install` renders the plist into `~/Library/LaunchAgents/`
+  and loads it with `launchctl`.
+- `pm serve stop` writes `~/.pollypm/.serve-quiesced` and unloads the
+  LaunchAgent for intentional operator shutdown.
+- `pm serve start` removes the quiesce marker, refreshes the plist, and
+  loads the LaunchAgent again.
+- `pm serve uninstall` unloads the LaunchAgent and removes the plist.
+
+The plist uses `KeepAlive=true`, `RunAtLoad=true`, and
+`ThrottleInterval=10` so launchd restarts the API after crashes,
+SIGKILL, OOM, or host login without depending on PollyPM's own
+heartbeat tiers. Each `pm serve` startup records its PID in the
+workspace base directory and emits `daemon.serve.respawn` when the PID
+changed from a prior launch.
+
 ### Why FastAPI?
 
 FastAPI is recommended because:

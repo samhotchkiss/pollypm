@@ -81,6 +81,7 @@ from pollypm.audit.bug_reporter import (
 )
 from pollypm.audit.log import (
     AuditEvent,
+    EVENT_DAEMON_SERVE_RESPAWN,
     central_log_path,
     emit,
     project_log_path,
@@ -108,6 +109,7 @@ __all__ = [
     "EVENT_BUG_REPORT_DEDUPED",
     "EVENT_BUG_REPORT_FAILED",
     "EVENT_BUG_REPORT_FILED",
+    "EVENT_DAEMON_SERVE_RESPAWN",
     "EVENT_HEARTBEAT_TICK",
     "Finding",
     "SELF_REPORT_LABEL",

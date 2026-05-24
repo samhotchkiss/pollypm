@@ -473,6 +473,7 @@ class MockWorkService:
                 exe.completed_at = _now()
         task.work_status = WorkStatus.QUEUED
         task.assignee = None
+        task.claimed_by_session = None
         task.current_node_id = None
         task.updated_at = _now()
         self._record_transition(
@@ -488,7 +489,12 @@ class MockWorkService:
         task = self._tasks.get(task_id)
         if task is None:
             raise TaskNotFoundError(f"Task '{task_id}' not found.")
-        if task.work_status not in (WorkStatus.IN_PROGRESS, WorkStatus.QUEUED):
+        if task.work_status not in (
+            WorkStatus.IN_PROGRESS,
+            WorkStatus.REWORK,
+            WorkStatus.QUEUED,
+            WorkStatus.REVIEW,
+        ):
             raise InvalidTransitionError(
                 f"Cannot hold task in '{task.work_status.value}' state."
             )

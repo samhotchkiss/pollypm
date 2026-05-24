@@ -1050,6 +1050,14 @@ paths:
             Filter by `work_status`. Repeatable — pass `status=draft&status=queued`
             to OR multiple statuses.
         - in: query
+          name: work_status
+          schema:
+            $ref: "#/components/schemas/TaskStatus"
+          description: |
+            Alias for `status`; repeatable and ORed with any `status`
+            values. Kept because clients naturally filter by the
+            response field name.
+        - in: query
           name: assignee
           schema: { type: string }
           description: Filter by assignee (exact match).
@@ -3860,6 +3868,7 @@ components:
         current_node_id: { type: string }
         plan_version: { type: integer }
         updated_at: { type: string, format: date-time }
+        dwell_seconds: { type: integer, minimum: 0 }
 
     Transition:
       type: object
@@ -4308,9 +4317,8 @@ components:
             committed but the per-task worker session could not
             be provisioned (tmux/worktree/cap failures), and to
             surface SessionManager wire-up failures. Each entry
-            includes recovery wording (hold + resume) matching
-            the CLI's `pm task claim` stderr warning. Empty on
-            the happy path; clients can branch on
+            includes REST recovery wording (hold + resume) without
+            terminal commands. Empty on the happy path; clients can branch on
             `len(warnings) > 0` to render a banner alongside the
             now-`in_progress` task.
 

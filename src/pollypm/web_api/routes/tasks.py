@@ -79,6 +79,15 @@ def list_tasks_endpoint(
     # Query into ``?status=draft&status=queued`` (OR semantics on the
     # service side).
     status: Annotated[list[str] | None, Query(description="Filter by work_status (repeatable).")] = None,
+    work_status: Annotated[
+        list[str] | None,
+        Query(
+            description=(
+                "Alias for `status`; kept because clients naturally "
+                "filter by the response field name."
+            ),
+        ),
+    ] = None,
     assignee: Annotated[str | None, Query(description="Filter by exact assignee.")] = None,
     since: Annotated[
         str | None,
@@ -96,6 +105,7 @@ def list_tasks_endpoint(
     limit: Annotated[int, Query(ge=1, le=200, description="Page size (capped at 200).")] = 50,
     cursor: Annotated[str | None, Query(description="Opaque cursor from next_cursor.")] = None,
 ) -> TaskListResponse:
+    statuses = [*list(status or []), *list(work_status or [])] or None
     since_dt: datetime | None = None
     if since is not None:
         try:
@@ -131,7 +141,7 @@ def list_tasks_endpoint(
         items, next_cursor, warnings = list_all_tasks(
             config,
             project=project,
-            statuses=status,
+            statuses=statuses,
             assignee=assignee,
             since=since_dt,
             include_untracked=include_untracked,

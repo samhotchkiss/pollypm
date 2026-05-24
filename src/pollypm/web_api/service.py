@@ -68,6 +68,12 @@ from pollypm.work.cancel_safety import (
 
 logger = logging.getLogger(__name__)
 
+_TASK_API_UNAVAILABLE_HINT = (
+    "Retry shortly; check API server health if the failure persists."
+)
+_PM_COMMAND_RE = re.compile(r"`?pm\s+[a-z][^`\n]*`?")
+_PM_COMMAND_LINE_RE = re.compile(r"(?m)^\s*pm\s+[^\n]*$")
+
 
 # ---------------------------------------------------------------------------
 # Read-only work-service open
@@ -1177,7 +1183,7 @@ def list_project_tasks(
         )
         raise service_unavailable(
             f"Backing store unavailable for project {project_key}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -1488,8 +1494,23 @@ def get_task_detail(
         )
         raise service_unavailable(
             f"Backing store unavailable for task {project_key}/{task_number}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
+
+
+def _sanitize_task_api_text(message: str) -> str:
+    """Remove CLI-command recovery prose from work-service messages."""
+    text = str(message or "").strip()
+    if not text:
+        return ""
+    for marker in ("\n\nFix:", "\nFix:", " Fix:"):
+        if marker in text:
+            text = text.split(marker, 1)[0].rstrip()
+            break
+    text = _PM_COMMAND_LINE_RE.sub("", text)
+    text = _PM_COMMAND_RE.sub("the REST task API", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1556,10 +1577,8 @@ def queue_task(
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
-                    message=(
-                        str(exc)
-                        or f"Task {task_id} cannot be queued from its current state."
-                    ),
+                    message=_sanitize_task_api_text(str(exc))
+                    or f"Task {task_id} cannot be queued from its current state.",
                     hint="Only draft tasks can be queued; refresh the task to see the current work_status.",
                 ) from exc
             except WorkValidationError as exc:
@@ -1573,7 +1592,8 @@ def queue_task(
                 raise APIError(
                     status_code=422,
                     code="validation_error",
-                    message=str(exc) or f"Task {task_id} failed pre-queue gates.",
+                    message=_sanitize_task_api_text(str(exc))
+                    or f"Task {task_id} failed pre-queue gates.",
                     hint="Fix the failing gate (e.g. add a description) before queueing.",
                 ) from exc
             # Re-read so the response carries the post-transition
@@ -1590,7 +1610,7 @@ def queue_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while queueing {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -1665,7 +1685,8 @@ def claim_task(
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
-                    message=str(exc) or f"Task {task_id} cannot be claimed.",
+                    message=_sanitize_task_api_text(str(exc))
+                    or f"Task {task_id} cannot be claimed.",
                     hint="Only queued+unblocked tasks can be claimed.",
                 ) from exc
             except WorkerCapExceededError as exc:
@@ -1703,7 +1724,7 @@ def claim_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while claiming {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -1731,11 +1752,10 @@ def _collect_claim_warnings(
       claim even though the operator expects the per-task worker
       lifecycle.
 
-    Each entry uses the same "what to do" wording as the CLI warning
-    at ``src/pollypm/work/cli.py:912-929`` so the recovery story is
-    identical across surfaces. The list is empty on the happy path —
-    clients can branch on ``len(warnings) > 0`` to decide whether to
-    surface a banner.
+    Each entry uses REST recovery actions instead of CLI commands so
+    HTTP clients can display the warning without translating shell
+    syntax. The list is empty on the happy path; clients can branch on
+    ``len(warnings) > 0`` to decide whether to surface a banner.
     """
     warnings: list[str] = []
     last_provision_error = getattr(svc, "last_provision_error", None)
@@ -1769,10 +1789,10 @@ def _collect_claim_warnings(
                 f"{last_provision_error}. The DB claim is in effect, "
                 f"but no live agent lane was created. To recover: "
                 f"either continue work from an existing worker "
-                f"session for this project, or hold + resume to "
-                f"retry provisioning "
-                f"(`pm task hold {task_id} --reason 'provision "
-                f"failed'` then `pm task resume {task_id}`)."
+                f"session for this project, or call "
+                f"POST /api/v1/tasks/{task_id}/hold with a reason, "
+                f"then POST /api/v1/tasks/{task_id}/resume to retry "
+                f"provisioning."
             )
     if session_attach_error:
         warnings.append(
@@ -1781,10 +1801,9 @@ def _collect_claim_warnings(
             f"but the worker-session subsystem could not be "
             f"initialised for this request — no per-task tmux lane "
             f"was provisioned. Check tmux availability and the "
-            f"project worktree, then hold + resume the task to "
-            f"retry (`pm task hold {task_id} --reason "
-            f"'session attach failed'` then `pm task resume "
-            f"{task_id}`)."
+            f"project worktree, then call "
+            f"POST /api/v1/tasks/{task_id}/hold with a reason, "
+            f"then POST /api/v1/tasks/{task_id}/resume to retry."
         )
     return warnings
 
@@ -1871,7 +1890,8 @@ def cancel_task(
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
-                    message=str(exc) or f"Task {task_id} cannot be cancelled.",
+                    message=_sanitize_task_api_text(str(exc))
+                    or f"Task {task_id} cannot be cancelled.",
                     hint="Tasks in terminal state (done/cancelled) cannot be cancelled again.",
                 ) from exc
             task = svc.get(task_id)
@@ -1895,7 +1915,7 @@ def cancel_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while cancelling {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -1932,7 +1952,8 @@ def reopen_task(
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
-                    message=str(exc) or f"Task {task_id} cannot be reopened.",
+                    message=_sanitize_task_api_text(str(exc))
+                    or f"Task {task_id} cannot be reopened.",
                     hint="Only cancelled tasks can be reopened.",
                 ) from exc
             task = svc.get(task_id)
@@ -1946,7 +1967,7 @@ def reopen_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while reopening {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2003,7 +2024,7 @@ def reassign_task(
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
-                    message=str(exc)
+                    message=_sanitize_task_api_text(str(exc))
                     or f"Task {task_id} cannot be reassigned in its "
                     f"current state.",
                     hint=(
@@ -2016,7 +2037,8 @@ def reassign_task(
                 raise APIError(
                     status_code=422,
                     code="validation_error",
-                    message=str(exc) or "Reassignment failed validation.",
+                    message=_sanitize_task_api_text(str(exc))
+                    or "Reassignment failed validation.",
                 ) from exc
             return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
@@ -2028,7 +2050,7 @@ def reassign_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while reassigning {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2082,7 +2104,7 @@ def _run_lifecycle_transition(
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
-                    message=str(exc)
+                    message=_sanitize_task_api_text(str(exc))
                     or f"Task {task_id} cannot transition via {verb}.",
                     hint=(
                         "Refresh the task to see the current "
@@ -2094,7 +2116,8 @@ def _run_lifecycle_transition(
                 raise APIError(
                     status_code=422,
                     code="validation_error",
-                    message=str(exc) or f"{verb} validation failed.",
+                    message=_sanitize_task_api_text(str(exc))
+                    or f"{verb} validation failed.",
                 ) from exc
             task = svc.get(task_id)
             return _task_to_detail_with_plan(task, svc=svc)
@@ -2108,7 +2131,7 @@ def _run_lifecycle_transition(
         )
         raise service_unavailable(
             f"Backing store unavailable while {verb}-ing {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2370,10 +2393,8 @@ def patch_task(
                     raise APIError(
                         status_code=422,
                         code="validation_error",
-                        message=(
-                            str(exc)
-                            or "labels/metadata update failed validation."
-                        ),
+                        message=_sanitize_task_api_text(str(exc))
+                        or "labels/metadata update failed validation.",
                     ) from exc
 
             # Status-only PATCH: route through the lifecycle owner
@@ -2418,16 +2439,15 @@ def patch_task(
                     raise APIError(
                         status_code=409,
                         code="invalid_state",
-                        message=(
-                            str(exc)
-                            or f"Status transition to {status!r} refused."
-                        ),
+                        message=_sanitize_task_api_text(str(exc))
+                        or f"Status transition to {status!r} refused.",
                     ) from exc
                 except WorkValidationError as exc:
                     raise APIError(
                         status_code=422,
                         code="validation_error",
-                        message=str(exc) or "status transition gate failed.",
+                        message=_sanitize_task_api_text(str(exc))
+                        or "status transition gate failed.",
                     ) from exc
 
             # Final read also serves as the existence probe for an
@@ -2448,7 +2468,7 @@ def patch_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while patching {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2594,7 +2614,7 @@ def archive_inbox_item(
             except InvalidTransitionError as exc:
                 # The atomic UPDATE asserted the row was non-terminal;
                 # losing the race means another caller archived first.
-                message = str(exc)
+                message = _sanitize_task_api_text(str(exc))
                 raise APIError(
                     status_code=409,
                     code="invalid_state",
@@ -2629,7 +2649,7 @@ def archive_inbox_item(
         )
         raise service_unavailable(
             f"Backing store unavailable while archiving {item_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2739,7 +2759,7 @@ def snooze_inbox_item(
         )
         raise service_unavailable(
             f"Backing store unavailable while snoozing {item_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2789,7 +2809,7 @@ def mark_read_inbox_item(
         )
         raise service_unavailable(
             f"Backing store unavailable while marking-read {item_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2837,7 +2857,8 @@ def reply_inbox_item(
                 raise APIError(
                     status_code=422,
                     code="validation_error",
-                    message=str(exc) or "Reply body failed validation.",
+                    message=_sanitize_task_api_text(str(exc))
+                    or "Reply body failed validation.",
                 ) from exc
             task = svc.get(item_id)
             return _task_to_detail(task)
@@ -2848,7 +2869,7 @@ def reply_inbox_item(
         )
         raise service_unavailable(
             f"Backing store unavailable while replying to {item_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2927,7 +2948,7 @@ def promote_inbox_to_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while promoting {item_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -2977,7 +2998,7 @@ def get_active_plan(
         )
         raise service_unavailable(
             f"Backing store unavailable for project {project_key}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
+            hint=_TASK_API_UNAVAILABLE_HINT,
         ) from exc
 
 
@@ -3156,6 +3177,17 @@ def _is_in_review(task) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _task_dwell_seconds(task: object) -> int | None:
+    updated_at = getattr(task, "updated_at", None)
+    if not isinstance(updated_at, datetime):
+        return None
+    if updated_at.tzinfo is None or updated_at.tzinfo.utcoffset(updated_at) is None:
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+    else:
+        now = datetime.now(updated_at.tzinfo)
+    return max(0, int((now - updated_at).total_seconds()))
+
+
 def _task_to_summary(task) -> APITaskSummary:
     return APITaskSummary(
         task_id=task.task_id,
@@ -3170,6 +3202,7 @@ def _task_to_summary(task) -> APITaskSummary:
         current_node_id=task.current_node_id,
         plan_version=getattr(task, "plan_version", None),
         updated_at=getattr(task, "updated_at", None),
+        dwell_seconds=_task_dwell_seconds(task),
     )
 
 
@@ -3245,6 +3278,7 @@ def _task_to_detail(task, *, plan: APIPlan | None = None) -> APITaskDetail:
         current_node_id=task.current_node_id,
         plan_version=getattr(task, "plan_version", None),
         updated_at=getattr(task, "updated_at", None),
+        dwell_seconds=_task_dwell_seconds(task),
         description=task.description or "",
         acceptance_criteria=task.acceptance_criteria,
         constraints=task.constraints,

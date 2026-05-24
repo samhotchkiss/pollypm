@@ -675,9 +675,12 @@ def test_claim_contract_exposes_session_identity() -> None:
     contract = _load_contract()
     static_summary = contract["components"]["schemas"]["TaskSummary"]
     assert "claimed_by_session" in static_summary["properties"]
+    assert "dwell_seconds" in static_summary["properties"]
+    assert static_summary["properties"]["dwell_seconds"]["minimum"] == 0
 
     runtime_summary = TaskSummary.model_json_schema()
     assert "claimed_by_session" in runtime_summary["properties"]
+    assert "dwell_seconds" in runtime_summary["properties"]
 
     static_actor = contract["components"]["schemas"]["TaskClaimRequest"][
         "properties"

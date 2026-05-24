@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +220,7 @@ class FakeWorkService:
             )
         task.work_status = WorkStatus.QUEUED
         task.assignee = None
+        task.claimed_by_session = None
         task.current_node_id = None
         task.updated_at = datetime.now(timezone.utc)
         return task
@@ -608,10 +609,12 @@ def test_claim_surfaces_last_provision_error_warning(
     warning = warnings[0]
     assert "tmux client missing" in warning
     assert "myproj/201" in warning
-    # Recovery wording must point at hold + resume — that is the
-    # exact same operator workflow ``pm task claim`` documents.
+    # Recovery wording must point at REST hold + resume actions.
     assert "hold" in warning.lower()
     assert "resume" in warning.lower()
+    assert "pm task" not in warning
+    assert "POST /api/v1/tasks/myproj/201/hold" in warning
+    assert "POST /api/v1/tasks/myproj/201/resume" in warning
 
 
 def test_claim_attach_session_manager_failure_captured(
@@ -669,6 +672,48 @@ def test_claim_attach_session_manager_failure_captured(
     assert "SessionManager wire-up failed" in warning
     assert "TmuxClient unreachable" in warning
     assert "myproj/202" in warning
+    assert "pm task" not in warning
+    assert "POST /api/v1/tasks/myproj/202/hold" in warning
+    assert "POST /api/v1/tasks/myproj/202/resume" in warning
+
+
+def test_claim_invalid_state_sanitizes_cli_recovery_message(
+    api_config, token_path, token, task_store, monkeypatch  # noqa: ARG001
+) -> None:
+    """REST errors should not surface CLI recovery commands."""
+    _seed(task_store, n=203, work_status=WorkStatus.QUEUED)
+
+    class _CliMessageWorkService(FakeWorkService):
+        def claim(self, task_id: str, actor: str) -> FakeTask:  # noqa: ARG002
+            raise InvalidTransitionError(
+                "Cannot claim task in 'review' state.\n\n"
+                "Fix: run `pm task hold myproj/203 --reason blocked` "
+                "then `pm task resume myproj/203`."
+            )
+
+    def _factory(**_kwargs: object) -> _CliMessageWorkService:
+        return _CliMessageWorkService(task_store)
+
+    from pollypm.web_api.app import create_app
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(work_factory, "create_work_service", _factory)
+    monkeypatch.setattr(
+        work_service_factory, "create_work_service_with_session", _factory
+    )
+    app = create_app(config=api_config, token_path=token_path)
+    local_client = TestClient(app)
+    response = local_client.post(
+        "/api/v1/tasks/myproj/203/claim",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"actor": "alice"},
+    )
+    assert response.status_code == 409, response.text
+    message = response.json()["error"]["message"]
+    assert "Cannot claim task" in message
+    assert "Fix:" not in message
+    assert "pm task" not in message
 
 
 def test_create_work_service_with_session_captures_attach_exception(
@@ -960,6 +1005,7 @@ def test_reopen_happy_path(client, auth_headers, task_store) -> None:
     _seed(
         task_store, n=53,
         work_status=WorkStatus.CANCELLED, assignee="bob",
+        claimed_by_session="stale-session",
         current_node_id="implement",
     )
     response = client.post(
@@ -972,6 +1018,7 @@ def test_reopen_happy_path(client, auth_headers, task_store) -> None:
     assert body["ok"] is True
     assert body["task"]["work_status"] == "queued"
     assert body["task"]["assignee"] is None
+    assert body["task"]["claimed_by_session"] is None
     assert body["task"]["current_node_id"] is None
 
 
@@ -1738,6 +1785,21 @@ def test_get_task_detail_hydrates_plan_for_plan_review(
     plan = response.json()["plan"]
     assert plan is not None
     assert "caching" in plan["summary"].lower()
+
+
+def test_get_task_detail_includes_dwell_seconds(
+    client, auth_headers, task_store
+) -> None:
+    seeded = _seed(task_store, n=46, work_status=WorkStatus.QUEUED)
+    seeded.updated_at = datetime.now(timezone.utc) - timedelta(seconds=125)
+
+    response = client.get(
+        "/api/v1/tasks/myproj/46", headers=auth_headers
+    )
+    assert response.status_code == 200, response.text
+    dwell_seconds = response.json()["dwell_seconds"]
+    assert isinstance(dwell_seconds, int)
+    assert dwell_seconds >= 120
 
 
 def test_action_result_plan_hydration_parity_claim(

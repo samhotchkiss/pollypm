@@ -164,6 +164,7 @@ class TaskSummary(BaseModel):
     current_node_id: str | None = None
     plan_version: int | None = None
     updated_at: datetime | None = None
+    dwell_seconds: int | None = Field(default=None, ge=0)
 
 
 class Transition(BaseModel):
@@ -521,10 +522,9 @@ class TaskActionResult(BaseModel):
     Today the claim path uses it to surface ``last_provision_error``
     when the DB transition committed but the per-task worker session
     failed to provision — the task is ``in_progress`` with no live
-    agent lane, and the operator needs to recover manually. This
-    mirrors the CLI's stderr warning at
-    ``src/pollypm/work/cli.py:912-929`` so the API and ``pm task
-    claim`` give the same recovery story (#2064 round-10).
+    agent lane, and the operator needs to recover manually. This gives
+    API clients the same recovery story without embedding terminal
+    commands in the HTTP response (#2064 round-10, #2219).
     """
 
     ok: bool

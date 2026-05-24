@@ -1210,7 +1210,8 @@ class PgWorkService:
                 )
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, "
-                    "assignee = NULL, current_node_id = NULL, "
+                    "assignee = NULL, claimed_by_session = NULL, "
+                    "current_node_id = NULL, "
                     "updated_at = %s "
                     "WHERE project = %s AND task_number = %s",
                     (WorkStatus.QUEUED.value, now, project, task_number),

@@ -1272,6 +1272,7 @@ def test_reopen_cancelled_task_returns_to_clean_queue(pg_service):
 
     assert reopened.work_status is WorkStatus.QUEUED
     assert reopened.assignee is None
+    assert reopened.claimed_by_session is None
     assert reopened.current_node_id is None
 
     with pg_service._pool.connection() as conn, conn.cursor() as cur:

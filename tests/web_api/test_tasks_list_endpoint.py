@@ -221,6 +221,29 @@ def test_list_tasks_status_filter_or_semantics(
     assert titles == ["Drafty", "Queued one"]
 
 
+def test_list_tasks_work_status_alias_filters(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """``?work_status=`` aliases ``?status=`` instead of no-oping."""
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        queued = make_task(svc, project="myproj", title="Queued alias")
+        make_task(svc, project="myproj", title="Draft alias")
+        svc.queue(queued.task_id, actor="tester")
+
+    response = client.get(
+        "/api/v1/tasks?work_status=queued", headers=auth_headers
+    )
+    assert response.status_code == 200, response.text
+    titles = {item["title"] for item in response.json()["items"]}
+    assert "Queued alias" in titles
+    assert "Draft alias" not in titles
+    assert {item["work_status"] for item in response.json()["items"]} == {
+        "queued"
+    }
+
+
 def test_list_tasks_since_filter_rejects_bad_iso(
     api_config, client, auth_headers
 ) -> None:

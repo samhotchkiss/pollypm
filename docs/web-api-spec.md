@@ -403,7 +403,7 @@ Fields: `project`, `task_number`, `task_id` (`{project}/{n}`),
 `relationships`, `flow_template_id`, `flow_template_version`,
 `plan_version`, `predecessor_task_id`, `transitions`, `executions`
 (optional, only on detail), `total_input_tokens`,
-`total_output_tokens`, `session_count`, timestamps.
+`total_output_tokens`, `session_count`, `dwell_seconds`, timestamps.
 
 ### TaskStatus (enum)
 

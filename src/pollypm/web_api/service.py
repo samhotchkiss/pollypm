@@ -157,7 +157,9 @@ class WorkServiceFacadeUnavailable(RuntimeError):
     """
 
 
-def list_active_worker_sessions_strict(config: PollyPMConfig) -> list[Any]:
+def list_active_worker_sessions_strict(
+    config: PollyPMConfig, *, project: str | None = None
+) -> list[Any]:
     """Strict variant of :func:`list_active_worker_sessions`.
 
     Same return shape, but raises :class:`WorkServiceFacadeUnavailable`
@@ -173,11 +175,12 @@ def list_active_worker_sessions_strict(config: PollyPMConfig) -> list[Any]:
     ``[]`` — there can't be any per-task workers without a project,
     so the caller treats that as a legitimate empty registry.
     """
-    project = getattr(config, "project", None)
-    if project is None:
+    project_filter = project
+    project_settings = getattr(config, "project", None)
+    if project_settings is None:
         return []
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
+    project_key = getattr(project_settings, "name", "")
+    project_path = getattr(project_settings, "root_dir", None)
     if not project_key or project_path is None:
         return []
     try:
@@ -189,13 +192,23 @@ def list_active_worker_sessions_strict(config: PollyPMConfig) -> list[Any]:
             list_fn = getattr(svc, "list_worker_sessions", None)
             if not callable(list_fn):
                 return []
-            records = list_fn(active_only=True)
+            try:
+                if project_filter is None:
+                    records = list_fn(active_only=True)
+                else:
+                    records = list_fn(
+                        project=project_filter, active_only=True
+                    )
+            except TypeError:
+                records = list_fn(active_only=True)
             return list(records or [])
     except Exception as exc:  # noqa: BLE001
         raise WorkServiceFacadeUnavailable(str(exc)) from exc
 
 
-def list_active_worker_sessions(config: PollyPMConfig) -> list[Any]:
+def list_active_worker_sessions(
+    config: PollyPMConfig, *, project: str | None = None
+) -> list[Any]:
     """Return active ``WorkerSessionRecord``s for chat surface discovery.
 
     Public facade so the chat-messages route doesn't need to reach
@@ -213,11 +226,12 @@ def list_active_worker_sessions(config: PollyPMConfig) -> list[Any]:
     module at import time (and the consumer only needs duck-typed
     attribute access).
     """
-    project = getattr(config, "project", None)
-    if project is None:
+    project_filter = project
+    project_settings = getattr(config, "project", None)
+    if project_settings is None:
         return []
-    project_key = getattr(project, "name", "")
-    project_path = getattr(project, "root_dir", None)
+    project_key = getattr(project_settings, "name", "")
+    project_path = getattr(project_settings, "root_dir", None)
     if not project_key or project_path is None:
         return []
     try:
@@ -230,7 +244,15 @@ def list_active_worker_sessions(config: PollyPMConfig) -> list[Any]:
             if not callable(list_fn):
                 return []
             try:
-                records = list_fn(active_only=True)
+                try:
+                    if project_filter is None:
+                        records = list_fn(active_only=True)
+                    else:
+                        records = list_fn(
+                            project=project_filter, active_only=True
+                        )
+                except TypeError:
+                    records = list_fn(active_only=True)
             except Exception:  # noqa: BLE001
                 logger.debug(
                     "list_active_worker_sessions: list_worker_sessions failed",
@@ -255,15 +277,24 @@ def list_projects(config: PollyPMConfig, *, tracked_only: bool = False) -> list[
     """Return every registered project as an :class:`APIProject`.
 
     Counts and flags are computed against the work-service so the
-    response matches what the cockpit dashboard renders. We open one
-    work-service per project to keep the implementation simple — the
-    factory is cheap and the cockpit does the same.
+    response matches what the cockpit dashboard renders. On the pg
+    backend, collapse the historical per-project fanout into one bulk
+    task read so dashboard/project-list polls do not open and query the
+    work service once per registered project.
     """
     out: list[APIProject] = []
+    snapshots = _project_task_snapshots(config)
     for key, project in config.projects.items():
         if tracked_only and not project.tracked:
             continue
-        out.append(_project_to_api(config, key, project))
+        if snapshots is not None:
+            out.append(
+                _project_to_api_from_tasks(
+                    config, key, project, snapshots.get(key, [])
+                )
+            )
+        else:
+            out.append(_project_to_api(config, key, project))
     return out
 
 
@@ -280,10 +311,10 @@ def project_drilldown(config: PollyPMConfig, key: str) -> APIProjectDrilldown | 
     One round-trip is enough to render the cockpit's drilldown per
     spec §8 (``GET /api/v1/projects/{key}``).
     """
-    base = get_project(config, key)
-    if base is None:
+    project = config.projects.get(key)
+    if project is None:
         return None
-    project_path = config.projects[key].path
+    project_path = project.path
 
     recent: list[APIProjectActivityEntry] = []
     try:
@@ -310,17 +341,38 @@ def project_drilldown(config: PollyPMConfig, key: str) -> APIProjectDrilldown | 
 
     top_tasks: list[APITaskSummary] = []
     plan: APIPlan | None = None
+    counts: dict[str, int] = {}
+    pending_plan_review = False
+    open_inbox_count = 0
     try:
         with _open_work_service_readonly(
             config=config, project_key=key, project_path=project_path
         ) as svc:
+            try:
+                counts = svc.state_counts(project=key) or {}
+            except Exception:  # noqa: BLE001
+                counts = {}
+            try:
+                review_tasks = svc.list_tasks(project=key, work_status="review")
+            except Exception:  # noqa: BLE001
+                review_tasks = []
+            pending_plan_review = any(_is_plan_task(t) for t in review_tasks)
+            open_inbox_count = _count_open_inbox_with_service(svc, key)
             tasks = svc.list_tasks(project=key, limit=10)
             for task in tasks:
                 top_tasks.append(_task_to_summary(task))
-            plan = _active_plan_for_project(svc, key)
+            plan = _active_plan_from_review_tasks(svc, review_tasks)
     except Exception as exc:  # noqa: BLE001
         logger.debug("drilldown: work-service open failed for %s: %s", key, exc)
 
+    base = _project_to_api_from_metrics(
+        config,
+        key,
+        project,
+        counts=counts,
+        pending_plan_review=pending_plan_review,
+        open_inbox_count=open_inbox_count,
+    )
     return APIProjectDrilldown(
         **base.model_dump(),
         recent_activity=recent,
@@ -830,12 +882,132 @@ def init_project_guide_for_role(
     }
 
 
+_TERMINAL_STATUS_VALUES = frozenset({"done", "cancelled"})
+
+
+def _status_value(task: object) -> str:
+    status = getattr(task, "work_status", None)
+    return str(getattr(status, "value", status) or "")
+
+
+def _zero_counts() -> dict[str, int]:
+    try:
+        from pollypm.work.models import WorkStatus
+
+        return {status.value: 0 for status in WorkStatus}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _counts_from_tasks(tasks: list[object]) -> dict[str, int]:
+    counts = _zero_counts()
+    for task in tasks:
+        status = _status_value(task)
+        if not status:
+            continue
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _open_inbox_count_from_tasks(tasks: list[object]) -> int:
+    count = 0
+    for task in tasks:
+        if getattr(task, "flow_template_id", "") != "chat":
+            continue
+        if _status_value(task) not in _TERMINAL_STATUS_VALUES:
+            count += 1
+    return count
+
+
+def _project_task_snapshots(
+    config: PollyPMConfig,
+) -> dict[str, list[object]] | None:
+    """Return pg task rows grouped by registered project, or ``None``.
+
+    This is an optimization only. If the pg aggregate path is unavailable
+    the callers fall back to the existing per-project service reads.
+    """
+    try:
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        if not is_pg_backend(config):
+            return None
+        from pollypm.cockpit_pg_aggregates import (
+            _all_tasks_grouped_uncached,
+            all_tasks_for_project,
+        )
+
+        # API responses should reflect the latest committed task state.
+        # Use the same one-query pg aggregate as the cockpit, but bypass
+        # the cockpit's short TTL cache so concurrent agents do not see
+        # deliberately stale project badges/counts through REST.
+        grouped = _all_tasks_grouped_uncached(config)
+        if grouped is None:
+            return None
+        return {
+            key: all_tasks_for_project(grouped, config, key)
+            for key in config.projects
+        }
+    except Exception:  # noqa: BLE001
+        logger.debug("project task snapshot aggregate unavailable", exc_info=True)
+        return None
+
+
+def _project_to_api_from_tasks(
+    config: PollyPMConfig,
+    key: str,
+    project: KnownProject,
+    tasks: list[object],
+) -> APIProject:
+    counts = _counts_from_tasks(tasks)
+    pending_plan_review = any(
+        _status_value(task) == "review" and _is_plan_task(task)
+        for task in tasks
+    )
+    open_inbox_count = _open_inbox_count_from_tasks(tasks)
+    return _project_to_api_from_metrics(
+        config,
+        key,
+        project,
+        counts=counts,
+        pending_plan_review=pending_plan_review,
+        open_inbox_count=open_inbox_count,
+    )
+
+
+def _project_to_api_from_metrics(
+    config: PollyPMConfig,  # noqa: ARG001 — kept for callsite symmetry
+    key: str,
+    project: KnownProject,
+    *,
+    counts: dict[str, int],
+    pending_plan_review: bool,
+    open_inbox_count: int,
+) -> APIProject:
+    glyph = _glyph_for_project(
+        project, counts, pending_plan_review, open_inbox_count
+    )
+    if not project.tracked:
+        glyph = "paused"
+    return APIProject(
+        key=key,
+        name=project.display_label(),
+        path=str(project.path),
+        tracked=project.tracked,
+        kind=project.kind.value if hasattr(project.kind, "value") else str(project.kind),
+        persona_name=project.persona_name,
+        state=None,
+        glyph=glyph,
+        task_counts=counts,
+        open_inbox_count=open_inbox_count,
+        pending_plan_review=pending_plan_review,
+    )
+
+
 def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> APIProject:
     counts: dict[str, int] = {}
     pending_plan_review = False
     open_inbox_count = 0
-    glyph = "unknown"
-    state_label: str | None = None
 
     try:
         with _open_work_service_readonly(
@@ -857,22 +1029,13 @@ def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> A
     except Exception as exc:  # noqa: BLE001
         logger.debug("project inbox count failed for %s: %s", key, exc)
 
-    glyph = _glyph_for_project(project, counts, pending_plan_review, open_inbox_count)
-    if not project.tracked:
-        glyph = "paused"
-
-    return APIProject(
-        key=key,
-        name=project.display_label(),
-        path=str(project.path),
-        tracked=project.tracked,
-        kind=project.kind.value if hasattr(project.kind, "value") else str(project.kind),
-        persona_name=project.persona_name,
-        state=state_label,
-        glyph=glyph,
-        task_counts=counts,
-        open_inbox_count=open_inbox_count,
+    return _project_to_api_from_metrics(
+        config,
+        key,
+        project,
+        counts=counts,
         pending_plan_review=pending_plan_review,
+        open_inbox_count=open_inbox_count,
     )
 
 
@@ -937,18 +1100,21 @@ def _count_open_inbox(config: PollyPMConfig, project_key: str) -> int:
         with _open_work_service_readonly(
             config=config, project_key=project_key, project_path=project.path
         ) as svc:
-            tasks = svc.list_tasks(project=project_key)
+            return _count_open_inbox_with_service(svc, project_key)
     except Exception:  # noqa: BLE001
         return 0
-    count = 0
-    for task in tasks:
-        if getattr(task, "flow_template_id", "") != "chat":
-            continue
-        status = getattr(task, "work_status", None)
-        status_value = getattr(status, "value", str(status)) if status else ""
-        if status_value not in {"done", "cancelled"}:
-            count += 1
-    return count
+
+
+def _count_open_inbox_with_service(svc: object, project_key: str) -> int:
+    try:
+        list_nonterminal = getattr(svc, "list_nonterminal_tasks", None)
+        if callable(list_nonterminal):
+            tasks = list_nonterminal(project=project_key)
+        else:
+            tasks = svc.list_tasks(project=project_key)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        return 0
+    return _open_inbox_count_from_tasks(list(tasks or []))
 
 
 # ---------------------------------------------------------------------------
@@ -2820,6 +2986,10 @@ def _active_plan_for_project(svc, project_key: str) -> APIPlan | None:
         review_tasks = svc.list_tasks(project=project_key, work_status="review")
     except Exception:  # noqa: BLE001
         review_tasks = []
+    return _active_plan_from_review_tasks(svc, review_tasks)
+
+
+def _active_plan_from_review_tasks(svc, review_tasks: list[object]) -> APIPlan | None:
     candidates = [t for t in review_tasks if _is_plan_task(t)]
     if not candidates:
         return None

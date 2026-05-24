@@ -644,6 +644,52 @@ def test_read_events_walks_gz_archives_after_rotation(
     assert archived_match.metadata.get("root_cause_hash") == "abc123"
 
 
+def test_read_events_limit_uses_live_tail_without_full_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Project detail asks for the last 25 audit rows.
+
+    That path must stay proportional to the requested page size, not to
+    the full audit history. When the live log has enough rows, the
+    limited reader should tail the JSONL directly and never invoke the
+    forward full-file iterator.
+    """
+    import pollypm.audit.log as log_mod
+
+    project_root = tmp_path / "tailfast"
+    (project_root / ".pollypm").mkdir(parents=True)
+    audit_path = project_root / ".pollypm" / "audit.jsonl"
+
+    rows = []
+    for i in range(200):
+        rows.append(json.dumps({
+            "schema": SCHEMA_VERSION,
+            "ts": f"2026-05-20T00:{i // 60:02d}:{i % 60:02d}+00:00",
+            "project": "tailfast",
+            "event": "task.status_changed",
+            "subject": f"tailfast/{i}",
+            "actor": "test",
+            "status": "ok",
+            "metadata": {},
+        }))
+    audit_path.write_text("\n".join(rows) + "\n", encoding="utf-8")
+
+    def fail_forward_scan(_path):
+        raise AssertionError("limited read should not scan from file head")
+
+    monkeypatch.setattr(log_mod, "_iter_log_lines", fail_forward_scan)
+
+    events = log_mod.read_events("tailfast", project_path=project_root, limit=5)
+
+    assert [event.subject for event in events] == [
+        "tailfast/195",
+        "tailfast/196",
+        "tailfast/197",
+        "tailfast/198",
+        "tailfast/199",
+    ]
+
+
 def test_read_events_chains_live_and_gz_in_chronological_order(
     tmp_path: Path,
 ) -> None:

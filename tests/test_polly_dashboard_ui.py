@@ -7,6 +7,8 @@ import threading
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from pollypm.cockpit_ui import PollyDashboardApp
 from pollypm.dashboard_data import (
     AccountQuotaUsage,
@@ -322,6 +324,90 @@ def test_dashboard_gather_includes_cached_llm_quota_usage(
     assert usage.email == "claude@swh.me"
     assert usage.used_pct == 79
     assert usage.limit_label == "weekly limit"
+
+
+def test_dashboard_gather_uses_bulk_heartbeat_lookup(monkeypatch) -> None:
+    from pollypm.dashboard_data import gather
+
+    config = SimpleNamespace(
+        projects={
+            "myproj": SimpleNamespace(display_label=lambda: "My Project"),
+        },
+        accounts={},
+    )
+    launches = [
+        SimpleNamespace(
+            session=SimpleNamespace(
+                name="operator",
+                role="operator",
+                project="myproj",
+            )
+        ),
+        SimpleNamespace(
+            session=SimpleNamespace(
+                name="architect_myproj",
+                role="architect",
+                project="myproj",
+            )
+        ),
+    ]
+    bulk_calls: list[list[str]] = []
+
+    monkeypatch.setattr(
+        "pollypm.storage._backend_dispatch.is_pg_backend",
+        lambda _config: True,
+    )
+    monkeypatch.setattr(
+        "pollypm.service_api.plan_launches_readonly",
+        lambda _config, _store: launches,
+    )
+    monkeypatch.setattr(
+        "pollypm.storage.pg_sessions.list_session_runtimes",
+        lambda: [
+            SimpleNamespace(
+                session_name="operator",
+                status="healthy",
+                updated_at="2026-05-24T00:00:00+00:00",
+            )
+        ],
+    )
+    monkeypatch.setattr(
+        "pollypm.storage.pg_heartbeats.latest_heartbeats_bulk",
+        lambda names, **_kw: bulk_calls.append(list(names)) or {
+            "operator": SimpleNamespace(snapshot_path=""),
+        },
+    )
+    monkeypatch.setattr(
+        "pollypm.storage.pg_heartbeats.latest_heartbeat",
+        lambda *_args, **_kw: pytest.fail(
+            "dashboard gather should not issue per-session heartbeat reads"
+        ),
+    )
+    monkeypatch.setattr(
+        "pollypm.storage.pg_sessions.recent_events", lambda *, limit: []
+    )
+    monkeypatch.setattr(
+        "pollypm.storage.pg_token_usage.daily_token_usage",
+        lambda *, days: [],
+    )
+    monkeypatch.setattr("pollypm.storage.pg_alerts.open_alerts", lambda: [])
+    monkeypatch.setattr("pollypm.dashboard_data._recent_commits", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._completed_issues", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._recent_inbox_messages", lambda *_a, **_kw: [])
+    monkeypatch.setattr("pollypm.dashboard_data._count_dashboard_inbox_items", lambda _config: 0)
+    monkeypatch.setattr("pollypm.dashboard_data._account_quota_usage", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        "pollypm.dashboard_data._user_waiting_task_ids_across_projects",
+        lambda _config: frozenset(),
+    )
+
+    data = gather(config, None)
+
+    assert bulk_calls == [["operator", "architect_myproj"]]
+    assert [session.name for session in data.active_sessions] == [
+        "operator",
+        "architect_myproj",
+    ]
 
 
 def test_polly_dashboard_i_key_routes_to_inbox(monkeypatch, tmp_path: Path) -> None:

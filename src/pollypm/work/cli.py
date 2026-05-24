@@ -26,6 +26,10 @@ from pollypm.audit.log import (
     EVENT_TASK_CANCEL_CONFIRMED,
     EVENT_TASK_CANCEL_WARNED,
 )
+from pollypm.claim_breadcrumbs import (
+    CLAIM_ATTEMPTED_BY_LOSER,
+    CLAIM_WON_BY,
+)
 from pollypm.work.cancel_safety import (
     emit_cancel_safety_event,
     in_progress_assignee,
@@ -342,6 +346,10 @@ def _resolve_actor_for_task(
 _INTERNAL_CONTEXT_ENTRY_TYPES = frozenset({
     "sweeper_ping",
 })
+_CLAIM_CONTEXT_ENTRY_TYPES = frozenset({
+    CLAIM_ATTEMPTED_BY_LOSER,
+    CLAIM_WON_BY,
+})
 
 
 def _is_sweeper_internal(entry) -> bool:
@@ -371,6 +379,16 @@ def _filter_visible_context(entries, *, show_internal: bool):
     if show_internal:
         return list(entries)
     return [e for e in entries if not _is_sweeper_internal(e)]
+
+
+def _format_claim_history_line(entries) -> str | None:
+    claim_entries = [
+        e for e in entries
+        if getattr(e, "entry_type", None) in _CLAIM_CONTEXT_ENTRY_TYPES
+    ]
+    if not claim_entries:
+        return None
+    return "Claim history: " + " | ".join(str(e.text) for e in claim_entries)
 
 
 def _print_task(task, as_json: bool = False, show_internal: bool = False) -> None:
@@ -1633,9 +1651,12 @@ def task_context(
         entries = _run(
             svc.get_context, task_id, limit=limit, entry_type=entry_type,
         )
-        # ``get_context`` returns DESC (most-recent first); reverse to
-        # render chronologically so readers can follow the conversation.
-        entries = list(reversed(entries))
+        # ``get_context`` returns DESC (most-recent first). Sort by the
+        # entry timestamp so post-commit audit breadcrumbs still render
+        # in the order the claim attempts happened.
+        entries = sorted(
+            entries, key=lambda e: str(getattr(e, "timestamp", "") or ""),
+        )
         visible = _filter_visible_context(
             entries, show_internal=show_internal,
         )
@@ -1671,14 +1692,26 @@ def task_context(
                 typer.echo(f"No context entries on {task_id}.")
             return
 
+        claim_history = _format_claim_history_line(visible)
+        if claim_history is not None:
+            typer.echo(claim_history)
+
+        actor_width = max(
+            14, *(len(str(getattr(e, "actor", "") or "")) for e in visible),
+        )
+        type_width = max(
+            14,
+            *(len(str(getattr(e, "entry_type", "") or "")) for e in visible),
+        )
         typer.echo(
-            f"{'Timestamp':<26} {'Actor':<14} {'Type':<14} Text"
+            f"{'Timestamp':<26} {'Actor':<{actor_width}} "
+            f"{'Type':<{type_width}} Text"
         )
         typer.echo("-" * 80)
         for e in visible:
             typer.echo(
-                f"{str(e.timestamp):<26} {e.actor:<14} "
-                f"{e.entry_type:<14} {e.text}"
+                f"{str(e.timestamp):<26} {e.actor:<{actor_width}} "
+                f"{e.entry_type:<{type_width}} {e.text}"
             )
         if hidden_count:
             typer.echo(

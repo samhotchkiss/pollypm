@@ -20,6 +20,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from pollypm.claim_breadcrumbs import (
+    CLAIM_ATTEMPTED_BY_LOSER,
+    CLAIM_WON_BY,
+)
+
 logger = logging.getLogger(__name__)
 
 # Rotation defaults — mirrored by :class:`pollypm.models.AuditSettings`.
@@ -57,6 +62,8 @@ SCHEMA_VERSION = 1
 EVENT_TASK_CREATED = "task.created"
 EVENT_TASK_STATUS_CHANGED = "task.status_changed"
 EVENT_TASK_CLAIMED_BY_SESSION = "task.claimed_by_session"
+EVENT_CLAIM_WON_BY = CLAIM_WON_BY
+EVENT_CLAIM_ATTEMPTED_BY_LOSER = CLAIM_ATTEMPTED_BY_LOSER
 EVENT_TASK_CANCEL_WARNED = "task.cancel.warned"
 EVENT_TASK_CANCEL_CONFIRMED = "task.cancel.confirmed"
 EVENT_TASK_DELETED = "task.deleted"
@@ -979,6 +986,8 @@ __all__ = [
     "EVENT_TASK_CREATED",
     "EVENT_TASK_STATUS_CHANGED",
     "EVENT_TASK_CLAIMED_BY_SESSION",
+    "EVENT_CLAIM_WON_BY",
+    "EVENT_CLAIM_ATTEMPTED_BY_LOSER",
     "EVENT_TASK_CANCEL_WARNED",
     "EVENT_TASK_CANCEL_CONFIRMED",
     "EVENT_TASK_DELETED",

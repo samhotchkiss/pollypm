@@ -126,6 +126,31 @@ def test_chat_message_type_enum_matches_runtime() -> None:
     )
 
 
+def test_task_status_enum_matches_runtime_work_status() -> None:
+    """``TaskStatus`` must mirror the work-service status enum.
+
+    Live PG may not currently contain every lifecycle state, but the
+    OpenAPI contract has to describe values the runtime can emit.
+    Tightening the schema to today's sampled rows would make generated
+    clients reject valid review/rework/on-hold transitions.
+    """
+    from pollypm.work.models import WorkStatus
+
+    contract = _load_contract()
+    yaml_enum = set(contract["components"]["schemas"]["TaskStatus"]["enum"])
+    runtime_enum = {member.value for member in WorkStatus}
+    missing_in_yaml = runtime_enum - yaml_enum
+    extra_in_yaml = yaml_enum - runtime_enum
+    assert not missing_in_yaml, (
+        f"TaskStatus enum is missing runtime values: {missing_in_yaml}. "
+        "Update docs/api/openapi.yaml to include them."
+    )
+    assert not extra_in_yaml, (
+        f"TaskStatus enum has values the runtime cannot emit: {extra_in_yaml}. "
+        "Remove them from docs/api/openapi.yaml."
+    )
+
+
 def test_static_yaml_does_not_advertise_idempotency_on_inbox_writes() -> None:
     """Static contract must match the implementation: no Idempotency-Key
     on inbox-write paths.

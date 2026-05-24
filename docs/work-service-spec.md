@@ -319,7 +319,7 @@ callers rely on, including `created_by`, `skip_gates`, and `entry_type`.
 | `get` | task_id | Task | Read a task with all fields including current flow node and execution state. |
 | `list_tasks` | work_status?, owner?, project?, assignee?, blocked?, type?, limit?, offset? | list[Task] | Query tasks with filters. |
 | `queue` | task_id, actor, skip_gates? | Task | Move from `draft` to `queued`. If `requires_human_review`, validates human has approved via inbox unless gates are explicitly skipped. |
-| `claim` | task_id, actor, skip_gates? | Task | Atomic: activate first flow node, set role-derived `assignee`, record `actor` as `claimed_by_session`, and set `work_status=in_progress`. Task must be `queued`. |
+| `claim` | task_id, actor, skip_gates? | Task | Atomic: activate first flow node, set role-derived `assignee`, record `actor` as `claimed_by_session`, append/emit `claim.won_by`, and set `work_status=in_progress`. Contended losers append/emit `claim.attempted_by_loser` with `reason=already_claimed`. Task must be `queued`. |
 | `next` | agent?, project? | Task? | Return the highest-priority queued+unblocked task, optionally filtered by project. Does not claim it. |
 | `update` | task_id, fields... | Task | Update mutable fields (title, description, priority, labels, roles). Cannot change work_status directly. |
 | `cancel` | task_id, actor, reason | Task | Move any non-terminal task to `cancelled`; operator surfaces must confirm before cancelling `in_progress` work. |
@@ -682,6 +682,9 @@ The single `claim` call:
 
 - Marks the task `assignee=worker`, records the caller as
   `claimed_by_session`, and sets `work_status=in_progress`.
+- Records claim forensics: `claim.won_by` for the winning session and
+  `claim.attempted_by_loser` with `reason=already_claimed` when another
+  claimant races an already-claimed task.
 - Activates the first flow node.
 - Creates a real git worktree at `.pollypm/worktrees/<project>-<number>`
   on branch `task/<project>-<number>`.

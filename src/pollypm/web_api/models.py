@@ -12,7 +12,7 @@ models (``ApproveRequest``, ``RejectRequest``, etc.) ship in Phase 2.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Any, Literal, TypeAlias
 
 from pydantic import BaseModel, Field
 
@@ -270,7 +270,7 @@ class TaskDetail(TaskSummary):
     plan: Plan | None = None
 
 
-class TaskListWarning(BaseModel):
+class TaskListPartialFailureWarning(BaseModel):
     """Per-project partial-failure notice on the cross-project task list.
 
     Round 1 of Codex review on PR #2067 flagged that silently skipping
@@ -283,6 +283,19 @@ class TaskListWarning(BaseModel):
 
     project: str
     error: str  # short code, e.g. "service_unavailable"
+
+
+class TaskListFilteredWarning(BaseModel):
+    """Notice that the list omitted untracked task rows by design."""
+
+    code: Literal["untracked_filtered"]
+    dropped_count: int = Field(ge=1)
+    reason: Literal["untracked_projects"]
+
+
+TaskListWarning: TypeAlias = (
+    TaskListPartialFailureWarning | TaskListFilteredWarning
+)
 
 
 class TaskListResponse(BaseModel):
@@ -637,6 +650,8 @@ __all__ = [
     "TaskCancelRequest",
     "TaskClaimRequest",
     "TaskDetail",
+    "TaskListFilteredWarning",
+    "TaskListPartialFailureWarning",
     "TaskListResponse",
     "TaskListWarning",
     "TaskPatchRequest",

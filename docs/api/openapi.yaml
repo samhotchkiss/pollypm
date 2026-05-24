@@ -1036,7 +1036,12 @@ paths:
         - in: query
           name: project
           schema: { type: string }
-          description: Limit results to this project key.
+          description: |
+            Limit results to this project key. By default this still
+            respects the tracked-project scope; pass
+            `include_untracked=true` to read rows for a project key
+            that exists in the backing store but is outside the
+            tracked set.
         - in: query
           name: status
           schema:
@@ -1057,6 +1062,15 @@ paths:
             ISO-8601 lower bound on `updated_at`. Only tasks whose
             `updated_at` is strictly after this value are returned.
         - in: query
+          name: include_untracked
+          schema: { type: boolean, default: false }
+          description: |
+            Include task rows for projects outside the tracked-project
+            set. Defaults to false so existing dashboards stay scoped.
+            When false and matching rows are omitted, the response
+            includes a `warnings[]` entry with
+            `code=untracked_filtered` and `dropped_count`.
+        - in: query
           name: limit
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
         - in: query
@@ -1068,8 +1082,10 @@ paths:
           description: |
             Page of task summaries. The optional `warnings` array
             lists any projects whose backing store failed during this
-            request — clients should surface that to the operator
-            rather than treat a 200 with warnings as a complete read.
+            request and any tracked-scope filtering that omitted
+            matching task rows — clients should surface that to the
+            operator rather than treat a 200 with warnings as a
+            complete read.
           content:
             application/json:
               schema:
@@ -3713,15 +3729,18 @@ components:
         warnings:
           type: array
           description: |
-            Per-project partial-failure notices. Absent/empty when
-            every project read succeeded. One entry per project whose
-            backing store raised during this request (clients should
-            render the partial-failure state explicitly rather than
-            assume the body is complete).
+            Per-project partial-failure notices and tracked-scope
+            filtering notices. Absent/empty when every project read
+            succeeded and no matching rows were omitted.
           items:
             $ref: "#/components/schemas/TaskListWarning"
 
     TaskListWarning:
+      oneOf:
+        - $ref: "#/components/schemas/TaskListPartialFailureWarning"
+        - $ref: "#/components/schemas/TaskListFilteredWarning"
+
+    TaskListPartialFailureWarning:
       type: object
       required: [project, error]
       properties:
@@ -3733,6 +3752,21 @@ components:
           description: |
             Short error code (e.g. `service_unavailable`). Stable across
             releases so clients can switch on it.
+
+    TaskListFilteredWarning:
+      type: object
+      required: [code, dropped_count, reason]
+      properties:
+        code:
+          type: string
+          enum: [untracked_filtered]
+        dropped_count:
+          type: integer
+          minimum: 1
+          description: Number of matching task rows omitted by the tracked-project scope.
+        reason:
+          type: string
+          enum: [untracked_projects]
 
     ApproveRequest:
       type: object

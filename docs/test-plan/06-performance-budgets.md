@@ -130,7 +130,7 @@ PY
 measure_http dashboard "$BASE/api/v1/dashboard"
 ```
 
-When `scripts/perf/measure_http.sh` is available, invoke that instead of redefining. Drift between the script and this inline copy is a `bug:perf-helper-drift` against lane E.
+When `scripts/perf/measure_http.sh` is available, invoke that instead of redefining. Drift between the script and this inline copy is a `bug:perf-helper-drift` against lane E. The Python runner behind the wrapper also provides named scenarios, JSON/Markdown reports, polling load, and resource snapshots; see `docs/test-plan/perf-harness.md`.
 
 ### Browser timing
 
@@ -243,12 +243,32 @@ done
 wait
 ```
 
+Canonical runner equivalent:
+
+```bash
+python3 scripts/perf/measure_http.py poll \
+  --base "$BASE" \
+  --clients 10 \
+  --duration 300 \
+  --interval 5 \
+  --json-out /tmp/pollypm-poll.json \
+  --markdown-out /tmp/pollypm-poll.md
+```
+
 **Pass:**
 - No unexplained 5xx.
 - Endpoint p95s still meet M-scale budgets.
 - `pm serve` CPU does not stay above 50%.
 - PG connections return to baseline within 60s after the run.
 - UI remains interactive during the load.
+
+Resource snapshot:
+
+```bash
+python3 scripts/perf/measure_http.py resources \
+  --json-out /tmp/pollypm-resources.json \
+  --markdown-out /tmp/pollypm-resources.md
+```
 
 ### 6.5.2 Concurrent reads
 

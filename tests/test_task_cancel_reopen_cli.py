@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from typer.testing import CliRunner
@@ -67,6 +68,52 @@ def test_cancel_in_progress_decline_does_not_cancel(monkeypatch) -> None:
     assert task.work_status is WorkStatus.IN_PROGRESS
     assert "Worker worker currently working this task" in result.output
     assert [event["event"] for event in events] == ["task.cancel.warned"]
+
+
+def test_cancel_in_progress_noninteractive_without_input_exits_2(
+    monkeypatch,
+) -> None:
+    task = _Task("demo/4", WorkStatus.IN_PROGRESS, assignee="worker")
+    service = _Service(task)
+    events: list[dict] = []
+    monkeypatch.setattr(work_cli, "_svc", lambda **_kw: service)
+    monkeypatch.setattr("pollypm.audit.emit", lambda **kw: events.append(kw))
+    monkeypatch.setattr(work_cli, "_confirm_active_cancel", lambda _prompt: None)
+
+    result = CliRunner().invoke(
+        work_cli.task_app,
+        ["cancel", "demo/4", "--reason", "oops"],
+    )
+
+    assert result.exit_code == 2
+    assert service.cancel_calls == []
+    assert task.work_status is WorkStatus.IN_PROGRESS
+    assert "Refusing to cancel in_progress task non-interactively" in result.output
+    assert "--force" in result.output
+    assert [event["event"] for event in events] == ["task.cancel.warned"]
+
+
+def test_cancel_confirmation_reads_piped_yes(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(write_fd, "w", encoding="utf-8") as writer:
+        writer.write("y\n")
+    reader = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(work_cli.sys, "stdin", reader)
+    try:
+        assert work_cli._confirm_active_cancel("Cancel?") is True
+    finally:
+        reader.close()
+
+
+def test_cancel_confirmation_empty_pipe_returns_no_decision(monkeypatch) -> None:
+    read_fd, write_fd = os.pipe()
+    os.close(write_fd)
+    reader = os.fdopen(read_fd, "r", encoding="utf-8")
+    monkeypatch.setattr(work_cli.sys, "stdin", reader)
+    try:
+        assert work_cli._confirm_active_cancel("Cancel?") is None
+    finally:
+        reader.close()
 
 
 def test_cancel_in_progress_force_skips_prompt(monkeypatch) -> None:

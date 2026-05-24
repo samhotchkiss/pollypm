@@ -1455,6 +1455,53 @@ def _tmux_window_alive_for_task(
     return False
 
 
+def _emit_task_reclaimed_audit(
+    services: Any,
+    *,
+    project: Any,
+    task: Any,
+    reason: str,
+) -> None:
+    """Best-effort audit breadcrumb for reclaiming work from a dead session."""
+    project_key = getattr(project, "key", None)
+    task_number = getattr(task, "task_number", None)
+    task_id = getattr(task, "task_id", None)
+    if not project_key or task_number is None or not task_id:
+        return
+    try:
+        from pollypm.audit.log import EVENT_TASK_RECLAIMED, emit as audit_emit
+        from pollypm.work.session_manager import task_window_name
+    except Exception:  # noqa: BLE001
+        logger.debug("task_auto_claim: audit import failed", exc_info=True)
+        return
+    project_path = getattr(project, "path", None) or getattr(
+        services, "project_root", None,
+    )
+    target_session = task_window_name(str(project_key), int(task_number))
+    try:
+        audit_emit(
+            event=EVENT_TASK_RECLAIMED,
+            project=str(project_key),
+            subject=str(task_id),
+            actor="auto_claim_sweep",
+            status="ok",
+            project_path=Path(project_path) if project_path is not None else None,
+            metadata={
+                "target_task": str(task_id),
+                "target_session": target_session,
+                "task_number": int(task_number),
+                "reason": reason,
+                "source": "task_assignment.sweep",
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "task_auto_claim: task.reclaimed audit failed for %s",
+            task_id,
+            exc_info=True,
+        )
+
+
 def _consecutive_abandonments_at_active_node(task: Any) -> int:
     """Return the count of consecutive ``ABANDONED`` executions at the
     task's current node, walking backwards from the most recent visit.
@@ -1726,6 +1773,12 @@ def _recover_dead_claims(
             continue
         by_outcome["auto_claim_recovered"] = (
             by_outcome.get("auto_claim_recovered", 0) + 1
+        )
+        _emit_task_reclaimed_audit(
+            services,
+            project=project,
+            task=task,
+            reason="worker session missing; stale claim released",
         )
         # Record an event so the activity log shows the auto-recovery.
         msg_store = getattr(services, "msg_store", None)

@@ -637,6 +637,23 @@ def test_supervisor_heartbeat_api_records_snapshot_learnings_into_memory(tmp_pat
     assert len(checkpoints) == 1
 
 
+def test_supervisor_heartbeat_api_records_observation_via_supervisor_facade() -> None:
+    calls: list[dict[str, object]] = []
+    supervisor = SimpleNamespace(
+        record_heartbeat=lambda **kwargs: calls.append(kwargs),
+    )
+    api = SupervisorHeartbeatAPI.__new__(SupervisorHeartbeatAPI)
+    api.supervisor = supervisor
+
+    api.record_observation(_context(session_name="operator", window_name="pm-operator"))
+
+    assert len(calls) == 1
+    assert calls[0]["session_name"] == "operator"
+    assert calls[0]["tmux_window"] == "pm-operator"
+    assert calls[0]["pane_id"] == "%1"
+    assert calls[0]["snapshot_hash"] == "hash-1"
+
+
 def test_supervisor_heartbeat_api_deduplicates_snapshot_learnings(tmp_path: Path, monkeypatch) -> None:
     supervisor = Supervisor(_config(tmp_path))
     supervisor.ensure_layout()

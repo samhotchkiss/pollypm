@@ -260,11 +260,14 @@ EVENT_ADVISOR_TICK_FIRED = "advisor.tick.fired"
 EVENT_ADVISOR_TICK_SKIPPED = "advisor.tick.skipped"
 # Recovery cascade breadcrumbs. ``heartbeat.missing`` records the
 # supervisor/heartbeat detection edge for a tracked session whose tmux
-# window or pane disappeared; ``session.spawn`` records the successful
-# relaunch edge. Operators use this pair to prove a kill->respawn
-# cascade happened without replaying message-store state.
+# window or pane disappeared; ``recovery.spawn`` records the canonical
+# recovery relaunch edge; ``session.spawn`` is the broader session
+# lifecycle synonym retained for existing consumers; ``task.reclaimed``
+# records the task layer picking work back up after a dead worker claim.
 EVENT_HEARTBEAT_MISSING = "heartbeat.missing"
+EVENT_RECOVERY_SPAWN = "recovery.spawn"
 EVENT_SESSION_SPAWN = "session.spawn"
+EVENT_TASK_RECLAIMED = "task.reclaimed"
 
 
 @dataclass(slots=True, frozen=True)
@@ -1021,7 +1024,9 @@ __all__ = [
     "EVENT_COCKPIT_PARK_SKIPPED_EXISTING",
     "EVENT_INBOX_KIND_BACKFILLED",
     "EVENT_HEARTBEAT_MISSING",
+    "EVENT_RECOVERY_SPAWN",
     "EVENT_SESSION_SPAWN",
+    "EVENT_TASK_RECLAIMED",
     "AuditEvent",
     "central_log_path",
     "emit",

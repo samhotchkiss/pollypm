@@ -1469,13 +1469,20 @@ def test_missing_window_recovery_emits_heartbeat_missing_audit(
     assert event.metadata["session"] == "operator"
     assert event.metadata["failure_type"] == "missing_window"
     assert event.metadata["window_name"] == "pm-operator"
+    assert event.metadata["target_session"] == "operator"
+    assert event.metadata["target_task"] == ""
+    assert event.metadata["reason"] == "Expected tmux window is missing"
 
 
 def test_restart_session_emits_session_spawn_audit(
     monkeypatch,
     tmp_path: Path,
 ) -> None:
-    from pollypm.audit.log import EVENT_SESSION_SPAWN, read_events
+    from pollypm.audit.log import (
+        EVENT_RECOVERY_SPAWN,
+        EVENT_SESSION_SPAWN,
+        read_events,
+    )
 
     monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
     config = _config(tmp_path)
@@ -1508,6 +1515,56 @@ def test_restart_session_emits_session_spawn_audit(
     assert event.metadata["session"] == "operator"
     assert event.metadata["failure_type"] == "missing_window"
     assert event.metadata["account"] == "claude_controller"
+    assert event.metadata["target_session"] == "operator"
+    assert event.metadata["target_task"] == ""
+
+    recovery_events = read_events(
+        "pollypm",
+        project_path=tmp_path,
+        event=EVENT_RECOVERY_SPAWN,
+    )
+    assert len(recovery_events) == 1
+    recovery_event = recovery_events[0]
+    assert recovery_event.subject == "operator"
+    assert recovery_event.actor == "supervisor"
+    assert recovery_event.status == "ok"
+    assert recovery_event.metadata["target_session"] == "operator"
+    assert recovery_event.metadata["target_task"] == ""
+    assert recovery_event.metadata["reason"] == "recovery_restart"
+    assert recovery_event.metadata["failure_type"] == "missing_window"
+
+
+def test_supervisor_record_heartbeat_routes_through_pg_facade(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    calls: list[dict[str, object]] = []
+
+    def fake_record_heartbeat(**kwargs) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "pollypm.storage.pg_heartbeats.record_heartbeat",
+        fake_record_heartbeat,
+    )
+
+    supervisor.record_heartbeat(
+        session_name="operator",
+        tmux_window="pm-operator",
+        pane_id="%1",
+        pane_command="claude",
+        pane_dead=False,
+        log_bytes=123,
+        snapshot_path=str(tmp_path / "snapshot.txt"),
+        snapshot_hash="hash-1",
+    )
+
+    assert len(calls) == 1
+    assert calls[0]["session_name"] == "operator"
+    assert calls[0]["tmux_window"] == "pm-operator"
+    assert calls[0]["config"] is config
 
 
 def test_stalled_worker_gets_heartbeat_nudge_after_five_identical_cycles(monkeypatch, tmp_path: Path) -> None:

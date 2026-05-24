@@ -207,6 +207,21 @@ class FakeWorkService:
         task.updated_at = datetime.now(timezone.utc)
         return task
 
+    def reopen(
+        self, task_id: str, actor: str, reason: str | None = None  # noqa: ARG002
+    ) -> FakeTask:
+        task = self.get(task_id)
+        if task.work_status != WorkStatus.CANCELLED:
+            raise InvalidTransitionError(
+                f"Cannot reopen task in '{task.work_status.value}' state. "
+                "Only cancelled tasks can be reopened."
+            )
+        task.work_status = WorkStatus.QUEUED
+        task.assignee = None
+        task.current_node_id = None
+        task.updated_at = datetime.now(timezone.utc)
+        return task
+
     _UPDATE_ALLOWED = {
         "title", "description", "priority", "labels", "roles",
         "acceptance_criteria", "constraints", "relevant_files",
@@ -864,7 +879,7 @@ def test_claim_post_commit_rollback_message_reflects_queued_state(
 def test_cancel_happy_path(client, auth_headers, task_store) -> None:
     _seed(task_store, n=3, work_status=WorkStatus.IN_PROGRESS, assignee="bob")
     response = client.post(
-        "/api/v1/tasks/myproj/3/cancel",
+        "/api/v1/tasks/myproj/3/cancel?force=true",
         headers=auth_headers,
         json={"reason": "scope cut"},
     )
@@ -872,6 +887,25 @@ def test_cancel_happy_path(client, auth_headers, task_store) -> None:
     body = response.json()
     assert body["ok"] is True
     assert body["task"]["work_status"] == "cancelled"
+
+
+def test_cancel_in_progress_without_force_requires_confirmation(
+    client, auth_headers, task_store
+) -> None:
+    seeded = _seed(
+        task_store, n=52,
+        work_status=WorkStatus.IN_PROGRESS, assignee="bob",
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/52/cancel",
+        headers=auth_headers,
+        json={"reason": "scope cut"},
+    )
+    assert response.status_code == 409, response.text
+    body = response.json()
+    assert body["error"]["code"] == "confirmation_required"
+    assert "bob" in body["error"]["message"]
+    assert seeded.work_status == WorkStatus.IN_PROGRESS
 
 
 def test_cancel_without_reason(client, auth_headers, task_store) -> None:
@@ -912,6 +946,41 @@ def test_cancel_rejects_unknown_field(client, auth_headers, task_store) -> None:
     assert response.status_code == 422, response.text
     # No state change — the request was rejected by the validator.
     assert seeded.work_status == WorkStatus.IN_PROGRESS
+
+
+# ---------------------------------------------------------------------------
+# Reopen
+# ---------------------------------------------------------------------------
+
+
+def test_reopen_happy_path(client, auth_headers, task_store) -> None:
+    _seed(
+        task_store, n=53,
+        work_status=WorkStatus.CANCELLED, assignee="bob",
+        current_node_id="implement",
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/53/reopen",
+        headers=auth_headers,
+        json={"reason": "operator undo"},
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["task"]["work_status"] == "queued"
+    assert body["task"]["assignee"] is None
+    assert body["task"]["current_node_id"] is None
+
+
+def test_reopen_non_cancelled_returns_409(client, auth_headers, task_store) -> None:
+    _seed(task_store, n=54, work_status=WorkStatus.QUEUED)
+    response = client.post(
+        "/api/v1/tasks/myproj/54/reopen",
+        headers=auth_headers,
+        json={"reason": "not cancelled"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "invalid_state"
 
 
 # ---------------------------------------------------------------------------
@@ -1246,6 +1315,23 @@ def test_patch_status_to_cancelled_routes_through_cancel(
     )
     assert response.status_code == 200, response.text
     assert response.json()["task"]["work_status"] == "cancelled"
+
+
+def test_patch_status_to_cancelled_in_progress_requires_confirmation(
+    client, auth_headers, task_store
+) -> None:
+    seeded = _seed(
+        task_store, n=55,
+        work_status=WorkStatus.IN_PROGRESS, assignee="bob",
+    )
+    response = client.patch(
+        "/api/v1/tasks/myproj/55",
+        headers=auth_headers,
+        json={"status": "cancelled"},
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "confirmation_required"
+    assert seeded.work_status == WorkStatus.IN_PROGRESS
 
 
 def test_patch_status_in_progress_returns_422(
@@ -1776,6 +1862,7 @@ def test_action_result_plan_not_hydrated_for_non_plan_task(
     [
         ("POST", "/api/v1/tasks/myproj/1/claim", {"actor": "alice"}),
         ("POST", "/api/v1/tasks/myproj/1/cancel", {}),
+        ("POST", "/api/v1/tasks/myproj/1/reopen", {}),
         ("POST", "/api/v1/tasks/myproj/1/reassign", {"actor": "carol"}),
         ("PATCH", "/api/v1/tasks/myproj/1", {"labels": []}),
     ],

@@ -338,6 +338,14 @@ class TaskCancelRequest(BaseModel):
     reason: str | None = None
 
 
+class TaskReopenRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/reopen``."""
+
+    model_config = {"extra": "forbid"}
+
+    reason: str | None = None
+
+
 class TaskReassignRequest(BaseModel):
     """Body for ``POST /tasks/{project}/{n}/reassign``.
 
@@ -626,6 +634,7 @@ __all__ = [
     "TaskListWarning",
     "TaskPatchRequest",
     "TaskReassignRequest",
+    "TaskReopenRequest",
     "TaskRelationships",
     "TaskSummary",
     "Transition",

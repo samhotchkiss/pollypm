@@ -1337,6 +1337,46 @@ def test_selecting_task_surface_disables_chat_send() -> None:
     assert rendered["sendButtonDisabled"] is True
 
 
+def test_task_detail_surfaces_cancel_and_reopen_actions() -> None:
+    active = _node_render_surface_rail({
+        "tasks": [
+            {
+                "key": "myproj/8",
+                "task_id": "task-8",
+                "project": "myproj",
+                "task_number": "8",
+                "title": "Active work",
+                "work_status": "in_progress",
+                "type": "task",
+                "priority": "normal",
+                "assignee": "worker",
+                "updated_at": "2026-05-23T00:00:00Z",
+            },
+        ],
+        "selectTask": "myproj/8",
+    })
+    assert "Cancel" in active["messages"]
+
+    cancelled = _node_render_surface_rail({
+        "tasks": [
+            {
+                "key": "myproj/9",
+                "task_id": "task-9",
+                "project": "myproj",
+                "task_number": "9",
+                "title": "Cancelled work",
+                "work_status": "cancelled",
+                "type": "task",
+                "priority": "normal",
+                "assignee": "",
+                "updated_at": "2026-05-23T00:00:00Z",
+            },
+        ],
+        "selectTask": "myproj/9",
+    })
+    assert "Reopen" in cancelled["messages"]
+
+
 def test_render_dashboard_real_payload_executes() -> None:
     """Feed a representative DashboardResponse through ``renderDashboard``.
 

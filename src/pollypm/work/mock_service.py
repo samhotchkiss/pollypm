@@ -455,6 +455,34 @@ class MockWorkService:
         self._record_transition(task_id, old, WorkStatus.CANCELLED.value, actor, reason)
         return deepcopy(task)
 
+    def reopen(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        if task.work_status != WorkStatus.CANCELLED:
+            raise InvalidTransitionError(
+                f"Cannot reopen task in '{task.work_status.value}' state. "
+                "Only cancelled tasks can be reopened."
+            )
+        for exe in self._executions.get(task_id, []):
+            if exe.status == ExecutionStatus.ACTIVE:
+                exe.status = ExecutionStatus.ABANDONED
+                exe.completed_at = _now()
+        task.work_status = WorkStatus.QUEUED
+        task.assignee = None
+        task.current_node_id = None
+        task.updated_at = _now()
+        self._record_transition(
+            task_id,
+            WorkStatus.CANCELLED.value,
+            WorkStatus.QUEUED.value,
+            actor,
+            reason,
+        )
+        return deepcopy(task)
+
     def hold(self, task_id: str, actor: str, reason: str | None = None) -> Task:
         task = self._tasks.get(task_id)
         if task is None:

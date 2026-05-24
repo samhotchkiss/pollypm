@@ -20,6 +20,14 @@ from pollypm.errors import (
     format_task_not_found_error,
     render_cli_error,
 )
+from pollypm.audit.log import (
+    EVENT_TASK_CANCEL_CONFIRMED,
+    EVENT_TASK_CANCEL_WARNED,
+)
+from pollypm.work.cancel_safety import (
+    emit_cancel_safety_event,
+    in_progress_assignee,
+)
 from pollypm.work.db_resolver import resolve_work_db_path as _resolve_db_path
 from pollypm.work.models import ArtifactKind, OutputType
 from pollypm.work.readiness import format_readiness_warnings, readiness_warnings
@@ -1149,6 +1157,7 @@ def task_cancel(
     task_id: str = typer.Argument(..., help="Task ID (project/number)"),
     reason: str = typer.Option(..., "--reason", help="Cancellation reason (required)"),
     actor: str = typer.Option("cli", "--actor", help="Actor cancelling"),
+    force: bool = typer.Option(False, "--force", "-f", help="Skip active-worker confirmation."),
     output_json: bool = _JSON_OPTION,
 ) -> None:
     """Cancel a task."""
@@ -1163,11 +1172,56 @@ def task_cancel(
         )
         raise typer.Exit(code=1)
     svc = _svc(project=_project_from_task_id(task_id))
+    before = _run(svc.get, task_id)
+    active_assignee = in_progress_assignee(before)
+    if active_assignee and not force:
+        emit_cancel_safety_event(
+            before,
+            event=EVENT_TASK_CANCEL_WARNED,
+            actor=actor,
+            assignee=active_assignee,
+            project_path=getattr(svc, "_project_path", None),
+            surface="cli",
+            force=False,
+        )
+        if not typer.confirm(
+            f"Worker {active_assignee} currently working this task. "
+            "Cancel anyway?",
+            default=False,
+        ):
+            typer.echo("Aborted; task was not cancelled.", err=True)
+            raise typer.Exit(code=1)
     task = _run(svc.cancel, task_id, actor, reason)
+    if active_assignee:
+        emit_cancel_safety_event(
+            before,
+            event=EVENT_TASK_CANCEL_CONFIRMED,
+            actor=actor,
+            assignee=active_assignee,
+            project_path=getattr(svc, "_project_path", None),
+            surface="cli",
+            force=force,
+        )
     if output_json:
         typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
     else:
         typer.echo(f"Cancelled {task.task_id}")
+
+
+@task_app.command("reopen")
+def task_reopen(
+    task_id: str = typer.Argument(..., help="Task ID (project/number)"),
+    actor: str = typer.Option("cli", "--actor", help="Actor reopening"),
+    reason: str | None = typer.Option(None, "--reason", help="Why the task is being reopened"),
+    output_json: bool = _JSON_OPTION,
+) -> None:
+    """Reopen a cancelled task back to queued."""
+    svc = _svc(project=_project_from_task_id(task_id))
+    task = _run(svc.reopen, task_id, actor, reason)
+    if output_json:
+        typer.echo(json.dumps(_task_to_dict(task), indent=2, default=str))
+    else:
+        typer.echo(f"Reopened {task.task_id}")
 
 
 @task_app.command("hold")

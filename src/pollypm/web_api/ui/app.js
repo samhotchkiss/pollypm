@@ -487,7 +487,81 @@
         text: data.acceptance_criteria,
       }));
     }
+    const actions = [];
+    if (data.work_status === "cancelled") {
+      const reopen = el("button", {
+        class: "task-action-button",
+        type: "button",
+        text: "Reopen",
+      });
+      reopen.addEventListener("click", () => reopenTaskFromDetail(data));
+      actions.push(reopen);
+    } else if (data.work_status && data.work_status !== "done") {
+      const cancel = el("button", {
+        class: "task-action-button danger",
+        type: "button",
+        text: "Cancel",
+      });
+      cancel.addEventListener("click", () => cancelTaskFromDetail(data));
+      actions.push(cancel);
+    }
+    if (actions.length > 0) {
+      children.push(el("div", { class: "task-detail-actions" }, actions));
+    }
     list.appendChild(el("div", { class: "task-detail" }, children));
+  }
+
+  async function cancelTaskFromDetail(task) {
+    if (!task.project || !task.task_number) return;
+    let force = false;
+    if (task.work_status === "in_progress") {
+      const assignee = task.assignee || "worker";
+      if (!window.confirm(
+        "Worker " + assignee + " currently working this task. Cancel anyway?",
+      )) {
+        return;
+      }
+      force = true;
+    }
+    const path = API + "/tasks/" + encodeURIComponent(task.project)
+      + "/" + encodeURIComponent(task.task_number)
+      + "/cancel" + (force ? "?force=true" : "");
+    try {
+      const result = await apiJson(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "cancelled from web UI" }),
+      });
+      renderTaskSummary(result.task || task);
+      loadSurfaces();
+    } catch (err) {
+      const list = $("message-list");
+      list.appendChild(el("div", {
+        class: "error-banner",
+        text: "cancel error: " + err.message,
+      }));
+    }
+  }
+
+  async function reopenTaskFromDetail(task) {
+    if (!task.project || !task.task_number) return;
+    const path = API + "/tasks/" + encodeURIComponent(task.project)
+      + "/" + encodeURIComponent(task.task_number) + "/reopen";
+    try {
+      const result = await apiJson(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ reason: "reopened from web UI" }),
+      });
+      renderTaskSummary(result.task || task);
+      loadSurfaces();
+    } catch (err) {
+      const list = $("message-list");
+      list.appendChild(el("div", {
+        class: "error-banner",
+        text: "reopen error: " + err.message,
+      }));
+    }
   }
 
   async function loadTaskDetail(task) {

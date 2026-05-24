@@ -1163,6 +1163,73 @@ class PgWorkService:
             )
         return result
 
+    def reopen(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        """Move a cancelled task back to queued for a fresh claim."""
+        task = self.get(task_id)
+        if task.work_status != WorkStatus.CANCELLED:
+            raise InvalidTransitionError(
+                f"Cannot reopen task in '{task.work_status.value}' state. "
+                "Only cancelled tasks can be reopened."
+            )
+
+        project, task_number = _parse_task_id(task_id)
+        now = _now_iso()
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "UPDATE work_node_executions SET status = %s, "
+                    "completed_at = %s "
+                    "WHERE task_project = %s AND task_number = %s "
+                    "AND status = %s",
+                    (
+                        ExecutionStatus.ABANDONED.value,
+                        now,
+                        project,
+                        task_number,
+                        ExecutionStatus.ACTIVE.value,
+                    ),
+                )
+                cur.execute(
+                    "UPDATE work_tasks SET work_status = %s, "
+                    "assignee = NULL, current_node_id = NULL, "
+                    "updated_at = %s "
+                    "WHERE project = %s AND task_number = %s",
+                    (WorkStatus.QUEUED.value, now, project, task_number),
+                )
+                cur.execute(
+                    "INSERT INTO work_transitions ("
+                    "task_project, task_number, from_state, to_state, "
+                    "actor, reason, created_at"
+                    ") VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        project,
+                        task_number,
+                        WorkStatus.CANCELLED.value,
+                        WorkStatus.QUEUED.value,
+                        actor,
+                        reason,
+                        now,
+                    ),
+                )
+            conn.commit()
+
+        self._emit_status_changed_audit(
+            project=project,
+            task_number=task_number,
+            from_state=WorkStatus.CANCELLED.value,
+            to_state=WorkStatus.QUEUED.value,
+            actor=actor,
+            reason=reason,
+        )
+        result = self.get(task_id)
+        self._sync_transition(
+            result, WorkStatus.CANCELLED.value, WorkStatus.QUEUED.value
+        )
+        return result
+
     def mark_done(self, task_id: str, actor: str) -> Task:
         """Force a task to ``done`` without running the flow.
 

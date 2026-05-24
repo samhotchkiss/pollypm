@@ -56,6 +56,14 @@ from pollypm.web_api.models import (
     WorkOutput as APIWorkOutput,
     Artifact as APIArtifact,
 )
+from pollypm.audit.log import (
+    EVENT_TASK_CANCEL_CONFIRMED,
+    EVENT_TASK_CANCEL_WARNED,
+)
+from pollypm.work.cancel_safety import (
+    emit_cancel_safety_event,
+    in_progress_assignee,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1504,6 +1512,7 @@ def cancel_task(
     *,
     actor: str = "api",
     reason: str | None = None,
+    force: bool = False,
 ) -> APITaskDetail:
     """Cancel a non-terminal task via the work-service.
 
@@ -1530,6 +1539,32 @@ def cancel_task(
             config=config, project_key=project_key, project_path=project.path
         ) as svc:
             try:
+                before = svc.get(task_id)
+                active_assignee = in_progress_assignee(before)
+                if active_assignee and not force:
+                    emit_cancel_safety_event(
+                        before,
+                        event=EVENT_TASK_CANCEL_WARNED,
+                        actor=actor,
+                        assignee=active_assignee,
+                        project_path=project.path,
+                        surface="api",
+                        force=False,
+                    )
+                    raise APIError(
+                        status_code=409,
+                        code="confirmation_required",
+                        message=(
+                            f"Worker {active_assignee} is currently "
+                            f"working task {task_id}."
+                        ),
+                        hint=(
+                            "Re-issue the cancel request with "
+                            "`?force=true` once the operator has "
+                            "confirmed the active worker should be "
+                            "interrupted."
+                        ),
+                    )
                 svc.cancel(task_id, actor, cancel_reason)
             except TaskNotFoundError as exc:
                 raise not_found(f"Task not found: {task_id}") from exc
@@ -1543,6 +1578,16 @@ def cancel_task(
                     hint="Tasks in terminal state (done/cancelled) cannot be cancelled again.",
                 ) from exc
             task = svc.get(task_id)
+            if active_assignee:
+                emit_cancel_safety_event(
+                    before,
+                    event=EVENT_TASK_CANCEL_CONFIRMED,
+                    actor=actor,
+                    assignee=active_assignee,
+                    project_path=project.path,
+                    surface="api",
+                    force=force,
+                )
             return _task_to_detail_with_plan(task, svc=svc)
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
@@ -1553,6 +1598,57 @@ def cancel_task(
         )
         raise service_unavailable(
             f"Backing store unavailable while cancelling {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def reopen_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str = "api",
+    reason: str | None = None,
+) -> APITaskDetail:
+    """Reopen a cancelled task back to queued via the work-service."""
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    reopen_reason = reason or "reopened via API"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                svc.reopen(task_id, actor, reopen_reason)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc) or f"Task {task_id} cannot be reopened.",
+                    hint="Only cancelled tasks can be reopened.",
+                ) from exc
+            task = svc.get(task_id)
+            return _task_to_detail_with_plan(task, svc=svc)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "reopen_task: backing store error for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while reopening {task_id}",
             hint="Retry shortly; check `pm doctor` if the failure persists.",
         ) from exc
 
@@ -1780,6 +1876,31 @@ def patch_task(
                     if method_name == "queue":
                         svc.queue(task_id, actor)
                     elif method_name == "cancel":
+                        before = svc.get(task_id)
+                        active_assignee = in_progress_assignee(before)
+                        if active_assignee:
+                            emit_cancel_safety_event(
+                                before,
+                                event=EVENT_TASK_CANCEL_WARNED,
+                                actor=actor,
+                                assignee=active_assignee,
+                                project_path=project.path,
+                                surface="api",
+                                force=False,
+                            )
+                            raise APIError(
+                                status_code=409,
+                                code="confirmation_required",
+                                message=(
+                                    f"Worker {active_assignee} is currently "
+                                    f"working task {task_id}."
+                                ),
+                                hint=(
+                                    "Use POST /tasks/{project}/{n}/cancel"
+                                    "?force=true after confirming the "
+                                    "active worker should be interrupted."
+                                ),
+                            )
                         svc.cancel(task_id, actor, "patched via API")
                 except TaskNotFoundError as exc:
                     raise not_found(f"Task not found: {task_id}") from exc
@@ -3107,6 +3228,7 @@ __all__ = [
     "promote_inbox_to_task",
     "queue_task",
     "reassign_task",
+    "reopen_task",
     "reply_inbox_item",
     "set_project_tracked",
     "snooze_inbox_item",

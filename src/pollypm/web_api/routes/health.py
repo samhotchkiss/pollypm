@@ -8,6 +8,7 @@ this one.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from functools import cache
 
 from fastapi import APIRouter, Request
 
@@ -17,6 +18,7 @@ from pollypm.web_api.models import HealthResponse
 router = APIRouter(tags=["Health"])
 
 
+@cache
 def _server_version() -> str:
     """Best-effort PollyPM package version.
 
@@ -44,7 +46,7 @@ _STARTED_AT = datetime.now(timezone.utc)
     summary="Liveness + version info",
     operation_id="getHealth",
 )
-def get_health(request: Request) -> HealthResponse:
+async def get_health(request: Request) -> HealthResponse:
     tailnet_trust_enabled = bool(
         getattr(request.app.state, "tailnet_trust_enabled", False)
     )

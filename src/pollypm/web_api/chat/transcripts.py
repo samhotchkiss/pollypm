@@ -106,6 +106,7 @@ class _SessionIndexEntry:
     path: Path
     session_id: str
     cwd: str
+    cwd_normalized: str
     account_name: str
     provider: str
     mtime: float
@@ -133,6 +134,7 @@ def build_session_index(transcripts_root: Path) -> list[_SessionIndexEntry]:
         return list(cached[1])
 
     entries: list[_SessionIndexEntry] = []
+    cwd_normalize_cache: dict[str, str] = {}
     for child_name, mtime, _size in signature:
         events_path = transcripts_root / child_name / "events.jsonl"
         fingerprint = _read_first_event_fingerprint(events_path)
@@ -141,6 +143,10 @@ def build_session_index(transcripts_root: Path) -> list[_SessionIndexEntry]:
             # unidentifiable transcript to the wrong surface.
             continue
         session_id, cwd, account_name, provider = fingerprint
+        cwd_normalized = cwd_normalize_cache.get(cwd)
+        if cwd_normalized is None:
+            cwd_normalized = _normalize_cwd(cwd)
+            cwd_normalize_cache[cwd] = cwd_normalized
         # Prefer the directory name as the canonical session_id (the
         # ingestor names dirs by session_id), but fall back to the event's
         # session_id if the dir name diverges.
@@ -148,6 +154,7 @@ def build_session_index(transcripts_root: Path) -> list[_SessionIndexEntry]:
             path=events_path,
             session_id=child_name or session_id,
             cwd=cwd,
+            cwd_normalized=cwd_normalized,
             account_name=account_name,
             provider=provider,
             mtime=mtime,
@@ -182,6 +189,15 @@ def _session_index_signature(
     return tuple(entries)
 
 
+def _normalize_cwd(cwd: str | None) -> str:
+    if not cwd:
+        return ""
+    try:
+        return str(Path(cwd).resolve())
+    except (OSError, RuntimeError):
+        return str(cwd)
+
+
 def lookup_transcript_path(
     index: list[_SessionIndexEntry],
     *,
@@ -207,29 +223,19 @@ def lookup_transcript_path(
     """
     if not index or not cwd:
         return None
-    try:
-        normalized = str(Path(cwd).resolve())
-    except (OSError, RuntimeError):
-        normalized = str(cwd)
-    matches: list[_SessionIndexEntry] = []
+    normalized = _normalize_cwd(cwd)
+    best: _SessionIndexEntry | None = None
     for entry in index:
-        if not entry.cwd:
-            continue
-        try:
-            entry_cwd = str(Path(entry.cwd).resolve())
-        except (OSError, RuntimeError):
-            entry_cwd = entry.cwd
+        entry_cwd = entry.cwd_normalized or _normalize_cwd(entry.cwd)
         if entry_cwd != normalized:
             continue
         if account_name and entry.account_name and entry.account_name != account_name:
             continue
         if provider and entry.provider and entry.provider != provider:
             continue
-        matches.append(entry)
-    if not matches:
-        return None
-    matches.sort(key=lambda item: item.mtime, reverse=True)
-    return matches[0].path
+        if best is None or entry.mtime > best.mtime:
+            best = entry
+    return best.path if best is not None else None
 
 
 def resolve_transcript_path(

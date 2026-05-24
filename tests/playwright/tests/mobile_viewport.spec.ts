@@ -40,4 +40,60 @@ test.describe("mobile viewport", () => {
     });
     expect(overflow, "horizontal overflow in CSS pixels").toBeLessThanOrEqual(1);
   });
+
+  test("surface list renders at 360px before optional task rail request completes", async ({ page }) => {
+    await page.setViewportSize({ width: 360, height: 800 });
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          rollups: {},
+          daemon_status: "up",
+          active_sessions: [],
+          recent_messages: [],
+          projects: [],
+          generated_at: "2026-05-23T00:00:00Z",
+          scoped_fields: [],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          sessions: [
+            {
+              session_name: "mobile-operator",
+              surface_type: "operator",
+              persona: "polly",
+              project: "demo",
+              window: { present: true, pane_dead: false },
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/events**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "text/event-stream",
+        body: "",
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, async (route) => {
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      });
+    });
+
+    await page.goto("/ui/", { waitUntil: "domcontentloaded" });
+    await expect(page.locator("li[data-session='mobile-operator']")).toBeVisible();
+    const railBox = await page.locator("#surface-rail").boundingBox();
+    expect(railBox?.width ?? 0).toBeGreaterThan(0);
+  });
 });

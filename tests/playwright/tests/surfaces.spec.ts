@@ -627,9 +627,11 @@ test.describe("surfaces", () => {
     await waitForSurfaceRailTerminal(page);
   });
 
-  test("initial center-pane state shows 'Select a surface'", async ({ page }) => {
+  test("initial center-pane state shows inline next actions", async ({ page }) => {
     await page.goto("/ui/");
-    await expect(page.locator("#pane-title")).toHaveText("Select a surface");
+    await expect(page.locator("#pane-title")).toHaveText("Ready");
+    await expect(page.locator(".empty-title")).toHaveText("No surface selected");
+    await expect(page.locator(".empty-action.primary")).toHaveText("Open inbox");
     await expect(page.locator("#send-input")).toBeDisabled();
     await expect(page.locator("#send-button")).toBeDisabled();
   });
@@ -697,6 +699,101 @@ test.describe("surfaces", () => {
     await expect(page.locator("#message-list")).toContainText(
       "Visible task detail",
     );
+  });
+
+  test("queued task detail Start posts to claim endpoint as worker", async ({ page }) => {
+    let claimActor = "";
+    await stubEmptyProjects(page);
+    await stubEmptyActivity(page);
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      }),
+    );
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(0)),
+      }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              task_id: "task-queued",
+              project: "demo",
+              task_number: 4,
+              title: "Queued rail item",
+              work_status: "queued",
+              type: "task",
+              priority: "normal",
+              assignee: "",
+              updated_at: "2026-05-23T00:00:00Z",
+            },
+          ],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/tasks/demo/4", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          task_id: "task-queued",
+          project: "demo",
+          task_number: 4,
+          title: "Queued rail item",
+          work_status: "queued",
+          type: "task",
+          priority: "normal",
+          assignee: "",
+          updated_at: "2026-05-23T00:00:00Z",
+          description: "Visible task detail",
+          relationships: {},
+          transitions: [],
+          executions: [],
+        }),
+      }),
+    );
+    await page.route("**/api/v1/tasks/demo/4/claim", async (route) => {
+      claimActor = (await route.request().postDataJSON()).actor;
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          ok: true,
+          message: "claimed demo/4",
+          warnings: [],
+          task: {
+            task_id: "task-queued",
+            project: "demo",
+            task_number: 4,
+            title: "Queued rail item",
+            work_status: "in_progress",
+            type: "task",
+            priority: "normal",
+            assignee: "worker",
+            updated_at: "2026-05-23T00:01:00Z",
+            description: "Visible task detail",
+            relationships: {},
+            transitions: [],
+            executions: [],
+          },
+        }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await page.locator("li[data-task='demo/4']").click();
+    await page.locator(".task-action-button.primary", { hasText: "Start" }).click();
+    await expect.poll(() => claimActor).toBe("worker");
+    await expect(page.locator("#message-list")).toContainText("in_progress");
   });
 
   test("project switcher filters surfaces and shows urgency", async ({ page }) => {

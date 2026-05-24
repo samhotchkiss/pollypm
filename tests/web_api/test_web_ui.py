@@ -994,6 +994,40 @@ def test_ui_app_js_has_surface_audit_panel_hooks(client: TestClient) -> None:
         assert expected in body
 
 
+def test_ui_app_js_has_inbox_panel_hooks(client: TestClient) -> None:
+    """The web UI exposes the API-backed inbox panel and write actions."""
+    body = client.get("/ui/app.js").text
+    for expected in (
+        "selectInbox",
+        "/inbox?",
+        "/mark-read",
+        "/archive",
+        "/snooze",
+        "/reply",
+        "Load more",
+        "Type filtering is unavailable",
+        "Plan approve/reject API is not available",
+    ):
+        assert expected in body
+
+
+def test_ui_app_js_claims_queued_tasks_as_worker(client: TestClient) -> None:
+    """Task detail Start uses the existing claim endpoint with CLI parity."""
+    body = client.get("/ui/app.js").text
+    assert 'CLAIM_ACTOR = "worker"' in body
+    assert ' + "/claim"' in body
+    assert "JSON.stringify({ actor: CLAIM_ACTOR })" in body
+
+
+def test_ui_empty_state_points_to_inbox_without_modal(client: TestClient) -> None:
+    """First-run/no-selection state is an inline action surface."""
+    body = client.get("/ui/app.js").text
+    assert "renderNoSelection" in body
+    assert "No surface selected" in body
+    assert "Open inbox" in body
+    assert "Refresh" in body
+
+
 # -------- Round-5: executable renderDashboard coverage ------------------
 #
 # Codex round-5 blocker: the prior three tests (static greps over
@@ -1338,6 +1372,25 @@ def test_selecting_task_surface_disables_chat_send() -> None:
 
 
 def test_task_detail_surfaces_cancel_and_reopen_actions() -> None:
+    queued = _node_render_surface_rail({
+        "tasks": [
+            {
+                "key": "myproj/10",
+                "task_id": "task-10",
+                "project": "myproj",
+                "task_number": "10",
+                "title": "Queued work",
+                "work_status": "queued",
+                "type": "task",
+                "priority": "normal",
+                "assignee": "",
+                "updated_at": "2026-05-23T00:00:00Z",
+            },
+        ],
+        "selectTask": "myproj/10",
+    })
+    assert "Start" in queued["messages"]
+
     active = _node_render_surface_rail({
         "tasks": [
             {
@@ -1445,6 +1498,8 @@ def test_render_dashboard_real_payload_executes() -> None:
     assert ">up<" in rendered, "daemon status 'up' missing"
     assert ">4<" in rendered, "active_sessions count (len=4) missing"
     assert ">5<" in rendered, "tracked_count value 5 missing"
+    assert 'role="button"' in rendered
+    assert 'title="Open inbox"' in rendered
 
     # Color-coding contract: daemon=up → rollup-working; alert_count>0
     # → rollup-blocked. Pin these too so a future restyle that drops

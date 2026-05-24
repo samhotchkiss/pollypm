@@ -28,6 +28,9 @@
   const AUDIT_LIMIT = 25;
   const ACTIVITY_LIMIT = 40;
   const ACTIVITY_DEFAULT_SINCE = "2d";
+  const INBOX_PAGE_LIMIT = 25;
+  const OPERATOR_ACTOR = "operator";
+  const CLAIM_ACTOR = "worker";
 
   const state = {
     projects: [],
@@ -37,7 +40,10 @@
     projectSort: "urgency",
     surfaces: [],
     taskSurfaces: [],
+    surfaceLoadError: null,
     taskLoadError: null,
+    surfaceLoading: false,
+    taskLoading: false,
     selectedKind: null,
     selectedSurface: null,
     selectedTaskKey: null,
@@ -69,6 +75,26 @@
     activityInFlight: false,
     activityRefreshQueued: false,
     pendingMessages: {},
+    inbox: {
+      items: [],
+      nextCursor: null,
+      loading: false,
+      loadingMore: false,
+      error: null,
+      warning: null,
+      reloadQueued: false,
+      filters: {
+        project: "",
+        state: "",
+        type: "",
+      },
+      selectedId: null,
+      detail: null,
+      detailLoading: false,
+      detailError: null,
+      actionInFlight: {},
+      replyDraft: "",
+    },
   };
 
   // ----- DOM helpers ------------------------------------------------------
@@ -205,7 +231,9 @@
       const detail = body && body.error
         ? body.error.message || body.error.code
         : ("HTTP " + resp.status);
-      throw new Error(detail);
+      const err = new Error(detail);
+      err.status = resp.status;
+      throw err;
     }
     setStatus("ok", "online");
     return resp;
@@ -232,7 +260,9 @@
       const detail = body && body.error
         ? body.error.message || body.error.code
         : ("HTTP " + resp.status);
-      throw new Error(detail);
+      const err = new Error(detail);
+      err.status = resp.status;
+      throw err;
     }
     return resp.json();
   }
@@ -257,6 +287,9 @@
       return;
     }
     state.surfacesInFlight = true;
+    state.surfaceLoading = true;
+    state.taskLoading = true;
+    renderSurfaces();
     try {
       const [sessionsResult, tasksResult, projectsResult] =
         await Promise.allSettled([
@@ -266,19 +299,21 @@
         ]);
 
       if (sessionsResult.status === "rejected") {
+        state.surfaces = [];
         state.taskSurfaces = [];
         state.projects = [];
         state.projectLoadError = null;
         state.taskLoadError = null;
-        renderProjects();
         const err = sessionsResult.reason instanceof Error
           ? sessionsResult.reason
           : new Error(String(sessionsResult.reason));
-        renderSurfaceError(err);
+        state.surfaceLoadError = err;
+        renderProjects();
         return;
       }
       const data = sessionsResult.value;
       state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
+      state.surfaceLoadError = null;
 
       if (tasksResult.status === "fulfilled") {
         state.taskLoadError = null;
@@ -307,9 +342,11 @@
       }
       renderProjects();
       ensureSelectionVisible();
-      renderSurfaces();
     } finally {
+      state.surfaceLoading = false;
+      state.taskLoading = false;
       state.surfacesInFlight = false;
+      renderSurfaces();
       if (state.surfacesRefreshQueued) {
         state.surfacesRefreshQueued = false;
         loadSurfaces();
@@ -655,15 +692,29 @@
     const hasRegistered = (
       state.surfaces.length > 0
       || state.taskSurfaces.length > 0
+      || state.surfaceLoadError
       || state.taskLoadError
     );
+    const isLoading = state.surfaceLoading || state.taskLoading;
+    if (!hasRegistered && isLoading) {
+      list.appendChild(
+        el("li", { class: "surface-empty", text: "loading surfaces..." }),
+      );
+      return;
+    }
     if (!hasRegistered) {
       list.appendChild(
         el("li", { class: "surface-empty", text: "no surfaces registered" }),
       );
       return;
     }
-    if (surfaces.length === 0 && taskSurfaces.length === 0 && !state.taskLoadError) {
+    if (
+      filter
+      && surfaces.length === 0
+      && taskSurfaces.length === 0
+      && !state.surfaceLoadError
+      && !state.taskLoadError
+    ) {
       list.appendChild(
         el("li", { class: "surface-empty", text: "no matching surfaces" }),
       );
@@ -672,6 +723,18 @@
     if (surfaces.length > 0) {
       appendRailGroup(list, "Chat surfaces");
       for (const s of surfaces) renderChatSurfaceItem(list, s);
+    } else if (state.surfaceLoadError) {
+      appendRailGroup(list, "Chat surfaces");
+      list.appendChild(el("li", {
+        class: "surface-empty",
+        text: "error: chat unavailable: " + state.surfaceLoadError.message,
+      }));
+    } else if (state.surfaceLoading) {
+      appendRailGroup(list, "Chat surfaces");
+      list.appendChild(el("li", {
+        class: "surface-empty",
+        text: "loading chat surfaces...",
+      }));
     }
     if (taskSurfaces.length > 0 || state.taskLoadError) {
       appendRailGroup(list, "Tasks");
@@ -687,9 +750,15 @@
       if (state.taskLoadError) {
         list.appendChild(el("li", {
           class: "surface-empty",
-          text: "tasks unavailable: " + state.taskLoadError.message,
+          text: "error: tasks unavailable: " + state.taskLoadError.message,
         }));
       }
+    } else if (state.taskLoading) {
+      appendRailGroup(list, "Tasks");
+      list.appendChild(el("li", {
+        class: "surface-empty",
+        text: "loading tasks...",
+      }));
     }
   }
 
@@ -744,6 +813,7 @@
     state.selectedKind = "chat";
     state.selectedSurface = name;
     state.selectedTaskKey = null;
+    state.inbox.selectedId = null;
     $("pane-title").textContent = name;
     $("pane-meta").textContent = "";
     $("send-input").disabled = false;
@@ -754,12 +824,51 @@
     if (state.auditExpanded[name]) loadAuditForSurface(name);
   }
 
+  function renderNoSelection() {
+    state.selectedKind = null;
+    state.selectedSurface = null;
+    state.selectedTaskKey = null;
+    state.inbox.selectedId = null;
+    $("pane-title").textContent = "Ready";
+    $("pane-meta").textContent = "";
+    $("send-input").disabled = true;
+    $("send-button").disabled = true;
+    updateStopAgentButton();
+    const openInbox = el("button", {
+      class: "empty-action primary",
+      type: "button",
+      text: "Open inbox",
+    });
+    openInbox.addEventListener("click", () => selectInbox());
+    const refresh = el("button", {
+      class: "empty-action",
+      type: "button",
+      text: "Refresh",
+    });
+    refresh.addEventListener("click", () => {
+      loadSurfaces();
+      pollDashboard();
+    });
+    const list = $("message-list");
+    list.innerHTML = "";
+    list.appendChild(el("div", { class: "empty-state" }, [
+      el("div", { class: "empty-title", text: "No surface selected" }),
+      el("div", {
+        class: "empty-copy",
+        text: "Choose a chat or task from the rail, or review items waiting in the inbox.",
+      }),
+      el("div", { class: "empty-actions" }, [openInbox, refresh]),
+    ]));
+    renderSurfaces();
+  }
+
   function selectTask(key) {
     const task = state.taskSurfaces.find((item) => item.key === key);
     if (!task) return;
     state.selectedKind = "task";
     state.selectedSurface = null;
     state.selectedTaskKey = key;
+    state.inbox.selectedId = null;
     $("pane-title").textContent = task.key;
     $("pane-meta").textContent = [
       task.work_status,
@@ -808,6 +917,15 @@
       }));
     }
     const actions = [];
+    if (data.work_status === "queued" || data.work_status === "rework") {
+      const claim = el("button", {
+        class: "task-action-button primary",
+        type: "button",
+        text: data.work_status === "rework" ? "Resume" : "Start",
+      });
+      claim.addEventListener("click", () => claimTaskFromDetail(data));
+      actions.push(claim);
+    }
     if (data.work_status === "cancelled") {
       const reopen = el("button", {
         class: "task-action-button",
@@ -829,6 +947,32 @@
       children.push(el("div", { class: "task-detail-actions" }, actions));
     }
     list.appendChild(el("div", { class: "task-detail" }, children));
+  }
+
+  async function claimTaskFromDetail(task) {
+    if (!task.project || !task.task_number) return;
+    const path = API + "/tasks/" + encodeURIComponent(task.project)
+      + "/" + encodeURIComponent(task.task_number) + "/claim";
+    try {
+      const result = await apiJson(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ actor: CLAIM_ACTOR }),
+      });
+      renderTaskSummary(result.task || task);
+      if (Array.isArray(result.warnings)) {
+        for (const warning of result.warnings) {
+          if (warning) showToast("error", warning);
+        }
+      }
+      loadSurfaces();
+    } catch (err) {
+      const list = $("message-list");
+      list.appendChild(el("div", {
+        class: "error-banner",
+        text: "start error: " + err.message,
+      }));
+    }
   }
 
   async function cancelTaskFromDetail(task) {
@@ -1260,6 +1404,497 @@
     showToast("ok", "sent interrupt to " + name);
   }
 
+  // ----- inbox ------------------------------------------------------------
+
+  function encodePathId(id) {
+    return String(id || "")
+      .split("/")
+      .map((part) => encodeURIComponent(part))
+      .join("/");
+  }
+
+  function inboxListPath(cursor, omitType) {
+    const params = new URLSearchParams();
+    const filters = state.inbox.filters;
+    params.set("limit", String(INBOX_PAGE_LIMIT));
+    if (cursor) params.set("cursor", cursor);
+    if (filters.project.trim()) params.set("project", filters.project.trim());
+    if (filters.state) params.set("state", filters.state);
+    if (filters.type && !omitType) params.set("type", filters.type);
+    return API + "/inbox?" + params.toString();
+  }
+
+  function selectInbox(filterPatch) {
+    state.selectedKind = "inbox";
+    state.selectedSurface = null;
+    state.selectedTaskKey = null;
+    if (filterPatch) {
+      state.inbox.filters = Object.assign(
+        {},
+        state.inbox.filters,
+        filterPatch,
+      );
+    }
+    $("pane-title").textContent = "Inbox";
+    $("pane-meta").textContent = "";
+    $("send-input").disabled = true;
+    $("send-button").disabled = true;
+    updateStopAgentButton();
+    renderSurfaces();
+    renderInboxView();
+    loadInbox(true);
+  }
+
+  async function loadInbox(reset, omitType, preserveSelection) {
+    if (state.inbox.loading || state.inbox.loadingMore) {
+      state.inbox.reloadQueued = true;
+      return;
+    }
+    const cursor = reset ? null : state.inbox.nextCursor;
+    if (!reset && !cursor) return;
+    const selectedId = preserveSelection ? state.inbox.selectedId : null;
+    if (reset) {
+      state.inbox.loading = true;
+      state.inbox.items = [];
+      state.inbox.nextCursor = null;
+      if (!preserveSelection) {
+        state.inbox.selectedId = null;
+        state.inbox.detail = null;
+        state.inbox.detailError = null;
+      }
+    } else {
+      state.inbox.loadingMore = true;
+    }
+    state.inbox.error = null;
+    state.inbox.warning = null;
+    renderInboxView();
+    try {
+      const data = await apiJson(inboxListPath(cursor, Boolean(omitType)));
+      const items = Array.isArray(data.items) ? data.items : [];
+      state.inbox.items = reset ? items : state.inbox.items.concat(items);
+      state.inbox.nextCursor = data.next_cursor || null;
+      if (selectedId) state.inbox.selectedId = selectedId;
+      if (omitType && state.inbox.filters.type) {
+        state.inbox.warning = "Type filtering is unavailable on this API; showing matching state/project items.";
+      }
+    } catch (err) {
+      if (
+        !omitType
+        && state.inbox.filters.type
+        && (err.status === 400 || err.status === 404 || err.status === 422)
+      ) {
+        state.inbox.loading = false;
+        state.inbox.loadingMore = false;
+        await loadInbox(reset, true, preserveSelection);
+        return;
+      }
+      state.inbox.error = err;
+    } finally {
+      state.inbox.loading = false;
+      state.inbox.loadingMore = false;
+      const reloadQueued = state.inbox.reloadQueued;
+      state.inbox.reloadQueued = false;
+      if (state.selectedKind === "inbox") renderInboxView();
+      if (reloadQueued && state.selectedKind === "inbox") {
+        loadInbox(true, false, preserveSelection);
+      }
+    }
+  }
+
+  function inboxMeta(item) {
+    return [
+      item.project,
+      item.type,
+      item.state,
+      item.owner ? "@" + item.owner : "",
+      item.updated_at,
+    ].filter(Boolean).join(" · ");
+  }
+
+  function setInboxAction(key, active) {
+    if (active) state.inbox.actionInFlight[key] = true;
+    else delete state.inbox.actionInFlight[key];
+    renderInboxView();
+  }
+
+  function inboxActionButton(item, action, label, handler, extraClass) {
+    const key = item.id + ":" + action;
+    const btn = el("button", {
+      class: ("inbox-action " + (extraClass || "")).trim(),
+      type: "button",
+      text: label,
+    });
+    btn.disabled = Boolean(state.inbox.actionInFlight[key]);
+    btn.addEventListener("click", (ev) => {
+      ev.stopPropagation();
+      handler(item);
+    });
+    return btn;
+  }
+
+  function disabledPlanReviewButton(label) {
+    const btn = el("button", {
+      class: "inbox-action disabled",
+      type: "button",
+      text: label,
+      title: "Plan approve/reject API is not available in this branch.",
+    });
+    btn.disabled = true;
+    return btn;
+  }
+
+  function renderInboxFilters() {
+    const project = el("input", {
+      class: "inbox-filter-input",
+      type: "text",
+      placeholder: "Project",
+      "aria-label": "Filter inbox by project",
+      value: state.inbox.filters.project,
+    });
+    const stateSelect = el("select", {
+      class: "inbox-filter-select",
+      "aria-label": "Filter inbox by state",
+    });
+    const states = [
+      ["", "All states"],
+      ["open", "Open"],
+      ["threaded", "Threaded"],
+      ["waiting-on-pa", "Waiting on PA"],
+      ["waiting-on-pm", "Waiting on PM"],
+      ["resolved", "Resolved"],
+      ["closed", "Closed"],
+    ];
+    for (const pair of states) {
+      const option = el("option", { value: pair[0], text: pair[1] });
+      if (pair[0] === state.inbox.filters.state) option.selected = true;
+      stateSelect.appendChild(option);
+    }
+    const typeSelect = el("select", {
+      class: "inbox-filter-select",
+      "aria-label": "Filter inbox by type",
+    });
+    const types = [
+      ["", "All types"],
+      ["message", "Messages"],
+      ["plan_review", "Plan reviews"],
+    ];
+    for (const pair of types) {
+      const option = el("option", { value: pair[0], text: pair[1] });
+      if (pair[0] === state.inbox.filters.type) option.selected = true;
+      typeSelect.appendChild(option);
+    }
+    project.addEventListener("input", () => {
+      state.inbox.filters.project = project.value || "";
+    });
+    stateSelect.addEventListener("change", () => {
+      state.inbox.filters.state = stateSelect.value || "";
+    });
+    typeSelect.addEventListener("change", () => {
+      state.inbox.filters.type = typeSelect.value || "";
+    });
+    const apply = el("button", {
+      class: "inbox-filter-button primary",
+      type: "submit",
+      text: "Apply",
+    });
+    const clear = el("button", {
+      class: "inbox-filter-button",
+      type: "button",
+      text: "Clear",
+    });
+    clear.addEventListener("click", () => {
+      state.inbox.filters = { project: "", state: "", type: "" };
+      loadInbox(true);
+    });
+    const refresh = el("button", {
+      class: "inbox-filter-button",
+      type: "button",
+      text: "Refresh",
+    });
+    refresh.addEventListener("click", () => loadInbox(true));
+    const form = el("form", { class: "inbox-filters" }, [
+      project,
+      stateSelect,
+      typeSelect,
+      apply,
+      clear,
+      refresh,
+    ]);
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      state.inbox.filters = {
+        project: project.value || "",
+        state: stateSelect.value || "",
+        type: typeSelect.value || "",
+      };
+      loadInbox(true);
+    });
+    return form;
+  }
+
+  function renderInboxList() {
+    const children = [];
+    if (state.inbox.warning) {
+      children.push(el("div", {
+        class: "inbox-warning",
+        text: state.inbox.warning,
+      }));
+    }
+    if (state.inbox.error) {
+      children.push(el("div", {
+        class: "error-banner inbox-error",
+        text: "inbox error: " + state.inbox.error.message,
+      }));
+    }
+    if (state.inbox.loading) {
+      children.push(el("div", {
+        class: "message-empty",
+        text: "loading inbox...",
+      }));
+      return el("div", { class: "inbox-list" }, children);
+    }
+    if (state.inbox.items.length === 0 && !state.inbox.error) {
+      children.push(el("div", {
+        class: "message-empty",
+        text: "no inbox items",
+      }));
+      return el("div", { class: "inbox-list" }, children);
+    }
+    for (const item of state.inbox.items) {
+      const rowActions = [
+        inboxActionButton(item, "mark-read", "Mark read", markInboxRead),
+        inboxActionButton(item, "snooze", "Snooze 1h", snoozeInboxItem),
+        inboxActionButton(item, "archive", "Archive", archiveInboxItem, "danger"),
+      ];
+      if (item.type === "plan_review") {
+        rowActions.push(disabledPlanReviewButton("Approve"));
+        rowActions.push(disabledPlanReviewButton("Reject"));
+      }
+      const row = el("div", {
+        class: (
+          "inbox-row "
+          + (state.inbox.selectedId === item.id ? "active" : "")
+        ).trim(),
+        "data-inbox-id": item.id,
+      }, [
+        el("div", { class: "inbox-row-main" }, [
+          el("div", { class: "inbox-subject", text: item.subject || item.id }),
+          el("div", { class: "inbox-meta", text: inboxMeta(item) }),
+          el("div", { class: "inbox-preview", text: item.preview || "" }),
+        ]),
+        el("div", { class: "inbox-row-actions" }, rowActions),
+      ]);
+      row.addEventListener("click", () => selectInboxItem(item.id));
+      children.push(row);
+    }
+    if (state.inbox.nextCursor) {
+      const more = el("button", {
+        class: "inbox-load-more",
+        type: "button",
+        text: state.inbox.loadingMore ? "Loading..." : "Load more",
+      });
+      more.disabled = state.inbox.loadingMore;
+      more.addEventListener("click", () => loadInbox(false));
+      children.push(more);
+    }
+    return el("div", { class: "inbox-list" }, children);
+  }
+
+  function renderInboxDetail() {
+    if (!state.inbox.selectedId) {
+      return el("div", {
+        class: "inbox-detail inbox-detail-empty",
+        text: "Select an inbox item to read the thread.",
+      });
+    }
+    if (state.inbox.detailLoading) {
+      return el("div", {
+        class: "inbox-detail inbox-detail-empty",
+        text: "loading thread...",
+      });
+    }
+    if (state.inbox.detailError) {
+      return el("div", {
+        class: "error-banner inbox-error",
+        text: "thread error: " + state.inbox.detailError.message,
+      });
+    }
+    const detail = state.inbox.detail;
+    if (!detail) {
+      return el("div", {
+        class: "inbox-detail inbox-detail-empty",
+        text: "No thread loaded.",
+      });
+    }
+    const messages = Array.isArray(detail.messages) ? detail.messages : [];
+    const messageNodes = messages.length === 0
+      ? [el("div", { class: "inbox-thread-empty", text: "no replies yet" })]
+      : messages.map((msg) => el("div", { class: "inbox-thread-message" }, [
+        el("div", { class: "inbox-thread-head" }, [
+          el("span", { text: msg.sender || "operator" }),
+          el("span", { text: msg.timestamp || "" }),
+        ]),
+        el("div", { class: "inbox-thread-body", text: msg.body || "" }),
+      ]));
+    const reply = el("textarea", {
+      class: "inbox-reply-input",
+      rows: "3",
+      placeholder: "Reply...",
+      "aria-label": "Reply to inbox item",
+    });
+    reply.value = state.inbox.replyDraft || "";
+    reply.addEventListener("input", () => {
+      state.inbox.replyDraft = reply.value;
+    });
+    const send = el("button", {
+      class: "inbox-filter-button primary",
+      type: "submit",
+      text: "Reply",
+    });
+    const actionKey = detail.id + ":reply";
+    send.disabled = Boolean(state.inbox.actionInFlight[actionKey]);
+    const form = el("form", { class: "inbox-reply-form" }, [reply, send]);
+    form.addEventListener("submit", (ev) => {
+      ev.preventDefault();
+      replyInboxItem(detail, reply.value || "");
+    });
+    const decisionActions = [];
+    if (detail.type === "plan_review") {
+      decisionActions.push(disabledPlanReviewButton("Approve"));
+      decisionActions.push(disabledPlanReviewButton("Reject"));
+    }
+    return el("div", { class: "inbox-detail" }, [
+      el("div", { class: "inbox-detail-title", text: detail.subject || detail.id }),
+      el("div", { class: "inbox-meta", text: inboxMeta(detail) }),
+      detail.preview
+        ? el("div", { class: "inbox-detail-preview", text: detail.preview })
+        : null,
+      decisionActions.length
+        ? el("div", { class: "inbox-decision-actions" }, decisionActions)
+        : null,
+      el("div", { class: "inbox-thread" }, messageNodes),
+      form,
+    ]);
+  }
+
+  function renderInboxView() {
+    if (state.selectedKind !== "inbox") return;
+    $("pane-title").textContent = "Inbox";
+    $("pane-meta").textContent = (
+      state.inbox.items.length + " shown"
+      + (state.inbox.nextCursor ? " · more available" : "")
+    );
+    const list = $("message-list");
+    list.innerHTML = "";
+    list.appendChild(el("div", { class: "inbox-view" }, [
+      renderInboxFilters(),
+      el("div", { class: "inbox-content" }, [
+        renderInboxList(),
+        renderInboxDetail(),
+      ]),
+    ]));
+  }
+
+  async function selectInboxItem(id) {
+    state.inbox.selectedId = id;
+    state.inbox.detail = null;
+    state.inbox.detailError = null;
+    state.inbox.replyDraft = "";
+    await loadInboxDetail(id);
+  }
+
+  async function loadInboxDetail(id) {
+    if (!id) return;
+    state.inbox.detailLoading = true;
+    state.inbox.detailError = null;
+    renderInboxView();
+    try {
+      const data = await apiJson(API + "/inbox/" + encodePathId(id));
+      if (state.selectedKind === "inbox" && state.inbox.selectedId === id) {
+        state.inbox.detail = data;
+      }
+    } catch (err) {
+      if (state.selectedKind === "inbox" && state.inbox.selectedId === id) {
+        state.inbox.detailError = err;
+      }
+    } finally {
+      state.inbox.detailLoading = false;
+      renderInboxView();
+    }
+  }
+
+  async function runInboxAction(item, action, suffix, body, options) {
+    const key = item.id + ":" + action;
+    setInboxAction(key, true);
+    try {
+      await apiJson(API + "/inbox/" + encodePathId(item.id) + suffix, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: body ? JSON.stringify(body) : undefined,
+      });
+      if (options && options.clearSelection) {
+        state.inbox.selectedId = null;
+        state.inbox.detail = null;
+        state.inbox.replyDraft = "";
+      }
+      await loadInbox(true, false, !(options && options.clearSelection));
+      if (state.inbox.selectedId) await loadInboxDetail(state.inbox.selectedId);
+      return true;
+    } catch (err) {
+      state.inbox.error = err;
+      showToast("error", action + " failed: " + err.message);
+      return false;
+    } finally {
+      setInboxAction(key, false);
+    }
+  }
+
+  function markInboxRead(item) {
+    runInboxAction(
+      item,
+      "mark-read",
+      "/mark-read",
+      { actor: OPERATOR_ACTOR },
+      {},
+    );
+  }
+
+  function archiveInboxItem(item) {
+    runInboxAction(
+      item,
+      "archive",
+      "/archive",
+      { reason: "archived from web UI" },
+      { clearSelection: true },
+    );
+  }
+
+  function snoozeInboxItem(item) {
+    runInboxAction(
+      item,
+      "snooze",
+      "/snooze",
+      { duration_seconds: 3600, reason: "snoozed from web UI" },
+      { clearSelection: true },
+    );
+  }
+
+  async function replyInboxItem(item, body) {
+    const text = String(body || "").trim();
+    if (!text) return;
+    const ok = await runInboxAction(
+      item,
+      "reply",
+      "/reply",
+      { body: text, owner: OPERATOR_ACTOR },
+      {},
+    );
+    if (ok) {
+      state.inbox.replyDraft = "";
+      renderInboxView();
+    }
+  }
+
   // ----- dashboard rollups (right rail) ----------------------------------
 
   async function pollDashboard() {
@@ -1300,12 +1935,28 @@
     return scopedFields.indexOf(key) !== -1;
   }
 
-  function buildCard(label, value, cls, scoped) {
+  function buildCard(label, value, cls, scoped, onClick) {
     const labelText = scoped ? label + " (filtered)" : label;
-    return el("div", { class: "rollup-card " + (cls || "") }, [
+    const attrs = { class: "rollup-card " + (cls || "") };
+    if (onClick) {
+      attrs.role = "button";
+      attrs.tabindex = "0";
+      attrs.title = "Open " + label;
+    }
+    const card = el("div", attrs, [
       el("div", { class: "rollup-label", text: labelText }),
       el("div", { class: "rollup-value", text: String(value) }),
     ]);
+    if (onClick) {
+      card.addEventListener("click", onClick);
+      card.addEventListener("keydown", (ev) => {
+        if (ev.key === "Enter" || ev.key === " ") {
+          ev.preventDefault();
+          onClick();
+        }
+      });
+    }
+    return card;
   }
 
   function renderDashboard(data) {
@@ -1335,6 +1986,7 @@
         rollups.open_inbox_count + " items",
         "rollup-attention",
         isScoped(scopedFields, "rollups.open_inbox_count"),
+        () => selectInbox(),
       ));
     }
     if (typeof rollups.pending_plan_reviews === "number") {
@@ -1343,6 +1995,7 @@
         rollups.pending_plan_reviews + " waiting",
         "rollup-attention",
         isScoped(scopedFields, "rollups.pending_plan_reviews"),
+        () => selectInbox({ type: "plan_review" }),
       ));
     }
     if (typeof rollups.alert_count === "number") {
@@ -1612,12 +2265,16 @@
         loadAuditForSurface(state.selectedSurface);
       }
     }
+    if (state.selectedKind === "inbox") {
+      loadInbox(true, false, true);
+    }
   }
 
   function refreshFromFallback() {
     pollDashboard();
     loadActivity();
     if (state.selectedSurface) loadHistory(state.selectedSurface);
+    if (state.selectedKind === "inbox") loadInbox(true, false, true);
   }
 
   function requestPushRefresh() {
@@ -1834,6 +2491,7 @@
     wireActivityControls();
     wireSendForm();
     wireStopAgentButton();
+    renderNoSelection();
     setStatus("warn", "connecting…");
     loadSurfaces();
     startEventStream();
@@ -1852,7 +2510,10 @@
     sendMessage: sendMessage,
     selectSurface: selectSurface,
     selectTask: selectTask,
+    selectInbox: selectInbox,
     interruptSurface: interruptSurface,
+    loadInbox: loadInbox,
+    renderInboxView: renderInboxView,
     pollDashboard: pollDashboard,
     loadActivity: loadActivity,
     startEventStream: startEventStream,

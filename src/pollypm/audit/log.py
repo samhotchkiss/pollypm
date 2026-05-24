@@ -56,6 +56,7 @@ SCHEMA_VERSION = 1
 # these strings. New events should follow ``noun.verb`` form.
 EVENT_TASK_CREATED = "task.created"
 EVENT_TASK_STATUS_CHANGED = "task.status_changed"
+EVENT_TASK_CLAIMED_BY_SESSION = "task.claimed_by_session"
 EVENT_TASK_CANCEL_WARNED = "task.cancel.warned"
 EVENT_TASK_CANCEL_CONFIRMED = "task.cancel.confirmed"
 EVENT_TASK_DELETED = "task.deleted"
@@ -970,6 +971,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "EVENT_TASK_CREATED",
     "EVENT_TASK_STATUS_CHANGED",
+    "EVENT_TASK_CLAIMED_BY_SESSION",
     "EVENT_TASK_CANCEL_WARNED",
     "EVENT_TASK_CANCEL_CONFIRMED",
     "EVENT_TASK_DELETED",

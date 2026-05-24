@@ -160,6 +160,7 @@ class TaskSummary(BaseModel):
     type: TaskTypeStr
     priority: TaskPriorityStr
     assignee: str | None = None
+    claimed_by_session: str | None = None
     current_node_id: str | None = None
     plan_version: int | None = None
     updated_at: datetime | None = None
@@ -301,11 +302,10 @@ class TaskListResponse(BaseModel):
 class TaskClaimRequest(BaseModel):
     """Body for ``POST /tasks/{project}/{n}/claim``.
 
-    Spec §5.3 documents ``{assignee, actor}``; this PR keeps the
-    surface tight to ``actor`` (the assigning user) — the
-    work-service derives the resulting ``assignee`` from the task's
-    flow + roles. A separate ``/reassign`` endpoint covers "change
-    owner" semantics.
+    ``actor`` is the session-level claimant identity recorded on the
+    response/task as ``claimed_by_session``. The work-service still
+    derives the resulting ``assignee`` from the task's flow + roles.
+    A separate ``/reassign`` endpoint covers "change owner" semantics.
 
     ``extra="forbid"`` (Codex round-12, #2064): without it Pydantic
     silently drops unsupported keys (e.g. an ``assignee`` field a
@@ -319,7 +319,14 @@ class TaskClaimRequest(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    actor: str = Field(min_length=1)
+    actor: str = Field(
+        min_length=1,
+        description=(
+            "Session-level claimant identity recorded as "
+            "`claimed_by_session`; does not override the role-derived "
+            "`assignee`."
+        ),
+    )
 
 
 class TaskCancelRequest(BaseModel):

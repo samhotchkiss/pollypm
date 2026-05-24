@@ -3453,7 +3453,7 @@ def test_cadence_dispatch_throttles_samblog_burst_by_root_cause(
 def test_cadence_operator_dispatch_throttles_burst_by_root_cause(
     now: datetime, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Same #2015 collapse for the tier-3 (operator inbox) leg."""
+    """Same-condition tier-3 findings throttle; changed evidence dispatches."""
     from pollypm.audit.watchdog import RULE_QUEUE_WITHOUT_MOTION
     from pollypm.plugins_builtin.core_recurring import audit_watchdog as aw
 
@@ -3487,6 +3487,24 @@ def test_cadence_operator_dispatch_throttles_burst_by_root_cause(
     assert outcomes[0] == "dispatched"
     assert outcomes[1:] == ["throttled", "throttled", "throttled"], outcomes
     assert len(created) == 1
+    first_dedup_key = created[0]["dedup_key"]
+
+    changed_condition = Finding(
+        rule=RULE_QUEUE_WITHOUT_MOTION,
+        tier="3",
+        project="proj",
+        subject="proj-e",
+        evidence={
+            "queued_subjects": ["proj/1", "proj/2", "proj/9"],
+            "queued_last_updated": "2026-05-19T13:30:00+00:00",
+        },
+    )
+    assert aw._maybe_dispatch_to_operator(
+        changed_condition, project_path=None, now=now,
+    ) == "dispatched"
+    assert len(created) == 2
+    assert created[0]["dedup_key"] == first_dedup_key
+    assert created[1]["dedup_key"] != first_dedup_key
 
 
 # ---------------------------------------------------------------------------

@@ -1209,8 +1209,10 @@ paths:
       operationId: claimTask
       summary: Atomically claim a queued task
       description: |
-        Sets the task's `assignee` and advances the flow to the start
-        (or current) node. Refuses non-queued tasks with `409
+        Advances the task to the start (or current) node, keeps
+        `assignee` role-derived, and records the request `actor` as
+        `claimed_by_session` for session-level claim forensics.
+        Refuses non-queued tasks with `409
         invalid_state`. Refuses claims that would exceed the
         project's `max_parallel_workers` ceiling with `429
         worker_cap_exceeded` (#2064 round-11) — normal back-pressure
@@ -3563,6 +3565,7 @@ components:
         priority:
           $ref: "#/components/schemas/TaskPriority"
         assignee: { type: string }
+        claimed_by_session: { type: string }
         current_node_id: { type: string }
         plan_version: { type: integer }
         updated_at: { type: string, format: date-time }
@@ -3767,9 +3770,10 @@ components:
           type: string
           minLength: 1
           description: |
-            Identity to record on the claim audit row. The
-            work-service derives the resulting `assignee` from the
-            task's flow + roles when applicable.
+            Session-level claimant identity recorded as
+            `claimed_by_session`. The work-service derives the
+            resulting `assignee` from the task's flow + roles when
+            applicable.
       description: |
         `additionalProperties: false` mirrors the runtime
         `TaskClaimRequest` model (`extra="forbid"` in

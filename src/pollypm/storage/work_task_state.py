@@ -127,6 +127,7 @@ def bump_reap_count_and_demote(
                     "SET reap_count = reap_count + 1, "
                     "    work_status = 'queued', "
                     "    assignee = NULL, "
+                    "    claimed_by_session = NULL, "
                     "    updated_at = now() "
                     "WHERE project = %s AND task_number = %s "
                     "  AND work_status IN ("

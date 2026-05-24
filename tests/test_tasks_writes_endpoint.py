@@ -97,6 +97,7 @@ class FakeTask:
     type: TaskType = TaskType.TASK
     priority: Priority = Priority.NORMAL
     assignee: str | None = None
+    claimed_by_session: str | None = None
     current_node_id: str | None = "node-start"
     plan_version: int = 1
     predecessor_task_id: str | None = None
@@ -193,6 +194,7 @@ class FakeWorkService:
             )
         task.work_status = WorkStatus.IN_PROGRESS
         task.assignee = actor
+        task.claimed_by_session = actor
         task.updated_at = datetime.now(timezone.utc)
         return task
 
@@ -463,6 +465,7 @@ def test_claim_happy_path(client, auth_headers, task_store) -> None:
     assert body["ok"] is True
     assert body["task"]["work_status"] == "in_progress"
     assert body["task"]["assignee"] == "alice"
+    assert body["task"]["claimed_by_session"] == "alice"
     assert "myproj/1" in body["message"]
 
 

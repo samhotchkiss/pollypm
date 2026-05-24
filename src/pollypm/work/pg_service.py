@@ -415,7 +415,8 @@ class PgWorkService:
         sql = """
             SELECT project, task_number, project_key, title, type, labels,
                    work_status, flow_template_id, flow_template_version,
-                   current_node_id, assignee, priority, requires_human_review,
+                   current_node_id, assignee, claimed_by_session,
+                   priority, requires_human_review,
                    description, acceptance_criteria, constraints, relevant_files,
                    parent_project, parent_task_number,
                    supersedes_project, supersedes_task_number,
@@ -480,7 +481,8 @@ class PgWorkService:
         sql = (
             "SELECT project, task_number, project_key, title, type, labels, "
             "work_status, flow_template_id, flow_template_version, "
-            "current_node_id, assignee, priority, requires_human_review, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
             "description, acceptance_criteria, constraints, relevant_files, "
             "parent_project, parent_task_number, "
             "supersedes_project, supersedes_task_number, "
@@ -538,6 +540,7 @@ class PgWorkService:
             flow_template_version,
             current_node_id,
             assignee,
+            claimed_by_session,
             priority_raw,
             requires_human_review,
             description,
@@ -569,6 +572,7 @@ class PgWorkService:
             flow_template_version=int(flow_template_version),
             current_node_id=current_node_id,
             assignee=assignee,
+            claimed_by_session=claimed_by_session,
             priority=_coerce_priority(str(priority_raw)),
             requires_human_review=bool(requires_human_review),
             description=str(description or ""),
@@ -1358,6 +1362,38 @@ class PgWorkService:
                 exc_info=True,
             )
 
+    def _emit_claimed_by_session_audit(
+        self,
+        *,
+        project: str,
+        task_number: int,
+        actor: str,
+        assignee: str | None,
+    ) -> None:
+        """Emit the claim identity breadcrumb without blocking claim."""
+        try:
+            from pollypm.audit import emit as _audit_emit
+            from pollypm.audit.log import EVENT_TASK_CLAIMED_BY_SESSION
+
+            _audit_emit(
+                event=EVENT_TASK_CLAIMED_BY_SESSION,
+                project=project,
+                subject=f"{project}/{task_number}",
+                actor=actor or "",
+                metadata={
+                    "assignee": assignee,
+                    "claimed_by_session": actor,
+                },
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break claim
+            logger.debug(
+                "task claimed-by-session audit emit failed for %s/%s",
+                project,
+                task_number,
+                exc_info=True,
+            )
+
     def _sync_transition(
         self, task: Task, old_status: str, new_status: str
     ) -> None:
@@ -1392,7 +1428,8 @@ class PgWorkService:
         sql = (
             "SELECT project, task_number, project_key, title, type, labels, "
             "work_status, flow_template_id, flow_template_version, "
-            "current_node_id, assignee, priority, requires_human_review, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
             "description, acceptance_criteria, constraints, relevant_files, "
             "parent_project, parent_task_number, "
             "supersedes_project, supersedes_task_number, "
@@ -1745,7 +1782,8 @@ class PgWorkService:
         sql = (
             "SELECT project, task_number, project_key, title, type, labels, "
             "work_status, flow_template_id, flow_template_version, "
-            "current_node_id, assignee, priority, requires_human_review, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
             "description, acceptance_criteria, constraints, relevant_files, "
             "parent_project, parent_task_number, "
             "supersedes_project, supersedes_task_number, "
@@ -1934,11 +1972,13 @@ class PgWorkService:
 
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, assignee = %s, "
-                    "current_node_id = %s, updated_at = %s "
+                    "claimed_by_session = %s, current_node_id = %s, "
+                    "updated_at = %s "
                     "WHERE project = %s AND task_number = %s",
                     (
                         resolved_target_status.value,
                         assignee,
+                        actor,
                         node_id,
                         now,
                         project,
@@ -2048,6 +2088,16 @@ class PgWorkService:
                         # instead of the stale in_progress snapshot
                         # captured pre-provisioning.
                         result = self.get(task_id)
+        if (
+            getattr(result, "claimed_by_session", None) == actor
+            and result.work_status is target_status
+        ):
+            self._emit_claimed_by_session_audit(
+                project=project,
+                task_number=task_number,
+                actor=actor,
+                assignee=assignee,
+            )
         return result
 
     def _fetch_task_for_claim_locked(
@@ -2066,7 +2116,8 @@ class PgWorkService:
         cur.execute(
             "SELECT project, task_number, project_key, title, type, labels, "
             "work_status, flow_template_id, flow_template_version, "
-            "current_node_id, assignee, priority, requires_human_review, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
             "description, acceptance_criteria, constraints, relevant_files, "
             "parent_project, parent_task_number, "
             "supersedes_project, supersedes_task_number, "
@@ -2162,7 +2213,7 @@ class PgWorkService:
                 with conn.cursor() as cur:
                     cur.execute(
                         "UPDATE work_tasks SET work_status = %s, "
-                        "updated_at = %s "
+                        "claimed_by_session = NULL, updated_at = %s "
                         "WHERE project = %s AND task_number = %s",
                         (
                             WorkStatus.QUEUED.value,
@@ -2226,7 +2277,8 @@ class PgWorkService:
             "SELECT t.project, t.task_number, t.project_key, t.title, t.type, "
             "t.labels, t.work_status, t.flow_template_id, "
             "t.flow_template_version, t.current_node_id, t.assignee, "
-            "t.priority, t.requires_human_review, t.description, "
+            "t.claimed_by_session, t.priority, t.requires_human_review, "
+            "t.description, "
             "t.acceptance_criteria, t.constraints, t.relevant_files, "
             "t.parent_project, t.parent_task_number, "
             "t.supersedes_project, t.supersedes_task_number, "
@@ -3563,7 +3615,8 @@ class PgWorkService:
         bulk_sql = (
             "SELECT project, task_number, project_key, title, type, labels, "
             "work_status, flow_template_id, flow_template_version, "
-            "current_node_id, assignee, priority, requires_human_review, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
             "description, acceptance_criteria, constraints, relevant_files, "
             "parent_project, parent_task_number, "
             "supersedes_project, supersedes_task_number, "
@@ -4003,7 +4056,8 @@ class PgWorkService:
         sql = (
             "SELECT project, task_number, project_key, title, type, labels, "
             "work_status, flow_template_id, flow_template_version, "
-            "current_node_id, assignee, priority, requires_human_review, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
             "description, acceptance_criteria, constraints, relevant_files, "
             "parent_project, parent_task_number, "
             "supersedes_project, supersedes_task_number, "
@@ -4038,7 +4092,8 @@ class PgWorkService:
         sql = (
             "SELECT project, task_number, project_key, title, type, labels, "
             "work_status, flow_template_id, flow_template_version, "
-            "current_node_id, assignee, priority, requires_human_review, "
+            "current_node_id, assignee, claimed_by_session, "
+            "priority, requires_human_review, "
             "description, acceptance_criteria, constraints, relevant_files, "
             "parent_project, parent_task_number, "
             "supersedes_project, supersedes_task_number, "

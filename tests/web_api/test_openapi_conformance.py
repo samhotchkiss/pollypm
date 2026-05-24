@@ -643,6 +643,25 @@ def test_task_claim_request_schema_forbids_extras() -> None:
     )
 
 
+def test_claim_contract_exposes_session_identity() -> None:
+    """Claim actor is documented as ``claimed_by_session`` identity."""
+    from pollypm.web_api.models import TaskClaimRequest, TaskSummary
+
+    contract = _load_contract()
+    static_summary = contract["components"]["schemas"]["TaskSummary"]
+    assert "claimed_by_session" in static_summary["properties"]
+
+    runtime_summary = TaskSummary.model_json_schema()
+    assert "claimed_by_session" in runtime_summary["properties"]
+
+    static_actor = contract["components"]["schemas"]["TaskClaimRequest"][
+        "properties"
+    ]["actor"]
+    runtime_actor = TaskClaimRequest.model_json_schema()["properties"]["actor"]
+    assert "claimed_by_session" in static_actor["description"]
+    assert "claimed_by_session" in runtime_actor["description"]
+
+
 def test_task_cancel_request_schema_forbids_extras() -> None:
     """Pin ``TaskCancelRequest`` extras=forbid in runtime + static YAML.
 

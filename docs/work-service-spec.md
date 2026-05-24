@@ -162,6 +162,7 @@ A task is the atomic unit of work tracked by the service.
 | `current_node_id` | string? | no | The flow node currently active (null when in `draft` or `queued`) |
 | `owner` | string | derived | Who owes the next action — computed from current node's actor + roles |
 | `assignee` | string | no | Who is doing the work (stable across state changes) |
+| `claimed_by_session` | string? | no | Session-level identity passed to `claim`; separate from the role-derived `assignee` |
 | `priority` | enum | yes | `critical`, `high`, `normal`, `low` |
 | `blocked` | bool | derived | True if any `blocked_by` task is not in a terminal state |
 | `requires_human_review` | bool | no | If true, task cannot move from `draft` to `queued` without human sign-off via inbox |
@@ -318,7 +319,7 @@ callers rely on, including `created_by`, `skip_gates`, and `entry_type`.
 | `get` | task_id | Task | Read a task with all fields including current flow node and execution state. |
 | `list_tasks` | work_status?, owner?, project?, assignee?, blocked?, type?, limit?, offset? | list[Task] | Query tasks with filters. |
 | `queue` | task_id, actor, skip_gates? | Task | Move from `draft` to `queued`. If `requires_human_review`, validates human has approved via inbox unless gates are explicitly skipped. |
-| `claim` | task_id, actor, skip_gates? | Task | Atomic: set assignee + activate first flow node + set `work_status=in_progress`. Task must be `queued`. |
+| `claim` | task_id, actor, skip_gates? | Task | Atomic: activate first flow node, set role-derived `assignee`, record `actor` as `claimed_by_session`, and set `work_status=in_progress`. Task must be `queued`. |
 | `next` | agent?, project? | Task? | Return the highest-priority queued+unblocked task, optionally filtered by project. Does not claim it. |
 | `update` | task_id, fields... | Task | Update mutable fields (title, description, priority, labels, roles). Cannot change work_status directly. |
 | `cancel` | task_id, actor, reason | Task | Move any non-terminal task to `cancelled`; operator surfaces must confirm before cancelling `in_progress` work. |
@@ -679,7 +680,8 @@ are the only ones that stop at `queued`.
 **`pm task claim` provisions the per-task tmux window automatically.**
 The single `claim` call:
 
-- Marks the task `assignee=worker` and `work_status=in_progress`.
+- Marks the task `assignee=worker`, records the caller as
+  `claimed_by_session`, and sets `work_status=in_progress`.
 - Activates the first flow node.
 - Creates a real git worktree at `.pollypm/worktrees/<project>-<number>`
   on branch `task/<project>-<number>`.

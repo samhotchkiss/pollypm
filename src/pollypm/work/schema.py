@@ -68,6 +68,7 @@ CREATE TABLE IF NOT EXISTS work_tasks (
     flow_template_version INTEGER NOT NULL DEFAULT 1,
     current_node_id TEXT,
     assignee TEXT,
+    claimed_by_session TEXT,
     priority TEXT NOT NULL DEFAULT 'normal',
     requires_human_review INTEGER NOT NULL DEFAULT 0,
 
@@ -303,6 +304,7 @@ def create_work_tables(conn: sqlite3.Connection) -> None:
     _ensure_node_execution_columns(conn)
     _ensure_work_task_plan_columns(conn)
     _ensure_work_task_kind_column(conn)
+    _ensure_work_task_claimed_by_session_column(conn)
     _run_work_migrations(conn)
 
 
@@ -390,6 +392,13 @@ def _ensure_work_task_kind_column(conn: sqlite3.Connection) -> None:
             "ALTER TABLE work_tasks "
             "ADD COLUMN kind TEXT NOT NULL DEFAULT 'legacy'"
         )
+
+
+def _ensure_work_task_claimed_by_session_column(conn: sqlite3.Connection) -> None:
+    """Backfill ``claimed_by_session`` on legacy work_tasks tables."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(work_tasks)")}
+    if "claimed_by_session" not in cols:
+        conn.execute("ALTER TABLE work_tasks ADD COLUMN claimed_by_session TEXT")
 
 
 def _ensure_context_entry_columns(conn: sqlite3.Connection) -> None:
@@ -561,6 +570,15 @@ _WORK_MIGRATIONS: list[tuple[int, str, list[str]]] = [
             # migration entry records the v10 bump so
             # ``work_schema_version`` stays accurate for both fresh and
             # legacy DBs.
+        ],
+    ),
+    (
+        11,
+        "Add claimed_by_session to work_tasks for claim identity "
+        "breadcrumbs (#2145)",
+        [
+            # Guarded by _ensure_work_task_claimed_by_session_column above
+            # for legacy DBs; fresh DBs get it from WORK_SCHEMA.
         ],
     ),
 ]

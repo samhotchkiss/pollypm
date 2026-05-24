@@ -1164,6 +1164,38 @@ def test_claim_advances_to_in_progress(pg_service):
     assert claimed.current_node_id is not None
 
 
+def test_claim_records_session_identity_separately(pg_service, monkeypatch):
+    from pollypm.audit.log import EVENT_TASK_CLAIMED_BY_SESSION
+
+    emitted: list[dict] = []
+    monkeypatch.setattr("pollypm.audit.emit", lambda **kw: emitted.append(kw))
+
+    task = _make_draft(
+        pg_service,
+        roles={"worker": "worker", "reviewer": "reviewer"},
+    )
+    pg_service.queue(task.task_id, actor="user")
+
+    claimed = pg_service.claim(task.task_id, actor="worker_pollypm/3")
+
+    assert claimed.assignee == "worker"
+    assert claimed.claimed_by_session == "worker_pollypm/3"
+    refetched = pg_service.get(task.task_id)
+    assert refetched.assignee == "worker"
+    assert refetched.claimed_by_session == "worker_pollypm/3"
+
+    claim_events = [
+        event for event in emitted
+        if event.get("event") == EVENT_TASK_CLAIMED_BY_SESSION
+    ]
+    assert len(claim_events) == 1
+    assert claim_events[0]["actor"] == "worker_pollypm/3"
+    assert claim_events[0]["metadata"] == {
+        "assignee": "worker",
+        "claimed_by_session": "worker_pollypm/3",
+    }
+
+
 def test_claim_from_wrong_state_raises(pg_service):
     from pollypm.work.service_support import InvalidTransitionError
 

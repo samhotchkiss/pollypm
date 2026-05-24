@@ -2947,11 +2947,41 @@ def test_cockpit_ui_bindings_expose_activity_and_pin_legend() -> None:
     bindings = {binding.key: binding.description for binding in PollyCockpitApp.BINDINGS}
 
     assert bindings["t"] == "Activity"
+    assert bindings["ctrl+h"] == "Rail"
+    assert bindings["escape"] == "Back to rail/home"
     # #1088 — pin moved from ``p`` to ``P``; lowercase ``p`` now forwards
     # to the project dashboard's ``p plan`` so the bottom hint matches
     # the actual behaviour.
     assert bindings["P"] == "Pin Project"
     assert bindings["p"] == "Plan"
+
+
+def test_cockpit_help_hides_hidden_rail_forwards_and_shows_context() -> None:
+    """#2203: ``?`` should avoid hidden rail-forwards and include pane help."""
+    from pollypm.cockpit_palette import _collect_keybindings_for_screen
+
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+    app.selected_key = "dashboard"
+
+    sections = _collect_keybindings_for_screen(app)
+    screen_rows = dict(next(rows for title, rows in sections if title == "This screen"))
+
+    assert "i" not in screen_rows
+    assert screen_rows["I"] == "Inbox"
+    assert screen_rows["ctrl+h"] == "Rail"
+    assert screen_rows["Esc"] == "Back to rail/home"
+
+    project_app = PollyCockpitApp.__new__(PollyCockpitApp)
+    project_app.selected_key = "project:demo:dashboard"
+    project_sections = dict(_collect_keybindings_for_screen(project_app))
+    project_rows = dict(project_sections["Right pane: Project dashboard"])
+    assert project_rows["c"] == "Chat PM"
+
+    settings_app = PollyCockpitApp.__new__(PollyCockpitApp)
+    settings_app.selected_key = "settings"
+    settings_sections = dict(_collect_keybindings_for_screen(settings_app))
+    settings_rows = dict(settings_sections["Right pane: Settings"])
+    assert settings_rows["t"] == "Pause / Resume project"
 
 
 def test_cockpit_new_worker_non_project_selection_updates_hint() -> None:
@@ -6871,12 +6901,19 @@ def test_cockpit_escape_and_q_from_active_inbox_nav_return_to_inbox_pane() -> No
     )
     app._right_pane_has_live_session = lambda: False  # type: ignore[method-assign]
     app._navigate_home = lambda: navigated.append("home") or True  # type: ignore[method-assign]
+    focused: list[str] = []
+    app._focus_rail_pane = lambda: focused.append("rail")  # type: ignore[method-assign]
 
     app.action_back_to_home()
+    assert router.active is False
+
+    router.active = True
     app.action_forward_project_home()
 
     assert forwarded == ["escape", "q"]
     assert navigated == []
+    assert focused == ["rail", "rail"]
+    assert router.active is False
 
 
 def test_cockpit_jk_from_inbox_forwards_to_inbox_pane() -> None:
@@ -7536,6 +7573,68 @@ def test_schedule_route_static_key_skips_refresh_rows_synchronously() -> None:
         "cold path past the 2s budget tracked by issue #1208"
     )
     assert ("dispatch", "inbox") in events
+
+
+@pytest.mark.parametrize("key", ["activity", "activity:demo"])
+def test_route_selected_worker_marks_activity_seen_before_apply(key: str) -> None:
+    """#2200/#2233: opening Activity clears the plugin-owned unread cursor."""
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+
+    class _Controller:
+        current_request_id = 7
+
+        async def resolve_and_apply(self, request):
+            return SimpleNamespace(
+                state="applied",
+                window_result=request.key,
+                destination_key=request.key,
+            )
+
+    marked: list[str] = []
+    successes: list[tuple[str, str, int]] = []
+    errors: list[tuple[str, str, int]] = []
+    controller = _Controller()
+
+    app._ensure_navigation_controller = lambda: controller  # type: ignore[method-assign]
+    app._mark_activity_seen_sync = lambda: marked.append(key)  # type: ignore[method-assign]
+    app._post_route_success = (  # type: ignore[method-assign]
+        lambda route_key, resolved, seq=0: successes.append((route_key, resolved, seq))
+    )
+    app._post_route_error = (  # type: ignore[method-assign]
+        lambda route_key, message, seq=0: errors.append((route_key, message, seq))
+    )
+    app._route_click_seq = 7
+
+    app._route_selected_worker(key, 7)
+
+    assert marked == [key]
+    assert successes == [(key, key, 7)]
+    assert errors == []
+
+
+def test_route_selected_worker_does_not_mark_non_activity_seen() -> None:
+    app = PollyCockpitApp.__new__(PollyCockpitApp)
+
+    class _Controller:
+        current_request_id = 3
+
+        async def resolve_and_apply(self, request):
+            return SimpleNamespace(
+                state="applied",
+                window_result=request.key,
+                destination_key=request.key,
+            )
+
+    marked: list[str] = []
+    app._ensure_navigation_controller = lambda: _Controller()  # type: ignore[method-assign]
+    app._mark_activity_seen_sync = lambda: marked.append("seen")  # type: ignore[method-assign]
+    app._post_route_success = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    app._post_route_error = lambda *args, **kwargs: None  # type: ignore[method-assign]
+    app._route_click_seq = 3
+
+    app._route_selected_worker("inbox", 3)
+
+    assert marked == []
 
 
 def test_async_click_surfaces_timeout_on_slow_route() -> None:

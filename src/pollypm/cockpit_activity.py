@@ -397,6 +397,7 @@ class PollyActivityFeedApp(App[None]):
         # ``call_from_thread``. Follow-mode ticks + manual refresh
         # also go off-thread (see ``_refresh`` / ``_follow_tick``).
         self._paint_loading_skeleton()
+        self._schedule_seen_marker()
         self._schedule_initial_load()
         # Alert toast surface removed in #956 — alerts already appear
         # as activity rows in the table below.
@@ -441,6 +442,26 @@ class PollyActivityFeedApp(App[None]):
             project=self._filter_project,
             limit=self.INITIAL_LIMIT,
         )
+
+    def _schedule_seen_marker(self) -> None:
+        """Advance the rail badge cursor without delaying first paint."""
+        try:
+            self.run_worker(
+                self._mark_seen_sync,
+                thread=True,
+                exclusive=True,
+                group="activity_feed_seen",
+            )
+        except Exception:  # noqa: BLE001
+            self._mark_seen_sync()
+
+    def _mark_seen_sync(self) -> None:
+        try:
+            from pollypm.activity_projector_registry import mark_activity_seen
+
+            mark_activity_seen(self._load_config())
+        except Exception:  # noqa: BLE001
+            pass
 
     # ------------------------------------------------------------------
     # Cold-boot + steady-state refresh (#1649). The activity feed

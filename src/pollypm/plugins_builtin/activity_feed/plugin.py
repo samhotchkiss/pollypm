@@ -26,6 +26,7 @@ from typing import Any
 
 from pollypm.activity_projector_registry import (
     register_activity_projector_factory,
+    register_activity_seen_marker,
 )
 from pollypm.plugin_api.v1 import (
     Capability,
@@ -41,7 +42,6 @@ from pollypm.plugins_builtin.activity_feed.handlers.event_projector import (
     FeedEntry,
 )
 from pollypm.plugins_builtin.activity_feed.projector_factory import (
-    _collect_work_db_paths,
     build_projector,
 )
 
@@ -86,6 +86,35 @@ def _save_last_seen_id(config: Any, value: int) -> None:
         logger.debug("activity_feed: failed to persist last-seen cursor", exc_info=True)
 
 
+def _numeric_feed_entry_id(entry_id: str) -> int | None:
+    """Return the integer id for feed ids that carry the shared numeric tail."""
+    for prefix in ("msg:", "evt:"):
+        if entry_id.startswith(prefix):
+            try:
+                return int(entry_id.split(":", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def mark_latest_activity_seen(config: Any) -> None:
+    """Advance the activity badge cursor to the newest visible feed entry."""
+    projector = build_projector(config)
+    if projector is None:
+        return
+    try:
+        entries = projector.project(limit=1)
+    except Exception:  # noqa: BLE001
+        logger.debug("activity_feed: failed to project latest seen entry", exc_info=True)
+        return
+    if not entries:
+        return
+    newest_id = _numeric_feed_entry_id(str(getattr(entries[0], "id", "") or ""))
+    if newest_id is None:
+        return
+    _save_last_seen_id(config, newest_id)
+
+
 def _badge_provider_factory(config: Any):
     """Return a ``badge_provider`` closure for rail registration.
 
@@ -127,27 +156,7 @@ def _handler_factory(config: Any):
             except Exception:  # noqa: BLE001
                 logger.exception("activity_feed: route_selected raised")
         # Update the last-seen cursor so the badge resets.
-        projector = build_projector(config)
-        if projector is not None:
-            try:
-                entries = projector.project(limit=1)
-            except Exception:  # noqa: BLE001
-                entries = []
-            if entries:
-                newest = entries[0].id
-                # Feed entries from the unified ``messages`` table carry
-                # an ``msg:<id>`` prefix (#342). Accept that in addition
-                # to the legacy ``evt:<id>`` shape some projectors may
-                # still hand back.
-                for prefix in ("msg:", "evt:"):
-                    if newest.startswith(prefix):
-                        try:
-                            _save_last_seen_id(
-                                config, int(newest.split(":", 1)[1]),
-                            )
-                        except ValueError:
-                            pass
-                        break
+        mark_latest_activity_seen(config)
         return PanelSpec(widget=None, focus_hint="activity")
 
     return _handler
@@ -171,6 +180,7 @@ def _initialize(api: Any) -> None:
     # callers get ``None`` and render an empty feed (their existing
     # graceful-degrade path).
     register_activity_projector_factory(build_projector)
+    register_activity_seen_marker(mark_latest_activity_seen)
 
     config = api.config
     state_db = None
@@ -217,4 +227,5 @@ __all__ = [
     "build_projector",
     "EventProjector",
     "FeedEntry",
+    "mark_latest_activity_seen",
 ]

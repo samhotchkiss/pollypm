@@ -302,6 +302,20 @@ paths:
           name: tracked
           schema: { type: boolean }
           description: When true, returns only `tracked=true` projects.
+        - in: query
+          name: q
+          schema: { type: string }
+          description: Filter projects by key, name, path, or persona.
+        - in: query
+          name: search
+          schema: { type: string }
+          description: Alias for `q`.
+        - in: query
+          name: sort
+          schema:
+            type: string
+            enum: [name, inbox_desc, recent, recent_desc, urgency]
+          description: Sort projects by name, inbox count, recency, or urgency.
       responses:
         "200":
           description: All registered projects with derived state.
@@ -2949,6 +2963,10 @@ components:
           $ref: "#/components/schemas/TaskCounts"
         open_inbox_count: { type: integer }
         pending_plan_review: { type: boolean }
+        last_activity_at:
+          type: string
+          format: date-time
+          nullable: true
 
     ProjectActivityEntry:
       type: object

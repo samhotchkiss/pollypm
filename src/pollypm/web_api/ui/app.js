@@ -24,9 +24,17 @@
   const SESSION_ISSUED_COOKIE = "pollypm-session-issued-at";
   const SESSION_EXPIRY_WARNING_MS = 6 * 24 * 60 * 60 * 1000;
   const TASK_RAIL_LIMIT = 200;
+  const TASK_RENDER_LIMIT = 80;
   const AUDIT_LIMIT = 25;
+  const ACTIVITY_LIMIT = 40;
+  const ACTIVITY_DEFAULT_SINCE = "2d";
 
   const state = {
+    projects: [],
+    projectLoadError: null,
+    selectedProject: null,
+    projectFilter: "",
+    projectSort: "urgency",
     surfaces: [],
     taskSurfaces: [],
     taskLoadError: null,
@@ -53,6 +61,14 @@
     auditLoading: {},
     surfaceMidStream: {},
     surfaceFilter: "",
+    activitySince: ACTIVITY_DEFAULT_SINCE,
+    activityEntries: [],
+    activityStats: null,
+    activityLoading: false,
+    activityError: null,
+    activityInFlight: false,
+    activityRefreshQueued: false,
+    pendingMessages: {},
   };
 
   // ----- DOM helpers ------------------------------------------------------
@@ -223,6 +239,18 @@
 
   // ----- surfaces (left rail) --------------------------------------------
 
+  function projectListPath() {
+    const params = new URLSearchParams();
+    if (state.projectFilter.trim()) {
+      params.set("q", state.projectFilter.trim());
+    }
+    if (state.projectSort) {
+      params.set("sort", state.projectSort);
+    }
+    const query = params.toString();
+    return API + "/projects" + (query ? "?" + query : "");
+  }
+
   async function loadSurfaces() {
     if (state.surfacesInFlight) {
       state.surfacesRefreshQueued = true;
@@ -230,25 +258,55 @@
     }
     state.surfacesInFlight = true;
     try {
-      try {
-        const data = await apiJson(API + "/chat/sessions");
-        state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
-      } catch (err) {
+      const [sessionsResult, tasksResult, projectsResult] =
+        await Promise.allSettled([
+          apiJson(API + "/chat/sessions"),
+          apiJsonOptional(API + "/tasks?limit=" + TASK_RAIL_LIMIT),
+          apiJsonOptional(projectListPath()),
+        ]);
+
+      if (sessionsResult.status === "rejected") {
+        state.taskSurfaces = [];
+        state.projects = [];
+        state.projectLoadError = null;
+        state.taskLoadError = null;
+        renderProjects();
+        const err = sessionsResult.reason instanceof Error
+          ? sessionsResult.reason
+          : new Error(String(sessionsResult.reason));
         renderSurfaceError(err);
         return;
       }
+      const data = sessionsResult.value;
+      state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
 
-      state.taskLoadError = null;
-      try {
-        const taskData = await apiJsonOptional(
-          API + "/tasks?limit=" + TASK_RAIL_LIMIT,
-        );
+      if (tasksResult.status === "fulfilled") {
+        state.taskLoadError = null;
+        const taskData = tasksResult.value;
         const items = Array.isArray(taskData.items) ? taskData.items : [];
-        state.taskSurfaces = items.map(normalizeTaskSurface);
-      } catch (err) {
+        state.taskSurfaces = dedupeTaskSurfaces(
+          items.map(normalizeTaskSurface),
+        );
+      } else {
         state.taskSurfaces = [];
-        state.taskLoadError = err;
+        state.taskLoadError = tasksResult.reason instanceof Error
+          ? tasksResult.reason
+          : new Error(String(tasksResult.reason));
       }
+
+      if (projectsResult.status === "fulfilled") {
+        state.projectLoadError = null;
+        const projectData = projectsResult.value;
+        state.projects = Array.isArray(projectData.items)
+          ? projectData.items : [];
+      } else {
+        state.projects = [];
+        state.projectLoadError = projectsResult.reason instanceof Error
+          ? projectsResult.reason
+          : new Error(String(projectsResult.reason));
+      }
+      renderProjects();
+      ensureSelectionVisible();
       renderSurfaces();
     } finally {
       state.surfacesInFlight = false;
@@ -275,7 +333,38 @@
       priority: task.priority || "",
       assignee: task.assignee || "",
       updated_at: task.updated_at || "",
+      duplicate_count: task.duplicate_count || 1,
     };
+  }
+
+  function taskDedupeKey(task) {
+    return [
+      task.project || "",
+      task.work_status || "",
+      String(task.title || "").trim().toLowerCase(),
+    ].join("\u0000");
+  }
+
+  function dedupeTaskSurfaces(tasks) {
+    const byKey = {};
+    const out = [];
+    for (const task of tasks) {
+      const key = taskDedupeKey(task);
+      const existing = byKey[key];
+      if (existing) {
+        existing.duplicate_count += 1;
+        if (
+          task.updated_at
+          && (!existing.updated_at || task.updated_at > existing.updated_at)
+        ) {
+          existing.updated_at = task.updated_at;
+        }
+        continue;
+      }
+      byKey[key] = task;
+      out.push(task);
+    }
+    return out;
   }
 
   function taskDotClass(status) {
@@ -289,6 +378,168 @@
 
   function appendRailGroup(list, label) {
     list.appendChild(el("li", { class: "surface-group", text: label }));
+  }
+
+  function countFor(project, name) {
+    const counts = project && typeof project.task_counts === "object"
+      ? project.task_counts : {};
+    return Number(counts && counts[name]) || 0;
+  }
+
+  function activeTaskCount(project) {
+    return countFor(project, "in_progress") + countFor(project, "rework");
+  }
+
+  function projectUrgency(project) {
+    const blocked = countFor(project, "blocked") + countFor(project, "on_hold");
+    const queued = countFor(project, "queued");
+    const active = activeTaskCount(project);
+    const review = countFor(project, "review");
+    if (!project.tracked || project.glyph === "paused") {
+      return { rank: 5, label: "paused", className: "paused" };
+    }
+    if (blocked > 0) {
+      return { rank: 0, label: "blocked", className: "blocked" };
+    }
+    if (queued > 0 && active === 0) {
+      return { rank: 1, label: "stalled", className: "stalled" };
+    }
+    if (project.pending_plan_review || project.open_inbox_count > 0 || review > 0) {
+      return { rank: 2, label: "attention", className: "attention" };
+    }
+    if (active > 0) {
+      return { rank: 3, label: "active", className: "active" };
+    }
+    return { rank: 4, label: "healthy", className: "healthy" };
+  }
+
+  function projectLastActivityMs(project) {
+    const raw = project && project.last_activity_at;
+    if (!raw) return 0;
+    const parsed = Date.parse(raw);
+    return Number.isFinite(parsed) ? parsed : 0;
+  }
+
+  function projectMeta(project) {
+    const parts = [];
+    const blocked = countFor(project, "blocked") + countFor(project, "on_hold");
+    const queued = countFor(project, "queued");
+    const active = activeTaskCount(project);
+    const inbox = Number(project.open_inbox_count) || 0;
+    if (blocked > 0) parts.push(blocked + " blocked");
+    if (queued > 0) parts.push(queued + " queued");
+    if (active > 0) parts.push(active + " active");
+    if (inbox > 0) parts.push(inbox + " inbox");
+    const last = projectLastActivityMs(project);
+    if (last > 0) parts.push("last " + formatShortTime(project.last_activity_at));
+    return parts.join(" · ") || "no open work";
+  }
+
+  function formatShortTime(value) {
+    const parsed = Date.parse(value);
+    if (!Number.isFinite(parsed)) return String(value || "");
+    return new Date(parsed).toLocaleString(undefined, {
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  }
+
+  function sortProjects(projects) {
+    const sorted = projects.slice();
+    if (state.projectSort === "name") {
+      sorted.sort((a, b) => String(a.name || a.key).localeCompare(String(b.name || b.key)));
+    } else if (state.projectSort === "inbox_desc") {
+      sorted.sort((a, b) => (
+        (Number(b.open_inbox_count) || 0) - (Number(a.open_inbox_count) || 0)
+        || String(a.name || a.key).localeCompare(String(b.name || b.key))
+      ));
+    } else if (state.projectSort === "recent") {
+      sorted.sort((a, b) => (
+        projectLastActivityMs(b) - projectLastActivityMs(a)
+        || String(a.name || a.key).localeCompare(String(b.name || b.key))
+      ));
+    } else {
+      sorted.sort((a, b) => (
+        projectUrgency(a).rank - projectUrgency(b).rank
+        || String(a.name || a.key).localeCompare(String(b.name || b.key))
+      ));
+    }
+    return sorted;
+  }
+
+  function renderProjectItem(list, project) {
+    const urgency = projectUrgency(project);
+    const key = project.key || "";
+    const li = el("li", {
+      "data-project": key,
+      "class": (
+        state.selectedProject === key ? "active " : ""
+      ) + "project-" + urgency.className,
+    }, [
+      el("span", { class: "project-name" }, [
+        el("span", {
+          class: "project-dot project-dot-" + urgency.className,
+        }),
+        document.createTextNode(project.name || key),
+      ]),
+      el("span", {
+        class: "project-meta",
+        text: urgency.label + " · " + projectMeta(project),
+      }),
+    ]);
+    li.addEventListener("click", () => selectProject(key));
+    list.appendChild(li);
+  }
+
+  function renderProjects() {
+    const list = $("project-list");
+    if (!list) return;
+    list.innerHTML = "";
+
+    const all = el("li", {
+      "data-project": "",
+      "class": state.selectedProject ? "project-all" : "project-all active",
+    }, [
+      el("span", { class: "project-name" }, [
+        el("span", { class: "project-dot project-dot-all" }),
+        document.createTextNode("All projects"),
+      ]),
+      el("span", {
+        class: "project-meta",
+        text: state.projects.length + " tracked",
+      }),
+    ]);
+    all.addEventListener("click", () => selectProject(null));
+    list.appendChild(all);
+
+    if (state.projectLoadError) {
+      list.appendChild(el("li", {
+        class: "project-empty",
+        text: "projects unavailable: " + state.projectLoadError.message,
+      }));
+      return;
+    }
+    const filter = state.projectFilter.trim().toLowerCase();
+    const projects = sortProjects(
+      filter
+        ? state.projects.filter((project) => (
+          String(project.key || "").toLowerCase().includes(filter)
+          || String(project.name || "").toLowerCase().includes(filter)
+          || String(project.path || "").toLowerCase().includes(filter)
+          || String(project.persona_name || "").toLowerCase().includes(filter)
+        ))
+        : state.projects,
+    );
+    if (projects.length === 0) {
+      list.appendChild(el("li", {
+        class: "project-empty",
+        text: "no matching projects",
+      }));
+      return;
+    }
+    for (const project of projects) renderProjectItem(list, project);
   }
 
   function renderChatSurfaceItem(list, s) {
@@ -333,6 +584,7 @@
       task.project,
     ].filter(Boolean);
     if (task.assignee) meta.push("@" + task.assignee);
+    if (task.duplicate_count > 1) meta.push("\u00d7" + task.duplicate_count);
     const li = el(
       "li",
       {
@@ -363,24 +615,43 @@
     list.appendChild(li);
   }
 
+  function selectedProjectMatches(project) {
+    return !state.selectedProject || project === state.selectedProject;
+  }
+
+  function surfaceMatchesFilter(surface, filter) {
+    if (!filter) return true;
+    return (
+      String(surface.session_name || "").toLowerCase().includes(filter)
+      || String(surface.project || "").toLowerCase().includes(filter)
+      || String(surface.surface_type || "").toLowerCase().includes(filter)
+      || String(surface.persona || "").toLowerCase().includes(filter)
+    );
+  }
+
+  function taskMatchesFilter(task, filter) {
+    if (!filter) return true;
+    return (
+      String(task.key || "").toLowerCase().includes(filter)
+      || String(task.title || "").toLowerCase().includes(filter)
+      || String(task.project || "").toLowerCase().includes(filter)
+      || String(task.work_status || "").toLowerCase().includes(filter)
+      || String(task.assignee || "").toLowerCase().includes(filter)
+    );
+  }
+
   function renderSurfaces() {
     const list = $("surface-list");
     list.innerHTML = "";
     const filter = state.surfaceFilter.trim().toLowerCase();
-    const surfaces = filter
-      ? state.surfaces.filter((s) => (
-        String(s.session_name || "").toLowerCase().includes(filter)
-      ))
-      : state.surfaces;
-    const taskSurfaces = filter
-      ? state.taskSurfaces.filter((task) => (
-        String(task.key || "").toLowerCase().includes(filter)
-        || String(task.title || "").toLowerCase().includes(filter)
-        || String(task.project || "").toLowerCase().includes(filter)
-        || String(task.work_status || "").toLowerCase().includes(filter)
-        || String(task.assignee || "").toLowerCase().includes(filter)
-      ))
-      : state.taskSurfaces;
+    const surfaces = state.surfaces.filter((s) => (
+      selectedProjectMatches(s.project || "")
+      && surfaceMatchesFilter(s, filter)
+    ));
+    const taskSurfaces = state.taskSurfaces.filter((task) => (
+      selectedProjectMatches(task.project || "")
+      && taskMatchesFilter(task, filter)
+    ));
     const hasRegistered = (
       state.surfaces.length > 0
       || state.taskSurfaces.length > 0
@@ -404,7 +675,15 @@
     }
     if (taskSurfaces.length > 0 || state.taskLoadError) {
       appendRailGroup(list, "Tasks");
-      for (const task of taskSurfaces) renderTaskSurfaceItem(list, task);
+      const visibleTasks = taskSurfaces.slice(0, TASK_RENDER_LIMIT);
+      for (const task of visibleTasks) renderTaskSurfaceItem(list, task);
+      if (taskSurfaces.length > visibleTasks.length) {
+        list.appendChild(el("li", {
+          class: "surface-empty surface-summary",
+          text: "showing " + visibleTasks.length + " of "
+            + taskSurfaces.length + " tasks",
+        }));
+      }
       if (state.taskLoadError) {
         list.appendChild(el("li", {
           class: "surface-empty",
@@ -420,6 +699,45 @@
     list.appendChild(
       el("li", { class: "surface-empty", text: "error: " + err.message }),
     );
+  }
+
+  function clearSelection() {
+    state.selectedKind = null;
+    state.selectedSurface = null;
+    state.selectedTaskKey = null;
+    $("pane-title").textContent = "Select a surface";
+    $("pane-meta").textContent = "";
+    $("send-input").disabled = true;
+    $("send-button").disabled = true;
+    const list = $("message-list");
+    list.innerHTML = "";
+    list.appendChild(el("div", {
+      class: "message-empty",
+      text: "No surface selected.",
+    }));
+    updateStopAgentButton();
+  }
+
+  function ensureSelectionVisible() {
+    if (!state.selectedProject) return;
+    if (state.selectedKind === "chat") {
+      const surface = surfaceByName(state.selectedSurface);
+      if (!surface || surface.project !== state.selectedProject) clearSelection();
+    } else if (state.selectedKind === "task") {
+      const task = state.taskSurfaces.find((item) => (
+        item.key === state.selectedTaskKey
+      ));
+      if (!task || task.project !== state.selectedProject) clearSelection();
+    }
+  }
+
+  function selectProject(key) {
+    state.selectedProject = key || null;
+    ensureSelectionVisible();
+    renderProjects();
+    renderSurfaces();
+    pollDashboard();
+    loadActivity();
   }
 
   function selectSurface(name) {
@@ -736,6 +1054,96 @@
 
   // ----- history (center) ------------------------------------------------
 
+  function pendingMessagesFor(name) {
+    if (!state.pendingMessages[name]) state.pendingMessages[name] = [];
+    return state.pendingMessages[name];
+  }
+
+  function normalizeMessageText(text) {
+    return String(text || "").replace(/\s+/g, " ").trim();
+  }
+
+  function reconcilePendingMessages(name, messages) {
+    const serverTexts = new Set(
+      messages.map((message) => normalizeMessageText(message.text)),
+    );
+    const pending = pendingMessagesFor(name).filter((message) => (
+      message.status === "failed"
+      || !serverTexts.has(normalizeMessageText(message.text))
+    ));
+    state.pendingMessages[name] = pending;
+    return pending;
+  }
+
+  function removeLocalEchoNodes(list) {
+    for (const node of list.querySelectorAll(".message-local-echo")) {
+      node.remove();
+    }
+  }
+
+  function localEchoNode(message) {
+    const status = message.status === "failed"
+      ? "failed"
+      : message.status === "sending" ? "sending" : "pending";
+    const children = [
+      el("div", { class: "message-head" }, [
+        el("span", { class: "message-actor", text: "you" }),
+        el("span", { class: "message-ts", text: message.ts || "" }),
+        el("span", { class: "message-type", text: status }),
+      ]),
+      el("div", { class: "message-text", text: message.text || "" }),
+    ];
+    if (message.error) {
+      children.push(el("div", {
+        class: "message-error",
+        text: "send failed: " + message.error,
+      }));
+    }
+    return el("div", {
+      class: "message message-role-user message-local-echo message-local-"
+        + status,
+      "data-local-message": message.id,
+    }, children);
+  }
+
+  function renderLocalEchoes(name) {
+    if (state.selectedKind !== "chat" || state.selectedSurface !== name) return;
+    const list = $("message-list");
+    removeLocalEchoNodes(list);
+    const pending = pendingMessagesFor(name);
+    if (pending.length === 0) return;
+    const empty = list.querySelector(".message-empty");
+    if (empty) empty.remove();
+    const auditPanel = list.querySelector(".audit-panel");
+    for (const message of pending) {
+      const node = localEchoNode(message);
+      if (auditPanel) list.insertBefore(node, auditPanel);
+      else list.appendChild(node);
+    }
+    list.scrollTop = list.scrollHeight;
+  }
+
+  function addLocalEcho(name, text) {
+    const message = {
+      id: "local-" + Date.now() + "-" + Math.random().toString(16).slice(2),
+      text: text,
+      ts: new Date().toISOString(),
+      status: "sending",
+      error: null,
+    };
+    pendingMessagesFor(name).push(message);
+    renderLocalEchoes(name);
+    return message;
+  }
+
+  function updateLocalEcho(name, id, patch) {
+    const pending = pendingMessagesFor(name);
+    const message = pending.find((item) => item.id === id);
+    if (!message) return;
+    Object.assign(message, patch);
+    renderLocalEchoes(name);
+  }
+
   async function loadHistory(name) {
     if (!name) return;
     if (state.historyInFlight[name]) {
@@ -774,11 +1182,12 @@
     if (data.transcript_source) meta.push("src=" + data.transcript_source);
     $("pane-meta").textContent = meta.join(" · ");
     const msgs = Array.isArray(data.messages) ? data.messages.slice() : [];
+    const pending = reconcilePendingMessages(data.session_name, msgs);
     state.surfaceMidStream[data.session_name] = (
       msgs.length > 0 && messageLooksMidStream(msgs[0])
     );
     updateStopAgentButton();
-    if (msgs.length === 0) {
+    if (msgs.length === 0 && pending.length === 0) {
       list.appendChild(
         el("div", { class: "message-empty", text: "no messages yet" }),
       );
@@ -801,6 +1210,7 @@
         ]),
       );
     }
+    renderLocalEchoes(data.session_name);
     list.scrollTop = list.scrollHeight;
     renderAuditPanel(data.session_name);
   }
@@ -819,14 +1229,26 @@
 
   async function sendMessage(name, text) {
     if (!name || !text) return;
+    const local = addLocalEcho(name, text);
     const path = API + "/chat/" + encodeURIComponent(name) + "/send";
-    await apiFetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ text: text }),
-    });
-    // Refresh after a short delay so the new line shows up.
-    setTimeout(() => loadHistory(name), 400);
+    try {
+      await apiFetch(path, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text: text }),
+      });
+      updateLocalEcho(name, local.id, { status: "pending" });
+      // Refresh after a short delay so the server-confirmed line can
+      // replace the local echo once tmux capture catches up.
+      setTimeout(() => loadHistory(name), 400);
+    } catch (err) {
+      updateLocalEcho(name, local.id, {
+        status: "failed",
+        error: err.message || String(err),
+      });
+      showToast("error", "send failed: " + (err.message || String(err)));
+      throw err;
+    }
   }
 
   async function interruptSurface(name) {
@@ -847,7 +1269,12 @@
     }
     state.dashboardInFlight = true;
     try {
-      const data = await apiJson(API + "/dashboard");
+      const params = new URLSearchParams();
+      if (state.selectedProject) params.set("project", state.selectedProject);
+      const query = params.toString();
+      const data = await apiJson(
+        API + "/dashboard" + (query ? "?" + query : ""),
+      );
       renderDashboard(data);
     } catch (err) {
       renderDashboardError(err);
@@ -992,11 +1419,193 @@
     );
   }
 
+  // ----- activity feed (right rail) --------------------------------------
+
+  function activityParams() {
+    const params = new URLSearchParams();
+    params.set("since", state.activitySince || ACTIVITY_DEFAULT_SINCE);
+    if (state.selectedProject) params.set("project", state.selectedProject);
+    return params;
+  }
+
+  function activityGrepPath() {
+    const params = activityParams();
+    params.set("limit", String(ACTIVITY_LIMIT));
+    return API + "/audit/grep?" + params.toString();
+  }
+
+  function activityStatsPath() {
+    return API + "/audit/stats?" + activityParams().toString();
+  }
+
+  async function loadActivity() {
+    if (state.activityInFlight) {
+      state.activityRefreshQueued = true;
+      return;
+    }
+    state.activityInFlight = true;
+    state.activityLoading = true;
+    state.activityError = null;
+    renderActivity();
+    try {
+      const [grepResult, statsResult] = await Promise.allSettled([
+        apiJsonOptional(activityGrepPath()),
+        apiJsonOptional(activityStatsPath()),
+      ]);
+      if (grepResult.status === "fulfilled") {
+        state.activityEntries = Array.isArray(grepResult.value.events)
+          ? grepResult.value.events : [];
+      } else {
+        state.activityEntries = [];
+        state.activityError = grepResult.reason instanceof Error
+          ? grepResult.reason
+          : new Error(String(grepResult.reason));
+      }
+      state.activityStats = statsResult.status === "fulfilled"
+        ? statsResult.value : null;
+      if (statsResult.status === "rejected" && !state.activityError) {
+        state.activityError = statsResult.reason instanceof Error
+          ? statsResult.reason
+          : new Error(String(statsResult.reason));
+      }
+    } finally {
+      state.activityLoading = false;
+      state.activityInFlight = false;
+      renderActivity();
+      if (state.activityRefreshQueued) {
+        state.activityRefreshQueued = false;
+        loadActivity();
+      }
+    }
+  }
+
+  function eventMetadata(entry) {
+    return entry && typeof entry.metadata === "object" && entry.metadata
+      ? entry.metadata : {};
+  }
+
+  function activityCompletedCount(entries) {
+    return entries.filter((entry) => {
+      const eventName = String(entry.event || "").toLowerCase();
+      const meta = eventMetadata(entry);
+      const stateName = String(
+        meta.to_state || meta.work_status || meta.status || "",
+      ).toLowerCase();
+      return (
+        stateName === "done"
+        || eventName.includes("completed")
+        || eventName.includes(".done")
+      );
+    }).length;
+  }
+
+  function activityDecisionCount(entries) {
+    return entries.filter((entry) => {
+      const eventName = String(entry.event || "").toLowerCase();
+      return (
+        eventName.includes("decision")
+        || eventName.includes("approve")
+        || eventName.includes("reject")
+        || eventName.includes("review")
+        || eventName.includes("plan.")
+      );
+    }).length;
+  }
+
+  function activityWarningCount(entries) {
+    return entries.filter((entry) => {
+      const eventName = String(entry.event || "").toLowerCase();
+      const status = String(entry.status || "").toLowerCase();
+      return (
+        status === "warn"
+        || status === "error"
+        || eventName.includes("blocked")
+        || eventName.includes("hold")
+        || eventName.includes("failed")
+      );
+    }).length;
+  }
+
+  function renderActivitySummary(summaryBox, entries) {
+    summaryBox.innerHTML = "";
+    const stats = state.activityStats || {};
+    const total = typeof stats.total === "number" ? stats.total : entries.length;
+    const actors = new Set(entries.map((entry) => entry.actor).filter(Boolean));
+    const cards = [
+      ["events", total],
+      ["done", activityCompletedCount(entries)],
+      ["warnings", activityWarningCount(entries)],
+      ["decisions", activityDecisionCount(entries)],
+      ["actors", actors.size],
+    ];
+    for (const card of cards) {
+      summaryBox.appendChild(el("div", { class: "activity-chip" }, [
+        el("span", { class: "activity-chip-label", text: card[0] }),
+        el("span", { class: "activity-chip-value", text: String(card[1]) }),
+      ]));
+    }
+  }
+
+  function renderActivity() {
+    const summaryBox = $("activity-summary");
+    const feed = $("activity-feed");
+    if (!summaryBox || !feed) return;
+    if (state.activityLoading) {
+      summaryBox.innerHTML = "";
+      feed.innerHTML = "";
+      feed.appendChild(el("div", {
+        class: "activity-empty",
+        text: "loading activity...",
+      }));
+      return;
+    }
+    if (state.activityError) {
+      summaryBox.innerHTML = "";
+      feed.innerHTML = "";
+      feed.appendChild(el("div", {
+        class: "activity-empty",
+        text: "activity unavailable: " + state.activityError.message,
+      }));
+      return;
+    }
+    const entries = state.activityEntries.slice().sort((a, b) => (
+      (Date.parse(b.ts || "") || 0) - (Date.parse(a.ts || "") || 0)
+    ));
+    renderActivitySummary(summaryBox, entries);
+    feed.innerHTML = "";
+    if (entries.length === 0) {
+      feed.appendChild(el("div", {
+        class: "activity-empty",
+        text: "no activity in " + (state.activitySince || ACTIVITY_DEFAULT_SINCE),
+      }));
+      return;
+    }
+    for (const entry of entries.slice(0, ACTIVITY_LIMIT)) {
+      feed.appendChild(el("div", { class: "activity-entry" }, [
+        el("div", { class: "activity-entry-head" }, [
+          el("span", {
+            class: "activity-entry-project",
+            text: entry.project || "workspace",
+          }),
+          el("span", {
+            class: "activity-entry-ts",
+            text: formatShortTime(entry.ts),
+          }),
+        ]),
+        el("div", {
+          class: "activity-entry-line",
+          text: auditSummary(entry),
+        }),
+      ]));
+    }
+  }
+
   // ----- push refresh / fallback polling ---------------------------------
 
   function refreshFromPush() {
     pollDashboard();
     loadSurfaces();
+    loadActivity();
     if (state.selectedSurface) {
       loadHistory(state.selectedSurface);
       if (state.auditExpanded[state.selectedSurface]) {
@@ -1007,6 +1616,7 @@
 
   function refreshFromFallback() {
     pollDashboard();
+    loadActivity();
     if (state.selectedSurface) loadHistory(state.selectedSurface);
   }
 
@@ -1155,9 +1765,7 @@
         return;
       }
       input.value = "";
-      sendMessage(state.selectedSurface, text).catch((err) => {
-        renderHistoryError(err);
-      });
+      sendMessage(state.selectedSurface, text).catch(() => {});
     });
   }
 
@@ -1184,9 +1792,46 @@
     });
   }
 
+  function wireProjectControls() {
+    const filter = $("project-filter");
+    if (filter) {
+      filter.addEventListener("input", () => {
+        state.projectFilter = filter.value || "";
+        renderProjects();
+        loadSurfaces();
+      });
+    }
+    const sort = $("project-sort");
+    if (sort) {
+      sort.value = state.projectSort;
+      sort.addEventListener("change", () => {
+        state.projectSort = sort.value || "urgency";
+        renderProjects();
+        loadSurfaces();
+      });
+    }
+  }
+
+  function wireActivityControls() {
+    const since = $("activity-since");
+    if (since) {
+      since.value = state.activitySince;
+      since.addEventListener("change", () => {
+        state.activitySince = since.value || ACTIVITY_DEFAULT_SINCE;
+        loadActivity();
+      });
+    }
+    const refresh = $("activity-refresh");
+    if (refresh) {
+      refresh.addEventListener("click", () => loadActivity());
+    }
+  }
+
   function init() {
     maybeShowSessionExpiryBanner();
+    wireProjectControls();
     wireSurfaceFilter();
+    wireActivityControls();
     wireSendForm();
     wireStopAgentButton();
     setStatus("warn", "connecting…");
@@ -1209,12 +1854,16 @@
     selectTask: selectTask,
     interruptSurface: interruptSurface,
     pollDashboard: pollDashboard,
+    loadActivity: loadActivity,
     startEventStream: startEventStream,
     startFallbackPolling: startFallbackPolling,
     handleSseEvent: handleSseEvent,
     renderAuditPanel: renderAuditPanel,
     renderSurfaces: renderSurfaces,
+    renderProjects: renderProjects,
     renderDashboard: renderDashboard,
+    renderActivity: renderActivity,
+    dedupeTaskSurfaces: dedupeTaskSurfaces,
     state: state,
   };
 

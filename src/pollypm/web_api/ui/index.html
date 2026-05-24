@@ -21,13 +21,37 @@
 
 <main id="layout">
   <aside id="surface-rail" aria-label="Chat surfaces">
+    <h2 class="rail-title">Projects</h2>
+    <div class="project-controls">
+      <input
+        id="project-filter"
+        class="rail-input"
+        type="search"
+        placeholder="Search projects"
+        aria-label="Search projects"
+        autocomplete="off"
+      />
+      <select
+        id="project-sort"
+        class="rail-select"
+        aria-label="Sort projects"
+      >
+        <option value="urgency">Urgency</option>
+        <option value="recent">Recent</option>
+        <option value="name">Name</option>
+        <option value="inbox_desc">Inbox</option>
+      </select>
+    </div>
+    <ul id="project-list" class="project-list">
+      <li class="project-empty">loading…</li>
+    </ul>
     <h2 class="rail-title">Surfaces</h2>
     <div class="surface-filter-wrap">
       <input
         id="surface-filter"
-        class="surface-filter"
+        class="rail-input surface-filter"
         type="search"
-        placeholder="Filter surfaces"
+        placeholder="Search surfaces"
         aria-label="Filter surfaces"
         autocomplete="off"
       />
@@ -70,6 +94,25 @@
     <h2 class="rail-title">Dashboard</h2>
     <div id="dashboard-rollups" class="dashboard-rollups">
       <div class="rollup-empty">loading…</div>
+    </div>
+    <h2 class="rail-title">Activity</h2>
+    <div class="activity-controls">
+      <select id="activity-since" class="rail-select" aria-label="Activity window">
+        <option value="24h">24h</option>
+        <option value="2d" selected>2d</option>
+        <option value="7d">7d</option>
+      </select>
+      <button
+        id="activity-refresh"
+        class="activity-refresh"
+        type="button"
+      >Refresh</button>
+    </div>
+    <div id="activity-summary" class="activity-summary">
+      <div class="activity-empty">loading…</div>
+    </div>
+    <div id="activity-feed" class="activity-feed">
+      <div class="activity-empty">loading…</div>
     </div>
   </aside>
 </main>

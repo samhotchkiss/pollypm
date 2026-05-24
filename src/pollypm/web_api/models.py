@@ -115,6 +115,7 @@ class Project(BaseModel):
     task_counts: dict[str, int] = Field(default_factory=dict)
     open_inbox_count: int
     pending_plan_review: bool
+    last_activity_at: datetime | None = None
 
 
 class ProjectListResponse(BaseModel):

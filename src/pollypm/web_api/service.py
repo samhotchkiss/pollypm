@@ -965,6 +965,10 @@ def _project_to_api_from_tasks(
         for task in tasks
     )
     open_inbox_count = _open_inbox_count_from_tasks(tasks)
+    last_activity_at = _max_datetime(
+        _latest_task_activity(tasks),
+        _latest_audit_activity(key, project),
+    )
     return _project_to_api_from_metrics(
         config,
         key,
@@ -972,6 +976,7 @@ def _project_to_api_from_tasks(
         counts=counts,
         pending_plan_review=pending_plan_review,
         open_inbox_count=open_inbox_count,
+        last_activity_at=last_activity_at,
     )
 
 
@@ -983,6 +988,7 @@ def _project_to_api_from_metrics(
     counts: dict[str, int],
     pending_plan_review: bool,
     open_inbox_count: int,
+    last_activity_at: datetime | None = None,
 ) -> APIProject:
     glyph = _glyph_for_project(
         project, counts, pending_plan_review, open_inbox_count
@@ -1001,6 +1007,7 @@ def _project_to_api_from_metrics(
         task_counts=counts,
         open_inbox_count=open_inbox_count,
         pending_plan_review=pending_plan_review,
+        last_activity_at=last_activity_at,
     )
 
 
@@ -1008,6 +1015,7 @@ def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> A
     counts: dict[str, int] = {}
     pending_plan_review = False
     open_inbox_count = 0
+    last_activity_at: datetime | None = None
 
     try:
         with _open_work_service_readonly(
@@ -1021,6 +1029,11 @@ def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> A
                 pending_plan_review = _has_pending_plan_review(svc, key)
             except Exception:  # noqa: BLE001
                 pending_plan_review = False
+            try:
+                latest_tasks = svc.list_tasks(project=key, limit=200)
+                last_activity_at = _latest_task_activity(latest_tasks)
+            except Exception:  # noqa: BLE001
+                last_activity_at = None
     except Exception as exc:  # noqa: BLE001
         logger.debug("project counts: work-service unavailable for %s: %s", key, exc)
 
@@ -1029,6 +1042,10 @@ def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> A
     except Exception as exc:  # noqa: BLE001
         logger.debug("project inbox count failed for %s: %s", key, exc)
 
+    last_activity_at = _max_datetime(
+        last_activity_at,
+        _latest_audit_activity(key, project),
+    )
     return _project_to_api_from_metrics(
         config,
         key,
@@ -1036,7 +1053,42 @@ def _project_to_api(config: PollyPMConfig, key: str, project: KnownProject) -> A
         counts=counts,
         pending_plan_review=pending_plan_review,
         open_inbox_count=open_inbox_count,
+        last_activity_at=last_activity_at,
     )
+
+
+def _max_datetime(a: datetime | None, b: datetime | None) -> datetime | None:
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return a if _datetime_sort_value(a) >= _datetime_sort_value(b) else b
+
+
+def _datetime_sort_value(value: datetime) -> float:
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.timestamp()
+
+
+def _latest_task_activity(tasks: Iterable[Any]) -> datetime | None:
+    latest: datetime | None = None
+    for task in tasks:
+        updated = getattr(task, "updated_at", None)
+        if isinstance(updated, datetime):
+            latest = _max_datetime(latest, updated)
+    return latest
+
+
+def _latest_audit_activity(key: str, project: KnownProject) -> datetime | None:
+    try:
+        events = read_events(key, project_path=project.path, limit=1)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("project audit activity failed for %s: %s", key, exc)
+        return None
+    if not events:
+        return None
+    return _parse_iso(events[-1].ts)
 
 
 def _glyph_for_project(

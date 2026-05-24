@@ -1866,6 +1866,219 @@ def reassign_task(
         ) from exc
 
 
+# ---------------------------------------------------------------------------
+# Lifecycle REST verbs (#2137) — done / approve / hold / rework / block /
+# review / in_progress. Each helper mirrors :func:`claim_task` /
+# :func:`cancel_task`: open a fresh work-service, route to the matching
+# pg-service method, map ``TaskNotFoundError`` → 404,
+# ``InvalidTransitionError`` → 409 invalid_state, ``ValidationError`` →
+# 422 validation_error, and ``_BACKING_STORE_ERRORS`` → 503. Returns the
+# post-transition :class:`TaskDetail` so the client refreshes in one
+# round-trip (spec §5.3 wrapper, same shape as the existing verbs).
+# ---------------------------------------------------------------------------
+
+
+def _run_lifecycle_transition(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    verb: str,
+    op,
+) -> APITaskDetail:
+    """Shared scaffolding for the #2137 lifecycle helpers.
+
+    ``op(svc, task_id)`` performs the actual work-service call. The
+    helper handles project lookup, exception mapping, and the final
+    ``svc.get`` → :class:`TaskDetail` hydration so each verb's helper
+    is two lines of intent + one ``op`` lambda.
+    """
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    task_id = f"{project_key}/{task_number}"
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                op(svc, task_id)
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task_id}") from exc
+            except InvalidTransitionError as exc:
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc)
+                    or f"Task {task_id} cannot transition via {verb}.",
+                    hint=(
+                        "Refresh the task to see the current "
+                        "`work_status`; the requested transition is "
+                        "not legal from that state."
+                    ),
+                ) from exc
+            except WorkValidationError as exc:
+                raise APIError(
+                    status_code=422,
+                    code="validation_error",
+                    message=str(exc) or f"{verb} validation failed.",
+                ) from exc
+            task = svc.get(task_id)
+            return _task_to_detail_with_plan(task, svc=svc)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "%s_task: backing store error for %s: %s",
+            verb,
+            task_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while {verb}-ing {task_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def done_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+) -> APITaskDetail:
+    """Force a task to ``done`` via :meth:`PgWorkService.mark_done`.
+
+    Operator "force done" gesture. The flow-respecting variant
+    (:meth:`node_done`) requires a work-output payload; the Web UI
+    needs a simpler surface (the Wave 2A finding behind #2137).
+    """
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="done",
+        op=lambda svc, task_id: svc.mark_done(task_id, actor),
+    )
+
+
+def approve_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+    reason: str | None = None,
+) -> APITaskDetail:
+    """Approve a task at a review node — see :meth:`PgWorkService.approve`."""
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="approve",
+        op=lambda svc, task_id: svc.approve(task_id, actor, reason),
+    )
+
+
+def hold_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+    reason: str | None = None,
+) -> APITaskDetail:
+    """Move a task to ``on_hold`` — see :meth:`PgWorkService.hold`."""
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="hold",
+        op=lambda svc, task_id: svc.hold(task_id, actor, reason),
+    )
+
+
+def rework_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+    reason: str,
+) -> APITaskDetail:
+    """Reject a review-state task back to ``rework`` — see :meth:`PgWorkService.reject`.
+
+    Note ``reason`` is required at the work-service level; the route
+    model (:class:`TaskReworkRequest`) enforces ``min_length=1`` so a
+    missing reason fails at request-validation time with 422.
+    """
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="rework",
+        op=lambda svc, task_id: svc.reject(task_id, actor, reason),
+    )
+
+
+def block_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+    blocker_task_id: str,
+) -> APITaskDetail:
+    """Mark a task ``blocked`` by ``blocker_task_id`` — see :meth:`PgWorkService.block`."""
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="block",
+        op=lambda svc, task_id: svc.block(task_id, actor, blocker_task_id),
+    )
+
+
+def review_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+) -> APITaskDetail:
+    """Force ``in_progress`` → ``review`` — see :meth:`PgWorkService.force_review`."""
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="review",
+        op=lambda svc, task_id: svc.force_review(task_id, actor),
+    )
+
+
+def in_progress_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+) -> APITaskDetail:
+    """Force a non-terminal task into ``in_progress`` — see :meth:`PgWorkService.force_in_progress`."""
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="in_progress",
+        op=lambda svc, task_id: svc.force_in_progress(task_id, actor),
+    )
+
+
 # Labels supported on PATCH ``status`` — we route the request through the
 # work-service lifecycle method that maps to each value. Statuses without
 # a direct setter (e.g. ``in_progress``, ``review``) raise 422 with a

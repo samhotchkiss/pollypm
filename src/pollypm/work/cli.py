@@ -369,6 +369,9 @@ def _print_task(task, as_json: bool = False, show_internal: bool = False) -> Non
         typer.echo(f"Type:     {task.type.value}")
         if task.assignee:
             typer.echo(f"Assignee: {task.assignee}")
+        claimed_by_session = getattr(task, "claimed_by_session", None)
+        if claimed_by_session:
+            typer.echo(f"Claimed:  {claimed_by_session}")
         if task.current_node_id:
             typer.echo(f"Node:     {task.current_node_id}")
         if task.description:
@@ -418,6 +421,7 @@ def _task_to_dict(task) -> dict:
         "priority": task.priority.value,
         "kind": kind_value,
         "assignee": task.assignee,
+        "claimed_by_session": getattr(task, "claimed_by_session", None),
         "current_node_id": task.current_node_id,
         "description": task.description,
         "acceptance_criteria": task.acceptance_criteria,

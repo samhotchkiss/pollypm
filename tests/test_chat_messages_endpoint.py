@@ -774,6 +774,120 @@ def test_messages_endpoint_emits_thinking_envelopes_when_include_thinking_true(
     assert thinking_msg["metadata"]["signature"] == "opaque"
 
 
+def test_messages_endpoint_include_thinking_reaches_ingested_surface_archive(
+    client, auth_headers, config, project_root, monkeypatch,
+):
+    """A real surface + ingested Claude transcript can return thinking.
+
+    Regression for #2160: ``source=auto`` used to choose stale tmux
+    capture before reading the archive, so ``include_thinking=true``
+    returned zero thinking envelopes even when the raw Claude JSONL had
+    an Anthropic ``thinking`` block. This drives the real ingestor,
+    real surface registry, and real REST route; only tmux is faked.
+    """
+    import json as _json
+
+    from pollypm.transcript_ingest import sync_transcripts_once
+    from pollypm.tmux.client import TmuxWindow
+    from pollypm.web_api.chat.transcripts import _parse_cache_clear
+
+    account_home = project_root / ".pollypm/homes/claude_main"
+    config.accounts["claude_main"] = AccountConfig(
+        name="claude_main",
+        provider=ProviderKind.CLAUDE,
+        home=account_home,
+    )
+    config.pollypm.controller_account = "claude_main"
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CLAUDE,
+        account="claude_main",
+        cwd=project_root,
+        project="myproj",
+        window_name="operator",
+    )
+
+    raw_path = (
+        account_home
+        / ".claude/projects/demo/session-rest-thinking.jsonl"
+    )
+    raw_path.parent.mkdir(parents=True, exist_ok=True)
+    raw_path.write_text(_json.dumps({
+        "type": "assistant",
+        "sessionId": "session-rest-thinking",
+        "timestamp": "2026-05-21T10:00:00Z",
+        "cwd": str(project_root),
+        "message": {
+            "role": "assistant",
+            "model": "claude-opus-4-7",
+            "content": [
+                {
+                    "type": "thinking",
+                    "thinking": "Route-level thought.",
+                    "signature": "sig-route",
+                },
+                {"type": "text", "text": "Visible reply."},
+            ],
+        },
+    }) + "\n")
+    sync_transcripts_once(config)
+    archive = (
+        project_root
+        / ".pollypm/transcripts/session-rest-thinking/events.jsonl"
+    )
+    assert archive.exists()
+    _parse_cache_clear()
+
+    class _LiveTmuxClient:
+        def list_windows(self, target, timeout=None):  # noqa: ARG002
+            return [TmuxWindow(
+                session=target,
+                index=0,
+                name="operator",
+                active=True,
+                pane_id="%2160",
+                pane_current_command="claude",
+                pane_current_path=str(project_root),
+                pane_dead=False,
+            )]
+
+        def capture_pane(self, target, lines=3000):  # noqa: ARG002
+            return "live capture without hidden thinking"
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_tmux_client",
+        lambda: _LiveTmuxClient(),
+    )
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "is_archive_stale",
+        lambda path, **kw: True,
+    )
+
+    default_response = client.get(
+        "/api/v1/chat/operator/messages?direction=asc",
+        headers=auth_headers,
+    )
+    assert default_response.status_code == 200, default_response.text
+    default_body = default_response.json()
+    assert default_body["transcript_source"] == "capture"
+    assert [m["type"] for m in default_body["messages"]] == ["text"]
+
+    thinking_response = client.get(
+        "/api/v1/chat/operator/messages?include_thinking=true&direction=asc",
+        headers=auth_headers,
+    )
+    assert thinking_response.status_code == 200, thinking_response.text
+    body = thinking_response.json()
+    assert body["transcript_source"] == "jsonl"
+    assert [m["type"] for m in body["messages"]] == ["thinking", "text"]
+    assert body["messages"][0]["text"] == "Route-level thought."
+    assert body["messages"][0]["metadata"]["signature"] == "sig-route"
+    assert body["messages"][1]["text"] == "Visible reply."
+
+
 def test_messages_endpoint_no_subagent_inlining_by_default(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):

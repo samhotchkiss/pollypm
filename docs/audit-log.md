@@ -108,10 +108,14 @@ The current event families are:
 | `work_db.opened` | `PgWorkService.__init__` | `had_messages_table_pre_open`, `tables_created`, `project_path` |
 | `work_table.cleared` | Reserved for future wholesale work-table reset paths | reset reason and affected scope |
 | `heartbeat.tick` | audit watchdog cadence | cadence metadata |
+| `heartbeat.missing` | supervisor recovery detection | `session`, `window_name`, `tmux_session`, `failure_type`, `failure_message` |
+| `session.spawn` | supervisor recovery relaunch | `session`, `window_name`, `tmux_session`, `failure_type`, `account`, `provider` |
 | `audit.finding` | audit watchdog findings | `rule`, `message`, `recommendation`, plus rule-specific data |
 | `worker.session_reaped` | worker marker reaper | `window_name`, `marker_path`, `reason` |
 | `watchdog.escalation_dispatched` | auto-unstick dispatch path | `finding_type`, `subject`, `brief` |
 | `session.provisioned` | reviewer/role recovery provisioning | `role`, `project`, `reason` |
+| `session.pause.marker_unreadable` | pause-marker reader | `path`, `reason`, `last_readable_paused_names` |
+| `session.pause.marker_restored` | pause-marker reader | `path`, `restored_size_bytes`, `restored_mtime`, `paused_state_diff` |
 | `worker.thread_leaked` | job worker shutdown leak detector | worker/thread diagnostic metadata |
 | `socket.reaped` | cockpit socket reaper | stale socket diagnostics |
 | `daemon.reaped` | rail daemon reaper | `role`, `pid`, `age_s`, `reason` |

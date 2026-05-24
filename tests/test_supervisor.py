@@ -1428,6 +1428,88 @@ def test_recovery_waits_on_non_pollypm_lease(tmp_path: Path) -> None:
     assert "lease owner human" in alerts[0].message
 
 
+def test_missing_window_recovery_emits_heartbeat_missing_audit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.audit.log import EVENT_HEARTBEAT_MISSING, read_events
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(
+        item for item in supervisor.plan_launches()
+        if item.session.name == "operator"
+    )
+
+    monkeypatch.setattr(supervisor, "_policy_recommendation", lambda *_: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_record_recovery_attempt",
+        lambda *_args, **_kwargs: (False, 1),
+    )
+
+    supervisor.maybe_recover_session(
+        launch,
+        failure_type="missing_window",
+        failure_message="Expected tmux window is missing",
+    )
+
+    events = read_events(
+        "pollypm",
+        project_path=tmp_path,
+        event=EVENT_HEARTBEAT_MISSING,
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.subject == "operator"
+    assert event.actor == "heartbeat"
+    assert event.status == "warn"
+    assert event.metadata["session"] == "operator"
+    assert event.metadata["failure_type"] == "missing_window"
+    assert event.metadata["window_name"] == "pm-operator"
+
+
+def test_restart_session_emits_session_spawn_audit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.audit.log import EVENT_SESSION_SPAWN, read_events
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(
+        item for item in supervisor.plan_launches()
+        if item.session.name == "operator"
+    )
+
+    monkeypatch.setattr(supervisor.session_service.tmux, "has_session", lambda _name: False)
+    monkeypatch.setattr(supervisor, "launch_session", lambda _name: launch)
+
+    supervisor.restart_session(
+        "operator",
+        "claude_controller",
+        failure_type="missing_window",
+    )
+
+    events = read_events(
+        "pollypm",
+        project_path=tmp_path,
+        event=EVENT_SESSION_SPAWN,
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.subject == "operator"
+    assert event.actor == "supervisor"
+    assert event.status == "ok"
+    assert event.metadata["session"] == "operator"
+    assert event.metadata["failure_type"] == "missing_window"
+    assert event.metadata["account"] == "claude_controller"
+
+
 def test_stalled_worker_gets_heartbeat_nudge_after_five_identical_cycles(monkeypatch, tmp_path: Path) -> None:
     config = _config(tmp_path)
     # #1004: pin workspace_root so the work-db resolver lands inside

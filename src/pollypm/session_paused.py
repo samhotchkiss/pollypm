@@ -75,6 +75,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -174,6 +175,9 @@ _MARKER_STATE_LOCK = threading.Lock()
 # can detect transitions and emit a restored event when the marker
 # becomes readable again.
 _LAST_MARKER_KIND: dict[str, str] = {}
+# Last known readable paused-name set. ``None`` means the process has
+# never seen a readable state for that marker path.
+_LAST_MARKER_NAMES: dict[str, frozenset[str] | None] = {}
 # Last monotonic timestamp at which we emitted the unreadable event
 # for a given marker path. ``None`` / missing entry means "never";
 # we deliberately avoid 0.0 because :func:`time.monotonic` can return
@@ -442,6 +446,7 @@ def _reset_skip_throttle_for_tests() -> None:
         _PAUSE_SKIP_LAST_EMITTED.clear()
     with _MARKER_STATE_LOCK:
         _LAST_MARKER_KIND.clear()
+        _LAST_MARKER_NAMES.clear()
         _LAST_UNREADABLE_EMITTED.clear()
 
 
@@ -519,6 +524,166 @@ def _marker_state_key(config: Any) -> str:
     return str(path)
 
 
+def _project_audit_context(config: Any) -> tuple[str, Path | None]:
+    """Return the audit project key and per-project path for ``config``."""
+    project_key = ""
+    project_path: Path | None = None
+    project_obj = getattr(config, "project", None)
+    if project_obj is not None:
+        project_key = str(
+            getattr(project_obj, "name", "")
+            or getattr(project_obj, "key", "")
+            or ""
+        )
+        root = getattr(project_obj, "root_dir", None)
+        if root is not None:
+            project_path = Path(root)
+    return project_key, project_path
+
+
+def _parse_audit_ts(value: str) -> datetime | None:
+    try:
+        if value.endswith("Z"):
+            value = value[:-1] + "+00:00"
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def _audit_event_age_seconds(ts: str) -> float | None:
+    parsed = _parse_audit_ts(ts)
+    if parsed is None:
+        return None
+    return (datetime.now(UTC) - parsed).total_seconds()
+
+
+def _latest_marker_diagnostic(config: Any, key: str) -> Any | None:
+    """Return the latest marker diagnostic for ``key`` from the audit log.
+
+    The unreadable/restored contract must survive heartbeat process
+    restarts. The canonical audit log is the durable state handoff:
+    process-local dictionaries are only a fast path for a long-lived
+    daemon.
+    """
+    try:
+        from pollypm.audit.log import read_events
+    except Exception:  # noqa: BLE001
+        logger.debug("pause marker diagnostic read import failed", exc_info=True)
+        return None
+
+    project_key, project_path = _project_audit_context(config)
+    wanted = {
+        PAUSE_MARKER_RESTORED_EVENT_TYPE,
+        PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
+    }
+    rows = []
+    try:
+        for event_type in wanted:
+            rows.extend(
+                read_events(
+                    project_key,
+                    project_path=project_path,
+                    event=event_type,
+                    limit=50,
+                )
+            )
+    except Exception:  # noqa: BLE001
+        logger.debug("pause marker diagnostic read failed", exc_info=True)
+        return None
+    rows.sort(key=lambda row: getattr(row, "ts", ""))
+    for row in reversed(rows):
+        if getattr(row, "event", "") not in wanted:
+            continue
+        metadata = getattr(row, "metadata", {}) or {}
+        if metadata.get("path") == key:
+            return row
+    return None
+
+
+def _names_from_unreadable_event(row: Any) -> frozenset[str] | None:
+    metadata = getattr(row, "metadata", {}) or {}
+    raw = metadata.get("last_readable_paused_names")
+    if not isinstance(raw, list):
+        return None
+    return frozenset(str(name) for name in raw if isinstance(name, str))
+
+
+def _marker_file_metadata(config: Any) -> dict[str, Any]:
+    path = _pause_marker_path(config)
+    if path is None:
+        return {
+            "restored_size_bytes": None,
+            "restored_mtime": None,
+        }
+    try:
+        stat = path.stat()
+    except FileNotFoundError:
+        return {
+            "restored_size_bytes": 0,
+            "restored_mtime": None,
+        }
+    except OSError as exc:
+        return {
+            "restored_size_bytes": None,
+            "restored_mtime": None,
+            "stat_error": f"{type(exc).__name__}: {exc!s}",
+        }
+    return {
+        "restored_size_bytes": stat.st_size,
+        "restored_mtime": datetime.fromtimestamp(stat.st_mtime, UTC).isoformat(),
+    }
+
+
+def _unreadable_metadata(
+    key: str,
+    state: MarkerState,
+    *,
+    prior_names: frozenset[str] | None,
+) -> dict[str, Any]:
+    metadata: dict[str, Any] = {"path": key, "reason": state.reason}
+    if prior_names is None:
+        metadata["last_readable_paused_names"] = None
+        metadata["last_readable_paused_count"] = None
+    else:
+        metadata["last_readable_paused_names"] = sorted(prior_names)
+        metadata["last_readable_paused_count"] = len(prior_names)
+    return metadata
+
+
+def _restored_metadata(
+    config: Any,
+    key: str,
+    state: MarkerState,
+    *,
+    prior_names: frozenset[str] | None,
+) -> dict[str, Any]:
+    current_names = state.names if state.kind == "ok" else frozenset()
+    previous_known = prior_names is not None
+    previous_names = prior_names or frozenset()
+    diff = {
+        "previous_names_known": previous_known,
+        "previous_state": "unreadable_fail_closed",
+        "current_state": state.kind,
+        "added_paused": sorted(current_names - previous_names)
+        if previous_known else sorted(current_names),
+        "removed_paused": sorted(previous_names - current_names)
+        if previous_known else [],
+    }
+    metadata: dict[str, Any] = {
+        "path": key,
+        "kind": state.kind,
+        "restored_at": datetime.now(UTC).isoformat(),
+        "paused_names": sorted(current_names),
+        "paused_count": len(current_names),
+        "paused_state_diff": diff,
+    }
+    metadata.update(_marker_file_metadata(config))
+    return metadata
+
+
 def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
     """Detect ``unreadable`` transitions and emit one-time diagnostics.
 
@@ -535,9 +700,16 @@ def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
     """
     key = _marker_state_key(config)
     kind = state.kind
+    prior_names: frozenset[str] | None = None
+    check_persistent_restored = False
     with _MARKER_STATE_LOCK:
         prior = _LAST_MARKER_KIND.get(key)
+        prior_names = _LAST_MARKER_NAMES.get(key)
         _LAST_MARKER_KIND[key] = kind
+        if kind == "ok":
+            _LAST_MARKER_NAMES[key] = state.names
+        elif kind == "absent":
+            _LAST_MARKER_NAMES[key] = frozenset()
         if kind == "unreadable":
             last_emit = _LAST_UNREADABLE_EMITTED.get(key)
             now = time.monotonic()
@@ -553,6 +725,7 @@ def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
             should_warn = became_unreadable
         else:
             should_emit = prior == "unreadable"
+            check_persistent_restored = prior is None
             should_warn = False
             # Successful read resets the unreadable-emit window so the
             # next failure re-emits even if it lands inside the prior
@@ -572,6 +745,17 @@ def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
         except Exception:  # noqa: BLE001
             logger.debug("pause marker stderr warn failed", exc_info=True)
     if should_emit and kind == "unreadable":
+        latest = _latest_marker_diagnostic(config, key)
+        if (
+            latest is not None
+            and getattr(latest, "event", "") == PAUSE_MARKER_UNREADABLE_EVENT_TYPE
+        ):
+            age = _audit_event_age_seconds(str(getattr(latest, "ts", "")))
+            if (
+                age is not None
+                and age < PAUSE_MARKER_UNREADABLE_THROTTLE_SECONDS
+            ):
+                return
         _emit_marker_diagnostic(
             config,
             event=PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
@@ -580,9 +764,23 @@ def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
                 "recovery loops failing closed"
             ),
             status="warn",
-            metadata={"path": key, "reason": state.reason},
+            metadata=_unreadable_metadata(
+                key,
+                state,
+                prior_names=prior_names,
+            ),
         )
-    elif should_emit:
+    elif not should_emit and check_persistent_restored:
+        latest = _latest_marker_diagnostic(config, key)
+        if (
+            latest is not None
+            and getattr(latest, "event", "") == PAUSE_MARKER_UNREADABLE_EVENT_TYPE
+        ):
+            should_emit = True
+            persisted_names = _names_from_unreadable_event(latest)
+            if persisted_names is not None:
+                prior_names = persisted_names
+    if should_emit and kind != "unreadable":
         _emit_marker_diagnostic(
             config,
             event=PAUSE_MARKER_RESTORED_EVENT_TYPE,
@@ -591,7 +789,12 @@ def _record_marker_kind_transition(config: Any, state: MarkerState) -> None:
                 f"(kind={kind}); recovery loops resumed normal gating"
             ),
             status="ok",
-            metadata={"path": key, "kind": kind},
+            metadata=_restored_metadata(
+                config,
+                key,
+                state,
+                prior_names=prior_names,
+            ),
         )
 
 
@@ -633,14 +836,7 @@ def _emit_marker_diagnostic(
         )
         return
 
-    project_key = ""
-    project_path: Path | None = None
-    project_obj = getattr(config, "project", None)
-    if project_obj is not None:
-        project_key = str(getattr(project_obj, "name", "") or "")
-        root = getattr(project_obj, "root_dir", None)
-        if root is not None:
-            project_path = Path(root)
+    project_key, project_path = _project_audit_context(config)
 
     try:
         _audit_emit(

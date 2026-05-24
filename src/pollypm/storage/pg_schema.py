@@ -353,6 +353,10 @@ CREATE INDEX IF NOT EXISTS idx_work_tasks_active
     ON work_tasks(current_node_id) WHERE current_node_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_work_tasks_priority
     ON work_tasks(priority, work_status);
+CREATE INDEX IF NOT EXISTS idx_work_tasks_project_updated
+    ON work_tasks(project, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_work_tasks_kind
+    ON work_tasks(kind);
 CREATE INDEX IF NOT EXISTS idx_work_tasks_predecessor
     ON work_tasks(predecessor_task_id) WHERE predecessor_task_id IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_work_tasks_labels_gin

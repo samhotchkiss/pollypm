@@ -49,7 +49,15 @@ router = APIRouter(tags=["Inbox"])
 def list_inbox_endpoint(
     config: ConfigDep,
     project: Annotated[str | None, Query()] = None,
-    type: Annotated[str | None, Query()] = None,
+    type: Annotated[
+        str | None,
+        Query(
+            description=(
+                "Inbox item type or structured kind, e.g. message, "
+                "plan_review, approval_request, manual_decision."
+            )
+        ),
+    ] = None,
     state: Annotated[str | None, Query()] = None,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     cursor: Annotated[str | None, Query()] = None,

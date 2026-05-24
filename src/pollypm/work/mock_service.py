@@ -294,6 +294,52 @@ class MockWorkService:
             out.append(copy)
         return out
 
+    def list_inbox_candidate_tasks(
+        self,
+        *,
+        project: str | None = None,
+        type_filter: str | None = None,
+        state_filter: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> list[Task]:
+        from pollypm.work.inbox_view import (
+            inbox_task_matches_type,
+            is_archived_inbox_task,
+            is_inbox_task,
+        )
+
+        tasks = list(self._tasks.values())
+        if project is not None:
+            tasks = [t for t in tasks if t.project == project]
+
+        state = (state_filter or "").strip().lower()
+        if state in {"closed", "resolved", "archived"}:
+            tasks = [t for t in tasks if is_archived_inbox_task(t, self)]
+        else:
+            tasks = [t for t in tasks if is_inbox_task(t, self)]
+            if state == "waiting-on-pm":
+                tasks = [t for t in tasks if t.work_status.value == "review"]
+            elif state == "open":
+                tasks = [t for t in tasks if t.work_status.value != "review"]
+            elif state in {"threaded", "waiting-on-pa"}:
+                tasks = []
+
+        tasks = [t for t in tasks if inbox_task_matches_type(t, type_filter)]
+        tasks.sort(
+            key=lambda t: (
+                t.updated_at.isoformat() if t.updated_at else "",
+                t.project,
+                t.task_number,
+            ),
+            reverse=True,
+        )
+        if offset:
+            tasks = tasks[offset:]
+        if limit:
+            tasks = tasks[:limit]
+        return [deepcopy(t) for t in tasks]
+
     def queue(self, task_id: str, actor: str, skip_gates: bool = False) -> Task:
         task = self._tasks.get(task_id)
         if task is None:

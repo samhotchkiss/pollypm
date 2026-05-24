@@ -23,6 +23,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Iterable, Protocol
 
+from pollypm.inbox.kind import InboxItemKind, coerce_kind
 from pollypm.work.inbox_snooze import is_snooze_active
 from pollypm.work.models import (
     ActorType,
@@ -173,6 +174,79 @@ def _is_plan_review_label(task: Task) -> bool:
     """
     labels = getattr(task, "labels", None) or []
     return any(label == "plan_review" for label in labels)
+
+
+def _labels(task: Task) -> set[str]:
+    return {str(label) for label in (getattr(task, "labels", None) or [])}
+
+
+def inbox_item_type_for_task(task: Task) -> str:
+    """Return the API inbox item type for a task-backed inbox row.
+
+    The work row carries both legacy labels and the structured ``kind``
+    discriminator. Keep the coarse API type derivation here so list filters,
+    detail conversion, and non-HTTP consumers agree on the same taxonomy.
+    """
+    labels = _labels(task)
+    if "blocking_question" in labels:
+        return "blocking_question"
+
+    kind = coerce_kind(getattr(task, "kind", None))
+    if kind is InboxItemKind.PLAN_REVIEW_PENDING:
+        return "plan_review"
+    if kind is InboxItemKind.WATCHDOG_OPERATOR_DISPATCH:
+        return "alert"
+    if kind is not InboxItemKind.LEGACY:
+        return kind.value
+
+    if "plan_review" in labels:
+        return "plan_review"
+    return "message"
+
+
+def inbox_task_matches_type(task: Task, type_filter: str | None) -> bool:
+    """Return True when ``task`` matches an API ``type=`` filter."""
+    if type_filter is None:
+        return True
+    wanted = str(type_filter).strip()
+    if not wanted:
+        return True
+    if inbox_item_type_for_task(task) == wanted:
+        return True
+    kind = coerce_kind(getattr(task, "kind", None))
+    return kind.value == wanted
+
+
+def inbox_state_for_task(task: Task) -> str:
+    """Map work-service lifecycle status to the API inbox state enum."""
+    status = getattr(task, "work_status", None)
+    value = getattr(status, "value", str(status)) if status else ""
+    if status in TERMINAL_STATUSES or value in {"done", "cancelled"}:
+        return "closed"
+    if value == "review":
+        return "waiting-on-pm"
+    return "open"
+
+
+def is_archived_inbox_task(
+    task: Task,
+    service: _FlowLookup,
+    *,
+    flow_cache: dict[tuple[str, int], FlowTemplate] | None = None,
+) -> bool:
+    """Return True iff ``task`` is a terminal row with inbox identity.
+
+    The work data model has no separate ``closed`` inbox state; archived
+    inbox rows are terminal work tasks (``done`` / ``cancelled``) that still
+    carry the same non-status inbox identity. This predicate is the shared
+    closed/resolved/archive check used by API state filters and archive
+    conflict handling.
+    """
+    status = getattr(task, "work_status", None)
+    value = getattr(status, "value", str(status)) if status else ""
+    if status not in TERMINAL_STATUSES and value not in {"done", "cancelled"}:
+        return False
+    return is_inbox_task_identity(task, service, flow_cache=flow_cache)
 
 
 def is_inbox_task_identity(

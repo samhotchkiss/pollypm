@@ -30,8 +30,15 @@ import psycopg_pool
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
-from pollypm.work.inbox_snooze import is_snooze_active as _is_snooze_active
-from pollypm.work.inbox_view import is_inbox_task, is_inbox_task_identity
+from pollypm.work import inbox_snooze as _inbox_snooze
+from pollypm.work.inbox_view import (
+    inbox_item_type_for_task,
+    inbox_state_for_task,
+    inbox_task_matches_type,
+    is_archived_inbox_task,
+    is_inbox_task,
+    is_inbox_task_identity,
+)
 from pollypm.web_api.errors import (
     APIError,
     not_found,
@@ -67,6 +74,9 @@ from pollypm.work.cancel_safety import (
 )
 
 logger = logging.getLogger(__name__)
+
+_is_snooze_active = _inbox_snooze.is_snooze_active
+_parse_snooze_until = _inbox_snooze.parse_snooze_until
 
 
 # ---------------------------------------------------------------------------
@@ -2946,11 +2956,19 @@ def list_inbox(
     coarser granularity — the API only exposes the typed shape per
     spec §7. Projects with no inbox state contribute nothing.
     """
-    items = _collect_inbox_items(config, project=project)
-    if type_filter is not None:
-        items = [i for i in items if i.type == type_filter]
-    if state_filter is not None:
-        items = [i for i in items if i.state == state_filter]
+    # The no-cursor first page is the hot path. Ask the work-service for
+    # only enough candidates to fill this page plus one sentinel row, then
+    # merge/sort across projects below. Cursor pages keep the older full
+    # scan path for correctness until the service grows cross-project
+    # keyset cursors.
+    candidate_limit = None if cursor is not None else limit + 1
+    items = _collect_inbox_items(
+        config,
+        project=project,
+        type_filter=type_filter,
+        state_filter=state_filter,
+        limit=candidate_limit,
+    )
     items.sort(key=lambda item: item.updated_at, reverse=True)
 
     cursor_idx = 0
@@ -2967,8 +2985,36 @@ def list_inbox(
 
 
 def get_inbox_item(config: PollyPMConfig, item_id: str) -> APIInboxItemDetail | None:
-    items = _collect_inbox_items(config, project=None)
-    target = next((item for item in items if item.id == item_id), None)
+    if "/" not in item_id:
+        return None
+    project_key = item_id.split("/", 1)[0]
+    project = config.projects.get(project_key)
+    if project is None:
+        return None
+    try:
+        from pollypm.work.service_support import TaskNotFoundError
+
+        with _open_work_service_readonly(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            try:
+                task = svc.get(item_id)
+            except TaskNotFoundError:
+                return None
+            target = _task_to_inbox_item(
+                task, svc, flow_cache={}, include_closed=True,
+            )
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "get_inbox_item: backing store error for %s: %s",
+            item_id,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable while reading {item_id}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
     if target is None:
         return None
     messages = _load_inbox_messages(config, target)
@@ -2989,7 +3035,12 @@ def get_inbox_item(config: PollyPMConfig, item_id: str) -> APIInboxItemDetail | 
 
 
 def _collect_inbox_items(
-    config: PollyPMConfig, *, project: str | None
+    config: PollyPMConfig,
+    *,
+    project: str | None,
+    type_filter: str | None = None,
+    state_filter: str | None = None,
+    limit: int | None = None,
 ) -> list[APIInboxItem]:
     """Load inbox items from the work-service for the requested projects.
 
@@ -3006,13 +3057,20 @@ def _collect_inbox_items(
         keys = config.projects.keys()
 
     now = datetime.now(timezone.utc)
+    include_closed = _state_filter_requests_closed(state_filter)
     for key in keys:
         proj = config.projects[key]
         try:
             with _open_work_service_readonly(
                 config=config, project_key=key, project_path=proj.path
             ) as svc:
-                tasks = svc.list_tasks(project=key)
+                tasks = _list_inbox_candidate_tasks(
+                    svc,
+                    project=key,
+                    type_filter=type_filter,
+                    state_filter=state_filter,
+                    limit=limit,
+                )
                 # Snooze visibility (#2060): the snooze write helper
                 # persists ``entry_type='snooze'`` rows whose text
                 # encodes the wake-up time. Items whose latest snooze
@@ -3040,9 +3098,19 @@ def _collect_inbox_items(
                 for task in tasks:
                     if task.task_id in snoozed_ids:
                         continue
-                    entry = _task_to_inbox_item(task, svc, flow_cache=flow_cache)
-                    if entry is not None:
-                        out.append(entry)
+                    if not inbox_task_matches_type(task, type_filter):
+                        continue
+                    entry = _task_to_inbox_item(
+                        task,
+                        svc,
+                        flow_cache=flow_cache,
+                        include_closed=include_closed,
+                    )
+                    if entry is None:
+                        continue
+                    if not _inbox_item_matches_state(entry, state_filter):
+                        continue
+                    out.append(entry)
         except _BACKING_STORE_ERRORS as exc:
             # Backing-store failure on a single project: log loudly,
             # skip that project but keep building the aggregate. We
@@ -3058,6 +3126,62 @@ def _collect_inbox_items(
             )
             continue
     return out
+
+
+_CLOSED_INBOX_STATE_FILTERS: frozenset[str] = frozenset(
+    {"closed", "resolved", "archived"}
+)
+
+
+def _state_filter_requests_closed(state_filter: str | None) -> bool:
+    return (
+        state_filter is not None
+        and str(state_filter).strip().lower() in _CLOSED_INBOX_STATE_FILTERS
+    )
+
+
+def _inbox_item_matches_state(
+    item: APIInboxItem, state_filter: str | None,
+) -> bool:
+    if state_filter is None:
+        return item.state != "closed"
+    wanted = str(state_filter).strip().lower()
+    if wanted in _CLOSED_INBOX_STATE_FILTERS:
+        return item.state == "closed"
+    return item.state == wanted
+
+
+def _list_inbox_candidate_tasks(
+    svc,
+    *,
+    project: str,
+    type_filter: str | None,
+    state_filter: str | None,
+    limit: int | None,
+):
+    """Ask the work-service for a bounded inbox-candidate page.
+
+    Pg exposes ``list_inbox_candidate_tasks`` so state/type predicates and
+    limits land in SQL. Older fakes/backends fall back to ``list_tasks`` with
+    the same limit when their signature accepts it.
+    """
+    optimized = getattr(svc, "list_inbox_candidate_tasks", None)
+    if callable(optimized):
+        return optimized(
+            project=project,
+            type_filter=type_filter,
+            state_filter=state_filter,
+            limit=limit,
+        )
+
+    kwargs: dict[str, object] = {"project": project}
+    if limit is not None:
+        kwargs["limit"] = limit
+    try:
+        return svc.list_tasks(**kwargs)
+    except TypeError:
+        kwargs.pop("limit", None)
+        return svc.list_tasks(**kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -3198,10 +3322,25 @@ class _NoFlowLookup:
         return None
 
 
-def _task_to_inbox_item(task, svc=None, flow_cache=None) -> APIInboxItem | None:
-    if not _is_inbox_member(task, svc, flow_cache=flow_cache):
+def _task_to_inbox_item(
+    task,
+    svc=None,
+    flow_cache=None,
+    *,
+    include_closed: bool = False,
+) -> APIInboxItem | None:
+    is_member = _is_inbox_member(task, svc, flow_cache=flow_cache)
+    if not is_member:
+        if not include_closed:
+            return None
+        flow_lookup = svc if svc is not None else _NoFlowLookup()
+        if not is_archived_inbox_task(
+            task, flow_lookup, flow_cache=flow_cache,
+        ):
+            return None
+    state = _inbox_state_from_task(task)
+    if state == "closed" and not include_closed:
         return None
-    flow = (getattr(task, "flow_template_id", "") or "").lower()
     labels = [str(lbl) for lbl in (getattr(task, "labels", []) or [])]
     # Exact-equality on ``plan_review`` (NOT substring) so labels like
     # ``not_plan_review`` / ``planning`` cannot get classified as
@@ -3209,17 +3348,15 @@ def _task_to_inbox_item(task, svc=None, flow_cache=None) -> APIInboxItem | None:
     # :func:`pollypm.work.inbox_view._is_plan_review_label` predicate
     # the write gate uses — Codex round-6 blocker 3 on PR #2060.
     is_plan_review = any(lbl == "plan_review" for lbl in labels)
-    is_chat = flow == "chat"
-    item_type = "plan_review" if is_plan_review and not is_chat else "message"
-    state = _inbox_state_from_task(task)
-    if state == "closed":
-        return None
+    item_type = inbox_item_type_for_task(task)
     body = task.description or ""
     preview = body.strip().splitlines()[0] if body.strip() else None
     metadata: dict[str, Any] = {
         "task_id": task.task_id,
         "labels": labels,
         "flow_template_id": task.flow_template_id,
+        "kind": getattr(getattr(task, "kind", None), "value", None)
+        or str(getattr(task, "kind", "legacy") or "legacy"),
     }
     if is_plan_review:
         metadata["judgment_calls"] = _extract_judgment_calls(body)
@@ -3239,17 +3376,7 @@ def _task_to_inbox_item(task, svc=None, flow_cache=None) -> APIInboxItem | None:
 
 
 def _inbox_state_from_task(task) -> str:
-    status = getattr(task, "work_status", None)
-    value = getattr(status, "value", str(status)) if status else ""
-    if value in {"done", "cancelled"}:
-        return "closed"
-    if value == "review":
-        return "waiting-on-pm"
-    if value in {"in_progress", "queued", "draft"}:
-        return "open"
-    if value in {"blocked", "on_hold", "rework"}:
-        return "open"
-    return "open"
+    return inbox_state_for_task(task)
 
 
 def _inbox_owner_for_task(task) -> str:
@@ -3263,7 +3390,7 @@ def _inbox_owner_for_task(task) -> str:
 
 
 def _load_inbox_messages(config: PollyPMConfig, item: APIInboxItem) -> list[APIInboxMessage]:
-    """Pull the context-log entries that drive an inbox thread."""
+    """Pull reply context entries that drive an inbox thread."""
     project = config.projects.get(item.project)
     if project is None:
         return []
@@ -3273,7 +3400,12 @@ def _load_inbox_messages(config: PollyPMConfig, item: APIInboxItem) -> list[APII
         with _open_work_service_readonly(
             config=config, project_key=item.project, project_path=project.path
         ) as svc:
-            entries = svc.get_context(item.id) or []
+            list_replies = getattr(svc, "list_replies", None)
+            if callable(list_replies):
+                entries = list_replies(item.id) or []
+            else:
+                entries = svc.get_context(item.id, entry_type="reply") or []
+                entries = list(reversed(entries))
     except Exception as exc:  # noqa: BLE001
         logger.debug("inbox: get_context failed for %s: %s", item.id, exc)
         return out

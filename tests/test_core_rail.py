@@ -95,7 +95,12 @@ def test_corerail_startable_protocol_recognizes_objects(tmp_path: Path) -> None:
     assert isinstance(_Sub(), Startable)
 
 
-def test_corerail_register_and_start_stop_invokes_in_order(tmp_path: Path) -> None:
+def test_corerail_register_and_start_stop_invokes_in_order(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        CoreRail, "_start_heartbeat_rail", lambda self, *, start_workers=True: None,
+    )
     rail = _rail(tmp_path)
     events: list[str] = []
 
@@ -168,8 +173,13 @@ def test_readonly_supervisor_does_not_register(tmp_path: Path) -> None:
     assert supervisor not in supervisor.core_rail.subsystems()
 
 
-def test_corerail_start_invokes_supervisor_lifecycle(tmp_path: Path) -> None:
+def test_corerail_start_invokes_supervisor_lifecycle(
+    monkeypatch, tmp_path: Path,
+) -> None:
     """CoreRail.start() must run Supervisor.start() (ensure_layout etc.)."""
+    monkeypatch.setattr(
+        CoreRail, "_start_heartbeat_rail", lambda self, *, start_workers=True: None,
+    )
     config = _config(tmp_path)
     supervisor = Supervisor(config)
 
@@ -194,7 +204,10 @@ def test_corerail_start_invokes_supervisor_lifecycle(tmp_path: Path) -> None:
     assert calls == ["layout", "heartbeat", "knowledge"]
 
 
-def test_corerail_start_is_idempotent(tmp_path: Path) -> None:
+def test_corerail_start_is_idempotent(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        CoreRail, "_start_heartbeat_rail", lambda self, *, start_workers=True: None,
+    )
     config = _config(tmp_path)
     supervisor = Supervisor(config)
 
@@ -209,7 +222,12 @@ def test_corerail_start_is_idempotent(tmp_path: Path) -> None:
     assert calls == ["layout", "hb", "kn"]
 
 
-def test_corerail_stop_reverse_order_with_subsystems(tmp_path: Path) -> None:
+def test_corerail_stop_reverse_order_with_subsystems(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        CoreRail, "_start_heartbeat_rail", lambda self, *, start_workers=True: None,
+    )
     config = _config(tmp_path)
     store = StateStore(config.project.state_db)
     host = extension_host_for_root(str(config.project.root_dir.resolve()))
@@ -236,7 +254,12 @@ def test_corerail_stop_reverse_order_with_subsystems(tmp_path: Path) -> None:
     assert events == ["start:a", "start:b", "stop:b", "stop:a"]
 
 
-def test_corerail_stop_swallows_subsystem_errors(tmp_path: Path) -> None:
+def test_corerail_stop_swallows_subsystem_errors(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(
+        CoreRail, "_start_heartbeat_rail", lambda self, *, start_workers=True: None,
+    )
     config = _config(tmp_path)
     store = StateStore(config.project.state_db)
     host = extension_host_for_root(str(config.project.root_dir.resolve()))
@@ -268,7 +291,10 @@ def test_corerail_stop_swallows_subsystem_errors(tmp_path: Path) -> None:
     assert events == ["good-start", "boom-start", "boom-stop", "good-stop"]
 
 
-def test_corerail_drives_plugin_host_load(tmp_path: Path) -> None:
+def test_corerail_drives_plugin_host_load(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(
+        CoreRail, "_start_heartbeat_rail", lambda self, *, start_workers=True: None,
+    )
     config = _config(tmp_path)
     store = StateStore(config.project.state_db)
     host = extension_host_for_root(str(config.project.root_dir.resolve()))
@@ -318,7 +344,9 @@ def test_corerail_start_retries_transient_first_party_heartbeat_import(
             self.roster = type("_Roster", (), {"entries": []})()
 
         @classmethod
-        def from_plugin_host(cls, *, state_db, plugin_host):
+        def from_plugin_host(
+            cls, *, state_db, plugin_host, config_path=None, config=None
+        ):
             return cls()
 
         def start(self, *, start_workers: bool = True) -> None:
@@ -355,6 +383,62 @@ def test_corerail_start_retries_transient_first_party_heartbeat_import(
     finally:
         rail.stop()
     assert stopped == [True]
+
+
+def test_corerail_start_threads_active_config_into_heartbeat_rail(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    import pollypm.core.rail as rail_mod
+
+    captured: dict[str, object] = {}
+
+    class _FakeHost:
+        def plugins(self):
+            return {}
+
+    class _FakeHeartbeatRail:
+        def __init__(self) -> None:
+            self.roster = type("_Roster", (), {"entries": []})()
+
+        @classmethod
+        def from_plugin_host(
+            cls, *, state_db, plugin_host, config_path=None, config=None
+        ):
+            captured.update(
+                {
+                    "state_db": state_db,
+                    "plugin_host": plugin_host,
+                    "config_path": config_path,
+                    "config": config,
+                }
+            )
+            return cls()
+
+        def start(self, *, start_workers: bool = True) -> None:
+            captured["start_workers"] = start_workers
+
+        def stop(self) -> None:
+            captured["stopped"] = True
+
+    monkeypatch.setattr(
+        rail_mod, "_load_heartbeat_rail_class", lambda: _FakeHeartbeatRail,
+    )
+
+    config = _config(tmp_path)
+    config.config_path = tmp_path / "workspace" / "pollypm.toml"
+    host = _FakeHost()
+    store = StateStore(config.project.state_db)
+    rail = CoreRail(config, store, host)
+
+    rail.start(start_workers=False)
+    try:
+        assert captured["state_db"] == config.project.state_db
+        assert captured["plugin_host"] is host
+        assert captured["config_path"] == config.config_path
+        assert captured["config"] is config
+        assert captured["start_workers"] is False
+    finally:
+        rail.stop()
 
 
 def test_corerail_start_does_not_retry_non_first_party_missing_dependency(

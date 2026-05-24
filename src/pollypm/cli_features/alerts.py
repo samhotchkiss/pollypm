@@ -233,6 +233,100 @@ def session_set_status(
     typer.echo(f"Updated {session_name} to {status}")
 
 
+def _session_restart_impl(
+    session_name: str,
+    *,
+    account: str | None,
+    force: bool,
+    json_output: bool,
+    config_path: Path,
+) -> None:
+    from pollypm import cli as cli_mod
+    from pollypm.session_leases import SessionLeaseConflictError
+
+    try:
+        result = _service(config_path).restart_session(
+            session_name,
+            account_name=account,
+            force=force,
+        )
+    except KeyError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    except SessionLeaseConflictError as exc:
+        typer.echo(f"Cannot restart {session_name}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+    except RuntimeError as exc:
+        typer.echo(f"Restart failed for {session_name}: {exc}", err=True)
+        raise typer.Exit(code=1) from exc
+
+    if json_output:
+        cli_mod._emit_json({"session": result})
+        return
+    typer.echo(
+        f"Restarted {result['session_name']} on "
+        f"{result['account']} [{result['provider']}]"
+    )
+
+
+@session_app.command(
+    "relaunch",
+    help=(
+        "Restart a configured session, optionally on a different account "
+        "without editing pollypm.toml."
+    ),
+)
+def session_relaunch(
+    session_name: str = typer.Argument(..., help="Configured session name."),
+    account: str | None = typer.Option(
+        None,
+        "--account",
+        help="Configured account to use for this relaunch.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Bypass an existing human lease on the session.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    _session_restart_impl(
+        session_name,
+        account=account,
+        force=force,
+        json_output=json_output,
+        config_path=config_path,
+    )
+
+
+@session_app.command(
+    "restart",
+    help="Alias for `pm session relaunch`.",
+)
+def session_restart(
+    session_name: str = typer.Argument(..., help="Configured session name."),
+    account: str | None = typer.Option(
+        None,
+        "--account",
+        help="Configured account to use for this restart.",
+    ),
+    force: bool = typer.Option(
+        False,
+        "--force",
+        help="Bypass an existing human lease on the session.",
+    ),
+    json_output: bool = typer.Option(False, "--json", help="Emit structured JSON."),
+    config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),
+) -> None:
+    _session_restart_impl(
+        session_name,
+        account=account,
+        force=force,
+        json_output=json_output,
+        config_path=config_path,
+    )
+
+
 @heartbeat_app.command("install")
 def heartbeat_install(
     config_path: Path = typer.Option(DEFAULT_CONFIG_PATH, "--config", help="PollyPM config path."),

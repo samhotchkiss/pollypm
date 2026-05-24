@@ -39,7 +39,7 @@ When the heartbeat detects a dead or stuck session:
 1. Raise an alert (warn or error severity)
 2. Check if a human holds a lease (defer if so)
 3. Rate limit (max 5 attempts per 30-minute window, hard stop at 20 total)
-4. Build candidate accounts (same provider first, then cross-provider failover)
+4. Build candidate accounts from the configured failover order
 5. Restart the session with the best available account
 6. Clear alerts on success
 

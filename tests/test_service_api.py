@@ -13,6 +13,7 @@ from pollypm.models import (
     ProjectKind,
     ProjectSettings,
     ProviderKind,
+    SessionConfig,
 )
 from pollypm.service_api import PollyPMService, render_json
 from pollypm.storage.state import StateStore
@@ -132,6 +133,64 @@ def test_service_focus_and_send_input_use_supervisor(monkeypatch, tmp_path: Path
     assert calls == [
         ("focus", "operator", None),
         ("send", "operator", "Continue"),
+    ]
+
+
+def test_service_restart_session_uses_supervisor_facade(monkeypatch, tmp_path: Path) -> None:
+    service = PollyPMService(tmp_path / "pollypm.toml")
+    calls: list[tuple[str, str, str, bool]] = []
+
+    class FakeConfig:
+        accounts = {
+            "claude_main": AccountConfig(
+                name="claude_main",
+                provider=ProviderKind.CLAUDE,
+            ),
+            "claude_backup": AccountConfig(
+                name="claude_backup",
+                provider=ProviderKind.CLAUDE,
+            ),
+        }
+
+    class FakeSupervisor:
+        config = FakeConfig()
+
+        def launch_by_session(self, session_name: str):
+            session = SessionConfig(
+                name=session_name,
+                role="architect",
+                provider=ProviderKind.CLAUDE,
+                account="claude_main",
+                cwd=tmp_path,
+            )
+            return type("Launch", (), {"session": session})()
+
+        def restart_session(
+            self,
+            session_name: str,
+            account_name: str,
+            *,
+            failure_type: str,
+            force: bool = False,
+        ) -> None:
+            calls.append((session_name, account_name, failure_type, force))
+
+    monkeypatch.setattr(service, "load_supervisor", lambda: FakeSupervisor())
+
+    result = service.restart_session(
+        "architect_demo",
+        account_name="claude_backup",
+        force=True,
+    )
+
+    assert result == {
+        "session_name": "architect_demo",
+        "account": "claude_backup",
+        "provider": "claude",
+        "status": "restarted",
+    }
+    assert calls == [
+        ("architect_demo", "claude_backup", "manual_relaunch", True)
     ]
 
 

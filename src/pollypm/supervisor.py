@@ -2730,7 +2730,7 @@ class Supervisor:
             )
             remaining_threshold = max(0, 100 - int(used_threshold))
             needs_roll, probe = account_needs_proactive_rollover(
-                self.config, self.store, launch.account.name,
+                self.config, None, launch.account.name,
                 threshold_pct=remaining_threshold,
             )
         except Exception:  # noqa: BLE001
@@ -2779,10 +2779,33 @@ class Supervisor:
         )
 
     def _account_is_viable(self, account_name: str) -> bool:
-        runtime = self.store.get_account_runtime(account_name)
-        if runtime is not None and runtime.status in {"auth_broken", "exhausted", "provider_outage"}:
+        account = self.config.accounts.get(account_name)
+        if account is None:
             return False
-        account = self.config.accounts[account_name]
+        try:
+            from pollypm.capacity import FAILOVER_TRIGGERS, probe_capacity
+
+            probe = probe_capacity(self.config, None, account_name)
+            if probe.state in FAILOVER_TRIGGERS:
+                return False
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "account viability pg probe failed for %s; falling back",
+                account_name,
+                exc_info=True,
+            )
+        try:
+            from pollypm.accounts import is_account_runtime_unavailable
+
+            runtime = self.store.get_account_runtime(account_name)
+            if runtime is not None and is_account_runtime_unavailable(runtime.status):
+                return False
+        except Exception:  # noqa: BLE001
+            logger.warning(
+                "account viability legacy runtime check failed for %s",
+                account_name,
+                exc_info=True,
+            )
         if account.home is None:
             return False
         if account.provider is ProviderKind.CLAUDE:
@@ -3819,12 +3842,14 @@ class Supervisor:
             )
             return
 
-        # For auth_broken on Claude accounts, allow retrying the same account —
-        # the refresh token is long-lived and Claude Code will refresh on restart.
-        # Force failover for capacity_exhausted (genuine account limit) and
+        # Force failover for auth_broken / capacity_exhausted and
         # capacity_low (proactive rollover near the limit — staying on the
         # same account defeats the purpose).
-        allow_same = failure_type not in {"capacity_exhausted", "capacity_low"}
+        allow_same = failure_type not in {
+            "auth_broken",
+            "capacity_exhausted",
+            "capacity_low",
+        }
         candidates = self._candidate_accounts(launch, allow_same=allow_same)
         if not candidates:
             self._msg_store.upsert_alert(
@@ -3940,6 +3965,7 @@ class Supervisor:
             last_failure_type=failure_type,
             last_failure_message=f"recovering on {account_name}",
         )
+        self.invalidate_launch_cache()
         spawned = False
         try:
             self.launch_session(session_name)
@@ -3975,6 +4001,7 @@ class Supervisor:
                 retry_at=previous_runtime.retry_at if previous_runtime else None,
                 last_recovered_at=previous_runtime.last_recovered_at if previous_runtime else None,
             )
+            self.invalidate_launch_cache()
             raise
         if spawned:
             from pollypm.audit.log import (

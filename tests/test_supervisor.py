@@ -123,6 +123,56 @@ def test_supervisor_failover_prefers_viable_backup(monkeypatch, tmp_path: Path) 
     }
 
 
+def test_supervisor_failover_skips_pg_exhausted_account(monkeypatch, tmp_path: Path) -> None:
+    from pollypm.capacity import CapacityProbeResult, CapacityState
+
+    config = _config(tmp_path)
+    backup_auth = config.accounts["codex_backup"].home / ".codex" / "auth.json"
+    backup_auth.parent.mkdir(parents=True, exist_ok=True)
+    backup_auth.write_text("{}")
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = next(
+        item for item in supervisor.plan_launches()
+        if item.session.name == "operator"
+    )
+    restarted: dict[str, str] = {}
+
+    def fake_probe_capacity(config, store, account_name: str):
+        state = (
+            CapacityState.EXHAUSTED
+            if account_name == "claude_controller"
+            else CapacityState.HEALTHY
+        )
+        return CapacityProbeResult(
+            account_name=account_name,
+            provider=config.accounts[account_name].provider,
+            state=state,
+            reason=state.value,
+        )
+
+    monkeypatch.setattr("pollypm.capacity.probe_capacity", fake_probe_capacity)
+    monkeypatch.setattr(
+        supervisor,
+        "_restart_session",
+        lambda session_name, account_name, failure_type: restarted.update(
+            {"session": session_name, "account": account_name, "failure": failure_type}
+        ),
+    )
+
+    supervisor._maybe_recover_session(
+        launch,
+        failure_type="capacity_exhausted",
+        failure_message="0% left",
+    )
+
+    assert restarted == {
+        "session": "operator",
+        "account": "codex_backup",
+        "failure": "capacity_exhausted",
+    }
+
+
 def test_ensure_layout_skips_scaffolding_global_control_root(
     monkeypatch, tmp_path: Path,
 ) -> None:
@@ -1492,8 +1542,14 @@ def test_restart_session_emits_session_spawn_audit(
         item for item in supervisor.plan_launches()
         if item.session.name == "operator"
     )
+    invalidations: list[str] = []
 
     monkeypatch.setattr(supervisor.session_service.tmux, "has_session", lambda _name: False)
+    monkeypatch.setattr(
+        supervisor,
+        "invalidate_launch_cache",
+        lambda: invalidations.append("invalidate"),
+    )
     monkeypatch.setattr(supervisor, "launch_session", lambda _name: launch)
 
     supervisor.restart_session(
@@ -1501,6 +1557,8 @@ def test_restart_session_emits_session_spawn_audit(
         "claude_controller",
         failure_type="missing_window",
     )
+
+    assert invalidations == ["invalidate"]
 
     events = read_events(
         "pollypm",

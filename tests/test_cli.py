@@ -7,6 +7,7 @@ import sys
 from typer.testing import CliRunner
 
 import pollypm.cli as cli
+from pollypm.cli_features import alerts as alerts_cli
 
 
 def test_root_command_defaults_to_up(monkeypatch, tmp_path: Path) -> None:
@@ -412,7 +413,7 @@ def test_worker_start_role_architect_still_works(monkeypatch, tmp_path: Path) ->
     monkeypatch.setattr(
         cli,
         "create_worker_session",
-        lambda path, project_key, prompt=None, role="worker", agent_profile=None: (
+        lambda path, project_key, prompt=None, role="worker", agent_profile=None, account_name=None: (
             created.append((path, project_key, prompt))
             or type("Session", (), {"name": "architect_pollypm"})()
         ),
@@ -428,6 +429,93 @@ def test_worker_start_role_architect_still_works(monkeypatch, tmp_path: Path) ->
     assert result.exit_code == 0
     assert created == [(config_path, "pollypm", "Plan it")]
     assert launched == [(config_path, "architect_pollypm")]
+    assert "Managed architect architect_pollypm ready for project pollypm" in result.output
+
+
+def test_worker_start_existing_role_restarts_with_account(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
+    restarted: list[tuple[str, str, str]] = []
+
+    class FakeSupervisor:
+        def __init__(self) -> None:
+            session = type(
+                "Session",
+                (),
+                {
+                    "name": "architect_pollypm",
+                    "role": "architect",
+                    "project": "pollypm",
+                    "enabled": True,
+                },
+            )()
+            self.config = type(
+                "Config",
+                (),
+                {
+                    "sessions": {"architect_pollypm": session},
+                    "accounts": {"claude_backup": object()},
+                    "project": type("Project", (), {"tmux_session": "pollypm"})(),
+                },
+            )()
+
+        def restart_session(
+            self,
+            session_name: str,
+            account_name: str,
+            *,
+            failure_type: str,
+        ) -> None:
+            restarted.append((session_name, account_name, failure_type))
+
+        def tmux_session_for_launch(self, launch) -> str:
+            return "pollypm-storage-closet"
+
+        def plan_launches(self):
+            session = type("Session", (), {"name": "architect_pollypm"})()
+            return [
+                type(
+                    "Launch",
+                    (),
+                    {"session": session, "window_name": "architect-pollypm"},
+                )()
+            ]
+
+    monkeypatch.setattr(cli, "_load_supervisor", lambda path: FakeSupervisor())
+    monkeypatch.setattr(
+        cli,
+        "create_worker_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("existing session should not be recreated")
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "launch_worker_session",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("account override should use restart_session")
+        ),
+    )
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.app,
+        [
+            "worker-start",
+            "pollypm",
+            "--role",
+            "architect",
+            "--account",
+            "claude_backup",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert restarted == [
+        ("architect_pollypm", "claude_backup", "manual_relaunch")
+    ]
     assert "Managed architect architect_pollypm ready for project pollypm" in result.output
 
 
@@ -488,7 +576,7 @@ def test_worker_start_role_architect_works_outside_tmux(monkeypatch, tmp_path: P
     monkeypatch.setattr(
         cli,
         "create_worker_session",
-        lambda path, project_key, prompt=None, role="worker", agent_profile=None: (
+        lambda path, project_key, prompt=None, role="worker", agent_profile=None, account_name=None: (
             created.append((path, project_key, prompt, role, agent_profile))
             or type("Session", (), {"name": "architect_pollypm"})()
         ),
@@ -518,6 +606,54 @@ def test_worker_start_role_architect_works_outside_tmux(monkeypatch, tmp_path: P
     assert created == [(config_path, "pollypm", None, "architect", None)]
     assert launched == [(config_path, "architect_pollypm")]
     assert "Managed architect architect_pollypm ready for project pollypm" in result.output
+
+
+def test_session_relaunch_cli_routes_account_to_service(monkeypatch, tmp_path: Path) -> None:
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = \"pollypm\"\n")
+    calls: list[tuple[Path, str, str | None, bool]] = []
+
+    class FakeService:
+        def __init__(self, config_path: Path) -> None:
+            self.config_path = config_path
+
+        def restart_session(
+            self,
+            session_name: str,
+            *,
+            account_name: str | None = None,
+            force: bool = False,
+        ) -> dict[str, str]:
+            calls.append((self.config_path, session_name, account_name, force))
+            return {
+                "session_name": session_name,
+                "account": account_name or "claude_main",
+                "provider": "claude",
+                "status": "restarted",
+            }
+
+    monkeypatch.setattr(alerts_cli, "_service", FakeService)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli.app,
+        [
+            "session",
+            "relaunch",
+            "architect_bikepath",
+            "--account",
+            "claude_backup",
+            "--force",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert calls == [
+        (config_path, "architect_bikepath", "claude_backup", True)
+    ]
+    assert "Restarted architect_bikepath on claude_backup [claude]" in result.output
 
 
 def test_help_lists_heartbeat_agent_commands() -> None:

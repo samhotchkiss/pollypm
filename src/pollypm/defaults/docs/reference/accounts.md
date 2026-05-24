@@ -23,7 +23,7 @@ Check with `pm accounts`. Each account shows:
   failover_accounts = ["codex_backup"]
   ```
 
-When a session fails auth or hits quota, the recovery system automatically tries failover accounts (same provider first, then cross-provider).
+When a session fails auth or hits quota, the recovery system automatically tries accounts in the configured failover order, then falls back to other available accounts.
 
 ## Quota Rotation
 

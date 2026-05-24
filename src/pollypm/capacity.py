@@ -133,11 +133,12 @@ def probe_capacity(
     usage, runtime = _read_account_state(config, store, account_name)
 
     # Runtime status takes precedence (captures live failures)
-    if runtime and runtime.status in FAILOVER_TRIGGERS:
+    runtime_state = _health_to_state(runtime.status) if runtime else None
+    if runtime_state in FAILOVER_TRIGGERS:
         return CapacityProbeResult(
             account_name=account_name,
             provider=account.provider,
-            state=CapacityState(runtime.status),
+            state=runtime_state,
             reason=runtime.reason,
             reset_time=runtime.available_at,
         )
@@ -351,11 +352,9 @@ def select_failover_account(
 ) -> FailoverDecision:
     """Select the best failover account when one fails.
 
-    Selection priority:
-    1. Healthy non-controller same provider
-    2. Healthy non-controller different provider
-    3. Controller same provider (if not the failed one)
-    4. Controller different provider (if not the failed one)
+    Selection follows ``config.pollypm.failover_accounts`` first, then
+    the controller account, then any remaining configured accounts. The
+    first healthy account in that order wins.
     """
     if not config.pollypm.failover_enabled:
         return FailoverDecision(
@@ -384,10 +383,24 @@ def select_failover_account(
     controller = config.pollypm.controller_account
     failed_provider = failed_config.provider
 
-    # Build candidate list with priorities
+    # Build candidate list in configured failover order. The operator-facing
+    # `pm failover` output presents this as an ordered chain, so recovery must
+    # walk that same chain before falling back to controller/other accounts.
     candidates: list[FailoverCandidate] = []
+    ordered_names: list[str] = []
+    for name in config.pollypm.failover_accounts:
+        if name and name not in ordered_names:
+            ordered_names.append(name)
+    if controller and controller not in ordered_names:
+        ordered_names.append(controller)
+    for name in config.accounts:
+        if name not in ordered_names:
+            ordered_names.append(name)
 
-    for name, account in config.accounts.items():
+    for order, name in enumerate(ordered_names):
+        account = config.accounts.get(name)
+        if account is None:
+            continue
         if name == failed_account:
             continue
 
@@ -395,23 +408,14 @@ def select_failover_account(
         if capacity.state in FAILOVER_TRIGGERS:
             continue  # Skip accounts that are also failing
 
-        is_controller = (name == controller)
-        same_provider = (account.provider == failed_provider)
-
-        if not is_controller and same_provider:
-            priority = 0  # Best: non-controller, same provider
-        elif not is_controller and not same_provider:
-            priority = 1  # Good: non-controller, different provider
-        elif is_controller and same_provider:
-            priority = 2  # Acceptable: controller, same provider
-        else:
-            priority = 3  # Last resort: controller, different provider
-
         candidates.append(FailoverCandidate(
             account_name=name,
             provider=account.provider,
-            priority=priority,
-            reason=f"priority={priority}, state={capacity.state}",
+            priority=order,
+            reason=(
+                f"order={order}, state={capacity.state}, "
+                f"same_provider={account.provider == failed_provider}"
+            ),
         ))
 
     if not candidates:
@@ -422,7 +426,7 @@ def select_failover_account(
             candidates_evaluated=0,
         )
 
-    # Sort by priority (lower is better)
+    # Sort by configured/fallback order (lower is better)
     candidates.sort(key=lambda c: c.priority)
     best = candidates[0]
 
@@ -567,6 +571,13 @@ def persist_capacity_probe(
 
 def _health_to_state(health: str) -> CapacityState:
     """Convert a health string to a CapacityState enum."""
+    aliases = {
+        "auth_broken": CapacityState.AUTH_BROKEN,
+        "capacity_exhausted": CapacityState.EXHAUSTED,
+        "exhausted": CapacityState.EXHAUSTED,
+    }
+    if health in aliases:
+        return aliases[health]
     try:
         return CapacityState(health)
     except ValueError:

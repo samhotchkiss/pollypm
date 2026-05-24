@@ -360,6 +360,28 @@ def _build_work_service_stub_strict(
     return _WorkerSessionStub(records)
 
 
+def _build_effective_account_map(config: Any) -> dict[str, str]:
+    """Return session runtime account overrides for transcript lookup."""
+    settings = getattr(config, "pollypm", None)
+    if not (
+        getattr(settings, "failover_enabled", False)
+        or getattr(settings, "failover_accounts", None)
+    ):
+        return {}
+    try:
+        from pollypm.web_api.service import list_session_effective_accounts
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        return list_session_effective_accounts(config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "chat_messages: session effective-account lookup failed",
+            exc_info=True,
+        )
+        return {}
+
+
 class _WorkerSessionStub:
     """Minimal stand-in exposing ``list_worker_sessions`` for the registry.
 
@@ -452,11 +474,16 @@ def _find_surface(
                     "Retry shortly; check `pm sessions` / pg pool health."
                 ),
             ) from exc
+    effective_accounts = _build_effective_account_map(config)
+    enumerate_kwargs: dict[str, Any] = {}
+    if effective_accounts:
+        enumerate_kwargs["effective_accounts"] = effective_accounts
     surface = find_chat_surface(
         config,
         session_name,
         work_service=work_service,
         tmux_client=tmux_client,
+        **enumerate_kwargs,
     )
     if surface is not None and surface.session_name == session_name:
         return surface
@@ -467,6 +494,7 @@ def _find_surface(
         config,
         work_service=work_service,
         tmux_client=tmux_client,
+        **enumerate_kwargs,
     )
     for candidate in surfaces:
         if candidate.session_name == session_name:
@@ -1033,10 +1061,15 @@ def list_chat_sessions_endpoint(config: ConfigDep) -> ChatSessionsResponse:
     """
     tmux_client = _build_tmux_client()
     work_service = _build_work_service_stub(config)
+    effective_accounts = _build_effective_account_map(config)
+    enumerate_kwargs: dict[str, Any] = {}
+    if effective_accounts:
+        enumerate_kwargs["effective_accounts"] = effective_accounts
     surfaces = enumerate_chat_surfaces(
         config,
         work_service=work_service,
         tmux_client=tmux_client,
+        **enumerate_kwargs,
     )
     return ChatSessionsResponse(
         sessions=[_surface_to_wire(surface) for surface in surfaces],

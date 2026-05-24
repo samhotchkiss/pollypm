@@ -20,6 +20,7 @@ the database.
 from __future__ import annotations
 
 import logging
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -165,6 +166,7 @@ def enumerate_chat_surfaces(
     *,
     work_service: Any | None = None,
     tmux_client: Any | None = None,
+    effective_accounts: Mapping[str, str] | None = None,
 ) -> list[ChatSurface]:
     """Return every chat surface (operator/architect/advisor/worker).
 
@@ -177,6 +179,11 @@ def enumerate_chat_surfaces(
     and ``pane_id``. When ``None`` we don't probe tmux — the response
     still returns the configured ``window_name`` and the caller can
     treat ``present`` as "unknown" (defaults to ``False``).
+
+    ``effective_accounts`` maps configured session names to runtime
+    accounts after failover / manual account switch. Transcript lookup
+    must follow the account that actually launched the provider
+    process, not only the static ``SessionConfig.account`` value.
 
     The returned list is ordered: operator first, then architects,
     then advisors, then workers (sorted by ``project`` then ``task_id``).
@@ -195,6 +202,7 @@ def enumerate_chat_surfaces(
         config,
         tmux_state_cache=tmux_state_cache,
         session_index_cache=session_index_cache,
+        effective_accounts=effective_accounts,
     ))
     if work_service is not None:
         surfaces.extend(enumerate_worker_surfaces(
@@ -232,6 +240,7 @@ def enumerate_config_surfaces(
     *,
     tmux_state_cache: dict[str, TmuxWindowState] | None = None,
     session_index_cache: dict[Path, list] | None = None,
+    effective_accounts: Mapping[str, str] | None = None,
 ) -> list[ChatSurface]:
     """Enumerate operator/architect/advisor surfaces from ``config.sessions``.
 
@@ -253,6 +262,7 @@ def enumerate_config_surfaces(
             tmux_session=tmux_session,
             tmux_state_cache=tmux_state_cache,
             session_index_cache=session_index_cache,
+            effective_accounts=effective_accounts,
         )
         if surface is not None:
             surfaces.append(surface)
@@ -310,6 +320,7 @@ def find_chat_surface(
     *,
     work_service: Any | None = None,
     tmux_client: Any | None = None,
+    effective_accounts: Mapping[str, str] | None = None,
 ) -> ChatSurface | None:
     """Resolve one chat surface without enumerating the whole workspace.
 
@@ -332,6 +343,7 @@ def find_chat_surface(
             tmux_session=storage_session_name(config.project.tmux_session),
             tmux_state_cache=tmux_state_cache,
             session_index_cache=session_index_cache,
+            effective_accounts=effective_accounts,
         )
 
     parsed = parse_task_window_name(session_name)
@@ -377,6 +389,7 @@ def _config_surface(
     tmux_session: str,
     tmux_state_cache: dict[str, TmuxWindowState] | None,
     session_index_cache: dict[Path, list] | None,
+    effective_accounts: Mapping[str, str] | None = None,
 ) -> ChatSurface | None:
     if not session.enabled:
         return None
@@ -388,12 +401,26 @@ def _config_surface(
     persona = _persona_for_session(config, session, surface_type)
     cwd = session.cwd if isinstance(session.cwd, Path) else Path(session.cwd or ".")
     index = _build_session_index(project_root, session_index_cache)
-    transcript_path = lookup_transcript_path(
+    account_candidates = _account_candidates_for_transcript_lookup(
+        config,
+        session_name,
+        session,
+        effective_accounts=effective_accounts,
+    )
+    transcript_path = _lookup_transcript_path_for_accounts(
         index,
         cwd=str(cwd),
-        account_name=session.account,
         provider=str(session.provider),
+        account_candidates=account_candidates,
     )
+    if transcript_path is None and surface_type == SurfaceType.OPERATOR:
+        transcript_path = _lookup_transcript_path_for_accounts(
+            index,
+            cwd=str(project_root),
+            provider=str(session.provider),
+            account_candidates=account_candidates,
+            prefer_newest=True,
+        )
     window_name = session.window_name or session_name
     if tmux_state_cache and window_name in tmux_state_cache:
         window_state = tmux_state_cache[window_name]
@@ -414,6 +441,73 @@ def _config_surface(
         provider=str(session.provider),
         auth_token_present=bool(session.auth_token),
     )
+
+
+def _account_candidates_for_transcript_lookup(
+    config: PollyPMConfig,
+    session_name: str,
+    session: SessionConfig,
+    *,
+    effective_accounts: Mapping[str, str] | None = None,
+) -> list[str | None]:
+    candidates: list[str | None] = []
+
+    def add(account_name: object) -> None:
+        candidate = str(account_name) if account_name else None
+        if candidate not in candidates:
+            candidates.append(candidate)
+
+    if effective_accounts is not None:
+        add(effective_accounts.get(session_name))
+    add(getattr(session, "account", None))
+
+    session_provider = str(getattr(session, "provider", "") or "")
+    settings = getattr(config, "pollypm", None)
+    failover_accounts = getattr(settings, "failover_accounts", None) or []
+    accounts = getattr(config, "accounts", None) or {}
+    for account_name in failover_accounts:
+        account = accounts.get(account_name)
+        if account is None:
+            continue
+        if str(getattr(account, "provider", "") or "") != session_provider:
+            continue
+        add(account_name)
+
+    return candidates or [None]
+
+
+def _lookup_transcript_path_for_accounts(
+    index: list,
+    *,
+    cwd: str | None,
+    provider: str | None,
+    account_candidates: list[str | None],
+    prefer_newest: bool = False,
+) -> Path | None:
+    matches: list[Path] = []
+    for account_name in account_candidates:
+        candidate = lookup_transcript_path(
+            index,
+            cwd=cwd,
+            account_name=account_name,
+            provider=provider,
+        )
+        if candidate is None:
+            continue
+        if not prefer_newest:
+            return candidate
+        matches.append(candidate)
+    if not matches:
+        return None
+    matches.sort(key=_path_mtime, reverse=True)
+    return matches[0]
+
+
+def _path_mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def _worker_surface(

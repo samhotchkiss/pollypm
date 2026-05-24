@@ -1141,6 +1141,134 @@ def test_messages_endpoint_include_thinking_reaches_ingested_surface_archive(
     assert body["messages"][1]["text"] == "Visible reply."
 
 
+def test_messages_endpoint_include_thinking_uses_effective_account_archive(
+    client, auth_headers, config, workspace, project_root, monkeypatch,
+):
+    """Failover-account transcripts remain registered REST surfaces."""
+    import json as _json
+
+    from pollypm.web_api.chat.transcripts import _parse_cache_clear
+
+    config.accounts["claude_primary"] = AccountConfig(
+        name="claude_primary",
+        provider=ProviderKind.CLAUDE,
+        home=project_root / ".pollypm/homes/claude_primary",
+    )
+    config.accounts["claude_backup"] = AccountConfig(
+        name="claude_backup",
+        provider=ProviderKind.CLAUDE,
+        home=project_root / ".pollypm/homes/claude_backup",
+    )
+    config.pollypm.failover_enabled = True
+    config.pollypm.failover_accounts = ["claude_backup"]
+    config.sessions["operator"] = SessionConfig(
+        name="operator",
+        role="operator-pm",
+        provider=ProviderKind.CLAUDE,
+        account="claude_primary",
+        cwd=workspace,
+        project="myproj",
+        window_name="operator",
+    )
+
+    transcripts = project_root / ".pollypm/transcripts"
+
+    def event(
+        session_id: str,
+        *,
+        account_name: str,
+        event_type: str,
+        timestamp: str,
+        text: str,
+    ) -> dict[str, Any]:
+        payload = (
+            {"text": text, "signature": "sig-effective"}
+            if event_type == "thinking"
+            else {"text": text}
+        )
+        return {
+            "timestamp": timestamp,
+            "event_type": event_type,
+            "session_id": session_id,
+            "account_name": account_name,
+            "provider": "claude",
+            "project_key": "myproj",
+            "source_path": "/tmp/raw.jsonl",
+            "source_offset": 0,
+            "cwd": str(project_root),
+            "model_name": "claude-opus-4-7",
+            "payload": payload,
+        }
+
+    primary_archive = transcripts / "session-primary/events.jsonl"
+    primary_archive.parent.mkdir(parents=True)
+    primary_archive.write_text(_json.dumps(event(
+        "session-primary",
+        account_name="claude_primary",
+        event_type="assistant_turn",
+        timestamp="2026-05-21T09:00:00Z",
+        text="Primary account text.",
+    )) + "\n")
+
+    backup_archive = transcripts / "session-backup/events.jsonl"
+    backup_archive.parent.mkdir(parents=True)
+    backup_archive.write_text(
+        _json.dumps(event(
+            "session-backup",
+            account_name="claude_backup",
+            event_type="thinking",
+            timestamp="2026-05-21T10:00:00Z",
+            text="Failover thought.",
+        ))
+        + "\n"
+        + _json.dumps(event(
+            "session-backup",
+            account_name="claude_backup",
+            event_type="assistant_turn",
+            timestamp="2026-05-21T10:00:01Z",
+            text="Failover visible reply.",
+        ))
+        + "\n"
+    )
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_tmux_client",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_effective_account_map",
+        lambda _config: {"operator": "claude_backup"},
+    )
+    _parse_cache_clear()
+
+    sessions_response = client.get(
+        "/api/v1/chat/sessions",
+        headers=auth_headers,
+    )
+    assert sessions_response.status_code == 200, sessions_response.text
+    operator = next(
+        s for s in sessions_response.json()["sessions"]
+        if s["session_name"] == "operator"
+    )
+    assert operator["transcript"]["source"] == "jsonl"
+    assert operator["transcript"]["path"] == str(backup_archive)
+
+    response = client.get(
+        "/api/v1/chat/operator/messages?include_thinking=true&limit=200",
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["transcript_source"] == "jsonl"
+    types = [m["type"] for m in body["messages"]]
+    assert "thinking" in types
+    thinking = next(m for m in body["messages"] if m["type"] == "thinking")
+    assert thinking["text"] == "Failover thought."
+    assert thinking["metadata"]["signature"] == "sig-effective"
+
+
 def test_messages_endpoint_no_subagent_inlining_by_default(
     client, auth_headers, patch_registry, patch_parser, tmp_path,
 ):

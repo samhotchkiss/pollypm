@@ -641,6 +641,113 @@ def test_two_surfaces_sharing_cwd_resolve_to_correct_transcripts(
     assert by_name["operator"].transcript_path != by_name["architect_pollypm"].transcript_path
 
 
+def test_surface_transcript_path_uses_runtime_effective_account(
+    tmp_path: Path,
+) -> None:
+    """Failover-account archives should remain attached to the session."""
+    project_root = tmp_path / "repo"
+    config = _build_config(tmp_path, sessions={
+        "operator": _session(
+            "operator",
+            role="operator-pm",
+            account="claude_main",
+            cwd=project_root,
+        ),
+    })
+    config.accounts["claude_backup"] = AccountConfig(
+        name="claude_backup",
+        provider=ProviderKind.CLAUDE,
+        home=project_root / ".pollypm/homes/claude_backup",
+    )
+
+    transcripts = project_root / ".pollypm" / "transcripts"
+    primary_dir = transcripts / "session-primary"
+    backup_dir = transcripts / "session-backup"
+    primary_dir.mkdir(parents=True)
+    backup_dir.mkdir(parents=True)
+
+    def write_event(path: Path, session_id: str, account_name: str) -> None:
+        event = {
+            "timestamp": "2026-05-21T20:00:00Z",
+            "event_type": "assistant_turn",
+            "session_id": session_id,
+            "account_name": account_name,
+            "provider": "claude",
+            "project_key": "pollypm",
+            "source_path": "/tmp/raw",
+            "source_offset": 0,
+            "cwd": str(project_root),
+            "payload": {"text": account_name},
+        }
+        path.write_text(json.dumps(event) + "\n")
+
+    write_event(primary_dir / "events.jsonl", "session-primary", "claude_main")
+    write_event(backup_dir / "events.jsonl", "session-backup", "claude_backup")
+
+    surfaces = enumerate_chat_surfaces(
+        config,
+        effective_accounts={"operator": "claude_backup"},
+    )
+
+    assert surfaces[0].session_name == "operator"
+    assert surfaces[0].transcript_path == backup_dir / "events.jsonl"
+
+
+def test_operator_transcript_falls_back_to_project_root_failover_archive(
+    tmp_path: Path,
+) -> None:
+    """Workspace-root operators can still see project-root failover JSONL."""
+    project_root = tmp_path / "repo"
+    workspace_root = tmp_path / "workspace"
+    workspace_root.mkdir()
+    config = _build_config(tmp_path, sessions={
+        "operator": _session(
+            "operator",
+            role="operator-pm",
+            account="claude_main",
+            cwd=workspace_root,
+        ),
+    })
+    config.pollypm.failover_accounts = ["claude_backup"]
+    config.accounts["claude_backup"] = AccountConfig(
+        name="claude_backup",
+        provider=ProviderKind.CLAUDE,
+        home=project_root / ".pollypm/homes/claude_backup",
+    )
+
+    transcripts = project_root / ".pollypm" / "transcripts"
+    primary_dir = transcripts / "session-primary"
+    backup_dir = transcripts / "session-backup"
+    primary_dir.mkdir(parents=True)
+    backup_dir.mkdir(parents=True)
+
+    def write_event(path: Path, session_id: str, account_name: str) -> None:
+        event = {
+            "timestamp": "2026-05-21T20:00:00Z",
+            "event_type": "assistant_turn",
+            "session_id": session_id,
+            "account_name": account_name,
+            "provider": "claude",
+            "project_key": "pollypm",
+            "source_path": "/tmp/raw",
+            "source_offset": 0,
+            "cwd": str(project_root),
+            "payload": {"text": account_name},
+        }
+        path.write_text(json.dumps(event) + "\n")
+
+    write_event(primary_dir / "events.jsonl", "session-primary", "claude_main")
+    write_event(backup_dir / "events.jsonl", "session-backup", "claude_backup")
+    import os as _os
+    _os.utime(primary_dir / "events.jsonl", (1_700_000_000, 1_700_000_000))
+    _os.utime(backup_dir / "events.jsonl", (1_700_000_100, 1_700_000_100))
+
+    surfaces = enumerate_chat_surfaces(config)
+
+    assert surfaces[0].session_name == "operator"
+    assert surfaces[0].transcript_path == backup_dir / "events.jsonl"
+
+
 # ---------------------------------------------------------------------------
 # auth_token_present surfacing
 # ---------------------------------------------------------------------------

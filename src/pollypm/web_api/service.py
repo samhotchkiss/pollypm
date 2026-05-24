@@ -268,6 +268,37 @@ def list_active_worker_sessions(
         return []
 
 
+def list_session_effective_accounts(config: PollyPMConfig) -> dict[str, str]:
+    """Return runtime account overrides for configured chat sessions.
+
+    Control sessions can fail over or be manually switched to a
+    different account than ``SessionConfig.account``. The transcript
+    ingestor records the account that actually produced each JSONL
+    line, so chat-surface discovery needs this runtime account map to
+    resolve the correct archive. Fail soft: if runtime state is
+    unavailable, callers fall back to static config and still return
+    the rest of the surface list.
+    """
+    del config  # The pg session-runtime facade reads the configured pool.
+    try:
+        from pollypm.storage.pg_sessions import list_session_runtimes
+
+        rows = list_session_runtimes()
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "list_session_effective_accounts: session-runtime read failed",
+            exc_info=True,
+        )
+        return {}
+    effective: dict[str, str] = {}
+    for row in rows or []:
+        session_name = getattr(row, "session_name", None)
+        account = getattr(row, "effective_account", None)
+        if session_name and account:
+            effective[str(session_name)] = str(account)
+    return effective
+
+
 # ---------------------------------------------------------------------------
 # Project helpers
 # ---------------------------------------------------------------------------
@@ -3730,6 +3761,7 @@ __all__ = [
     "list_inbox",
     "list_project_tasks",
     "list_projects",
+    "list_session_effective_accounts",
     "load_api_config",
     "mark_read_inbox_item",
     "patch_task",

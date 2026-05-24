@@ -1502,6 +1502,7 @@ def test_pause_happy_path_then_visible_in_list(
     listing = client.get("/api/v1/sessions", headers=auth_headers).json()
     by_name = {s["name"]: s for s in listing["sessions"]}
     assert by_name["operator"]["paused"] is True
+    assert by_name["operator"].get("paused_reason") is None
     # status must be a real health value, not the legacy "paused" string.
     assert by_name["operator"]["status"] in {"healthy", "stale"}
     assert by_name["operator"]["status"] != "paused"
@@ -1575,7 +1576,64 @@ def test_status_unpaused_session_reports_paused_false(
     listing = client.get("/api/v1/sessions", headers=auth_headers).json()
     row = next(s for s in listing["sessions"] if s["name"] == "operator")
     assert row["paused"] is False
+    assert row.get("paused_reason") is None
     assert row["status"] != "paused"
+
+
+def test_list_sessions_unreadable_marker_returns_200_fail_closed(
+    client,
+    auth_headers,
+    config: PollyPMConfig,
+    patch_heartbeat,
+    patch_tmux_windows,
+    isolate_audit_home: Path,
+):
+    """#2187: unreadable marker makes every listed session paused."""
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator", "advisor_myproj"])
+    marker = config.project.base_dir / "paused-sessions.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{not json}")
+
+    response = client.get("/api/v1/sessions", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    rows = response.json()["sessions"]
+    assert {row["name"] for row in rows} == {"advisor_myproj", "operator"}
+    for row in rows:
+        assert row["paused"] is True
+        assert row["paused_reason"] == "marker_unreadable"
+        assert row["status"] != "paused"
+
+
+def test_list_sessions_restored_marker_clears_unreadable_reason(
+    client,
+    auth_headers,
+    config: PollyPMConfig,
+    patch_heartbeat,
+    patch_tmux_windows,
+    isolate_audit_home: Path,
+):
+    """Once the marker is readable, intentional pause has no reason."""
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_tmux_windows(["operator", "advisor_myproj"])
+    marker = config.project.base_dir / "paused-sessions.json"
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text("{not json}")
+    first = client.get("/api/v1/sessions", headers=auth_headers)
+    assert first.status_code == 200
+    assert all(
+        row["paused_reason"] == "marker_unreadable"
+        for row in first.json()["sessions"]
+    )
+
+    marker.write_text('[\n  "operator"\n]\n')
+    response = client.get("/api/v1/sessions", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    by_name = {s["name"]: s for s in response.json()["sessions"]}
+    assert by_name["operator"]["paused"] is True
+    assert by_name["operator"].get("paused_reason") is None
+    assert by_name["advisor_myproj"]["paused"] is False
+    assert by_name["advisor_myproj"].get("paused_reason") is None
 
 
 def test_pause_is_idempotent(
@@ -1602,15 +1660,11 @@ def test_pause_response_labels_marker_partial_enforcement(
 ):
     """PR #2081: pause response must spell out PARTIAL enforcement.
 
-    PR ``feat/sessions-pause-marker-wire-loops-1-3`` wired the marker
-    into the recovery loops (``no_session_spawn``,
-    ``Supervisor.maybe_recover_session``), but the remaining dispatch /
-    cockpit / heartbeat loops still don't consume it (tracked under
-    #2068). The response body must surface BOTH sides — which loops
-    honor the marker and which don't — so an operator knows exactly
-    what they have quiesced. "Informational only" used to be the
-    contract; now the correct word is "honored by recovery loops",
-    plus a NOT-yet caveat for the rest.
+    The marker is now honored by the daemon-loop chokepoints wired
+    under #2068. The response body still needs to surface BOTH sides:
+    which loops honor the marker and which direct/manual actions remain
+    explicit operator actions, so an operator knows exactly what they
+    have quiesced.
     """
     patch_heartbeat({})
     patch_tmux_windows(["operator"])
@@ -1624,8 +1678,8 @@ def test_pause_response_labels_marker_partial_enforcement(
     # marker (else operators still think it's a pure tag).
     assert "honored" in msg or "honor" in msg, msg
     assert "recovery" in msg, msg
-    # Remaining-gaps side: must keep flagging what DOES NOT yet
-    # consume the marker so operators don't over-trust pause.
+    # Remaining-gaps side: must keep flagging what is NOT yet covered
+    # so operators don't over-trust pause.
     assert "do not" in msg or "does not" in msg or "not yet" in msg, msg
     # #2068 is the follow-up ticket — must be referenced so the gap is
     # discoverable from the response without grepping docs.

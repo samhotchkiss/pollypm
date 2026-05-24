@@ -36,6 +36,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -363,6 +364,43 @@ class TestNotifyDedupe:
         )
         assert outcome["outcome"] == "sent"
         assert len(svc.sent) == 2
+
+    def test_paused_session_skips_assignment_send(self, tmp_path, state_store):
+        from pollypm.session_paused import _reset_skip_throttle_for_tests
+
+        _reset_skip_throttle_for_tests()
+        base_dir = tmp_path / ".pollypm"
+        base_dir.mkdir()
+        (base_dir / "paused-sessions.json").write_text('["worker-demo"]\n')
+
+        config = SimpleNamespace(
+            project=SimpleNamespace(
+                name="demo",
+                root_dir=tmp_path,
+                base_dir=base_dir,
+            )
+        )
+
+        svc = FakeSessionService(handles=[FakeHandle("worker-demo")])
+        services = _RuntimeServices(
+            session_service=svc,
+            state_store=state_store,
+            work_service=None,
+            project_root=Path("."),
+            config=config,
+        )
+
+        outcome = notify(_event(), services=services)
+
+        assert outcome["outcome"] == "skipped_paused"
+        assert outcome["session"] == "worker-demo"
+        assert svc.sent == []
+        events = state_store.recent_events(5)
+        assert any(
+            event.event_type == "session.pause.skip"
+            and event.session_name == "worker-demo"
+            for event in events
+        )
 
 
 class TestNotifyEscalation:

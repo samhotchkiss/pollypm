@@ -3698,12 +3698,8 @@ class Supervisor:
         # this guard stops the relaunch / failover apply from firing —
         # leaving the policy classification + recommendation in place
         # so an operator can still see what would have happened.
-        from pollypm.session_paused import skip_if_paused
-
-        if skip_if_paused(
-            self.config,
+        if self._skip_if_session_paused(
             launch.session.name,
-            store=self._msg_store,
             loop="supervisor.maybe_recover_session",
             reason=f"failure_type={failure_type}",
         ):
@@ -3917,6 +3913,16 @@ class Supervisor:
         updates runtime/alert state.
         """
         launch = self._launch_by_session(session_name)
+        if self._skip_if_session_paused(
+            session_name,
+            loop="supervisor.restart_session",
+            reason=f"failure_type={failure_type}",
+        ):
+            logger.info(
+                "restart_session: skipped %s — pause marker present",
+                session_name,
+            )
+            return
         self._assert_lease_available(
             session_name,
             owner="pollypm",
@@ -4145,6 +4151,24 @@ class Supervisor:
     def _require_session(self, session_name: str) -> None:
         return self.require_session(session_name)
 
+    def _skip_if_session_paused(
+        self,
+        session_name: str,
+        *,
+        loop: str,
+        reason: str = "",
+    ) -> bool:
+        """Return True when the sessions-admin pause marker suppresses work."""
+        from pollypm.session_paused import skip_if_paused
+
+        return skip_if_paused(
+            self.config,
+            session_name,
+            store=getattr(self, "_msg_store", None),
+            loop=loop,
+            reason=reason,
+        )
+
     def launch_session(
         self,
         session_name: str,
@@ -4166,6 +4190,16 @@ class Supervisor:
         address.  If the window already exists, *target* is ``None``.
         """
         launch = self._launch_by_session(session_name)
+        if self._skip_if_session_paused(
+            session_name,
+            loop="supervisor.create_session_window",
+            reason="launch_session",
+        ):
+            logger.info(
+                "create_session_window: skipped %s — pause marker present",
+                session_name,
+            )
+            return launch, None
         tmux_session = self._tmux_session_for_launch(launch)
         window_map = self._window_map()
         # #1096 — scope existence-check to the launch's tmux_session.

@@ -713,6 +713,30 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         )
         api.send_session_message(context.session_name, text, owner=owner)
 
+    def _skip_if_session_paused(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+    ) -> bool:
+        supervisor = getattr(api, "supervisor", None)
+        config = getattr(supervisor, "config", None)
+        if config is None:
+            return False
+        store = (
+            getattr(supervisor, "msg_store", None)
+            or getattr(supervisor, "_msg_store", None)
+            or getattr(supervisor, "store", None)
+        )
+        from pollypm.session_paused import skip_if_paused
+
+        return skip_if_paused(
+            config,
+            context.session_name,
+            store=store,
+            loop="heartbeat.local.process_session",
+            reason=f"role={context.role}",
+        )
+
     def _process_unmanaged_windows(self, api) -> None:
         current_alert_types: set[str] = set()
         existing_alert_types = {
@@ -766,6 +790,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
                 return
         except (AttributeError, Exception):  # noqa: BLE001
             pass  # API may not have supervisor (e.g., tests)
+        if self._skip_if_session_paused(api, context):
+            return
         mechanical_only = context.role == "heartbeat-supervisor"
         if not context.window_present:
             _emit_routed_alert(

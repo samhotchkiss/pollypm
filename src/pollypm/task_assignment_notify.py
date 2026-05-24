@@ -203,6 +203,30 @@ def _notify_record_delivery(
             )
 
 
+def _notify_skip_if_paused(
+    *,
+    services: _RuntimeServices,
+    target_name: str,
+    event: TaskAssignmentEvent,
+) -> bool:
+    """Return True when a session pause marker suppresses assignment send."""
+    config = getattr(services, "config", None)
+    if config is None:
+        return False
+    from pollypm.session_paused import skip_if_paused
+
+    return skip_if_paused(
+        config,
+        target_name,
+        store=services.msg_store or services.state_store,
+        loop="task_assignment_notify.notify",
+        reason=(
+            f"task_id={event.task_id} "
+            f"actor={event.actor_type.value}:{event.actor_name}"
+        ),
+    )
+
+
 def notify(
     event: TaskAssignmentEvent,
     *,
@@ -248,6 +272,14 @@ def notify(
         }
 
     target_name = getattr(handle, "name", "")
+    if _notify_skip_if_paused(
+        services=services, target_name=target_name, event=event,
+    ):
+        return {
+            "outcome": "skipped_paused",
+            "task_id": event.task_id,
+            "session": target_name,
+        }
 
     # #279: key the dedupe on ``(session, task, execution_version)``.
     execution_version = int(getattr(event, "execution_version", 0) or 0)

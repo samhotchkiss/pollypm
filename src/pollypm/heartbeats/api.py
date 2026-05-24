@@ -259,6 +259,20 @@ class SupervisorHeartbeatAPI:
 
     def send_session_message(self, session_name: str, text: str, *, owner: str = "heartbeat") -> None:
         try:
+            from pollypm.session_paused import skip_if_paused
+
+            if skip_if_paused(
+                self.supervisor.config,
+                session_name,
+                store=self.supervisor.msg_store,
+                loop="heartbeat.api.send_session_message",
+                reason=f"owner={owner}",
+            ):
+                return
+        except Exception:  # noqa: BLE001
+            # Pause-marker audit/read failures must not crash the sweep.
+            pass
+        try:
             self.supervisor.send_input(session_name, text, owner=owner)
         except Exception:  # noqa: BLE001
             # Session may be dead or missing — don't crash the sweep.

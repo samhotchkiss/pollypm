@@ -40,6 +40,81 @@ test.describe("surfaces", () => {
     );
   }
 
+  async function installHealthyEventSource(page: import("@playwright/test").Page) {
+    await page.addInitScript(() => {
+      const instances: any[] = [];
+      class MockEventSource {
+        url: string;
+        listeners: Record<string, EventListenerOrEventListenerObject>;
+        onopen: ((event: Event) => void) | null;
+        onmessage: ((event: MessageEvent) => void) | null;
+        onerror: ((event: Event) => void) | null;
+        closed: boolean;
+
+        constructor(url: string) {
+          this.url = url;
+          this.listeners = {};
+          this.onopen = null;
+          this.onmessage = null;
+          this.onerror = null;
+          this.closed = false;
+          instances.push(this);
+          setTimeout(() => {
+            if (!this.closed && typeof this.onopen === "function") {
+              this.onopen(new Event("open"));
+            }
+          }, 0);
+        }
+
+        addEventListener(
+          type: string,
+          handler: EventListenerOrEventListenerObject,
+        ) {
+          this.listeners[type] = handler;
+        }
+
+        close() {
+          this.closed = true;
+        }
+      }
+
+      (window as any).__pollypmEventSources = instances;
+      (window as any).EventSource = MockEventSource as any;
+    });
+  }
+
+  function dashboardPayload(count: number) {
+    return {
+      rollups: { message_count_24h: count },
+      daemon_status: "up",
+      active_sessions: [],
+      recent_messages: [],
+      projects: [],
+      generated_at: "2026-05-23T00:00:00Z",
+      scoped_fields: [],
+    };
+  }
+
+  async function stubEmptyTasks(page: import("@playwright/test").Page) {
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      }),
+    );
+  }
+
+  async function stubEmptySessions(page: import("@playwright/test").Page) {
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      }),
+    );
+  }
+
   test("left rail renders surface list after load", async ({ page }) => {
     await page.goto("/ui/");
     const list = page.locator("#surface-list");
@@ -227,6 +302,92 @@ test.describe("surfaces", () => {
     await expect(page.locator("#message-list .message-text")).toContainText(
       "refresh",
     );
+  });
+
+  test("dashboard refreshes coalesce while a request is in flight", async ({ page }) => {
+    await installHealthyEventSource(page);
+    await stubEmptySessions(page);
+    await stubEmptyTasks(page);
+
+    let dashboardRequests = 0;
+    let releaseFirst: (() => void) | null = null;
+    const firstRequestGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    await page.route("**/api/v1/dashboard", async (route) => {
+      dashboardRequests += 1;
+      if (dashboardRequests === 1) {
+        await firstRequestGate;
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(dashboardRequests)),
+      });
+    });
+
+    await page.goto("/ui/");
+    await expect.poll(() => dashboardRequests).toBe(1);
+
+    await page.evaluate(() => {
+      (window as any).PollyPM.pollDashboard();
+      (window as any).PollyPM.pollDashboard();
+    });
+    await page.waitForTimeout(250);
+    expect(dashboardRequests).toBe(1);
+
+    releaseFirst!();
+    await expect.poll(() => dashboardRequests).toBe(2);
+    await page.waitForTimeout(250);
+    expect(dashboardRequests).toBe(2);
+  });
+
+  test("surface refreshes coalesce while a request is in flight", async ({ page }) => {
+    await installHealthyEventSource(page);
+    await stubEmptyTasks(page);
+
+    let dashboardRequests = 0;
+    await page.route("**/api/v1/dashboard", (route) => {
+      dashboardRequests += 1;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(dashboardRequests)),
+      });
+    });
+
+    let sessionRequests = 0;
+    let releaseFirst: (() => void) | null = null;
+    const firstRequestGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    await page.route("**/api/v1/chat/sessions", async (route) => {
+      sessionRequests += 1;
+      if (sessionRequests === 1) {
+        await firstRequestGate;
+      }
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      });
+    });
+
+    await page.goto("/ui/");
+    await expect.poll(() => sessionRequests).toBe(1);
+
+    await page.evaluate(() => {
+      (window as any).PollyPM.loadSurfaces();
+      (window as any).PollyPM.loadSurfaces();
+    });
+    await page.waitForTimeout(250);
+    expect(sessionRequests).toBe(1);
+
+    releaseFirst!();
+    await expect.poll(() => sessionRequests).toBe(2);
+    await page.waitForTimeout(250);
+    expect(sessionRequests).toBe(2);
   });
 
   test("initial center-pane state shows 'Select a surface'", async ({ page }) => {

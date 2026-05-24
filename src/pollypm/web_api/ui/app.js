@@ -36,6 +36,12 @@
     eventSource: null,
     fallbackTimer: null,
     pushRefreshTimer: null,
+    surfacesInFlight: false,
+    surfacesRefreshQueued: false,
+    dashboardInFlight: false,
+    dashboardRefreshQueued: false,
+    historyInFlight: {},
+    historyRefreshQueued: {},
     sseFailures: 0,
     sseRetryTimer: null,
     lastEventId: null,
@@ -216,26 +222,39 @@
   // ----- surfaces (left rail) --------------------------------------------
 
   async function loadSurfaces() {
-    try {
-      const data = await apiJson(API + "/chat/sessions");
-      state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
-    } catch (err) {
-      renderSurfaceError(err);
+    if (state.surfacesInFlight) {
+      state.surfacesRefreshQueued = true;
       return;
     }
-
-    state.taskLoadError = null;
+    state.surfacesInFlight = true;
     try {
-      const taskData = await apiJsonOptional(
-        API + "/tasks?limit=" + TASK_RAIL_LIMIT,
-      );
-      const items = Array.isArray(taskData.items) ? taskData.items : [];
-      state.taskSurfaces = items.map(normalizeTaskSurface);
-    } catch (err) {
-      state.taskSurfaces = [];
-      state.taskLoadError = err;
+      try {
+        const data = await apiJson(API + "/chat/sessions");
+        state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
+      } catch (err) {
+        renderSurfaceError(err);
+        return;
+      }
+
+      state.taskLoadError = null;
+      try {
+        const taskData = await apiJsonOptional(
+          API + "/tasks?limit=" + TASK_RAIL_LIMIT,
+        );
+        const items = Array.isArray(taskData.items) ? taskData.items : [];
+        state.taskSurfaces = items.map(normalizeTaskSurface);
+      } catch (err) {
+        state.taskSurfaces = [];
+        state.taskLoadError = err;
+      }
+      renderSurfaces();
+    } finally {
+      state.surfacesInFlight = false;
+      if (state.surfacesRefreshQueued) {
+        state.surfacesRefreshQueued = false;
+        loadSurfaces();
+      }
     }
-    renderSurfaces();
   }
 
   function normalizeTaskSurface(task) {
@@ -643,14 +662,31 @@
 
   async function loadHistory(name) {
     if (!name) return;
+    if (state.historyInFlight[name]) {
+      state.historyRefreshQueued[name] = true;
+      return;
+    }
+    state.historyInFlight[name] = true;
     try {
       const path =
         API + "/chat/" + encodeURIComponent(name) + "/messages?limit="
         + MAX_MESSAGES + "&direction=desc";
       const data = await apiJson(path);
-      renderHistory(data);
+      if (state.selectedKind === "chat" && state.selectedSurface === name) {
+        renderHistory(data);
+      }
     } catch (err) {
-      renderHistoryError(err);
+      if (state.selectedKind === "chat" && state.selectedSurface === name) {
+        renderHistoryError(err);
+      }
+    } finally {
+      state.historyInFlight[name] = false;
+      if (state.historyRefreshQueued[name]) {
+        state.historyRefreshQueued[name] = false;
+        if (state.selectedKind === "chat" && state.selectedSurface === name) {
+          loadHistory(name);
+        }
+      }
     }
   }
 
@@ -729,11 +765,22 @@
   // ----- dashboard rollups (right rail) ----------------------------------
 
   async function pollDashboard() {
+    if (state.dashboardInFlight) {
+      state.dashboardRefreshQueued = true;
+      return;
+    }
+    state.dashboardInFlight = true;
     try {
       const data = await apiJson(API + "/dashboard");
       renderDashboard(data);
     } catch (err) {
       renderDashboardError(err);
+    } finally {
+      state.dashboardInFlight = false;
+      if (state.dashboardRefreshQueued) {
+        state.dashboardRefreshQueued = false;
+        pollDashboard();
+      }
     }
   }
 

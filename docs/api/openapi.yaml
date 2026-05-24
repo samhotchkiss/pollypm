@@ -3717,12 +3717,19 @@ components:
 
     TaskListResponse:
       type: object
-      required: [items]
+      required: [items, total, has_more]
       properties:
         items:
           type: array
           items:
             $ref: "#/components/schemas/TaskSummary"
+        total:
+          type: integer
+          minimum: 0
+          description: Total matching tasks before pagination.
+        has_more:
+          type: boolean
+          description: True when `next_cursor` can fetch another page.
         next_cursor:
           type: string
           description: Absent when no more pages.
@@ -4052,12 +4059,23 @@ components:
 
     InboxListResponse:
       type: object
-      required: [items]
+      required: [items, total, has_more, unread_count]
       properties:
         items:
           type: array
           items:
             $ref: "#/components/schemas/InboxItem"
+        total:
+          type: integer
+          minimum: 0
+          description: Total matching inbox items before pagination.
+        has_more:
+          type: boolean
+          description: True when `next_cursor` can fetch another page.
+        unread_count:
+          type: integer
+          minimum: 0
+          description: Matching inbox items without a persisted read marker.
         next_cursor: { type: string }
 
     InboxReplyRequest:

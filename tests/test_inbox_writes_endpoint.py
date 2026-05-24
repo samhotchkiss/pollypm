@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
@@ -35,10 +36,14 @@ from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
 from pollypm.web_api import create_app, ensure_token
 from pollypm.web_api.errors import APIError
 from pollypm.web_api.models import (
+    InboxItem,
     TaskDetail,
     TaskRelationships,
+    TaskSummary,
 )
 from pollypm.web_api.routes import inbox as inbox_routes
+from pollypm.web_api.routes import projects as project_routes
+from pollypm.web_api.routes import tasks as task_routes
 
 
 # ---------------------------------------------------------------------------
@@ -171,6 +176,87 @@ def _make_task_detail(
         created_at=datetime(2026, 5, 20, 9, 0, 0, tzinfo=timezone.utc),
         created_by="tester",
     )
+
+
+def _make_task_summary(*, task_id: str = "myproj/1") -> TaskSummary:
+    project, num = task_id.split("/", 1)
+    return TaskSummary(
+        task_id=task_id,
+        project=project,
+        task_number=int(num),
+        title="Task",
+        work_status="queued",
+        type="task",
+        priority="normal",
+        updated_at=datetime(2026, 5, 20, 9, 0, 0, tzinfo=timezone.utc),
+    )
+
+
+def test_list_inbox_response_includes_counts(
+    client, auth_headers, monkeypatch,
+) -> None:
+    now = datetime(2026, 5, 20, 9, 0, 0, tzinfo=timezone.utc)
+    item = InboxItem(
+        id="myproj/1",
+        project="myproj",
+        type="message",
+        state="open",
+        subject="Inbox item",
+        owner="pm",
+        thread_id="myproj/1",
+        created_at=now,
+        updated_at=now,
+    )
+
+    def fake_list_inbox(*_args, **_kwargs):
+        return SimpleNamespace(
+            items=[item],
+            total=3,
+            has_more=True,
+            unread_count=2,
+            next_cursor="myproj/1",
+        )
+
+    monkeypatch.setattr(inbox_routes, "list_inbox", fake_list_inbox)
+
+    response = client.get("/api/v1/inbox?limit=1", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["total"] == 3
+    assert body["has_more"] is True
+    assert body["unread_count"] == 2
+    assert body["next_cursor"] == "myproj/1"
+
+
+def test_task_list_responses_include_counts(
+    client, auth_headers, monkeypatch,
+) -> None:
+    summary = _make_task_summary()
+
+    def fake_list_all_tasks(*_args, **_kwargs):
+        return [summary], "cursor-1", [], 4
+
+    def fake_list_project_tasks(*_args, **_kwargs):
+        return [summary], None, 1
+
+    monkeypatch.setattr(task_routes, "list_all_tasks", fake_list_all_tasks)
+    monkeypatch.setattr(
+        project_routes, "list_project_tasks", fake_list_project_tasks,
+    )
+
+    flat = client.get("/api/v1/tasks?limit=1", headers=auth_headers)
+    project = client.get("/api/v1/projects/myproj/tasks", headers=auth_headers)
+
+    assert flat.status_code == 200, flat.text
+    flat_body = flat.json()
+    assert flat_body["total"] == 4
+    assert flat_body["has_more"] is True
+    assert flat_body["next_cursor"] == "cursor-1"
+    assert project.status_code == 200, project.text
+    project_body = project.json()
+    assert project_body["total"] == 1
+    assert project_body["has_more"] is False
 
 
 # ---------------------------------------------------------------------------

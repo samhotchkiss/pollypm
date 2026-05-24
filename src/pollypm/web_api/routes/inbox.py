@@ -62,7 +62,7 @@ def list_inbox_endpoint(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     cursor: Annotated[str | None, Query()] = None,
 ) -> InboxListResponse:
-    items, next_cursor = list_inbox(
+    page = list_inbox(
         config,
         project=project,
         type_filter=type,
@@ -70,7 +70,13 @@ def list_inbox_endpoint(
         limit=limit,
         cursor=cursor,
     )
-    return InboxListResponse(items=items, next_cursor=next_cursor)
+    return InboxListResponse(
+        items=page.items,
+        total=page.total,
+        has_more=page.has_more,
+        unread_count=page.unread_count,
+        next_cursor=page.next_cursor,
+    )
 
 
 @router.get(

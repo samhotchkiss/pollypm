@@ -91,6 +91,8 @@ def test_list_tasks_returns_all_projects(
     body = response.json()
     titles = sorted(item["title"] for item in body["items"])
     assert titles == ["My A", "My B", "Second A"]
+    assert body["total"] == 3
+    assert body["has_more"] is False
     # ``next_cursor`` is absent when no more pages remain.
     assert body.get("next_cursor") is None
     # Every item carries the cross-project ``project`` field so the
@@ -275,6 +277,8 @@ def test_list_tasks_pagination_cursor(
         "/api/v1/tasks?limit=2", headers=auth_headers
     ).json()
     assert len(first["items"]) == 2
+    assert first["total"] == 5
+    assert first["has_more"] is True
     assert first.get("next_cursor") is not None
 
     second = client.get(
@@ -282,6 +286,7 @@ def test_list_tasks_pagination_cursor(
         headers=auth_headers,
     ).json()
     assert len(second["items"]) == 2
+    assert second["total"] == 5
     # The pages must not overlap.
     first_ids = {item["task_id"] for item in first["items"]}
     second_ids = {item["task_id"] for item in second["items"]}

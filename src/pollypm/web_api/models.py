@@ -300,6 +300,14 @@ TaskListWarning: TypeAlias = (
 
 class TaskListResponse(BaseModel):
     items: list[TaskSummary]
+    total: int = Field(
+        ge=0,
+        description="Total matching tasks before pagination.",
+    )
+    has_more: bool = Field(
+        default=False,
+        description="True when `next_cursor` can fetch another page.",
+    )
     next_cursor: str | None = None
     # Empty/absent means every project read succeeded. One entry per
     # project whose backing store raised during this request — see
@@ -486,6 +494,18 @@ class InboxItemDetail(InboxItem):
 
 class InboxListResponse(BaseModel):
     items: list[InboxItem]
+    total: int = Field(
+        ge=0,
+        description="Total matching inbox items before pagination.",
+    )
+    has_more: bool = Field(
+        default=False,
+        description="True when `next_cursor` can fetch another page.",
+    )
+    unread_count: int = Field(
+        ge=0,
+        description="Matching inbox items without a persisted read marker.",
+    )
     next_cursor: str | None = None
 
 

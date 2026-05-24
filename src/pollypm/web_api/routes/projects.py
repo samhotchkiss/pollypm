@@ -93,10 +93,15 @@ def list_project_tasks_endpoint(
 ) -> TaskListResponse:
     if key not in config.projects:
         raise not_found(f"Project not registered: {key}")
-    items, next_cursor = list_project_tasks(
+    items, next_cursor, total = list_project_tasks(
         config, key, status=status, limit=limit, cursor=cursor
     )
-    return TaskListResponse(items=items, next_cursor=next_cursor)
+    return TaskListResponse(
+        items=items,
+        total=total,
+        has_more=next_cursor is not None,
+        next_cursor=next_cursor,
+    )
 
 
 @router.get(

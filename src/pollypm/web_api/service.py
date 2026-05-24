@@ -18,6 +18,7 @@ import logging
 import os
 import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -77,6 +78,15 @@ logger = logging.getLogger(__name__)
 
 _is_snooze_active = _inbox_snooze.is_snooze_active
 _parse_snooze_until = _inbox_snooze.parse_snooze_until
+
+
+@dataclass(frozen=True)
+class InboxListPage:
+    items: list[APIInboxItem]
+    next_cursor: str | None
+    total: int
+    has_more: bool
+    unread_count: int
 
 
 # ---------------------------------------------------------------------------
@@ -973,7 +983,7 @@ def list_project_tasks(
     status: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APITaskSummary], str | None]:
+) -> tuple[list[APITaskSummary], str | None, int]:
     """Page of task summaries with cursor-based pagination.
 
     The cursor is the integer ``task_number`` of the last item in the
@@ -983,7 +993,7 @@ def list_project_tasks(
     """
     project = config.projects.get(project_key)
     if project is None:
-        return [], None
+        return [], None, 0
 
     cursor_n: int | None = None
     if cursor is not None:
@@ -1005,13 +1015,14 @@ def list_project_tasks(
         ) as svc:
             tasks = svc.list_tasks(project=project_key, work_status=status)
             tasks.sort(key=lambda t: getattr(t, "task_number", 0))
+            total = len(tasks)
             if cursor_n is not None:
                 tasks = [t for t in tasks if getattr(t, "task_number", 0) > cursor_n]
             page = tasks[:limit]
             next_cursor: str | None = None
             if len(tasks) > limit and page:
                 next_cursor = str(getattr(page[-1], "task_number", 0))
-            return [_task_to_summary(t) for t in page], next_cursor
+            return [_task_to_summary(t) for t in page], next_cursor, total
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "list_tasks: backing store error for %s: %s",
@@ -1047,7 +1058,7 @@ def list_all_tasks(
     include_untracked: bool = False,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]]]:
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]], int]:
     """Cross-project flat task list (spec §5.1 / Phase 6 P0).
 
     The default scoped view iterates tracked projects, calls
@@ -1078,7 +1089,7 @@ def list_all_tasks(
       duplicate rows / infinite loops under concurrent updates
       (PR #2067 Codex round 1, P0 #3).
 
-    Returns ``(page, next_cursor, warnings)``. ``warnings`` contains
+    Returns ``(page, next_cursor, warnings, total)``. ``warnings`` contains
     either per-project backing-store failures
     (``{"project": <key>, "error": <code>}``) or the tracked-scope
     filter warning (``{"code": "untracked_filtered", ...}``). An
@@ -1257,7 +1268,7 @@ def _page_task_summaries(
     limit: int,
     cursor: str | None,
     warnings: list[dict[str, object]],
-) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]]]:
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]], int]:
     # Newest-first ordering is the most useful default for cross-
     # project list views (cockpit "what changed recently?"). Tasks
     # without ``updated_at`` sort to the end via the epoch fallback so
@@ -1286,12 +1297,13 @@ def _page_task_summaries(
             # and force the client to restart explicitly.
             raise StaleCursorError(cursor)
 
+    total = len(summaries)
     page = summaries[cursor_idx : cursor_idx + limit]
     next_cursor: str | None = None
     if cursor_idx + limit < len(summaries) and page:
         tail = page[-1]
         next_cursor = f"{(tail.updated_at or epoch).isoformat()}|{tail.task_id}"
-    return page, next_cursor, warnings
+    return page, next_cursor, warnings, total
 
 
 def get_task_detail(
@@ -2949,26 +2961,37 @@ def list_inbox(
     state_filter: str | None = None,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APIInboxItem], str | None]:
+) -> InboxListPage:
     """Aggregate inbox view across one or all projects.
 
     Mirrors :func:`pollypm.cockpit_inbox.render_inbox_panel` at a
     coarser granularity — the API only exposes the typed shape per
     spec §7. Projects with no inbox state contribute nothing.
     """
-    # The no-cursor first page is the hot path. Ask the work-service for
-    # only enough candidates to fill this page plus one sentinel row, then
-    # merge/sort across projects below. Cursor pages keep the older full
-    # scan path for correctness until the service grows cross-project
-    # keyset cursors.
+    # Preserve the first-page hot path from #2205: fetch only enough
+    # candidates to render the page plus one sentinel, then run the
+    # full scan separately for exact metadata fields required by the
+    # response contract (#2231). Cursor pages already require the full
+    # ordered set to locate the cursor.
     candidate_limit = None if cursor is not None else limit + 1
-    items = _collect_inbox_items(
+    items, candidate_unread_count, candidate_complete = _collect_inbox_items(
         config,
         project=project,
         type_filter=type_filter,
         state_filter=state_filter,
         limit=candidate_limit,
     )
+    if candidate_limit is None or candidate_complete:
+        metric_items = items
+        unread_count = candidate_unread_count
+    else:
+        metric_items, unread_count, _ = _collect_inbox_items(
+            config,
+            project=project,
+            type_filter=type_filter,
+            state_filter=state_filter,
+            limit=None,
+        )
     items.sort(key=lambda item: item.updated_at, reverse=True)
 
     cursor_idx = 0
@@ -2977,11 +3000,18 @@ def list_inbox(
             if item.id == cursor:
                 cursor_idx = idx + 1
                 break
+    total = len(metric_items)
     page = items[cursor_idx : cursor_idx + limit]
     next_cursor: str | None = None
     if cursor_idx + limit < len(items) and page:
         next_cursor = page[-1].id
-    return page, next_cursor
+    return InboxListPage(
+        items=page,
+        next_cursor=next_cursor,
+        total=total,
+        has_more=next_cursor is not None,
+        unread_count=unread_count,
+    )
 
 
 def get_inbox_item(config: PollyPMConfig, item_id: str) -> APIInboxItemDetail | None:
@@ -3041,7 +3071,7 @@ def _collect_inbox_items(
     type_filter: str | None = None,
     state_filter: str | None = None,
     limit: int | None = None,
-) -> list[APIInboxItem]:
+) -> tuple[list[APIInboxItem], int, bool]:
     """Load inbox items from the work-service for the requested projects.
 
     "Inbox" here = chat-flow tasks + plan-review tasks. Mirrors the
@@ -3050,6 +3080,8 @@ def _collect_inbox_items(
     address it.
     """
     out: list[APIInboxItem] = []
+    unread_count = 0
+    complete = True
     keys: Iterable[str]
     if project is not None:
         keys = (project,) if project in config.projects else ()
@@ -3070,6 +3102,11 @@ def _collect_inbox_items(
                     type_filter=type_filter,
                     state_filter=state_filter,
                     limit=limit,
+                )
+                if limit is not None and len(tasks) >= limit:
+                    complete = False
+                read_marker_numbers = _task_numbers_with_context_entry(
+                    svc, project=key, entry_type="read", tasks=tasks,
                 )
                 # Snooze visibility (#2060): the snooze write helper
                 # persists ``entry_type='snooze'`` rows whose text
@@ -3111,6 +3148,8 @@ def _collect_inbox_items(
                     if not _inbox_item_matches_state(entry, state_filter):
                         continue
                     out.append(entry)
+                    if _task_number(task) not in read_marker_numbers:
+                        unread_count += 1
         except _BACKING_STORE_ERRORS as exc:
             # Backing-store failure on a single project: log loudly,
             # skip that project but keep building the aggregate. We
@@ -3125,7 +3164,43 @@ def _collect_inbox_items(
                 exc_info=True,
             )
             continue
-    return out
+    return out, unread_count, complete
+
+
+def _task_number(task) -> int:
+    value = getattr(task, "task_number", None)
+    if value is not None:
+        return int(value)
+    return int(str(getattr(task, "task_id")).split("/", 1)[1])
+
+
+def _task_numbers_with_context_entry(
+    svc,
+    *,
+    project: str,
+    entry_type: str,
+    tasks,
+) -> set[int]:
+    bulk = getattr(svc, "task_numbers_with_context_entry", None)
+    if callable(bulk):
+        return set(bulk(project=project, entry_type=entry_type))
+
+    marked: set[int] = set()
+    for task in tasks:
+        try:
+            entries = svc.get_context(
+                task.task_id, entry_type=entry_type, limit=1,
+            )
+        except Exception:  # noqa: BLE001 - metrics should not hide inbox rows
+            logger.debug(
+                "inbox: context marker lookup failed for %s",
+                getattr(task, "task_id", "<unknown>"),
+                exc_info=True,
+            )
+            continue
+        if entries:
+            marked.add(_task_number(task))
+    return marked
 
 
 _CLOSED_INBOX_STATE_FILTERS: frozenset[str] = frozenset(

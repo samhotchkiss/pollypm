@@ -582,7 +582,9 @@ def test_concurrent_reassign_serializes_breadcrumbs(pg_service):
     assert final.assignee == destinations[1]
 
 
-def test_concurrent_claim_serializes_one_winner_one_loser(pg_service):
+def test_concurrent_claim_serializes_one_winner_one_loser(
+    pg_service, monkeypatch,
+):
     """Spec §P-9 + concurrency safety (#2064 round-8 blocker #1).
 
     The new ``POST /tasks/{p}/{n}/claim`` route advertises an atomic
@@ -626,8 +628,22 @@ def test_concurrent_claim_serializes_one_winner_one_loser(pg_service):
     """
     import threading
 
+    from pollypm.claim_breadcrumbs import (
+        CLAIM_ALREADY_CLAIMED_REASON,
+        CLAIM_ATTEMPTED_BY_LOSER,
+        CLAIM_WON_BY,
+    )
     from pollypm.work.models import WorkStatus
     from pollypm.work.service_support import InvalidTransitionError
+
+    event_lock = threading.Lock()
+    emitted: list[dict] = []
+
+    def fake_emit(**kw):
+        with event_lock:
+            emitted.append(kw)
+
+    monkeypatch.setattr("pollypm.audit.emit", fake_emit)
 
     task = _make_draft(
         pg_service, roles={"worker": "alice", "reviewer": "bob"}
@@ -823,6 +839,44 @@ def test_concurrent_claim_serializes_one_winner_one_loser(pg_service):
         f"{execution_count}. Loser inserted a duplicate visit row "
         f"from its stale pre-transaction snapshot."
     )
+
+    entries = pg_service.get_context(task.task_id)
+    claim_entries = {
+        entry.entry_type: entry
+        for entry in entries
+        if entry.entry_type in {CLAIM_WON_BY, CLAIM_ATTEMPTED_BY_LOSER}
+    }
+    assert set(claim_entries) == {CLAIM_WON_BY, CLAIM_ATTEMPTED_BY_LOSER}
+    won = claim_entries[CLAIM_WON_BY]
+    assert won.actor == "winner"
+    assert f"task_id={task.task_id}" in won.text
+    assert "actor=winner" in won.text
+    assert "session=winner" in won.text
+    assert "assignee=alice" in won.text
+
+    lost = claim_entries[CLAIM_ATTEMPTED_BY_LOSER]
+    assert lost.actor == "loser"
+    assert f"task_id={task.task_id}" in lost.text
+    assert "actor=loser" in lost.text
+    assert "session=loser" in lost.text
+    assert f"reason={CLAIM_ALREADY_CLAIMED_REASON}" in lost.text
+    assert "winner_session=winner" in lost.text
+    assert "assignee=alice" in lost.text
+
+    claim_events = [
+        event for event in emitted
+        if event.get("event") in {CLAIM_WON_BY, CLAIM_ATTEMPTED_BY_LOSER}
+    ]
+    assert {event["event"] for event in claim_events} == {
+        CLAIM_WON_BY,
+        CLAIM_ATTEMPTED_BY_LOSER,
+    }
+    events_by_type = {event["event"]: event for event in claim_events}
+    assert events_by_type[CLAIM_WON_BY]["metadata"]["session"] == "winner"
+    loser_metadata = events_by_type[CLAIM_ATTEMPTED_BY_LOSER]["metadata"]
+    assert loser_metadata["session"] == "loser"
+    assert loser_metadata["reason"] == CLAIM_ALREADY_CLAIMED_REASON
+    assert loser_metadata["winner_session"] == "winner"
 
 
 def test_concurrent_role_update_does_not_leak_into_claim(pg_service):

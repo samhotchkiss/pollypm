@@ -30,6 +30,7 @@ import psycopg_pool
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
+from pollypm.work.inbox_snooze import is_snooze_active as _is_snooze_active
 from pollypm.work.inbox_view import is_inbox_task, is_inbox_task_identity
 from pollypm.web_api.errors import (
     APIError,
@@ -1033,18 +1034,17 @@ def list_all_tasks(
     statuses: list[str] | None = None,
     assignee: str | None = None,
     since: datetime | None = None,
+    include_untracked: bool = False,
     limit: int = 50,
     cursor: str | None = None,
-) -> tuple[list[APITaskSummary], str | None, list[dict[str, str]]]:
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]]]:
     """Cross-project flat task list (spec §5.1 / Phase 6 P0).
 
-    No cross-project helper exists on the work-service yet, so we
-    iterate the registered projects, call :meth:`list_tasks` per
-    project, and concatenate. This is acceptable for v1 — workspaces
-    are small (<20 projects, low hundreds of tasks each) and the
-    per-project DB open is the same cost ``list_project_tasks`` pays.
-    A native cross-project query can replace this body without
-    changing the route signature.
+    The default scoped view iterates tracked projects, calls
+    :meth:`list_tasks` per project, and concatenates. The
+    ``include_untracked`` opt-in uses the work-service's workspace
+    list query so rows outside ``config.projects`` can be surfaced
+    without teaching the route layer about storage internals.
 
     * ``project`` — when set, restricts to a single project. The
       result is equivalent to ``list_project_tasks`` minus the 404 on
@@ -1056,6 +1056,10 @@ def list_all_tasks(
     * ``since`` — only tasks with ``updated_at > since`` are returned.
       Must be timezone-aware; the route layer rejects naive ISO
       values before they reach this helper.
+    * ``include_untracked`` — when false, restrict results to the
+      tracked-project set and surface a warning when matching rows
+      are omitted. When true, include rows for any project key stored
+      in the work-service backing store.
     * Pagination uses an opaque cursor; the cursor encodes the
       ``(updated_at_iso, task_id)`` of the last item on the previous
       page. A cursor that no longer matches any item raises
@@ -1064,23 +1068,39 @@ def list_all_tasks(
       duplicate rows / infinite loops under concurrent updates
       (PR #2067 Codex round 1, P0 #3).
 
-    Returns ``(page, next_cursor, warnings)``. ``warnings`` is a list
-    of ``{"project": <key>, "error": <code>}`` dicts — one entry per
-    project whose backing store raised during this request. An empty
-    list means every project read succeeded; the partial-failure
-    surface is explicit so a pg outage on one project can't hide
-    behind a 200 with a silently-truncated body (PR #2067 Codex round
-    1, P0 #1).
+    Returns ``(page, next_cursor, warnings)``. ``warnings`` contains
+    either per-project backing-store failures
+    (``{"project": <key>, "error": <code>}``) or the tracked-scope
+    filter warning (``{"code": "untracked_filtered", ...}``). An
+    empty list means every project read succeeded and no matching
+    rows were omitted.
     """
-    keys: Iterable[str]
-    if project is not None:
-        keys = (project,) if project in config.projects else ()
-    else:
-        keys = config.projects.keys()
-
     status_filter = set(statuses or [])
     summaries: list[APITaskSummary] = []
-    warnings: list[dict[str, str]] = []
+    warnings: list[dict[str, object]] = []
+
+    if include_untracked:
+        tasks = _list_tasks_from_workspace(config, project=project)
+        for task in tasks:
+            if not _task_matches_list_filters(
+                task,
+                status_filter=status_filter,
+                assignee=assignee,
+                since=since,
+            ):
+                continue
+            summaries.append(_task_to_summary(task))
+        return _page_task_summaries(
+            summaries, limit=limit, cursor=cursor, warnings=warnings
+        )
+
+    tracked_keys = _tracked_project_keys(config)
+    keys: Iterable[str]
+    if project is not None:
+        keys = (project,) if project in tracked_keys else ()
+    else:
+        keys = tracked_keys
+
     for key in keys:
         proj = config.projects[key]
         try:
@@ -1104,19 +1124,130 @@ def list_all_tasks(
             continue
 
         for task in tasks:
-            if status_filter:
-                value = _enum_value(getattr(task, "work_status", ""))
-                if value not in status_filter:
-                    continue
-            if assignee is not None:
-                if (getattr(task, "assignee", None) or "") != assignee:
-                    continue
-            if since is not None:
-                updated = getattr(task, "updated_at", None)
-                if updated is not None and updated <= since:
-                    continue
+            if not _task_matches_list_filters(
+                task,
+                status_filter=status_filter,
+                assignee=assignee,
+                since=since,
+            ):
+                continue
             summaries.append(_task_to_summary(task))
 
+    try:
+        dropped_count = _count_untracked_matches(
+            config,
+            tracked_keys=tracked_keys,
+            project=project,
+            status_filter=status_filter,
+            assignee=assignee,
+            since=since,
+        )
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "list_all_tasks: could not inspect untracked task rows; "
+            "surfacing workspace warning: %s",
+            exc,
+            exc_info=True,
+        )
+        warnings.append(
+            {"project": "__workspace__", "error": "service_unavailable"}
+        )
+        dropped_count = 0
+    if dropped_count:
+        warnings.append(
+            {
+                "code": "untracked_filtered",
+                "dropped_count": dropped_count,
+                "reason": "untracked_projects",
+            }
+        )
+
+    return _page_task_summaries(
+        summaries, limit=limit, cursor=cursor, warnings=warnings
+    )
+
+
+def _tracked_project_keys(config: PollyPMConfig) -> tuple[str, ...]:
+    return tuple(
+        key
+        for key, proj in config.projects.items()
+        if getattr(proj, "tracked", True)
+    )
+
+
+def _list_tasks_from_workspace(config: PollyPMConfig, *, project: str | None):
+    workspace_root = (
+        getattr(config.project, "workspace_root", None)
+        or getattr(config.project, "root_dir", None)
+        or Path.cwd()
+    )
+    with _open_work_service_readonly(
+        config=config,
+        project_key="__workspace__",
+        project_path=Path(workspace_root),
+    ) as svc:
+        return svc.list_tasks(project=project)
+
+
+def _task_matches_list_filters(
+    task,
+    *,
+    status_filter: set[str],
+    assignee: str | None,
+    since: datetime | None,
+) -> bool:
+    if status_filter:
+        value = _enum_value(getattr(task, "work_status", ""))
+        if value not in status_filter:
+            return False
+    if assignee is not None:
+        if (getattr(task, "assignee", None) or "") != assignee:
+            return False
+    if since is not None:
+        updated = getattr(task, "updated_at", None)
+        if updated is not None and updated <= since:
+            return False
+    return True
+
+
+def _count_untracked_matches(
+    config: PollyPMConfig,
+    *,
+    tracked_keys: Iterable[str],
+    project: str | None,
+    status_filter: set[str],
+    assignee: str | None,
+    since: datetime | None,
+) -> int:
+    tracked = set(tracked_keys)
+    if project is not None and project in tracked:
+        return 0
+    tasks = _list_tasks_from_workspace(config, project=project)
+    dropped = 0
+    for task in tasks:
+        task_project = str(getattr(task, "project", ""))
+        if project is None:
+            if task_project in tracked:
+                continue
+        elif task_project != project:
+            continue
+        if _task_matches_list_filters(
+            task,
+            status_filter=status_filter,
+            assignee=assignee,
+            since=since,
+        ):
+            dropped += 1
+    return dropped
+
+
+def _page_task_summaries(
+    summaries: list[APITaskSummary],
+    *,
+    limit: int,
+    cursor: str | None,
+    warnings: list[dict[str, object]],
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]]]:
     # Newest-first ordering is the most useful default for cross-
     # project list views (cockpit "what changed recently?"). Tasks
     # without ``updated_at`` sort to the end via the epoch fallback so
@@ -2934,11 +3065,10 @@ def _collect_inbox_items(
 #
 # The POST /inbox/{id}/snooze endpoint persists an ``entry_type='snooze'``
 # row whose text starts with ``until_iso=<ISO>; snoozed until <ISO>``.
-# The wake-time parser + "still snoozed?" predicate live in
+# The "still snoozed?" predicate lives in
 # ``pollypm.work.inbox_snooze`` so cockpit can adopt them WITHOUT
-# duplicating regex logic (Codex round-2 ask on PR #2060). The
-# module-private aliases here keep the existing import sites + tests
-# working unchanged.
+# duplicating regex logic (Codex round-2 ask on PR #2060). The import
+# alias keeps the existing call sites + tests working unchanged.
 #
 # ``_active_snoozed_ids`` calls ``svc.latest_snoozes_bulk(...)``
 # (single SQL on pg) instead of the original per-task
@@ -2946,12 +3076,6 @@ def _collect_inbox_items(
 # inbox-list path is user-facing and a 50-task page was paying N
 # round-trips to the work-service per request.
 # ---------------------------------------------------------------------------
-
-from pollypm.work.inbox_snooze import (
-    is_snooze_active as _is_snooze_active,
-    parse_snooze_until as _parse_snooze_until,
-)
-
 
 def _task_key(task_id: str) -> tuple[str, int]:
     """Split ``project/n`` into a ``(project, number)`` tuple.

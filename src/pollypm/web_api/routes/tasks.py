@@ -32,7 +32,6 @@ from pollypm.web_api.models import (
     TaskClaimRequest,
     TaskDetail,
     TaskListResponse,
-    TaskListWarning,
     TaskPatchRequest,
     TaskReassignRequest,
     TaskReopenRequest,
@@ -71,6 +70,15 @@ def list_tasks_endpoint(
         str | None,
         Query(description="ISO-8601 lower bound on updated_at (strictly after)."),
     ] = None,
+    include_untracked: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include task rows for projects outside the tracked-project "
+                "set. Defaults to false so existing dashboards stay scoped."
+            ),
+        ),
+    ] = False,
     limit: Annotated[int, Query(ge=1, le=200, description="Page size (capped at 200).")] = 50,
     cursor: Annotated[str | None, Query(description="Opaque cursor from next_cursor.")] = None,
 ) -> TaskListResponse:
@@ -112,6 +120,7 @@ def list_tasks_endpoint(
             statuses=status,
             assignee=assignee,
             since=since_dt,
+            include_untracked=include_untracked,
             limit=limit,
             cursor=cursor,
         )
@@ -131,9 +140,7 @@ def list_tasks_endpoint(
     return TaskListResponse(
         items=items,
         next_cursor=next_cursor,
-        warnings=(
-            [TaskListWarning(**w) for w in warnings] if warnings else None
-        ),
+        warnings=warnings or None,
     )
 
 

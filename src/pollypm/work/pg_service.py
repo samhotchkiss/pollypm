@@ -42,6 +42,13 @@ import logging
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 
+from pollypm.claim_breadcrumbs import (
+    CLAIM_ALREADY_CLAIMED_REASON,
+    CLAIM_ATTEMPTED_BY_LOSER,
+    CLAIM_WON_BY,
+    build_claim_breadcrumb_metadata,
+    build_claim_breadcrumb_text,
+)
 from pollypm.inbox.kind import InboxItemKind, coerce_kind as _coerce_inbox_kind
 from pollypm.work.models import (
     ActorType,
@@ -80,6 +87,11 @@ if TYPE_CHECKING:
     from pollypm.work.sync import SyncManager
 
 logger = logging.getLogger(__name__)
+
+_CLAIM_CONTESTED_STATUSES = frozenset({
+    WorkStatus.IN_PROGRESS,
+    WorkStatus.REVIEW,
+})
 
 # Per-process dedup for the ``work_db.opened`` audit row (#1808). The
 # event is a doctor / heartbeat diagnostic stamped at first open of a
@@ -1394,6 +1406,135 @@ class PgWorkService:
                 exc_info=True,
             )
 
+    def _insert_claim_breadcrumb_locked(
+        self,
+        cur,
+        *,
+        event_type: str,
+        project: str,
+        task_number: int,
+        actor: str,
+        session: str | None,
+        timestamp: datetime,
+        reason: str | None = None,
+        assignee: str | None = None,
+        winner_session: str | None = None,
+    ) -> None:
+        task_id = f"{project}/{task_number}"
+        text = build_claim_breadcrumb_text(
+            event_type=event_type,
+            task_id=task_id,
+            actor=actor,
+            session=session,
+            reason=reason,
+            assignee=assignee,
+            winner_session=winner_session,
+        )
+        cur.execute(
+            "INSERT INTO work_context_entries "
+            "(task_project, task_number, actor, text, created_at, "
+            "entry_type) VALUES (%s, %s, %s, %s, %s, %s)",
+            (
+                project,
+                task_number,
+                actor,
+                text,
+                timestamp,
+                event_type,
+            ),
+        )
+
+    def _emit_claim_breadcrumb_audit(
+        self,
+        *,
+        event_type: str,
+        project: str,
+        task_number: int,
+        actor: str,
+        session: str | None,
+        timestamp: datetime,
+        reason: str | None = None,
+        assignee: str | None = None,
+        winner_session: str | None = None,
+    ) -> None:
+        task_id = f"{project}/{task_number}"
+        try:
+            from pollypm.audit import emit as _audit_emit
+
+            _audit_emit(
+                event=event_type,
+                project=project,
+                subject=task_id,
+                actor=actor or "",
+                metadata=build_claim_breadcrumb_metadata(
+                    task_id=task_id,
+                    actor=actor,
+                    session=session,
+                    timestamp=timestamp,
+                    reason=reason,
+                    assignee=assignee,
+                    winner_session=winner_session,
+                ),
+                project_path=self._project_path,
+            )
+        except Exception:  # noqa: BLE001 — audit must never break claim
+            logger.debug(
+                "claim breadcrumb audit emit failed for %s",
+                task_id,
+                exc_info=True,
+            )
+
+    def _record_claim_breadcrumb(
+        self,
+        *,
+        event_type: str,
+        project: str,
+        task_number: int,
+        actor: str,
+        session: str | None,
+        timestamp: datetime,
+        reason: str | None = None,
+        assignee: str | None = None,
+        winner_session: str | None = None,
+    ) -> None:
+        """Record a claim forensic breadcrumb without changing claim outcome."""
+        task_id = f"{project}/{task_number}"
+        try:
+            with self._pool.connection() as conn:
+                conn.autocommit = False
+                with conn.cursor() as cur:
+                    self._insert_claim_breadcrumb_locked(
+                        cur,
+                        event_type=event_type,
+                        project=project,
+                        task_number=task_number,
+                        actor=actor,
+                        session=session,
+                        timestamp=timestamp,
+                        reason=reason,
+                        assignee=assignee,
+                        winner_session=winner_session,
+                    )
+                conn.commit()
+        except Exception:  # noqa: BLE001 — forensics must not change claim
+            logger.warning(
+                "claim breadcrumb context insert failed for %s",
+                task_id,
+                exc_info=True,
+            )
+
+        self._emit_claim_breadcrumb_audit(
+            event_type=event_type,
+            project=project,
+            task_number=task_number,
+            actor=actor,
+            session=session,
+            timestamp=timestamp,
+            reason=reason,
+            assignee=assignee,
+            winner_session=winner_session,
+        )
+
     def _sync_transition(
         self, task: Task, old_status: str, new_status: str
     ) -> None:
@@ -1866,25 +2007,72 @@ class PgWorkService:
                 )
 
                 if locked_task.work_status != WorkStatus.QUEUED:
-                    if locked_task.work_status == WorkStatus.IN_PROGRESS:
-                        claimant = locked_task.assignee or "another actor"
-                        raise InvalidTransitionError(
+                    if locked_task.work_status in _CLAIM_CONTESTED_STATUSES:
+                        claimant = (
+                            locked_task.claimed_by_session
+                            or locked_task.assignee
+                            or "another actor"
+                        )
+                        timestamp = _now_iso()
+                        error = InvalidTransitionError(
                             f"Task {task_id} is already claimed by "
                             f"'{claimant}'.\n"
                             f"\n"
-                            f"Why: the task is in 'in_progress' and "
+                            f"Why: the task is in "
+                            f"'{locked_task.work_status.value}' and "
                             f"assigned. A second claim would orphan "
-                            f"the first worker's session.\n"
+                            f"the first claimant's session.\n"
                             f"\n"
                             f"Fix: use `pm task get {task_id}` to see "
                             f"the current state. If the existing claim "
-                            f"is stale (worker session dead), hold and "
+                            f"is stale (claimant session dead), hold and "
                             f"resume:\n"
                             f"    pm task hold {task_id} --reason 'stale claim'\n"
                             f"    pm task resume {task_id}\n"
                             f"Otherwise, find an unclaimed task with "
                             f"`pm task next`."
                         )
+                        try:
+                            self._insert_claim_breadcrumb_locked(
+                                cur,
+                                event_type=CLAIM_ATTEMPTED_BY_LOSER,
+                                project=project,
+                                task_number=task_number,
+                                actor=actor,
+                                session=actor,
+                                timestamp=timestamp,
+                                reason=CLAIM_ALREADY_CLAIMED_REASON,
+                                assignee=locked_task.assignee,
+                                winner_session=locked_task.claimed_by_session,
+                            )
+                            conn.commit()
+                        except Exception:  # noqa: BLE001
+                            try:
+                                conn.rollback()
+                            except Exception:  # noqa: BLE001
+                                logger.debug(
+                                    "claim loser rollback failed for %s",
+                                    task_id,
+                                    exc_info=True,
+                                )
+                            logger.warning(
+                                "claim loser breadcrumb insert failed for %s",
+                                task_id,
+                                exc_info=True,
+                            )
+                        else:
+                            self._emit_claim_breadcrumb_audit(
+                                event_type=CLAIM_ATTEMPTED_BY_LOSER,
+                                project=project,
+                                task_number=task_number,
+                                actor=actor,
+                                session=actor,
+                                timestamp=timestamp,
+                                reason=CLAIM_ALREADY_CLAIMED_REASON,
+                                assignee=locked_task.assignee,
+                                winner_session=locked_task.claimed_by_session,
+                            )
+                        raise error
                     raise InvalidTransitionError(
                         f"Cannot claim task in "
                         f"'{locked_task.work_status.value}' state.\n"
@@ -2096,6 +2284,15 @@ class PgWorkService:
                 project=project,
                 task_number=task_number,
                 actor=actor,
+                assignee=assignee,
+            )
+            self._record_claim_breadcrumb(
+                event_type=CLAIM_WON_BY,
+                project=project,
+                task_number=task_number,
+                actor=actor,
+                session=actor,
+                timestamp=now,
                 assignee=assignee,
             )
         return result

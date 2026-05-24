@@ -57,6 +57,23 @@ def _seed_two_projects(api_config, workspace_root):
     return second_root
 
 
+def _seed_untracked_project(api_config, workspace_root, key: str = "paused"):
+    """Register an untracked project that still has work rows in PG."""
+    from pollypm.models import KnownProject, ProjectKind
+
+    project_root = workspace_root / key
+    project_root.mkdir()
+    (project_root / ".pollypm").mkdir()
+    api_config.projects[key] = KnownProject(
+        key=key,
+        path=project_root,
+        name=key.title(),
+        tracked=False,
+        kind=ProjectKind.GIT,
+    )
+    return project_root
+
+
 def test_list_tasks_returns_all_projects(
     api_config, client, auth_headers, project_root, workspace_root
 ) -> None:
@@ -99,6 +116,84 @@ def test_list_tasks_project_filter(
     assert response.status_code == 200
     titles = [item["title"] for item in response.json()["items"]]
     assert titles == ["Theirs"]
+
+
+def test_list_tasks_warns_when_tracked_scope_drops_untracked_rows(
+    api_config, client, auth_headers, project_root, workspace_root
+) -> None:
+    """Default list scope is tracked projects, but the truncation is explicit."""
+    _seed_untracked_project(api_config, workspace_root)
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        make_task(svc, project="myproj", title="Visible")
+        make_task(svc, project="paused", title="Hidden")
+
+    response = client.get("/api/v1/tasks", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["title"] for item in body["items"]] == ["Visible"]
+    assert body["warnings"] == [
+        {
+            "code": "untracked_filtered",
+            "dropped_count": 1,
+            "reason": "untracked_projects",
+        }
+    ]
+
+
+def test_list_tasks_include_untracked_returns_hidden_rows(
+    api_config, client, auth_headers, project_root, workspace_root
+) -> None:
+    """``include_untracked=true`` opts into rows outside the tracked set."""
+    _seed_untracked_project(api_config, workspace_root)
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        make_task(svc, project="myproj", title="Visible")
+        make_task(svc, project="paused", title="Hidden")
+
+    response = client.get(
+        "/api/v1/tasks?include_untracked=true", headers=auth_headers
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    titles = sorted(item["title"] for item in body["items"])
+    assert titles == ["Hidden", "Visible"]
+    assert body.get("warnings") is None
+
+
+def test_list_tasks_project_filter_warns_for_unregistered_pg_rows(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """A project key absent from config is a no-match unless explicitly included."""
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        make_task(svc, project="orphan", title="Orphan row")
+
+    response = client.get(
+        "/api/v1/tasks?project=orphan", headers=auth_headers
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["items"] == []
+    assert body["warnings"] == [
+        {
+            "code": "untracked_filtered",
+            "dropped_count": 1,
+            "reason": "untracked_projects",
+        }
+    ]
+
+    included = client.get(
+        "/api/v1/tasks?project=orphan&include_untracked=true",
+        headers=auth_headers,
+    )
+    assert included.status_code == 200, included.text
+    included_body = included.json()
+    assert [item["title"] for item in included_body["items"]] == ["Orphan row"]
+    assert included_body.get("warnings") is None
 
 
 def test_list_tasks_status_filter_or_semantics(

@@ -478,6 +478,40 @@ def test_is_paused_unreadable_emits_audit_event_once(
     assert "payload" not in row
 
 
+def test_is_paused_unreadable_throttle_survives_process_restart(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """A one-shot heartbeat process must not reset the 5 min throttle."""
+    from pollypm.session_paused import (
+        PAUSE_MARKER_UNREADABLE_EVENT_TYPE,
+        _reset_skip_throttle_for_tests,
+        is_paused,
+    )
+
+    marker = config_with_base_dir.project.base_dir / "paused-sessions.json"
+    marker.write_text("{not json}")
+    assert is_paused(config_with_base_dir, "operator") is True
+
+    # Simulate the next heartbeat invocation in a fresh process: the
+    # in-memory transition/throttle dictionaries are gone, but the
+    # canonical audit log remains.
+    _reset_skip_throttle_for_tests()
+    assert is_paused(config_with_base_dir, "operator") is True
+
+    audit_path = config_with_base_dir.project.base_dir / "audit.jsonl"
+    rows = [
+        json.loads(line)
+        for line in audit_path.read_text().splitlines()
+        if line.strip()
+    ]
+    unreadable_rows = [
+        row
+        for row in rows
+        if row.get("event") == PAUSE_MARKER_UNREADABLE_EVENT_TYPE
+    ]
+    assert len(unreadable_rows) == 1, rows
+
+
 def test_is_paused_unreadable_to_readable_emits_restored(
     config_with_base_dir: _FakeConfig,
 ) -> None:
@@ -524,6 +558,77 @@ def test_is_paused_unreadable_to_readable_emits_restored(
     assert restored["status"] == "ok"
     assert restored["actor"] == "system"
     assert restored["metadata"]["kind"] in {"ok", "absent"}
+
+
+def test_marker_restored_survives_process_restart(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """Restored detection must use the durable audit log, not memory."""
+    from pollypm.session_paused import (
+        PAUSE_MARKER_RESTORED_EVENT_TYPE,
+        _reset_skip_throttle_for_tests,
+        is_paused,
+    )
+
+    marker = config_with_base_dir.project.base_dir / "paused-sessions.json"
+    marker.write_text("{not json}")
+    assert is_paused(config_with_base_dir, "operator") is True
+
+    _reset_skip_throttle_for_tests()
+    _write_marker(config_with_base_dir, ["operator"])
+    assert is_paused(config_with_base_dir, "operator") is True
+
+    audit_path = config_with_base_dir.project.base_dir / "audit.jsonl"
+    rows = [
+        json.loads(line)
+        for line in audit_path.read_text().splitlines()
+        if line.strip()
+    ]
+    restored_rows = [
+        row
+        for row in rows
+        if row.get("event") == PAUSE_MARKER_RESTORED_EVENT_TYPE
+    ]
+    assert len(restored_rows) == 1, rows
+    metadata = restored_rows[0]["metadata"]
+    assert metadata["restored_size_bytes"] > 0
+    assert metadata["restored_at"]
+    assert metadata["restored_mtime"]
+    assert metadata["paused_names"] == ["operator"]
+    assert metadata["paused_count"] == 1
+    assert metadata["paused_state_diff"]["current_state"] == "ok"
+
+
+def test_marker_restored_metadata_includes_session_diff(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    from pollypm.session_paused import (
+        PAUSE_MARKER_RESTORED_EVENT_TYPE,
+        is_paused,
+    )
+
+    marker = _write_marker(config_with_base_dir, ["operator"])
+    assert is_paused(config_with_base_dir, "operator") is True
+    marker.write_text("{not json}")
+    assert is_paused(config_with_base_dir, "operator") is True
+    _write_marker(config_with_base_dir, ["reviewer"])
+    assert is_paused(config_with_base_dir, "reviewer") is True
+
+    audit_path = config_with_base_dir.project.base_dir / "audit.jsonl"
+    rows = [
+        json.loads(line)
+        for line in audit_path.read_text().splitlines()
+        if line.strip()
+    ]
+    restored = next(
+        row
+        for row in rows
+        if row.get("event") == PAUSE_MARKER_RESTORED_EVENT_TYPE
+    )
+    diff = restored["metadata"]["paused_state_diff"]
+    assert diff["previous_names_known"] is True
+    assert diff["added_paused"] == ["reviewer"]
+    assert diff["removed_paused"] == ["operator"]
 
 
 def test_skip_if_paused_returns_false_for_unpaused_session(

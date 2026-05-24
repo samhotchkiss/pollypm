@@ -913,6 +913,57 @@ class Supervisor:
         launch = self._launch_by_session(session_name)
         return self._tmux_session_for_launch(launch)
 
+    def _emit_session_recovery_audit(
+        self,
+        event: str,
+        launch: SessionLaunchSpec,
+        *,
+        status: str,
+        actor: str,
+        metadata: dict[str, object],
+    ) -> None:
+        """Best-effort JSONL audit breadcrumb for recovery cascade edges."""
+        try:
+            from pollypm.audit.log import emit as _audit_emit
+        except Exception:  # noqa: BLE001
+            logger.debug("session recovery audit import failed", exc_info=True)
+            return
+
+        project_key = str(launch.session.project or "")
+        try:
+            project_path = self._project_path_for_session(project_key)
+        except Exception:  # noqa: BLE001
+            project_path = getattr(self.config.project, "root_dir", None)
+        try:
+            tmux_session = self._tmux_session_for_launch(launch)
+        except Exception:  # noqa: BLE001
+            tmux_session = ""
+        payload: dict[str, object] = {
+            "session": launch.session.name,
+            "role": launch.session.role,
+            "project": project_key,
+            "window_name": launch.window_name,
+            "tmux_session": tmux_session,
+        }
+        payload.update(metadata)
+        try:
+            _audit_emit(
+                event=event,
+                project=project_key,
+                subject=launch.session.name,
+                actor=actor,
+                status=status,
+                metadata=payload,
+                project_path=project_path,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "session recovery audit emit failed for %s/%s",
+                event,
+                launch.session.name,
+                exc_info=True,
+            )
+
     def _all_tmux_session_names(self) -> list[str]:
         names = [self.config.project.tmux_session]
         storage = self.storage_closet_session_name()
@@ -2747,6 +2798,7 @@ class Supervisor:
 
     # Failure types where the session is gone — no live interaction to protect.
     _DEAD_SESSION_FAILURES = frozenset({"missing_window", "pane_dead", "shell_returned"})
+    _AUDIT_MISSING_FAILURES = _DEAD_SESSION_FAILURES
 
     # Map detected failure types to the raw signals the RecoveryPolicy
     # expects. Keeps the policy decoupled from Supervisor's vocabulary.
@@ -3634,6 +3686,21 @@ class Supervisor:
                 },
             )
 
+        if failure_type in self._AUDIT_MISSING_FAILURES:
+            from pollypm.audit.log import EVENT_HEARTBEAT_MISSING
+
+            self._emit_session_recovery_audit(
+                EVENT_HEARTBEAT_MISSING,
+                launch,
+                status="warn",
+                actor="heartbeat",
+                metadata={
+                    "failure_type": failure_type,
+                    "failure_message": failure_message,
+                    "loop": "supervisor.maybe_recover_session",
+                },
+            )
+
         lease = self._get_lease(launch.session.name)
         if lease is not None and lease.owner != "pollypm":
             if failure_type in self._DEAD_SESSION_FAILURES:
@@ -3822,14 +3889,17 @@ class Supervisor:
             last_failure_type=failure_type,
             last_failure_message=f"recovering on {account_name}",
         )
+        spawned = False
         try:
             self.launch_session(session_name)
+            spawned = True
         except RuntimeError as exc:
             # Retry once if window name collision
             if "already exists" in str(exc).lower() or "duplicate" in str(exc).lower():
                 time.sleep(0.5)
                 try:
                     self.launch_session(session_name)
+                    spawned = True
                 except Exception:
                     # #1355: previously silent. This is the second of two
                     # launch attempts during account-recovery. If both
@@ -3855,6 +3925,21 @@ class Supervisor:
                 last_recovered_at=previous_runtime.last_recovered_at if previous_runtime else None,
             )
             raise
+        if spawned:
+            from pollypm.audit.log import EVENT_SESSION_SPAWN
+
+            self._emit_session_recovery_audit(
+                EVENT_SESSION_SPAWN,
+                launch,
+                status="ok",
+                actor="supervisor",
+                metadata={
+                    "failure_type": failure_type,
+                    "account": account_name,
+                    "provider": account.provider.value,
+                    "reason": "recovery_restart",
+                },
+            )
         # Inject recovery prompt so the agent knows what it was doing.
         # For role-scoped agents (reviewer / heartbeat) prepend an
         # identity reminder so a recovery that lands inside a noisy

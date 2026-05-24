@@ -251,6 +251,13 @@ EVENT_INBOX_KIND_BACKFILLED = "inbox.kind_backfilled"
 # evidence.
 EVENT_ADVISOR_TICK_FIRED = "advisor.tick.fired"
 EVENT_ADVISOR_TICK_SKIPPED = "advisor.tick.skipped"
+# Recovery cascade breadcrumbs. ``heartbeat.missing`` records the
+# supervisor/heartbeat detection edge for a tracked session whose tmux
+# window or pane disappeared; ``session.spawn`` records the successful
+# relaunch edge. Operators use this pair to prove a kill->respawn
+# cascade happened without replaying message-store state.
+EVENT_HEARTBEAT_MISSING = "heartbeat.missing"
+EVENT_SESSION_SPAWN = "session.spawn"
 
 
 @dataclass(slots=True, frozen=True)
@@ -1004,6 +1011,8 @@ __all__ = [
     "EVENT_COCKPIT_DUPLICATE_WINDOW_KILLED",
     "EVENT_COCKPIT_PARK_SKIPPED_EXISTING",
     "EVENT_INBOX_KIND_BACKFILLED",
+    "EVENT_HEARTBEAT_MISSING",
+    "EVENT_SESSION_SPAWN",
     "AuditEvent",
     "central_log_path",
     "emit",

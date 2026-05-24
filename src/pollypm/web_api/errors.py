@@ -6,6 +6,8 @@ Every 4xx / 5xx response body in the Web API conforms to the
     {"error": {"code": "snake_case", "message": "...", "hint": "..."}}
 
 Plus an optional ``details[]`` array for ``validation_error``.
+Contention responses may also include ``retry_after_seconds`` inside
+``error`` and a matching ``Retry-After`` header.
 
 This module owns the canonical exception class
 (:class:`APIError`) and the FastAPI exception handler that renders
@@ -27,7 +29,9 @@ class APIError(Exception):
 
     Carries the spec's ``(code, message, hint?)`` triple plus the HTTP
     status code. ``details`` is optional and only surfaces on
-    ``validation_error`` (per §6).
+    ``validation_error`` (per §6). ``retry_after_seconds`` is optional
+    and surfaces on contention/back-pressure responses that have an
+    actionable retry window.
     """
 
     def __init__(
@@ -38,6 +42,7 @@ class APIError(Exception):
         message: str,
         hint: str | None = None,
         details: list[dict[str, str]] | None = None,
+        retry_after_seconds: int | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -45,6 +50,7 @@ class APIError(Exception):
         self.message = message
         self.hint = hint
         self.details = details
+        self.retry_after_seconds = retry_after_seconds
 
     def to_body(self) -> dict[str, Any]:
         body: dict[str, Any] = {
@@ -55,13 +61,22 @@ class APIError(Exception):
         }
         if self.hint is not None:
             body["error"]["hint"] = self.hint
+        if self.retry_after_seconds is not None:
+            body["error"]["retry_after_seconds"] = self.retry_after_seconds
         if self.details is not None:
             body["details"] = self.details
         return body
 
 
 def error_response(error: APIError) -> JSONResponse:
-    return JSONResponse(status_code=error.status_code, content=error.to_body())
+    headers: dict[str, str] | None = None
+    if error.retry_after_seconds is not None:
+        headers = {"Retry-After": str(error.retry_after_seconds)}
+    return JSONResponse(
+        status_code=error.status_code,
+        content=error.to_body(),
+        headers=headers,
+    )
 
 
 # Convenience constructors so endpoint code reads naturally:

@@ -273,6 +273,16 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "404":
           $ref: "#/components/responses/NotFound"
+        "409":
+          description: |
+            A `fix=true` doctor run is already in progress. The typed
+            error code is `in_progress`; the body includes
+            `retry_after_seconds` and the response carries a matching
+            `Retry-After` header.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
         "422":
           $ref: "#/components/responses/ValidationError"
         "504":
@@ -2642,6 +2652,9 @@ components:
           description: Stable snake_case error code.
         message: { type: string }
         hint: { type: string }
+        retry_after_seconds:
+          type: integer
+          minimum: 1
     ErrorResponse:
       type: object
       required: [error]

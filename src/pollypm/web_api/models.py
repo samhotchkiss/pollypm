@@ -25,6 +25,7 @@ class ErrorBody(BaseModel):
     code: str
     message: str
     hint: str | None = None
+    retry_after_seconds: int | None = None
 
 
 class ErrorResponse(BaseModel):

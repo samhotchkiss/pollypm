@@ -1,10 +1,11 @@
 """Shared fixtures for the Web API integration tests.
 
-Each fixture builds a tmp ``PollyPMConfig`` whose work-DB path
-points at a per-test SQLite file, registers a single project, and
-wires the bearer-auth token into a tmp file. The FastAPI app is
-constructed via :func:`pollypm.web_api.create_app` so the tests
-exercise the same code path ``pm serve`` uses at runtime.
+Each fixture builds a tmp ``PollyPMConfig`` with one tracked project,
+wires the bearer-auth token into a tmp file, and opens work-service
+state through the shared per-test Postgres schema fixture. The FastAPI
+app is constructed via :func:`pollypm.web_api.create_app` so the tests
+exercise the same code path ``pm serve`` uses at runtime without
+touching the operator's live ``~/.pollypm`` or default ``pollypm`` DB.
 """
 
 from __future__ import annotations
@@ -43,8 +44,19 @@ def workspace_root(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def api_config(tmp_path: Path, project_root: Path, workspace_root: Path) -> PollyPMConfig:
+def api_pg_pool(pg_schema_pool):
+    """Require a per-test pg schema before any app/client opens storage."""
+    return pg_schema_pool
+
+
+@pytest.fixture
+def api_config(
+    project_root: Path,
+    workspace_root: Path,
+    api_pg_pool,
+) -> PollyPMConfig:
     """A minimal :class:`PollyPMConfig` with one tracked project."""
+    del api_pg_pool
     base_dir = workspace_root / ".pollypm"
     state_db = base_dir / "state.db"
     config = PollyPMConfig(

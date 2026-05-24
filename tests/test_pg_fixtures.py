@@ -23,6 +23,42 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
+# Ambient database guard
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://localhost:5432/pollypm",
+        "postgresql://localhost/pollypm",
+        "postgresql:///pollypm",
+        "dbname=pollypm",
+        "host=/var/run/postgresql dbname=pollypm",
+    ],
+)
+def test_pg_fixture_rejects_ambient_live_pollypm_dsn(dsn: str) -> None:
+    from tests.conftest_pg import _is_ambient_live_pg_dsn
+
+    assert _is_ambient_live_pg_dsn(dsn) is True
+
+
+@pytest.mark.parametrize(
+    "dsn",
+    [
+        "postgresql://localhost:5432/pollypm_test",
+        "postgresql://localhost:15432/pollypm",
+        "postgresql://postgres.example.invalid:5432/pollypm",
+        "host=localhost dbname=pollypm_test",
+    ],
+)
+def test_pg_fixture_allows_isolated_test_dsns(dsn: str) -> None:
+    from tests.conftest_pg import _is_ambient_live_pg_dsn
+
+    assert _is_ambient_live_pg_dsn(dsn) is False
+
+
+# ---------------------------------------------------------------------------
 # pg_work_service fixture
 # ---------------------------------------------------------------------------
 

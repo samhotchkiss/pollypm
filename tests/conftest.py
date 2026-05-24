@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -46,6 +47,13 @@ _POLLYPM_HOME_GUARDED_DIRS = (
 # any process by these names that appears DURING a test but persists
 # AFTER the test is an orphan the test failed to tear down.
 _POLLYPM_REAP_NAMES = ("claude", "codex")
+
+# Capture the operator home before any test fixture can monkeypatch
+# ``HOME``. The real-home pollution guard below must continue watching
+# the operator's ``~/.pollypm`` even for tests that deliberately run with
+# a sandboxed home.
+_OPERATOR_HOME = Path(os.environ.get("HOME") or os.path.expanduser("~")).expanduser()
+_OPERATOR_POLLYPM_HOME = _OPERATOR_HOME / ".pollypm"
 
 
 def pytest_configure(config):
@@ -201,6 +209,133 @@ def _resolve_backend_marker(request) -> str:
     return raw
 
 
+def _node_relpath(request) -> str:
+    """Return the current test path relative to the repo root."""
+    raw_path = getattr(request.node, "path", None)
+    if raw_path is None:
+        raw_path = getattr(request.node, "fspath", "")
+    path = Path(str(raw_path)).resolve()
+    root = Path(__file__).resolve().parents[1]
+    try:
+        return path.relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def _needs_live_state_isolation(request) -> bool:
+    """True for the issue #2177 target subset."""
+    rel = _node_relpath(request)
+    return (
+        rel.startswith("tests/web_api/")
+        or rel.startswith("tests/test_work_service")
+    )
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+    except ValueError:
+        return False
+    return True
+
+
+def _patch_module_path(module_name: str, attr: str, value: Path, monkeypatch) -> None:
+    module = sys.modules.get(module_name)
+    if module is not None and hasattr(module, attr):
+        monkeypatch.setattr(module, attr, value)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_web_api_and_work_service_live_state(
+    request,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Sandbox HOME/config and guard PG DSN resolution for #2177 tests.
+
+    The targeted web_api/work_service tests should never read the
+    operator's ``~/.pollypm`` or fall through to the default local
+    ``pollypm`` Postgres database. Production code still sees normal
+    public config/env seams; the fixture just binds those seams to a
+    pytest-owned sandbox for this subset.
+    """
+    if not _needs_live_state_isolation(request):
+        yield
+        return
+
+    sandbox_home = tmp_path / "home"
+    sandbox_pollypm = sandbox_home / ".pollypm"
+    sandbox_pollypm.mkdir(parents=True, exist_ok=True)
+    sandbox_config = sandbox_pollypm / "pollypm.toml"
+
+    monkeypatch.setenv("HOME", str(sandbox_home))
+    monkeypatch.setenv("POLLYPM_HOME", str(sandbox_pollypm))
+
+    import pollypm.config as config_mod
+
+    monkeypatch.setattr(config_mod, "GLOBAL_CONFIG_DIR", sandbox_pollypm)
+    monkeypatch.setattr(config_mod, "DEFAULT_CONFIG_PATH", sandbox_config)
+    _patch_module_path(
+        "pollypm.cli_features.web_api",
+        "DEFAULT_CONFIG_PATH",
+        sandbox_config,
+        monkeypatch,
+    )
+    _patch_module_path(
+        "pollypm.web_api.token",
+        "DEFAULT_TOKEN_PATH",
+        sandbox_pollypm / "api-token",
+        monkeypatch,
+    )
+
+    try:
+        from pollypm.storage import pg_pool
+        from tests.conftest_pg import _is_ambient_live_pg_dsn
+    except ImportError:
+        pg_pool = None  # type: ignore[assignment]
+        _is_ambient_live_pg_dsn = None  # type: ignore[assignment]
+
+    if pg_pool is not None and _is_ambient_live_pg_dsn is not None:
+        real_resolve_dsn = pg_pool.resolve_dsn
+
+        def _guarded_resolve_dsn(config=None):
+            dsn = real_resolve_dsn(config)
+            if _is_ambient_live_pg_dsn(dsn):
+                pytest.fail(
+                    "Targeted test attempted to use the ambient local "
+                    "pollypm Postgres database. Request pg_schema_pool "
+                    "or pass an explicit isolated test DSN.",
+                    pytrace=False,
+                )
+            return dsn
+
+        monkeypatch.setattr(pg_pool, "resolve_dsn", _guarded_resolve_dsn)
+
+    yield
+
+    current_home = Path(os.environ.get("HOME", ""))
+    if current_home == _OPERATOR_HOME:
+        pytest.fail(
+            "Targeted test restored HOME to the operator home; keep "
+            "web_api/work_service tests bound to tmp_path.",
+            pytrace=False,
+        )
+
+    if Path(config_mod.GLOBAL_CONFIG_DIR) == _OPERATOR_POLLYPM_HOME:
+        pytest.fail(
+            "Targeted test restored pollypm.config.GLOBAL_CONFIG_DIR to "
+            "the operator ~/.pollypm.",
+            pytrace=False,
+        )
+
+    if not _is_under(Path(config_mod.DEFAULT_CONFIG_PATH), sandbox_pollypm):
+        pytest.fail(
+            "Targeted test moved pollypm.config.DEFAULT_CONFIG_PATH outside "
+            "the pytest PollyPM sandbox.",
+            pytrace=False,
+        )
+
+
 @pytest.fixture
 def work_service(request, tmp_path):
     """Dispatch fixture returning a pg-backed work service.
@@ -247,14 +382,13 @@ def work_service(request, tmp_path):
 def _real_pollypm_home() -> Path | None:
     """Return the dev machine's ``~/.pollypm`` (or ``None`` if unset).
 
-    Uses ``os.path.expanduser`` rather than ``Path.home()`` so a test
-    that monkeypatched ``Path.home`` doesn't accidentally redirect the
-    guard at its own sandbox — we want the *real* home here.
+    Uses the import-time operator home so tests that monkeypatch
+    ``HOME`` / ``Path.home`` don't accidentally redirect the guard at
+    their own sandbox — we want the *real* home here.
     """
-    home = os.environ.get("HOME") or os.path.expanduser("~")
-    if not home or home == "~":
+    if str(_OPERATOR_HOME) in {"", "~"}:
         return None
-    candidate = Path(home) / ".pollypm"
+    candidate = _OPERATOR_POLLYPM_HOME
     return candidate if candidate.is_dir() else None
 
 

@@ -33,11 +33,64 @@ from __future__ import annotations
 
 import importlib
 import os
+import re
 import uuid
 from pathlib import Path
 from typing import Iterator
+from urllib.parse import unquote, urlsplit
 
 import pytest
+
+
+_LOCAL_PG_FALLBACK_DSNS = (
+    "postgresql://localhost:5432/pollypm_test",
+)
+
+_LOCAL_PG_HOSTS = {"", "localhost", "127.0.0.1", "::1"}
+
+
+def _keyword_dsn_value(dsn: str, key: str) -> str | None:
+    match = re.search(rf"(?:^|\s){re.escape(key)}=('[^']*'|\"[^\"]*\"|\S+)", dsn)
+    if match is None:
+        return None
+    value = match.group(1).strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+        value = value[1:-1]
+    return value
+
+
+def _is_ambient_live_pg_dsn(dsn: str) -> bool:
+    """Return True for the operator-default local ``pollypm`` database.
+
+    Testcontainers also commonly uses a database named ``pollypm``, but
+    on a randomized forwarded port. The unsafe shape is the ambient
+    local endpoint that production defaults to: local host/socket,
+    default port, database name ``pollypm``.
+    """
+    stripped = dsn.strip()
+    if "://" in stripped:
+        try:
+            parsed = urlsplit(stripped)
+            port = parsed.port
+        except ValueError:
+            return False
+        db_name = unquote(parsed.path or "").lstrip("/").split("/", 1)[0]
+        host = (parsed.hostname or "").lower()
+        return (
+            db_name == "pollypm"
+            and host in _LOCAL_PG_HOSTS
+            and (port is None or port == 5432)
+        )
+
+    db_name = _keyword_dsn_value(stripped, "dbname")
+    if db_name != "pollypm":
+        return False
+    host = (_keyword_dsn_value(stripped, "host") or "").lower()
+    port = _keyword_dsn_value(stripped, "port")
+    return (
+        (host in _LOCAL_PG_HOSTS or host.startswith("/"))
+        and (port in {None, "", "5432"})
+    )
 
 
 def _has_docker() -> bool:
@@ -58,8 +111,8 @@ def _local_pg_with_vector() -> str | None:
     """Return a DSN to a local pg with pgvector installed, or None.
 
     Used as the fallback when Docker isn't available. Tries the env
-    DSN first, then the conventional dev DBs (``pollypm_test``,
-    ``pollypm``); returns the first one that's reachable and has the
+    DSN first, then the conventional test DB (``pollypm_test``);
+    returns the first one that's reachable and has the
     ``vector`` extension available. Returns None on missing driver or
     no reachable candidate.
     """
@@ -70,13 +123,15 @@ def _local_pg_with_vector() -> str | None:
     candidates: list[str] = []
     env = os.environ.get("POLLYPM_PG_DSN", "").strip()
     if env:
+        if _is_ambient_live_pg_dsn(env):
+            raise RuntimeError(
+                "Refusing to run pg-backed tests against the ambient "
+                "local pollypm database. Use Docker/testcontainers or "
+                "set POLLYPM_PG_DSN to an isolated test database such "
+                "as pollypm_test."
+            )
         candidates.append(env)
-    candidates.extend(
-        [
-            "postgresql://localhost:5432/pollypm_test",
-            "postgresql://localhost:5432/pollypm",
-        ]
-    )
+    candidates.extend(_LOCAL_PG_FALLBACK_DSNS)
     for dsn in candidates:
         try:
             conn = psycopg.connect(dsn, connect_timeout=2)
@@ -126,7 +181,10 @@ def _pg_container() -> Iterator[str]:
             finally:
                 container.stop()
 
-    dsn = _local_pg_with_vector()
+    try:
+        dsn = _local_pg_with_vector()
+    except RuntimeError as exc:
+        pytest.fail(str(exc), pytrace=False)
     if dsn is None:
         pytest.skip(
             "no pg container / local pg with vector ext; install Docker "

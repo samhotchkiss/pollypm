@@ -121,6 +121,23 @@ def test_parses_claude_assistant_turn_with_actor_fallback(tmp_path: Path) -> Non
     assert envelopes[0].metadata["model"] == "claude-opus-4-7"
 
 
+def test_synthetic_assistant_turn_becomes_typed_notice(tmp_path: Path) -> None:
+    events_path = tmp_path / "events.jsonl"
+    event = _claude_event("assistant_turn", text="limit reset")
+    event["model_name"] = "<synthetic>"
+    _write_events(events_path, [event])
+
+    envelopes = parse_events_jsonl(events_path, actor_fallback="Polly")
+
+    assert len(envelopes) == 1
+    env = envelopes[0]
+    assert env.type == MessageType.SYNTHETIC_NOTICE
+    assert env.role == MessageRole.SYSTEM
+    assert env.actor == "system"
+    assert env.metadata["model"] == "<synthetic>"
+    assert env.metadata["synthetic"] is True
+
+
 def test_skips_user_turn_with_empty_text(tmp_path: Path) -> None:
     # Spec: ingestor only emits user_turn when text is truthy, but we
     # still test the parser is tolerant of an empty-string payload.
@@ -1375,6 +1392,37 @@ def test_build_session_index_skips_unreadable_events(tmp_path: Path) -> None:
     )
     index = build_session_index(transcripts)
     assert {entry.session_id for entry in index} == {"session-ok"}
+
+
+def test_build_session_index_reuses_fingerprint_cache(
+    tmp_path: Path, monkeypatch
+) -> None:
+    transcripts_module._parse_cache_clear()
+    project_root = tmp_path / "proj"
+    transcripts = project_root / ".pollypm" / "transcripts"
+    session_dir = transcripts / "session-a"
+    session_dir.mkdir(parents=True)
+    event = _claude_event("user_turn", text="hi")
+    event["cwd"] = str(tmp_path / "x")
+    (session_dir / "events.jsonl").write_text(json.dumps(event) + "\n")
+
+    calls = {"count": 0}
+    real = transcripts_module._read_first_event_fingerprint
+
+    def counting(path: Path):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        return real(path)
+
+    monkeypatch.setattr(
+        transcripts_module, "_read_first_event_fingerprint", counting,
+    )
+
+    first = build_session_index(transcripts)
+    second = build_session_index(transcripts)
+
+    assert [entry.session_id for entry in first] == ["session-a"]
+    assert [entry.session_id for entry in second] == ["session-a"]
+    assert calls["count"] == 1
 
 
 def test_lookup_returns_none_without_cwd(tmp_path: Path) -> None:

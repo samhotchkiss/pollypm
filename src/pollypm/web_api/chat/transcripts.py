@@ -127,21 +127,14 @@ def build_session_index(transcripts_root: Path) -> list[_SessionIndexEntry]:
     """
     if not transcripts_root.exists():
         return []
+    signature = _session_index_signature(transcripts_root)
+    cached = _SESSION_INDEX_CACHE.get(transcripts_root)
+    if cached is not None and cached[0] == signature:
+        return list(cached[1])
+
     entries: list[_SessionIndexEntry] = []
-    for child in transcripts_root.iterdir():
-        if not child.is_dir():
-            continue
-        if child.name in {"tasks", ".ingestion-state.lock"}:
-            # ``tasks/`` holds per-task raw-provider-JSONL archives
-            # written by SessionManager._archive_jsonl; not normalized.
-            continue
-        events_path = child / "events.jsonl"
-        if not events_path.exists():
-            continue
-        try:
-            mtime = events_path.stat().st_mtime
-        except OSError:
-            continue
+    for child_name, mtime, _size in signature:
+        events_path = transcripts_root / child_name / "events.jsonl"
         fingerprint = _read_first_event_fingerprint(events_path)
         if fingerprint is None:
             # Empty / malformed — skip so we never serve an
@@ -153,13 +146,40 @@ def build_session_index(transcripts_root: Path) -> list[_SessionIndexEntry]:
         # session_id if the dir name diverges.
         entries.append(_SessionIndexEntry(
             path=events_path,
-            session_id=child.name or session_id,
+            session_id=child_name or session_id,
             cwd=cwd,
             account_name=account_name,
             provider=provider,
             mtime=mtime,
         ))
+    _SESSION_INDEX_CACHE[transcripts_root] = (signature, entries)
+    while len(_SESSION_INDEX_CACHE) > _SESSION_INDEX_CACHE_MAX:
+        _SESSION_INDEX_CACHE.pop(next(iter(_SESSION_INDEX_CACHE)))
     return entries
+
+
+def _session_index_signature(
+    transcripts_root: Path,
+) -> tuple[tuple[str, float, int], ...]:
+    """Cheap invalidation signature for normalized transcript archives."""
+    entries: list[tuple[str, float, int]] = []
+    try:
+        children = list(transcripts_root.iterdir())
+    except OSError:
+        return ()
+    for child in children:
+        if not child.is_dir():
+            continue
+        if child.name in {"tasks", ".ingestion-state.lock"}:
+            continue
+        events_path = child / "events.jsonl"
+        try:
+            stat = events_path.stat()
+        except OSError:
+            continue
+        entries.append((child.name, stat.st_mtime, stat.st_size))
+    entries.sort()
+    return tuple(entries)
 
 
 def lookup_transcript_path(
@@ -315,9 +335,16 @@ _PARSE_CACHE: dict[
 _PARSE_CACHE_MAX = 100
 
 
+_SESSION_INDEX_CACHE: dict[
+    Path, tuple[tuple[tuple[str, float, int], ...], list[_SessionIndexEntry]]
+] = {}
+_SESSION_INDEX_CACHE_MAX = 100
+
+
 def _parse_cache_clear() -> None:
     """Drop every cached parse result. Test-only helper."""
     _PARSE_CACHE.clear()
+    _SESSION_INDEX_CACHE.clear()
 
 
 def parse_events_jsonl(
@@ -795,6 +822,21 @@ def _envelope_assistant_turn(
     actor_fallback: str,
 ) -> MessageEnvelope:
     text = str(payload.get("text") or "")
+    model = str(event.get("model_name") or "")
+    if model == "<synthetic>":
+        return MessageEnvelope(
+            id=msg_id,
+            ts=timestamp,
+            role=MessageRole.SYSTEM,
+            actor="system",
+            type=MessageType.SYNTHETIC_NOTICE,
+            text=text,
+            metadata={
+                "provider": event.get("provider", ""),
+                "model": model,
+                "synthetic": True,
+            },
+        )
     return MessageEnvelope(
         id=msg_id,
         ts=timestamp,
@@ -804,7 +846,7 @@ def _envelope_assistant_turn(
         text=text,
         metadata={
             "provider": event.get("provider", ""),
-            "model": event.get("model_name") or "",
+            "model": model,
         },
     )
 

@@ -40,6 +40,8 @@ from pollypm.web_api.chat import (
     STALE_THRESHOLD_SECONDS,
     ChatSurface,
     MessageEnvelope,
+    MessageRole,
+    MessageType,
     SurfaceType,
     capture_envelopes,
     enumerate_chat_surfaces,
@@ -162,9 +164,9 @@ class ChatMessageEnvelope(BaseModel):
 
     id: str
     ts: str
-    role: str
+    role: MessageRole
     actor: str
-    type: str
+    type: MessageType
     text: str
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -176,7 +178,6 @@ class ChatMessagesResponse(BaseModel):
     surface_type: str
     persona: str | None = None
     transcript_source: str | None = None
-    transcript_path: str | None = None
     messages: list[ChatMessageEnvelope]
     has_more: bool = False
     next_cursor: str | None = None
@@ -1066,7 +1067,7 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
     ):
         tail_hint = limit + 1
 
-    envelopes, transcript_source, transcript_path = _load_envelopes(
+    envelopes, transcript_source, _transcript_path = _load_envelopes(
         surface,
         source=source,
         tail_hint=tail_hint,
@@ -1099,7 +1100,6 @@ def get_chat_messages_endpoint(  # noqa: PLR0913 — query surface mirrors spec 
         surface_type=str(surface.surface_type),
         persona=surface.persona,
         transcript_source=transcript_source,
-        transcript_path=str(transcript_path) if transcript_path else None,
         messages=rows,
         has_more=has_more,
         next_cursor=next_cursor,

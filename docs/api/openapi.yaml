@@ -3314,6 +3314,7 @@ components:
         - subagent_result
         - system_event
         - thinking
+        - synthetic_notice
 
     ChatMessageEnvelope:
       type: object
@@ -3343,6 +3344,10 @@ components:
             `subagent_transcript` — a list of envelopes parsed from
             the raw Claude subagent JSONL referenced by `output_file`
             (allowlist-constrained, capped per envelope). See #2052.
+            `synthetic_notice` envelopes are ingestor-generated stubs
+            and carry `metadata.synthetic=true` with
+            `metadata.model="<synthetic>"`; clients should render them
+            as notice/banner content, not as assistant speech.
 
     ChatMessagesResponse:
       type: object
@@ -3362,10 +3367,6 @@ components:
             Which source the envelopes came from for this request —
             `jsonl` (archive), `capture` (live tmux), or `null` (no
             archive yet and capture unavailable).
-        transcript_path:
-          type: string
-          nullable: true
-          description: Archive path when `transcript_source=jsonl`.
         messages:
           type: array
           items:

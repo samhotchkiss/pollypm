@@ -58,6 +58,7 @@ class MessageType(StrEnum):
     SUBAGENT_RESULT = "subagent_result"
     SYSTEM_EVENT = "system_event"
     THINKING = "thinking"
+    SYNTHETIC_NOTICE = "synthetic_notice"
 
 
 @dataclass(slots=True)

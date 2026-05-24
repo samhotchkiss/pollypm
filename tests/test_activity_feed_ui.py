@@ -24,8 +24,9 @@ targeted as the agent brief demands.
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -119,6 +120,26 @@ def activity_app(activity_env):
         pytest.skip("minimal pollypm.toml fixture not supported by loader")
     from pollypm.cockpit_ui import PollyActivityFeedApp
     return PollyActivityFeedApp(activity_env["config_path"])
+
+
+def test_activity_feed_mark_latest_seen_persists_numeric_cursor(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    """#2200/#2233: opening Activity advances the unread badge cursor."""
+    from pollypm.plugins_builtin.activity_feed import plugin as plugin_mod
+
+    config = SimpleNamespace(project=SimpleNamespace(state_db=tmp_path / "state.db"))
+
+    class _Projector:
+        def project(self, *, limit: int):
+            assert limit == 1
+            return [SimpleNamespace(id="evt:42")]
+
+    monkeypatch.setattr(plugin_mod, "build_projector", lambda _config: _Projector())
+
+    plugin_mod.mark_latest_activity_seen(config)
+
+    assert plugin_mod._load_last_seen_id(config) == 42
 
 
 # ---------------------------------------------------------------------------

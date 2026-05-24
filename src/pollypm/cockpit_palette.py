@@ -547,6 +547,7 @@ _GLOBAL_HELP_BINDINGS: list[tuple[str, str]] = [
     ("?", "this help"),
     ("ctrl+q", "quit"),
     ("ctrl+w", "detach"),
+    ("ctrl+h", "return focus to the cockpit rail"),
     # PM Chat / live agent panes are raw Claude Code subprocesses that
     # consume Tab themselves (Shift-Tab cycles permission modes inside
     # Claude). The cockpit cannot intercept them, so document the tmux
@@ -678,6 +679,8 @@ def _right_pane_help_section_for_cockpit(
         desc = getattr(binding, "description", "") or ""
         if not key_field:
             continue
+        if getattr(binding, "show", True) is False:
+            continue
         norm_keys = {key.strip() for key in key_field.split(",")}
         if norm_keys & {"question_mark", "colon", "ctrl+k"}:
             continue
@@ -709,6 +712,8 @@ def _collect_keybindings_for_screen(
         key_field = getattr(binding, "key", "") or ""
         desc = getattr(binding, "description", "") or ""
         if not key_field:
+            continue
+        if getattr(binding, "show", True) is False:
             continue
         norm_keys = {key.strip() for key in key_field.split(",")}
         if norm_keys & {"question_mark", "colon", "ctrl+k"}:

@@ -39,9 +39,11 @@ logger = logging.getLogger(__name__)
 # ``Any`` to avoid pulling the projector class — which lives in the
 # plugin tree — into the core seam.
 ActivityProjectorFactory = Callable[[Any], Any]
+ActivitySeenMarker = Callable[[Any], None]
 
 
 _factory: ActivityProjectorFactory | None = None
+_seen_marker: ActivitySeenMarker | None = None
 
 
 def register_activity_projector_factory(
@@ -54,13 +56,37 @@ def register_activity_projector_factory(
     optional plugin tree. Pass ``factory=None`` to clear (used by tests
     that want to simulate the plugin being absent).
     """
-    global _factory
+    global _factory, _seen_marker
     _factory = factory
+    if factory is None:
+        _seen_marker = None
 
 
 def get_activity_projector_factory() -> ActivityProjectorFactory | None:
     """Return the registered factory, or ``None`` when no provider is installed."""
     return _factory
+
+
+def register_activity_seen_marker(marker: ActivitySeenMarker | None) -> None:
+    """Install (or clear) the plugin-owned "mark activity seen" hook."""
+    global _seen_marker
+    _seen_marker = marker
+
+
+def mark_activity_seen(config: Any) -> None:
+    """Advance the activity-feed read cursor when a cockpit view opens it.
+
+    The cursor file is plugin-owned, so core cockpit code calls this seam
+    instead of importing from ``pollypm.plugins_builtin.activity_feed``.
+    With the plugin disabled this is a no-op.
+    """
+    if _seen_marker is None:
+        logger.debug(
+            "activity_projector_registry: no seen marker registered; "
+            "activity badge cursor unchanged",
+        )
+        return
+    _seen_marker(config)
 
 
 def build_activity_projector(config: Any) -> Any | None:
@@ -87,7 +113,10 @@ def build_activity_projector(config: Any) -> Any | None:
 
 __all__ = [
     "ActivityProjectorFactory",
+    "ActivitySeenMarker",
     "build_activity_projector",
     "get_activity_projector_factory",
+    "mark_activity_seen",
     "register_activity_projector_factory",
+    "register_activity_seen_marker",
 ]

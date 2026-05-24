@@ -869,6 +869,7 @@ def test_tier1_healer_registry_includes_existing_self_heal_rules() -> None:
 
 def test_tier1_healer_role_session_missing_idempotent(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Registry healer must be safe to call repeatedly. We mock the
     cli helpers so the test doesn't actually shell out."""
@@ -913,11 +914,13 @@ def test_tier1_healer_role_session_missing_idempotent(
         subject="demo/42",
         metadata={"role": "advisor", "expected_window": "advisor-demo"},
     )
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = 'Demo'\n")
     counters_a = _self_heal_role_session_missing(
-        finding, project_key="demo", project_path=None,
+        finding, project_key="demo", project_path=None, config_path=config_path,
     )
     counters_b = _self_heal_role_session_missing(
-        finding, project_key="demo", project_path=None,
+        finding, project_key="demo", project_path=None, config_path=config_path,
     )
     assert counters_a["worker_lane_spawned"] == 1
     assert counters_b["worker_lane_spawned"] == 1

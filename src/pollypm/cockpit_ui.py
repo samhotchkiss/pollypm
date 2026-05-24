@@ -597,6 +597,7 @@ class PollyCockpitApp(App[None]):
         # the rail's cursor stops moving — the user has to Tab back
         # to the nav before navigation responds again.
         Binding("right", "focus_inbox_pane_nav", "Inbox pane", show=False, priority=True),
+        Binding("ctrl+h", "focus_rail", "Rail", priority=True),
         Binding("j,down", "cursor_down", "Down", show=False, priority=True),
         Binding("k,up", "cursor_up", "Up", show=False, priority=True),
         Binding("g,home", "cursor_first", "First", show=False, priority=True),
@@ -615,7 +616,7 @@ class PollyCockpitApp(App[None]):
             show=False, priority=True,
         ),
         Binding("Q,ctrl+q", "request_quit", "Quit", priority=True),
-        Binding("escape", "back_to_home", "Back to Home", show=False, priority=True),
+        Binding("escape", "back_to_home", "Back to rail/home", priority=True),
         Binding("w,W,ctrl+w", "detach", "Detach", priority=True),
     ]
 
@@ -667,6 +668,7 @@ class PollyCockpitApp(App[None]):
         "cursor_first",          # g, home
         "cursor_last",           # G, end
         "focus_inbox_pane_nav",  # right
+        "focus_rail",            # ctrl+h
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -701,6 +703,7 @@ class PollyCockpitApp(App[None]):
         "cursor_first",          # g, home
         "cursor_last",           # G, end
         "focus_inbox_pane_nav",  # right
+        "focus_rail",            # ctrl+h
         "forward_tab_to_right",  # tab
         "forward_action_button_1",
         "forward_action_button_2",
@@ -730,6 +733,7 @@ class PollyCockpitApp(App[None]):
         "cursor_up",             # k, up
         "cursor_first",          # g, home
         "cursor_last",           # G, end
+        "focus_rail",            # ctrl+h
         "forward_action_button_1",
         "forward_action_button_2",
         "forward_action_button_3",
@@ -1448,6 +1452,11 @@ class PollyCockpitApp(App[None]):
         focus_method = getattr(self.router, "focus_rail_pane", None)
         if callable(focus_method):
             focus_method()
+
+    def action_focus_rail(self) -> None:
+        """Explicitly return keyboard ownership to the cockpit rail."""
+        self._set_inbox_pane_nav_active(False)
+        self._focus_rail_pane()
 
     def _right_pane_has_live_session(self) -> bool:
         try:
@@ -3069,6 +3078,9 @@ class PollyCockpitApp(App[None]):
         else:
             request = NavigationCommand(seq, key)
 
+        if self._is_activity_route_key(key):
+            self._mark_activity_seen_sync()
+
         try:
             result = asyncio.run(controller.resolve_and_apply(request))
         except Exception as exc:  # noqa: BLE001
@@ -3082,6 +3094,19 @@ class PollyCockpitApp(App[None]):
             self._post_route_error(key, f"Routing to {key} timed out — try again.", seq)
         elif result.state == "failed":
             self._post_route_error(key, f"Error: {result.error or result.message}", seq)
+
+    @staticmethod
+    def _is_activity_route_key(key: str) -> bool:
+        return key == "activity" or key.startswith("activity:")
+
+    def _mark_activity_seen_sync(self) -> None:
+        """Advance the activity badge cursor off the UI thread."""
+        try:
+            from pollypm.activity_projector_registry import mark_activity_seen
+
+            mark_activity_seen(load_config(self.config_path))
+        except Exception:  # noqa: BLE001
+            logger.debug("activity seen marker failed", exc_info=True)
 
     def _post_route_success(
         self, key: str, resolved: str, seq: int = 0,
@@ -3240,9 +3265,9 @@ class PollyCockpitApp(App[None]):
         a no-op (Esc still routes to Home everywhere).
         """
         if self._inbox_pane_owns_nav():
-            if self._send_key_to_inbox_pane("q"):
-                return
+            self._send_key_to_inbox_pane("q")
             self._set_inbox_pane_nav_active(False)
+            self._focus_rail_pane()
             return
         if self._on_project_surface():
             self._send_key_to_right_pane("q")
@@ -3383,9 +3408,9 @@ class PollyCockpitApp(App[None]):
             self._send_key_to_inbox_pane("escape")
             return
         if self._inbox_pane_owns_nav():
-            if self._send_key_to_inbox_pane("escape"):
-                return
+            self._send_key_to_inbox_pane("escape")
             self._set_inbox_pane_nav_active(False)
+            self._focus_rail_pane()
             return
         if self._right_pane_has_live_session():
             return_key = self._mounted_return_key()
@@ -3756,7 +3781,7 @@ class PollySettingsPaneApp(App[None]):
         Binding("c", "add_claude_account", "Add Claude", show=False),
         Binding("o", "add_codex_account", "Add Codex", show=False),
         Binding("x", "remove_account", "Remove account", show=False),
-        Binding("t", "toggle_project_tracked", "Toggle project", show=False),
+        Binding("t", "toggle_project_tracked", "Pause / Resume project"),
         Binding("m", "make_controller", "Controller", show=False),
         Binding("s", "reassign_account_sessions", "Reassign sessions", show=False),
         Binding("v", "toggle_failover", "Failover", show=False),

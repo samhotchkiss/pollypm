@@ -54,6 +54,19 @@ class UnusableDatabaseError(RuntimeError):
         super().__init__(f"{db_path}: {detail}")
 
 
+class MigrationApplyError(RuntimeError):
+    """Raised when an apply run finishes but pending migrations remain."""
+
+    def __init__(self, db_path: Path, pending: list["PendingMigration"]) -> None:
+        self.db_path = db_path
+        self.pending = list(pending)
+        count = len(self.pending)
+        plural = "s" if count != 1 else ""
+        super().__init__(
+            f"{db_path}: migration apply left {count} pending migration{plural}"
+        )
+
+
 @dataclass(frozen=True)
 class PendingMigration:
     """One migration that has not yet been applied to a target DB."""
@@ -128,6 +141,7 @@ def _readonly_connect(db_path: Path) -> sqlite3.Connection | None:
     # #1674: percent-encode so URI metacharacters in the workspace path
     # don't get parsed as fragment/query.
     from pollypm.storage.sqlite_pragmas import readonly_uri
+
     uri = readonly_uri(db_path)
     try:
         return sqlite3.connect(uri, uri=True, timeout=1.0)
@@ -159,9 +173,7 @@ def _ensure_readable_sqlite(conn: sqlite3.Connection, db_path: Path) -> None:
 def _applied_version(conn: sqlite3.Connection, table: str) -> int:
     """Return ``MAX(version)`` from a schema-tracking table, 0 if missing."""
     try:
-        row = conn.execute(
-            f"SELECT COALESCE(MAX(version), 0) FROM {table}"
-        ).fetchone()
+        row = conn.execute(f"SELECT COALESCE(MAX(version), 0) FROM {table}").fetchone()
     except sqlite3.Error:
         return 0
     return int(row[0]) if row and row[0] is not None else 0
@@ -187,9 +199,7 @@ def inspect(db_path: Path) -> MigrationStatus:
         # Missing DB — all migrations are pending.
         pending = [
             PendingMigration(NAMESPACE_STATE, v, d) for v, d in state_declared
-        ] + [
-            PendingMigration(NAMESPACE_WORK, v, d) for v, d in work_declared
-        ]
+        ] + [PendingMigration(NAMESPACE_WORK, v, d) for v, d in work_declared]
         return MigrationStatus(
             db_path=db_path,
             applied={NAMESPACE_STATE: 0, NAMESPACE_WORK: 0},
@@ -215,7 +225,10 @@ def inspect(db_path: Path) -> MigrationStatus:
             pending.append(PendingMigration(NAMESPACE_WORK, version, desc))
 
     return MigrationStatus(
-        db_path=db_path, applied=applied, latest=latest, pending=pending,
+        db_path=db_path,
+        applied=applied,
+        latest=latest,
+        pending=pending,
     )
 
 
@@ -245,6 +258,8 @@ def _table_set(db_path: Path) -> set[str]:
 
 def _default_clone_path() -> Path:
     """Location of the dry-run clone (~/.pollypm/migration-check.db)."""
+    from pollypm.config import GLOBAL_CONFIG_DIR
+
     home = Path(os.environ.get("POLLYPM_HOME", str(GLOBAL_CONFIG_DIR)))
     return home / "migration-check.db"
 
@@ -263,7 +278,10 @@ def check_against_clone(
     status = inspect(db_path)
     if not status.pending:
         return CheckOutcome(
-            ok=True, applied=[], tables_changed=[], clone_path=None,
+            ok=True,
+            applied=[],
+            tables_changed=[],
+            clone_path=None,
         )
 
     clone = clone_path or _default_clone_path()
@@ -279,6 +297,9 @@ def check_against_clone(
 
     try:
         _apply_all(clone)
+        status_after = inspect(clone)
+        if status_after.pending:
+            raise MigrationApplyError(clone, list(status_after.pending))
     except Exception as exc:  # noqa: BLE001
         # Roll back by removing the clone — there is no live connection
         # to issue a SQL rollback against (StateStore opens its own).
@@ -309,21 +330,33 @@ def _apply_all(db_path: Path) -> None:
     """Replay every migration idempotently by opening the existing writers.
 
     ``StateStore.__init__`` already replays ``_MIGRATIONS`` against the
-    DB; ``SQLiteWorkService.__init__`` (via ``create_work_tables``) does
-    the same for ``_WORK_MIGRATIONS``. We also mirror the applied set
-    into the unified ``schema_migrations`` audit table so operators have
-    a single pane of glass.
+    DB. Work-service production traffic is now pg-only, so the public
+    ``create_work_service(db_path=...)`` compatibility argument no longer
+    opens this SQLite file. The migration gate still protects the legacy
+    SQLite ``state.db`` records, so replay the work schema runner directly.
+    We also mirror the applied set into the unified ``schema_migrations``
+    audit table so operators have a single pane of glass.
     """
     from pollypm.storage.state import StateStore
-    from pollypm.work import create_work_service
 
     with StateStore(db_path) as _store:
         pass
 
-    with create_work_service(db_path=db_path) as _svc:
-        pass
-
+    _apply_work_schema_migrations(db_path)
     _record_schema_migrations(db_path)
+
+
+def _apply_work_schema_migrations(db_path: Path) -> None:
+    """Replay legacy SQLite work-service migrations against ``db_path``."""
+    from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+    from pollypm.work.schema import create_work_tables
+
+    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    apply_workspace_pragmas(conn)
+    try:
+        create_work_tables(conn)
+    finally:
+        conn.close()
 
 
 def _record_schema_migrations(db_path: Path) -> None:
@@ -393,6 +426,9 @@ def apply(db_path: Path) -> ApplyOutcome:
         return ApplyOutcome(applied=[], already_up_to_date=True)
 
     _apply_all(db_path)
+    status_after = inspect(db_path)
+    if status_after.pending:
+        raise MigrationApplyError(db_path, list(status_after.pending))
     return ApplyOutcome(applied=list(status_before.pending), already_up_to_date=False)
 
 
@@ -412,10 +448,12 @@ def format_unusable_database_message(error: UnusableDatabaseError) -> str:
     """Render a friendly corruption/recovery message for CLI surfaces."""
     from pollypm.structured_message import StructuredUserMessage
 
-    details = "\n".join([
-        f"DB: {error.db_path}",
-        f"SQLite error: {error.detail}",
-    ])
+    details = "\n".join(
+        [
+            f"DB: {error.db_path}",
+            f"SQLite error: {error.detail}",
+        ]
+    )
     msg = StructuredUserMessage(
         summary="Cannot use state.db — the file is not a valid SQLite database.",
         why=(
@@ -501,11 +539,13 @@ def _format_refuse_start_message(status: MigrationStatus) -> str:
         f"  [{item.namespace}] v{item.version}: {item.description}"
         for item in status.pending
     ]
-    details = "\n".join([
-        f"DB: {status.db_path}",
-        f"{count} pending migration{plural}:",
-        *pending_lines,
-    ])
+    details = "\n".join(
+        [
+            f"DB: {status.db_path}",
+            f"{count} pending migration{plural}:",
+            *pending_lines,
+        ]
+    )
     msg = StructuredUserMessage(
         summary=f"Cannot start — {count} pending schema migration{plural} on state.db.",
         why=(
@@ -572,7 +612,7 @@ def check_pending(db_path: Path | None = None) -> tuple[bool, str]:
     """
     if db_path is None:
         try:
-            from pollypm.config import DEFAULT_CONFIG_PATH, GLOBAL_CONFIG_DIR, load_config
+            from pollypm.config import DEFAULT_CONFIG_PATH, load_config
         except ImportError:
             return (True, "skipped: config module unavailable")
         if not DEFAULT_CONFIG_PATH.is_file():

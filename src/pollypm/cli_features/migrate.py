@@ -58,9 +58,7 @@ def _resolve_state_db(config_path: Path) -> Path:
     """Return the workspace-scope state.db path from the resolved config."""
     path = resolve_config_path(config_path)
     if not path.exists():
-        raise typer.BadParameter(
-            f"Config not found at {path}. Run `pm onboard` first."
-        )
+        raise typer.BadParameter(f"Config not found at {path}. Run `pm onboard` first.")
     config = load_config(path)
     return config.project.state_db
 
@@ -89,9 +87,7 @@ def register_migrate_commands(app: typer.Typer) -> None:
         ),
     ) -> None:
         if check == apply:
-            raise typer.BadParameter(
-                "Specify exactly one of --check or --apply."
-            )
+            raise typer.BadParameter("Specify exactly one of --check or --apply.")
 
         db_path = _resolve_state_db(config_path)
 
@@ -99,12 +95,20 @@ def register_migrate_commands(app: typer.Typer) -> None:
         # tool that fixes the situation the gate protects against, so
         # opening the store here must not trip the guard.
         from pollypm.store import migrations as _migrations
+
+        previous_bypass = os.environ.get("POLLYPM_SKIP_MIGRATION_GATE")
         _migrations.set_bypass(True)
 
-        if check:
-            _run_check(db_path)
-        else:
-            _run_apply(db_path, force=force)
+        try:
+            if check:
+                _run_check(db_path)
+            else:
+                _run_apply(db_path, force=force)
+        finally:
+            if previous_bypass is None:
+                _migrations.set_bypass(False)
+            else:
+                os.environ["POLLYPM_SKIP_MIGRATION_GATE"] = previous_bypass
 
 
 def _run_check(db_path: Path) -> None:
@@ -198,8 +202,7 @@ def _refuse_live_processes(live: list[tuple[str, int, Path]]) -> None:
     from pollypm.structured_message import StructuredUserMessage
 
     bullets = "\n".join(
-        f"  - {label} (pid {pid}, pidfile {pidfile})"
-        for label, pid, pidfile in live
+        f"  - {label} (pid {pid}, pidfile {pidfile})" for label, pid, pidfile in live
     )
     msg = StructuredUserMessage(
         summary="Refusing to apply migrations — live PollyPM process detected.",
@@ -234,13 +237,34 @@ def _run_apply(db_path: Path, *, force: bool = False) -> None:
         outcome = _migrations.apply(db_path)
     except _migrations.UnusableDatabaseError as exc:
         _migrations.exit_unusable_database(exc)
+    except _migrations.MigrationApplyError as exc:
+        from pollypm.structured_message import StructuredUserMessage
+
+        status = _migrations.MigrationStatus(
+            db_path=exc.db_path,
+            pending=list(exc.pending),
+        )
+        msg = StructuredUserMessage(
+            summary="Migration apply FAILED — gate still reports pending migrations.",
+            why=(
+                "PollyPM replayed the migration runners, but the follow-up "
+                "gate check still found pending schema versions. Reporting "
+                "success here would leave the next launch blocked."
+            ),
+            next_action=(
+                "Run `pm migrate --check` and inspect the pending list below; "
+                "do not bypass the migration gate until the schema records "
+                "match the installed version."
+            ),
+            details=_migrations.format_pending_summary(status),
+        )
+        typer.echo(msg.render_cli(show_details=True), err=True)
+        raise typer.Exit(code=3) from exc
     if outcome.already_up_to_date:
         typer.echo("All migrations up to date.")
     else:
         migration_word = "migration" if len(outcome.applied) == 1 else "migrations"
-        typer.echo(
-            f"Applied {len(outcome.applied)} {migration_word} to {db_path}:"
-        )
+        typer.echo(f"Applied {len(outcome.applied)} {migration_word} to {db_path}:")
         for item in outcome.applied:
             typer.echo(f"  [{item.namespace}] v{item.version}: {item.description}")
     _run_legacy_per_project_db_migration()
@@ -277,11 +301,14 @@ def _run_legacy_per_project_db_migration() -> None:
                 err=True,
             )
             continue
-        copied_summary = ", ".join(
-            f"{table}={count}"
-            for table, count in report.rows_copied.items()
-            if count
-        ) or "no rows"
+        copied_summary = (
+            ", ".join(
+                f"{table}={count}"
+                for table, count in report.rows_copied.items()
+                if count
+            )
+            or "no rows"
+        )
         archive = (
             f" → archived {report.archived_to.name}"
             if report.archived_to is not None

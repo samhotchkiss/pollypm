@@ -588,6 +588,8 @@ def _enforce_migration_gate(config_path: Path) -> None:
             exc_info=True,
         )
         return
+    if getattr(getattr(config, "storage", None), "backend", "") == "postgres":
+        return
     _migrations.require_no_pending_or_exit(config.project.state_db)
 
 

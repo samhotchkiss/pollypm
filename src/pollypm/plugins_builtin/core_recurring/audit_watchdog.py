@@ -26,14 +26,12 @@ want to see "this fired N ticks in a row" as a signal of severity.
 from __future__ import annotations
 
 import logging
-import sqlite3
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from pollypm.projects import project_state_db_path
-from pollypm.storage.sqlite_pragmas import readonly_uri
 from pollypm.inbox.kind import InboxItemKind
 from pollypm.audit.watchdog import (
     ESCALATION_THROTTLE_SECONDS,
@@ -628,41 +626,33 @@ def _gather_open_tasks(project_key: str, project_path: Path | None) -> list[Any]
 def _count_work_tasks_for_project(db_path: Path, project_key: str) -> int:
     """Return the number of ``work_tasks`` rows for ``project_key`` in ``db_path``.
 
-    Best-effort; opens read-only and swallows every exception, returning
-    ``0`` on any failure. We deliberately avoid going through the
-    work-service factory so this probe doesn't pin a connection or
-    trigger resolver migration side-effects — it's a pure peek.
+    Best-effort legacy inspection; sqlite access is centralized in
+    :mod:`pollypm.storage.legacy_per_project_db`, the only sanctioned
+    module for these per-project migration probes.
 
     Powers the #1519 ``legacy_db_shadow`` detector. Returning 0 on a
     missing / unreadable DB means the detector treats that side as
     empty, which is the right default — we only fire when *both* sides
     are non-empty.
     """
-    if not db_path.exists():
+    try:
+        from pollypm.storage.legacy_per_project_db import (
+            count_work_tasks_for_project_ro,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: legacy sqlite inspection helper unavailable",
+            exc_info=True,
+        )
         return 0
     try:
-        conn = sqlite3.connect(readonly_uri(db_path), uri=True)
-    except sqlite3.Error:
-        return 0
-    try:
-        try:
-            cur = conn.execute(
-                "SELECT COUNT(*) FROM work_tasks WHERE project = ?",
-                (project_key,),
-            )
-            row = cur.fetchone()
-        except sqlite3.Error:
-            return 0
-    finally:
-        try:
-            conn.close()
-        except sqlite3.Error:
-            pass
-    if not row:
-        return 0
-    try:
-        return int(row[0])
-    except (TypeError, ValueError):
+        return count_work_tasks_for_project_ro(db_path, project_key)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: legacy sqlite inspection failed for %s",
+            db_path,
+            exc_info=True,
+        )
         return 0
 
 

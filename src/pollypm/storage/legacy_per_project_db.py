@@ -43,7 +43,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pollypm.storage.sqlite_pragmas import readonly_uri
+from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 if TYPE_CHECKING:
     from pollypm.config import PollyPMConfig
@@ -94,10 +94,13 @@ def _open_ro(path: Path) -> sqlite3.Connection | None:
     if not path.exists():
         return None
     try:
-        return sqlite3.connect(readonly_uri(path), uri=True)
+        # sqlite-ripout: sanctioned - migration/backup only
+        conn = sqlite3.connect(readonly_uri(path), uri=True)
     except sqlite3.Error as exc:
         logger.warning("legacy_per_project_db: cannot open %s read-only: %s", path, exc)
         return None
+    apply_workspace_pragmas(conn, readonly=True)
+    return conn
 
 
 def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
@@ -106,6 +109,153 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
         (table,),
     )
     return cur.fetchone() is not None
+
+
+_INSPECTION_TABLES = {
+    "messages",
+    "schema_migrations",
+    "schema_version",
+    "sessions",
+    "work_schema_version",
+    "work_sessions",
+    "work_tasks",
+}
+
+
+def _validated_inspection_table(table: str) -> str:
+    if table not in _INSPECTION_TABLES:
+        raise ValueError(f"unsupported legacy sqlite inspection table: {table}")
+    return table
+
+
+def applied_schema_version_ro(db_path: Path, table: str) -> int | None:
+    """Return ``MAX(version)`` from a legacy sqlite schema table."""
+    try:
+        table = _validated_inspection_table(table)
+    except ValueError:
+        return None
+    conn = _open_ro(db_path)
+    if conn is None:
+        return None
+    try:
+        try:
+            row = conn.execute(
+                f"SELECT COALESCE(MAX(version), 0) FROM {table}"
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def has_table_ro(db_path: Path, table: str) -> bool:
+    """Return whether a legacy sqlite DB contains ``table``."""
+    try:
+        table = _validated_inspection_table(table)
+    except ValueError:
+        return False
+    conn = _open_ro(db_path)
+    if conn is None:
+        return False
+    try:
+        return _table_exists(conn, table)
+    finally:
+        conn.close()
+
+
+def count_rows_ro(db_path: Path, table: str) -> int | None:
+    """Return ``COUNT(*)`` from ``table`` in a legacy sqlite DB."""
+    try:
+        table = _validated_inspection_table(table)
+    except ValueError:
+        return None
+    conn = _open_ro(db_path)
+    if conn is None:
+        return None
+    try:
+        if not _table_exists(conn, table):
+            return None
+        try:
+            row = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()
+        except sqlite3.Error:
+            return None
+        return int(row[0]) if row and row[0] is not None else 0
+    finally:
+        conn.close()
+
+
+def count_work_tasks_for_project_ro(db_path: Path, project_key: str) -> int:
+    """Return legacy sqlite ``work_tasks`` rows for ``project_key``."""
+    conn = _open_ro(db_path)
+    if conn is None:
+        return 0
+    try:
+        if not _table_exists(conn, "work_tasks"):
+            return 0
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM work_tasks WHERE project = ?",
+                (project_key,),
+            ).fetchone()
+        except sqlite3.Error:
+            return 0
+    finally:
+        conn.close()
+    if not row:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        return 0
+
+
+def aggregate_project_session_tokens_ro(
+    db_path: Path,
+    *,
+    project_key: str,
+) -> tuple[int, int] | None:
+    """Return legacy sqlite ``work_sessions`` token sums for ``project_key``."""
+    conn = _open_ro(db_path)
+    if conn is None:
+        return None
+    try:
+        if not _table_exists(conn, "work_sessions"):
+            return None
+        try:
+            row = conn.execute(
+                "SELECT COALESCE(SUM(total_input_tokens), 0), "
+                "       COALESCE(SUM(total_output_tokens), 0) "
+                "FROM work_sessions WHERE task_project = ?",
+                (project_key,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+    finally:
+        conn.close()
+    if row is None:
+        return 0, 0
+    return int(row[0] or 0), int(row[1] or 0)
+
+
+def session_window_names_ro(db_path: Path) -> set[str] | None:
+    """Return legacy sqlite session window names, or ``None`` on failure."""
+    conn = _open_ro(db_path)
+    if conn is None:
+        return None
+    try:
+        if not _table_exists(conn, "sessions"):
+            return None
+        windows: set[str] = set()
+        try:
+            for row in conn.execute("SELECT window_name FROM sessions"):
+                if row and row[0]:
+                    windows.add(str(row[0]))
+        except sqlite3.Error:
+            return None
+        return windows
+    finally:
+        conn.close()
 
 
 def _columns(conn: sqlite3.Connection, table: str) -> list[str]:
@@ -262,6 +412,7 @@ def migrate_one(
         return report
 
     try:
+        # sqlite-ripout: sanctioned - migration/backup only
         dst = sqlite3.connect(workspace_db)
     except sqlite3.Error as exc:
         report.errors.append(f"cannot open workspace DB: {exc}")
@@ -338,6 +489,12 @@ def migrate_legacy_per_project_dbs(
 __all__ = [
     "LEGACY_DB_SUFFIX",
     "PerProjectMigrationReport",
+    "aggregate_project_session_tokens_ro",
+    "applied_schema_version_ro",
+    "count_rows_ro",
+    "count_work_tasks_for_project_ro",
+    "has_table_ro",
     "migrate_legacy_per_project_dbs",
     "migrate_one",
+    "session_window_names_ro",
 ]

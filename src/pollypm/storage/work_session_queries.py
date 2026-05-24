@@ -23,12 +23,10 @@ busy-timeout setup that #1018 introduced.
 from __future__ import annotations
 
 import logging
-import sqlite3
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from pollypm.storage._backend_dispatch import is_pg_backend
-from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas, readonly_uri
 
 if TYPE_CHECKING:
     from pollypm.models import PollyPMConfig
@@ -57,39 +55,17 @@ def aggregate_project_session_tokens(
         return _aggregate_pg(project_key=project_key, config=config)
 
     try:
-        if not db_path.exists():
-            return None
-    except OSError:
-        return None
-    # #1652: open read-only via the ``file:<path>?mode=ro`` URI so the
-    # render-side aggregate cannot mutate the workspace DB (journal
-    # mode, write lock, etc.). #1674: percent-encode the path so ``#``
-    # / ``?`` in the workspace dir don't get parsed as URI fragment /
-    # query syntax.
-    uri = readonly_uri(db_path)
-    try:
-        conn = sqlite3.connect(uri, uri=True)
-    except sqlite3.Error as exc:
+        from pollypm.storage.legacy_per_project_db import (
+            aggregate_project_session_tokens_ro,
+        )
+    except Exception as exc:  # noqa: BLE001
         logger.debug(
-            "work_session_queries: connect failed for %s: %s", db_path, exc,
+            "work_session_queries: legacy sqlite helper import failed: %s", exc,
         )
         return None
-    try:
-        apply_workspace_pragmas(conn, readonly=True)
-        try:
-            row = conn.execute(
-                "SELECT COALESCE(SUM(total_input_tokens), 0), "
-                "       COALESCE(SUM(total_output_tokens), 0) "
-                "FROM work_sessions WHERE task_project = ?",
-                (project_key,),
-            ).fetchone()
-        except sqlite3.Error:
-            return None
-    finally:
-        conn.close()
-    if row is None:
-        return 0, 0
-    return int(row[0] or 0), int(row[1] or 0)
+    return aggregate_project_session_tokens_ro(
+        db_path, project_key=project_key,
+    )
 
 
 def _aggregate_pg(

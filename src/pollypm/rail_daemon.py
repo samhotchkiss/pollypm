@@ -214,7 +214,8 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     # Refuse-start gate (#717): the daemon opens the state store and
     # would silently run migrations otherwise. Exit loudly so the
     # operator runs ``pm migrate --apply`` from a terminal instead.
-    _migrations.require_no_pending_or_exit(cfg.project.state_db)
+    if getattr(getattr(cfg, "storage", None), "backend", "") != "postgres":
+        _migrations.require_no_pending_or_exit(cfg.project.state_db)
     pollypm_home = Path(DEFAULT_CONFIG_PATH).parent
     pid_path = _pid_file(pollypm_home)
     lock_path = _lock_file(pollypm_home)

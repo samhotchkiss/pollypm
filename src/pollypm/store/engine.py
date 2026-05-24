@@ -83,6 +83,11 @@ def make_engines(url: str) -> tuple[Engine, Engine]:
         Two separate :class:`~sqlalchemy.engine.Engine` instances backed
         by independent ``QueuePool`` instances.
     """
+    if is_sqlite(url):
+        raise RuntimeError(
+            "sqlite not supported in production runtime; use Postgres"
+        )
+
     write_engine = create_engine(
         url,
         poolclass=QueuePool,
@@ -97,10 +102,6 @@ def make_engines(url: str) -> tuple[Engine, Engine]:
         pool_size=5,
         future=True,
     )
-
-    if is_sqlite(url):
-        _install_sqlite_pragmas(write_engine)
-        _install_sqlite_pragmas(read_engine)
 
     return write_engine, read_engine
 

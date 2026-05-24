@@ -11755,31 +11755,12 @@ def _dashboard_discover_db_aliases(
                 if isinstance(project, str) and project.strip():
                     labels.add(project)
     except Exception:  # noqa: BLE001
-        # Sqlite-install fallback: read the per-project DB directly so
-        # the legacy code path keeps working until the cutover is
-        # complete on every workspace.
-        import sqlite3
-
-        try:
-            from pollypm.storage.sqlite_pragmas import readonly_uri
-            conn = sqlite3.connect(readonly_uri(db_path), uri=True)
-        except Exception:  # noqa: BLE001
-            return discovered
-        try:
-            try:
-                rows = conn.execute(
-                    "SELECT DISTINCT project FROM work_tasks",
-                ).fetchall()
-            except Exception:  # noqa: BLE001
-                return discovered
-            for (label,) in rows:
-                if isinstance(label, str) and label.strip():
-                    labels.add(label)
-        finally:
-            try:
-                conn.close()
-            except Exception:  # noqa: BLE001
-                pass
+        logger.debug(
+            "dashboard alias discovery failed via configured work service; "
+            "sqlite not supported in production runtime; use Postgres",
+            exc_info=True,
+        )
+        return discovered
 
     for label in labels:
         if label in aliases or label in discovered:

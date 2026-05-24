@@ -35,6 +35,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -107,6 +108,12 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
 """
 
 
+def _connect_rw(db_path: Path, *, timeout: float = 5.0) -> sqlite3.Connection:
+    """Open sqlite read-write for the explicit migration CLI only."""
+    # sqlite-ripout: sanctioned - migration/backup only
+    return sqlite3.connect(str(db_path), timeout=timeout)
+
+
 def _declared_state_migrations() -> list[tuple[int, str]]:
     # state.py is still the source of truth for the legacy migration
     # list (pg has its own schema_migrations registry).
@@ -130,6 +137,7 @@ def _readonly_connect(db_path: Path) -> sqlite3.Connection | None:
     from pollypm.storage.sqlite_pragmas import readonly_uri
     uri = readonly_uri(db_path)
     try:
+        # sqlite-ripout: sanctioned - migration/backup only
         return sqlite3.connect(uri, uri=True, timeout=1.0)
     except sqlite3.Error:
         return None
@@ -224,7 +232,7 @@ def _table_set(db_path: Path) -> set[str]:
     if not db_path.is_file():
         return set()
     try:
-        conn = sqlite3.connect(str(db_path), timeout=5.0)
+        conn = _connect_rw(db_path, timeout=5.0)
     except sqlite3.Error:
         return set()
     # #1018 — read-only probe, but the workspace DB is held by the live
@@ -315,41 +323,62 @@ def check_against_clone(
     )
 
 
-def _apply_all(db_path: Path) -> None:
-    """Replay every migration idempotently by opening the existing writers.
-
-    ``StateStore.__init__`` already replays ``_MIGRATIONS`` against the
-    DB. The work-domain migrations live in ``_WORK_MIGRATIONS`` and used
-    to be applied via ``SQLiteWorkService.__init__`` — but post-sqlite-
-    ripout (#1971) ``create_work_service`` returns a PG-backed service
-    that ignores ``db_path`` and never touches the workspace state.db
-    (#2194). ``inspect()`` still reads ``work_schema_version`` from the
-    sqlite state.db, so a stale ``work_schema_version`` row keeps the
-    refuse-start gate firing forever even after ``pm migrate --apply``
-    claims success. Replay the work-domain migrations directly against
-    the state.db sqlite connection so the gate-tracked table actually
-    advances.
-    """
+def _state_store_adapter(conn: sqlite3.Connection, db_path: Path):
+    """Return a ``StateStore``-shaped adapter without opening sqlite."""
     from pollypm.storage.state import StateStore
-    from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
+    store = StateStore.__new__(StateStore)
+    store.path = db_path
+    store.readonly = False
+    store._conn = conn
+    store._lock = threading.RLock()
+    return store
+
+
+def _apply_state_schema_and_migrations(
+    conn: sqlite3.Connection, db_path: Path,
+) -> None:
+    """Run the legacy StateStore schema during explicit sqlite migration."""
+    from pollypm.storage.state import SCHEMA
+
+    store = _state_store_adapter(conn, db_path)
+    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+    try:
+        conn.executescript(SCHEMA)
+    except sqlite3.IntegrityError:
+        store._deduplicate_alerts()
+        conn.executescript(SCHEMA)
+    store._migrate()
+    conn.commit()
+    store._ensure_incremental_auto_vacuum()
+
+
+def _apply_work_schema_and_migrations(conn: sqlite3.Connection) -> None:
+    """Run the legacy sqlite work schema during explicit migration."""
     from pollypm.work.schema import create_work_tables
 
-    with StateStore(db_path) as _store:
-        pass
+    create_work_tables(conn)
 
-    # #2194 — apply the work-domain migrations directly to the sqlite
-    # state.db. The state.db retains the legacy ``work_*`` tables from
-    # pre-pg installs; ``inspect()`` reads ``work_schema_version`` from
-    # here, so if this step is skipped the refuse-start gate fires
-    # forever.
-    conn = sqlite3.connect(str(db_path), timeout=5.0)
+
+def _apply_all(db_path: Path) -> None:
+    """Replay every migration idempotently via explicit sqlite migration code.
+
+    ``StateStore`` no longer opens sqlite at runtime post-ripout, so the
+    migration CLI applies its schema using a private adapter that reuses
+    the legacy migration methods without invoking ``StateStore.__init__``.
+    Work-service migrations are likewise applied through the schema
+    helper, not the runtime work-service factory (pg-only post-ripout).
+    """
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = _connect_rw(db_path, timeout=5.0)
+    from pollypm.storage.sqlite_pragmas import apply_workspace_pragmas
+
+    apply_workspace_pragmas(conn, busy_timeout_ms=30000)
     try:
-        apply_workspace_pragmas(conn)
-        create_work_tables(conn)
-        conn.commit()
+        _apply_state_schema_and_migrations(conn, db_path)
+        _apply_work_schema_and_migrations(conn)
     finally:
         conn.close()
-
     _record_schema_migrations(db_path)
 
 
@@ -362,7 +391,7 @@ def _record_schema_migrations(db_path: Path) -> None:
     unified audit table: the first call after upgrade back-fills every
     already-applied migration.
     """
-    conn = sqlite3.connect(str(db_path), timeout=5.0)
+    conn = _connect_rw(db_path, timeout=5.0)
     # #1018 — schema-audit writer; flip into WAL + 5 s busy_timeout so
     # an ``INSERT OR IGNORE`` doesn't race the heartbeat alert upserts
     # holding the writer briefly.
@@ -608,6 +637,8 @@ def check_pending(db_path: Path | None = None) -> tuple[bool, str]:
             config = load_config(DEFAULT_CONFIG_PATH)
         except Exception as exc:  # noqa: BLE001
             return (True, f"skipped: config load failed ({type(exc).__name__})")
+        if getattr(getattr(config, "storage", None), "backend", "") == "postgres":
+            return (True, "skipped: postgres backend")
         db_path = config.project.state_db
     if not db_path.is_file():
         return (True, "skipped: no state.db present")

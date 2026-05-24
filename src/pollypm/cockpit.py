@@ -489,30 +489,12 @@ def _resource_section(config) -> MetricsSection:
             db_size = state_db.stat().st_size
         except OSError:
             db_size = 0
-        freelist_ratio = 0.0
-        try:
-            import sqlite3
-            from pollypm.storage.sqlite_pragmas import readonly_uri
-            conn = sqlite3.connect(readonly_uri(state_db), uri=True)
-            try:
-                page_size = int(
-                    conn.execute("PRAGMA page_size").fetchone()[0] or 0,
-                )
-                freelist = int(
-                    conn.execute("PRAGMA freelist_count").fetchone()[0] or 0,
-                )
-                if page_size and db_size:
-                    freelist_ratio = (page_size * freelist) / db_size
-            finally:
-                conn.close()
-        except Exception:  # noqa: BLE001
-            pass
         tone = "alert" if db_size > 500 * 1024 * 1024 else (
             "warn" if db_size > 100 * 1024 * 1024 else "ok"
         )
         rows.append(
             ("state.db",
-             f"{_humanize_bytes(db_size)} · freelist {freelist_ratio*100:.1f}%",
+             f"{_humanize_bytes(db_size)} · sqlite freelist n/a",
              tone),
         )
     else:

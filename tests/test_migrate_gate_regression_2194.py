@@ -43,8 +43,9 @@ def _seed_state_db_at_work_v10(db_path: Path) -> None:
 
     Steps:
 
-    1. Open a full ``StateStore`` + ``create_work_tables`` against
-       ``db_path`` so every state-domain and work-domain table exists.
+    1. Run the explicit sqlite migration path against ``db_path`` so
+       every state-domain and work-domain table exists without using
+       the guarded runtime ``StateStore`` constructor.
     2. Roll the ``work_schema_version`` row set back to v10 and drop
        the v11 column from ``work_tasks``. SQLite supports DROP COLUMN
        since 3.35 (May 2021), which is well below our floor.
@@ -53,17 +54,10 @@ def _seed_state_db_at_work_v10(db_path: Path) -> None:
     ``git pull`` on the #2145 commit: every prior migration applied,
     only v11 outstanding.
     """
-    # Late imports — they pull pollypm.config et al., which want a real
-    # workspace; we only want the sqlite DDL bits here.
-    from pollypm.storage.state import StateStore
-    from pollypm.work.schema import create_work_tables
-
-    with StateStore(db_path) as _store:
-        pass
+    _migrations._apply_all(db_path)
 
     conn = sqlite3.connect(str(db_path))
     try:
-        create_work_tables(conn)
         # Trim work_schema_version back to v10 and drop the v11 column
         # so ``inspect()`` reports work v11 as pending.
         conn.execute("DELETE FROM work_schema_version WHERE version > 10")

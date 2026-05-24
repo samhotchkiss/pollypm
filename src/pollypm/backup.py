@@ -184,6 +184,7 @@ def _is_valid_sqlite_file(path: Path) -> bool:
     if not header.startswith(b"SQLite format 3\x00"):
         return False
     try:
+        # sqlite-ripout: sanctioned - migration/backup only
         conn = sqlite3.connect(readonly_uri(path), uri=True)
         try:
             conn.execute("PRAGMA schema_version").fetchone()
@@ -241,8 +242,10 @@ def _online_backup_to_plain_file(source_db: Path, dest: Path) -> None:
     deadline = time.monotonic() + BACKUP_LOCK_RETRY_MAX_SECONDS
     while True:
         try:
+            # sqlite-ripout: sanctioned - migration/backup only
             src = sqlite3.connect(readonly_uri(source_db), uri=True)
             try:
+                # sqlite-ripout: sanctioned - migration/backup only
                 dst = sqlite3.connect(dest)
                 try:
                     src.backup(dst)

@@ -406,6 +406,8 @@ def _enforce_migration_gate(config_path: Path) -> None:
     try:
         from pollypm.config import load_config
         config = load_config(config_path)
+        if getattr(getattr(config, "storage", None), "backend", "") == "postgres":
+            return
         db_path = config.project.state_db
     except Exception:  # noqa: BLE001
         return

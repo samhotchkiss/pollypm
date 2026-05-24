@@ -300,32 +300,11 @@ def open_workspace_db(
     *,
     timeout: float = 30.0,
 ) -> sqlite3.Connection:
-    """Open a workspace SQLite DB, attaching a diagnostic on open failure.
-
-    #1095: thin wrapper around ``sqlite3.connect`` that re-raises an
-    ``OperationalError("unable to open database file")`` with a
-    structured ``key=value`` suffix so the next time this fires we know
-    which path was tried, whether the parent is writable, and whether
-    stale WAL/SHM sidecars are present. The original error class and
-    chain are preserved so callers that match on
-    ``OperationalError`` keep working.
-
-    All other errors propagate untouched — only the specific
-    ``unable to open`` failure mode gets the extra context. This is
-    deliberately narrow because the more general lock / busy errors
-    already have their own retry path (:func:`retry_on_database_locked`).
-    """
-    try:
-        return sqlite3.connect(str(db_path), timeout=timeout)
-    except sqlite3.OperationalError as exc:
-        msg = str(exc)
-        if "unable to open database file" not in msg:
-            raise
-        diag = diagnose_unable_to_open(db_path)
-        # Log at ERROR so the diagnostic survives even if the caller
-        # swallows the exception higher up.
-        logger.error("sqlite open failed: %s :: %s", msg, diag)
-        raise sqlite3.OperationalError(f"{msg} ({diag})") from exc
+    """Legacy runtime sqlite opener, disabled after the pg cutover."""
+    del db_path, timeout
+    raise RuntimeError(
+        "sqlite not supported in production runtime; use Postgres"
+    )
 
 
 __all__ = [

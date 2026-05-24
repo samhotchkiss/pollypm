@@ -28,6 +28,9 @@ rejection in :func:`pollypm.store.registry.register_backend`.
 
 from __future__ import annotations
 
+import ast
+from pathlib import Path
+
 import pytest
 
 from pollypm.store.registry import register_backend, unregister_backend
@@ -179,3 +182,112 @@ def test_register_backend_sqlite_no_kwarg_bypass_outside_pytest(
     assert "sqlite" not in registry_mod._REGISTERED_BACKENDS, (
         "rejected bypass attempts must never mutate the registry."
     )
+
+
+_SQLITE_RIPOUT_MARKER = "# sqlite-ripout: sanctioned - migration/backup only"
+_SQLITE_CONNECT_ALLOWLIST = {
+    Path("src/pollypm/backup.py"),
+    Path("src/pollypm/storage/legacy_per_project_db.py"),
+    Path("src/pollypm/storage/pg_migration_tool.py"),
+    Path("src/pollypm/store/migrations.py"),
+}
+
+
+def _repo_root() -> Path:
+    return Path(__file__).resolve().parents[1]
+
+
+def _production_python_files() -> list[Path]:
+    root = _repo_root()
+    return sorted((root / "src" / "pollypm").rglob("*.py"))
+
+
+def _relative(path: Path) -> Path:
+    return path.relative_to(_repo_root())
+
+
+def _is_sqlite3_connect(call: ast.Call) -> bool:
+    func = call.func
+    return (
+        isinstance(func, ast.Attribute)
+        and func.attr == "connect"
+        and isinstance(func.value, ast.Name)
+        and func.value.id == "sqlite3"
+    )
+
+
+def _is_sqlalchemy_store_constructor(call: ast.Call) -> bool:
+    func = call.func
+    if isinstance(func, ast.Name):
+        return func.id == "SQLAlchemyStore"
+    return isinstance(func, ast.Attribute) and func.attr == "SQLAlchemyStore"
+
+
+def _has_ripout_marker(lines: list[str], lineno: int) -> bool:
+    # The marker should sit immediately above the sanctioned connect
+    # site; allow a one-line expression wrap without weakening the
+    # source-level audit.
+    start = max(0, lineno - 3)
+    return any(_SQLITE_RIPOUT_MARKER in line for line in lines[start:lineno])
+
+
+def test_no_production_sqlite_connect_outside_allowlist() -> None:
+    """Pin #1970's sqlite runtime allowlist at the source level."""
+    violations: list[str] = []
+    missing_markers: list[str] = []
+    for path in _production_python_files():
+        rel = _relative(path)
+        text = path.read_text()
+        tree = ast.parse(text, filename=str(rel))
+        lines = text.splitlines()
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not _is_sqlite3_connect(node):
+                continue
+            location = f"{rel}:{node.lineno}"
+            if rel not in _SQLITE_CONNECT_ALLOWLIST:
+                violations.append(location)
+                continue
+            if not _has_ripout_marker(lines, node.lineno):
+                missing_markers.append(location)
+
+    assert violations == [], (
+        "sqlite3.connect is only sanctioned for backup, legacy "
+        "per-project migration/inspection, and explicit migration "
+        f"subcommands. Move/port/guard these call sites: {violations}"
+    )
+    assert missing_markers == [], (
+        "sanctioned sqlite3.connect call sites must carry the "
+        f"{_SQLITE_RIPOUT_MARKER!r} marker: {missing_markers}"
+    )
+
+
+def test_no_production_sqlalchemy_store_constructor() -> None:
+    """No production path may rebuild the removed sqlite SQLAlchemyStore."""
+    violations: list[str] = []
+    for path in _production_python_files():
+        rel = _relative(path)
+        tree = ast.parse(path.read_text(), filename=str(rel))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Call) and _is_sqlalchemy_store_constructor(node):
+                violations.append(f"{rel}:{node.lineno}")
+
+    assert violations == [], (
+        "SQLAlchemyStore construction is not allowed in production "
+        f"runtime post-sqlite-ripout: {violations}"
+    )
+
+
+def test_make_engines_rejects_sqlite_urls() -> None:
+    """The legacy SQLAlchemy engine helper must not create sqlite engines."""
+    from pollypm.store.engine import make_engines
+
+    with pytest.raises(RuntimeError, match="sqlite not supported"):
+        make_engines("sqlite:///:memory:")
+
+
+def test_state_store_constructor_rejects_sqlite_runtime(tmp_path: Path) -> None:
+    """The legacy StateStore must fail before opening a sqlite DB."""
+    from pollypm.storage.state import StateStore
+
+    with pytest.raises(RuntimeError, match="sqlite not supported"):
+        StateStore(tmp_path / "state.db")

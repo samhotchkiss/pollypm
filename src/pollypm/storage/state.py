@@ -25,7 +25,6 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -46,11 +45,6 @@ from pollypm.storage.records import (
     TokenSampleRecord,
     TokenUsageHourlyRecord,
     WorktreeRecord,
-)
-from pollypm.storage.sqlite_pragmas import (
-    apply_workspace_pragmas,
-    readonly_uri,
-    retry_on_database_locked,
 )
 
 __all__ = [
@@ -452,59 +446,10 @@ def _safe_tags(raw: object) -> tuple:
 
 class StateStore:
     def __init__(self, path: Path, *, readonly: bool = False) -> None:
-        self.path = path
-        self.readonly = readonly
-        # Always ensure the parent directory exists — SQLite can't create the
-        # database file if the directory is missing, even in read-only mode.
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
-        use_readonly_uri = readonly and path.exists()
-        db_target = readonly_uri(path, immutable=True) if use_readonly_uri else str(path)
-        self._conn = sqlite3.connect(db_target, check_same_thread=False, uri=use_readonly_uri)
-        with self._lock:
-            # #1018: centralised WAL + busy_timeout. We keep StateStore's
-            # historically-longer 30 s timeout because alert upserts hold
-            # the writer through several queries — the workspace default
-            # of 5 s would surface contention at the wrong layer.
-            apply_workspace_pragmas(
-                self._conn,
-                readonly=use_readonly_uri,
-                busy_timeout_ms=30000,
-            )
-            if not use_readonly_uri:
-                # Apply schema for new or writable databases — even in
-                # "readonly" mode we may have just created an empty DB
-                # (when the file didn't exist before connect).
-                # auto_vacuum=INCREMENTAL lets us reclaim freelist space on
-                # demand via ``PRAGMA incremental_vacuum``. This pragma must
-                # run BEFORE any tables are created to take effect on a
-                # fresh DB — on existing DBs it's a no-op and the one-shot
-                # VACUUM below (gated on the current mode) actually flips
-                # the page format.
-                retry_on_database_locked(
-                    lambda: self.execute("PRAGMA auto_vacuum=INCREMENTAL"),
-                    label="StateStore.__init__.auto_vacuum",
-                )
-                try:
-                    self._conn.executescript(SCHEMA)
-                except sqlite3.IntegrityError:
-                    # Duplicates exist that conflict with a UNIQUE index.
-                    # Deduplicate and retry.
-                    self._deduplicate_alerts()
-                    self._conn.executescript(SCHEMA)
-                try:
-                    self._migrate()
-                except Exception:
-                    self._conn.rollback()
-                    raise
-                self.commit()
-                # One-shot migration to flip existing NONE-mode DBs into
-                # INCREMENTAL mode. Must run OUTSIDE any transaction —
-                # VACUUM cannot run mid-tx, so we gate it behind a pragma
-                # read and skip if already in the right mode. New DBs hit
-                # this path with auto_vacuum already set, so the VACUUM is
-                # skipped for them (the initial pragma above sufficed).
-                self._ensure_incremental_auto_vacuum()
+        del path, readonly
+        raise RuntimeError(
+            "sqlite not supported in production runtime; use Postgres"
+        )
 
     def _ensure_incremental_auto_vacuum(self) -> None:
         """Flip pre-existing DBs into ``auto_vacuum=INCREMENTAL`` mode.

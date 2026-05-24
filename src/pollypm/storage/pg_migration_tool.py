@@ -671,6 +671,7 @@ def preflight(pool: "ConnectionPool", *, min_version: int = 16) -> PreflightResu
 def _sqlite_open_ro(path: Path) -> sqlite3.Connection:
     """Open a sqlite file read-only. Uses :func:`readonly_uri` so the
     pragma machinery is consistent with the rest of the codebase."""
+    # sqlite-ripout: sanctioned - migration/backup only
     conn = sqlite3.connect(readonly_uri(path), uri=True)
     conn.row_factory = sqlite3.Row
     return conn

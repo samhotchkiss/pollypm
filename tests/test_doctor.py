@@ -7,6 +7,7 @@ import socket
 import sqlite3
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from typer.testing import CliRunner
@@ -435,6 +436,117 @@ def test_check_plugin_capability_shapes_clean() -> None:
     # this must hold in CI.
     result = doctor.check_plugin_capabilities_no_deprecations()
     assert result.passed
+
+
+def test_check_session_model_args_explicit_skips_without_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(doctor, "_doctor_config_or_none", lambda: None)
+
+    result = doctor.check_session_model_args_explicit()
+
+    assert result.skipped
+
+
+def test_check_session_model_args_explicit_passes_with_model_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        sessions={
+            "heartbeat": SimpleNamespace(
+                args=["--model", "sonnet"],
+                role="heartbeat",
+                provider="claude",
+                account="main",
+                project="pollypm",
+            ),
+            "operator": SimpleNamespace(
+                args=["--model=gpt-5"],
+                role="operator",
+                provider="codex",
+                account="codex-main",
+                project="pollypm",
+            ),
+        }
+    )
+    monkeypatch.setattr(doctor, "_doctor_config_or_none", lambda: config)
+
+    result = doctor.check_session_model_args_explicit()
+
+    assert result.passed
+    assert "2 configured sessions have explicit --model args" in result.status
+
+
+def test_check_session_model_args_explicit_warns_on_missing_model_args(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        sessions={
+            "heartbeat": SimpleNamespace(
+                args=["--model", "sonnet"],
+                role="heartbeat",
+                provider="claude",
+                account="main",
+                project="pollypm",
+            ),
+            "operator": SimpleNamespace(
+                args=[],
+                role="operator",
+                provider="claude",
+                account="main",
+                project="pollypm",
+            ),
+        }
+    )
+    monkeypatch.setattr(doctor, "_doctor_config_or_none", lambda: config)
+
+    result = doctor.check_session_model_args_explicit()
+
+    assert not result.passed
+    assert result.severity == "warning"
+    assert "1 configured session missing explicit --model args" in result.status
+    assert "operator" in result.why
+    assert 'args = ["--model", "sonnet"]' in result.fix
+    assert result.data["missing"] == [
+        {
+            "session": "operator",
+            "role": "operator",
+            "provider": "claude",
+            "account": "main",
+            "project": "pollypm",
+            "args": [],
+        }
+    ]
+
+
+def test_check_session_model_args_explicit_warns_on_model_without_value(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = SimpleNamespace(
+        sessions={
+            "dangling": SimpleNamespace(
+                args=["--model"],
+                role="worker",
+                provider="claude",
+                account="main",
+                project="demo",
+            ),
+            "next_flag": SimpleNamespace(
+                args=["--model", "--permission-mode", "acceptEdits"],
+                role="worker",
+                provider="claude",
+                account="main",
+                project="demo",
+            ),
+        }
+    )
+    monkeypatch.setattr(doctor, "_doctor_config_or_none", lambda: config)
+
+    result = doctor.check_session_model_args_explicit()
+
+    assert not result.passed
+    assert "2 configured sessions missing explicit --model args" in result.status
+    assert [item["session"] for item in result.data["missing"]] == ["dangling", "next_flag"]
 
 
 # --------------------------------------------------------------------- #

@@ -150,6 +150,7 @@ check. Tonight's wave specifically resolves:
 | `heartbeat-offline`         | Must NOT fire. Pre-#1987 this was a false-positive triggered by the supervisor reading sqlite while pg held the fresh heartbeat. | #1987 |
 | `pg-sequence-alignment`     | Must report all pg-owned serial sequences aligned. If it fires after a restore/import, `pm doctor --fix` advances lagging sequences without lowering healthy ones. | #2087 |
 | `project-guide-drift`       | Bulk-fixable via `pm doctor --fix`. The action now refreshes drifted guides in one shot instead of per-project. | #2028 |
+| `session-model-args`        | Warns when configured sessions omit an explicit `--model` value in `args`; add the provider-appropriate model to avoid relying on mutable CLI defaults. | #2147 |
 | `agent-worktree-count`      | The prune handler now actually reaps stale agent worktrees. Pre-#1975 the check fired but the fix was a no-op. | #1975 |
 
 > **Note on output format:** Post-#2038, `pm doctor` clusters human

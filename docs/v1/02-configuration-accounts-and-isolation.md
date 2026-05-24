@@ -115,7 +115,7 @@ system_prompt = "prompts/operator.md"
 | `role` | enum | yes | `heartbeat` or `operator` (control sessions only) |
 | `provider` | enum | yes | Which provider CLI to run |
 | `account` | string | yes | Account to use for credentials and isolation |
-| `args` | list | no | Additional CLI arguments passed to the provider |
+| `args` | list | no | Additional CLI arguments passed to the provider. `pm doctor` warns when a configured session omits an explicit `--model` value. |
 | `system_prompt` | path | no | Path to the system/role prompt file |
 
 ### Project-Local Config: `<project>/.pollypm/config/project.toml`
@@ -152,7 +152,7 @@ name = "worker-acme-2"
 role = "worker"
 provider = "codex"
 account = "codex-worker-1"
-args = []
+args = ["--model", "gpt-5"]
 system_prompt = "prompts/worker.md"
 ```
 
@@ -162,7 +162,7 @@ system_prompt = "prompts/worker.md"
 | `role` | enum | yes | `worker` (project-local sessions are always workers) |
 | `provider` | enum | yes | Which provider CLI to run |
 | `account` | string | yes | Account to use for credentials and isolation |
-| `args` | list | no | Additional CLI arguments passed to the provider |
+| `args` | list | no | Additional CLI arguments passed to the provider. `pm doctor` warns when a configured session omits an explicit `--model` value. |
 | `system_prompt` | path | no | Path to the system/role prompt file |
 | `persona` | string | no | Persona override for this session |
 

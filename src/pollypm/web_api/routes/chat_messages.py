@@ -636,6 +636,20 @@ def _load_envelopes(
     # branch above) — try capture, fall back to whatever JSONL we have
     # (better stale data than no data, per spec §4.8 which prefers
     # empty over erroring).
+    if include_thinking and archive is not None and archive.exists():
+        # tmux capture can only see rendered pane text; Anthropic
+        # thinking blocks live exclusively in the normalized JSONL.
+        # When the caller explicitly opts in and the archive has any
+        # thinking envelope, prefer that archive over stale capture so
+        # the request can actually satisfy ``include_thinking=true``.
+        envelopes = parse_events_jsonl(
+            archive,
+            actor_fallback=actor_fallback,
+            include_thinking=True,
+        )
+        if any(env.type == MessageType.THINKING for env in envelopes):
+            return envelopes, "jsonl", archive
+
     captured = _capture_for_surface(surface, actor_fallback=actor_fallback)
     if captured:
         return captured, "capture", None

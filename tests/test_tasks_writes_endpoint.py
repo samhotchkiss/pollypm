@@ -21,7 +21,9 @@ plumbing.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import threading
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -54,6 +56,7 @@ from pollypm.work.service_support import (
 # ``attach_session_manager`` exception lands on
 # ``svc._session_attach_error``.
 from pollypm.work.service_factory import (  # noqa: E402
+    create_work_service_with_deferred_session as _REAL_DEFERRED_FACTORY,
     create_work_service_with_session as _REAL_CREATE_WORK_SERVICE_WITH_SESSION,
 )
 
@@ -423,6 +426,11 @@ def patched_work_service(
         "create_work_service_with_session",
         _fake_factory,
     )
+    monkeypatch.setattr(
+        work_service_factory,
+        "create_work_service_with_deferred_session",
+        _fake_factory,
+    )
     # The web-api READ helpers (``_open_work_service_readonly``)
     # already wrap ``create_work_service`` via ``contextlib.contextmanager``
     # so the patch on the factory module reaches both call sites.
@@ -550,6 +558,204 @@ def test_claim_happy_path_warnings_empty(
     body = response.json()
     assert "warnings" in body, body
     assert body["warnings"] == []
+
+
+def test_claim_task_defers_worker_provisioning(
+    api_config, task_store, monkeypatch
+) -> None:
+    """API claims return before slow worktree/tmux provisioning runs."""
+    _seed(task_store, n=102, work_status=WorkStatus.QUEUED)
+
+    class _SlowSessionManager:
+        def __init__(self) -> None:
+            self.cap_checks: list[tuple[str, str]] = []
+            self.provisions: list[tuple[str, str]] = []
+
+        def check_parallel_cap(self, project: str, task_id: str) -> None:
+            self.cap_checks.append((project, task_id))
+
+        def provision_worker(self, task_id: str, agent_name: str) -> None:
+            time.sleep(0.15)
+            self.provisions.append((task_id, agent_name))
+
+    class _ProvisioningWorkService(FakeWorkService):
+        def set_session_manager(self, mgr: object) -> None:
+            self._session_mgr = mgr
+
+        def claim(self, task_id: str, actor: str) -> FakeTask:
+            mgr = getattr(self, "_session_mgr")
+            mgr.check_parallel_cap("myproj", task_id)
+            task = super().claim(task_id, actor)
+            mgr.provision_worker(task_id, actor)
+            return task
+
+    attached_managers: list[_SlowSessionManager] = []
+    scheduled: list[Callable[[], None]] = []
+
+    def _factory(**_kwargs: object) -> _ProvisioningWorkService:
+        return _ProvisioningWorkService(task_store)
+
+    def _attach(svc: object, **_kwargs: object) -> _SlowSessionManager:
+        mgr = _SlowSessionManager()
+        svc.set_session_manager(mgr)
+        attached_managers.append(mgr)
+        return mgr
+
+    def _schedule(work: Callable[[], None]) -> None:
+        scheduled.append(work)
+
+    from pollypm.web_api.service import claim_task
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(work_factory, "create_work_service", _factory)
+    monkeypatch.setattr(
+        work_service_factory,
+        "attach_session_manager",
+        _attach,
+    )
+    monkeypatch.setattr(
+        work_service_factory,
+        "create_work_service_with_deferred_session",
+        _REAL_DEFERRED_FACTORY,
+    )
+
+    started = time.perf_counter()
+    detail, warnings = claim_task(
+        api_config,
+        "myproj",
+        102,
+        actor="alice",
+        provision_scheduler=_schedule,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert detail.work_status == "in_progress"
+    assert warnings == []
+    assert elapsed < 0.05
+    assert len(scheduled) == 1
+    assert attached_managers[0].cap_checks == [("myproj", "myproj/102")]
+    assert attached_managers[0].provisions == []
+
+    scheduled[0]()
+    assert attached_managers[-1].provisions == [("myproj/102", "alice")]
+
+
+def test_claim_endpoint_uses_lifespan_executor_for_deferred_provision(
+    api_config, token_path, token, task_store, monkeypatch
+) -> None:
+    """Route requests use the app-owned executor when lifespan is active."""
+    _seed(task_store, n=104, work_status=WorkStatus.QUEUED)
+    scheduled = threading.Event()
+
+    def _deferred_factory(**kwargs: object) -> FakeWorkService:
+        schedule = kwargs.get("schedule")
+        assert callable(schedule)
+        schedule(scheduled.set)
+        return FakeWorkService(task_store)
+
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(
+        work_service_factory,
+        "create_work_service_with_deferred_session",
+        _deferred_factory,
+    )
+
+    app = create_app(config=api_config, token_path=token_path)
+    with TestClient(app) as local_client:
+        response = local_client.post(
+            "/api/v1/tasks/myproj/104/claim",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"actor": "alice"},
+        )
+        assert scheduled.wait(timeout=1.0)
+
+    assert response.status_code == 200, response.text
+
+
+def test_deferred_provision_cap_race_rolls_claim_back(
+    api_config, task_store, monkeypatch
+) -> None:
+    """Deferred worker-cap races keep the existing queued rollback."""
+    task = _seed(task_store, n=103, work_status=WorkStatus.IN_PROGRESS)
+    task.claimed_by_session = "alice"
+    task.current_node_id = "node-start"
+
+    class WorkerCapExceededError(RuntimeError):
+        pass
+
+    class _CapExceededSessionManager:
+        def provision_worker(self, task_id: str, agent_name: str) -> None:
+            raise WorkerCapExceededError("cap exceeded")
+
+    class _RollbackWorkService(FakeWorkService):
+        def __enter__(self) -> "_RollbackWorkService":
+            return self
+
+        def __exit__(self, *exc: object) -> None:
+            return None
+
+        def set_session_manager(self, mgr: object) -> None:
+            self._session_mgr = mgr
+
+        def _rollback_claim_to_queued(
+            self,
+            project: str,
+            task_number: int,
+            node_id: str,
+            actor: str,
+            exc: BaseException,
+        ) -> bool:
+            self.rollback_call = (
+                project,
+                task_number,
+                node_id,
+                actor,
+                str(exc),
+            )
+            task = self.get(f"{project}/{task_number}")
+            task.work_status = WorkStatus.QUEUED
+            task.claimed_by_session = None
+            return True
+
+    svc = _RollbackWorkService(task_store)
+
+    def _factory(**_kwargs: object) -> _RollbackWorkService:
+        return svc
+
+    def _attach(svc: object, **_kwargs: object) -> _CapExceededSessionManager:
+        mgr = _CapExceededSessionManager()
+        svc.set_session_manager(mgr)
+        return mgr
+
+    from pollypm.work import factory as work_factory
+    from pollypm.work import service_factory as work_service_factory
+
+    monkeypatch.setattr(work_factory, "create_work_service", _factory)
+    monkeypatch.setattr(
+        work_service_factory,
+        "attach_session_manager",
+        _attach,
+    )
+
+    work_service_factory.provision_claimed_worker(
+        config=api_config,
+        project_key="myproj",
+        project_path=api_config.projects["myproj"].path,
+        task_id="myproj/103",
+        agent_name="alice",
+    )
+
+    assert svc.rollback_call == (
+        "myproj",
+        103,
+        "node-start",
+        "alice",
+        "cap exceeded",
+    )
+    assert task.work_status == WorkStatus.QUEUED
+    assert task.claimed_by_session is None
 
 
 def test_claim_surfaces_last_provision_error_warning(

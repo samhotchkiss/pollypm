@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 import logging
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,7 @@ def attach_session_manager(
     *,
     project_path: Path,
     config: Any = None,
-) -> None:
+) -> Any | None:
     """Wire a :class:`SessionManager` onto an already-constructed work service.
 
     Mirrors the per-task worker lifecycle wiring that ``pm`` CLI calls
@@ -53,12 +54,12 @@ def attach_session_manager(
         _record_attach_error(
             svc, f"SessionManager imports failed: {exc}"
         )
-        return
+        return None
     try:
         if not (project_path.exists() and (project_path / ".git").exists()):
-            return
+            return None
     except OSError:
-        return
+        return None
 
     # #2064 round-11 blocker #4: stamping ``_session_attach_error``
     # on SessionService construction failure was a false positive
@@ -109,6 +110,7 @@ def attach_session_manager(
         # path). DO NOT stamp ``_session_attach_error``; the
         # warning at ``_collect_claim_warnings`` would otherwise
         # falsely claim "no per-task tmux lane was provisioned".
+        return session_mgr
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "attach_session_manager: SessionManager wire-up failed",
@@ -126,6 +128,7 @@ def attach_session_manager(
             _record_attach_error(
                 svc, f"SessionManager wire-up failed: {exc}"
             )
+        return None
 
 
 def _record_attach_error(svc: Any, message: str) -> None:
@@ -203,6 +206,204 @@ def create_work_service_with_session(
     return svc
 
 
+class _DeferredProvisionSessionManager:
+    """SessionManager facade that defers slow worker provisioning.
+
+    ``PgWorkService.claim`` uses the attached manager for two things:
+    a cheap pre-claim cap probe and the expensive post-commit
+    ``provision_worker`` side effect. The Web API needs the first part
+    before returning but must not make the HTTP response wait for git
+    worktree creation and tmux/provider launch. This facade forwards
+    the cap probe to the real manager and schedules provisioning on
+    the caller-owned executor.
+    """
+
+    def __init__(
+        self,
+        real_manager: Any,
+        *,
+        config: Any,
+        project_key: str,
+        project_path: Path,
+        schedule: Callable[[Callable[[], None]], object],
+    ) -> None:
+        self._real_manager = real_manager
+        self._config = config
+        self._project_key = project_key
+        self._project_path = project_path
+        self._schedule = schedule
+
+    def check_parallel_cap(self, project: str, task_id: str) -> None:
+        check_cap = getattr(self._real_manager, "check_parallel_cap", None)
+        if callable(check_cap):
+            check_cap(project, task_id)
+
+    def provision_worker(self, task_id: str, agent_name: str) -> None:
+        def _run() -> None:
+            provision_claimed_worker(
+                config=self._config,
+                project_key=self._project_key,
+                project_path=self._project_path,
+                task_id=task_id,
+                agent_name=agent_name,
+            )
+
+        self._schedule(_run)
+
+
+def create_work_service_with_deferred_session(
+    *,
+    config: Any,
+    project_key: str,
+    project_path: Path,
+    schedule: Callable[[Callable[[], None]], object],
+    sync_manager: Any = None,
+) -> Any:
+    """Construct a work service with post-claim provisioning deferred.
+
+    This is the Web API variant of
+    :func:`create_work_service_with_session`. It still wires a real
+    ``SessionManager`` so ``claim()`` can run the same pre-claim
+    parallel-cap check as the CLI, but replaces the post-commit
+    provisioning call with an executor-scheduled background task.
+    """
+    from pollypm.work.factory import create_work_service
+
+    svc = create_work_service(
+        config=config,
+        project_path=project_path,
+        project_key=project_key,
+        sync_manager=sync_manager,
+    )
+    try:
+        session_mgr = attach_session_manager(
+            svc, project_path=project_path, config=config
+        )
+        if session_mgr is not None:
+            svc.set_session_manager(
+                _DeferredProvisionSessionManager(
+                    session_mgr,
+                    config=config,
+                    project_key=project_key,
+                    project_path=project_path,
+                    schedule=schedule,
+                )
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug(
+            "create_work_service_with_deferred_session: "
+            "attach_session_manager raised unexpectedly",
+            exc_info=True,
+        )
+        _record_attach_error(svc, f"SessionManager attach failed: {exc}")
+    return svc
+
+
+def provision_claimed_worker(
+    *,
+    config: Any,
+    project_key: str,
+    project_path: Path,
+    task_id: str,
+    agent_name: str,
+) -> None:
+    """Provision the per-task worker for an already-claimed API task."""
+    from pollypm.work.factory import create_work_service
+
+    try:
+        with create_work_service(
+            config=config,
+            project_path=project_path,
+            project_key=project_key,
+        ) as svc:
+            session_mgr = attach_session_manager(
+                svc, project_path=project_path, config=config
+            )
+            if session_mgr is None:
+                logger.warning(
+                    "deferred claim provision: no SessionManager for %s",
+                    task_id,
+                )
+                return
+            try:
+                task = svc.get(task_id)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "deferred claim provision: task %s disappeared",
+                    task_id,
+                    exc_info=True,
+                )
+                return
+            status = getattr(getattr(task, "work_status", None), "value", None)
+            if status is None:
+                status = getattr(task, "work_status", None)
+            if status not in {"in_progress", "review"}:
+                logger.info(
+                    "deferred claim provision: skip %s in state %r",
+                    task_id,
+                    status,
+                )
+                return
+            try:
+                session_mgr.provision_worker(task_id, agent_name)
+            except Exception as exc:  # noqa: BLE001
+                _rollback_deferred_claim_if_cap_exceeded(
+                    svc, task, task_id, agent_name, exc
+                )
+                raise
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "deferred claim provision failed for %s: %s",
+            task_id,
+            exc,
+            exc_info=True,
+        )
+
+
+def _rollback_deferred_claim_if_cap_exceeded(
+    svc: Any,
+    task: Any,
+    task_id: str,
+    actor: str,
+    exc: BaseException,
+) -> None:
+    """Mirror PgWorkService.claim's cap-race rollback when available."""
+    if not _is_worker_cap_exceeded(exc):
+        return
+    status = getattr(getattr(task, "work_status", None), "value", None)
+    if status is None:
+        status = getattr(task, "work_status", None)
+    if status != "in_progress":
+        return
+    rollback = getattr(svc, "_rollback_claim_to_queued", None)
+    if not callable(rollback):
+        return
+    node_id = getattr(task, "current_node_id", None)
+    if not node_id:
+        return
+    try:
+        rollback(
+            getattr(task, "project"),
+            getattr(task, "task_number"),
+            node_id,
+            actor,
+            exc,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "deferred claim provision: rollback failed for %s",
+            task_id,
+            exc_info=True,
+        )
+
+
+def _is_worker_cap_exceeded(exc: BaseException) -> bool:
+    for cls in type(exc).__mro__:
+        if cls.__name__ == "WorkerCapExceededError":
+            return True
+    return False
+
+
 def open_project_work_service(project: Any, *, config: Any = None) -> Any | None:
     """Open a per-project work service, returning None on failure.
 
@@ -252,6 +453,8 @@ def open_project_work_service(project: Any, *, config: Any = None) -> Any | None
 
 __all__ = [
     "attach_session_manager",
+    "create_work_service_with_deferred_session",
     "create_work_service_with_session",
     "open_project_work_service",
+    "provision_claimed_worker",
 ]

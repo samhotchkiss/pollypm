@@ -19,10 +19,12 @@ refresh state in one round-trip (spec §5.3 wrapper).
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Callable
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Query, Request
 
 from pollypm.web_api.errors import APIError, invalid_request, not_found
 from pollypm.web_api.models import (
@@ -64,6 +66,32 @@ from pollypm.web_api.service import (
 )
 
 router = APIRouter(tags=["Tasks"])
+logger = logging.getLogger(__name__)
+
+
+def _claim_provision_scheduler(
+    request: Request,
+) -> Callable[[Callable[[], None]], object] | None:
+    executor = getattr(request.app.state, "claim_provision_executor", None)
+    if executor is None:
+        return None
+
+    def _schedule(work: Callable[[], None]) -> object:
+        future = executor.submit(work)
+
+        def _log_failure(done) -> None:
+            try:
+                done.result()
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "claim worker provisioning task failed",
+                    exc_info=True,
+                )
+
+        future.add_done_callback(_log_failure)
+        return future
+
+    return _schedule
 
 
 @router.get(
@@ -248,6 +276,7 @@ def claim_task_endpoint(
     project: str,
     n: int,
     body: TaskClaimRequest,
+    request: Request,
     config: ConfigDep,
 ) -> TaskActionResult:
     if project not in config.projects:
@@ -257,7 +286,13 @@ def claim_task_endpoint(
     # and SessionManager attach failures (#2064 round-10). They never
     # fail the request; the envelope's ``warnings`` field lets the
     # client surface a banner alongside the ``in_progress`` task.
-    task, warnings = claim_task(config, project, n, actor=body.actor)
+    task, warnings = claim_task(
+        config,
+        project,
+        n,
+        actor=body.actor,
+        provision_scheduler=_claim_provision_scheduler(request),
+    )
     # #2064 round-11 blocker #2: the message must reflect the actual
     # post-claim state. The post-commit cap race
     # (``pg_service.py:1917-1939``) can roll the row back to

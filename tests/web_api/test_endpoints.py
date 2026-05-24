@@ -8,6 +8,7 @@ so the test path matches what the cockpit uses.
 
 from __future__ import annotations
 
+import inspect
 import sqlite3
 
 import pytest
@@ -23,6 +24,29 @@ def test_health_returns_status_ok(client) -> None:
     body = response.json()
     assert body["status"] == "ok"
     assert isinstance(body["schema_version"], int)
+
+
+def test_health_handler_stays_off_sync_threadpool(monkeypatch) -> None:
+    import importlib.metadata
+
+    from pollypm.web_api.routes import health as health_routes
+
+    calls = {"count": 0}
+
+    def fake_version(package: str) -> str:
+        assert package == "pollypm"
+        calls["count"] += 1
+        return "9.9.9"
+
+    health_routes._server_version.cache_clear()
+    monkeypatch.setattr(importlib.metadata, "version", fake_version)
+    try:
+        assert inspect.iscoroutinefunction(health_routes.get_health)
+        assert health_routes._server_version() == "9.9.9"
+        assert health_routes._server_version() == "9.9.9"
+        assert calls["count"] == 1
+    finally:
+        health_routes._server_version.cache_clear()
 
 
 def test_list_projects_returns_registered_project(client, auth_headers) -> None:

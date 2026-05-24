@@ -22,6 +22,7 @@ The route's behaviour mirrors the cockpit per spec §3.3 edge cases:
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Annotated, Any
@@ -265,7 +266,7 @@ def _gather_dashboard(config: Any) -> Any:
     summary="Aggregate dashboard / cockpit state",
     operation_id="getDashboard",
 )
-def get_dashboard_endpoint(
+async def get_dashboard_endpoint(
     config: ConfigDep,
     project: Annotated[
         str | None,
@@ -314,37 +315,39 @@ def get_dashboard_endpoint(
             hint="Drop ?project= to fetch the whole-system snapshot.",
         )
 
-    # Projects view — list_projects is the authoritative cockpit row
-    # builder; reuse it so the rollups derived below match the project
-    # rows exactly.
-    try:
-        projects_all = list_projects(config)
-    except Exception as exc:  # noqa: BLE001
+    projects_result, data_result = await asyncio.gather(
+        asyncio.to_thread(list_projects, config),
+        asyncio.to_thread(_gather_dashboard, config),
+        return_exceptions=True,
+    )
+    if isinstance(projects_result, Exception):
         # list_projects swallows per-project failures internally; a
         # raise here means the config itself is unreadable.
-        logger.warning("dashboard: list_projects failed: %s", exc)
+        logger.warning("dashboard: list_projects failed: %s", projects_result)
         raise service_unavailable(
             "Failed to load project list for dashboard",
             hint="Check `pm doctor` and config.toml health.",
-        ) from exc
+        ) from projects_result
+    if isinstance(data_result, Exception):
+        logger.warning("dashboard: gather failed: %s", data_result)
+        raise service_unavailable(
+            "Dashboard gather failed; backing store may be unreachable",
+            hint="Retry shortly; check `pm doctor` for pg pool health.",
+        ) from data_result
+
+    # Projects view — list_projects is the authoritative cockpit row
+    # builder; reuse it so the rollups derived below match the project
+    # rows exactly. In parallel, gather loads the aggregate dashboard
+    # payload (active sessions, commits, tokens, …). Transient pg outages
+    # surface as 503 per spec §3.3 final bullet; a healthy daemon-down
+    # state is captured below as ``daemon_status="down"`` (200, not 503).
+    projects_all = projects_result
+    data = data_result
 
     if project is not None:
         projects_view = [p for p in projects_all if p.key == project]
     else:
         projects_view = list(projects_all)
-
-    # Aggregate dashboard payload (active sessions, commits, tokens,
-    # …). Transient pg outages surface as 503 per spec §3.3 final
-    # bullet; a healthy daemon-down state is captured below as
-    # ``daemon_status="down"`` (200, not 503).
-    try:
-        data = _gather_dashboard(config)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("dashboard: gather failed: %s", exc)
-        raise service_unavailable(
-            "Dashboard gather failed; backing store may be unreachable",
-            hint="Retry shortly; check `pm doctor` for pg pool health.",
-        ) from exc
 
     # Derive daemon health from the UNFILTERED gather result. This is a
     # system-wide signal — a caller polling ``?project=foo`` must still

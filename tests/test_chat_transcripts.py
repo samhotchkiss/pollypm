@@ -1440,6 +1440,46 @@ def test_lookup_returns_none_without_cwd(tmp_path: Path) -> None:
     assert lookup_transcript_path(index, cwd="") is None
 
 
+def test_lookup_uses_pre_normalized_index_cwds(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Surface-list lookups must not resolve every archive cwd per surface."""
+    shared_cwd = tmp_path / "shared"
+    shared_cwd.mkdir()
+    normalized = str(shared_cwd.resolve())
+    index = [
+        transcripts_module._SessionIndexEntry(
+            path=tmp_path / f"session-{idx}" / "events.jsonl",
+            session_id=f"session-{idx}",
+            cwd=str(shared_cwd),
+            cwd_normalized=normalized,
+            account_name="codex_primary",
+            provider="codex",
+            mtime=float(idx),
+        )
+        for idx in range(1000)
+    ]
+
+    calls = {"count": 0}
+    real_resolve = Path.resolve
+
+    def counting_resolve(self: Path, *args, **kwargs):  # type: ignore[no-untyped-def]
+        calls["count"] += 1
+        return real_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", counting_resolve)
+
+    resolved = lookup_transcript_path(
+        index,
+        cwd=str(shared_cwd),
+        account_name="codex_primary",
+        provider="codex",
+    )
+
+    assert resolved == tmp_path / "session-999" / "events.jsonl"
+    assert calls["count"] == 1
+
+
 # ---------------------------------------------------------------------------
 # Envelope id stability
 # ---------------------------------------------------------------------------

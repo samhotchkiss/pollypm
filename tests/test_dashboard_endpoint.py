@@ -12,6 +12,7 @@ harness which these tests intentionally avoid.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -335,6 +336,32 @@ def test_list_projects_uses_pg_bulk_task_snapshot(
     assert by_key["myproj"].pending_plan_review is True
     assert by_key["myproj"].open_inbox_count == 1
     assert by_key["myproj"].task_counts["review"] == 1
+
+
+def test_dashboard_loads_projects_and_gather_concurrently(
+    client, auth_headers, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_started = threading.Event()
+    gather_started = threading.Event()
+
+    def fake_list_projects(_config):
+        project_started.set()
+        assert gather_started.wait(1.0)
+        return [_api_project("myproj")]
+
+    def fake_gather(_config):
+        gather_started.set()
+        assert project_started.wait(1.0)
+        return _make_data()
+
+    monkeypatch.setattr(dashboard_routes, "list_projects", fake_list_projects)
+    monkeypatch.setattr(dashboard_routes, "_gather_dashboard", fake_gather)
+
+    response = client.get("/api/v1/dashboard", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    assert project_started.is_set()
+    assert gather_started.is_set()
 
 
 # ---------------------------------------------------------------------------

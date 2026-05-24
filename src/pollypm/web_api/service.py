@@ -17,7 +17,7 @@ import contextlib
 import logging
 import os
 import re
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1622,6 +1622,7 @@ def claim_task(
     task_number: int,
     *,
     actor: str,
+    provision_scheduler: Callable[[Callable[[], None]], object] | None = None,
 ) -> tuple[APITaskDetail, list[str]]:
     """Atomically claim a queued task via the work-service.
 
@@ -1652,8 +1653,15 @@ def claim_task(
     surface with the same recovery wording the CLI emits at
     ``work/cli.py:912-929`` so cockpit operators see the same
     story regardless of channel.
+
+    When ``provision_scheduler`` is supplied by the Web API route, the
+    worker-session provisioning side effect is scheduled after the DB
+    claim instead of blocking the HTTP response. The synchronous path is
+    retained for CLI-like callers and tests that need immediate warning
+    collection.
     """
     from pollypm.work.service_factory import (
+        create_work_service_with_deferred_session,
         create_work_service_with_session,
     )
     from pollypm.work.service_support import (
@@ -1674,11 +1682,21 @@ def claim_task(
 
     task_id = f"{project_key}/{task_number}"
     try:
-        with create_work_service_with_session(
-            config=config,
-            project_key=project_key,
-            project_path=project.path,
-        ) as svc:
+        service_kwargs = {
+            "config": config,
+            "project_key": project_key,
+            "project_path": project.path,
+        }
+        if provision_scheduler is None:
+            work_service_cm = create_work_service_with_session(
+                **service_kwargs
+            )
+        else:
+            work_service_cm = create_work_service_with_deferred_session(
+                **service_kwargs,
+                schedule=provision_scheduler,
+            )
+        with work_service_cm as svc:
             try:
                 svc.claim(task_id, actor)
             except TaskNotFoundError as exc:

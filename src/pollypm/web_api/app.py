@@ -170,6 +170,13 @@ _BRIEFING_REGEN_THREAD_PREFIX = "briefing-regen"
 # :data:`_DOCTOR_SHUTDOWN_GRACE_S`.
 _BRIEFING_SHUTDOWN_GRACE_S = 5.0
 
+# Claim worker provisioning is intentionally off the HTTP request path:
+# git worktree creation and tmux/provider startup can take seconds, but
+# the operator's click only needs the atomic DB claim to complete.
+_CLAIM_PROVISION_MAX_WORKERS = 2
+_CLAIM_PROVISION_THREAD_PREFIX = "claim-provision"
+_CLAIM_PROVISION_SHUTDOWN_GRACE_S = 5.0
+
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -214,6 +221,13 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
       work on the executor.
     - ``briefing_inflight_lock``: guards the dict.
 
+    Claims:
+
+    - ``claim_provision_executor``: shared daemon executor for slow
+      post-claim worker provisioning. The DB claim remains synchronous;
+      worktree/tmux launch continues in this pool so ``POST
+      /tasks/{p}/{n}/claim`` returns within the click budget.
+
     Shutdown cancels not-yet-started futures for each executor, then
     calls ``executor.shutdown(wait=False, cancel_futures=True)`` so
     the teardown doesn't block on a wedged worker (a running
@@ -255,6 +269,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     )
     app.state.briefing_inflight: dict[tuple[str, str], concurrent.futures.Future[Any]] = {}
     app.state.briefing_inflight_lock = threading.Lock()
+    app.state.claim_provision_executor = DaemonThreadPoolExecutor(
+        max_workers=_CLAIM_PROVISION_MAX_WORKERS,
+        thread_name_prefix=_CLAIM_PROVISION_THREAD_PREFIX,
+    )
     try:
         yield
     finally:
@@ -272,6 +290,11 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
                 "lifespan: failed to clear briefing in-flight registry",
                 exc_info=True,
             )
+        _shutdown_daemon_executor(
+            app.state.claim_provision_executor,
+            label="claim provisioning executor",
+            grace_s=_CLAIM_PROVISION_SHUTDOWN_GRACE_S,
+        )
         _shutdown_daemon_executor(
             app.state.briefing_executor,
             label="briefing executor",

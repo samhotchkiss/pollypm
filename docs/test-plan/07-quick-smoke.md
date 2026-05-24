@@ -39,7 +39,7 @@ When you have 5 minutes (e.g., post-merge sanity, mid-incident):
 2. **Web UI load + 3 clicks** (2 min) — open `/ui/`, click 3 surfaces, verify each <1s.
 3. **Send-receive round-trip** (2 min) — Web → tmux (<1s), tmux → Web (<5s).
 
-Skip task cycle, doctor, sessions health. The crunch version catches outright breakage but not subtle drift.
+Skip task cycle, doctor, `pm sessions --health`. The crunch version catches outright breakage but not subtle drift.
 
 Use the full 15-min version any time before declaring main shippable for the day.
 
@@ -138,7 +138,7 @@ pm doctor
 ### Sessions health (1 min)
 
 ```bash
-pm sessions health
+pm sessions --health
 ```
 
 - ☐ Lists active sessions.

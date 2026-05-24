@@ -373,7 +373,7 @@ After 2 minutes (recovery cascade detection window), the operator should see:
 - TUI: a clear "stuck" indicator on that task, with the reason (no heartbeat from actor).
 - Web UI: same, surfaced in dashboard alerts.
 
-If it's silent or requires drilling into `pm sessions health` to discover, that's a magic-gap. File `magic-gap:stuck-task-surfacing`.
+If it's silent or requires drilling into `pm sessions --health` to discover, that's a magic-gap. File `magic-gap:stuck-task-surfacing`.
 
 ---
 

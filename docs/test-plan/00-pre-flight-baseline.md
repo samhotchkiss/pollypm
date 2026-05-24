@@ -127,10 +127,10 @@ pm doctor
 
 ---
 
-## 0.5 `pm sessions health`
+## 0.5 `pm sessions --health`
 
 ```bash
-pm sessions health
+pm sessions --health
 ```
 
 **Expected:** lists active sessions; no `stuck` or `stale` heartbeats from before this session started.

@@ -37,7 +37,7 @@ The journal is the durable record of a test pass — what was tested, what faile
 - pytest: <X passed / Y failed — list failures or "only known">
 - Playwright: <X passed / Y failed — list failures or "all pass">
 - pm doctor: <clean / N alerts>
-- pm sessions health: <clean / N stale>
+- pm sessions --health: <clean / N stale>
 - Baseline verdict: <green / yellow / red>
 
 If baseline is red, stop here and either fix or document why proceeding anyway.

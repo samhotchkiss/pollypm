@@ -354,7 +354,7 @@ Every 30 minutes record:
 - `/api/v1/dashboard` p95 from 10 samples
 - Browser heap
 - `pm doctor`
-- `pm sessions health`
+- `pm sessions --health`
 
 **Pass:** no monotonic resource growth, no new stale-heartbeat cluster, no connection-pool exhaustion, no progressive UI slowdown.
 

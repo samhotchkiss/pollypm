@@ -4201,6 +4201,74 @@ def check_persona_swap_defense_wired() -> CheckResult:
     return _ok("persona-swap assertion wired in supervisor.py")
 
 
+def _args_have_explicit_model_value(args: list[str]) -> bool:
+    """Return true when provider args include ``--model`` with a value."""
+    for index, arg in enumerate(args):
+        if arg == "--model":
+            if index + 1 >= len(args):
+                continue
+            value = str(args[index + 1]).strip()
+            if value and not value.startswith("-"):
+                return True
+            continue
+        if arg.startswith("--model="):
+            if arg.split("=", 1)[1].strip():
+                return True
+    return False
+
+
+def check_session_model_args_explicit() -> CheckResult:
+    """Warn when configured sessions rely on provider default models."""
+    config = _doctor_config_or_none()
+    if config is None:
+        return _skip("no config file found")
+
+    sessions = getattr(config, "sessions", {}) or {}
+    if not sessions:
+        return _ok("no configured sessions")
+
+    missing: list[dict[str, object]] = []
+    for session_name, session in sorted(sessions.items()):
+        args = [str(arg) for arg in (getattr(session, "args", []) or [])]
+        if _args_have_explicit_model_value(args):
+            continue
+        missing.append(
+            {
+                "session": str(session_name),
+                "role": str(getattr(session, "role", "") or ""),
+                "provider": str(getattr(session, "provider", "") or ""),
+                "account": str(getattr(session, "account", "") or ""),
+                "project": str(getattr(session, "project", "") or ""),
+                "args": args,
+            }
+        )
+
+    if not missing:
+        session_word = "session" if len(sessions) == 1 else "sessions"
+        return _ok(f"{len(sessions)} configured {session_word} have explicit --model args")
+
+    session_word = "session" if len(missing) == 1 else "sessions"
+    names = ", ".join(str(item["session"]) for item in missing[:5])
+    if len(missing) > 5:
+        names = f"{names}, ... (+{len(missing) - 5} more)"
+    return _fail(
+        f"{len(missing)} configured {session_word} missing explicit --model args",
+        severity="warning",
+        why=(
+            "Provider default models can change outside PollyPM. Sessions without "
+            "an explicit --model value may relaunch on a different model than intended. "
+            f"Affected sessions: {names}."
+        ),
+        fix=(
+            "Add an explicit model argument to each affected session's args, for example:\n"
+            '  args = ["--model", "sonnet"]\n'
+            "Use the model name appropriate for that session's provider/account, then recheck:\n"
+            "  pm doctor"
+        ),
+        data={"missing": missing, "count": len(missing)},
+    )
+
+
 # --------------------------------------------------------------------- #
 # Runner
 # --------------------------------------------------------------------- #
@@ -4298,6 +4366,7 @@ def _registered_checks() -> list[Check]:
         Check("inbox-aggregator-path", check_inbox_aggregator_path, "inbox", severity="warning"),
         Check("inbox-open-count", check_inbox_open_count, "inbox", severity="warning"),
         # Sessions
+        Check("session-model-args", check_session_model_args_explicit, "sessions", severity="warning"),
         Check("session-drift", check_sessions_table_vs_tmux, "sessions", severity="warning"),
         Check("persona-swap-defense", check_persona_swap_defense_wired, "sessions"),
     ]

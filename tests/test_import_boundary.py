@@ -64,7 +64,6 @@ _SUPERVISOR_IMPORT_ALLOWLIST: frozenset[str] = frozenset(
         # the rail grows (tracked under the decomposition meta-issue).
         "src/pollypm/job_runner.py",
         "src/pollypm/plugins_builtin/core_recurring/plugin.py",
-        "src/pollypm/schedulers/base.py",
         "src/pollypm/session_intelligence.py",
         "src/pollypm/workers.py",
         # TODO(#2061-followup): pre-existing direct imports in two CLI/API

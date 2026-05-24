@@ -2,10 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Protocol
-
-if TYPE_CHECKING:
-    from pollypm.supervisor import Supervisor
+from typing import Any, Protocol
 
 
 @dataclass(slots=True)
@@ -19,12 +16,26 @@ class ScheduledJob:
     last_error: str | None = None
 
 
+class SchedulerHost(Protocol):
+    """Structural host surface required by scheduler backends.
+
+    ``pollypm.supervisor`` imports the scheduler facade at module load, so
+    the scheduler protocol cannot type-import ``Supervisor`` without
+    reintroducing the #1367 static import back-edge. Scheduler backends only
+    need the config/message-store surface below and an opaque object for job
+    executors, so a structural protocol keeps ownership local.
+    """
+
+    config: Any
+    msg_store: Any
+
+
 class SchedulerBackend(Protocol):
     name: str
 
     def schedule(
         self,
-        supervisor: "Supervisor",
+        supervisor: SchedulerHost,
         *,
         kind: str,
         run_at: datetime,
@@ -32,6 +43,6 @@ class SchedulerBackend(Protocol):
         interval_seconds: int | None = None,
     ) -> ScheduledJob: ...
 
-    def list_jobs(self, supervisor: "Supervisor") -> list[ScheduledJob]: ...
+    def list_jobs(self, supervisor: SchedulerHost) -> list[ScheduledJob]: ...
 
-    def run_due(self, supervisor: "Supervisor", *, now: datetime | None = None) -> list[ScheduledJob]: ...
+    def run_due(self, supervisor: SchedulerHost, *, now: datetime | None = None) -> list[ScheduledJob]: ...

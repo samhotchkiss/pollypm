@@ -82,6 +82,57 @@ def test_list_projects_tracked_filter(api_config, client, auth_headers) -> None:
     assert keys == ["myproj"]
 
 
+def test_list_projects_search_sort_and_activity(
+    api_config, client, auth_headers, project_root
+) -> None:
+    from pollypm.models import KnownProject, ProjectKind
+
+    alpha_root = project_root.parent / "alpha"
+    zeta_root = project_root.parent / "zeta"
+    alpha_root.mkdir()
+    zeta_root.mkdir()
+    (alpha_root / ".pollypm").mkdir()
+    (zeta_root / ".pollypm").mkdir()
+    api_config.projects["alpha"] = KnownProject(
+        key="alpha",
+        path=alpha_root,
+        name="Alpha",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+    api_config.projects["zeta"] = KnownProject(
+        key="zeta",
+        path=zeta_root,
+        name="Zeta",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+
+    with create_work_service(
+        db_path=api_config.project.state_db,
+        project_path=project_root,
+    ) as svc:
+        make_task(svc, project="zeta", title="Inbox A", flow_template="chat")
+        make_task(svc, project="zeta", title="Inbox B", flow_template="chat")
+        make_task(svc, project="alpha", title="Recent work")
+
+    response = client.get("/api/v1/projects?q=alp", headers=auth_headers)
+    assert response.status_code == 200
+    assert [item["key"] for item in response.json()["items"]] == ["alpha"]
+
+    response = client.get("/api/v1/projects?sort=name", headers=auth_headers)
+    assert response.status_code == 200
+    names = [item["name"] for item in response.json()["items"]]
+    assert names == sorted(names)
+
+    response = client.get("/api/v1/projects?sort=inbox_desc", headers=auth_headers)
+    assert response.status_code == 200
+    body = response.json()
+    assert body["items"][0]["key"] == "zeta"
+    alpha = next(item for item in body["items"] if item["key"] == "alpha")
+    assert alpha["last_activity_at"] is not None
+
+
 def test_get_project_drilldown_returns_404_for_unknown(client, auth_headers) -> None:
     response = client.get("/api/v1/projects/nope", headers=auth_headers)
     assert response.status_code == 404

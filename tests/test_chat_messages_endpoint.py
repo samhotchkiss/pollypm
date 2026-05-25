@@ -14,8 +14,11 @@ skipped — these tests are self-contained.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import json
 import subprocess
+import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -385,6 +388,51 @@ def test_sessions_endpoint_surfaces_window_state(
     assert op["window"]["window_name"] == "operator"
     assert op["window"]["pane_id"] == "%99"
     assert op["transcript"]["source"] is None  # no archive in this fixture
+
+
+def test_sessions_endpoint_coalesces_concurrent_discovery(
+    config, monkeypatch,
+) -> None:
+    chat_messages_routes._CHAT_SESSIONS_CACHE.clear()
+    calls = {"n": 0}
+    surface = _surface("operator", SurfaceType.OPERATOR, persona="Polly")
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_tmux_client",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "_build_work_service_stub",
+        lambda _config: None,
+    )
+
+    def fake_enumerate(_config, *, work_service=None, tmux_client=None):
+        calls["n"] += 1
+        time.sleep(0.05)
+        return [surface]
+
+    monkeypatch.setattr(
+        chat_messages_routes,
+        "enumerate_chat_surfaces",
+        fake_enumerate,
+    )
+
+    start = threading.Event()
+
+    def call_endpoint() -> list[str]:
+        start.wait(timeout=1)
+        response = chat_messages_routes.list_chat_sessions_endpoint(config)
+        return [row.session_name for row in response.sessions]
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(call_endpoint) for _ in range(8)]
+        start.set()
+        results = [future.result(timeout=2) for future in futures]
+
+    assert results == [["operator"]] * 8
+    assert calls == {"n": 1}
 
 
 def test_sessions_endpoint_cookie_auth_uses_bounded_tmux_probe(

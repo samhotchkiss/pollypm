@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import threading
+import time
 from types import SimpleNamespace
 
 
@@ -30,6 +33,48 @@ def test_inbox_tasks_grouped_shares_scan_with_copy_safe_cache(
 
     assert calls["n"] == 1
     assert second == {"demo": [task]}
+
+
+def test_grouped_task_caches_coalesce_concurrent_cold_misses(
+    monkeypatch,
+) -> None:
+    import pollypm.cockpit_pg_aggregates as agg
+
+    agg._ALL_TASKS_GROUPED_CACHE.clear()
+    agg._INBOX_TASKS_GROUPED_CACHE.clear()
+    calls = {"all": 0, "inbox": 0}
+    task = SimpleNamespace(task_id="demo/1", project="demo")
+
+    def fake_all(_config):
+        calls["all"] += 1
+        time.sleep(0.05)
+        return {"demo": [task]}
+
+    def fake_inbox(_config):
+        calls["inbox"] += 1
+        time.sleep(0.05)
+        return {"demo": [task]}
+
+    monkeypatch.setattr(agg, "_all_tasks_grouped_uncached", fake_all)
+    monkeypatch.setattr(agg, "_inbox_tasks_grouped_uncached", fake_inbox)
+
+    config = object()
+    start = threading.Event()
+
+    def call_both() -> tuple[dict, dict]:
+        start.wait(timeout=1)
+        return (
+            agg.all_tasks_grouped(config) or {},
+            agg.inbox_tasks_grouped(config) or {},
+        )
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(call_both) for _ in range(8)]
+        start.set()
+        results = [future.result(timeout=2) for future in futures]
+
+    assert all(result == ({"demo": [task]}, {"demo": [task]}) for result in results)
+    assert calls == {"all": 1, "inbox": 1}
 
 
 def test_awaits_user_list_annotates_only_actionable_rows(

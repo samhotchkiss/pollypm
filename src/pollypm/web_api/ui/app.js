@@ -63,6 +63,7 @@
     sseStableOpenTimer: null,
     surfacesInFlight: false,
     surfacesRefreshQueued: false,
+    surfacesQueuedPreserveErrors: false,
     dashboardInFlight: false,
     dashboardRefreshQueued: false,
     historyInFlight: {},
@@ -424,12 +425,18 @@
 
   async function loadSurfaces(opts) {
     const force = opts && opts.force;
+    const preserveErrors = opts && opts.preserveErrors;
     if (state.surfacesInFlight) {
       if (force) {
         abortFetchState("surfaces");
         state.surfacesInFlight = false;
+        state.surfacesRefreshQueued = false;
+        state.surfacesQueuedPreserveErrors = false;
       } else {
         state.surfacesRefreshQueued = true;
+        state.surfacesQueuedPreserveErrors = (
+          state.surfacesQueuedPreserveErrors || !!preserveErrors
+        );
         return;
       }
     }
@@ -437,9 +444,11 @@
     state.surfaceLoading = true;
     state.taskLoading = true;
     state.projectLoading = true;
-    state.surfaceLoadError = null;
-    state.taskLoadError = null;
-    state.projectLoadError = null;
+    if (!preserveErrors) {
+      state.surfaceLoadError = null;
+      state.taskLoadError = null;
+      state.projectLoadError = null;
+    }
     const request = beginFetchState(
       "surfaces",
       "surfaces",
@@ -525,8 +534,10 @@
       if (!finishFetchState("surfaces", request.seq)) return;
       state.surfacesInFlight = false;
       if (state.surfacesRefreshQueued) {
+        const queuedPreserveErrors = state.surfacesQueuedPreserveErrors;
         state.surfacesRefreshQueued = false;
-        loadSurfaces();
+        state.surfacesQueuedPreserveErrors = false;
+        loadSurfaces({ preserveErrors: queuedPreserveErrors });
       }
     }
   }
@@ -2618,7 +2629,7 @@
 
   function refreshFromPush() {
     pollDashboard();
-    loadSurfaces();
+    loadSurfaces({ preserveErrors: true });
     loadActivity();
     if (state.selectedSurface) {
       loadHistory(state.selectedSurface);
@@ -2868,7 +2879,7 @@
     setStatus("warn", "connecting…");
     loadSurfaces();
     startEventStream();
-    setInterval(loadSurfaces, 30000);
+    setInterval(() => loadSurfaces({ preserveErrors: true }), 30000);
   }
 
   // Expose for tests / debugging. ``renderDashboard`` is exported so

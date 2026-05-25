@@ -407,10 +407,11 @@ def skip_if_paused(
     is paused.
 
     ``store`` — when supplied, the helper emits a ``session.pause.skip``
-    event via ``store.record_event(scope, sender, subject)`` so the
-    cockpit / audit log records that the loop honoured the marker
-    rather than silently dropping the call. Best-effort: any store
-    error is swallowed so a flaky event-write can't unblock the guard.
+    event via ``store.record_event(scope, sender, subject)`` and the
+    canonical audit log so cockpit readers and ``pm audit`` can both
+    see that the loop honoured the marker rather than silently
+    dropping the call. Best-effort: any event-write error is swallowed
+    so a flaky audit path can't unblock the guard.
 
     ``loop`` / ``reason`` — free-form context used to build the audit
     subject. ``loop`` is the calling site (e.g. ``"supervisor.maybe_recover_session"``,
@@ -432,7 +433,7 @@ def skip_if_paused(
     if not is_paused(config, session_name):
         return False
     if store is not None and _should_emit_skip(session_name, loop):
-        _emit_pause_skip(store, session_name, loop=loop, reason=reason)
+        _emit_pause_skip(config, store, session_name, loop=loop, reason=reason)
     return True
 
 
@@ -473,7 +474,12 @@ def _reset_skip_throttle_for_tests() -> None:
 
 
 def _emit_pause_skip(
-    store: Any, session_name: str, *, loop: str = "", reason: str = "",
+    config: Any,
+    store: Any,
+    session_name: str,
+    *,
+    loop: str = "",
+    reason: str = "",
 ) -> None:
     """Best-effort emit of the ``session.pause.skip`` audit event.
 
@@ -490,9 +496,6 @@ def _emit_pause_skip(
     failure is swallowed: the guard side is the contract, the audit
     event is observability only.
     """
-    record = getattr(store, "record_event", None)
-    if not callable(record):
-        return
     subject_loop = loop or "unknown_loop"
     subject = (
         f"skipped {session_name} — {subject_loop} honored pause marker"
@@ -503,6 +506,15 @@ def _emit_pause_skip(
         "loop": subject_loop,
         "reason": reason,
     }
+    record = getattr(store, "record_event", None)
+    if not callable(record):
+        _emit_pause_skip_audit(
+            config,
+            session_name,
+            subject=subject,
+            payload=payload,
+        )
+        return
     try:
         record(
             scope=session_name,
@@ -510,7 +522,6 @@ def _emit_pause_skip(
             subject=subject,
             payload=payload,
         )
-        return
     except TypeError:
         # Older / legacy ``record_event(session_name, event_type, message)``
         # positional shape — fall through.
@@ -520,6 +531,13 @@ def _emit_pause_skip(
             "session.pause.skip emit (kw) failed for %s", session_name,
             exc_info=True,
         )
+    else:
+        _emit_pause_skip_audit(
+            config,
+            session_name,
+            subject=subject,
+            payload=payload,
+        )
         return
     try:
         record(session_name, PAUSE_SKIP_EVENT_TYPE, subject)
@@ -527,6 +545,49 @@ def _emit_pause_skip(
         logger.debug(
             "session.pause.skip emit (positional) failed for %s",
             session_name, exc_info=True,
+        )
+    _emit_pause_skip_audit(
+        config,
+        session_name,
+        subject=subject,
+        payload=payload,
+    )
+
+
+def _emit_pause_skip_audit(
+    config: Any,
+    session_name: str,
+    *,
+    subject: str,
+    payload: dict[str, Any],
+) -> None:
+    """Mirror pause-skip events into the canonical audit JSONL."""
+    try:
+        from pollypm.audit import emit as _audit_emit
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "session.pause.skip canonical audit import failed for %s",
+            session_name,
+            exc_info=True,
+        )
+        return
+
+    project_key, project_path = _project_audit_context(config)
+    try:
+        _audit_emit(
+            event=PAUSE_SKIP_EVENT_TYPE,
+            project=project_key,
+            subject=subject,
+            actor="system",
+            status="ok",
+            metadata=payload,
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "session.pause.skip canonical audit emit failed for %s",
+            session_name,
+            exc_info=True,
         )
 
 

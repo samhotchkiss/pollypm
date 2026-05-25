@@ -104,6 +104,18 @@ def _write_marker(config: _FakeConfig, names: list[str]) -> Path:
     return path
 
 
+def _read_pause_skip_audit_events(config: _FakeConfig) -> list[Any]:
+    from pollypm.audit.log import read_events
+    from pollypm.session_paused import PAUSE_SKIP_EVENT_TYPE
+
+    return read_events(
+        config.project.name,
+        project_path=config.project.root_dir,
+        event=PAUSE_SKIP_EVENT_TYPE,
+        limit=20,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Unit — session_paused reader
 # ---------------------------------------------------------------------------
@@ -686,6 +698,15 @@ def test_skip_if_paused_emits_audit_event_on_skip(
     assert "unit_test" in event["subject"]
     assert event["payload"]["loop"] == "unit_test"
     assert event["payload"]["reason"] == "failure_type=missing_window"
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
+    assert len(audit_events) == 1
+    audit_event = audit_events[0]
+    assert audit_event.event == PAUSE_SKIP_EVENT_TYPE
+    assert audit_event.project == "demo"
+    assert audit_event.subject == event["subject"]
+    assert audit_event.actor == "system"
+    assert audit_event.status == "ok"
+    assert audit_event.metadata == event["payload"]
 
 
 def test_skip_if_paused_no_store_still_returns_true(
@@ -736,10 +757,12 @@ def test_skip_if_paused_throttles_repeat_audit_emission(
     skip_events = [
         e for e in captured if e.get("sender") == PAUSE_SKIP_EVENT_TYPE
     ]
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
     assert len(skip_events) == 1, (
         f"expected 1 throttled skip event, got {len(skip_events)}: "
         f"{skip_events}"
     )
+    assert len(audit_events) == 1
 
 
 def test_skip_if_paused_throttle_is_per_loop(
@@ -792,6 +815,9 @@ def test_skip_if_paused_throttle_is_per_loop(
         "no_session_spawn.auto_recover",
         "supervisor.maybe_recover_session",
     }
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
+    assert len(audit_events) == 2
+    assert {event.metadata["loop"] for event in audit_events} == loops
 
 
 def test_skip_if_paused_swallows_store_errors(
@@ -820,6 +846,9 @@ def test_skip_if_paused_swallows_store_errors(
         config_with_base_dir, "operator", store=_FlakyStore(),
         loop="flaky_store",
     ) is True
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
+    assert len(audit_events) == 1
+    assert audit_events[0].metadata["loop"] == "flaky_store"
 
 
 # ---------------------------------------------------------------------------
@@ -963,6 +992,9 @@ def test_auto_recover_no_session_skips_paused_session(
     assert any(
         ev.get("sender") == "session.pause.skip" for ev in store.kw_events
     ), store.kw_events
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
+    assert len(audit_events) == 1
+    assert audit_events[0].metadata["loop"] == "no_session_spawn.auto_recover"
 
 
 def test_auto_recover_no_session_spawns_when_not_paused(
@@ -1110,6 +1142,12 @@ def test_supervisor_maybe_recover_session_skips_paused_session(
     assert "supervisor.maybe_recover_session" in event["subject"]
     assert event["payload"]["loop"] == "supervisor.maybe_recover_session"
     assert "missing_window" in event["payload"]["reason"]
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
+    assert len(audit_events) == 1
+    assert (
+        audit_events[0].metadata["loop"]
+        == "supervisor.maybe_recover_session"
+    )
 
 
 def test_supervisor_maybe_recover_session_proceeds_when_not_paused(

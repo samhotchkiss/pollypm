@@ -17,6 +17,7 @@ import contextlib
 import logging
 import os
 import re
+import time
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -120,6 +121,8 @@ _BACKING_STORE_ERRORS: tuple[type[BaseException], ...] = (
     psycopg.OperationalError,
     psycopg_pool.PoolTimeout,
 )
+
+_CLAIM_TRANSIENT_RETRY_DELAYS = (0.02, 0.05, 0.1)
 
 
 @contextlib.contextmanager
@@ -1852,70 +1855,128 @@ def claim_task(
         raise not_found(f"Project not registered: {project_key}")
 
     task_id = f"{project_key}/{task_number}"
+    service_kwargs = {
+        "config": config,
+        "project_key": project_key,
+        "project_path": project.path,
+    }
+    last_store_error: BaseException | None = None
+    for attempt in range(len(_CLAIM_TRANSIENT_RETRY_DELAYS) + 1):
+        try:
+            if provision_scheduler is None:
+                work_service_cm = create_work_service_with_session(
+                    **service_kwargs
+                )
+            else:
+                work_service_cm = create_work_service_with_deferred_session(
+                    **service_kwargs,
+                    schedule=provision_scheduler,
+                )
+            with work_service_cm as svc:
+                try:
+                    svc.claim(task_id, actor)
+                except TaskNotFoundError as exc:
+                    raise not_found(f"Task not found: {task_id}") from exc
+                except InvalidTransitionError as exc:
+                    raise APIError(
+                        status_code=409,
+                        code="invalid_state",
+                        message=(
+                            str(exc) or f"Task {task_id} cannot be claimed."
+                        ),
+                        hint="Only queued+unblocked tasks can be claimed.",
+                    ) from exc
+                except WorkerCapExceededError as exc:
+                    # Normal back-pressure — the project is at its
+                    # ``max_parallel_workers`` ceiling, not a server bug.
+                    raise too_many_requests(
+                        f"Worker cap exceeded for project "
+                        f"{project_key}: {exc}",
+                        code="worker_cap_exceeded",
+                        hint=(
+                            "Wait for an in-progress task on this "
+                            "project to finish, raise "
+                            "`max_parallel_workers` under "
+                            f"`[projects.{project_key}]` in pollypm.toml, "
+                            "or retry the claim once a slot frees up."
+                        ),
+                    ) from exc
+                task = svc.get(task_id)
+                warnings = _collect_claim_warnings(svc, task, task_id)
+                return _task_to_detail_with_plan(task, svc=svc), warnings
+        except _BACKING_STORE_ERRORS as exc:
+            last_store_error = exc
+            conflict = _claim_conflict_after_transient_store_error(
+                config=config,
+                project_key=project_key,
+                project_path=project.path,
+                task_id=task_id,
+            )
+            if conflict is not None:
+                raise conflict from exc
+            if attempt < len(_CLAIM_TRANSIENT_RETRY_DELAYS):
+                time.sleep(_CLAIM_TRANSIENT_RETRY_DELAYS[attempt])
+                continue
+            logger.warning(
+                "claim_task: backing store error for %s: %s",
+                task_id,
+                exc,
+                exc_info=True,
+            )
+            break
+    assert last_store_error is not None
+    raise service_unavailable(
+        f"Backing store unavailable while claiming {task_id}",
+        hint="Retry shortly; check `pm doctor` if the failure persists.",
+    ) from last_store_error
+
+
+def _claim_conflict_after_transient_store_error(
+    *,
+    config: PollyPMConfig,
+    project_key: str,
+    project_path: Path,
+    task_id: str,
+) -> APIError | None:
+    """Map claim-time store contention to conflict after a fresh read.
+
+    In a claim storm, a losing request can occasionally see a pg pool or
+    lock operational error instead of the normal
+    ``InvalidTransitionError``. If a cheap follow-up read shows the row is
+    no longer queued, the correct API shape is the same 409 a normal loser
+    receives. Real outages still fall through to 503.
+    """
+    from pollypm.work.factory import create_work_service
+
     try:
-        service_kwargs = {
-            "config": config,
-            "project_key": project_key,
-            "project_path": project.path,
-        }
-        if provision_scheduler is None:
-            work_service_cm = create_work_service_with_session(
-                **service_kwargs
-            )
-        else:
-            work_service_cm = create_work_service_with_deferred_session(
-                **service_kwargs,
-                schedule=provision_scheduler,
-            )
-        with work_service_cm as svc:
-            try:
-                svc.claim(task_id, actor)
-            except TaskNotFoundError as exc:
-                raise not_found(f"Task not found: {task_id}") from exc
-            except InvalidTransitionError as exc:
-                raise APIError(
-                    status_code=409,
-                    code="invalid_state",
-                    message=str(exc) or f"Task {task_id} cannot be claimed.",
-                    hint="Only queued+unblocked tasks can be claimed.",
-                ) from exc
-            except WorkerCapExceededError as exc:
-                # #2064 round-11 blocker #1: pre-claim cap probe at
-                # ``PgWorkService.claim`` (``pg_service.py:1759-1763``)
-                # raises ``WorkerCapExceededError`` from
-                # ``SessionManager.check_parallel_cap`` (``session_manager.py:418/473``).
-                # That is normal back-pressure — the project is at its
-                # ``max_parallel_workers`` ceiling — not a server bug.
-                # Surface it as ``429`` with a stable
-                # ``worker_cap_exceeded`` code so clients can apply
-                # back-off and operators see the same recovery story
-                # the CLI emits.
-                raise too_many_requests(
-                    f"Worker cap exceeded for project "
-                    f"{project_key}: {exc}",
-                    code="worker_cap_exceeded",
-                    hint=(
-                        "Wait for an in-progress task on this "
-                        "project to finish, raise "
-                        "`max_parallel_workers` under "
-                        f"`[projects.{project_key}]` in pollypm.toml, "
-                        "or retry the claim once a slot frees up."
-                    ),
-                ) from exc
+        with create_work_service(
+            config=config,
+            project_key=project_key,
+            project_path=project_path,
+        ) as svc:
             task = svc.get(task_id)
-            warnings = _collect_claim_warnings(svc, task, task_id)
-            return _task_to_detail_with_plan(task, svc=svc), warnings
-    except _BACKING_STORE_ERRORS as exc:
-        logger.warning(
-            "claim_task: backing store error for %s: %s",
-            task_id,
-            exc,
-            exc_info=True,
-        )
-        raise service_unavailable(
-            f"Backing store unavailable while claiming {task_id}",
-            hint="Retry shortly; check `pm doctor` if the failure persists.",
-        ) from exc
+    except _BACKING_STORE_ERRORS:
+        return None
+    except Exception:  # noqa: BLE001
+        return None
+    status_attr = getattr(task, "work_status", None)
+    status = getattr(status_attr, "value", status_attr)
+    if status == "queued":
+        return None
+    claimant = (
+        getattr(task, "claimed_by_session", None)
+        or getattr(task, "assignee", None)
+        or "another actor"
+    )
+    return APIError(
+        status_code=409,
+        code="invalid_state",
+        message=(
+            f"Task {task_id} cannot be claimed because it is now "
+            f"'{status}' and owned by '{claimant}'."
+        ),
+        hint="Only queued+unblocked tasks can be claimed.",
+    )
 
 
 def _collect_claim_warnings(

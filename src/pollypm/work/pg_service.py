@@ -95,6 +95,12 @@ _CLAIM_CONTESTED_STATUSES = frozenset({
     WorkStatus.REVIEW,
 })
 
+_CAPACITY_CONSUMING_STATUS_VALUES = (
+    WorkStatus.IN_PROGRESS.value,
+    WorkStatus.REWORK.value,
+)
+
+
 # Per-process dedup for the ``work_db.opened`` audit row (#1808). The
 # event is a doctor / heartbeat diagnostic stamped at first open of a
 # given (subject, project_path) pair — subsequent opens within the
@@ -141,6 +147,24 @@ def _is_cap_exceeded_error(exc: BaseException) -> bool:
         if cls.__name__ == "WorkerCapExceededError":
             return True
     return False
+
+
+def _default_parallel_worker_cap() -> int:
+    try:
+        from pollypm.work.session_manager import DEFAULT_MAX_PARALLEL_WORKERS
+
+        return int(DEFAULT_MAX_PARALLEL_WORKERS)
+    except Exception:  # noqa: BLE001
+        return 5
+
+
+def _worker_cap_exceeded_error(message: str) -> RuntimeError:
+    try:
+        from pollypm.work.session_manager import WorkerCapExceededError
+
+        return WorkerCapExceededError(message)
+    except Exception:  # noqa: BLE001
+        return RuntimeError(message)
 
 
 def _coerce_status(raw: str) -> WorkStatus:
@@ -418,6 +442,117 @@ class PgWorkService:
         registered back. Mirrors :meth:`SQLiteWorkService.set_session_manager`.
         """
         self._session_mgr = session_manager
+
+    def _resolve_parallel_cap(self, project: str) -> int:
+        """Return the configured per-project worker cap.
+
+        Kept local to the pg service so the claim transaction can make
+        the cap decision without calling back into ``SessionManager`` and
+        borrowing more pool connections while holding a task row lock.
+        """
+        config = self._config
+        if config is None:
+            return _default_parallel_worker_cap()
+        projects = getattr(config, "projects", {}) or {}
+        proj = projects.get(project)
+        if proj is None:
+            return _default_parallel_worker_cap()
+        override = getattr(proj, "max_parallel_workers", None)
+        if isinstance(override, int) and override > 0:
+            return override
+        legacy = getattr(proj, "max_concurrent_workers", None)
+        if isinstance(legacy, int) and legacy > 0:
+            return legacy
+        return _default_parallel_worker_cap()
+
+    def _lock_worker_capacity_project(self, cur, project: str) -> None:
+        cur.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"work_tasks.worker_cap:{project}",),
+        )
+
+    def _count_capacity_consuming_tasks_locked(
+        self,
+        cur,
+        *,
+        project: str,
+        exclude_task_number: int | None = None,
+    ) -> int:
+        params: list[object] = [
+            project,
+            *_CAPACITY_CONSUMING_STATUS_VALUES,
+        ]
+        sql = (
+            "SELECT COUNT(*) FROM work_tasks "
+            "WHERE project = %s "
+            "AND work_status IN (%s, %s) "
+            "AND claimed_by_session IS NOT NULL"
+        )
+        if exclude_task_number is not None:
+            sql += " AND task_number <> %s"
+            params.append(exclude_task_number)
+        cur.execute(sql, params)
+        row = cur.fetchone()
+        return int(row[0] if row is not None else 0)
+
+    def count_capacity_consuming_tasks(
+        self,
+        *,
+        project: str,
+        exclude_task_id: str | None = None,
+    ) -> int:
+        """Return active worker-capacity consumers for ``project``.
+
+        Capacity is owned by task lifecycle state, not by stale
+        ``work_sessions`` rows. ``work_sessions`` remains the runtime
+        binding/audit table; ``in_progress`` and ``rework`` are the
+        authoritative states that consume worker capacity.
+        """
+        exclude_task_number: int | None = None
+        if exclude_task_id:
+            try:
+                exclude_project, parsed_number = _parse_task_id(exclude_task_id)
+            except ValidationError:
+                exclude_project = ""
+                parsed_number = None
+            if exclude_project == project:
+                exclude_task_number = parsed_number
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            return self._count_capacity_consuming_tasks_locked(
+                cur,
+                project=project,
+                exclude_task_number=exclude_task_number,
+            )
+
+    def _check_parallel_cap_locked(
+        self,
+        cur,
+        *,
+        project: str,
+        task_number: int,
+        task_id: str,
+    ) -> None:
+        """Enforce project worker capacity inside the claim transaction."""
+        cap = self._resolve_parallel_cap(project)
+        self._lock_worker_capacity_project(cur, project)
+        active = self._count_capacity_consuming_tasks_locked(
+            cur,
+            project=project,
+            exclude_task_number=task_number,
+        )
+        if active < cap:
+            return
+        raise _worker_cap_exceeded_error(
+            f"Cannot spawn worker for {task_id}: project {project!r} "
+            f"already has {active} active worker tasks (cap={cap}). "
+            "Why it matters: per-task workers run in parallel up to a "
+            "per-project ceiling so a queue burst doesn't burn every "
+            "provider session at once. "
+            "Fix: wait for one of the running workers to finish, or "
+            "raise the cap by setting "
+            f"`max_parallel_workers = <N>` under `[projects.{project}]` "
+            "in pollypm.toml."
+        )
 
     # ------------------------------------------------------------------
     # Read path
@@ -1744,6 +1879,41 @@ class PgWorkService:
                 exc_info=True,
             )
 
+    def _finish_worker_session_after_capacity_release(
+        self,
+        task_id: str,
+        *,
+        project: str,
+        task_number: int,
+        from_state: WorkStatus,
+        to_state: WorkStatus,
+        ended_at: datetime,
+    ) -> None:
+        """End the worker runtime when a capacity-consuming task exits.
+
+        The cap check no longer trusts ``work_sessions.ended_at``, but
+        terminal/release transitions should still close the runtime
+        binding for auditability and future same-task reclaims.
+        """
+        if to_state in TERMINAL_STATUSES:
+            self._finish_worker_session_after_release(
+                task_id,
+                project=project,
+                task_number=task_number,
+                ended_at=ended_at,
+            )
+            return
+        if from_state.value not in _CAPACITY_CONSUMING_STATUS_VALUES:
+            return
+        if to_state.value in _CAPACITY_CONSUMING_STATUS_VALUES:
+            return
+        self._finish_worker_session_after_release(
+            task_id,
+            project=project,
+            task_number=task_number,
+            ended_at=ended_at,
+        )
+
     def mark_done(self, task_id: str, actor: str) -> Task:
         """Force a task to ``done`` without running the flow.
 
@@ -1908,6 +2078,14 @@ class PgWorkService:
         )
         task = self.get(task_id)
         self._sync_transition(task, current.value, to_state.value)
+        self._finish_worker_session_after_capacity_release(
+            task_id,
+            project=project,
+            task_number=task_number,
+            from_state=current,
+            to_state=to_state,
+            ended_at=now,
+        )
         return task
 
     def _emit_status_changed_audit(
@@ -2716,22 +2894,25 @@ class PgWorkService:
                     if node.type == NodeType.REVIEW
                     else WorkStatus.IN_PROGRESS
                 )
-                # #1737 — pre-claim cap check. Runs INSIDE the
-                # transaction but BEFORE the UPDATE so cap-exceeded
-                # callers don't commit a transition they'll then have
-                # to roll back. The cap check queries worker session
-                # rows (not work_tasks), so it doesn't deadlock against
-                # our row lock. Mirrors the sqlite transition manager.
+                # #2303/#2305 — pre-claim cap check. Runs INSIDE the
+                # transaction and uses this cursor, so a claim storm
+                # cannot starve the pg pool by holding a task row lock
+                # while borrowing extra connections through
+                # SessionManager. Capacity is counted from active task
+                # state (in_progress/rework), not stale work_sessions
+                # rows whose ended_at may be missing after crashes or
+                # older lifecycle paths.
                 if (
                     resolved_target_status is WorkStatus.IN_PROGRESS
                     and not skip_gates
                     and self._session_mgr is not None
                 ):
-                    check_cap = getattr(
-                        self._session_mgr, "check_parallel_cap", None,
+                    self._check_parallel_cap_locked(
+                        cur,
+                        project=project,
+                        task_number=task_number,
+                        task_id=task_id,
                     )
-                    if callable(check_cap):
-                        check_cap(project, task_id)
 
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, assignee = %s, "
@@ -3023,6 +3204,27 @@ class PgWorkService:
                 "post-commit provision failure (%s)",
                 project, task_number, exc,
             )
+            self._finish_worker_session_after_release(
+                f"{project}/{task_number}",
+                project=project,
+                task_number=task_number,
+                ended_at=now,
+            )
+            try:
+                self.add_context(
+                    f"{project}/{task_number}",
+                    actor or "system",
+                    "Claim rolled back to queued after worker "
+                    f"provisioning failed: {exc}",
+                    entry_type="claim_rollback",
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "claim rollback context failed for %s/%d",
+                    project,
+                    task_number,
+                    exc_info=True,
+                )
             return True
         except Exception as rollback_exc:  # noqa: BLE001
             logger.warning(
@@ -3228,6 +3430,14 @@ class PgWorkService:
         self._sync_transition(
             result, from_status.value, result.work_status.value
         )
+        self._finish_worker_session_after_capacity_release(
+            task_id,
+            project=task.project,
+            task_number=task.task_number,
+            from_state=from_status,
+            to_state=result.work_status,
+            ended_at=now,
+        )
         self._write_review_summary_after_transition(result)
         if (
             result.flow_template_id == "plan_project"
@@ -3404,6 +3614,12 @@ class PgWorkService:
         # Cascade: any dependents blocked on this task should unblock
         # when approve drives us to DONE. Mirrors sqlite path.
         if result.work_status == WorkStatus.DONE:
+            self._finish_worker_session_after_release(
+                task_id,
+                project=task.project,
+                task_number=task.task_number,
+                ended_at=now,
+            )
             try:
                 self._check_auto_unblock(task_id)
             except Exception:  # noqa: BLE001
@@ -3618,6 +3834,14 @@ class PgWorkService:
         result = self.get(task_id)
         self._sync_transition(
             result, old_status.value, WorkStatus.BLOCKED.value
+        )
+        self._finish_worker_session_after_capacity_release(
+            task_id,
+            project=task.project,
+            task_number=task.task_number,
+            from_state=old_status,
+            to_state=WorkStatus.BLOCKED,
+            ended_at=now,
         )
         return result
 
@@ -4164,6 +4388,14 @@ class PgWorkService:
         )
         result = self.get(task_id)
         self._sync_transition(result, from_status.value, WorkStatus.DONE.value)
+        self._finish_worker_session_after_capacity_release(
+            task_id,
+            project=project,
+            task_number=task_number,
+            from_state=from_status,
+            to_state=WorkStatus.DONE,
+            ended_at=now,
+        )
         # Cascade: any dependents blocked on this task should unblock,
         # same as mark_done. archive_task is effectively 'done' for the
         # chat-flow, so we respect the same contract.
@@ -4973,12 +5205,11 @@ class PgWorkService:
         """Atomically reserve a per-project worker-cap slot (#1883).
 
         Holds a transaction-scoped ``pg_advisory_xact_lock`` keyed on
-        ``"worker_cap:{task_project}"`` while counting active rows and
-        inserting the placeholder. Two concurrent ``provision_worker``
-        calls for different ``task_number``\\s on the same project
-        therefore serialise on the lock; once the first commits its
-        placeholder, the second's COUNT sees the new row and (if at
-        cap) returns ``False`` without inserting.
+        the project while counting active task-state capacity consumers
+        and inserting the placeholder. ``work_sessions`` rows are runtime
+        bindings; they are not the authoritative cap source because old
+        rows can survive with ``ended_at IS NULL`` after interrupted
+        lifecycle paths.
 
         Idempotent for the same ``(task_project, task_number)``: an
         existing row (active or not) short-circuits to ``True`` without
@@ -4989,11 +5220,7 @@ class PgWorkService:
         with self._pool.connection() as conn:
             conn.autocommit = False
             with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT pg_advisory_xact_lock("
-                    "hashtextextended(%s, 0))",
-                    (f"work_sessions.worker_cap:{task_project}",),
-                )
+                self._lock_worker_capacity_project(cur, task_project)
                 # Idempotent path: an existing row for this task
                 # consumes its own slot already.
                 cur.execute(
@@ -5005,12 +5232,11 @@ class PgWorkService:
                 if existing is not None and existing[0] is None:
                     conn.commit()
                     return True
-                cur.execute(
-                    "SELECT COUNT(*) FROM work_sessions "
-                    "WHERE task_project = %s AND ended_at IS NULL",
-                    (task_project,),
+                active = self._count_capacity_consuming_tasks_locked(
+                    cur,
+                    project=task_project,
+                    exclude_task_number=task_number,
                 )
-                active = int(cur.fetchone()[0])
                 if active >= int(cap):
                     conn.rollback()
                     return False

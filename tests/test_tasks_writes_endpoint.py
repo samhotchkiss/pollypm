@@ -674,10 +674,10 @@ def test_claim_endpoint_uses_lifespan_executor_for_deferred_provision(
     assert response.status_code == 200, response.text
 
 
-def test_deferred_provision_cap_race_rolls_claim_back(
+def test_deferred_provision_failure_keeps_claim_and_records_context(
     api_config, task_store, monkeypatch
 ) -> None:
-    """Deferred worker-cap races keep the existing queued rollback."""
+    """Deferred provisioning failures are auditable without undoing 200."""
     task = _seed(task_store, n=103, work_status=WorkStatus.IN_PROGRESS)
     task.claimed_by_session = "alice"
     task.current_node_id = "node-start"
@@ -689,8 +689,8 @@ def test_deferred_provision_cap_race_rolls_claim_back(
         def provision_worker(self, task_id: str, agent_name: str) -> None:
             raise WorkerCapExceededError("cap exceeded")
 
-    class _RollbackWorkService(FakeWorkService):
-        def __enter__(self) -> "_RollbackWorkService":
+    class _ProvisionFailureWorkService(FakeWorkService):
+        def __enter__(self) -> "_ProvisionFailureWorkService":
             return self
 
         def __exit__(self, *exc: object) -> None:
@@ -699,29 +699,25 @@ def test_deferred_provision_cap_race_rolls_claim_back(
         def set_session_manager(self, mgr: object) -> None:
             self._session_mgr = mgr
 
-        def _rollback_claim_to_queued(
+        def add_context(
             self,
-            project: str,
-            task_number: int,
-            node_id: str,
+            task_id: str,  # noqa: ARG002
             actor: str,
-            exc: BaseException,
-        ) -> bool:
-            self.rollback_call = (
-                project,
-                task_number,
-                node_id,
-                actor,
-                str(exc),
+            text: str,
+            *,
+            entry_type: str = "note",
+        ) -> FakeContextEntry:
+            entry = FakeContextEntry(
+                actor=actor,
+                text=text,
+                entry_type=entry_type,
             )
-            task = self.get(f"{project}/{task_number}")
-            task.work_status = WorkStatus.QUEUED
-            task.claimed_by_session = None
-            return True
+            task.context.append(entry)
+            return entry
 
-    svc = _RollbackWorkService(task_store)
+    svc = _ProvisionFailureWorkService(task_store)
 
-    def _factory(**_kwargs: object) -> _RollbackWorkService:
+    def _factory(**_kwargs: object) -> _ProvisionFailureWorkService:
         return svc
 
     def _attach(svc: object, **_kwargs: object) -> _CapExceededSessionManager:
@@ -747,15 +743,14 @@ def test_deferred_provision_cap_race_rolls_claim_back(
         agent_name="alice",
     )
 
-    assert svc.rollback_call == (
-        "myproj",
-        103,
-        "node-start",
-        "alice",
-        "cap exceeded",
-    )
-    assert task.work_status == WorkStatus.QUEUED
-    assert task.claimed_by_session is None
+    assert task.work_status == WorkStatus.IN_PROGRESS
+    assert task.claimed_by_session == "alice"
+    assert len(task.context) == 1
+    entry = task.context[0]
+    assert entry.entry_type == "worker_provision_failed"
+    assert entry.actor == "system"
+    assert "claim preserved for alice" in entry.text
+    assert "cap exceeded" in entry.text
 
 
 def test_claim_surfaces_last_provision_error_warning(

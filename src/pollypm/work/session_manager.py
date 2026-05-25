@@ -357,15 +357,36 @@ class SessionManager:
             return legacy
         return DEFAULT_MAX_PARALLEL_WORKERS
 
-    def _count_active_workers(self, project: str) -> int:
+    def _count_active_workers(
+        self, project: str, *, exclude_task_id: str | None = None,
+    ) -> int:
         """Return the number of currently active worker sessions for a project.
 
-        Counts ``work_sessions`` rows with ``ended_at IS NULL``. The
-        teardown path stamps ``ended_at`` on accept / cancel so this
-        count tracks live per-task tmux windows in steady state. Best
-        effort: a DB error returns 0 so a transient failure doesn't
-        spuriously raise the cap and lock out new claims.
+        Prefer the work service's authoritative task-state count when
+        available. ``work_sessions`` rows are runtime bindings and can
+        survive with ``ended_at IS NULL`` after interrupted older paths;
+        active task states (``in_progress``/``rework``) are the capacity
+        source of truth. Best effort: a DB error returns 0 so a transient
+        failure doesn't spuriously raise the cap and lock out new claims.
         """
+        count_capacity = getattr(
+            self._svc, "count_capacity_consuming_tasks", None,
+        )
+        if callable(count_capacity):
+            try:
+                return int(
+                    count_capacity(
+                        project=project,
+                        exclude_task_id=exclude_task_id,
+                    )
+                    or 0
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "provision_worker[%s]: active-task capacity count "
+                    "failed: %s; falling back to work_sessions",
+                    project, exc,
+                )
         try:
             records = self._svc.list_worker_sessions(
                 project=project, active_only=True,
@@ -396,7 +417,9 @@ class SessionManager:
         if existing is not None and self._existing_session_is_alive(existing):
             return
         cap = self._resolve_parallel_cap(project)
-        active = self._count_active_workers(project)
+        active = self._count_active_workers(
+            project, exclude_task_id=task_id,
+        )
         if active < cap:
             return
         raise WorkerCapExceededError(
@@ -469,7 +492,9 @@ class SessionManager:
         )
         if reserved:
             return
-        active = self._count_active_workers(project)
+        active = self._count_active_workers(
+            project, exclude_task_id=f"{project}/{task_number}",
+        )
         raise WorkerCapExceededError(
             f"Cannot spawn worker for {project}/{task_number}: "
             f"project {project!r} already has {active} active worker "

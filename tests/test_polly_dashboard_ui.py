@@ -47,27 +47,31 @@ def _fake_config() -> SimpleNamespace:
     )
 
 
-def test_load_dashboard_closes_store(monkeypatch, tmp_path: Path) -> None:
-    closed: list[bool] = []
+def test_load_dashboard_uses_pg_facade(monkeypatch, tmp_path: Path) -> None:
+    """sqlite-ripout (#1970): load_dashboard no longer opens StateStore.
+
+    The pre-cutover behaviour opened a sqlite ``StateStore`` and passed
+    it into ``gather``. After the ripout, ``gather(config, None)`` is
+    the only path — the pg facades own every read. The test asserts
+    that ``StateStore`` is never constructed and that ``gather`` is
+    invoked with ``store=None``.
+    """
     sentinel_config = SimpleNamespace(project=SimpleNamespace(state_db=tmp_path / "state.db"))
     sentinel_data = _fake_dashboard_data()
+    captured: list[object] = []
 
-    class FakeStore:
-        def __init__(self, db_path: Path) -> None:
-            self.db_path = db_path
-
-        def close(self) -> None:
-            closed.append(True)
+    def fake_gather(config, store):
+        captured.append(store)
+        return sentinel_data
 
     monkeypatch.setattr("pollypm.dashboard_data.load_config", lambda path: sentinel_config)
-    monkeypatch.setattr("pollypm.dashboard_data.StateStore", FakeStore)
-    monkeypatch.setattr("pollypm.dashboard_data.gather", lambda config, store: sentinel_data)
+    monkeypatch.setattr("pollypm.dashboard_data.gather", fake_gather)
 
     config, data = load_dashboard(tmp_path / "pollypm.toml")
 
     assert config is sentinel_config
     assert data is sentinel_data
-    assert closed == [True]
+    assert captured == [None]
 
 
 def test_polly_dashboard_refresh_runs_in_worker_thread(monkeypatch, tmp_path: Path) -> None:

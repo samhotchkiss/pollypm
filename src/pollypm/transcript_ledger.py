@@ -298,91 +298,62 @@ def _scan_account_transcripts(config, account_name: str) -> list[TranscriptScanR
 
 
 def sync_token_ledger_for_config(config, *, account: str | None = None) -> list[TranscriptTokenSample]:
-    """Ingest fresh transcript samples.
+    """Ingest fresh transcript samples through the pg token-usage facade.
 
-    Backend-aware: pg installs use the pg token-usage facade; sqlite
-    installs route through the per-project StateStore.
+    sqlite-ripout (#1970): the pre-cutover dual-backend branch that
+    opened a per-project ``StateStore`` for the sqlite path is gone.
+    Production has been pg-only for several releases; the sqlite fork
+    was dead code that re-registered the legacy sqlite store on the
+    heartbeat hot path.
     """
-    from pollypm.storage._backend_dispatch import is_pg_backend
+    from pollypm.storage.pg_token_usage import (
+        replace_token_usage_hourly,
+        upsert_token_sample,
+    )
 
     account_names = [account] if account else list(config.accounts)
     ingested: list[TranscriptTokenSample] = []
     rollups: dict[tuple[str, str, str, str, str], int] = {}
     updated_at = datetime.now(UTC).isoformat()
 
-    use_pg = is_pg_backend(config)
-    store = None
-    if use_pg:
-        from pollypm.storage.pg_token_usage import (
-            replace_token_usage_hourly,
-            upsert_token_sample,
-        )
-    else:
-        # #1019 — close the StateStore on exit (try/finally below) to
-        # avoid WAL/SHM fd leaks under repeated heartbeat ticks.
-        from pollypm.storage.state import StateStore
-
-        store = StateStore(config.project.state_db)
-
-    try:
-        for account_name in account_names:
-            for result in _scan_account_transcripts(config, account_name):
-                sample = result.final_sample
-                if use_pg:
-                    upsert_token_sample(
-                        session_name=sample.session_name,
-                        account_name=sample.account_name,
-                        provider=sample.provider,
-                        model_name=sample.model_name,
-                        project_key=sample.project_key,
-                        cumulative_tokens=sample.cumulative_tokens,
-                        observed_at=sample.observed_at.isoformat(),
-                    )
-                else:
-                    store.upsert_token_sample(  # type: ignore[union-attr]
-                        session_name=sample.session_name,
-                        account_name=sample.account_name,
-                        provider=sample.provider,
-                        model_name=sample.model_name,
-                        project_key=sample.project_key,
-                        cumulative_tokens=sample.cumulative_tokens,
-                        observed_at=sample.observed_at.isoformat(),
-                    )
-                ingested.append(sample)
-                for event in result.usage_events:
-                    hour_bucket = event.observed_at.astimezone(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
-                    key = (
-                        hour_bucket,
-                        sample.account_name,
-                        sample.provider,
-                        event.model_name,
-                        event.project_key,
-                    )
-                    rollups[key] = rollups.get(key, 0) + event.tokens_used
-
-        records = [
-            TokenUsageHourlyRecord(
-                hour_bucket=hour_bucket,
-                account_name=account_name,
-                provider=provider,
-                model_name=model_name,
-                project_key=project_key,
-                tokens_used=tokens_used,
-                updated_at=updated_at,
+    for account_name in account_names:
+        for result in _scan_account_transcripts(config, account_name):
+            sample = result.final_sample
+            upsert_token_sample(
+                session_name=sample.session_name,
+                account_name=sample.account_name,
+                provider=sample.provider,
+                model_name=sample.model_name,
+                project_key=sample.project_key,
+                cumulative_tokens=sample.cumulative_tokens,
+                observed_at=sample.observed_at.isoformat(),
             )
-            for (hour_bucket, account_name, provider, model_name, project_key), tokens_used in sorted(rollups.items())
-        ]
-        if use_pg:
-            replace_token_usage_hourly(records, account_names=account_names)
-        else:
-            store.replace_token_usage_hourly(records, account_names=account_names)  # type: ignore[union-attr]
-        return ingested
-    finally:
-        if store is not None:
-            try:
-                store.close()
-            except Exception:  # noqa: BLE001
-                pass
+            ingested.append(sample)
+            for event in result.usage_events:
+                hour_bucket = event.observed_at.astimezone(UTC).replace(minute=0, second=0, microsecond=0).isoformat()
+                key = (
+                    hour_bucket,
+                    sample.account_name,
+                    sample.provider,
+                    event.model_name,
+                    event.project_key,
+                )
+                rollups[key] = rollups.get(key, 0) + event.tokens_used
+
+    records = [
+        TokenUsageHourlyRecord(
+            hour_bucket=hour_bucket,
+            account_name=account_name,
+            provider=provider,
+            model_name=model_name,
+            project_key=project_key,
+            tokens_used=tokens_used,
+            updated_at=updated_at,
+        )
+        for (hour_bucket, account_name, provider, model_name, project_key), tokens_used in sorted(rollups.items())
+    ]
+    replace_token_usage_hourly(records, account_names=account_names)
+    return ingested
 
 
 def sync_token_ledger(config_path: Path, *, account: str | None = None) -> list[TranscriptTokenSample]:

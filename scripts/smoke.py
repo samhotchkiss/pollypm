@@ -77,7 +77,17 @@ def task_command_specs(project: str, title: str) -> list[CommandSpec]:
     return [
         CommandSpec(
             name="task create",
-            argv=("pm", "task", "create", "--project", project, title, "--json"),
+            argv=(
+                "pm",
+                "task",
+                "create",
+                "--project",
+                project,
+                "--description",
+                "Lane F smoke validation task.",
+                title,
+                "--json",
+            ),
             timeout_seconds=30,
         ),
         CommandSpec(

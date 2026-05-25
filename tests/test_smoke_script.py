@@ -27,6 +27,8 @@ def test_task_command_construction() -> None:
         "create",
         "--project",
         "pollypm",
+        "--description",
+        "Lane F smoke validation task.",
         "smoke-090807",
         "--json",
     )

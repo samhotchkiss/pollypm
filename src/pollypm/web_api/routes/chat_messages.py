@@ -28,6 +28,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Annotated, Any, Literal
@@ -153,6 +155,14 @@ class ChatSessionsResponse(BaseModel):
     """``GET /api/v1/chat/sessions`` envelope."""
 
     sessions: list[ChatSurfaceResponse]
+
+
+_CHAT_SESSIONS_TTL_SECONDS = 1.0
+_CHAT_SESSIONS_LOCK = threading.Lock()
+_CHAT_SESSIONS_CACHE: dict[
+    tuple[int, int, int, int],
+    tuple[float, tuple[ChatSurfaceResponse, ...]],
+] = {}
 
 
 class ChatMessageEnvelope(BaseModel):
@@ -1031,16 +1041,40 @@ def list_chat_sessions_endpoint(config: ConfigDep) -> ChatSessionsResponse:
     endpoint never 500s — the cockpit / frontend depend on it for
     sidebar bootstrap.
     """
-    tmux_client = _build_tmux_client()
-    work_service = _build_work_service_stub(config)
-    surfaces = enumerate_chat_surfaces(
-        config,
-        work_service=work_service,
-        tmux_client=tmux_client,
+    cache_key = (
+        id(config),
+        id(enumerate_chat_surfaces),
+        id(_build_tmux_client),
+        id(_build_work_service_stub),
     )
-    return ChatSessionsResponse(
-        sessions=[_surface_to_wire(surface) for surface in surfaces],
-    )
+    now = time.monotonic()
+    cached = _CHAT_SESSIONS_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < _CHAT_SESSIONS_TTL_SECONDS:
+        return ChatSessionsResponse(sessions=list(cached[1]))
+
+    with _CHAT_SESSIONS_LOCK:
+        now = time.monotonic()
+        cached = _CHAT_SESSIONS_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _CHAT_SESSIONS_TTL_SECONDS:
+            return ChatSessionsResponse(sessions=list(cached[1]))
+
+        tmux_client = _build_tmux_client()
+        work_service = _build_work_service_stub(config)
+        surfaces = enumerate_chat_surfaces(
+            config,
+            work_service=work_service,
+            tmux_client=tmux_client,
+        )
+        rows = tuple(_surface_to_wire(surface) for surface in surfaces)
+        completed_at = time.monotonic()
+        if len(_CHAT_SESSIONS_CACHE) > 8:
+            for stale_key in [
+                k for k, (ts, _v) in _CHAT_SESSIONS_CACHE.items()
+                if completed_at - ts >= _CHAT_SESSIONS_TTL_SECONDS
+            ]:
+                _CHAT_SESSIONS_CACHE.pop(stale_key, None)
+        _CHAT_SESSIONS_CACHE[cache_key] = (completed_at, rows)
+        return ChatSessionsResponse(sessions=list(rows))
 
 
 @router.get(

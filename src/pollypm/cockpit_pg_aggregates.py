@@ -20,6 +20,7 @@ crash the rail.
 from __future__ import annotations
 
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING, Any
 
@@ -56,6 +57,7 @@ _ALL_TASKS_GROUPED_TTL_SECONDS = 1.0
 _ALL_TASKS_GROUPED_CACHE: dict[
     int, tuple[float, "dict[str, tuple[Task, ...]] | None"]
 ] = {}
+_ALL_TASKS_GROUPED_LOCK = threading.Lock()
 
 # Same request-local sharing for the inbox-task aggregate. The dashboard
 # count path and the recent-inbox preview path both need the same broad
@@ -65,6 +67,7 @@ _INBOX_TASKS_GROUPED_TTL_SECONDS = 1.0
 _INBOX_TASKS_GROUPED_CACHE: dict[
     int, tuple[float, "dict[str, tuple[Task, ...]] | None"]
 ] = {}
+_INBOX_TASKS_GROUPED_LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -123,27 +126,36 @@ def all_tasks_grouped(
             return None
         return {key: list(rows) for key, rows in snapshot.items()}
 
-    result = _all_tasks_grouped_uncached(config)
-    # #1957 perf — stamp the cache AFTER the uncached scan returns so a
-    # cold ``SELECT * FROM work_tasks`` that exceeds the TTL doesn't
-    # write a born-expired entry that forces the next caller to recompute.
-    completed_at = time.monotonic()
-    # Best-effort eviction so the cache doesn't grow across long-lived
-    # processes with config reloads (each reload yields a fresh
-    # ``id(config)``).
-    if len(_ALL_TASKS_GROUPED_CACHE) > 8:
-        for stale_key in [
-            k for k, (ts, _v) in _ALL_TASKS_GROUPED_CACHE.items()
-            if completed_at - ts >= _ALL_TASKS_GROUPED_TTL_SECONDS
-        ]:
-            _ALL_TASKS_GROUPED_CACHE.pop(stale_key, None)
-    snapshot = (
-        None
-        if result is None
-        else {key: tuple(rows) for key, rows in result.items()}
-    )
-    _ALL_TASKS_GROUPED_CACHE[cache_key] = (completed_at, snapshot)
-    return result
+    with _ALL_TASKS_GROUPED_LOCK:
+        now = time.monotonic()
+        cached = _ALL_TASKS_GROUPED_CACHE.get(cache_key)
+        if cached is not None and now - cached[0] < _ALL_TASKS_GROUPED_TTL_SECONDS:
+            snapshot = cached[1]
+            if snapshot is None:
+                return None
+            return {key: list(rows) for key, rows in snapshot.items()}
+
+        result = _all_tasks_grouped_uncached(config)
+        # #1957 perf — stamp the cache AFTER the uncached scan returns so a
+        # cold ``SELECT * FROM work_tasks`` that exceeds the TTL doesn't
+        # write a born-expired entry that forces the next caller to recompute.
+        completed_at = time.monotonic()
+        # Best-effort eviction so the cache doesn't grow across long-lived
+        # processes with config reloads (each reload yields a fresh
+        # ``id(config)``).
+        if len(_ALL_TASKS_GROUPED_CACHE) > 8:
+            for stale_key in [
+                k for k, (ts, _v) in _ALL_TASKS_GROUPED_CACHE.items()
+                if completed_at - ts >= _ALL_TASKS_GROUPED_TTL_SECONDS
+            ]:
+                _ALL_TASKS_GROUPED_CACHE.pop(stale_key, None)
+        snapshot = (
+            None
+            if result is None
+            else {key: tuple(rows) for key, rows in result.items()}
+        )
+        _ALL_TASKS_GROUPED_CACHE[cache_key] = (completed_at, snapshot)
+        return result
 
 
 def _all_tasks_grouped_uncached(
@@ -199,21 +211,33 @@ def inbox_tasks_grouped(
             return None
         return {key: list(rows) for key, rows in snapshot.items()}
 
-    result = _inbox_tasks_grouped_uncached(config)
-    completed_at = time.monotonic()
-    if len(_INBOX_TASKS_GROUPED_CACHE) > 8:
-        for stale_key in [
-            k for k, (ts, _v) in _INBOX_TASKS_GROUPED_CACHE.items()
-            if completed_at - ts >= _INBOX_TASKS_GROUPED_TTL_SECONDS
-        ]:
-            _INBOX_TASKS_GROUPED_CACHE.pop(stale_key, None)
-    snapshot = (
-        None
-        if result is None
-        else {key: tuple(rows) for key, rows in result.items()}
-    )
-    _INBOX_TASKS_GROUPED_CACHE[cache_key] = (completed_at, snapshot)
-    return result
+    with _INBOX_TASKS_GROUPED_LOCK:
+        now = time.monotonic()
+        cached = _INBOX_TASKS_GROUPED_CACHE.get(cache_key)
+        if (
+            cached is not None
+            and now - cached[0] < _INBOX_TASKS_GROUPED_TTL_SECONDS
+        ):
+            snapshot = cached[1]
+            if snapshot is None:
+                return None
+            return {key: list(rows) for key, rows in snapshot.items()}
+
+        result = _inbox_tasks_grouped_uncached(config)
+        completed_at = time.monotonic()
+        if len(_INBOX_TASKS_GROUPED_CACHE) > 8:
+            for stale_key in [
+                k for k, (ts, _v) in _INBOX_TASKS_GROUPED_CACHE.items()
+                if completed_at - ts >= _INBOX_TASKS_GROUPED_TTL_SECONDS
+            ]:
+                _INBOX_TASKS_GROUPED_CACHE.pop(stale_key, None)
+        snapshot = (
+            None
+            if result is None
+            else {key: tuple(rows) for key, rows in result.items()}
+        )
+        _INBOX_TASKS_GROUPED_CACHE[cache_key] = (completed_at, snapshot)
+        return result
 
 
 def _inbox_tasks_grouped_uncached(

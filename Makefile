@@ -1,4 +1,7 @@
-.PHONY: perf-measure perf-poll perf-snapshot
+.PHONY: smoke perf-measure perf-poll perf-snapshot
+
+smoke:
+	python scripts/smoke.py
 
 perf-measure:
 	scripts/perf/measure_http.sh --scenarios dashboard,sessions,messages,task-list,task-detail,inbox

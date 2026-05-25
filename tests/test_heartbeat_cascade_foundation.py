@@ -992,6 +992,154 @@ def test_tier1_healer_role_session_missing_reviewer_role_routes_per_task(
 
 
 # ---------------------------------------------------------------------------
+# #2225 — failure path emits an audit event so operators can see the
+# cascade *tried* and failed (vs the prior silent path that only
+# logged ``audit.finding`` rows without any spawn/failure signal).
+# ---------------------------------------------------------------------------
+
+
+def test_self_heal_role_session_missing_emits_failed_event_on_missing_role(
+    tmp_path: Path,
+) -> None:
+    """A finding with no ``role`` metadata fails fast — the failure
+    path must emit ``audit.worker_lane_failed`` so the audit log
+    surfaces the attempt + reason.
+
+    #2225 regression: pre-fix the failure paths only logged via
+    ``logger.warning`` (process-local) and bumped a counter — the
+    audit log carried no positive signal that the cascade tried.
+    """
+    from pollypm.audit.log import EVENT_WATCHDOG_WORKER_LANE_FAILED
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _self_heal_role_session_missing,
+    )
+
+    finding = Finding(
+        rule=RULE_ROLE_SESSION_MISSING,
+        tier=TIER_1,
+        project="demo",
+        subject="demo/7",
+        metadata={},  # explicitly empty — no "role" key
+    )
+    counters = _self_heal_role_session_missing(
+        finding,
+        project_key="demo",
+        project_path=None,
+        config_path=tmp_path / "pollypm.toml",
+    )
+    assert counters["worker_lane_failed"] == 1
+    rows = read_events("demo", event=EVENT_WATCHDOG_WORKER_LANE_FAILED)
+    assert len(rows) >= 1
+    last = rows[-1]
+    assert last.subject == "demo/7"
+    assert (last.metadata or {}).get("reason") == "missing_role_metadata"
+
+
+def test_self_heal_role_session_missing_emits_failed_event_on_spawn_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    """When ``create_worker_session`` / ``launch_worker_session`` raises,
+    the catch-all path must emit ``audit.worker_lane_failed`` with a
+    ``reason`` that captures the exception type token.
+
+    #2225 regression: pre-fix the operator could see 1000+ findings
+    with zero spawn AND zero failure events; this assertion makes
+    sure the audit log carries the attempt signal even when the
+    spawn machinery raises.
+    """
+    from pollypm.audit.log import EVENT_WATCHDOG_WORKER_LANE_FAILED
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _self_heal_role_session_missing,
+    )
+
+    class _StubSession:
+        def __init__(self, name: str) -> None:
+            self.name = name
+
+    class _StubSupervisorConfig:
+        def __init__(self) -> None:
+            self.sessions: dict[str, Any] = {}
+
+    class _StubSupervisor:
+        def __init__(self) -> None:
+            self.config = _StubSupervisorConfig()
+
+    def _stub_load_supervisor(_path: Any) -> _StubSupervisor:
+        return _StubSupervisor()
+
+    def _stub_create(*_args: Any, **kwargs: Any) -> _StubSession:
+        return _StubSession(f"{kwargs['role']}-{kwargs['project_key']}")
+
+    def _stub_launch_raises(_cfg: Any, _name: str) -> None:
+        raise RuntimeError("tmux unreachable")
+
+    import pollypm.cli as cli_mod
+
+    monkeypatch.setattr(cli_mod, "_load_supervisor", _stub_load_supervisor)
+    monkeypatch.setattr(cli_mod, "create_worker_session", _stub_create)
+    monkeypatch.setattr(cli_mod, "launch_worker_session", _stub_launch_raises)
+
+    finding = Finding(
+        rule=RULE_ROLE_SESSION_MISSING,
+        tier=TIER_1,
+        project="demo",
+        subject="demo/42",
+        metadata={"role": "advisor", "expected_window": "advisor-demo"},
+    )
+    config_path = tmp_path / "pollypm.toml"
+    config_path.write_text("[project]\nname = 'Demo'\n")
+    counters = _self_heal_role_session_missing(
+        finding,
+        project_key="demo",
+        project_path=None,
+        config_path=config_path,
+    )
+    assert counters["worker_lane_failed"] == 1
+    assert counters["worker_lane_spawned"] == 0
+    rows = read_events("demo", event=EVENT_WATCHDOG_WORKER_LANE_FAILED)
+    assert len(rows) >= 1
+    last = rows[-1]
+    assert last.subject == "demo/42"
+    meta = last.metadata or {}
+    assert meta.get("role") == "advisor"
+    assert meta.get("project") == "demo"
+    # Reason token includes the exception class so operators can
+    # triage without re-running the cadence.
+    assert "RuntimeError" in (meta.get("reason") or "")
+
+
+def test_self_heal_role_session_missing_reviewer_missing_task_id_emits_failed(
+    tmp_path: Path,
+) -> None:
+    """The reviewer branch's task-id guard also emits the failure
+    event, distinguishable by ``reason=reviewer_missing_task_id``."""
+    from pollypm.audit.log import EVENT_WATCHDOG_WORKER_LANE_FAILED
+    from pollypm.plugins_builtin.core_recurring.audit_watchdog import (
+        _self_heal_role_session_missing,
+    )
+
+    finding = Finding(
+        rule=RULE_ROLE_SESSION_MISSING,
+        tier=TIER_1,
+        project="demo",
+        # subject has no slash — task_id reconstruction will also fail.
+        subject="demo",
+        metadata={"role": "reviewer", "status": "review"},
+    )
+    counters = _self_heal_role_session_missing(
+        finding,
+        project_key="demo",
+        project_path=None,
+        config_path=tmp_path / "pollypm.toml",
+    )
+    assert counters["worker_lane_failed"] == 1
+    rows = read_events("demo", event=EVENT_WATCHDOG_WORKER_LANE_FAILED)
+    assert len(rows) >= 1
+    last = rows[-1]
+    assert (last.metadata or {}).get("reason") == "reviewer_missing_task_id"
+
+
+# ---------------------------------------------------------------------------
 # Tier-3 operator dispatch — throttle, audit emit, no-op for ineligible rules
 # ---------------------------------------------------------------------------
 

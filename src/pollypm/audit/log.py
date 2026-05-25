@@ -162,6 +162,16 @@ EVENT_WATCHDOG_TIER3_DISPATCH_FAILED = "watchdog.tier3_dispatch_failed"
 # so forensic reads can confirm which queued / in-flight task drove
 # the spawn.
 EVENT_WATCHDOG_WORKER_LANE_SPAWNED = "audit.worker_lane_spawned"
+# #2225 — fires when the ``role_session_missing`` self-heal attempt
+# fails (missing role metadata, missing config, supervisor load raise,
+# tmux launch raise, reviewer provision returned ``None``, etc). One
+# event per failed attempt; metadata carries ``role``, ``project``,
+# ``task_subject``, and ``reason`` (a short token identifying which
+# guard / except branch fired). Without this event the audit log shows
+# repeated ``audit.finding`` rows for ``role_session_missing`` with no
+# corresponding spawn or failure trace, making it impossible to tell
+# whether the cascade tried and failed vs never tried at all.
+EVENT_WATCHDOG_WORKER_LANE_FAILED = "audit.worker_lane_failed"
 # #1546 — fires when the watchdog repairs a tracked project whose
 # canonical ``.pollypm/state.db`` is missing (only legacy archives
 # remain). Metadata carries ``project_key`` and ``project_path`` so
@@ -1132,6 +1142,7 @@ __all__ = [
     "EVENT_WATCHDOG_OPERATOR_DISPATCHED",
     "EVENT_WATCHDOG_TIER3_DISPATCH_FAILED",
     "EVENT_WATCHDOG_WORKER_LANE_SPAWNED",
+    "EVENT_WATCHDOG_WORKER_LANE_FAILED",
     "EVENT_WATCHDOG_PROJECT_TRACKED_MODE_REPAIRED",
     "EVENT_DAEMON_REAPED",
     "EVENT_DAEMON_REVIVED",

@@ -203,6 +203,11 @@ async def handle_validation_error(
     return error_response(api_err)
 
 
+async def handle_not_found(request: Request, _exc: Exception) -> JSONResponse:
+    api_err = not_found(f"{request.url.path} is not a known endpoint")
+    return error_response(api_err)
+
+
 async def handle_unhandled_exception(_request: Request, exc: Exception) -> JSONResponse:
     """Last-resort catch — never let a stack trace leak."""
     api_err = APIError(
@@ -218,6 +223,7 @@ __all__ = [
     "conflict",
     "error_response",
     "handle_api_error",
+    "handle_not_found",
     "handle_unhandled_exception",
     "handle_validation_error",
     "internal_error",

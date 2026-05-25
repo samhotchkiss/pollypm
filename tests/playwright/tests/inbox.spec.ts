@@ -67,6 +67,21 @@ async function stubChrome(page: import("@playwright/test").Page) {
 }
 
 test.describe("inbox panel", () => {
+  test("inbox deep link opens the inbox view on boot", async ({ page }) => {
+    await stubChrome(page);
+    await page.route("**/api/v1/inbox?**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [ITEM], next_cursor: null }),
+      }),
+    );
+
+    await page.goto("/ui/inbox");
+    await expect(page.locator("#pane-title")).toHaveText("Inbox");
+    await expect(page.locator("[data-inbox-id='demo/1']")).toContainText("Plan ready");
+  });
+
   test("dashboard inbox card opens browsable list with load more and disabled plan decisions", async ({ page }) => {
     await stubChrome(page);
 

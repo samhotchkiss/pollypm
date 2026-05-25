@@ -55,6 +55,9 @@ from pollypm.session_health import (
     latest_heartbeat as _latest_heartbeat,
 )
 from pollypm.session_health import (
+    latest_session_runtime as _latest_session_runtime,
+)
+from pollypm.session_health import (
     list_storage_closet_windows as _list_windows,
 )
 from pollypm.session_health import (
@@ -75,6 +78,7 @@ __all_shared__ = (
     "_classify_status",
     "_humanize_age",
     "_latest_heartbeat",
+    "_latest_session_runtime",
     "_list_windows",
     "_storage_session_name",
 )
@@ -108,7 +112,13 @@ def _build_row(
     heartbeat = _latest_heartbeat(config, session.name)
     hb_iso = getattr(heartbeat, "created_at", None) if heartbeat else None
     age = _age_seconds(hb_iso)
-    status = _classify_status(window_present=window is not None, age_seconds=age)
+    runtime = _latest_session_runtime(config, session.name)
+    status = _classify_status(
+        window_present=window is not None,
+        age_seconds=age,
+        runtime_status=getattr(runtime, "status", None),
+        last_failure_type=getattr(runtime, "last_failure_type", None),
+    )
     token_state = "ok" if (getattr(session, "auth_token", "") or "") else "missing"
 
     row: dict[str, Any] = {
@@ -237,7 +247,11 @@ __all__ = [
     "register_sessions_health_command",
     "sessions_health",
     "_STALE_HEARTBEAT_SECONDS",
+    "_STORAGE_CLOSET_SUFFIX",
     "_classify_status",
     "_humanize_age",
+    "_latest_heartbeat",
+    "_latest_session_runtime",
+    "_list_windows",
     "_build_row",
 ]

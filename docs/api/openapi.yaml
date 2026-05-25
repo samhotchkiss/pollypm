@@ -2129,8 +2129,10 @@ paths:
       description: |
         Mirrors `pm sessions` (#2039) — one row per configured (and
         enabled) session in `[sessions]` config with classification
-        (`healthy` / `stale` / `missing` / `unknown`) derived
-        from the latest heartbeat row plus a tmux storage-closet probe.
+        (`healthy` / `stale` / `missing` / `unknown` plus runtime
+        failure pins such as `auth_broken` / `capacity_exhausted`)
+        derived from the latest heartbeat row, session-runtime state,
+        and a tmux storage-closet probe.
         The operator-set pause marker is surfaced via the separate
         `paused: bool` field so it cannot mask the runtime-health
         classification (see `SessionInfo.paused`). Read-side is
@@ -4788,13 +4790,27 @@ components:
     # ---- Sessions admin (Phase 2 §10) -------------------------------
     SessionStatus:
       type: string
-      enum: [healthy, stale, missing, unknown]
+      enum:
+        - healthy
+        - stale
+        - missing
+        - unknown
+        - auth_broken
+        - capacity_exhausted
+        - provider_outage
+        - blocked
+        - degraded
       description: |
         Live runtime-health classification mirroring `pm sessions`.
         `healthy` = heartbeat <=5min old AND tmux window present.
         `stale` = heartbeat older than 5min. `missing` = tmux window
         absent (beats `stale` — pane is the more urgent problem).
         `unknown` = no heartbeat row yet (fresh boot OR pg outage).
+        Functional failures recorded by the heartbeat/recovery path
+        (`auth_broken`, `capacity_exhausted`, `provider_outage`,
+        `blocked`, `degraded`) override fresh heartbeat liveness while
+        the window is still present, so a provider login/quota screen
+        cannot report as healthy just because the pane is alive.
 
         Pause is NOT a value of this enum. The operator-set pause
         marker is exposed as the separate `SessionInfo.paused`

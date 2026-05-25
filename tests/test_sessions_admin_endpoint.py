@@ -315,6 +315,29 @@ def patch_heartbeat(monkeypatch: pytest.MonkeyPatch):
     return install
 
 
+@pytest.fixture(autouse=True)
+def patch_session_runtime_default(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        sessions_admin_routes,
+        "_latest_session_runtime",
+        lambda _config, _name: None,
+    )
+
+
+@pytest.fixture
+def patch_session_runtime(monkeypatch: pytest.MonkeyPatch):
+    """Install a stub for ``_latest_session_runtime`` on the route module."""
+
+    def install(values: dict[str, SimpleNamespace | None]) -> None:
+        monkeypatch.setattr(
+            sessions_admin_routes,
+            "_latest_session_runtime",
+            lambda _config, name: values.get(name),
+        )
+
+    return install
+
+
 @pytest.fixture
 def patch_tmux_windows(monkeypatch: pytest.MonkeyPatch):
     """Install a stub for ``_list_storage_closet_windows``."""
@@ -479,6 +502,29 @@ def test_list_sessions_marks_missing_when_window_absent(
     # Missing window beats heartbeat staleness (matches CLI behavior).
     assert by_name["operator"]["status"] == "missing"
     assert by_name["operator"]["window_present"] is False
+
+
+def test_list_sessions_surfaces_runtime_failure_status(
+    client,
+    auth_headers,
+    patch_heartbeat,
+    patch_session_runtime,
+    patch_tmux_windows,
+):
+    patch_heartbeat({"operator": "2026-05-21T10:00:00Z"})
+    patch_session_runtime({
+        "operator": SimpleNamespace(
+            status="recovering",
+            last_failure_type="capacity_exhausted",
+        )
+    })
+    patch_tmux_windows(["operator"])
+
+    response = client.get("/api/v1/sessions", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    by_name = {s["name"]: s for s in response.json()["sessions"]}
+    assert by_name["operator"]["status"] == "capacity_exhausted"
 
 
 def test_list_sessions_requires_bearer_auth(client):

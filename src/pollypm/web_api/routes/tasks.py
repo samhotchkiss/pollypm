@@ -219,6 +219,7 @@ def get_task_endpoint(project: str, n: int, config: ConfigDep) -> TaskDetail:
         "401": {"description": "Missing or invalid bearer token."},
         "404": {"description": "Project or task not found."},
         "409": {"description": "Task is not in a queueable state."},
+        "422": {"description": "Task failed pre-queue validation gates."},
         # #2064 round-9 blocker #3: the service helper catches
         # ``_BACKING_STORE_ERRORS`` and raises ``service_unavailable``;
         # advertise that here so generated clients branch on the same

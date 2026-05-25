@@ -1117,11 +1117,35 @@ class PgWorkService:
                 "fast-track queue bypass recorded via --skip-gates",
                 entry_type="human_review_approved",
             )
+        transition_reason = None
+        if not skip_gates:
+            from pollypm.work.gates import (
+                GateRegistry,
+                evaluate_gates,
+                has_hard_failure,
+            )
+
+            registry = GateRegistry(project_path=self._project_path)
+            kwargs: dict[str, object] = {"get_task": self.get}
+            if self._project_path is not None:
+                kwargs["project_root"] = self._project_path
+            results = evaluate_gates(
+                task, ["has_description"], registry, **kwargs
+            )
+            if has_hard_failure(results):
+                failing = [r for r in results if not r.passed]
+                reason = failing[0].reason if failing else "unknown gate failure"
+                raise ValidationError(
+                    f"Cannot queue task: gate failed -- {reason}"
+                )
+        else:
+            transition_reason = "fast-track queue bypass recorded via --skip-gates"
         return self._simple_transition(
             task_id,
             from_state=WorkStatus.DRAFT,
             to_state=WorkStatus.QUEUED,
             actor=actor,
+            reason=transition_reason,
         )
 
     def has_human_review_approval(self, task_id: str) -> bool:

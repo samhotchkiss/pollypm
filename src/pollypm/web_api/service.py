@@ -1632,6 +1632,17 @@ def queue_task(
             config=config, project_key=project_key, project_path=project.path
         ) as svc:
             try:
+                current = svc.get(task_id)
+                if current.work_status.value != "draft":
+                    raise APIError(
+                        status_code=409,
+                        code="invalid_state",
+                        message=(
+                            f"Cannot queue task in '{current.work_status.value}' state. "
+                            "Task must be in 'draft' state."
+                        ),
+                        hint="Only draft tasks can be queued; refresh the task to see the current work_status.",
+                    )
                 svc.queue(task_id, actor)
             except TaskNotFoundError as exc:
                 raise not_found(f"Task not found: {task_id}") from exc

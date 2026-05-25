@@ -139,6 +139,7 @@ def test_list_tasks_filter_by_status(pg_service):
     a = pg_service.create(
         title="a", type="task", project="demo",
         flow_template="default", roles={"worker": "x"},
+        description="ready to queue",
     )
     pg_service.create(
         title="b", type="task", project="demo",
@@ -155,6 +156,7 @@ def test_queue_transitions_draft_to_queued(pg_service):
     task = pg_service.create(
         title="x", type="task", project="demo",
         flow_template="default", roles={"worker": "a"},
+        description="ready to queue",
     )
     queued = pg_service.queue(f"demo/{task.task_number}", actor="user")
     assert queued.work_status is WorkStatus.QUEUED
@@ -164,6 +166,7 @@ def test_queue_writes_transition_row(pg_service, pg_schema_pool):
     task = pg_service.create(
         title="x", type="task", project="demo",
         flow_template="default", roles={"worker": "a"},
+        description="ready to queue",
     )
     pg_service.queue(f"demo/{task.task_number}", actor="user")
     with pg_schema_pool.connection() as conn, conn.cursor() as cur:
@@ -182,6 +185,7 @@ def test_queue_is_idempotent(pg_service):
     task = pg_service.create(
         title="x", type="task", project="demo",
         flow_template="default", roles={"worker": "a"},
+        description="ready to queue",
     )
     pg_service.queue(f"demo/{task.task_number}", actor="user")
     second = pg_service.queue(f"demo/{task.task_number}", actor="user")
@@ -230,6 +234,7 @@ def test_state_counts_aggregates(pg_service):
     a = pg_service.create(
         title="a", type="task", project="demo",
         flow_template="default", roles={"worker": "a"},
+        description="ready to queue",
     )
     pg_service.create(
         title="b", type="task", project="demo",

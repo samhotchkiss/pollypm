@@ -32,6 +32,8 @@ PHASE_1_PATHS: set[tuple[str, str]] = {
     ("GET", "/projects/{key}"),
     ("GET", "/projects/{key}/tasks"),
     ("GET", "/projects/{key}/plan"),
+    ("POST", "/projects/{key}/plan/approve"),
+    ("POST", "/projects/{key}/plan/reject"),
     ("GET", "/tasks/{project}/{n}"),
     ("GET", "/inbox"),
     ("GET", "/inbox/{id}"),

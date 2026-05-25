@@ -1144,18 +1144,7 @@ def _has_pending_plan_review(svc, project_key: str) -> bool:
     Phase 1 only needs a boolean, so we read tasks-in-review and check
     whether their flow template is plan-shaped.
     """
-    try:
-        tasks = svc.list_tasks(project=project_key, work_status="review")
-    except Exception:  # noqa: BLE001
-        return False
-    for task in tasks:
-        flow_id = getattr(task, "flow_template_id", "") or ""
-        if "plan" in flow_id.lower():
-            return True
-        labels = getattr(task, "labels", []) or []
-        if any("plan" in lbl.lower() for lbl in labels):
-            return True
-    return False
+    return _active_plan_task_for_project(svc, project_key) is not None
 
 
 def _count_open_inbox(config: PollyPMConfig, project_key: str) -> int:
@@ -3107,7 +3096,8 @@ def get_active_plan(
         with _open_work_service_readonly(
             config=config, project_key=project_key, project_path=project.path
         ) as svc:
-            plan = _active_plan_for_project(svc, project_key)
+            task = _active_plan_task_for_project(svc, project_key)
+            plan = _build_plan(svc, task) if task is not None else None
             if plan is None:
                 return None
             if version is not None and plan.version != version:
@@ -3128,21 +3118,152 @@ def get_active_plan(
         ) from exc
 
 
-def _active_plan_for_project(svc, project_key: str) -> APIPlan | None:
+def _active_plan_task_for_project(svc, project_key: str):
     try:
         review_tasks = svc.list_tasks(project=project_key, work_status="review")
     except Exception:  # noqa: BLE001
         review_tasks = []
-    return _active_plan_from_review_tasks(svc, review_tasks)
+    return _active_plan_task_from_review_tasks(review_tasks)
+
+
+def _active_plan_task_from_review_tasks(review_tasks: list[object]):
+    candidates = [
+        t for t in review_tasks
+        if _is_plan_task(t)
+        and (getattr(t, "current_node_id", "") or "") == "user_approval"
+    ]
+    if not candidates:
+        return None
+    # Newest plan_version wins; updated_at breaks ties so repeated
+    # review tasks in the same project do not return a stale decision.
+    def _plan_sort_key(task) -> tuple[int, str]:
+        updated = getattr(task, "updated_at", None)
+        updated_key = (
+            updated.isoformat()
+            if hasattr(updated, "isoformat")
+            else str(updated or "")
+        )
+        return (getattr(task, "plan_version", 1) or 1, updated_key)
+
+    candidates.sort(key=_plan_sort_key, reverse=True)
+    return candidates[0]
 
 
 def _active_plan_from_review_tasks(svc, review_tasks: list[object]) -> APIPlan | None:
-    candidates = [t for t in review_tasks if _is_plan_task(t)]
-    if not candidates:
-        return None
-    # Newest plan_version wins.
-    candidates.sort(key=lambda t: getattr(t, "plan_version", 1) or 1, reverse=True)
-    return _build_plan(svc, candidates[0])
+    task = _active_plan_task_from_review_tasks(review_tasks)
+    return _build_plan(svc, task) if task is not None else None
+
+
+def _active_plan_for_project(svc, project_key: str) -> APIPlan | None:
+    task = _active_plan_task_for_project(svc, project_key)
+    return _build_plan(svc, task) if task is not None else None
+
+
+def approve_active_plan(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    actor: str = "user",
+    note: str | None = None,
+) -> APITaskDetail:
+    """Approve the active plan-review task for ``project_key``."""
+    return _decide_active_plan(
+        config,
+        project_key,
+        actor=actor,
+        decision="approve",
+        reason=note,
+    )
+
+
+def reject_active_plan(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    actor: str = "user",
+    reason: str,
+) -> APITaskDetail:
+    """Reject the active plan-review task for ``project_key``."""
+    return _decide_active_plan(
+        config,
+        project_key,
+        actor=actor,
+        decision="reject",
+        reason=reason,
+    )
+
+
+def _decide_active_plan(
+    config: PollyPMConfig,
+    project_key: str,
+    *,
+    actor: str,
+    decision: str,
+    reason: str | None,
+) -> APITaskDetail:
+    from pollypm.work.factory import create_work_service
+    from pollypm.work.service_support import (
+        InvalidTransitionError,
+        TaskNotFoundError,
+        ValidationError as WorkValidationError,
+    )
+
+    project = config.projects.get(project_key)
+    if project is None:
+        raise not_found(f"Project not registered: {project_key}")
+
+    try:
+        with create_work_service(
+            config=config, project_key=project_key, project_path=project.path
+        ) as svc:
+            task = _active_plan_task_for_project(svc, project_key)
+            if task is None:
+                raise not_found(
+                    "No plan in review for this project",
+                    hint=(
+                        "Plans can be approved or rejected only while a "
+                        "plan_project task is parked at the user_approval node."
+                    ),
+                )
+            try:
+                if decision == "approve":
+                    updated = svc.approve(task.task_id, actor, reason)
+                else:
+                    updated = svc.reject(task.task_id, actor, reason or "")
+            except TaskNotFoundError as exc:
+                raise not_found(f"Task not found: {task.task_id}") from exc
+            except InvalidTransitionError as exc:
+                raise APIError(
+                    status_code=409,
+                    code="invalid_state",
+                    message=str(exc) or f"Plan {task.task_id} is not reviewable.",
+                    hint=(
+                        "Refresh the project plan; only an active "
+                        "user_approval review can be decided."
+                    ),
+                ) from exc
+            except WorkValidationError as exc:
+                raise APIError(
+                    status_code=422,
+                    code="validation_error",
+                    message=str(exc) or f"Plan decision rejected for {task.task_id}.",
+                    hint=(
+                        "Use an authorized human actor such as `user`, "
+                        "and include a rejection reason when rejecting."
+                    ),
+                ) from exc
+            return _task_to_detail_with_plan(updated, svc=svc)
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "plan decision: backing store error for %s: %s",
+            project_key,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable for project {project_key}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
 
 
 def _build_plan(svc, task) -> APIPlan:

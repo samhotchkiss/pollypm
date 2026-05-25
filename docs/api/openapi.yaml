@@ -598,6 +598,80 @@ paths:
         "409":
           $ref: "#/components/responses/Conflict"
 
+  /projects/{key}/plan/approve:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Plans]
+      operationId: approveProjectPlan
+      summary: Approve the active project plan review
+      description: |
+        Finds the active `plan_project` task parked at
+        `work_status=review` and `current_node_id=user_approval`,
+        then routes through the work-service `approve` transition.
+        The lifecycle service owns actor validation, node advancement,
+        decision persistence, and follow-up assignment.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanApproveRequest"
+      responses:
+        "200":
+          description: Plan approved; response carries the post-transition task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
+  /projects/{key}/plan/reject:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey"
+    post:
+      tags: [Plans]
+      operationId: rejectProjectPlan
+      summary: Reject the active project plan review
+      description: |
+        Finds the active `plan_project` task parked at
+        `work_status=review` and `current_node_id=user_approval`,
+        then routes through the work-service `reject` transition.
+        Rejection requires a reason and sends the task to its
+        configured reject node.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PlanRejectRequest"
+      responses:
+        "200":
+          description: Plan rejected; response carries the post-transition task.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   /projects/{key}/chat:
     parameters:
       - $ref: "#/components/parameters/ProjectKey"
@@ -4451,6 +4525,34 @@ components:
           type: string
           description: Architect critic notes; nullable.
         created_at: { type: string, format: date-time }
+
+    PlanApproveRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          default: user
+          description: Human/operator actor approving the plan review.
+        note:
+          type: string
+          description: Optional approval note recorded on the review decision.
+
+    PlanRejectRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          default: user
+          description: Human/operator actor rejecting the plan review.
+        reason:
+          type: string
+          minLength: 1
+          description: Required rejection reason recorded on the review decision.
 
     # ---- Inbox ------------------------------------------------------
     InboxItemType:

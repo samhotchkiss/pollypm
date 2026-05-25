@@ -19,25 +19,42 @@ If any of these would affect the operator's real workload, STOP. Move to a test 
 
 Suggested targeted snapshot before starting (best-effort):
 ```bash
-# State you can restore later. Snapshot is best-effort, not transactional —
-# events.jsonl + audit.jsonl + pollypm.toml may have mid-write inconsistencies.
-# Acceptable for a test environment; do not rely on it for production restore.
-SNAPSHOT=/tmp/pollypm-pre-05-snapshot
-rm -rf "$SNAPSHOT"
-mkdir -p "$SNAPSHOT"
-pg_dump pollypm > /tmp/pollypm-pre-05-snapshot.sql
-git -C /Users/sam/dev/pollypm rev-parse HEAD > /tmp/pollypm-pre-05-snapshot.sha
-for path in \
-  ~/.pollypm/paused-sessions.json \
-  ~/.pollypm/pollypm.toml \
-  ~/.pollypm/audit \
-  ~/.pollypm/briefings
-do
-  [ -e "$path" ] && cp -R "$path" "$SNAPSHOT/"
-done
+# Targeted snapshot — covers the destructive surfaces §05 actually touches.
+# Do NOT use `cp -r ~/.pollypm` — on a busy box that tree can exceed 40 GB
+# and take >10 minutes. The targeted backup below completes in <2 minutes.
+
+SNAP=/tmp/pollypm-pre-05-snapshot
+mkdir -p "$SNAP"
+
+# PG state (the canonical source of truth)
+pg_dump pollypm > "$SNAP/pollypm.sql"
+
+# Session-pause marker (§05.3 corrupt-pause scenario)
+cp ~/.pollypm/paused-sessions.json "$SNAP/" 2>/dev/null || true
+
+# Audit trail (per-project .jsonl files, not the whole tree)
+cp -r ~/.pollypm/audit/ "$SNAP/audit/" 2>/dev/null || true
+
+# Briefings (referenced by recovery prompt tests)
+cp -r ~/.pollypm/briefings/ "$SNAP/briefings/" 2>/dev/null || true
+
+# Config
+cp ~/.pollypm/pollypm.toml "$SNAP/" 2>/dev/null || true
+
+# Source SHA for reproducibility
+git -C /Users/sam/dev/pollypm rev-parse HEAD > "$SNAP/source.sha"
 ```
 
-This intentionally avoids copying the full `~/.pollypm` tree: `agent_homes/`, `artifacts/`, and transcript caches can be tens of gigabytes and are not the destructive surface for these scenarios. If you need a clean, transactionally-consistent database snapshot, stop the daemon before `pg_dump`, then restart it after the dump finishes.
+**If you want a clean, transactionally-consistent snapshot:** stop the daemon first, run the above, then restart.
+
+```bash
+tmux send-keys -t pm-serve:serve C-c
+sleep 5
+# run the targeted snapshot block above
+tmux send-keys -t pm-serve:serve 'pm serve' Enter
+```
+
+Either approach is fine for a test environment. The targeted snapshot captures the surfaces §05 actually mutates; a full `cp -r ~/.pollypm` is not required and will time out on large workspaces.
 
 Setup:
 ```bash

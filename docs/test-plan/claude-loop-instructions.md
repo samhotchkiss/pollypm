@@ -10,7 +10,7 @@ Find user-facing rough edges, file or fix them, review and merge Codex's PRs, ke
 
 | Agent | Owns |
 |---|---|
-| **Claude (you)** | User-perspective testing (Web UI / TUI / curl / Playwright); PR review; merging codex-created PRs; rebasing Codex's stalled PRs; issue triage; journal; docs/ |
+| **Claude (you)** | User-perspective testing (Web UI / TUI / curl / Playwright); PR review; merging codex-created PRs; escalating Codex's stalled PRs per the ladder in section 7; issue triage; journal; docs/ |
 | **Codex** | Code authoring (codex-created PRs); reviewing claude-created PRs; merging claude-created PRs |
 
 Symmetric "you don't merge your own work" rule: Codex never merges codex-created; Claude never merges claude-created.
@@ -24,13 +24,13 @@ Symmetric "you don't merge your own work" rule: Codex never merges codex-created
 
 Any reviewer subagent that posts a verdict without flipping the label leaves the PR/issue orphaned. Verify the label flip via `gh pr view --json labels` after every action.
 
-**Escalation**: if Codex sits >2h on a release-blocker without a PR, you may open a `claude-created` PR fixing it. Codex then reviews + merges per the symmetry above.
+**Escalation**: if Codex sits >2h on a release-blocker issue without opening a PR, you may open a `claude-created` PR fixing it. Codex then reviews + merges per the symmetry above. If Codex has an open-but-stalled PR, follow the ladder in section 7 — do not push onto Codex's branch by default.
 
 ## What Claude commits
 
 - **PRs only** for production code, tests, OpenAPI, schemas. Label `claude-created` + `needs-codex`.
 - **Direct commits OK** on `docs/`, `docs/test-plan/journals/*`, this file itself.
-- **Force-push with `--force-with-lease`** onto Codex's stale PR branch when escalating (>2h stall, explicit comment, SHA-verify after).
+- **Stalled Codex PRs**: do NOT default to force-pushing onto Codex's branch — that violates the `mixed-agent-authors` contract in `fix-flow.md` and `parallel-execution.md` ("Do not co-edit"). Follow the escalation ladder in section 7 instead.
 - **Never** direct-commit `src/`, `tests/`, or `openapi.yaml` to main. Always via PR.
 
 ## Each tick (the bounded unit)
@@ -148,7 +148,7 @@ Dispatch and **end your tick**. The subagent's completion notification wakes the
    - CLI issue: run the command
 6. pytest <touched test files> -x --no-header -q --timeout=120
    (FOREGROUND only, never & or run_in_background)
-7. APPROVE → gh pr review --comment (self-approve blocked); 
+7. APPROVE → gh pr review --comment (self-approve blocked);
    gh pr merge <N> --squash --delete-branch
    Verify state=MERGED.
 8. REQUEST_CHANGES → review + gh pr edit --remove-label needs-claude --add-label needs-codex
@@ -161,9 +161,19 @@ Dispatch and **end your tick**. The subagent's completion notification wakes the
 When operator hasn't commented on an issue/PR within recent reasonable window:
 
 - **`needs-claude` operator-decision issues**: pick the MOST DEFENSIVE option (preserves data, preserves user-facing contract, fail-closed default). Post decision + rationale + alternatives. Journal it. Flip label to `needs-codex` so Codex implements.
-- **Stale Codex PRs (>2h on release-blocker)**: rebase yourself if conflicts are unambiguous; otherwise dispatch a Claude-fixer.
 - **Destructive scenarios** (DB drop, fill-disk, Tailscale flap, multi-machine): NEVER without per-engagement authorization. Skip and document.
-- **Force-pushes**: always `--force-with-lease`. SHA-verify after. Comment the rationale on the PR.
+
+**Stalled Codex PR escalation ladder.** Codex authors codex-created PRs; per `fix-flow.md` and `parallel-execution.md`, Claude must NOT silently push commits onto a Codex branch. When Codex sits >2h on a release-blocker PR, escalate in this order — do not skip steps:
+
+1. **Default — comment-request.** Post a clear `gh pr comment` requesting Codex to rebase and re-tag `needs-codex`, with an explicit deadline (e.g., "if no rebase in 2h, Claude will escalate per ladder"). Verify the label is `needs-codex`. End the tick. This is the only action taken on the first escalation.
+2. **Deadline expired AND change is mechanical** (pure rebase, no new commits required): open a **separate `claude-created` PR** that supersedes the stalled one. Use a fresh branch, cherry-pick the original commits, resolve conflicts, push, and label `claude-created` + `needs-codex`. Close the stalled PR with a cross-reference to the new one. Do NOT touch the original Codex branch.
+3. **Deadline expired, the stall blocks a release-blocker, AND a separate PR is not feasible** (e.g., diff is too intertwined with in-progress Codex work to cherry-pick cleanly): only as a last resort, force-push `--force-with-lease` onto the Codex branch. Required discipline on this path:
+   - Add the `mixed-agent-authors` label IMMEDIATELY in the same action — not after.
+   - **Stop the normal merge flow.** Per `fix-flow.md` step 308, neither agent may merge a `mixed-agent-authors` PR; the operator handles the merge.
+   - Comment on the PR with rationale, the pre-push SHA, and the post-push SHA.
+   - SHA-verify before AND after the push (`git rev-parse HEAD` + `gh pr view --json headRefOid`).
+
+Path 3 is the rare path. Default to path 1; path 2 is the right answer for most stalled rebases. Force-pushing onto another agent's PR without `mixed-agent-authors` violates the cross-agent review contract and is treated as a process bug.
 
 ### 8. Triage sweep (every 5 ticks)
 

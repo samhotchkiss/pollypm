@@ -22,9 +22,13 @@ Suggested targeted snapshot before starting (best-effort):
 # Targeted snapshot — covers the destructive surfaces §05 actually touches.
 # Do NOT use `cp -r ~/.pollypm` — on a busy box that tree can exceed 40 GB
 # and take >10 minutes. The targeted backup below completes in <2 minutes.
+#
+# $SNAP is a per-invocation directory (mktemp -d) so reruns can't leak
+# stale files from a prior §05 pass. Echo it so the operator can record
+# the path in the engagement journal.
 
-SNAP=/tmp/pollypm-pre-05-snapshot
-mkdir -p "$SNAP"
+SNAP=$(mktemp -d -t pollypm-pre-05-snapshot-XXXX)
+echo "$SNAP"
 
 # PG state (the canonical source of truth)
 pg_dump pollypm > "$SNAP/pollypm.sql"
@@ -45,12 +49,14 @@ cp ~/.pollypm/pollypm.toml "$SNAP/" 2>/dev/null || true
 git -C /Users/sam/dev/pollypm rev-parse HEAD > "$SNAP/source.sha"
 ```
 
-**If you want a clean, transactionally-consistent snapshot:** stop the daemon first, run the above, then restart.
+**If you want a clean, transactionally-consistent snapshot:** stop the daemon first, run the snapshot block above (which creates a fresh `$SNAP` directory via `mktemp -d`), then restart.
 
 ```bash
 tmux send-keys -t pm-serve:serve C-c
 sleep 5
-# run the targeted snapshot block above
+# Re-run the targeted snapshot block above — `mktemp -d` will mint a new
+# per-invocation $SNAP directory, so this variant does not collide with
+# the live-daemon snapshot path.
 tmux send-keys -t pm-serve:serve 'pm serve' Enter
 ```
 

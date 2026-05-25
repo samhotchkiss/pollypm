@@ -70,7 +70,8 @@ They do not read documentation between sessions. They expect to sit down and pic
 1. Worker on project Y stopped responding (Claude session crashed in tmux).
 2. **What the plan must verify (this is the heart of the product):**
    - Heartbeat tier detects within ~60s (§01.5.1, §05.2.3 cascade detection lag).
-   - `no_session_spawn` respawns the worker within 3 min total (§01.5.1, §05.2.1).
+   - Task-assignment recovery releases the stale per-task claim and provisions a
+     fresh worker within 3 min total (§01.5.1, §05.2.1).
    - Task gets re-claimed without operator intervention (§01.1.3).
    - Audit log shows the cascade trail (§01.5.1 audit verification).
    - Operator's UI surfaces "worker was stuck, has been restarted, task continues" — they DON'T have to act (§01.4.5, §03.4).

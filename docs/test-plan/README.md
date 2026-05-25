@@ -55,7 +55,9 @@ Output: a short journal entry that says "shippable / not-shippable / blocked on 
 Add to the 2-hour slice:
 - Full **§01** (task lifecycle, all subsections)
 - Full **§02** (translation layer, triple-witness)
-- **§05.1 + §05.2 + §05.4** (daemon kill, pane kill, pause-marker enforcement)
+- **§05.1 + §05.2 + §05.4** (daemon kill, pane kill, pause-marker enforcement).
+  §05.2 only counts when run with a managed PollyPM control plane or explicit
+  scheduler/test dispatcher; an isolated `pm serve` run is unverified evidence.
 - **§04.1 + §04.3** (canonical role prompts + auth-marker)
 - **§06.3 + §06.4 + §06.7** at S-scale
 
@@ -188,6 +190,8 @@ This plan exists to support a binary decision. Use these criteria to convert jou
 - §03 1-second click rule met for every interaction tested.
 - §04 canonical prompts pass per role; auth-marker contract enforced; no confident hallucination.
 - §05 daemon kill, pane kill, pause-marker fail-closed all recover within budget.
+  Pane-kill evidence must include the §05.2 control-plane prerequisite; `pm serve`
+  alone cannot make this gate green.
 - §06 M-scale gate green with recorded p50/p95/p99/max for every cell in the budget table.
 - §07 smoke green on the merge commit being shipped.
 
@@ -201,6 +205,8 @@ This plan exists to support a binary decision. Use these criteria to convert jou
 - Any §01 cascade self-heal requires manual operator action.
 - Any §02 triple-witness scenario shows drift between pane, archive, and REST.
 - Any §03 click breaks the 1-second rule.
+- §05.2 is reported from an isolated `pm serve` run without a managed control
+  plane or explicit scheduler/test dispatcher.
 - Any §05 fail-closed scenario fails open (e.g., malformed pause marker silently allows recovery).
 - §5.5.2 Claude subscription failover does not happen automatically, or loses session context.
 - Any §06 M-scale endpoint p95 above budget, or any payload above budget.

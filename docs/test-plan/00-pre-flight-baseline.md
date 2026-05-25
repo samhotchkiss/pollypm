@@ -58,6 +58,31 @@ git rev-parse HEAD
 
 Record the SHA you're testing in your test journal. Every issue you file from now on references this SHA.
 
+### Clean local build artifacts before reinstall evidence
+
+If this run uses a globally installed `pm` from the checkout, remove local build
+artifacts before reinstalling. `uv tool install --force --no-cache .` can still
+consume a stale `build/lib/pollypm/` snapshot left by an earlier wheel build; a
+fresh `src/pollypm/release_check.py` with `GLOBAL_CONFIG_DIR` imported is not
+evidence that the installed tool copied that file.
+
+```bash
+cd /Users/sam/dev/pollypm
+rm -rf build/ dist/
+uv tool install --force --reinstall .
+python - <<'PY'
+import inspect
+import pollypm.release_check as rc
+print(inspect.getsourcefile(rc))
+print("GLOBAL_CONFIG_DIR" in inspect.getsource(rc))
+PY
+pm doctor
+```
+
+If the installed module does not come from the just-reinstalled wheel or the
+source check prints `False`, record the run as blocked on install freshness; do
+not treat `pm doctor` output as valid baseline evidence.
+
 ---
 
 ## 0.2 pytest — full suite

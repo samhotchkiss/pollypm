@@ -6,6 +6,22 @@
 
 **Prereqs:** §00 green. §01 task lifecycle reliable (so we can tell when recovery actually works). §02 translation-layer reliable.
 
+**Control-plane prerequisite for §5.2:** an isolated `pm serve` process is
+not enough to exercise worker-spawn recovery. `pm serve` only hosts the
+HTTP/Web API surface; it does not drain the heartbeat/job queue that runs
+`task_assignment.sweep`, `session.health_sweep`, or the per-task worker
+reclaim path. To mark §5.2 green, run against one of:
+
+- a managed PollyPM home booted with `pm up`, with the rail daemon or cockpit
+  HeartbeatRail alive and draining jobs;
+- an explicit local scheduler/test dispatcher that constructs HeartbeatRail
+  with workers enabled, calls `tick()`, and drains `task_assignment.sweep`.
+
+If the run only has `pm serve` plus CLI/API calls, record §5.2 as
+**unverified**, not passed. `pm heartbeat` by itself is also insufficient
+unless a long-lived rail daemon/cockpit is present to drain the jobs it
+enqueues.
+
 **Important:** these tests are destructive. Run against a non-production PollyPM instance, or accept that you'll have to restart sessions. Have a known-good state snapshot before starting.
 
 **Prereq: §00.0 environment safety check must have passed.** This section will:
@@ -124,25 +140,46 @@ Restart. Same recovery as 5.1.2 — assert PollyPM doesn't accumulate stale stat
 
 ## 5.2 Pane kill mid-task
 
+This is a **control-plane** test, not a Web API test. Before starting, verify
+the scheduler is actually running:
+
+```bash
+pm doctor | grep 'rail-daemon-alive'
+pm status --json | jq '.sessions[] | select(.kind == "per_task" or (.name | startswith("task-")))'
+```
+
+If no per-task workers appear after claiming a task, stop and fix the control
+plane or switch to an explicit scheduler/test dispatcher. Do not substitute an
+isolated `pm serve` run.
+
 ### 5.2.1 Worker pane killed
 
 ```bash
-TID=$(pm task create --project pollypm "test-5-2-1" --json | jq -r .task_id)
+TID=$(pm task create --project pollypm "test-5-2-1" \
+  --description "Exercise §5.2 worker pane recovery" \
+  --json | jq -r .task_id)
 pm task queue "$TID"
-sleep 60  # let worker claim
+pm task claim "$TID" --actor worker
+sleep 60  # let the per-task worker window boot and receive kickoff
 pm task get "$TID"  # Assignee: worker..., Status: in_progress
 
-tmux kill-window -t pollypm:worker_pollypm
+PROJECT=$(printf '%s\n' "$TID" | cut -d/ -f1)
+NUMBER=$(printf '%s\n' "$TID" | cut -d/ -f2)
+tmux kill-window -t "pollypm-storage-closet:task-${PROJECT}-${NUMBER}"
 ```
 
 **Expected cascade (within 3 min):**
-1. Heartbeat tier detects missing pane.
-2. `no_session_spawn` recovery (per #2081 wiring) detects it, respawns `worker_pollypm`.
-3. New worker session picks up `$TID` (or task is re-queued + claimed).
+1. Heartbeat / task-assignment sweep detects the missing per-task pane.
+2. `_recover_dead_claims` releases the stale claim and records
+   `task.reclaimed` / `worker_session_recovered`.
+3. The auto-claim sweep re-claims `$TID`, provisions a fresh
+   `task-${PROJECT}-${NUMBER}` window, and kickoff delivery resumes.
 
 Verify via audit log:
 ```bash
-grep -E 'heartbeat.missing|session.spawn|task.reclaim' ~/.pollypm/audit/pollypm.jsonl | tail -10
+grep -E 'heartbeat.missing|task.reclaimed|worker_session_recovered|worker_auto_claimed' ~/.pollypm/audit/pollypm.jsonl | tail -10
+pm task get "$TID"
+tmux list-windows -t pollypm-storage-closet | grep "task-${PROJECT}-${NUMBER}"
 ```
 
 **Pass:** cascade fires. Task ends in a known state (`done`, `review`, `cancelled`, or queued again), never silently stuck.

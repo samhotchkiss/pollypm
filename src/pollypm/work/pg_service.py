@@ -1318,9 +1318,14 @@ class PgWorkService:
                         ExecutionStatus.ACTIVE.value,
                     ),
                 )
+                # #2220: also clear claimed_by_session so the queued
+                # row doesn't carry the prior worker's session id —
+                # otherwise the next claim attempt sees a stale
+                # "already claimed" breadcrumb on a freshly queued task.
                 cur.execute(
                     "UPDATE work_tasks SET work_status = %s, "
                     "assignee = NULL, current_node_id = NULL, "
+                    "claimed_by_session = NULL, "
                     "updated_at = %s "
                     "WHERE project = %s AND task_number = %s",
                     (WorkStatus.QUEUED.value, now, project, task_number),

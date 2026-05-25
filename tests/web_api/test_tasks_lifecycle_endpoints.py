@@ -369,6 +369,50 @@ def test_lifecycle_endpoints_require_auth(client) -> None:
         assert response.status_code == 401, (verb, response.text)
 
 
+# ---------------------------------------------------------------------------
+# /reopen — claim-cleanup regression (#2220)
+# ---------------------------------------------------------------------------
+
+
+def test_reopen_clears_claimed_by_session(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """A reopened task must NULL out claimed_by_session (#2220).
+
+    Black-box session 2026-05-24 found a cancel+reopen cycle left the
+    queued row carrying the prior worker's session id. The next claim
+    attempt could then trip "already claimed" guards on a task the
+    operator just explicitly re-queued. Pin the cleanup on the reopen
+    path so the bug can't regress.
+    """
+    # Seed a cancelled task whose flow has been claimed once — that's
+    # what writes claimed_by_session in the first place. The shared
+    # ``_seed_task_in_state(..., state="cancelled")`` helper does:
+    # queue -> claim (claimed_by_session="agent-1") -> cancel.
+    task = _seed_task_in_state(api_config, project_root, state="cancelled")
+    assert task.claimed_by_session is not None, (
+        "test precondition: cancel-from-in-progress should leave "
+        "claimed_by_session set so reopen has something to clear"
+    )
+
+    # ``TaskReopenRequest`` is reason-only (no ``actor``); the route
+    # supplies actor="api" itself.
+    response = client.post(
+        f"/api/v1/tasks/myproj/{task.task_number}/reopen",
+        json={"reason": "rerun"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    assert body["task"]["work_status"] == "queued"
+    assert body["task"]["claimed_by_session"] is None, (
+        "claimed_by_session must be cleared on reopen (#2220), got "
+        f"{body['task']['claimed_by_session']!r}"
+    )
+
+
 def test_lifecycle_endpoints_unknown_project_404(client, auth_headers) -> None:
     """Unknown project key surfaces as 404 with the standard envelope."""
     for verb in (

@@ -520,6 +520,9 @@ class MockWorkService:
         task.work_status = WorkStatus.QUEUED
         task.assignee = None
         task.current_node_id = None
+        # #2220: clear the prior worker's session id so a reopened
+        # task doesn't trip "already claimed" checks on the next claim.
+        task.claimed_by_session = None
         task.updated_at = _now()
         self._record_transition(
             task_id,

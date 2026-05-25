@@ -510,15 +510,16 @@ class PgWorkService:
         # avoid the N+1 hit on big result sets.
         keys = [(str(r[0]), int(r[1])) for r in rows]
         rels_by_key = self._load_relationships_bulk(keys)
-        tasks = [
-            self._row_to_task(
+        transitions_by_key = self._load_transitions_bulk(keys)
+        tasks = []
+        for row in rows:
+            key = (str(row[0]), int(row[1]))
+            task = self._row_to_task(
                 row,
-                relationships=rels_by_key.get(
-                    (str(row[0]), int(row[1])), None
-                ),
+                relationships=rels_by_key.get(key, None),
             )
-            for row in rows
-        ]
+            task.transitions = transitions_by_key.get(key, [])
+            tasks.append(task)
         # ``blocked`` post-filter mirrors the sqlite behaviour: the column
         # is derived from ``work_status``, so callers passing
         # ``blocked=True/False`` get the same surface either backend.
@@ -751,6 +752,40 @@ class PgWorkService:
             for r in rows
         ]
 
+    def _load_transitions_bulk(
+        self, keys: list[tuple[str, int]]
+    ) -> dict[tuple[str, int], list[Transition]]:
+        """Load transition history for many tasks in one query."""
+        if not keys:
+            return {}
+        pairs = list(dict.fromkeys(keys))
+        projects = [project for project, _number in pairs]
+        task_numbers = [number for _project, number in pairs]
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT task_project, task_number, from_state, to_state, "
+                "actor, reason, created_at "
+                "FROM work_transitions "
+                "WHERE (task_project, task_number) IN ("
+                "SELECT * FROM unnest(%s::text[], %s::int[])) "
+                "ORDER BY task_project, task_number, id ASC",
+                (projects, task_numbers),
+            )
+            rows = cur.fetchall()
+        by_key: dict[tuple[str, int], list[Transition]] = {}
+        for row in rows:
+            key = (str(row[0]), int(row[1]))
+            by_key.setdefault(key, []).append(
+                Transition(
+                    from_state=str(row[2]),
+                    to_state=str(row[3]),
+                    actor=str(row[4]),
+                    reason=row[5],
+                    timestamp=row[6],
+                )
+            )
+        return by_key
+
     def _load_context_entries(
         self, project: str, task_number: int
     ) -> list[ContextEntry]:
@@ -815,32 +850,28 @@ class PgWorkService:
         """
         if not keys:
             return {}
-        out: dict[tuple[str, int], dict] = {key: _empty_rels() for key in keys}
-        # We don't have a single VALUES clause that scales to thousands
-        # of rows ergonomically, so issue one query that pulls every
-        # row touching ANY of the keys, then bucket in Python.
-        where_clauses: list[str] = []
-        params: list[object] = []
-        for project, number in keys:
-            where_clauses.append(
-                "(from_project = %s AND from_task_number = %s) "
-                "OR (to_project = %s AND to_task_number = %s)"
-            )
-            params.extend([project, number, project, number])
-        clause = " OR ".join(where_clauses)
+        pairs = list(dict.fromkeys(keys))
+        out: dict[tuple[str, int], dict] = {key: _empty_rels() for key in pairs}
+        projects = [project for project, _number in pairs]
+        task_numbers = [number for _project, number in pairs]
         sql = (
+            "WITH keys(project, task_number) AS ("
+            "SELECT * FROM unnest(%s::text[], %s::int[])) "
             "SELECT from_project, from_task_number, "
             "to_project, to_task_number, kind "
-            f"FROM work_task_dependencies WHERE {clause}"
+            "FROM work_task_dependencies d "
+            "JOIN keys k ON "
+            "(d.from_project = k.project AND d.from_task_number = k.task_number) "
+            "OR (d.to_project = k.project AND d.to_task_number = k.task_number)"
         )
         with self._pool.connection() as conn, conn.cursor() as cur:
-            cur.execute(sql, params)
+            cur.execute(sql, (projects, task_numbers))
             all_rows = cur.fetchall()
         # Bucket by both endpoints (outgoing and incoming relative to
         # each key) and re-use the same aggregator the per-task path
         # uses, so the wire shape is identical.
-        key_set = set(keys)
-        bucket: dict[tuple[str, int], list[tuple]] = {k: [] for k in keys}
+        key_set = set(pairs)
+        bucket: dict[tuple[str, int], list[tuple]] = {k: [] for k in pairs}
         for row in all_rows:
             from_p, from_n, to_p, to_n, kind = (
                 str(row[0]),

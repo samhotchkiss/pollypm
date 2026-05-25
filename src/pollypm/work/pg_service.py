@@ -95,6 +95,18 @@ _CLAIM_CONTESTED_STATUSES = frozenset({
     WorkStatus.REVIEW,
 })
 
+# #2305 — task states that hold an active per-task worker session row
+# (``work_sessions.ended_at IS NULL``). When a transition leaves one of
+# these states for anything else, the session row must be stamped ended
+# or the per-project ``max_parallel_workers`` cap leaks: cap is counted
+# from active session rows, and a leaked row 429s every subsequent claim
+# until ``pm serve`` restarts.
+_WORKER_SESSION_HOLDING_STATUSES = frozenset({
+    WorkStatus.IN_PROGRESS,
+    WorkStatus.REVIEW,
+    WorkStatus.REWORK,
+})
+
 # Per-process dedup for the ``work_db.opened`` audit row (#1808). The
 # event is a doctor / heartbeat diagnostic stamped at first open of a
 # given (subject, project_path) pair — subsequent opens within the
@@ -1906,6 +1918,23 @@ class PgWorkService:
             actor=actor,
             reason=reason,
         )
+        # #2305: release the worker-cap slot when the task leaves an
+        # active worker state for one that does not hold a session
+        # (e.g. ``in_progress``→``done`` via ``mark_done``,
+        # ``in_progress``→``cancelled`` via ``cancel``,
+        # ``in_progress``→``on_hold`` via ``hold``, etc.). The cap is
+        # counted from ``work_sessions WHERE ended_at IS NULL``, so a
+        # leak here 429s every subsequent claim on the project until
+        # ``pm serve`` restarts.
+        if (
+            current in _WORKER_SESSION_HOLDING_STATUSES
+            and to_state not in _WORKER_SESSION_HOLDING_STATUSES
+        ):
+            self._release_worker_session_for_transition(
+                project=project,
+                task_number=task_number,
+                ended_at=now,
+            )
         task = self.get(task_id)
         self._sync_transition(task, current.value, to_state.value)
         return task
@@ -3018,6 +3047,18 @@ class PgWorkService:
                         None,
                     )
                 conn.commit()
+            # #2305: ensure the worker-cap slot is released. The session
+            # manager's failure path already calls
+            # ``_release_cap_slot_on_failure`` for the cap-exceeded race
+            # that triggered this rollback, but for any other provision
+            # failure that lands here we belt-and-suspender stamp
+            # ``ended_at`` so a leaked placeholder can't 429 the next
+            # claim.
+            self._release_worker_session_for_transition(
+                project=project,
+                task_number=task_number,
+                ended_at=now,
+            )
             logger.warning(
                 "claim rollback: %s/%d returned to queued after "
                 "post-commit provision failure (%s)",
@@ -3228,6 +3269,19 @@ class PgWorkService:
         self._sync_transition(
             result, from_status.value, result.work_status.value
         )
+        # #2305: if the advance landed on a state that no longer holds a
+        # worker session (terminal ``done``, plus ``queued``/``on_hold``
+        # bypass nodes), free the cap slot. ``review`` and a new
+        # ``in_progress`` keep the row active for the next node.
+        if (
+            from_status in _WORKER_SESSION_HOLDING_STATUSES
+            and result.work_status not in _WORKER_SESSION_HOLDING_STATUSES
+        ):
+            self._release_worker_session_for_transition(
+                project=task.project,
+                task_number=task.task_number,
+                ended_at=now,
+            )
         self._write_review_summary_after_transition(result)
         if (
             result.flow_template_id == "plan_project"
@@ -5142,6 +5196,49 @@ class PgWorkService:
                     (ended_at, task_project, task_number),
                 )
             conn.commit()
+
+    def _release_worker_session_for_transition(
+        self,
+        *,
+        project: str,
+        task_number: int,
+        ended_at: str | datetime,
+    ) -> None:
+        """End any active worker session row for ``(project, task_number)``.
+
+        #2305 — the per-project worker-cap (``max_parallel_workers``)
+        counts ``work_sessions`` rows with ``ended_at IS NULL``. Pre-fix
+        only :meth:`release` and the teardown helpers stamped
+        ``ended_at``; transitions through :meth:`mark_done`,
+        :meth:`force_review`, :meth:`cancel`, :meth:`hold`, the
+        ``node_done`` terminal advance, and the post-commit claim
+        rollback all left the row open. After enough such transitions
+        the project hit cap and every subsequent claim returned 429
+        ``worker_cap_exceeded`` until ``pm serve`` restarted.
+
+        This helper stamps ``ended_at`` only on rows that are still
+        active so re-running it is a no-op and we don't accidentally
+        backdate an already-ended row. Best-effort: a DB error is
+        logged at debug and swallowed because the surfaced transition
+        is the primary signal; the next claim will re-evaluate cap
+        from source-of-truth.
+        """
+        try:
+            with self._pool.connection() as conn:
+                conn.autocommit = False
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "UPDATE work_sessions SET ended_at = %s "
+                        "WHERE task_project = %s AND task_number = %s "
+                        "AND ended_at IS NULL",
+                        (ended_at, project, task_number),
+                    )
+                conn.commit()
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "release worker session for %s/%d failed",
+                project, task_number, exc_info=True,
+            )
 
     def update_worker_session_tokens(
         self,

@@ -1755,3 +1755,138 @@ def test_available_flows_returns_some_templates(pg_service):
 def test_get_flow_returns_template(pg_service):
     tmpl = pg_service.get_flow("standard")
     assert tmpl.name == "standard"
+
+
+# ---------------------------------------------------------------------------
+# #2305 worker-cap counter leak — terminal transitions must release
+# the per-project ``work_sessions`` row so the cap doesn't saturate
+# and 429 every subsequent claim until ``pm serve`` restarts.
+# ---------------------------------------------------------------------------
+
+
+def _seed_active_session(svc, task):
+    """Simulate a successfully-provisioned worker session row."""
+    from datetime import UTC, datetime
+
+    svc.upsert_worker_session(
+        task_project=task.project,
+        task_number=task.task_number,
+        agent_name="alice",
+        pane_id=f"pane-{task.task_number}",
+        worktree_path=f"/tmp/wt-{task.task_number}",
+        branch_name=f"task/{task.task_number}",
+        started_at=datetime.now(UTC),
+    )
+
+
+def _active_session_count(svc, project: str) -> int:
+    return len(
+        svc.list_worker_sessions(project=project, active_only=True)
+    )
+
+
+def test_mark_done_releases_worker_cap_slot(pg_service):
+    """#2305 — ``mark_done`` from ``in_progress`` ends the session row."""
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="alice")
+    _seed_active_session(pg_service, task)
+
+    assert _active_session_count(pg_service, task.project) == 1
+    pg_service.mark_done(task.task_id, actor="operator")
+    # The cap slot must be freed so a follow-up claim doesn't 429.
+    assert _active_session_count(pg_service, task.project) == 0
+
+
+def test_cancel_releases_worker_cap_slot(pg_service):
+    """#2305 — ``cancel`` from ``in_progress`` ends the session row."""
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="alice")
+    _seed_active_session(pg_service, task)
+
+    assert _active_session_count(pg_service, task.project) == 1
+    pg_service.cancel(task.task_id, actor="operator", reason="oops")
+    assert _active_session_count(pg_service, task.project) == 0
+
+
+def test_hold_releases_worker_cap_slot(pg_service):
+    """#2305 — ``hold`` from ``in_progress`` ends the session row."""
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="alice")
+    _seed_active_session(pg_service, task)
+
+    assert _active_session_count(pg_service, task.project) == 1
+    pg_service.hold(task.task_id, actor="operator", reason="pause")
+    assert _active_session_count(pg_service, task.project) == 0
+
+
+def test_force_review_releases_worker_cap_slot(pg_service):
+    """#2305 — ``force_review`` moves in_progress→review.
+
+    ``review`` is itself a holding state (the reviewer node is still
+    associated with the worker session), so the cap slot is preserved.
+    Approving / rejecting the review later will free it via the
+    terminal advance / rework path.
+    """
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    pg_service.claim(task.task_id, actor="alice")
+    _seed_active_session(pg_service, task)
+
+    assert _active_session_count(pg_service, task.project) == 1
+    pg_service.force_review(task.task_id, actor="operator")
+    # review still holds a session row; cap is unchanged.
+    assert _active_session_count(pg_service, task.project) == 1
+
+
+def test_cap_does_not_leak_across_repeated_done_cycles(pg_service):
+    """#2305 regression — N successive claim→done cycles must not saturate cap.
+
+    Pre-fix: ``mark_done`` left ``ended_at IS NULL`` so each cycle
+    incremented the active count. After ``max_parallel_workers``
+    cycles every subsequent claim 429'd until ``pm serve`` restarted.
+    Post-fix: source-of-truth re-counts zero between cycles.
+    """
+    project = "demo"
+    for _ in range(5):
+        task = _make_draft(pg_service, project=project)
+        pg_service.queue(task.task_id, actor="user")
+        pg_service.claim(task.task_id, actor="alice")
+        _seed_active_session(pg_service, task)
+        pg_service.mark_done(task.task_id, actor="operator")
+    # All five sessions must be terminated; the cap counter (counted
+    # from ``work_sessions`` rows with ``ended_at IS NULL``) must be 0.
+    assert _active_session_count(pg_service, project) == 0
+
+
+def test_release_worker_session_helper_is_idempotent(pg_service):
+    """The helper must not bump ``ended_at`` on an already-ended row."""
+    from datetime import UTC, datetime
+
+    task = _make_draft(pg_service)
+    _seed_active_session(pg_service, task)
+    first_end = datetime.now(UTC).isoformat()
+    pg_service._release_worker_session_for_transition(
+        project=task.project,
+        task_number=task.task_number,
+        ended_at=first_end,
+    )
+    rec_after_first = pg_service.get_worker_session(
+        task_project=task.project, task_number=task.task_number
+    )
+    assert rec_after_first is not None
+    assert rec_after_first.ended_at is not None
+    # A second release with a different timestamp must not overwrite —
+    # the helper only updates rows where ``ended_at IS NULL``.
+    pg_service._release_worker_session_for_transition(
+        project=task.project,
+        task_number=task.task_number,
+        ended_at=datetime.now(UTC).isoformat(),
+    )
+    rec_after_second = pg_service.get_worker_session(
+        task_project=task.project, task_number=task.task_number
+    )
+    assert rec_after_second is not None
+    assert rec_after_second.ended_at == rec_after_first.ended_at

@@ -77,7 +77,7 @@ def attach_session_manager(
     storage_closet_name = "pollypm-storage-closet"
     try:
         from pollypm.session_services.tmux import TmuxSessionService
-        from pollypm.storage.state import StateStore
+        from pollypm.storage._backend_dispatch import is_pg_backend
 
         if config is None:
             from pollypm.config import load_config
@@ -86,7 +86,17 @@ def attach_session_manager(
         storage_closet_name = (
             f"{config.project.tmux_session}-storage-closet"
         )
-        store = StateStore(config.project.state_db)
+        # PR #2253 — under pg-mode the legacy state.db is unsupported;
+        # pass ``store=None`` so TmuxSessionService uses its pg-aware
+        # path (it routes through the unified Store for the surfaces it
+        # actually reads). Mirrors the gate pattern in
+        # ``runtime_services.py``.
+        if is_pg_backend(config):
+            store = None
+        else:
+            from pollypm.storage.state import StateStore
+
+            store = StateStore(config.project.state_db)
         session_service = TmuxSessionService(config=config, store=store)
     except Exception as exc:  # noqa: BLE001
         logger.debug(

@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -450,6 +451,37 @@ class StateStore:
         raise RuntimeError(
             "sqlite not supported in production runtime; use Postgres"
         )
+
+    @classmethod
+    def _open_for_migration(
+        cls,
+        conn: sqlite3.Connection,
+        db_path: Path,
+        *,
+        readonly: bool = False,
+    ) -> "StateStore":
+        """Sanctioned bypass for the offline migration tool only.
+
+        ``pm migrate --apply`` (see :mod:`pollypm.store.migrations`) needs
+        access to the legacy schema + migration methods (``_migrate``,
+        ``_deduplicate_alerts``, ``_ensure_incremental_auto_vacuum``)
+        without invoking the runtime guard in ``__init__``. The migration
+        path opens its own sqlite connection (``_connect_rw``) — this
+        classmethod wraps that connection in a ``StateStore``-shaped
+        adapter so the legacy migration code can run unchanged.
+
+        NEVER call this from runtime code paths. The guard in
+        ``__init__`` is the sealed contract for runtime — production code
+        must route through the Postgres facades. This method exists
+        solely so the migration CLI can replay schema bumps against a
+        sqlite clone during ``pm migrate --check``/``--apply``.
+        """
+        store = cls.__new__(cls)
+        store.path = db_path
+        store.readonly = readonly
+        store._conn = conn
+        store._lock = threading.RLock()
+        return store
 
     def _ensure_incremental_auto_vacuum(self) -> None:
         """Flip pre-existing DBs into ``auto_vacuum=INCREMENTAL`` mode.

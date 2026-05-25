@@ -73,9 +73,20 @@ def load_runtime_services(
     # StateStore-shaped surface (session service, recovery prompt).
     # The pg cutover work to replace the consumers lives in
     # K-state-finish.
-    from pollypm.storage.state import StateStore
+    #
+    # PR #2253 sealed ``StateStore.__init__`` against runtime sqlite —
+    # under pg-mode there is no legacy state.db to open, so skip the
+    # construction and let downstream consumers operate against the pg
+    # facades exposed via the unified ``msg_store`` / session-service
+    # surfaces. Mirrors the gate pattern already in ``cli.py`` and
+    # ``rail_daemon.py``.
+    from pollypm.storage._backend_dispatch import is_pg_backend
 
-    store = StateStore(config.project.state_db)
+    store: Any | None = None
+    if not is_pg_backend(config):
+        from pollypm.storage.state import StateStore
+
+        store = StateStore(config.project.state_db)
 
     msg_store: Any | None
     try:

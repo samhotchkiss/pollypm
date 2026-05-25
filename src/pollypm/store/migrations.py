@@ -35,7 +35,6 @@ import os
 import shutil
 import sqlite3
 import sys
-import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -324,15 +323,18 @@ def check_against_clone(
 
 
 def _state_store_adapter(conn: sqlite3.Connection, db_path: Path):
-    """Return a ``StateStore``-shaped adapter without opening sqlite."""
+    """Return a ``StateStore``-shaped adapter without opening sqlite.
+
+    Routes through the sanctioned :meth:`StateStore._open_for_migration`
+    classmethod (instead of a raw ``__new__`` bypass) so the runtime
+    guard in :meth:`StateStore.__init__` stays the single, documented
+    way to refuse sqlite at runtime. The classmethod bears the
+    migration-only semantics explicitly — see its docstring for why
+    runtime callers must never reach it.
+    """
     from pollypm.storage.state import StateStore
 
-    store = StateStore.__new__(StateStore)
-    store.path = db_path
-    store.readonly = False
-    store._conn = conn
-    store._lock = threading.RLock()
-    return store
+    return StateStore._open_for_migration(conn, db_path)
 
 
 def _apply_state_schema_and_migrations(

@@ -1680,12 +1680,22 @@ def _self_heal_role_session_missing(
                     from pollypm.session_services.tmux import (
                         TmuxSessionService,
                     )
-                    from pollypm.storage.state import StateStore
+                    from pollypm.storage._backend_dispatch import (
+                        is_pg_backend,
+                    )
 
                     storage_closet_name = (
                         f"{cfg.project.tmux_session}-storage-closet"
                     )
-                    store = StateStore(cfg.project.state_db)
+                    # PR #2253 — under pg-mode the sealed StateStore
+                    # constructor would raise here; pass ``store=None``
+                    # so TmuxSessionService runs on its pg-aware path.
+                    if is_pg_backend(cfg):
+                        store = None
+                    else:
+                        from pollypm.storage.state import StateStore
+
+                        store = StateStore(cfg.project.state_db)
                     session_service = TmuxSessionService(
                         config=cfg, store=store,
                     )

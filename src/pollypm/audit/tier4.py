@@ -241,6 +241,27 @@ class Tier4PromotionTracker:
         # StateStore.execute(SQL) without a corresponding pg facade.
         # Migrating requires building a pg_tier4 facade (filed as
         # pg-gap). For now this caller stays on StateStore.
+        #
+        # PR #2253 — under pg-mode the sealed StateStore constructor
+        # would raise; signal "unavailable" instead so the tier4
+        # cadence no-ops (matches the dispatch path's existing handling
+        # of a missing tracker — see callers in ``audit_watchdog`` and
+        # ``cli_features/tier4``).
+        try:
+            from pollypm.config import DEFAULT_CONFIG_PATH, load_config
+            from pollypm.storage._backend_dispatch import is_pg_backend
+
+            if DEFAULT_CONFIG_PATH.exists():
+                cfg = load_config(DEFAULT_CONFIG_PATH)
+                if is_pg_backend(cfg):
+                    raise RuntimeError(
+                        "tier4_promotion_state unavailable under pg-mode "
+                        "(pg facade not yet implemented; pg-callers-port)"
+                    )
+        except RuntimeError:
+            raise
+        except Exception:  # noqa: BLE001 — best-effort backend probe
+            pass
         from pollypm.storage.state import StateStore
 
         return StateStore(self._db_path)

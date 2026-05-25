@@ -425,9 +425,21 @@ class Supervisor:
             # (cluster-A reads/writes are pg-routed by the
             # ``_upsert_session`` / ``_get_session_runtime`` / ... helpers
             # below).
-            from pollypm.storage.state import StateStore
+            #
+            # PR #2253 — under pg-mode the legacy state.db is a no-op,
+            # so skip the (sealed) StateStore construction and leave
+            # ``self.store`` as ``None``. Cluster-A reads/writes already
+            # route through the ``pg_sessions`` / ``pg_heartbeats`` /
+            # ``pg_alerts`` facades; any helper that still expects a
+            # StateStore-shaped object must be ported (#342-followup).
+            from pollypm.storage._backend_dispatch import is_pg_backend
 
-            self.store = StateStore(config.project.state_db, readonly=readonly_state)
+            if is_pg_backend(config):
+                self.store = None  # type: ignore[assignment]
+            else:
+                from pollypm.storage.state import StateStore
+
+                self.store = StateStore(config.project.state_db, readonly=readonly_state)
             # Lazy-import to avoid import cycles (core imports nothing from
             # supervisor, but keep the reference local to be safe).
             from pollypm.core import CoreRail as _CoreRail

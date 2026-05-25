@@ -331,8 +331,34 @@ def _recent_commits(config: PollyPMConfig, hours: int = 24) -> list[CommitInfo]:
     return commits
 
 
+# #2307 perf — process-wide TTL cache for ``_completed_issues``.
+# The 20-way concurrent dashboard test fires 20 parallel filesystem
+# walks across ~16 ``issues/05-completed/`` directories per request,
+# each ~1s under GIL + fs-cache contention (vs ~0.01s warm single-shot).
+# Cache the result for 5 seconds — completed-issue updates are
+# user-facing only at the dashboard level and never sub-second.
+_COMPLETED_ISSUES_CACHE: dict[
+    tuple[int, int], tuple[float, list["CompletedItem"]]
+] = {}
+_COMPLETED_ISSUES_TTL_SECONDS = 5.0
+
+
 def _completed_issues(config: PollyPMConfig, hours: int = 72) -> list[CompletedItem]:
-    """Find recently completed issues across projects."""
+    """Find recently completed issues across projects.
+
+    Caches per ``(id(config), hours)`` for
+    :data:`_COMPLETED_ISSUES_TTL_SECONDS` so concurrent dashboard reads
+    (20-way fanout in #2307) share one filesystem walk instead of each
+    running an independent ``glob('*.md')`` scan across every project's
+    ``05-completed`` directory.
+    """
+    cache_key = (id(config), hours)
+    now_mono = time.monotonic()
+    cached = _COMPLETED_ISSUES_CACHE.get(cache_key)
+    if cached is not None and now_mono - cached[0] < _COMPLETED_ISSUES_TTL_SECONDS:
+        # Return a copy — callers may sort/mutate downstream.
+        return list(cached[1])
+
     items: list[CompletedItem] = []
     now = datetime.now(UTC)
     cutoff = now - timedelta(hours=hours)
@@ -358,7 +384,18 @@ def _completed_issues(config: PollyPMConfig, hours: int = 72) -> list[CompletedI
                 continue
 
     items.sort(key=lambda i: i.age_seconds)
-    return items[:10]
+    result = items[:10]
+    completed_at = time.monotonic()
+    # Cap the cache so config reloads (each yielding a fresh ``id(config)``)
+    # don't grow it unbounded across a long-lived ``pm serve`` process.
+    if len(_COMPLETED_ISSUES_CACHE) > 8:
+        for stale_key in [
+            k for k, (ts, _v) in _COMPLETED_ISSUES_CACHE.items()
+            if completed_at - ts >= _COMPLETED_ISSUES_TTL_SECONDS
+        ]:
+            _COMPLETED_ISSUES_CACHE.pop(stale_key, None)
+    _COMPLETED_ISSUES_CACHE[cache_key] = (completed_at, list(result))
+    return result
 
 
 # #1025 — recognized event signatures the Home "Now" feed should

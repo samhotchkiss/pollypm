@@ -2158,6 +2158,8 @@ def _run_lifecycle_transition(
     task_number: int,
     verb: str,
     op,
+    *,
+    with_session: bool = False,
 ) -> APITaskDetail:
     """Shared scaffolding for the #2137 lifecycle helpers.
 
@@ -2166,12 +2168,17 @@ def _run_lifecycle_transition(
     ``svc.get`` → :class:`TaskDetail` hydration so each verb's helper
     is two lines of intent + one ``op`` lambda.
     """
-    from pollypm.work.factory import create_work_service
     from pollypm.work.service_support import (
         InvalidTransitionError,
         TaskNotFoundError,
         ValidationError as WorkValidationError,
     )
+    if with_session:
+        from pollypm.work.service_factory import (
+            create_work_service_with_session,
+        )
+    else:
+        from pollypm.work.factory import create_work_service
 
     project = config.projects.get(project_key)
     if project is None:
@@ -2179,9 +2186,19 @@ def _run_lifecycle_transition(
 
     task_id = f"{project_key}/{task_number}"
     try:
-        with create_work_service(
-            config=config, project_key=project_key, project_path=project.path
-        ) as svc:
+        if with_session:
+            svc_cm = create_work_service_with_session(
+                config=config,
+                project_key=project_key,
+                project_path=project.path,
+            )
+        else:
+            svc_cm = create_work_service(
+                config=config,
+                project_key=project_key,
+                project_path=project.path,
+            )
+        with svc_cm as svc:
             try:
                 op(svc, task_id)
             except TaskNotFoundError as exc:
@@ -2350,6 +2367,28 @@ def in_progress_task(
         task_number,
         verb="in_progress",
         op=lambda svc, task_id: svc.force_in_progress(task_id, actor),
+    )
+
+
+def release_task(
+    config: PollyPMConfig,
+    project_key: str,
+    task_number: int,
+    *,
+    actor: str,
+    reason: str | None = None,
+) -> APITaskDetail:
+    """Release ``in_progress`` / ``rework`` back to ``queued``."""
+    release_reason = reason or "released via API"
+    return _run_lifecycle_transition(
+        config,
+        project_key,
+        task_number,
+        verb="release",
+        op=lambda svc, task_id: svc.release(
+            task_id, actor, release_reason
+        ),
+        with_session=True,
     )
 
 

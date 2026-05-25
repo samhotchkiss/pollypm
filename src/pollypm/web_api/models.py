@@ -378,6 +378,15 @@ class TaskReopenRequest(BaseModel):
     reason: str | None = None
 
 
+class TaskReleaseRequest(BaseModel):
+    """Body for ``POST /tasks/{project}/{n}/release``."""
+
+    model_config = {"extra": "forbid"}
+
+    actor: str = Field(min_length=1)
+    reason: str | None = None
+
+
 class TaskReassignRequest(BaseModel):
     """Body for ``POST /tasks/{project}/{n}/reassign``.
 

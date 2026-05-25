@@ -1299,6 +1299,57 @@ def test_reopen_cancelled_task_returns_to_clean_queue(pg_service):
         assert cur.fetchone()[0] == 0
 
 
+def test_release_active_claim_returns_to_queue_preserving_node(pg_service):
+    from pollypm.work.models import ExecutionStatus, WorkStatus
+
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    claimed = pg_service.claim(task.task_id, actor="alice")
+
+    released = pg_service.release(
+        task.task_id, actor="operator", reason="worker gone"
+    )
+
+    assert released.work_status is WorkStatus.QUEUED
+    assert released.assignee is None
+    assert released.claimed_by_session is None
+    assert released.current_node_id == claimed.current_node_id
+
+    with pg_service._pool.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT from_state, to_state, reason FROM work_transitions "
+            "WHERE task_project = %s AND task_number = %s "
+            "ORDER BY id DESC LIMIT 1",
+            (task.project, task.task_number),
+        )
+        assert cur.fetchone() == (
+            WorkStatus.IN_PROGRESS.value,
+            WorkStatus.QUEUED.value,
+            "worker gone",
+        )
+        cur.execute(
+            "SELECT COUNT(*) FROM work_node_executions "
+            "WHERE task_project = %s AND task_number = %s "
+            "AND status = %s",
+            (
+                task.project,
+                task.task_number,
+                ExecutionStatus.ACTIVE.value,
+            ),
+        )
+        assert cur.fetchone()[0] == 0
+
+
+def test_release_rejects_terminal_task(pg_service):
+    from pollypm.work.service_support import InvalidTransitionError
+
+    task = _make_draft(pg_service)
+    pg_service.mark_done(task.task_id, actor="user")
+
+    with pytest.raises(InvalidTransitionError):
+        pg_service.release(task.task_id, actor="operator")
+
+
 def test_reopen_rejects_non_cancelled_task(pg_service):
     from pollypm.work.service_support import InvalidTransitionError
 

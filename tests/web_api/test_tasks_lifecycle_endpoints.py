@@ -1,5 +1,5 @@
-"""Tests for the lifecycle REST endpoints — done / approve / hold /
-rework / block / review / in_progress (#2137).
+"""Tests for the lifecycle REST endpoints — release / done / approve /
+hold / rework / block / review / in_progress (#2137 / #2114).
 
 Each endpoint mirrors the existing ``/claim`` / ``/cancel`` shape:
 ``TaskActionResult`` envelope on success, 409 ``invalid_state`` on
@@ -86,6 +86,55 @@ def _seed_task_in_state(api_config, project_root, *, state: str):
             svc.cancel(task.task_id, actor="tester", reason="test setup")
             return svc.get(task.task_id)
         raise ValueError(f"unsupported test state: {state}")
+
+
+# ---------------------------------------------------------------------------
+# /release
+# ---------------------------------------------------------------------------
+
+
+def test_release_happy_path(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """Release an in-progress task back to queued with audit history."""
+    task = _seed_task_in_state(api_config, project_root, state="in_progress")
+    response = client.post(
+        f"/api/v1/tasks/myproj/{task.task_number}/release",
+        json={"actor": "operator", "reason": "stale claim"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["ok"] is True
+    released = body["task"]
+    assert released["work_status"] == "queued"
+    assert released["assignee"] is None
+    assert released["claimed_by_session"] is None
+    assert released["current_node_id"] == task.current_node_id
+    assert any(
+        transition["from_state"] == "in_progress"
+        and transition["to_state"] == "queued"
+        and transition["reason"] == "stale claim"
+        for transition in released["transitions"]
+    )
+    assert all(
+        execution["status"] != "active"
+        for execution in released["executions"]
+    )
+
+
+def test_release_illegal_from_done(
+    api_config, client, auth_headers, project_root
+) -> None:
+    """Completed tasks cannot be released/unclaimed."""
+    task = _seed_task_in_state(api_config, project_root, state="done")
+    response = client.post(
+        f"/api/v1/tasks/myproj/{task.task_number}/release",
+        json={"actor": "operator"},
+        headers=auth_headers,
+    )
+    assert response.status_code == 409, response.text
+    assert response.json()["error"]["code"] == "invalid_state"
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +403,7 @@ def test_in_progress_illegal_from_done(
 def test_lifecycle_endpoints_require_auth(client) -> None:
     """Every new verb honors the same bearer-auth gate as /claim."""
     for verb in (
+        "release",
         "done",
         "approve",
         "hold",
@@ -416,6 +466,7 @@ def test_reopen_clears_claimed_by_session(
 def test_lifecycle_endpoints_unknown_project_404(client, auth_headers) -> None:
     """Unknown project key surfaces as 404 with the standard envelope."""
     for verb in (
+        "release",
         "done",
         "approve",
         "hold",

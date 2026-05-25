@@ -148,6 +148,29 @@ class WorkService(Protocol):
         """
         ...
 
+    def release(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        """Release an active worker claim back to ``queued``.
+
+        The task must currently be ``in_progress`` or ``rework``. The
+        implementation clears the live claim owner, abandons any active
+        node execution, records an ``active -> queued`` transition, and
+        preserves ``current_node_id`` so the next claim resumes the same
+        flow node with a fresh visit.
+        """
+        ...
+
+    def release_stale_claim(
+        self, task_id: str, actor: str, *, reason: str
+    ) -> Task:
+        """Compatibility alias for stale-worker recovery callers.
+
+        Same semantics as :meth:`release`; retained for the auto-claim
+        sweeper, which historically probed for ``release_stale_claim``.
+        """
+        ...
+
     def next(self, *, agent: str | None = None, project: str | None = None) -> Task | None:
         """Return the highest-priority queued and unblocked task.
 

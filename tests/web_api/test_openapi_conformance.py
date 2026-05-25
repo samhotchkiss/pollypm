@@ -38,6 +38,8 @@ PHASE_1_PATHS: set[tuple[str, str]] = {
     ("GET", "/events"),
     # Phase 2 wedge — first write endpoint, see #1548.
     ("POST", "/tasks/{project}/{n}/queue"),
+    # Task release/unclaim recovery endpoint (#2114).
+    ("POST", "/tasks/{project}/{n}/release"),
     # Phase 2 — chat GET endpoints (PR #2045).
     ("GET", "/chat/sessions"),
     ("GET", "/chat/{session_name}/messages"),
@@ -235,6 +237,7 @@ def test_static_yaml_does_not_advertise_idempotency_or_ifmatch_on_tasks() -> Non
         "/tasks/{project}/{n}/claim",
         "/tasks/{project}/{n}/cancel",
         "/tasks/{project}/{n}/reopen",
+        "/tasks/{project}/{n}/release",
         "/tasks/{project}/{n}/reassign",
     ]
     for path in task_post_paths:
@@ -340,6 +343,7 @@ def test_static_yaml_declares_503_on_task_write_paths() -> None:
         "/tasks/{project}/{n}/claim",
         "/tasks/{project}/{n}/cancel",
         "/tasks/{project}/{n}/reopen",
+        "/tasks/{project}/{n}/release",
         "/tasks/{project}/{n}/reassign",
     ]
     paths = contract.get("paths", {})
@@ -422,6 +426,7 @@ def test_task_write_endpoints_document_503() -> None:
         "/api/v1/tasks/{project}/{n}/claim",
         "/api/v1/tasks/{project}/{n}/cancel",
         "/api/v1/tasks/{project}/{n}/reopen",
+        "/api/v1/tasks/{project}/{n}/release",
         "/api/v1/tasks/{project}/{n}/reassign",
     ]
     for path in post_paths:
@@ -752,6 +757,18 @@ def test_task_reopen_request_schema_forbids_extras() -> None:
     assert static_schema.get("additionalProperties") is False
 
     runtime_schema = TaskReopenRequest.model_json_schema()
+    assert runtime_schema.get("additionalProperties") is False
+
+
+def test_task_release_request_schema_forbids_extras() -> None:
+    """Pin ``TaskReleaseRequest`` extras=forbid in runtime + static YAML."""
+    from pollypm.web_api.models import TaskReleaseRequest
+
+    contract = _load_contract()
+    static_schema = contract["components"]["schemas"]["TaskReleaseRequest"]
+    assert static_schema.get("additionalProperties") is False
+
+    runtime_schema = TaskReleaseRequest.model_json_schema()
     assert runtime_schema.get("additionalProperties") is False
 
 

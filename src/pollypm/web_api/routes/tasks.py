@@ -39,6 +39,7 @@ from pollypm.web_api.models import (
     TaskListResponse,
     TaskPatchRequest,
     TaskReassignRequest,
+    TaskReleaseRequest,
     TaskReopenRequest,
     TaskReviewRequest,
     TaskReworkRequest,
@@ -58,6 +59,7 @@ from pollypm.web_api.service import (
     patch_task,
     queue_task,
     reassign_task,
+    release_task,
     reopen_task,
     review_task,
     rework_task,
@@ -339,6 +341,35 @@ def reopen_task_endpoint(
     task = reopen_task(config, project, n, reason=reason)
     return TaskActionResult(
         ok=True, message=f"reopened {task.task_id}", task=task
+    )
+
+
+@router.post(
+    "/tasks/{project}/{n}/release",
+    response_model=TaskActionResult,
+    summary="Release an active worker claim",
+    operation_id="releaseTask",
+    responses={
+        "401": {"description": "Missing or invalid bearer token."},
+        "404": {"description": "Project or task not found."},
+        "409": {"description": "Task is not actively claimed."},
+        "422": {"description": "Body validation."},
+        "503": {"description": "Backing store unavailable."},
+    },
+)
+def release_task_endpoint(
+    project: str,
+    n: int,
+    body: TaskReleaseRequest,
+    config: ConfigDep,
+) -> TaskActionResult:
+    if project not in config.projects:
+        raise not_found(f"Project not registered: {project}")
+    task = release_task(
+        config, project, n, actor=body.actor, reason=body.reason
+    )
+    return TaskActionResult(
+        ok=True, message=f"released {task.task_id}", task=task
     )
 
 

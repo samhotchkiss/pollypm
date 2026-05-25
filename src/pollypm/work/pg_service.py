@@ -1356,6 +1356,130 @@ class PgWorkService:
         )
         return result
 
+    def release(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        """Release an active worker claim back to queued.
+
+        This is the operator/recovery counterpart to the post-commit
+        claim rollback path: only active worker-owned states are legal,
+        the flow node is preserved, active executions are abandoned, and
+        the live assignee/session claim is cleared so a later claim starts
+        a fresh visit at the same node.
+        """
+        project, task_number = _parse_task_id(task_id)
+        now = _now_iso()
+        release_reason = reason or "released via work service"
+        with self._pool.connection() as conn:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT work_status FROM work_tasks "
+                    "WHERE project = %s AND task_number = %s "
+                    "FOR UPDATE",
+                    (project, task_number),
+                )
+                row = cur.fetchone()
+                if row is None:
+                    raise TaskNotFoundError(f"Task '{task_id}' not found.")
+                current = _coerce_status(str(row[0]))
+                if current not in (WorkStatus.IN_PROGRESS, WorkStatus.REWORK):
+                    raise InvalidTransitionError(
+                        f"Cannot release task in '{current.value}' state. "
+                        "Task must be in 'in_progress' or 'rework' state."
+                    )
+                cur.execute(
+                    "UPDATE work_tasks SET work_status = %s, "
+                    "assignee = NULL, claimed_by_session = NULL, "
+                    "updated_at = %s "
+                    "WHERE project = %s AND task_number = %s",
+                    (WorkStatus.QUEUED.value, now, project, task_number),
+                )
+                cur.execute(
+                    "UPDATE work_node_executions SET status = %s, "
+                    "completed_at = %s "
+                    "WHERE task_project = %s AND task_number = %s "
+                    "AND status = %s",
+                    (
+                        ExecutionStatus.ABANDONED.value,
+                        now,
+                        project,
+                        task_number,
+                        ExecutionStatus.ACTIVE.value,
+                    ),
+                )
+                cur.execute(
+                    "INSERT INTO work_transitions ("
+                    "task_project, task_number, from_state, to_state, "
+                    "actor, reason, created_at"
+                    ") VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                    (
+                        project,
+                        task_number,
+                        current.value,
+                        WorkStatus.QUEUED.value,
+                        actor,
+                        release_reason,
+                        now,
+                    ),
+                )
+            conn.commit()
+
+        self._emit_status_changed_audit(
+            project=project,
+            task_number=task_number,
+            from_state=current.value,
+            to_state=WorkStatus.QUEUED.value,
+            actor=actor,
+            reason=release_reason,
+        )
+        self._finish_worker_session_after_release(
+            task_id,
+            project=project,
+            task_number=task_number,
+            ended_at=now,
+        )
+        result = self.get(task_id)
+        self._sync_transition(result, current.value, WorkStatus.QUEUED.value)
+        return result
+
+    def release_stale_claim(
+        self, task_id: str, actor: str, *, reason: str
+    ) -> Task:
+        return self.release(task_id, actor, reason)
+
+    def _finish_worker_session_after_release(
+        self,
+        task_id: str,
+        *,
+        project: str,
+        task_number: int,
+        ended_at: datetime,
+    ) -> None:
+        session_mgr = self._session_mgr
+        if session_mgr is not None:
+            try:
+                session_mgr.teardown_worker(task_id)
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "release[%s]: worker teardown failed: %s",
+                    task_id,
+                    exc,
+                )
+        try:
+            self.mark_worker_session_ended(
+                task_project=project,
+                task_number=task_number,
+                ended_at=ended_at,
+            )
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "release[%s]: worker-session end stamp failed",
+                task_id,
+                exc_info=True,
+            )
+
     def mark_done(self, task_id: str, actor: str) -> Task:
         """Force a task to ``done`` without running the flow.
 

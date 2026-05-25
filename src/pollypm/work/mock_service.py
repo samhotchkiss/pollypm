@@ -392,6 +392,38 @@ class MockWorkService:
         self._record_transition(task_id, WorkStatus.QUEUED.value, WorkStatus.IN_PROGRESS.value, actor)
         return deepcopy(task)
 
+    def release(
+        self, task_id: str, actor: str, reason: str | None = None
+    ) -> Task:
+        task = self._tasks.get(task_id)
+        if task is None:
+            raise TaskNotFoundError(f"Task '{task_id}' not found.")
+        if task.work_status not in (WorkStatus.IN_PROGRESS, WorkStatus.REWORK):
+            raise InvalidTransitionError(
+                f"Cannot release task in '{task.work_status.value}' state. "
+                "Task must be in 'in_progress' or 'rework' state."
+            )
+
+        old = task.work_status.value
+        now = _now()
+        for exe in self._executions.get(task_id, []):
+            if exe.status == ExecutionStatus.ACTIVE:
+                exe.status = ExecutionStatus.ABANDONED
+                exe.completed_at = now
+        task.work_status = WorkStatus.QUEUED
+        task.assignee = None
+        task.claimed_by_session = None
+        task.updated_at = now
+        self._record_transition(
+            task_id, old, WorkStatus.QUEUED.value, actor, reason
+        )
+        return deepcopy(task)
+
+    def release_stale_claim(
+        self, task_id: str, actor: str, *, reason: str
+    ) -> Task:
+        return self.release(task_id, actor, reason)
+
     def next(self, *, agent: str | None = None, project: str | None = None) -> Task | None:
         candidates = [
             t for t in self._tasks.values()

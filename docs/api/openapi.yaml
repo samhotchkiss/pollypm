@@ -1365,9 +1365,54 @@ paths:
         "503":
           $ref: "#/components/responses/ServiceUnavailable"
 
+  /tasks/{project}/{n}/release:
+    parameters:
+      - $ref: "#/components/parameters/ProjectKey2"
+      - $ref: "#/components/parameters/TaskNumber"
+    post:
+      tags: [Tasks]
+      operationId: releaseTask
+      summary: Release an active worker claim
+      description: |
+        Moves an active worker-owned task (`in_progress` or `rework`)
+        back to `queued` for recovery from stale or accidental
+        claims. The flow `current_node_id` is preserved so the next
+        claim resumes the same node with a fresh execution visit;
+        `assignee` and `claimed_by_session` are cleared, active node
+        executions are marked `abandoned`, and a transition/audit row
+        records the release reason. Completed/cancelled tasks return
+        `409 invalid_state`.
+
+        `Idempotency-Key` and `If-Match` are intentionally NOT
+        accepted — no replay cache or version-token enforcement
+        exists yet (#2064 round-1, mirrors #2060).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TaskReleaseRequest"
+      responses:
+        "200":
+          description: Task released back to `queued`.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TaskActionResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "422":
+          $ref: "#/components/responses/ValidationError"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+
   # Lifecycle REST verbs (#2137) — done / approve / hold / rework /
   # block / review / in_progress. Each mirrors the existing
-  # claim/cancel/reopen pattern: typed envelope on success
+  # claim/cancel/reopen/release pattern: typed envelope on success
   # (`TaskActionResult`), 404 for unknown project/task, 409
   # `invalid_state` for illegal transitions, 422 for body / argument
   # validation, 503 for backing-store outage.
@@ -4127,6 +4172,26 @@ components:
           description: |
             Optional explanation; absent reasons collapse to
             "reopened via API" in the audit row.
+
+    TaskReleaseRequest:
+      type: object
+      additionalProperties: false
+      required: [actor]
+      properties:
+        actor:
+          type: string
+          minLength: 1
+          description: Operator identity recorded on the release transition.
+        reason:
+          type: string
+          description: |
+            Optional explanation; absent reasons collapse to
+            "released via API" in the audit row.
+      description: |
+        `additionalProperties: false` mirrors the runtime
+        `TaskReleaseRequest` model (`extra="forbid"` in
+        `src/pollypm/web_api/models.py`). Unknown keys surface as a
+        `422 validation_error` instead of being silently dropped.
 
     TaskReassignRequest:
       type: object

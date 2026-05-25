@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import inspect
 from datetime import datetime, timedelta, timezone
-from typing import Any
 
 import pytest
 
@@ -33,6 +32,8 @@ _REQUIRED_PARAMETERS: dict[str, set[str]] = {
     "create": {"created_by", "priority", "description", "kind"},
     "queue": {"skip_gates"},
     "claim": {"skip_gates"},
+    "release": {"reason"},
+    "release_stale_claim": {"reason"},
     "node_done": {"skip_gates"},
     "approve": {"skip_gates"},
     "add_context": {"entry_type"},

@@ -77,6 +77,72 @@ def test_grouped_task_caches_coalesce_concurrent_cold_misses(
     assert calls == {"all": 1, "inbox": 1}
 
 
+def test_completed_issues_coalesces_concurrent_cold_misses(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """#2320 regression — N parallel cold callers share one fs walk.
+
+    Without the lock + double-check around the miss path, 8 parallel
+    threads all race past the empty-cache check and each runs an
+    independent ``glob('*.md')`` against every project's
+    ``05-completed/`` directory. The lock collapses them to one walk.
+    """
+    import pollypm.dashboard_data as dd
+
+    dd._COMPLETED_ISSUES_CACHE.clear()
+
+    # Build a fake config with two projects, each with a completed/ dir
+    # populated with a single recent issue file so glob has something to
+    # return and the cache writes a non-trivial result.
+    projects = {}
+    for alias in ("proj-a", "proj-b"):
+        root = tmp_path / alias
+        completed = root / "issues" / "05-completed"
+        completed.mkdir(parents=True)
+        (completed / "0001-demo.md").write_text("demo\n")
+        projects[alias] = SimpleNamespace(path=root)
+
+    config = SimpleNamespace(projects=projects)
+
+    # Wrap Path.glob so we can count fs walks AND inject latency on the
+    # cold path. Without the lock all 8 threads race past the empty
+    # cache check before any of them writes, so we'd see 8 *
+    # n_projects calls; with the lock we see exactly n_projects.
+    real_glob = Path.glob
+    glob_calls = {"n": 0}
+    glob_lock = threading.Lock()
+
+    def slow_glob(self, pattern, *args, **kwargs):
+        with glob_lock:
+            glob_calls["n"] += 1
+        # Simulate filesystem walk latency so concurrent threads pile
+        # up on the miss path. Without the singleflight lock they all
+        # call into here.
+        time.sleep(0.05)
+        return real_glob(self, pattern, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "glob", slow_glob)
+
+    start = threading.Event()
+
+    def call() -> list:
+        start.wait(timeout=1)
+        return dd._completed_issues(config, hours=72)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = [pool.submit(call) for _ in range(8)]
+        start.set()
+        results = [future.result(timeout=5) for future in futures]
+
+    # All callers see the same result.
+    assert all(len(r) == 2 for r in results)
+    # Exactly one walk per project, not 8 * n_projects.
+    assert glob_calls["n"] == len(projects), (
+        f"expected {len(projects)} glob calls (one per project, "
+        f"shared across 8 threads), got {glob_calls['n']}"
+    )
+
+
 def test_awaits_user_list_annotates_only_actionable_rows(
     tmp_path: Path, monkeypatch,
 ) -> None:

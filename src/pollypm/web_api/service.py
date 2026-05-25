@@ -958,15 +958,22 @@ def _project_task_snapshots(
         if not is_pg_backend(config):
             return None
         from pollypm.cockpit_pg_aggregates import (
-            _all_tasks_grouped_uncached,
             all_tasks_for_project,
+            all_tasks_grouped,
         )
 
-        # API responses should reflect the latest committed task state.
-        # Use the same one-query pg aggregate as the cockpit, but bypass
-        # the cockpit's short TTL cache so concurrent agents do not see
-        # deliberately stale project badges/counts through REST.
-        grouped = _all_tasks_grouped_uncached(config)
+        # #2307 perf — route through the 1s-TTL singleflight cache rather
+        # than the uncached scan. The 11s p95 on 20-way concurrent
+        # ``/api/v1/dashboard`` (issue #2307) traced to 20 separate
+        # ``SELECT * FROM work_tasks`` scans firing under pg-pool
+        # contention (max_size=10), each request paying 1-2s vs the warm
+        # 0.2s single-shot cost. Sharing one scan across a 1-second
+        # window via the existing singleflight collapses 20 parallel
+        # scans into 1 and is API-compatible (the 1-second staleness
+        # window is well below the cockpit's 5-10s poll cadence and
+        # matches what the cockpit rail itself already accepts on the
+        # same data).
+        grouped = all_tasks_grouped(config)
         if grouped is None:
             return None
         return {

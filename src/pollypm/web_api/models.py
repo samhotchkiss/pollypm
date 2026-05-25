@@ -619,6 +619,7 @@ class InboxItem(BaseModel):
     type: InboxItemTypeStr
     state: InboxItemStateStr
     subject: str
+    priority: TaskPriorityStr
     preview: str | None = None
     owner: InboxOwnerStr
     thread_id: str | None = None

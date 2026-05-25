@@ -59,6 +59,16 @@ def list_inbox_endpoint(
         ),
     ] = None,
     state: Annotated[str | None, Query()] = None,
+    include_drafts: Annotated[
+        bool,
+        Query(
+            description=(
+                "Include notify-only draft/FYI task rows. Defaults to false "
+                "to match `pm inbox --project`; pass true for the wider "
+                "legacy inbox view."
+            )
+        ),
+    ] = False,
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     cursor: Annotated[str | None, Query()] = None,
 ) -> InboxListResponse:
@@ -67,6 +77,7 @@ def list_inbox_endpoint(
         project=project,
         type_filter=type,
         state_filter=state,
+        include_drafts=include_drafts,
         limit=limit,
         cursor=cursor,
     )

@@ -237,6 +237,18 @@ def _project_from_task_id(task_id: str) -> str | None:
     return None
 
 
+def _value(value):
+    return getattr(value, "value", value)
+
+
+def _json_datetime(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 def _svc(project: str | None = None) -> "WorkService":
     import atexit
 
@@ -469,14 +481,27 @@ def _task_to_dict(task) -> dict:
     # --json`` consumers can read the structured inbox-item
     # discriminator alongside the rest of the task state.
     kind_value = _coerce_inbox_kind(getattr(task, "kind", None)).value
+    transitions = [
+        {
+            "from_state": _value(tr.from_state),
+            "to_state": _value(tr.to_state),
+            "actor": tr.actor,
+            "timestamp": _json_datetime(getattr(tr, "timestamp", None)),
+            "reason": tr.reason,
+        }
+        for tr in sorted(
+            getattr(task, "transitions", None) or [],
+            key=lambda tr: _json_datetime(getattr(tr, "timestamp", None)) or "",
+        )
+    ]
     return {
         "task_id": task.task_id,
         "project": task.project,
         "task_number": task.task_number,
         "title": task.title,
-        "type": task.type.value,
-        "work_status": task.work_status.value,
-        "priority": task.priority.value,
+        "type": _value(task.type),
+        "work_status": _value(task.work_status),
+        "priority": _value(task.priority),
         "kind": kind_value,
         "assignee": task.assignee,
         "claimed_by_session": getattr(task, "claimed_by_session", None),
@@ -494,12 +519,13 @@ def _task_to_dict(task) -> dict:
         "tokens_in": task.total_input_tokens,
         "tokens_out": task.total_output_tokens,
         "session_count": task.session_count,
+        "transitions": transitions,
         "executions": [
             {
                 "node_id": ex.node_id,
                 "visit": ex.visit,
-                "status": ex.status.value if hasattr(ex.status, "value") else ex.status,
-                "decision": (ex.decision.value if ex.decision and hasattr(ex.decision, "value") else ex.decision),
+                "status": _value(ex.status),
+                "decision": _value(ex.decision) if ex.decision else ex.decision,
                 "decision_reason": ex.decision_reason,
             }
             for ex in task.executions

@@ -555,8 +555,8 @@ def inbox_root(
     # #1013 — hide ``pm notify``-backed stub tasks (chat-flow rows
     # carrying the ``notify`` label) by default.
     if not show_drafts:
-        from pollypm.notify_task import is_notify_inbox_task
-        tasks = [task for task in tasks if not is_notify_inbox_task(task)]
+        from pollypm.notify_task import is_notify_only_inbox_entry
+        tasks = [task for task in tasks if not is_notify_only_inbox_entry(task)]
 
     # #1806 — default-lens curation.
     if apply_curated_filter or awaits_user_only:

@@ -1868,6 +1868,10 @@ paths:
           schema:
             $ref: "#/components/schemas/InboxItemState"
         - in: query
+          name: include_drafts
+          description: Include notify-only draft/FYI task rows hidden by default.
+          schema: { type: boolean, default: false }
+        - in: query
           name: limit
           schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
         - in: query
@@ -4598,7 +4602,7 @@ components:
 
     InboxItem:
       type: object
-      required: [id, project, type, state, subject, owner, created_at, updated_at]
+      required: [id, project, type, state, subject, priority, owner, created_at, updated_at]
       properties:
         id: { type: string }
         project: { type: string }
@@ -4607,6 +4611,8 @@ components:
         state:
           $ref: "#/components/schemas/InboxItemState"
         subject: { type: string }
+        priority:
+          $ref: "#/components/schemas/TaskPriority"
         preview: { type: string, description: Short preview of the body. }
         owner:
           $ref: "#/components/schemas/InboxOwner"

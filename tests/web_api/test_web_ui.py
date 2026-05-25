@@ -106,6 +106,17 @@ def test_ui_root_returns_html_and_sets_session_cookie(client: TestClient, token:
     )
 
 
+def test_ui_deep_links_return_spa_shell_and_set_session_cookie(
+    client: TestClient, token: str,
+) -> None:
+    for path in ("/ui/inbox", "/ui/tasks", "/ui/alerts"):
+        response = client.get(path, headers={"Authorization": f"Bearer {token}"})
+        assert response.status_code == 200
+        assert response.headers["content-type"].startswith("text/html")
+        assert "/ui/app.js" in response.text
+        _assert_signed_session_cookie(response.cookies.get(SESSION_COOKIE_NAME), token)
+
+
 # -------- P0 #1: cookie issuance gating ---------------------------------
 
 
@@ -242,6 +253,12 @@ def test_ui_app_js_uses_sse_refresh_with_polling_fallback(
     assert "POLL_MESSAGES_MS" not in body
     assert "POLL_DASHBOARD_MS" not in body
     assert "setInterval(pollDashboard" not in body
+
+
+def test_ui_app_js_selects_inbox_for_deep_link(client: TestClient) -> None:
+    body = client.get("/ui/app.js").text
+    assert 'path === "/ui/inbox"' in body
+    assert "selectInbox();" in body
 
 
 def test_ui_static_css_served(client: TestClient) -> None:

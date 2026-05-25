@@ -42,6 +42,7 @@ from pollypm.web_api.token import DEFAULT_TOKEN_PATH, load_token
 from pollypm.web_api.errors import (
     APIError,
     handle_api_error,
+    handle_not_found,
     handle_unhandled_exception,
     handle_validation_error,
 )
@@ -478,6 +479,7 @@ def create_app(
     # shape.
     app.add_exception_handler(APIError, handle_api_error)
     app.add_exception_handler(RequestValidationError, handle_validation_error)
+    app.add_exception_handler(404, handle_not_found)
     app.add_exception_handler(Exception, handle_unhandled_exception)
 
     # Wire the briefings provider so /api/v1/briefings reports
@@ -729,6 +731,9 @@ def _mount_web_ui(
       ``pollypm-session`` cookie, so subsequent ``fetch(...,
       {credentials: 'include'})`` calls authenticate without the user
       ever seeing the bearer token.
+    - ``GET /ui/inbox`` (and the dashboard-adjacent ``/ui/tasks`` /
+      ``/ui/alerts`` aliases) serve the same SPA shell so bookmarked
+      operator surfaces don't fall through to the static-file 404.
     - ``GET /ui/{path}`` (e.g. ``app.js``, ``styles.css``) is served by
       :class:`StaticFiles` from the ``ui/`` directory next to this
       module. No auth on the static assets themselves — the bytes are
@@ -757,6 +762,12 @@ def _mount_web_ui(
         # is canonical" without altering verbs.
         return Response(status_code=307, headers={"Location": "/ui/"})
 
+    @app.get("/ui/alerts/", include_in_schema=False)
+    @app.get("/ui/alerts", include_in_schema=False)
+    @app.get("/ui/tasks/", include_in_schema=False)
+    @app.get("/ui/tasks", include_in_schema=False)
+    @app.get("/ui/inbox/", include_in_schema=False)
+    @app.get("/ui/inbox", include_in_schema=False)
     @app.get("/ui/", include_in_schema=False)
     def _ui_index(
         request: Request,

@@ -523,6 +523,18 @@ def test_validation_error_shape_for_bad_query(client, auth_headers) -> None:
     assert all("field" in row and "message" in row for row in body["details"])
 
 
+def test_unknown_api_route_uses_structured_not_found(client, auth_headers) -> None:
+    response = client.get("/api/v1/nonexistent", headers=auth_headers)
+    assert response.status_code == 404
+    body = response.json()
+    assert body == {
+        "error": {
+            "code": "not_found",
+            "message": "/api/v1/nonexistent is not a known endpoint",
+        }
+    }
+
+
 # ---------------------------------------------------------------------------
 # Backing-store failures during work-service construction map to 503.
 #

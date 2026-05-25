@@ -2246,19 +2246,21 @@
           return;
         }
       }
+      if (card.target === "inbox") {
+        selectInbox(card.filter || undefined);
+        return;
+      }
       renderDashboardDrilldown(card);
     };
   }
 
   // Dashboard rail cards always render as buttons with a Playwright-friendly
-  // aria-label and route through `dashboardCardAction` for drill-down. PR
-  // #2266's `selectInbox` workflow remains reachable via the inbox surface
-  // rail entry; merging both click semantics into the same card produced
-  // ambiguous routing, so we standardize on the PR #2172 button shape here.
+  // aria-label and route through `dashboardCardAction` for drill-down.
   function buildCard(label, value, cls, scoped, action, detail) {
     const labelText = scoped ? label + " (filtered)" : label;
     const button = el("button", {
       type: "button",
+      role: "button",
       class: "rollup-card " + (cls || ""),
       "aria-label": "Open dashboard detail for " + labelText + ": " + value,
     }, [
@@ -2300,10 +2302,10 @@
         dashboardCardAction({
           label: "inbox",
           value: rollups.open_inbox_count + " items",
-          target: "surface",
-          detail: "Opens an active chat surface when one is visible.",
+          target: "inbox",
+          detail: "Opens the inbox view.",
         }, data),
-        "Open an active chat surface",
+        "Open inbox",
       ));
     }
     if (typeof rollups.pending_plan_reviews === "number") {
@@ -2315,10 +2317,11 @@
         dashboardCardAction({
           label: "plan reviews",
           value: rollups.pending_plan_reviews + " waiting",
-          target: "review-task",
-          detail: "Opens a visible task waiting on review when available.",
+          target: "inbox",
+          filter: { type: "plan_review" },
+          detail: "Opens inbox items waiting on plan review.",
         }, data),
-        "Open a review task",
+        "Open plan reviews",
       ));
     }
     if (typeof rollups.alert_count === "number") {
@@ -2842,6 +2845,14 @@
     }
   }
 
+  function initialUiRoute() {
+    const path = window.location && window.location.pathname
+      ? window.location.pathname.replace(/\/+$/, "")
+      : "";
+    if (path === "/ui/inbox") return "inbox";
+    return null;
+  }
+
   function init() {
     maybeShowSessionExpiryBanner();
     wireProjectControls();
@@ -2849,7 +2860,11 @@
     wireActivityControls();
     wireSendForm();
     wireStopAgentButton();
-    renderNoSelection();
+    if (initialUiRoute() === "inbox") {
+      selectInbox();
+    } else {
+      renderNoSelection();
+    }
     setStatus("warn", "connecting…");
     loadSurfaces();
     startEventStream();

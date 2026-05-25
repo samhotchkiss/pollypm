@@ -31,6 +31,7 @@ import psycopg_pool
 from pollypm.audit.log import AuditEvent, read_events
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.models import KnownProject
+from pollypm.notify_task import is_notify_only_inbox_entry
 from pollypm.work import inbox_snooze as _inbox_snooze
 from pollypm.work.inbox_view import (
     inbox_item_type_for_task,
@@ -3759,6 +3760,7 @@ def list_inbox(
     project: str | None = None,
     type_filter: str | None = None,
     state_filter: str | None = None,
+    include_drafts: bool = False,
     limit: int = 50,
     cursor: str | None = None,
 ) -> InboxListPage:
@@ -3779,6 +3781,7 @@ def list_inbox(
         project=project,
         type_filter=type_filter,
         state_filter=state_filter,
+        include_drafts=include_drafts,
         limit=candidate_limit,
     )
     if candidate_limit is None or candidate_complete:
@@ -3790,6 +3793,7 @@ def list_inbox(
             project=project,
             type_filter=type_filter,
             state_filter=state_filter,
+            include_drafts=include_drafts,
             limit=None,
         )
     items.sort(key=lambda item: item.updated_at, reverse=True)
@@ -3854,6 +3858,7 @@ def get_inbox_item(config: PollyPMConfig, item_id: str) -> APIInboxItemDetail | 
         type=target.type,
         state=target.state,
         subject=target.subject,
+        priority=target.priority,
         preview=target.preview,
         owner=target.owner,
         thread_id=target.thread_id,
@@ -3870,6 +3875,7 @@ def _collect_inbox_items(
     project: str | None,
     type_filter: str | None = None,
     state_filter: str | None = None,
+    include_drafts: bool = False,
     limit: int | None = None,
 ) -> tuple[list[APIInboxItem], int, bool]:
     """Load inbox items from the work-service for the requested projects.
@@ -3934,6 +3940,8 @@ def _collect_inbox_items(
                 flow_cache: dict = {}
                 for task in tasks:
                     if task.task_id in snoozed_ids:
+                        continue
+                    if not include_drafts and is_notify_only_inbox_entry(task):
                         continue
                     if not inbox_task_matches_type(task, type_filter):
                         continue
@@ -4241,6 +4249,7 @@ def _task_to_inbox_item(
         type=item_type,
         state=state,
         subject=task.title,
+        priority=_enum_value(getattr(task, "priority", "normal")),
         preview=preview,
         owner=_inbox_owner_for_task(task),
         thread_id=task.task_id,

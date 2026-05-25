@@ -202,6 +202,7 @@ def test_list_inbox_response_includes_counts(
         type="message",
         state="open",
         subject="Inbox item",
+        priority="high",
         owner="pm",
         thread_id="myproj/1",
         created_at=now,
@@ -227,6 +228,7 @@ def test_list_inbox_response_includes_counts(
     assert body["has_more"] is True
     assert body["unread_count"] == 2
     assert body["next_cursor"] == "myproj/1"
+    assert body["items"][0]["priority"] == "high"
 
 
 def test_task_list_responses_include_counts(
@@ -2122,10 +2124,11 @@ class _ReadInboxTask:
         status=None,
         kind=None,
         labels: list[str] | None = None,
+        priority=None,
         updated_at: datetime | None = None,
     ) -> None:
         from pollypm.inbox.kind import InboxItemKind
-        from pollypm.work.models import WorkStatus
+        from pollypm.work.models import Priority, WorkStatus
 
         self.task_id = f"myproj/{n}"
         self.project = "myproj"
@@ -2138,6 +2141,7 @@ class _ReadInboxTask:
         self.roles = {"requester": "user", "operator": "pm"}
         self.current_node_id = None
         self.work_status = status or WorkStatus.IN_PROGRESS
+        self.priority = priority or Priority.NORMAL
         self.kind = kind or InboxItemKind.LEGACY
         self.created_at = datetime(2026, 5, 22, 12, 0, tzinfo=timezone.utc)
         self.updated_at = updated_at or self.created_at
@@ -2243,6 +2247,60 @@ def test_list_inbox_type_filter_matches_structured_kind(
     assert body["items"][0]["type"] == "approval_request"
     assert body["items"][0]["metadata"]["kind"] == "approval_request"
     assert svc.candidate_calls[0]["type_filter"] == "approval_request"
+
+
+def test_list_inbox_includes_priority(
+    client, auth_headers, monkeypatch,
+) -> None:
+    from pollypm.work.models import Priority
+
+    svc = _ReadInboxSvc([
+        _ReadInboxTask(1, title="Priority row", priority=Priority.CRITICAL),
+    ])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get("/api/v1/inbox", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["items"][0]["priority"] == "critical"
+
+
+def test_list_inbox_default_hides_notify_only_task_drafts(
+    client, auth_headers, monkeypatch,
+) -> None:
+    svc = _ReadInboxSvc([
+        _ReadInboxTask(1, title="Visible action"),
+        _ReadInboxTask(2, title="Draft notify", labels=["notify"]),
+    ])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get("/api/v1/inbox?project=myproj", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["myproj/1"]
+    assert body["total"] == 1
+
+
+def test_list_inbox_include_drafts_restores_notify_only_tasks(
+    client, auth_headers, monkeypatch,
+) -> None:
+    svc = _ReadInboxSvc([
+        _ReadInboxTask(1, title="Visible action"),
+        _ReadInboxTask(2, title="Draft notify", labels=["notify"]),
+    ])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get(
+        "/api/v1/inbox?project=myproj&include_drafts=true",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["myproj/1", "myproj/2"]
+    assert body["total"] == 2
 
 
 def test_list_inbox_limit_passes_bounded_candidate_limit(

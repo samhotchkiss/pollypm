@@ -99,6 +99,10 @@ def _log_mtime_iso(config, session_name: str) -> str | None:
     return datetime.fromtimestamp(stat.st_mtime, UTC).isoformat()
 
 
+def _value(value: Any) -> Any:
+    return getattr(value, "value", value)
+
+
 def _build_row(
     *,
     config,
@@ -125,6 +129,10 @@ def _build_row(
         "name": session.name,
         "role": session.role,
         "project": session.project,
+        "provider": str(_value(getattr(session, "provider", "")) or ""),
+        "account": getattr(session, "account", "") or "",
+        "window_name": window_name,
+        "tmux_session": storage_session,
         "window": f"{storage_session}:{window_name}",
         "status": status,
         "last_heartbeat_age": _humanize_age(hb_iso),

@@ -29,6 +29,8 @@ def _make_session(
     *,
     role: str = "worker",
     project: str = "demo",
+    provider: str = "claude",
+    account: str = "claude_main",
     window: str | None = None,
     auth_token: str = "",
     enabled: bool = True,
@@ -37,6 +39,8 @@ def _make_session(
         name=name,
         role=role,
         project=project,
+        provider=provider,
+        account=account,
         window_name=window or name,
         auth_token=auth_token,
         enabled=enabled,
@@ -216,6 +220,8 @@ class TestBuildRow:
             health=False,
         )
         assert row["window"] == "pollypm-storage-closet:worker-demo"
+        assert row["window_name"] == "worker-demo"
+        assert row["tmux_session"] == "pollypm-storage-closet"
 
 
 # ---------------------------------------------------------------------------
@@ -422,6 +428,11 @@ class TestSessionsHealthCLI:
         lines = [line for line in result.output.splitlines() if line.strip()]
         payloads = [json.loads(line) for line in lines]
         assert {p["name"] for p in payloads} == {"worker_demo", "worker_other"}
+        by_name = {p["name"]: p for p in payloads}
+        assert by_name["worker_demo"]["provider"] == "claude"
+        assert by_name["worker_demo"]["account"] == "claude_main"
+        assert by_name["worker_demo"]["tmux_session"] == "pollypm-storage-closet"
+        assert by_name["worker_demo"]["window"] == "pollypm-storage-closet:worker-demo"
         # No table header in JSON mode.
         assert "NAME" not in result.output
         # Each payload carries the required keys.
@@ -430,6 +441,10 @@ class TestSessionsHealthCLI:
                 "name",
                 "role",
                 "project",
+                "provider",
+                "account",
+                "window_name",
+                "tmux_session",
                 "window",
                 "status",
                 "last_heartbeat_age",

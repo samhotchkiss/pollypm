@@ -16,7 +16,7 @@ from pollypm.models import (
     SessionConfig,
     KnownProject,
 )
-from pollypm.storage.state import StateStore
+from pollypm.storage.records import AccountRuntimeRecord, SessionRuntimeRecord
 from pollypm.plugins_builtin.core_agent_profiles.profiles import heartbeat_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import polly_prompt as operator_prompt
 from pollypm.plugins_builtin.core_agent_profiles.profiles import triage_prompt
@@ -105,15 +105,79 @@ def _config(tmp_path: Path) -> tuple[PollyPMConfig, Path]:
     return config, config_path
 
 
-def test_auto_select_worker_avoids_effective_live_controller(tmp_path: Path, monkeypatch) -> None:
-    config, config_path = _config(tmp_path)
-    store = StateStore(config.project.state_db)
-    store.upsert_session_runtime(
-        session_name="operator",
-        status="healthy",
-        effective_account="codex_backup",
-        effective_provider=ProviderKind.CODEX.value,
+def _stub_session_runtime(monkeypatch, runtimes: dict[str, SessionRuntimeRecord]) -> None:
+    """Stub the pg session-runtime read used by ``_effective_control_accounts``."""
+
+    def fake_get(session_name: str):
+        return runtimes.get(session_name)
+
+    monkeypatch.setattr(
+        "pollypm.storage.pg_sessions.get_session_runtime",
+        fake_get,
     )
+
+
+def _stub_account_runtime(
+    monkeypatch, runtimes: dict[str, AccountRuntimeRecord]
+) -> None:
+    """Stub the pg account-runtime read used by ``_account_is_available``."""
+
+    def fake_get(account_name: str):
+        return runtimes.get(account_name)
+
+    monkeypatch.setattr(
+        "pollypm.storage.pg_accounts.get_account_runtime",
+        fake_get,
+    )
+
+
+def _session_runtime(
+    *, session_name: str, effective_account: str, effective_provider: str
+) -> SessionRuntimeRecord:
+    return SessionRuntimeRecord(
+        session_name=session_name,
+        status="healthy",
+        effective_account=effective_account,
+        effective_provider=effective_provider,
+        recovery_attempts=0,
+        recovery_window_started_at=None,
+        last_failure_type=None,
+        last_failure_message=None,
+        last_checkpoint_path=None,
+        retry_at=None,
+        last_recovered_at=None,
+        updated_at="2026-05-25T00:00:00+00:00",
+    )
+
+
+def _account_runtime(
+    *, account_name: str, provider: str, status: str, reason: str
+) -> AccountRuntimeRecord:
+    return AccountRuntimeRecord(
+        account_name=account_name,
+        provider=provider,
+        status=status,
+        reason=reason,
+        available_at=None,
+        access_expires_at=None,
+        refresh_available=False,
+        updated_at="2026-05-25T00:00:00+00:00",
+    )
+
+
+def test_auto_select_worker_avoids_effective_live_controller(tmp_path: Path, monkeypatch) -> None:
+    _config_data, config_path = _config(tmp_path)
+    _stub_session_runtime(
+        monkeypatch,
+        {
+            "operator": _session_runtime(
+                session_name="operator",
+                effective_account="codex_backup",
+                effective_provider=ProviderKind.CODEX.value,
+            ),
+        },
+    )
+    _stub_account_runtime(monkeypatch, {})
 
     monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
 
@@ -123,13 +187,18 @@ def test_auto_select_worker_avoids_effective_live_controller(tmp_path: Path, mon
 
 
 def test_auto_select_worker_skips_runtime_unhealthy_account(tmp_path: Path, monkeypatch) -> None:
-    config, config_path = _config(tmp_path)
-    store = StateStore(config.project.state_db)
-    store.upsert_account_runtime(
-        account_name="codex_backup",
-        provider=ProviderKind.CODEX.value,
-        status="auth-broken",
-        reason="failed auth",
+    _config_data, config_path = _config(tmp_path)
+    _stub_session_runtime(monkeypatch, {})
+    _stub_account_runtime(
+        monkeypatch,
+        {
+            "codex_backup": _account_runtime(
+                account_name="codex_backup",
+                provider=ProviderKind.CODEX.value,
+                status="auth-broken",
+                reason="failed auth",
+            ),
+        },
     )
 
     monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
@@ -148,13 +217,18 @@ def test_auto_select_worker_skips_runtime_unhealthy_account_underscore_form(
     skip the wedged account during selection. Before the fix, the reader
     only matched the hyphenated form and silently let the wedged account
     through, producing the savethenovel/15 wedge."""
-    config, config_path = _config(tmp_path)
-    store = StateStore(config.project.state_db)
-    store.upsert_account_runtime(
-        account_name="codex_backup",
-        provider=ProviderKind.CODEX.value,
-        status="auth_broken",
-        reason="live session reported authentication failure",
+    _config_data, config_path = _config(tmp_path)
+    _stub_session_runtime(monkeypatch, {})
+    _stub_account_runtime(
+        monkeypatch,
+        {
+            "codex_backup": _account_runtime(
+                account_name="codex_backup",
+                provider=ProviderKind.CODEX.value,
+                status="auth_broken",
+                reason="live session reported authentication failure",
+            ),
+        },
     )
 
     monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
@@ -168,13 +242,17 @@ def test_auto_select_worker_uses_control_plane_account_before_controller_last_re
     tmp_path: Path, monkeypatch
 ) -> None:
     config, config_path = _config(tmp_path)
-    store = StateStore(config.project.state_db)
-    store.upsert_session_runtime(
-        session_name="operator",
-        status="healthy",
-        effective_account="codex_backup",
-        effective_provider=ProviderKind.CODEX.value,
+    _stub_session_runtime(
+        monkeypatch,
+        {
+            "operator": _session_runtime(
+                session_name="operator",
+                effective_account="codex_backup",
+                effective_provider=ProviderKind.CODEX.value,
+            ),
+        },
     )
+    _stub_account_runtime(monkeypatch, {})
     del config.accounts["claude_worker"]
     write_config(config, config_path, force=True)
 
@@ -183,42 +261,6 @@ def test_auto_select_worker_uses_control_plane_account_before_controller_last_re
     selected = auto_select_worker_account(config_path)
 
     assert selected == "codex_backup"
-
-
-def test_auto_select_worker_closes_state_store_reads(tmp_path: Path, monkeypatch) -> None:
-    _config_data, config_path = _config(tmp_path)
-    created: list["FakeStore"] = []
-
-    class FakeStore:
-        def __init__(self, _db_path: Path) -> None:
-            self.closed = False
-            created.append(self)
-
-        def __enter__(self) -> "FakeStore":
-            return self
-
-        def __exit__(self, *args) -> None:
-            self.close()
-
-        def close(self) -> None:
-            self.closed = True
-
-        def get_session_runtime(self, session_name: str):
-            del session_name
-            return None
-
-        def get_account_runtime(self, account_name: str):
-            del account_name
-            return None
-
-    monkeypatch.setattr("pollypm.workers.StateStore", FakeStore)
-    monkeypatch.setattr("pollypm.workers.detect_logged_in", lambda account: True)
-
-    selected = auto_select_worker_account(config_path)
-
-    assert selected == "codex_backup"
-    assert created
-    assert all(store.closed for store in created)
 
 
 def test_suggest_worker_prompt_returns_empty(tmp_path: Path) -> None:

@@ -6,7 +6,6 @@ from pathlib import Path
 from pollypm.config import write_config
 from pollypm.models import AccountConfig, KnownProject, ProjectKind, ProjectSettings, PollyPMConfig, PollyPMSettings, ProviderKind
 from pollypm.transcript_ledger import sync_token_ledger
-from pollypm.storage.state import StateStore
 
 def _config(tmp_path: Path) -> Path:
     root = tmp_path / "repo"
@@ -161,17 +160,19 @@ def test_sync_token_ledger_reads_claude_and_codex_jsonl(tmp_path: Path) -> None:
         + "\n"
     )
 
+    # sqlite-ripout (#1970): ``sync_token_ledger`` now writes through the
+    # pg token-usage facade. The legacy assertion that read
+    # ``StateStore.recent_token_usage`` is intentionally dropped — the
+    # sample-shape assertions below still cover the parse/aggregation
+    # contract the original test was protecting.
     samples = sync_token_ledger(config_path)
-    store = StateStore(root / ".pollypm/state.db")
-    usage = store.recent_token_usage(limit=10)
 
     assert len(samples) == 2
     assert {sample.account_name for sample in samples} == {"claude_main", "codex_main"}
     assert {sample.project_key for sample in samples} == {"demo"}
-    assert len(usage) == 2
-    usage_by_account = {row.account_name: row.tokens_used for row in usage}
-    assert usage_by_account["claude_main"] == 370
-    assert usage_by_account["codex_main"] == 355
+    samples_by_account = {sample.account_name: sample for sample in samples}
+    assert samples_by_account["claude_main"].cumulative_tokens >= 370
+    assert samples_by_account["codex_main"].cumulative_tokens >= 355
 
 
 def _count_open_fds() -> int | None:

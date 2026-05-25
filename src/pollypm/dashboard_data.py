@@ -14,8 +14,11 @@ from pollypm.config import PollyPMConfig, load_config
 
 logger = logging.getLogger(__name__)
 
-# Test seam for ``load_dashboard``. Kept lazy in production so importing
-# dashboard_data does not eagerly open the sqlite state module.
+# sqlite-ripout (#1970): ``StateStore`` is no longer constructed from
+# ``load_dashboard``. The pg facades are the only production read path.
+# The symbol is kept as ``None`` so legacy tests that monkeypatch
+# ``pollypm.dashboard_data.StateStore`` still import cleanly; the
+# refactored ``load_dashboard`` simply never references it.
 StateStore = None
 
 
@@ -812,24 +815,16 @@ def _account_quota_usage(config: PollyPMConfig, store: object | None) -> list[Ac
 
 
 def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
-    """Load config + state store and gather one blocking dashboard snapshot."""
+    """Load config and gather one blocking dashboard snapshot.
+
+    sqlite-ripout (#1970): ``StateStore`` is no longer constructed here.
+    Production runs on the pg facades; ``gather(config, None)`` is the
+    only path. The sqlite fallback that used to open
+    ``config.project.state_db`` was the last in-process call site that
+    routinely created a legacy sqlite file on the dashboard hot path.
+    """
     config = load_config(config_path)
-    from pollypm.storage._backend_dispatch import is_pg_backend
-
-    if is_pg_backend(config):
-        data = gather(config, None)
-        return config, data
-    global StateStore
-    if StateStore is None:
-        from pollypm.storage.state import StateStore as _StateStore
-
-        StateStore = _StateStore
-
-    store = StateStore(config.project.state_db)
-    try:
-        data = gather(config, store)
-    finally:
-        store.close()
+    data = gather(config, None)
     return config, data
 
 

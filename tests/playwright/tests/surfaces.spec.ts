@@ -742,6 +742,76 @@ test.describe("surfaces", () => {
     );
   });
 
+  test("SSE queued surface refresh preserves timeout error until success", async ({ page }) => {
+    await page.clock.install({ time: new Date("2026-05-23T00:00:00Z") });
+    await installHealthyEventSource(page);
+    await stubEmptyTasks(page);
+    await stubEmptyProjects(page);
+    await stubEmptyActivity(page);
+    await page.addInitScript(() => {
+      (window as any).__POLLYPM_RAIL_REQUEST_TIMEOUT_MS = 1000;
+    });
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(0)),
+      }),
+    );
+
+    let sessionRequests = 0;
+    let secondRequestWaiting = false;
+    let releaseFirst: (() => void) | null = null;
+    let releaseSecond: (() => void) | null = null;
+    const firstRequestGate = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    const secondRequestGate = new Promise<void>((resolve) => {
+      releaseSecond = resolve;
+    });
+
+    await page.route("**/api/v1/chat/sessions", async (route) => {
+      sessionRequests += 1;
+      if (sessionRequests === 1) {
+        await firstRequestGate;
+      } else if (sessionRequests === 2) {
+        secondRequestWaiting = true;
+        await secondRequestGate;
+        secondRequestWaiting = false;
+      }
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      }).catch(() => undefined);
+    });
+
+    await page.goto("/ui/", { waitUntil: "domcontentloaded" });
+    await page.clock.runFor(1);
+    await expect.poll(() => sessionRequests).toBe(1);
+
+    await emitAuditEvent(page, 1);
+    await page.clock.runFor(151);
+    await expect.poll(() =>
+      page.evaluate(() => (window as any).PollyPM.state.surfacesRefreshQueued),
+    ).toBe(true);
+
+    await page.clock.runFor(849);
+    await expect.poll(() => sessionRequests).toBe(2);
+    await expect.poll(() => secondRequestWaiting).toBe(true);
+    await expect(page.locator("#surface-list")).toContainText(
+      "error: chat unavailable: chat surfaces request timed out after 1s",
+      { timeout: 750 },
+    );
+
+    releaseSecond!();
+    await expect(page.locator("#surface-list .surface-empty")).toHaveText(
+      "no surfaces registered",
+      { timeout: 750 },
+    );
+    releaseFirst!();
+  });
+
   test("initial center-pane state shows inline next actions", async ({ page }) => {
     await page.goto("/ui/");
     await expect(page.locator("#pane-title")).toHaveText("Ready");

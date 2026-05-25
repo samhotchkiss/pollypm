@@ -171,6 +171,15 @@ class FakeHeartbeatAPI:
     def mark_account_auth_broken(self, account_name: str, provider: str, *, reason: str) -> None:
         self.account_marks.append((account_name, provider, reason))
 
+    def mark_account_capacity_exhausted(
+        self,
+        account_name: str,
+        provider: str,
+        *,
+        reason: str,
+    ) -> None:
+        self.account_marks.append((account_name, provider, reason))
+
     def recent_snapshot_hashes(self, session_name: str, *, limit: int = 3) -> list[str]:
         return self._hashes.get(session_name, [])[:limit]
 
@@ -999,6 +1008,40 @@ def test_local_heartbeat_backend_marks_auth_broken_on_org_disabled() -> None:
     assert api.account_marks == [
         ("claude_controller", "claude", "live session reported authentication failure")
     ]
+
+
+def test_local_heartbeat_backend_marks_login_prompt_auth_broken() -> None:
+    pane_text = "Not logged in · Please run /login"
+    api = FakeHeartbeatAPI([_context(transcript_delta=pane_text)])
+
+    LocalHeartbeatBackend().run(api)
+
+    assert api.statuses["worker_pollypm"][0] == "auth_broken"
+    assert ("worker_pollypm", "auth_broken") in api.alerts
+    assert any(
+        session == "worker_pollypm" and failure_type == "auth_broken"
+        for session, failure_type, _ in api.recoveries
+    )
+
+
+def test_local_heartbeat_backend_marks_capacity_exhausted() -> None:
+    pane_text = (
+        "You've hit your limit · resets May 26 at 8pm "
+        "(America/Denver)\n/usage-credits to finish what you're working on."
+    )
+    api = FakeHeartbeatAPI([_context(transcript_delta=pane_text)])
+
+    LocalHeartbeatBackend().run(api)
+
+    assert api.statuses["worker_pollypm"][0] == "capacity_exhausted"
+    assert ("worker_pollypm", "capacity_exhausted") in api.alerts
+    assert api.account_marks == [
+        ("claude_controller", "claude", "live session reported capacity exhaustion")
+    ]
+    assert any(
+        session == "worker_pollypm" and failure_type == "capacity_exhausted"
+        for session, failure_type, _ in api.recoveries
+    )
 
 
 def test_local_heartbeat_backend_triggers_recovery_on_auth_broken() -> None:

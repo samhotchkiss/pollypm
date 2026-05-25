@@ -247,6 +247,20 @@ class SupervisorHeartbeatAPI:
             reason=reason,
         )
 
+    def mark_account_capacity_exhausted(
+        self,
+        account_name: str,
+        provider: str,
+        *,
+        reason: str,
+    ) -> None:
+        self.supervisor.store.upsert_account_runtime(
+            account_name=account_name,
+            provider=provider,
+            status="exhausted",
+            reason=reason,
+        )
+
     def recent_snapshot_hashes(self, session_name: str, *, limit: int = 3) -> list[str]:
         return [
             item.snapshot_hash

@@ -87,11 +87,18 @@ def classify_status(
     *,
     window_present: bool,
     age_seconds: int | None,
+    runtime_status: str | None = None,
+    last_failure_type: str | None = None,
 ) -> str:
-    """Return one of ``healthy`` / ``stale`` / ``missing`` / ``unknown``.
+    """Return a user-facing session-health status.
 
     ``missing`` wins over ``stale`` — when the tmux window is gone the
     pane is the more urgent problem and reporting both would be noisy.
+
+    Runtime failure pins win over heartbeat freshness when the window
+    is still present. A session that is actively printing "not logged
+    in" or "you've hit your limit" can keep emitting fresh heartbeats;
+    the persisted runtime failure is the functional health signal.
 
     The pause marker is intentionally NOT consulted here (Codex PR #2061
     round 2). Pause is informational only — folding it into ``status``
@@ -99,11 +106,47 @@ def classify_status(
     """
     if not window_present:
         return "missing"
+    runtime_override = runtime_status_override(
+        runtime_status=runtime_status,
+        last_failure_type=last_failure_type,
+    )
+    if runtime_override is not None:
+        return runtime_override
     if age_seconds is None:
         return "unknown"
     if age_seconds > STALE_HEARTBEAT_SECONDS:
         return "stale"
     return "healthy"
+
+
+def runtime_status_override(
+    *,
+    runtime_status: str | None,
+    last_failure_type: str | None = None,
+) -> str | None:
+    """Return the functional-failure status that should override liveness.
+
+    The runtime table is the source of truth for failures detected by the
+    heartbeat/recovery path. Keep this mapping narrow so ordinary
+    lifecycle states such as ``idle`` do not shadow the mechanical
+    heartbeat classification.
+    """
+    status = (runtime_status or "").strip()
+    failure = (last_failure_type or "").strip()
+    failure_pinned = status in {"recovering", "blocked", "degraded"}
+    if status == "auth_broken" or (failure_pinned and failure == "auth_broken"):
+        return "auth_broken"
+    if status in {"capacity_exhausted", "exhausted", "blocked_no_capacity"}:
+        return "capacity_exhausted"
+    if failure_pinned and failure in {"capacity_exhausted", "capacity_low"}:
+        return "capacity_exhausted"
+    if status == "provider_outage" or (
+        failure_pinned and failure == "provider_outage"
+    ):
+        return "provider_outage"
+    if status in {"blocked", "degraded"} and failure:
+        return status
+    return None
 
 
 def latest_heartbeat(config: Any, session_name: str) -> Any | None:
@@ -123,6 +166,24 @@ def latest_heartbeat(config: Any, session_name: str) -> Any | None:
     except Exception:  # noqa: BLE001
         logger.debug(
             "latest_heartbeat lookup failed for %s",
+            session_name,
+            exc_info=True,
+        )
+        return None
+
+
+def latest_session_runtime(config: Any, session_name: str) -> Any | None:
+    """Fetch the latest session runtime row; ``None`` on any failure."""
+    try:
+        from pollypm.storage.pg_sessions import get_session_runtime as _pg
+    except Exception:  # noqa: BLE001
+        logger.debug("pg_sessions import failed", exc_info=True)
+        return None
+    try:
+        return _pg(session_name, config=config)
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "session_runtime lookup failed for %s",
             session_name,
             exc_info=True,
         )
@@ -351,8 +412,10 @@ __all__ = [
     "classify_status",
     "humanize_age",
     "latest_heartbeat",
+    "latest_session_runtime",
     "list_storage_closet_windows",
     "parse_iso",
     "probe_strict_turn_active",
+    "runtime_status_override",
     "storage_session_name",
 ]

@@ -9,6 +9,12 @@ from typing import Any
 
 from pollypm.heartbeats.base import HeartbeatBackend, HeartbeatSessionContext
 from pollypm.persona_drift import detect_persona_drift
+from pollypm.provider_failures import (
+    AUTH_FAILURE_PATTERNS,
+    CAPACITY_FAILURE_PATTERNS,
+    has_auth_failure,
+    has_capacity_failure,
+)
 from pollypm.recovery.base import (
     InterventionHistoryEntry,
     SessionHealth,
@@ -554,16 +560,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
     # recovery (auth, missing window, pane_dead, role_crashed) counts.
     _CRASH_LOOP_ATTEMPT_THRESHOLD = 2
 
-    _AUTH_FAILURE_PATTERNS = (
-        "authentication failure",
-        "not authenticated",
-        "login required",
-        "please login",
-        "please log in",
-        "invalid api key",
-        "disabled claude subscription",
-        "use an anthropic api key",
-    )
+    _AUTH_FAILURE_PATTERNS = AUTH_FAILURE_PATTERNS
+    _CAPACITY_FAILURE_PATTERNS = CAPACITY_FAILURE_PATTERNS
     _WAITING_PATTERNS = (
         "let me know",
         "waiting for your",
@@ -846,6 +844,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         alerts.extend(self._handle_persona_drift(api, context))
 
         status_locked = self._handle_auth_failure(api, context, alerts)
+        if not status_locked:
+            status_locked = self._handle_capacity_failure(api, context, alerts)
 
         if context.pane_dead:
             status_locked = True
@@ -1168,8 +1168,8 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         """
         combined_text = "\n".join(
             part for part in [context.transcript_delta, context.pane_text] if part
-        ).lower()
-        if any(pattern in combined_text for pattern in self._AUTH_FAILURE_PATTERNS):
+        )
+        if has_auth_failure(combined_text):
             _emit_routed_alert(
                 api,
                 session_name=context.session_name,
@@ -1212,6 +1212,55 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             )
             return True
         api.clear_alert(context.session_name, "auth_broken")
+        return False
+
+    def _handle_capacity_failure(
+        self,
+        api,
+        context: HeartbeatSessionContext,
+        alerts: list[str],
+    ) -> bool:
+        """Detect provider usage/quota exhaustion and trigger failover."""
+        combined_text = "\n".join(
+            part for part in [context.transcript_delta, context.pane_text] if part
+        )
+        if has_capacity_failure(combined_text):
+            _emit_routed_alert(
+                api,
+                session_name=context.session_name,
+                alert_type="capacity_exhausted",
+                severity="error",
+                message=(
+                    f"Window {context.window_name} reported a usage or quota limit"
+                ),
+                subject=f"{context.session_name} account capacity exhausted",
+                suggested_action=(
+                    "Open Settings to inspect account capacity, then "
+                    "restart the session from Workers."
+                ),
+            )
+            marker = getattr(api, "mark_account_capacity_exhausted", None)
+            if marker is not None:
+                marker(
+                    context.account_name,
+                    context.provider,
+                    reason="live session reported capacity exhaustion",
+                )
+            self._set_session_status(
+                api,
+                context,
+                "capacity_exhausted",
+                reason="Provider usage or quota limit reported",
+            )
+            alerts.append("capacity_exhausted")
+            self._recover_session(
+                api,
+                context,
+                failure_type="capacity_exhausted",
+                message="Provider usage or quota limit reported",
+            )
+            return True
+        api.clear_alert(context.session_name, "capacity_exhausted")
         return False
 
     def _handle_persona_drift(
@@ -1700,15 +1749,21 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         except Exception:  # noqa: BLE001
             placeholder_idle = False
 
+        from pollypm.capacity import CapacityState
+
+        pane_failure_text = context.transcript_delta or context.pane_text or ""
+
         return SessionSignals(
             session_name=context.session_name,
             window_present=context.window_present,
             pane_dead=context.pane_dead,
             output_stale=not bool(context.transcript_delta),
             snapshot_repeated=repeated,
-            auth_failure=any(
-                p in (context.transcript_delta or context.pane_text or "").lower()
-                for p in self._AUTH_FAILURE_PATTERNS
+            auth_failure=has_auth_failure(pane_failure_text),
+            capacity_state=(
+                CapacityState.EXHAUSTED
+                if has_capacity_failure(pane_failure_text)
+                else CapacityState.UNKNOWN
             ),
             has_transcript_delta=bool(context.transcript_delta),
             last_verdict=context.cursor.last_verdict if context.cursor else "",

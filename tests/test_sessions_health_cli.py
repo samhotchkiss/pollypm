@@ -106,6 +106,48 @@ class TestClassifier:
             == "stale"
         )
 
+    def test_runtime_auth_failure_overrides_fresh_heartbeat(self) -> None:
+        assert (
+            mod._classify_status(
+                window_present=True,
+                age_seconds=5,
+                runtime_status="auth_broken",
+            )
+            == "auth_broken"
+        )
+
+    def test_runtime_capacity_failure_overrides_fresh_heartbeat(self) -> None:
+        assert (
+            mod._classify_status(
+                window_present=True,
+                age_seconds=5,
+                runtime_status="recovering",
+                last_failure_type="capacity_exhausted",
+            )
+            == "capacity_exhausted"
+        )
+
+    def test_missing_window_still_wins_over_runtime_failure(self) -> None:
+        assert (
+            mod._classify_status(
+                window_present=False,
+                age_seconds=5,
+                runtime_status="auth_broken",
+            )
+            == "missing"
+        )
+
+    def test_recovered_runtime_does_not_pin_old_failure(self) -> None:
+        assert (
+            mod._classify_status(
+                window_present=True,
+                age_seconds=5,
+                runtime_status="healthy",
+                last_failure_type="capacity_exhausted",
+            )
+            == "healthy"
+        )
+
 
 # ---------------------------------------------------------------------------
 # humanize_age
@@ -138,6 +180,7 @@ class TestHumanize:
 class TestBuildRow:
     def test_token_ok_when_session_has_auth_token(self, monkeypatch) -> None:
         monkeypatch.setattr(mod, "_latest_heartbeat", lambda *_, **__: None)
+        monkeypatch.setattr(mod, "_latest_session_runtime", lambda *_, **__: None)
         session = _make_session("worker_demo", auth_token="cafebabe" * 8)
         row = mod._build_row(
             config=_make_config(sessions={"worker_demo": session}),
@@ -150,6 +193,7 @@ class TestBuildRow:
 
     def test_token_missing_for_legacy_session(self, monkeypatch) -> None:
         monkeypatch.setattr(mod, "_latest_heartbeat", lambda *_, **__: None)
+        monkeypatch.setattr(mod, "_latest_session_runtime", lambda *_, **__: None)
         session = _make_session("worker_legacy", auth_token="")
         row = mod._build_row(
             config=_make_config(sessions={"worker_legacy": session}),
@@ -162,6 +206,7 @@ class TestBuildRow:
 
     def test_window_target_includes_storage_session(self, monkeypatch) -> None:
         monkeypatch.setattr(mod, "_latest_heartbeat", lambda *_, **__: None)
+        monkeypatch.setattr(mod, "_latest_session_runtime", lambda *_, **__: None)
         session = _make_session("worker_demo", window="worker-demo")
         row = mod._build_row(
             config=_make_config(sessions={"worker_demo": session}),
@@ -209,6 +254,7 @@ class TestLatestHeartbeatPgOnly:
         monkeypatch.setattr(
             mod, "_list_windows", lambda _name: {"worker-demo": _fake_window()}
         )
+        monkeypatch.setattr(mod, "_latest_session_runtime", lambda *_, **__: None)
 
         result = runner.invoke(_build_cli_app(), ["sessions", "--json"])
         assert result.exit_code == 0, result.output
@@ -228,6 +274,7 @@ def _install_fakes(
     sessions: dict[str, SimpleNamespace],
     windows: dict[str, SimpleNamespace],
     heartbeats: dict[str, SimpleNamespace | None],
+    runtimes: dict[str, SimpleNamespace | None] | None = None,
 ) -> None:
     config = _make_config(sessions=sessions)
     monkeypatch.setattr(
@@ -238,6 +285,12 @@ def _install_fakes(
         mod,
         "_latest_heartbeat",
         lambda _config, session_name: heartbeats.get(session_name),
+    )
+    runtimes = runtimes or {}
+    monkeypatch.setattr(
+        mod,
+        "_latest_session_runtime",
+        lambda _config, session_name: runtimes.get(session_name),
     )
 
 
@@ -382,6 +435,34 @@ class TestSessionsHealthCLI:
                 "last_heartbeat_age",
                 "token",
             } <= payload.keys()
+
+    def test_json_output_surfaces_runtime_failure_status(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        session = _make_session(
+            "operator",
+            role="operator-pm",
+            window="pm-operator",
+            auth_token="t" * 16,
+        )
+        _install_fakes(
+            monkeypatch,
+            sessions={"operator": session},
+            windows={"pm-operator": _fake_window()},
+            heartbeats={"operator": _heartbeat(seconds_ago=5)},
+            runtimes={
+                "operator": SimpleNamespace(
+                    status="auth_broken",
+                    last_failure_type="auth_broken",
+                )
+            },
+        )
+
+        result = runner.invoke(_build_cli_app(), ["sessions", "--json"])
+
+        assert result.exit_code == 0, result.output
+        payload = json.loads(result.output.strip().splitlines()[0])
+        assert payload["status"] == "auth_broken"
 
     def test_health_flag_adds_diagnostic_columns(
         self, monkeypatch: pytest.MonkeyPatch

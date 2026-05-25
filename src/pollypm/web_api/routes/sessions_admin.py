@@ -34,7 +34,7 @@ Design notes
 ------------
 
 * **Read-side health.** Shares the :mod:`pollypm.session_health`
-  classification (``healthy`` / ``stale`` / ``missing`` / ``unknown``)
+  classification (mechanical liveness plus runtime failure pins)
   with the ``pm sessions`` CLI so the API returns the same status
   field an operator sees there (Codex PR #2061 round 5 blocker 3 —
   single source of truth for the contract). Heartbeats come from the
@@ -77,8 +77,9 @@ Design notes
   ``status="paused"`` and operators would believe the daemon had
   quiesced when in fact the session was simply absent. ``status``
   reflects pure runtime health (``healthy`` / ``stale`` /
-  ``missing`` / ``unknown``) and ``paused`` carries the operator
-  intent. The response ``message`` and OpenAPI description both
+  ``missing`` / ``unknown`` plus functional failures such as
+  ``auth_broken`` and ``capacity_exhausted``) and ``paused`` carries
+  the operator intent. The response ``message`` and OpenAPI description both
   spell out which loops do and do not yet consume the marker so an
   operator is never misled. Both operations are idempotent and
   return 200, and concurrent writes are serialised by an
@@ -115,6 +116,9 @@ from pollypm.session_health import (
 )
 from pollypm.session_health import (
     latest_heartbeat as _latest_heartbeat,
+)
+from pollypm.session_health import (
+    latest_session_runtime as _latest_session_runtime,
 )
 from pollypm.session_health import (
     list_storage_closet_windows as _list_storage_closet_windows,
@@ -177,7 +181,17 @@ class SessionInfo(BaseModel):
     window_name: str
     tmux_session: str
     window_present: bool
-    status: Literal["healthy", "stale", "missing", "unknown"]
+    status: Literal[
+        "healthy",
+        "stale",
+        "missing",
+        "unknown",
+        "auth_broken",
+        "capacity_exhausted",
+        "provider_outage",
+        "blocked",
+        "degraded",
+    ]
     last_heartbeat_iso: str | None = None
     last_heartbeat_age_seconds: int | None = None
     auth_token_present: bool
@@ -471,9 +485,12 @@ def _build_session_info(
     hb_iso = getattr(heartbeat, "created_at", None) if heartbeat else None
     age = _age_seconds(hb_iso)
     window_present = window is not None
+    runtime = _latest_session_runtime(config, session.name)
     status = _classify_status(
         window_present=window_present,
         age_seconds=age,
+        runtime_status=getattr(runtime, "status", None),
+        last_failure_type=getattr(runtime, "last_failure_type", None),
     )
     auth_token_present = bool(getattr(session, "auth_token", "") or "")
     return SessionInfo(

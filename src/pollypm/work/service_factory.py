@@ -347,7 +347,7 @@ def provision_claimed_worker(
             try:
                 session_mgr.provision_worker(task_id, agent_name)
             except Exception as exc:  # noqa: BLE001
-                _rollback_deferred_claim_if_cap_exceeded(
+                _record_deferred_provision_failure(
                     svc, task, task_id, agent_name, exc
                 )
                 raise
@@ -360,48 +360,40 @@ def provision_claimed_worker(
         )
 
 
-def _rollback_deferred_claim_if_cap_exceeded(
+def _record_deferred_provision_failure(
     svc: Any,
     task: Any,
     task_id: str,
     actor: str,
     exc: BaseException,
 ) -> None:
-    """Mirror PgWorkService.claim's cap-race rollback when available."""
-    if not _is_worker_cap_exceeded(exc):
+    """Audit deferred provisioning failure without undoing the claim.
+
+    The HTTP claim response has already reported success by the time
+    deferred provisioning runs. Rolling the task back in the background
+    makes the 200 response false and hides the ownership boundary from
+    operators. Keep the claim and record an explicit breadcrumb instead.
+    """
+    add_context = getattr(svc, "add_context", None)
+    if not callable(add_context):
         return
-    status = getattr(getattr(task, "work_status", None), "value", None)
-    if status is None:
-        status = getattr(task, "work_status", None)
-    if status != "in_progress":
-        return
-    rollback = getattr(svc, "_rollback_claim_to_queued", None)
-    if not callable(rollback):
-        return
-    node_id = getattr(task, "current_node_id", None)
-    if not node_id:
-        return
+    reason = (
+        "Deferred worker provisioning failed after the task was claimed; "
+        f"claim preserved for {actor}. Error: {exc}"
+    )
     try:
-        rollback(
-            getattr(task, "project"),
-            getattr(task, "task_number"),
-            node_id,
-            actor,
-            exc,
+        add_context(
+            task_id,
+            "system",
+            reason,
+            entry_type="worker_provision_failed",
         )
     except Exception:  # noqa: BLE001
         logger.warning(
-            "deferred claim provision: rollback failed for %s",
+            "deferred claim provision: failed to record context for %s",
             task_id,
             exc_info=True,
         )
-
-
-def _is_worker_cap_exceeded(exc: BaseException) -> bool:
-    for cls in type(exc).__mro__:
-        if cls.__name__ == "WorkerCapExceededError":
-            return True
-    return False
 
 
 def open_project_work_service(project: Any, *, config: Any = None) -> Any | None:

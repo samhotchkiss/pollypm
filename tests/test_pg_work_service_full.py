@@ -1512,6 +1512,32 @@ def test_block_marks_task_blocked(pg_service):
     assert blocked.work_status is WorkStatus.BLOCKED
 
 
+def test_block_from_active_task_ends_worker_session(pg_service):
+    from datetime import UTC, datetime
+
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    claimed = pg_service.claim(task.task_id, actor="alice")
+    pg_service.upsert_worker_session(
+        task_project=claimed.project,
+        task_number=claimed.task_number,
+        agent_name="alice",
+        pane_id="p",
+        worktree_path="/tmp/wt",
+        branch_name="b",
+        started_at=datetime.now(UTC),
+    )
+    blocker = _make_draft(pg_service, title="blocker")
+
+    pg_service.block(task.task_id, actor="user", blocker_task_id=blocker.task_id)
+
+    assert pg_service.get_worker_session(
+        task_project=task.project,
+        task_number=task.task_number,
+        active_only=True,
+    ) is None
+
+
 def test_blocked_tasks_filter_by_project(pg_service):
     task = _drive_to_review(pg_service)
     pg_service.node_done(
@@ -1682,6 +1708,50 @@ def test_worker_session_active_only_filter(pg_service):
     assert rec_any is not None
     assert rec_any.total_input_tokens == 100
     assert rec_any.total_output_tokens == 200
+
+
+def test_force_review_from_active_task_ends_worker_session(pg_service):
+    from datetime import UTC, datetime
+
+    task = _make_draft(pg_service)
+    pg_service.queue(task.task_id, actor="user")
+    claimed = pg_service.claim(task.task_id, actor="alice")
+    pg_service.upsert_worker_session(
+        task_project=claimed.project,
+        task_number=claimed.task_number,
+        agent_name="alice",
+        pane_id="p",
+        worktree_path="/tmp/wt",
+        branch_name="b",
+        started_at=datetime.now(UTC),
+    )
+
+    pg_service.force_review(task.task_id, actor="alice")
+
+    assert pg_service.get_worker_session(
+        task_project=task.project,
+        task_number=task.task_number,
+        active_only=True,
+    ) is None
+
+
+def test_capacity_count_ignores_unclaimed_active_rows(pg_service):
+    from pollypm.work.models import WorkStatus
+
+    claimed_task = _make_draft(pg_service, title="claimed")
+    pg_service.queue(claimed_task.task_id, actor="user")
+    pg_service.claim(claimed_task.task_id, actor="alice")
+    orphan = _make_draft(pg_service, title="orphan")
+    pg_service.queue(orphan.task_id, actor="user")
+    orphan = pg_service.force_in_progress(orphan.task_id, actor="operator")
+
+    assert orphan.work_status is WorkStatus.IN_PROGRESS
+    assert orphan.claimed_by_session is None
+    assert pg_service.count_capacity_consuming_tasks(project="demo") == 1
+    assert pg_service.count_capacity_consuming_tasks(
+        project="demo",
+        exclude_task_id=claimed_task.task_id,
+    ) == 0
 
 
 def test_list_worker_sessions_active_only(pg_service):

@@ -25,7 +25,6 @@ from fastapi import Depends, FastAPI, Header, Request, Response
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from pollypm.config import PollyPMConfig, load_config
 from pollypm.web_api.auth import (
@@ -848,14 +847,27 @@ def _mount_web_ui(
         # `pm api regen-token`).
         return response
 
-    # Static assets served raw. ``html=False`` keeps StaticFiles from
-    # hijacking the bare ``/ui/`` path (we've already taken that route
-    # above with the cookie-setting handler).
-    app.mount(
-        "/ui",
-        StaticFiles(directory=str(ui_dir), html=False),
-        name="ui-static",
-    )
+    ui_root = ui_dir.resolve()
+    spa_deep_links = {"", "inbox", "tasks", "alerts"}
+
+    @app.get("/ui/{asset_path:path}", include_in_schema=False)
+    def _ui_static_asset(
+        asset_path: str,
+        request: Request,
+        authorization: str | None = Header(default=None),
+    ) -> Response:
+        normalized = asset_path.strip("/")
+        if normalized in spa_deep_links:
+            return _ui_index(request, authorization)
+
+        candidate = (ui_dir / asset_path).resolve()
+        try:
+            candidate.relative_to(ui_root)
+        except ValueError:
+            return Response("Not Found", status_code=404)
+        if not candidate.is_file():
+            return Response("Not Found", status_code=404)
+        return FileResponse(candidate)
 
 
 __all__ = ["API_V1_PREFIX", "create_app"]

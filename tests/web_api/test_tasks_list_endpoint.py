@@ -18,9 +18,11 @@ state across runs.
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from pollypm.work.models import TaskSummaryProjection
 from pollypm.work.factory import create_work_service
 
 from .conftest import make_task
@@ -141,7 +143,12 @@ def test_list_tasks_timing_uses_latest_transition(
     db_path = api_config.project.state_db
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with create_work_service(db_path=db_path, project_path=project_root) as svc:
-        task = make_task(svc, project="myproj", title="Queued timing")
+        task = make_task(
+            svc,
+            project="myproj",
+            title="Queued timing",
+            description="queueable task",
+        )
         svc.queue(task.task_id, actor="tester")
 
     now = datetime.now(timezone.utc).replace(microsecond=0)
@@ -170,7 +177,6 @@ def test_list_all_tasks_uses_list_rows_without_per_item_refetch(
 ) -> None:
     """The flat task list must not turn a page into N extra ``get`` calls."""
     from contextlib import contextmanager
-    from types import SimpleNamespace
 
     from pollypm.web_api import service as svc_mod
 
@@ -207,6 +213,61 @@ def test_list_all_tasks_uses_list_rows_without_per_item_refetch(
 
         def get(self, task_id):  # pragma: no cover - failure path
             raise AssertionError(f"unexpected per-item refetch: {task_id}")
+
+    @contextmanager
+    def fake_open(**_kwargs):
+        yield FakeService()
+
+    monkeypatch.setattr(svc_mod, "_open_work_service_readonly", fake_open)
+
+    items, next_cursor, warnings, total = svc_mod.list_all_tasks(
+        api_config, limit=10
+    )
+
+    assert [item.task_id for item in items] == ["myproj/1"]
+    assert items[0].state_entered_at == now - timedelta(minutes=5)
+    assert next_cursor is None
+    assert warnings == []
+    assert total == 1
+
+
+def test_list_all_tasks_uses_summary_page_without_full_hydration(
+    api_config, monkeypatch
+) -> None:
+    from contextlib import contextmanager
+
+    from pollypm.web_api import service as svc_mod
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    class FakeService:
+        def list_task_summary_page(self, **kwargs):
+            assert kwargs["projects"] == ("myproj",)
+            assert kwargs["limit"] == 10
+            return (
+                [
+                    TaskSummaryProjection(
+                        task_id="myproj/1",
+                        project="myproj",
+                        task_number=1,
+                        title="Projected",
+                        work_status="queued",
+                        type="task",
+                        priority="normal",
+                        created_at=now - timedelta(hours=1),
+                        state_entered_at=now - timedelta(minutes=5),
+                        updated_at=now,
+                    )
+                ],
+                None,
+                1,
+            )
+
+        def count_task_summary_matches(self, **_kwargs):
+            return 0
+
+        def list_tasks(self, **_kwargs):  # pragma: no cover - failure path
+            raise AssertionError("summary page must avoid full task hydration")
 
     @contextmanager
     def fake_open(**_kwargs):
@@ -334,7 +395,12 @@ def test_list_tasks_status_filter_or_semantics(
         # another so we have a status nobody asks for.
         make_task(svc, project="myproj", title="Drafty")
         cancelled = make_task(svc, project="myproj", title="Cancelled one")
-        queued = make_task(svc, project="myproj", title="Queued one")
+        queued = make_task(
+            svc,
+            project="myproj",
+            title="Queued one",
+            description="queueable task",
+        )
         svc.queue(queued.task_id, actor="tester")
         svc.cancel(cancelled.task_id, actor="tester", reason="cleanup")
 

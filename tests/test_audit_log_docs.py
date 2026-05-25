@@ -29,7 +29,7 @@ def test_audit_log_doc_covers_operator_and_contributor_surface() -> None:
         "stuck_draft",
         "cancellation_no_promotion",
         "POLLYPM_BRIEFING_INCLUDE_ALL",
-        "`pm audit clear`",
+        "clear subcommand",
         "src/pollypm/audit/log.py",
         "tests/test_audit_watchdog.py",
     ]

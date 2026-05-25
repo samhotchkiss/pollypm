@@ -111,6 +111,8 @@ The current event families are:
 | `heartbeat.missing` | supervisor recovery detection | `session`, `window_name`, `tmux_session`, `failure_type`, `failure_message` |
 | `session.spawn` | supervisor recovery relaunch | `session`, `window_name`, `tmux_session`, `failure_type`, `account`, `provider` |
 | `audit.finding` | audit watchdog findings | `rule`, `message`, `recommendation`, plus rule-specific data |
+| `agent.injection.flagged` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |
+| `agent.refusal` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |
 | `worker.session_reaped` | worker marker reaper | `window_name`, `marker_path`, `reason` |
 | `watchdog.escalation_dispatched` | auto-unstick dispatch path | `finding_type`, `subject`, `brief` |
 | `session.provisioned` | reviewer/role recovery provisioning | `role`, `project`, `reason` |
@@ -201,6 +203,18 @@ Filter by event with `jq`:
 jq 'select(.event == "audit.finding")' ~/.pollypm/audit/<project>.jsonl
 ```
 
+Record an agent refusal of a PollyPM-claimed message that is unsigned or has a
+bad auth marker:
+
+```bash
+pm audit agent-refusal --reason unsigned-pollypm-claim --project <project> --actor <session-name> --source pollypm-auth
+```
+
+Use `--reason bad-auth-marker` when a marker is present but does not match the
+session's contract. The command emits both `agent.injection.flagged` and
+`agent.refusal` with compact JSON metadata. It intentionally does not accept
+the raw message body; do not include the auth marker or token in audit metadata.
+
 Read through the Python API:
 
 ```python
@@ -218,8 +232,8 @@ gzip -c ~/.pollypm/audit/<project>.jsonl > ~/Desktop/<project>-audit.jsonl.gz
 : > ~/.pollypm/audit/<project>.jsonl
 ```
 
-Prefer truncation over deletion when a process may be tailing the file. There
-is no `pm audit clear` command today.
+Prefer truncation over deletion when a process may be tailing the file. No
+clear subcommand exists under `pm audit` today.
 
 ## Contributor Surface
 

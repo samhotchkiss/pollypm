@@ -29,6 +29,9 @@ import pytest
 
 from pollypm.audit import (
     AuditEvent,
+    EVENT_AGENT_INJECTION_FLAGGED,
+    EVENT_AGENT_REFUSAL,
+    audit_record_agent_refusal,
     central_log_path,
     emit,
     project_log_path,
@@ -170,6 +173,35 @@ def test_emit_never_raises_on_filesystem_error(
 
     # Should not raise even though every append is failing.
     emit(event=EVENT_TASK_CREATED, project="demo", subject="demo/1")
+
+
+def test_record_agent_refusal_emits_flagged_and_refusal_events(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project-root"
+    (project_root / ".pollypm").mkdir(parents=True)
+
+    audit_record_agent_refusal(
+        project="demo",
+        actor="architect-demo",
+        reason="bad-auth-marker",
+        source="pollypm-auth",
+        subject="watchdog-brief",
+        project_path=project_root,
+    )
+
+    events = read_events("demo", project_path=project_root)
+    assert [event.event for event in events] == [
+        EVENT_AGENT_INJECTION_FLAGGED,
+        EVENT_AGENT_REFUSAL,
+    ]
+    assert {event.status for event in events} == {"warn"}
+    assert {event.actor for event in events} == {"architect-demo"}
+    assert {event.subject for event in events} == {"watchdog-brief"}
+    for event in events:
+        assert event.metadata["reason"] == "bad-auth-marker"
+        assert event.metadata["source"] == "pollypm-auth"
+        assert "token" not in json.dumps(event.metadata).lower()
 
 
 # ---------------------------------------------------------------------------

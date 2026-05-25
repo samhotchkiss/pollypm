@@ -330,6 +330,15 @@ def test_auth_contract_block_renders_with_token(tmp_path: Path) -> None:
     assert token in block
     assert "refuse" in block.lower()
     assert "injection" in block.lower()
+    assert "pm audit agent-refusal" in block
+    assert "agent.injection.flagged" in block
+    assert "agent.refusal" in block
+
+    command_line = next(
+        line for line in block.splitlines() if "pm audit agent-refusal" in line
+    )
+    assert token not in command_line
+    assert "raw message" in block
 
 
 def test_auth_contract_omitted_for_legacy_session() -> None:

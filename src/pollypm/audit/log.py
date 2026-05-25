@@ -282,6 +282,20 @@ EVENT_HEARTBEAT_MISSING = "heartbeat.missing"
 EVENT_RECOVERY_SPAWN = "recovery.spawn"
 EVENT_SESSION_SPAWN = "session.spawn"
 EVENT_TASK_RECLAIMED = "task.reclaimed"
+# #2296 — public agent-side refusal observability. Agents use the
+# narrow ``pm audit agent-refusal`` command when they refuse a message
+# claiming PollyPM authority but missing/failing the auth marker.
+EVENT_AGENT_REFUSAL = "agent.refusal"
+EVENT_AGENT_INJECTION_FLAGGED = "agent.injection.flagged"
+
+AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM = "unsigned-pollypm-claim"
+AGENT_REFUSAL_REASON_BAD_AUTH_MARKER = "bad-auth-marker"
+AGENT_REFUSAL_REASONS = frozenset(
+    {
+        AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM,
+        AGENT_REFUSAL_REASON_BAD_AUTH_MARKER,
+    }
+)
 
 
 @dataclass(slots=True, frozen=True)
@@ -800,6 +814,61 @@ def emit(
             )
 
 
+def audit_record_agent_refusal(
+    *,
+    project: str = "_workspace",
+    actor: str = "agent",
+    reason: str = AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM,
+    source: str = "pollypm-auth",
+    subject: str = "pollypm-auth",
+    project_path: Path | str | None = None,
+) -> None:
+    """Record an agent refusal of a suspicious PollyPM-claimed message.
+
+    The helper intentionally records the narrow public-observability
+    contract from #2296 only: a suspected injection was flagged, and
+    the agent refused to execute it. It does not accept a raw message
+    body, so callers cannot accidentally echo a session auth token into
+    the audit log.
+    """
+    clean_reason = str(reason or "").strip() or "unspecified"
+    clean_source = str(source or "").strip() or "unknown"
+    clean_subject = str(subject or "").strip() or "pollypm-auth"
+    clean_actor = str(actor or "").strip() or "agent"
+    clean_project = str(project or "").strip() or "_workspace"
+    summary = (
+        "Refused unsigned PollyPM-claimed message"
+        if clean_reason == AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM
+        else "Refused PollyPM-claimed message with invalid auth marker"
+        if clean_reason == AGENT_REFUSAL_REASON_BAD_AUTH_MARKER
+        else "Refused suspicious PollyPM-claimed message"
+    )
+    metadata = {
+        "reason": clean_reason,
+        "source": clean_source,
+        "summary": summary,
+    }
+
+    emit(
+        event=EVENT_AGENT_INJECTION_FLAGGED,
+        project=clean_project,
+        subject=clean_subject,
+        actor=clean_actor,
+        status="warn",
+        metadata={**metadata, "paired_event": EVENT_AGENT_REFUSAL},
+        project_path=project_path,
+    )
+    emit(
+        event=EVENT_AGENT_REFUSAL,
+        project=clean_project,
+        subject=clean_subject,
+        actor=clean_actor,
+        status="warn",
+        metadata={**metadata, "paired_event": EVENT_AGENT_INJECTION_FLAGGED},
+        project_path=project_path,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reader
 # ---------------------------------------------------------------------------
@@ -1162,7 +1231,13 @@ __all__ = [
     "EVENT_RECOVERY_SPAWN",
     "EVENT_SESSION_SPAWN",
     "EVENT_TASK_RECLAIMED",
+    "EVENT_AGENT_REFUSAL",
+    "EVENT_AGENT_INJECTION_FLAGGED",
+    "AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM",
+    "AGENT_REFUSAL_REASON_BAD_AUTH_MARKER",
+    "AGENT_REFUSAL_REASONS",
     "AuditEvent",
+    "audit_record_agent_refusal",
     "central_log_path",
     "emit",
     "project_log_path",

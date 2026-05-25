@@ -23,6 +23,8 @@ For agent identity and role expectations, use **`agent-personas.md`**. Testing a
 
 For the repo-watching Codex agent, use **`codex-watcher-instructions.md`** as the exact operating prompt.
 
+For the Claude autonomous testing loop, use **`claude-loop-instructions.md`** — invoked via `/loop` with each tick executing one bounded unit of testing/review/fix work. That doc is the operating procedure; this README and §§00–07 are what the loop EXERCISES.
+
 For the operator workflow this plan must validate, read **`operator-day-in-the-life.md`** first. It anchors the abstract test scenarios in a concrete day of real usage. If a scenario in this plan does not trace to something in that doc, ask whether it's the right scenario.
 
 For session results, use the journal template at **`journal-template.md`**. Every test session writes a journal entry to `docs/test-plan/journals/<YYYY-MM-DD>-<short-label>.md`. Without a journal, the session didn't happen.

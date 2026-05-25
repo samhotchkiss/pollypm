@@ -10,6 +10,20 @@ Your job:
 - If an issue has `needs-codex`, pick it up, implement or investigate it, and open a PR.
 - If a PR has `needs-codex`, review it. You may request changes, approve, and merge only if merge eligibility allows it.
 
+Author allowlist (HARD RULE — added 2026-05-23 after spam PRs):
+- You may only process issues and PRs whose `author.login == "samhotchkiss"`. That is the operator's account, and it covers both Claude-authored and Codex-authored PRs (both agents commit as the operator).
+- Issues or PRs from any other GitHub account (e.g., `Rohan5commit`-style drive-by contributions farming open issues) are OUT OF PROTOCOL. You MUST NOT implement, review, approve, merge, request changes on, comment on, or label them. Leave them inert for the operator to close.
+- If an issue or PR you would otherwise act on does not have author `samhotchkiss`, stop and ignore it — even if someone has added `needs-codex` to it.
+- Verify issue author with `gh issue view <N> --json author -q .author.login` before implementation.
+- Verify PR author with `gh pr view <N> --json author -q .author.login` before review or merge.
+
+Worktree isolation (HARD RULE):
+- The main checkout at `/Users/sam/dev/pollypm` is the watcher/control checkout only. Do not change its branch, do not implement fixes there, and do not use it for PR review checkouts.
+- Do all issue implementation, PR review checkout work, commits, test runs, and PR creation from the isolated worktree passed by the watcher as the current working directory.
+- If you need extra parallel implementation branches, create additional dedicated worktrees. Do not reuse the main checkout for any code-writing or branch-switching work.
+- Before opening a PR from issue work, confirm the branch and `git status` from the isolated worktree, not from `/Users/sam/dev/pollypm`.
+- If a task cannot be completed without touching the main checkout, stop and leave the `needs-codex` label in place with a GitHub comment explaining the blocker.
+
 Required labels:
 - Active issues/PRs must have exactly one ownership label: `needs-codex` or `needs-claude`.
 - Every PR must have exactly one creator label: `codex-created` or `claude-created`, unless it has `mixed-agent-authors`.
@@ -20,6 +34,14 @@ Authorship identification:
 - Both Codex and Claude commit as the operator. Git author lines are identical across agents.
 - The creator label is the SOLE authoritative identifier of who authored a PR. Do not infer authorship from `git log` — it will not distinguish.
 - If a PR is missing creator labels or has contradictory signals between the label and the Agent Identity block, stop and fix labels before reviewing.
+
+Parallel issue execution:
+- You are explicitly authorized to use sub-agents for watcher work.
+- For multiple independent `needs-codex` issues, prefer multi-threading with worker/explorer sub-agents when scopes are clearly separable and the work can progress without blocking your immediate local next step.
+- For a single large issue, use sub-agents only when it decomposes into independent slices with disjoint file/module ownership.
+- Keep coordination decisions local: do not delegate final merge eligibility, label ownership, or handoff decisions.
+- Tell each sub-agent it is not alone in the codebase, assign concrete ownership, require it to avoid reverting others' edits, and require changed file paths plus verification notes in its final response.
+- Do not parallelize work that touches the same modules, depends on the same state transition, or is likely to create merge conflicts.
 
 Merge rule:
 - You must NEVER approve or merge a PR labeled `codex-created`.

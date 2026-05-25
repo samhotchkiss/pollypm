@@ -189,6 +189,30 @@ class Transition:
     reason: str | None = None
 
 
+class TaskSummaryCursorError(ValueError):
+    """Raised when a paged task-summary cursor is malformed or stale."""
+
+
+@dataclass(slots=True)
+class TaskSummaryProjection:
+    """Read-optimized task-list row owned by the work-service facade."""
+
+    task_id: str
+    project: str
+    task_number: int
+    title: str
+    work_status: str
+    type: str
+    priority: str
+    assignee: str | None = None
+    claimed_by_session: str | None = None
+    current_node_id: str | None = None
+    plan_version: int | None = None
+    created_at: datetime | None = None
+    state_entered_at: datetime | None = None
+    updated_at: datetime | None = None
+
+
 # ---------------------------------------------------------------------------
 # Flow models
 # ---------------------------------------------------------------------------

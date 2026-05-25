@@ -27,12 +27,14 @@ from __future__ import annotations
 import asyncio
 import json
 import shutil
+import socket
 import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
+import uvicorn
 from fastapi.testclient import TestClient
 
 from pollypm.cli_features.web_api import detect_tailscale_ip
@@ -115,6 +117,48 @@ def test_ui_deep_links_return_spa_shell_and_set_session_cookie(
         assert response.headers["content-type"].startswith("text/html")
         assert "/ui/app.js" in response.text
         _assert_signed_session_cookie(response.cookies.get(SESSION_COOKIE_NAME), token)
+
+
+def test_ui_deep_links_return_spa_shell_from_live_uvicorn(app, token: str) -> None:
+    async def _probe() -> None:
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            port = sock.getsockname()[1]
+
+        server = uvicorn.Server(
+            uvicorn.Config(
+                app,
+                host="127.0.0.1",
+                port=port,
+                log_level="warning",
+            )
+        )
+        task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(500):
+                if server.started:
+                    break
+                await asyncio.sleep(0.01)
+            assert server.started, "uvicorn server did not start"
+
+            async with httpx.AsyncClient() as ac:
+                for path in ("/ui/inbox", "/ui/tasks", "/ui/alerts"):
+                    response = await ac.get(
+                        f"http://127.0.0.1:{port}{path}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    )
+                    assert response.status_code == 200
+                    assert response.headers["content-type"].startswith("text/html")
+                    assert "/ui/app.js" in response.text
+                    _assert_signed_session_cookie(
+                        response.cookies.get(SESSION_COOKIE_NAME),
+                        token,
+                    )
+        finally:
+            server.should_exit = True
+            await task
+
+    asyncio.run(_probe())
 
 
 # -------- P0 #1: cookie issuance gating ---------------------------------

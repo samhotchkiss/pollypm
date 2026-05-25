@@ -65,6 +65,8 @@ from pollypm.work.models import (
     OutputType,
     Priority,
     Task,
+    TaskSummaryCursorError,
+    TaskSummaryProjection,
     TaskType,
     TERMINAL_STATUSES,
     Transition,
@@ -527,6 +529,100 @@ class PgWorkService:
             tasks = [task for task in tasks if task.blocked == blocked]
         return tasks
 
+    def list_task_summary_page(
+        self,
+        *,
+        projects: tuple[str, ...] | list[str] | None = None,
+        project: str | None = None,
+        work_statuses: tuple[str, ...] | list[str] | None = None,
+        assignee: str | None = None,
+        since: datetime | None = None,
+        limit: int = 50,
+        cursor: str | None = None,
+    ) -> tuple[list[TaskSummaryProjection], str | None, int]:
+        """Return a cursor page of task-list summaries without full hydration."""
+        where, params = self._task_summary_where(
+            projects=projects,
+            project=project,
+            work_statuses=work_statuses,
+            assignee=assignee,
+            since=since,
+        )
+        total = self._count_task_summary_where(where, params)
+        epoch = datetime.min.replace(tzinfo=UTC)
+        page_where = list(where)
+        page_params = list(params)
+
+        if cursor is not None:
+            cursor_updated_at, cursor_task_id = self._parse_task_summary_cursor(cursor)
+            anchor_where = [
+                *where,
+                "COALESCE(wt.updated_at, %s) = %s",
+                "(wt.project || '/' || wt.task_number::text) = %s",
+            ]
+            anchor_params = [*params, epoch, cursor_updated_at, cursor_task_id]
+            if not self._task_summary_exists(anchor_where, anchor_params):
+                raise TaskSummaryCursorError("stale task summary cursor")
+            page_where.append(
+                "(COALESCE(wt.updated_at, %s), "
+                "(wt.project || '/' || wt.task_number::text)) < (%s, %s)"
+            )
+            page_params.extend([epoch, cursor_updated_at, cursor_task_id])
+
+        clause = (" WHERE " + " AND ".join(page_where)) if page_where else ""
+        capped_limit = max(1, int(limit))
+        sql = (
+            "SELECT wt.project, wt.task_number, wt.title, wt.work_status, "
+            "wt.type, wt.priority, wt.assignee, wt.claimed_by_session, "
+            "wt.current_node_id, wt.plan_version, wt.created_at, wt.updated_at, "
+            "COALESCE(("
+            "SELECT tr.created_at FROM work_transitions tr "
+            "WHERE tr.task_project = wt.project "
+            "AND tr.task_number = wt.task_number "
+            "AND tr.to_state = wt.work_status "
+            "ORDER BY tr.id DESC LIMIT 1"
+            "), wt.created_at) AS state_entered_at "
+            "FROM work_tasks wt"
+            + clause
+            + " ORDER BY COALESCE(wt.updated_at, %s) DESC, "
+            "(wt.project || '/' || wt.task_number::text) DESC "
+            "LIMIT %s"
+        )
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute(sql, [*page_params, epoch, capped_limit + 1])
+            rows = cur.fetchall()
+
+        projections = [self._row_to_task_summary_projection(row) for row in rows]
+        page = projections[:capped_limit]
+        next_cursor: str | None = None
+        if len(projections) > capped_limit and page:
+            last = page[-1]
+            next_cursor = (
+                f"{(last.updated_at or epoch).isoformat()}|{last.task_id}"
+            )
+        return page, next_cursor, total
+
+    def count_task_summary_matches(
+        self,
+        *,
+        projects: tuple[str, ...] | list[str] | None = None,
+        exclude_projects: tuple[str, ...] | list[str] | None = None,
+        project: str | None = None,
+        work_statuses: tuple[str, ...] | list[str] | None = None,
+        assignee: str | None = None,
+        since: datetime | None = None,
+    ) -> int:
+        """Count task-summary matches without hydrating task rows."""
+        where, params = self._task_summary_where(
+            projects=projects,
+            exclude_projects=exclude_projects,
+            project=project,
+            work_statuses=work_statuses,
+            assignee=assignee,
+            since=since,
+        )
+        return self._count_task_summary_where(where, params)
+
     def list_inbox_candidate_tasks(
         self,
         *,
@@ -636,6 +732,114 @@ class PgWorkService:
             )
             for row in rows
         ]
+
+    def _task_summary_where(
+        self,
+        *,
+        projects: tuple[str, ...] | list[str] | None = None,
+        exclude_projects: tuple[str, ...] | list[str] | None = None,
+        project: str | None = None,
+        work_statuses: tuple[str, ...] | list[str] | None = None,
+        assignee: str | None = None,
+        since: datetime | None = None,
+    ) -> tuple[list[str], list[object]]:
+        where: list[str] = []
+        params: list[object] = []
+        if projects is not None:
+            allowed = tuple(str(value) for value in projects)
+            if not allowed:
+                where.append("FALSE")
+            else:
+                where.append("wt.project = ANY(%s)")
+                params.append(list(allowed))
+        if exclude_projects:
+            excluded = tuple(str(value) for value in exclude_projects)
+            where.append("wt.project <> ALL(%s)")
+            params.append(list(excluded))
+        if project is not None:
+            where.append("wt.project = %s")
+            params.append(project)
+        if work_statuses:
+            statuses = tuple(str(value) for value in work_statuses)
+            where.append("wt.work_status = ANY(%s)")
+            params.append(list(statuses))
+        if assignee is not None:
+            where.append("wt.assignee = %s")
+            params.append(assignee)
+        if since is not None:
+            where.append("(wt.updated_at IS NULL OR wt.updated_at > %s)")
+            params.append(since)
+        return where, params
+
+    def _count_task_summary_where(
+        self, where: list[str], params: list[object]
+    ) -> int:
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM work_tasks wt" + clause, params)
+            row = cur.fetchone()
+        return int(row[0] if row else 0)
+
+    def _task_summary_exists(
+        self, where: list[str], params: list[object]
+    ) -> bool:
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        with self._pool.connection() as conn, conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM work_tasks wt" + clause + " LIMIT 1", params)
+            return cur.fetchone() is not None
+
+    def _parse_task_summary_cursor(
+        self, cursor: str
+    ) -> tuple[datetime, str]:
+        try:
+            updated_raw, task_id = cursor.split("|", 1)
+            updated_at = datetime.fromisoformat(updated_raw)
+        except (TypeError, ValueError) as exc:
+            raise TaskSummaryCursorError("invalid task summary cursor") from exc
+        if not task_id:
+            raise TaskSummaryCursorError("invalid task summary cursor")
+        if updated_at.tzinfo is None or updated_at.tzinfo.utcoffset(updated_at) is None:
+            updated_at = updated_at.replace(tzinfo=UTC)
+        else:
+            updated_at = updated_at.astimezone(UTC)
+        return updated_at, task_id
+
+    def _row_to_task_summary_projection(
+        self, row: tuple
+    ) -> TaskSummaryProjection:
+        (
+            project,
+            task_number,
+            title,
+            work_status,
+            type_raw,
+            priority,
+            assignee,
+            claimed_by_session,
+            current_node_id,
+            plan_version,
+            created_at,
+            updated_at,
+            state_entered_at,
+        ) = row
+        task_number_int = int(task_number)
+        project_str = str(project)
+        return TaskSummaryProjection(
+            task_id=f"{project_str}/{task_number_int}",
+            project=project_str,
+            task_number=task_number_int,
+            title=str(title),
+            work_status=str(work_status),
+            type=str(type_raw),
+            priority=str(priority),
+            assignee=assignee,
+            claimed_by_session=claimed_by_session,
+            current_node_id=current_node_id,
+            plan_version=int(plan_version or 1),
+            created_at=created_at,
+            state_entered_at=state_entered_at,
+            updated_at=updated_at,
+        )
 
     def _row_to_task(
         self,

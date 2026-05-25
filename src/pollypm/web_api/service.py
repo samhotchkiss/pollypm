@@ -40,6 +40,7 @@ from pollypm.work.inbox_view import (
     is_inbox_task,
     is_inbox_task_identity,
 )
+from pollypm.work.models import TaskSummaryCursorError, TaskSummaryProjection
 from pollypm.web_api.errors import (
     APIError,
     not_found,
@@ -1306,6 +1307,19 @@ def list_all_tasks(
     rows were omitted.
     """
     status_filter = set(statuses or [])
+    fast_page = _list_all_tasks_summary_page(
+        config,
+        project=project,
+        statuses=statuses,
+        assignee=assignee,
+        since=since,
+        include_untracked=include_untracked,
+        limit=limit,
+        cursor=cursor,
+    )
+    if fast_page is not None:
+        return fast_page
+
     summaries: list[APITaskSummary] = []
     warnings: list[dict[str, object]] = []
 
@@ -1397,11 +1411,104 @@ def list_all_tasks(
     )
 
 
+def _list_all_tasks_summary_page(
+    config: PollyPMConfig,
+    *,
+    project: str | None,
+    statuses: list[str] | None,
+    assignee: str | None,
+    since: datetime | None,
+    include_untracked: bool,
+    limit: int,
+    cursor: str | None,
+) -> tuple[list[APITaskSummary], str | None, list[dict[str, object]], int] | None:
+    workspace_root = _workspace_root_path(config)
+    tracked_keys = _tracked_project_keys(config)
+    # Multi-project reads keep the older per-project path so one failed
+    # project still surfaces as a partial-failure warning.
+    if not include_untracked and len(tracked_keys) > 1:
+        return None
+    try:
+        with _open_work_service_readonly(
+            config=config,
+            project_key="__workspace__",
+            project_path=workspace_root,
+        ) as svc:
+            list_page = getattr(svc, "list_task_summary_page", None)
+            count_matches = getattr(svc, "count_task_summary_matches", None)
+            if not callable(list_page) or not callable(count_matches):
+                return None
+
+            projects: tuple[str, ...] | None
+            page_project: str | None = None
+            if include_untracked:
+                projects = None
+                page_project = project
+            elif project is not None:
+                projects = (project,) if project in tracked_keys else ()
+            else:
+                projects = tracked_keys
+
+            rows, next_cursor, total = list_page(
+                projects=projects,
+                project=page_project,
+                work_statuses=tuple(statuses or ()),
+                assignee=assignee,
+                since=since,
+                limit=limit,
+                cursor=cursor,
+            )
+            warnings: list[dict[str, object]] = []
+            if not include_untracked:
+                if project is None:
+                    dropped_count = count_matches(
+                        exclude_projects=tracked_keys,
+                        work_statuses=tuple(statuses or ()),
+                        assignee=assignee,
+                        since=since,
+                    )
+                elif project not in tracked_keys:
+                    dropped_count = count_matches(
+                        project=project,
+                        work_statuses=tuple(statuses or ()),
+                        assignee=assignee,
+                        since=since,
+                    )
+                else:
+                    dropped_count = 0
+                if dropped_count:
+                    warnings.append(
+                        {
+                            "code": "untracked_filtered",
+                            "dropped_count": dropped_count,
+                            "reason": "untracked_projects",
+                        }
+                    )
+            return (
+                [_task_summary_projection_to_api(row) for row in rows],
+                next_cursor,
+                warnings,
+                total,
+            )
+    except TaskSummaryCursorError as exc:
+        raise StaleCursorError(str(exc)) from exc
+    except _BACKING_STORE_ERRORS:
+        return None
+
+
 def _tracked_project_keys(config: PollyPMConfig) -> tuple[str, ...]:
     return tuple(
         key
         for key, proj in config.projects.items()
         if getattr(proj, "tracked", True)
+    )
+
+
+def _workspace_root_path(config: PollyPMConfig) -> Path:
+    return Path(
+        getattr(config.project, "workspace_root", None)
+        or getattr(config.project, "root_dir", None)
+        or Path.cwd()
     )
 
 
@@ -1417,15 +1524,11 @@ def _task_for_summary(svc, task):
 def _list_tasks_from_workspace(
     config: PollyPMConfig, *, project: str | None, hydrate: bool = False
 ):
-    workspace_root = (
-        getattr(config.project, "workspace_root", None)
-        or getattr(config.project, "root_dir", None)
-        or Path.cwd()
-    )
+    workspace_root = _workspace_root_path(config)
     with _open_work_service_readonly(
         config=config,
         project_key="__workspace__",
-        project_path=Path(workspace_root),
+        project_path=workspace_root,
     ) as svc:
         tasks = svc.list_tasks(project=project)
         if hydrate:
@@ -3454,6 +3557,30 @@ def _task_to_summary(task) -> APITaskSummary:
         dwell_seconds=timing["dwell_seconds"],
         age_seconds=timing["age_seconds"],
         updated_at=getattr(task, "updated_at", None),
+    )
+
+
+def _task_summary_projection_to_api(row: TaskSummaryProjection) -> APITaskSummary:
+    created_at = _as_aware_datetime(row.created_at)
+    state_entered_at = _as_aware_datetime(row.state_entered_at) or created_at
+    now = datetime.now(timezone.utc)
+    return APITaskSummary(
+        task_id=row.task_id,
+        project=row.project,
+        task_number=row.task_number,
+        title=row.title,
+        work_status=row.work_status,
+        type=row.type,
+        priority=row.priority,
+        assignee=row.assignee,
+        claimed_by_session=row.claimed_by_session,
+        current_node_id=row.current_node_id,
+        plan_version=row.plan_version,
+        created_at=created_at,
+        state_entered_at=state_entered_at,
+        dwell_seconds=_elapsed_seconds(state_entered_at, now),
+        age_seconds=_elapsed_seconds(created_at, now),
+        updated_at=_as_aware_datetime(row.updated_at),
     )
 
 

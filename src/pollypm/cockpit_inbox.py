@@ -152,14 +152,17 @@ def _render_work_service_issues(
 # computations. Caching at the function itself collapses those two
 # calls into one and dampens navigation-burst churn.
 #
-# Cache key: ``id(config)`` — the cockpit router already invalidates
-# its config cache on mtime change, so a config reload yields a fresh
-# object identity and bypasses this cache automatically. TTL is set at
-# 1.0s to match the existing ``_INBOX_COUNT_CACHE`` wall-clock bucket
-# in :mod:`pollypm.plugins_builtin.core_rail_items.plugin`; freshly
+# Cache key: ``(id(config), id(_pm_inbox_awaits_user_list_uncached))``.
+# The cockpit router already invalidates its config cache on mtime
+# change, so a config reload yields a fresh object identity; including
+# the uncached function identity keeps monkeypatched/test direct paths
+# from inheriting an older cached shape. TTL is set at 1.0s to match the
+# existing ``_INBOX_COUNT_CACHE`` wall-clock bucket in
+# :mod:`pollypm.plugins_builtin.core_rail_items.plugin`; freshly
 # completed work surfaces within ~1 rail tick (0.8s).
 _AWAITS_USER_TTL_SECONDS = 1.0
-_AWAITS_USER_CACHE: dict[int, tuple[float, tuple[object, ...]]] = {}
+_AWAITS_USER_CACHE: dict[tuple[int, int], tuple[float, tuple[object, ...]]] = {}
+_AWAITS_USER_COUNT_CACHE: dict[tuple[int, int], tuple[float, int]] = {}
 
 
 # Move A PR 4 — cache fall-through gate for the cache-routed fast path
@@ -170,7 +173,11 @@ _AWAITS_USER_CACHE: dict[int, tuple[float, tuple[object, ...]]] = {}
 _AWAITS_USER_DIVERGENCE_COUNTER = _DivergenceCounter()
 
 
-def pm_inbox_awaits_user_list(config) -> list[object]:
+def pm_inbox_awaits_user_list(
+    config,
+    *,
+    use_cache: bool = True,
+) -> list[object]:
     """Return every inbox entry across the config that ``awaits_user``.
 
     Single source of truth for "what is waiting on the user across all
@@ -199,19 +206,26 @@ def pm_inbox_awaits_user_list(config) -> list[object]:
     by default. ``POLLYPM_STATE_CACHE=0`` forces fall-through. No runtime
     sampler.
     """
-    cached_result = _maybe_cache_route_awaits_user(config)
-    if cached_result is not None:
-        return cached_result
+    if use_cache:
+        cached_result = _maybe_cache_route_awaits_user(config)
+        if cached_result is not None:
+            return cached_result
 
     import time as _time
 
-    cache_key = id(config)
+    cache_key = (id(config), id(_pm_inbox_awaits_user_list_uncached))
     now = _time.monotonic()
-    cached = _AWAITS_USER_CACHE.get(cache_key)
-    if cached is not None and now - cached[0] < _AWAITS_USER_TTL_SECONDS:
-        return list(cached[1])
+    if use_cache:
+        cached = _AWAITS_USER_CACHE.get(cache_key)
+        if (
+            cached is not None
+            and now - cached[0] < _AWAITS_USER_TTL_SECONDS
+        ):
+            return list(cached[1])
 
     result = _pm_inbox_awaits_user_list_uncached(config)
+    if not use_cache:
+        return result
     # #1957 #1968 perf — stamp the cache AFTER the uncached sweep returns
     # so a cold awaits-user fetch that exceeds the TTL doesn't write a
     # born-expired entry that forces the next caller to recompute.
@@ -390,7 +404,11 @@ def _maybe_cache_route_awaits_user(config) -> list[object] | None:
     return cached_items
 
 
-def _pm_inbox_awaits_user_list_uncached(config) -> list[object]:
+def _pm_inbox_awaits_user_list_uncached(
+    config,
+    *,
+    annotate_entries: bool = True,
+) -> list[object]:
     """Underlying implementation of :func:`pm_inbox_awaits_user_list`.
 
     Separated from the public entry point so the cache wrapper stays
@@ -442,11 +460,13 @@ def _pm_inbox_awaits_user_list_uncached(config) -> list[object]:
             for task in inbox_tasks_for_project(
                 pg_inbox_grouped, config, project_key,
             ):
-                item = annotate_inbox_entry(
-                    task_to_inbox_entry(task, db_path=db_path),
-                    known_projects=known_projects,
-                )
+                item = task_to_inbox_entry(task, db_path=db_path)
                 if awaits_user(item):
+                    if annotate_entries:
+                        item = annotate_inbox_entry(
+                            item,
+                            known_projects=known_projects,
+                        )
                     task_entries.setdefault(task.task_id, item)
 
     # pg-path messages: one query covered the whole workspace above.
@@ -474,15 +494,17 @@ def _pm_inbox_awaits_user_list_uncached(config) -> list[object]:
                 if scope and scope in known_projects
                 else project_db_paths.get(_WORKSPACE_DB_KEY, (None, None))[0]
             )
-            item = annotate_inbox_entry(
-                message_row_to_inbox_entry(
-                    row,
-                    source_key=source_key,
-                    db_path=entry_dbpath or Path("."),
-                ),
-                known_projects=known_projects,
+            item = message_row_to_inbox_entry(
+                row,
+                source_key=source_key,
+                db_path=entry_dbpath or Path("."),
             )
             if awaits_user(item):
+                if annotate_entries:
+                    item = annotate_inbox_entry(
+                        item,
+                        known_projects=known_projects,
+                    )
                 msg_key = (str(scope), row_id)
                 message_entries.setdefault(msg_key, item)
 
@@ -502,7 +524,41 @@ def _pm_inbox_awaits_user_list_uncached(config) -> list[object]:
     return collected
 
 
-def _count_inbox_tasks_for_label(config) -> int:
+_pm_inbox_awaits_user_list_uncached._supports_unannotated = True  # type: ignore[attr-defined]
+
+
+def _uncached_awaits_user_count(config) -> int:
+    uncached = _pm_inbox_awaits_user_list_uncached
+    if getattr(uncached, "_supports_unannotated", False):
+        return len(uncached(config, annotate_entries=False))
+    return len(uncached(config))
+
+
+def _direct_awaits_user_count(config) -> int:
+    import time as _time
+
+    cache_key = (id(config), id(_pm_inbox_awaits_user_list_uncached))
+    now = _time.monotonic()
+    cached = _AWAITS_USER_COUNT_CACHE.get(cache_key)
+    if cached is not None and now - cached[0] < _AWAITS_USER_TTL_SECONDS:
+        return cached[1]
+    count = _uncached_awaits_user_count(config)
+    completed_at = _time.monotonic()
+    if len(_AWAITS_USER_COUNT_CACHE) > 8:
+        for stale_key in [
+            k for k, (ts, _v) in _AWAITS_USER_COUNT_CACHE.items()
+            if completed_at - ts >= _AWAITS_USER_TTL_SECONDS
+        ]:
+            _AWAITS_USER_COUNT_CACHE.pop(stale_key, None)
+    _AWAITS_USER_COUNT_CACHE[cache_key] = (completed_at, count)
+    return count
+
+
+def _count_inbox_tasks_for_label(
+    config,
+    *,
+    use_state_cache: bool = True,
+) -> int:
     """Count actionable inbox items across tracked projects + workspace-root.
 
     The cockpit rail is a notification surface, not an activity feed.
@@ -539,10 +595,11 @@ def _count_inbox_tasks_for_label(config) -> int:
     holds (the public helper itself routes through the same cache
     when populated).
     """
-    cached = _maybe_cache_count_awaits_user(config)
-    if cached is not None:
-        return cached
-    return len(pm_inbox_awaits_user_list(config))
+    if use_state_cache:
+        cached = _maybe_cache_count_awaits_user(config)
+        if cached is not None:
+            return cached
+    return _direct_awaits_user_count(config)
 
 
 def _maybe_cache_count_awaits_user(config) -> int | None:

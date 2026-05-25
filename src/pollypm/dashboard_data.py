@@ -5,6 +5,7 @@ import logging
 import re
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -211,6 +212,7 @@ class DashboardData:
 _COMMIT_CACHE: dict[tuple[str, int], tuple[float, list["_CachedCommitRow"]]] = {}
 _COMMIT_CACHE_TTL_SECONDS = 60.0
 _COMMIT_PER_PROJECT_TIMEOUT_SECONDS = 2.0
+_COMMIT_LOG_MAX_WORKERS = 8
 
 
 @dataclass(slots=True, frozen=True)
@@ -269,6 +271,14 @@ def _git_log_rows_cached(project_path: Path, hours: int) -> list[_CachedCommitRo
     return rows
 
 
+def _recent_commit_rows_for_project(
+    item: tuple[str, object],
+    hours: int,
+) -> tuple[str, list[_CachedCommitRow]]:
+    key, project = item
+    return key, _git_log_rows_cached(project.path, hours)
+
+
 def _recent_commits(config: PollyPMConfig, hours: int = 24) -> list[CommitInfo]:
     """Get git commits from the last N hours across all projects.
 
@@ -280,8 +290,25 @@ def _recent_commits(config: PollyPMConfig, hours: int = 24) -> list[CommitInfo]:
     now = datetime.now(UTC)
     seen: set[str] = set()
 
-    for key, project in config.projects.items():
-        for row in _git_log_rows_cached(project.path, hours):
+    project_items = list(config.projects.items())
+    if len(project_items) > 1:
+        with ThreadPoolExecutor(
+            max_workers=min(_COMMIT_LOG_MAX_WORKERS, len(project_items)),
+            thread_name_prefix="dashboard-git-log",
+        ) as executor:
+            row_batches = executor.map(
+                lambda item: _recent_commit_rows_for_project(item, hours),
+                project_items,
+            )
+            project_rows = list(row_batches)
+    else:
+        project_rows = [
+            _recent_commit_rows_for_project(item, hours)
+            for item in project_items
+        ]
+
+    for key, rows in project_rows:
+        for row in rows:
             if row.hash7 in seen:
                 continue
             seen.add(row.hash7)
@@ -563,7 +590,11 @@ def _count_inbox_tasks(config: PollyPMConfig) -> int:
     return total
 
 
-def _count_dashboard_inbox_items(config: PollyPMConfig) -> int:
+def _count_dashboard_inbox_items(
+    config: PollyPMConfig,
+    *,
+    use_state_cache: bool = True,
+) -> int:
     """Return the user-facing inbox count shown on the cockpit home.
 
     The cockpit home and rail are the same at-a-glance surface, so their
@@ -573,7 +604,13 @@ def _count_dashboard_inbox_items(config: PollyPMConfig) -> int:
     """
     try:
         from pollypm.cockpit_inbox import _count_inbox_tasks_for_label
-        return int(_count_inbox_tasks_for_label(config) or 0)
+        return int(
+            _count_inbox_tasks_for_label(
+                config,
+                use_state_cache=use_state_cache,
+            )
+            or 0
+        )
     except Exception:  # noqa: BLE001
         logger.warning(
             "_count_dashboard_inbox_items: registered-project count failed; "
@@ -796,7 +833,12 @@ def load_dashboard(config_path: Path) -> tuple[PollyPMConfig, DashboardData]:
     return config, data
 
 
-def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
+def gather(
+    config: PollyPMConfig,
+    store: object | None,
+    *,
+    use_state_cache: bool = True,
+) -> DashboardData:
     """Gather all dashboard data.
 
     Backend-aware: pg installs read through the pg facades; sqlite
@@ -902,7 +944,10 @@ def gather(config: PollyPMConfig, store: object | None) -> DashboardData:
 
     commits = _recent_commits(config, hours=24)
     completed = _completed_issues(config, hours=72)
-    inbox_count = _count_dashboard_inbox_items(config)
+    inbox_count = _count_dashboard_inbox_items(
+        config,
+        use_state_cache=use_state_cache,
+    )
     recent_messages = _recent_inbox_messages(config)
     sweeps = sum(1 for e in day_events if e.event_type == "heartbeat")
     recoveries = sum(1 for e in day_events if "recover" in e.event_type)

@@ -252,7 +252,7 @@ def _gather_dashboard(config: Any) -> Any:
     """
     from pollypm.dashboard_data import gather
 
-    return gather(config, None)
+    return gather(config, None, use_state_cache=False)
 
 
 # ---------------------------------------------------------------------------

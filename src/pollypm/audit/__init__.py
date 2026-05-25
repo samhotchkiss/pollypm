@@ -81,7 +81,10 @@ from pollypm.audit.bug_reporter import (
 )
 from pollypm.audit.log import (
     AuditEvent,
+    EVENT_AGENT_INJECTION_FLAGGED,
+    EVENT_AGENT_REFUSAL,
     EVENT_DAEMON_SERVE_RESPAWN,
+    audit_record_agent_refusal,
     central_log_path,
     emit,
     project_log_path,
@@ -106,6 +109,8 @@ __all__ = [
     "DEFAULT_DEDUP_WINDOW_SECONDS",
     "ESCALATION_THROTTLE_SECONDS",
     "EVENT_AUDIT_FINDING",
+    "EVENT_AGENT_INJECTION_FLAGGED",
+    "EVENT_AGENT_REFUSAL",
     "EVENT_BUG_REPORT_DEDUPED",
     "EVENT_BUG_REPORT_FAILED",
     "EVENT_BUG_REPORT_FILED",
@@ -114,6 +119,7 @@ __all__ = [
     "Finding",
     "SELF_REPORT_LABEL",
     "WatchdogConfig",
+    "audit_record_agent_refusal",
     "central_log_path",
     "emit",
     "emit_escalation_dispatched",

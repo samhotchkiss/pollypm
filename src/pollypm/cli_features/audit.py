@@ -38,6 +38,13 @@ from pollypm.audit.query import (
     resolve_target_files as _resolve_target_files,
     walk_log_chain as _walk_log_chain,
 )
+from pollypm.audit.log import (
+    AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM,
+    AGENT_REFUSAL_REASONS,
+    EVENT_AGENT_INJECTION_FLAGGED,
+    EVENT_AGENT_REFUSAL,
+    audit_record_agent_refusal,
+)
 from pollypm.cli_help import help_with_examples
 from pollypm.config import DEFAULT_CONFIG_PATH
 
@@ -165,9 +172,102 @@ def format_event(record: dict, *, color: bool = True) -> str:
     return line
 
 
+def _validate_agent_refusal_reason(value: str) -> str:
+    reason = str(value or "").strip()
+    if reason not in AGENT_REFUSAL_REASONS:
+        allowed = ", ".join(sorted(AGENT_REFUSAL_REASONS))
+        raise typer.BadParameter(
+            f"invalid --reason {value!r}: expected one of {allowed}"
+        )
+    return reason
+
+
+def _resolve_agent_refusal_project_path(
+    *,
+    project: str,
+    config_path: Path,
+) -> Path | None:
+    """Best-effort project-root lookup for the refusal audit command."""
+    if not project or project == "_workspace":
+        return None
+    try:
+        from pollypm.config import load_config
+
+        config = load_config(config_path)
+    except Exception:  # noqa: BLE001 — central-tail write still works
+        return None
+    known = config.projects.get(project)
+    if known is None:
+        return None
+    return known.path
+
+
 # ---------------------------------------------------------------------------
 # CLI command.
 # ---------------------------------------------------------------------------
+
+
+@audit_app.command(
+    "agent-refusal",
+    help=(
+        "Record that an agent refused a PollyPM-claimed control message "
+        "because it was unsigned or had a bad auth marker. This is a "
+        "narrow writer for refusal observability; it does not accept raw "
+        "message text or arbitrary event names."
+    ),
+)
+def audit_agent_refusal(
+    reason: str = typer.Option(
+        AGENT_REFUSAL_REASON_UNSIGNED_POLLYPM_CLAIM,
+        "--reason",
+        help=(
+            "Refusal reason: unsigned-pollypm-claim or bad-auth-marker."
+        ),
+    ),
+    project: str = typer.Option(
+        "_workspace",
+        "--project",
+        help="Project key for the audit tail; use _workspace when unknown.",
+    ),
+    actor: str = typer.Option(
+        "agent",
+        "--actor",
+        help="Agent/session label recording the refusal.",
+    ),
+    subject: str = typer.Option(
+        "pollypm-auth",
+        "--subject",
+        help="Short non-secret subject label. Do not pass the raw message.",
+    ),
+    source: str = typer.Option(
+        "pollypm-auth",
+        "--source",
+        help="Short source label such as pollypm-auth, watchdog, or operator.",
+    ),
+    config_path: Path = typer.Option(
+        DEFAULT_CONFIG_PATH,
+        "--config",
+        help="PollyPM config path.",
+    ),
+) -> None:
+    clean_reason = _validate_agent_refusal_reason(reason)
+    project_path = _resolve_agent_refusal_project_path(
+        project=project,
+        config_path=config_path,
+    )
+    audit_record_agent_refusal(
+        project=project,
+        actor=actor,
+        reason=clean_reason,
+        source=source,
+        subject=subject,
+        project_path=project_path,
+    )
+    typer.echo(
+        "recorded "
+        f"{EVENT_AGENT_INJECTION_FLAGGED} and {EVENT_AGENT_REFUSAL} "
+        f"for {project or '_workspace'}"
+    )
 
 
 @audit_app.command(
@@ -247,6 +347,7 @@ def audit_grep(
 
 __all__ = [
     "audit_app",
+    "audit_agent_refusal",
     "format_event",
     "parse_since",
     # Re-exports from the neutral query module — kept for the CLI test

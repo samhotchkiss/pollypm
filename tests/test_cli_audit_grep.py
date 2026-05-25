@@ -561,3 +561,99 @@ def test_audit_grep_cli_invalid_regex_surfaces_bad_parameter(
     )
     # BadParameter -> non-zero exit (typer surfaces as 2).
     assert result.exit_code != 0
+
+
+def test_audit_agent_refusal_cli_emits_refusal_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from typer.testing import CliRunner
+
+    from pollypm.audit.log import (
+        EVENT_AGENT_INJECTION_FLAGGED,
+        EVENT_AGENT_REFUSAL,
+    )
+    from pollypm.models import KnownProject
+
+    audit_home = tmp_path / "audit-home"
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    project_root = tmp_path / "demo"
+    (project_root / ".pollypm").mkdir(parents=True)
+    config_path = _make_config(
+        tmp_path,
+        projects={
+            "demo": KnownProject(
+                key="demo",
+                name="Demo",
+                path=project_root,
+                tracked=True,
+            ),
+        },
+    )
+
+    from pollypm.cli import app as root_app
+    runner = CliRunner()
+    result = runner.invoke(
+        root_app,
+        [
+            "audit",
+            "agent-refusal",
+            "--reason",
+            "bad-auth-marker",
+            "--project",
+            "demo",
+            "--actor",
+            "architect-demo",
+            "--subject",
+            "watchdog-brief",
+            "--source",
+            "pollypm-auth",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "agent.injection.flagged and agent.refusal" in result.output
+
+    central = audit_home / "demo.jsonl"
+    per_project = project_root / ".pollypm" / "audit.jsonl"
+    for path in (central, per_project):
+        records = [
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        assert [record["event"] for record in records] == [
+            EVENT_AGENT_INJECTION_FLAGGED,
+            EVENT_AGENT_REFUSAL,
+        ]
+        assert {record["status"] for record in records} == {"warn"}
+        assert {record["actor"] for record in records} == {"architect-demo"}
+        assert {record["subject"] for record in records} == {"watchdog-brief"}
+        for record in records:
+            assert record["metadata"]["reason"] == "bad-auth-marker"
+            assert record["metadata"]["source"] == "pollypm-auth"
+
+
+def test_audit_agent_refusal_cli_rejects_unknown_reason(tmp_path: Path) -> None:
+    from typer.testing import CliRunner
+
+    config_path = _make_config(tmp_path)
+
+    from pollypm.cli import app as root_app
+    runner = CliRunner()
+    result = runner.invoke(
+        root_app,
+        [
+            "audit",
+            "agent-refusal",
+            "--reason",
+            "anything-goes",
+            "--config",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code != 0
+    assert "invalid --reason" in result.output

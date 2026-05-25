@@ -23,6 +23,16 @@ async function stubSurfaces(page: import("@playwright/test").Page) {
       body: JSON.stringify({ items: [] }),
     }),
   );
+  // PR #2266 added a parallel /projects fetch inside `loadSurfaces`; the
+  // dashboard rail tests need a deterministic stub so `surfacesInFlight`
+  // settles regardless of operator state on the running server.
+  await page.route(/\/api\/v1\/projects(\?.*)?$/, (route) =>
+    route.fulfill({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify({ items: [] }),
+    }),
+  );
   await page.route("**/api/v1/chat/operator/messages*", (route) =>
     route.fulfill({
       status: 200,
@@ -92,6 +102,15 @@ test.describe("dashboard rail", () => {
     );
 
     await page.goto("/ui/");
+    // Wait for `loadSurfaces` to settle before clicking — PR #2266 added
+    // a third (`/projects`) leg to that fetch which can outlive the
+    // dashboard render, and the "surface" target relies on
+    // `state.surfaces` being populated.
+    await page.waitForFunction(
+      () => !(window as any).PollyPM.state.surfacesInFlight,
+      undefined,
+      { timeout: 5000 },
+    );
 
     const expected: Array<[RegExp, string]> = [
       [/inbox/i, "operator"],
@@ -103,8 +122,13 @@ test.describe("dashboard rail", () => {
       [/projects tracked/i, "Dashboard: projects tracked"],
     ];
 
+    // Scope rollup-card lookups to the dashboard rail because the empty
+    // pane CTA "Open inbox" introduced by PR #2266 also matches the
+    // /inbox/i locator at the page level.
+    const rollups = page.locator("#dashboard-rollups");
+
     for (const [name, title] of expected) {
-      const card = page.getByRole("button", { name });
+      const card = rollups.getByRole("button", { name });
       await expect(card).toBeVisible();
       await expect(card).toHaveAttribute("aria-label", /Open dashboard detail/);
       await card.focus();
@@ -146,7 +170,10 @@ test.describe("dashboard rail", () => {
 
     await page.goto("/ui/");
     await expect.poll(() => dashboardRequests).toBe(1);
-    await expect(page.getByRole("button", { name: /inbox/i })).toBeVisible();
+    const inboxCard = page
+      .locator("#dashboard-rollups")
+      .getByRole("button", { name: /inbox/i });
+    await expect(inboxCard).toBeVisible();
 
     await page.evaluate(() => {
       (window as any).PollyPM.pollDashboard();
@@ -155,13 +182,13 @@ test.describe("dashboard rail", () => {
     await expect(
       page.locator("#dashboard-rollups .rollup-empty.fetch-state"),
     ).toHaveCount(0, { timeout: 250 });
-    await expect(page.getByRole("button", { name: /inbox/i })).toBeVisible();
+    await expect(inboxCard).toBeVisible();
 
     releaseSecond!();
     await expect.poll(() =>
       page.evaluate(() => (window as any).PollyPM.state.dashboardInFlight),
     ).toBe(false);
-    await expect(page.getByRole("button", { name: /inbox/i })).toBeVisible();
+    await expect(inboxCard).toBeVisible();
   });
 
   test("slow dashboard load shows retry after three seconds", async ({ page }) => {
@@ -211,8 +238,10 @@ test.describe("dashboard rail", () => {
     await expect.poll(() => dashboardRequests).toBe(2);
 
     releaseFirst!();
-    await expect(page.getByRole("button", { name: /inbox/i })).toBeVisible(
-      { timeout: 750 },
-    );
+    await expect(
+      page
+        .locator("#dashboard-rollups")
+        .getByRole("button", { name: /inbox/i }),
+    ).toBeVisible({ timeout: 750 });
   });
 });

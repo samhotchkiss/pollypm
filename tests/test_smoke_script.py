@@ -21,12 +21,18 @@ def test_task_command_construction() -> None:
     specs = smoke.task_command_specs("pollypm", title)
 
     assert title == "smoke-090807"
+    # Description satisfies the queue-time has_description gate added by #2275.
     assert specs[0].argv == (
         "pm",
         "task",
         "create",
         "--project",
         "pollypm",
+        "--description",
+        (
+            "Lane F smoke automation probe task — exercises pm task create/queue/get "
+            "end-to-end. Safe to cancel/delete; no real work expected."
+        ),
         "smoke-090807",
         "--json",
     )

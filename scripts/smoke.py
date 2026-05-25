@@ -74,10 +74,21 @@ def smoke_task_title(now: datetime) -> str:
 
 
 def task_command_specs(project: str, title: str) -> list[CommandSpec]:
+    # Description satisfies the queue-time has_description gate added by #2275.
+    smoke_description = (
+        "Lane F smoke automation probe task — exercises pm task create/queue/get end-to-end. "
+        "Safe to cancel/delete; no real work expected."
+    )
     return [
         CommandSpec(
             name="task create",
-            argv=("pm", "task", "create", "--project", project, title, "--json"),
+            argv=(
+                "pm", "task", "create",
+                "--project", project,
+                "--description", smoke_description,
+                title,
+                "--json",
+            ),
             timeout_seconds=30,
         ),
         CommandSpec(

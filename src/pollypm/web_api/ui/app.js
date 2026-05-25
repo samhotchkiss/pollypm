@@ -32,10 +32,18 @@
   const INBOX_PAGE_LIMIT = 25;
   const OPERATOR_ACTOR = "operator";
   const CLAIM_ACTOR = "worker";
+  const railRequestTimeoutOverride = Number(
+    window.__POLLYPM_RAIL_REQUEST_TIMEOUT_MS,
+  );
+  const RAIL_REQUEST_TIMEOUT_MS = (
+    Number.isFinite(railRequestTimeoutOverride)
+    && railRequestTimeoutOverride > 0
+  ) ? railRequestTimeoutOverride : 10000;
 
   const state = {
     projects: [],
     projectLoadError: null,
+    projectLoading: false,
     selectedProject: null,
     projectFilter: "",
     projectSort: "urgency",
@@ -388,6 +396,32 @@
     return API + "/projects" + (query ? "?" + query : "");
   }
 
+  function asError(reason) {
+    return reason instanceof Error ? reason : new Error(String(reason));
+  }
+
+  function railTimeoutError(label) {
+    const timeoutLabel = RAIL_REQUEST_TIMEOUT_MS >= 1000
+      ? Math.round(RAIL_REQUEST_TIMEOUT_MS / 1000) + "s"
+      : RAIL_REQUEST_TIMEOUT_MS + "ms";
+    return new Error(
+      label + " request timed out after " + timeoutLabel,
+    );
+  }
+
+  function railJsonWithTimeout(label, request, opts) {
+    let timer = null;
+    const timeout = new Promise((_, reject) => {
+      timer = setTimeout(() => {
+        reject(railTimeoutError(label));
+      }, RAIL_REQUEST_TIMEOUT_MS);
+    });
+    const pending = Promise.resolve().then(() => request(opts));
+    return Promise.race([pending, timeout]).finally(() => {
+      if (timer !== null) clearTimeout(timer);
+    });
+  }
+
   async function loadSurfaces(opts) {
     const force = opts && opts.force;
     if (state.surfacesInFlight) {
@@ -402,89 +436,94 @@
     state.surfacesInFlight = true;
     state.surfaceLoading = true;
     state.taskLoading = true;
+    state.projectLoading = true;
+    state.surfaceLoadError = null;
+    state.taskLoadError = null;
+    state.projectLoadError = null;
     const request = beginFetchState(
       "surfaces",
       "surfaces",
-      renderSurfacesLoading,
+      renderSurfaces,
       () => loadSurfaces({ force: true }),
       { preserveSettled: true },
     );
+    const ownsRequest = () => (
+      ensureFetchState("surfaces").seq === request.seq
+    );
+    renderProjects();
     renderSurfaces();
-    try {
-      const [sessionsResult, tasksResult, projectsResult] =
-        await Promise.allSettled([
-          apiJson(API + "/chat/sessions", { signal: request.signal }),
-          apiJsonOptional(
-            API + "/tasks?limit=" + TASK_RAIL_LIMIT,
-            { signal: request.signal },
-          ),
-          apiJsonOptional(projectListPath(), { signal: request.signal }),
-        ]);
-
-      // If any leg aborted because a newer load took over, bail without
-      // mutating shared state — the newer load owns the render path.
-      if (
-        (sessionsResult.status === "rejected"
-          && isAbortError(sessionsResult.reason))
-        || (tasksResult.status === "rejected"
-          && isAbortError(tasksResult.reason))
-        || (projectsResult.status === "rejected"
-          && isAbortError(projectsResult.reason))
-      ) {
-        return;
-      }
-
-      if (sessionsResult.status === "rejected") {
-        state.surfaces = [];
-        state.taskSurfaces = [];
-        state.projects = [];
-        state.projectLoadError = null;
-        state.taskLoadError = null;
-        const err = sessionsResult.reason instanceof Error
-          ? sessionsResult.reason
-          : new Error(String(sessionsResult.reason));
-        state.surfaceLoadError = err;
-        renderSurfaceError(err);
-        renderProjects();
-        return;
-      }
-      const data = sessionsResult.value;
+    const sessionsPromise = railJsonWithTimeout(
+      "chat surfaces",
+      (opts) => apiJson(API + "/chat/sessions", opts),
+      { signal: request.signal },
+    ).then((data) => {
+      if (!ownsRequest()) return;
       state.surfaces = Array.isArray(data.sessions) ? data.sessions : [];
       state.surfaceLoadError = null;
-
-      if (tasksResult.status === "fulfilled") {
-        state.taskLoadError = null;
-        const taskData = tasksResult.value;
-        const items = Array.isArray(taskData.items) ? taskData.items : [];
-        state.taskSurfaces = dedupeTaskSurfaces(
-          items.map(normalizeTaskSurface),
-        );
-      } else {
-        state.taskSurfaces = [];
-        state.taskLoadError = tasksResult.reason instanceof Error
-          ? tasksResult.reason
-          : new Error(String(tasksResult.reason));
-      }
-
-      if (projectsResult.status === "fulfilled") {
-        state.projectLoadError = null;
-        const projectData = projectsResult.value;
-        state.projects = Array.isArray(projectData.items)
-          ? projectData.items : [];
-      } else {
-        state.projects = [];
-        state.projectLoadError = projectsResult.reason instanceof Error
-          ? projectsResult.reason
-          : new Error(String(projectsResult.reason));
-      }
-      renderProjects();
-      ensureSelectionVisible();
-    } finally {
+    }, (err) => {
+      if (!ownsRequest() || isAbortError(err)) return;
+      state.surfaces = [];
+      state.surfaceLoadError = asError(err);
+    }).finally(() => {
+      if (!ownsRequest()) return;
       state.surfaceLoading = false;
+      ensureSelectionVisible();
+      renderSurfaces();
+    });
+
+    const tasksPromise = railJsonWithTimeout(
+      "tasks",
+      (opts) => apiJsonOptional(
+        API + "/tasks?limit=" + TASK_RAIL_LIMIT,
+        opts,
+      ),
+      { signal: request.signal },
+    ).then((taskData) => {
+      if (!ownsRequest()) return;
+      state.taskLoadError = null;
+      const items = Array.isArray(taskData.items) ? taskData.items : [];
+      state.taskSurfaces = dedupeTaskSurfaces(
+        items.map(normalizeTaskSurface),
+      );
+    }, (err) => {
+      if (!ownsRequest() || isAbortError(err)) return;
+      state.taskSurfaces = [];
+      state.taskLoadError = asError(err);
+    }).finally(() => {
+      if (!ownsRequest()) return;
       state.taskLoading = false;
+      ensureSelectionVisible();
+      renderSurfaces();
+    });
+
+    const projectsPromise = railJsonWithTimeout(
+      "projects",
+      (opts) => apiJsonOptional(projectListPath(), opts),
+      { signal: request.signal },
+    ).then((projectData) => {
+      if (!ownsRequest()) return;
+      state.projectLoadError = null;
+      state.projects = Array.isArray(projectData.items)
+        ? projectData.items : [];
+    }, (err) => {
+      if (!ownsRequest() || isAbortError(err)) return;
+      state.projects = [];
+      state.projectLoadError = asError(err);
+    }).finally(() => {
+      if (!ownsRequest()) return;
+      state.projectLoading = false;
+      renderProjects();
+    });
+
+    try {
+      await Promise.allSettled([
+        sessionsPromise,
+        tasksPromise,
+        projectsPromise,
+      ]);
+    } finally {
       if (!finishFetchState("surfaces", request.seq)) return;
       state.surfacesInFlight = false;
-      renderSurfaces();
       if (state.surfacesRefreshQueued) {
         state.surfacesRefreshQueued = false;
         loadSurfaces();
@@ -719,7 +758,8 @@
     if (projects.length === 0) {
       list.appendChild(el("li", {
         class: "project-empty",
-        text: "no matching projects",
+        text: state.projectLoading
+          ? "loading projects..." : "no matching projects",
       }));
       return;
     }
@@ -843,9 +883,12 @@
       || state.taskLoadError
     );
     const isLoading = state.surfaceLoading || state.taskLoading;
-    if (!hasRegistered && isLoading) {
+    const allSectionsPending = state.surfaceLoading && state.taskLoading;
+    if (!hasRegistered && isLoading && allSectionsPending) {
       list.appendChild(
-        el("li", { class: "surface-empty", text: "loading surfaces..." }),
+        fetchAffordance(
+          "surfaces", "li", "surface-empty", "loading surfaces...",
+        ),
       );
       return;
     }

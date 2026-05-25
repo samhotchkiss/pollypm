@@ -627,6 +627,121 @@ test.describe("surfaces", () => {
     await waitForSurfaceRailTerminal(page);
   });
 
+  test("projects render on cold load before sessions and tasks finish", async ({ page }) => {
+    await installHealthyEventSource(page);
+    await stubEmptyActivity(page);
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(0)),
+      }),
+    );
+
+    let releaseSessions: (() => void) | null = null;
+    const sessionsGate = new Promise<void>((resolve) => {
+      releaseSessions = resolve;
+    });
+    let releaseTasks: (() => void) | null = null;
+    const tasksGate = new Promise<void>((resolve) => {
+      releaseTasks = resolve;
+    });
+
+    await page.route("**/api/v1/chat/sessions", async (route) => {
+      await sessionsGate;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ sessions: [] }),
+      });
+    });
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, async (route) => {
+      await tasksGate;
+      return route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({ items: [] }),
+      });
+    });
+    await page.route("**/api/v1/projects**", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          items: [
+            {
+              key: "demo",
+              name: "Demo",
+              tracked: true,
+              task_counts: { in_progress: 1 },
+              open_inbox_count: 0,
+              last_activity_at: "2026-05-23T00:00:00Z",
+            },
+          ],
+        }),
+      }),
+    );
+
+    await page.goto("/ui/", { waitUntil: "domcontentloaded" });
+    await expect(page.locator("#project-list li[data-project='demo']")).toBeVisible();
+    await expect(page.locator("#project-list")).toContainText("1 tracked");
+    await expect(page.locator("#surface-list .surface-empty")).toHaveText(
+      "loading surfaces...",
+    );
+
+    releaseSessions!();
+    releaseTasks!();
+    await waitForSurfaceRailTerminal(page);
+  });
+
+  test("rail requests time out into visible error states", async ({ page }) => {
+    await installHealthyEventSource(page);
+    await stubEmptyActivity(page);
+    await page.addInitScript(() => {
+      (window as any).__POLLYPM_RAIL_REQUEST_TIMEOUT_MS = 50;
+    });
+    await page.route("**/api/v1/dashboard", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(dashboardPayload(0)),
+      }),
+    );
+
+    async function slowJson(
+      route: import("@playwright/test").Route,
+      body: unknown,
+    ) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 500));
+      await route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(body),
+      }).catch(() => undefined);
+    }
+
+    await page.route("**/api/v1/chat/sessions", (route) =>
+      slowJson(route, { sessions: [] }),
+    );
+    await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
+      slowJson(route, { items: [] }),
+    );
+    await page.route("**/api/v1/projects**", (route) =>
+      slowJson(route, { items: [] }),
+    );
+
+    await page.goto("/ui/", { waitUntil: "domcontentloaded" });
+    await expect(page.locator("#project-list .project-empty")).toHaveText(
+      "projects unavailable: projects request timed out after 50ms",
+    );
+    await expect(page.locator("#surface-list")).toContainText(
+      "error: chat unavailable: chat surfaces request timed out after 50ms",
+    );
+    await expect(page.locator("#surface-list")).toContainText(
+      "error: tasks unavailable: tasks request timed out after 50ms",
+    );
+  });
+
   test("initial center-pane state shows inline next actions", async ({ page }) => {
     await page.goto("/ui/");
     await expect(page.locator("#pane-title")).toHaveText("Ready");

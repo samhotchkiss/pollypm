@@ -238,8 +238,12 @@ def print_result(result: CheckResult, *, color: bool = True) -> None:
     print(f"{prefix} {result.name}: {result.detail}")
 
 
+def failed_check_names(results: list[CheckResult]) -> list[str]:
+    return [result.name for result in results if not result.ok]
+
+
 def summary_block(sha: str, timestamp: str, results: list[CheckResult]) -> str:
-    failed = [result.name for result in results if not result.ok]
+    failed = failed_check_names(results)
     result_text = "all green" if not failed else f"red on {', '.join(failed)}"
     failed_text = "none" if not failed else ", ".join(failed)
     return "\n".join(
@@ -299,7 +303,7 @@ def run_smoke(args: argparse.Namespace) -> int:
         if spec.name == "task queue" and args.task_wait_seconds > 0 and not args.dry_run:
             time.sleep(args.task_wait_seconds)
 
-    if all(result.ok for result in results):
+    if not failed_check_names(results):
         for spec in fixed_command_specs():
             result, _stdout = run_command(spec, dry_run=args.dry_run)
             results.append(result)
@@ -310,9 +314,9 @@ def run_smoke(args: argparse.Namespace) -> int:
         print(summary_block(sha, timestamp, results))
     else:
         block = summary_block(sha, timestamp, results)
-        color = GREEN if all(result.ok for result in results) else RED
+        color = GREEN if not failed_check_names(results) else RED
         print(f"{BOLD}{color}{block}{RESET}")
-    return 0 if all(result.ok for result in results) else 1
+    return 1 if failed_check_names(results) else 0
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:

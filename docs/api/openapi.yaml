@@ -3880,6 +3880,23 @@ components:
         claimed_by_session: { type: string }
         current_node_id: { type: string }
         plan_version: { type: integer }
+        created_at:
+          type: string
+          format: date-time
+          description: Task creation timestamp.
+        state_entered_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the task entered its current work_status.
+        dwell_seconds:
+          type: integer
+          nullable: true
+          description: Seconds spent in the current work_status.
+        age_seconds:
+          type: integer
+          nullable: true
+          description: Seconds since task creation.
         updated_at: { type: string, format: date-time }
 
     Transition:
@@ -4005,7 +4022,6 @@ components:
             total_input_tokens: { type: integer }
             total_output_tokens: { type: integer }
             session_count: { type: integer }
-            created_at: { type: string, format: date-time }
             created_by: { type: string }
             plan:
               $ref: "#/components/schemas/Plan"

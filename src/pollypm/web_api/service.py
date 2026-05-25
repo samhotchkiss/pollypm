@@ -1240,7 +1240,9 @@ def list_project_tasks(
             next_cursor: str | None = None
             if len(tasks) > limit and page:
                 next_cursor = str(getattr(page[-1], "task_number", 0))
-            return [_task_to_summary(t) for t in page], next_cursor, total
+            return [
+                _task_to_summary(_task_for_summary(svc, t)) for t in page
+            ], next_cursor, total
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "list_tasks: backing store error for %s: %s",
@@ -1319,7 +1321,7 @@ def list_all_tasks(
     warnings: list[dict[str, object]] = []
 
     if include_untracked:
-        tasks = _list_tasks_from_workspace(config, project=project)
+        tasks = _list_tasks_from_workspace(config, project=project, hydrate=True)
         for task in tasks:
             if not _task_matches_list_filters(
                 task,
@@ -1370,7 +1372,7 @@ def list_all_tasks(
                 since=since,
             ):
                 continue
-            summaries.append(_task_to_summary(task))
+            summaries.append(_task_to_summary(_task_for_summary(svc, task)))
 
     try:
         dropped_count = _count_untracked_matches(
@@ -1414,7 +1416,18 @@ def _tracked_project_keys(config: PollyPMConfig) -> tuple[str, ...]:
     )
 
 
-def _list_tasks_from_workspace(config: PollyPMConfig, *, project: str | None):
+def _task_for_summary(svc, task):
+    try:
+        return svc.get(task.task_id)
+    except _BACKING_STORE_ERRORS:
+        raise
+    except Exception:  # noqa: BLE001
+        return task
+
+
+def _list_tasks_from_workspace(
+    config: PollyPMConfig, *, project: str | None, hydrate: bool = False
+):
     workspace_root = (
         getattr(config.project, "workspace_root", None)
         or getattr(config.project, "root_dir", None)
@@ -1425,7 +1438,10 @@ def _list_tasks_from_workspace(config: PollyPMConfig, *, project: str | None):
         project_key="__workspace__",
         project_path=Path(workspace_root),
     ) as svc:
-        return svc.list_tasks(project=project)
+        tasks = svc.list_tasks(project=project)
+        if hydrate:
+            tasks = [_task_for_summary(svc, task) for task in tasks]
+        return tasks
 
 
 def _task_matches_list_filters(
@@ -3249,6 +3265,7 @@ def _is_in_review(task) -> bool:
 
 
 def _task_to_summary(task) -> APITaskSummary:
+    timing = _task_timing_fields(task)
     return APITaskSummary(
         task_id=task.task_id,
         project=task.project,
@@ -3261,8 +3278,51 @@ def _task_to_summary(task) -> APITaskSummary:
         claimed_by_session=getattr(task, "claimed_by_session", None),
         current_node_id=task.current_node_id,
         plan_version=getattr(task, "plan_version", None),
+        created_at=timing["created_at"],
+        state_entered_at=timing["state_entered_at"],
+        dwell_seconds=timing["dwell_seconds"],
+        age_seconds=timing["age_seconds"],
         updated_at=getattr(task, "updated_at", None),
     )
+
+
+def _task_timing_fields(task) -> dict[str, datetime | int | None]:
+    created_at = _as_aware_datetime(getattr(task, "created_at", None))
+    state_entered_at = _state_entered_at(task)
+    now = datetime.now(timezone.utc)
+    dwell_seconds = _elapsed_seconds(state_entered_at, now)
+    age_seconds = _elapsed_seconds(created_at, now)
+    return {
+        "created_at": created_at,
+        "state_entered_at": state_entered_at,
+        "dwell_seconds": dwell_seconds,
+        "age_seconds": age_seconds,
+    }
+
+
+def _state_entered_at(task) -> datetime | None:
+    current = _enum_value(getattr(task, "work_status", ""))
+    transitions = list(getattr(task, "transitions", None) or [])
+    for transition in reversed(transitions):
+        if _enum_value(getattr(transition, "to_state", "")) == current:
+            entered = _as_aware_datetime(getattr(transition, "timestamp", None))
+            if entered is not None:
+                return entered
+    return _as_aware_datetime(getattr(task, "created_at", None))
+
+
+def _as_aware_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    if value.tzinfo is None or value.tzinfo.utcoffset(value) is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _elapsed_seconds(start: datetime | None, end: datetime) -> int | None:
+    if start is None:
+        return None
+    return max(0, int((end - start).total_seconds()))
 
 
 def _task_to_detail_with_plan(task, *, svc) -> APITaskDetail:
@@ -3324,19 +3384,9 @@ def _task_to_detail(task, *, plan: APIPlan | None = None) -> APITaskDetail:
         )
         for c in (task.context or [])
     ]
+    summary = _task_to_summary(task)
     return APITaskDetail(
-        task_id=task.task_id,
-        project=task.project,
-        task_number=task.task_number,
-        title=task.title,
-        work_status=_enum_value(task.work_status),
-        type=_enum_value(task.type),
-        priority=_enum_value(task.priority),
-        assignee=task.assignee,
-        claimed_by_session=getattr(task, "claimed_by_session", None),
-        current_node_id=task.current_node_id,
-        plan_version=getattr(task, "plan_version", None),
-        updated_at=getattr(task, "updated_at", None),
+        **summary.model_dump(),
         description=task.description or "",
         acceptance_criteria=task.acceptance_criteria,
         constraints=task.constraints,
@@ -3354,7 +3404,6 @@ def _task_to_detail(task, *, plan: APIPlan | None = None) -> APITaskDetail:
         total_input_tokens=getattr(task, "total_input_tokens", 0),
         total_output_tokens=getattr(task, "total_output_tokens", 0),
         session_count=getattr(task, "session_count", 0),
-        created_at=task.created_at,
         created_by=task.created_by or "",
         plan=plan,
     )

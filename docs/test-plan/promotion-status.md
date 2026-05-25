@@ -80,7 +80,7 @@ Use this tracker while executing the ship-readiness plan. Promote manual checks 
 | Scenario | Manual Run | Result | Promoted? | Test Path | Notes |
 |---|---|---|---|---|---|
 | 5.1 `pm serve` kill/restart | — | — | ☐ | — | integration test |
-| 5.2 Pane kill mid-task | — | — | ☐ | — | pytest integration |
+| 5.2 Pane kill mid-task | — | — | ☐ | — | requires managed control plane or local HeartbeatRail dispatcher; `pm serve`-only result is unverified |
 | 5.3 DB drop / reconnect | — | — | ☐ | — | toxiproxy-style integration |
 | 5.4 Pause-marker enforcement | — | — | partial | tests/test_session_paused_marker_wiring.py | extend with §5.4 cells |
 | 5.4.5 Malformed marker fail-closed | — | — | partial | tests/test_session_paused_marker_wiring.py | already covers basic case |

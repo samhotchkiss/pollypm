@@ -139,7 +139,7 @@ All of §02 → pytest. Drive a known fixture transcript file, assert envelope s
 | Scenario | Target |
 |---|---|
 | 5.1 `pm serve` kill/restart | Integration test |
-| 5.2 Pane kill mid-task | pytest integration (mock tmux or real) |
+| 5.2 Pane kill mid-task | pytest/integration with managed control plane or local HeartbeatRail dispatcher; HTTP-only `pm serve` cannot cover this |
 | 5.3 DB drop | Integration test with toxiproxy |
 | 5.4 Pause-marker | pytest + integration |
 | 5.5 Token rotation | Playwright |

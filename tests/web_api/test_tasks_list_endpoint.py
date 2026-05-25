@@ -165,6 +165,66 @@ def test_list_tasks_timing_uses_latest_transition(
     assert item["age_seconds"] > item["dwell_seconds"]
 
 
+def test_list_all_tasks_uses_list_rows_without_per_item_refetch(
+    api_config, monkeypatch
+) -> None:
+    """The flat task list must not turn a page into N extra ``get`` calls."""
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+
+    from pollypm.web_api import service as svc_mod
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    class FakeTask(SimpleNamespace):
+        @property
+        def task_id(self) -> str:
+            return f"{self.project}/{self.task_number}"
+
+    task = FakeTask(
+        project="myproj",
+        task_number=1,
+        title="No refetch",
+        work_status="queued",
+        type="task",
+        priority="normal",
+        assignee=None,
+        claimed_by_session=None,
+        current_node_id=None,
+        plan_version=1,
+        created_at=now - timedelta(hours=1),
+        updated_at=now,
+        transitions=[
+            SimpleNamespace(to_state="queued", timestamp=now - timedelta(minutes=5))
+        ],
+    )
+
+    class FakeService:
+        def list_tasks(self, *, project=None, **_kwargs):
+            if project in (None, "myproj"):
+                return [task]
+            return []
+
+        def get(self, task_id):  # pragma: no cover - failure path
+            raise AssertionError(f"unexpected per-item refetch: {task_id}")
+
+    @contextmanager
+    def fake_open(**_kwargs):
+        yield FakeService()
+
+    monkeypatch.setattr(svc_mod, "_open_work_service_readonly", fake_open)
+
+    items, next_cursor, warnings, total = svc_mod.list_all_tasks(
+        api_config, limit=10
+    )
+
+    assert [item.task_id for item in items] == ["myproj/1"]
+    assert items[0].state_entered_at == now - timedelta(minutes=5)
+    assert next_cursor is None
+    assert warnings == []
+    assert total == 1
+
+
 def test_list_tasks_project_filter(
     api_config, client, auth_headers, project_root, workspace_root
 ) -> None:

@@ -1230,7 +1230,7 @@ def list_project_tasks(
             if len(tasks) > limit and page:
                 next_cursor = str(getattr(page[-1], "task_number", 0))
             return [
-                _task_to_summary(_task_for_summary(svc, t)) for t in page
+                _task_to_summary(t) for t in page
             ], next_cursor, total
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
@@ -1310,7 +1310,7 @@ def list_all_tasks(
     warnings: list[dict[str, object]] = []
 
     if include_untracked:
-        tasks = _list_tasks_from_workspace(config, project=project, hydrate=True)
+        tasks = _list_tasks_from_workspace(config, project=project)
         for task in tasks:
             if not _task_matches_list_filters(
                 task,
@@ -1361,7 +1361,7 @@ def list_all_tasks(
                 since=since,
             ):
                 continue
-            summaries.append(_task_to_summary(_task_for_summary(svc, task)))
+            summaries.append(_task_to_summary(task))
 
     try:
         dropped_count = _count_untracked_matches(

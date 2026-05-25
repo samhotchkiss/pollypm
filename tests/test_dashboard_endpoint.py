@@ -364,6 +364,25 @@ def test_dashboard_loads_projects_and_gather_concurrently(
     assert gather_started.is_set()
 
 
+def test_dashboard_route_gather_bypasses_state_cache(
+    config: PollyPMConfig, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_gather(_config, _store, *, use_state_cache):
+        seen["use_state_cache"] = use_state_cache
+        return _make_data()
+
+    monkeypatch.setattr(
+        "pollypm.dashboard_data.gather",
+        fake_gather,
+    )
+
+    dashboard_routes._gather_dashboard(config)
+
+    assert seen == {"use_state_cache": False}
+
+
 # ---------------------------------------------------------------------------
 # Happy paths
 # ---------------------------------------------------------------------------

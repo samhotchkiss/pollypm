@@ -57,6 +57,15 @@ _ALL_TASKS_GROUPED_CACHE: dict[
     int, tuple[float, "dict[str, tuple[Task, ...]] | None"]
 ] = {}
 
+# Same request-local sharing for the inbox-task aggregate. The dashboard
+# count path and the recent-inbox preview path both need the same broad
+# ``inbox_tasks(svc, project=None)`` scan; without this cache one
+# ``/api/v1/dashboard`` request pays that scan twice.
+_INBOX_TASKS_GROUPED_TTL_SECONDS = 1.0
+_INBOX_TASKS_GROUPED_CACHE: dict[
+    int, tuple[float, "dict[str, tuple[Task, ...]] | None"]
+] = {}
+
 
 # --------------------------------------------------------------------------- #
 # Shared pg service handle
@@ -178,6 +187,39 @@ def inbox_tasks_grouped(
     independent ``inbox_tasks(svc, project=key)`` calls — one per
     tracked project — that the sqlite path runs today.
     """
+    cache_key = id(config)
+    now = time.monotonic()
+    cached = _INBOX_TASKS_GROUPED_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and now - cached[0] < _INBOX_TASKS_GROUPED_TTL_SECONDS
+    ):
+        snapshot = cached[1]
+        if snapshot is None:
+            return None
+        return {key: list(rows) for key, rows in snapshot.items()}
+
+    result = _inbox_tasks_grouped_uncached(config)
+    completed_at = time.monotonic()
+    if len(_INBOX_TASKS_GROUPED_CACHE) > 8:
+        for stale_key in [
+            k for k, (ts, _v) in _INBOX_TASKS_GROUPED_CACHE.items()
+            if completed_at - ts >= _INBOX_TASKS_GROUPED_TTL_SECONDS
+        ]:
+            _INBOX_TASKS_GROUPED_CACHE.pop(stale_key, None)
+    snapshot = (
+        None
+        if result is None
+        else {key: tuple(rows) for key, rows in result.items()}
+    )
+    _INBOX_TASKS_GROUPED_CACHE[cache_key] = (completed_at, snapshot)
+    return result
+
+
+def _inbox_tasks_grouped_uncached(
+    config: "PollyPMConfig | None",
+) -> dict[str, list["Task"]] | None:
+    """Underlying implementation of :func:`inbox_tasks_grouped`."""
     svc = _open_pg_service(config)
     if svc is None:
         return None

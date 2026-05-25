@@ -32,8 +32,8 @@ Implemented in Slice A (mirrored here):
   labels, acceptance criteria, full round-trip.
 * ``TestGetTask`` — get, missing-raises.
 * ``TestListTasks`` — by project, by status, by type, all.
-* ``TestQueue`` (subset) — happy path only; the validation gates
-  (description-required, requires_human_review) are Slice-B.
+* ``TestQueue`` (subset) — happy path, idempotency, and
+  description-required validation.
 * ``TestCancel`` (subset) — happy path + reject-terminal.
 * ``TestMarkDone`` (subset) — happy path + idempotency.
 * ``TestListNonterminalTasks`` — Slice-A specific (no sqlite mirror).
@@ -41,7 +41,7 @@ Implemented in Slice A (mirrored here):
 Deferred — TODO when each slice lands:
 
 * ``TestUpdateTask`` — Slice B (``update``).
-* ``TestQueue`` validation paths — Slice B (gates).
+* ``TestQueue`` remaining validation paths — Slice B (human review).
 * ``TestClaim`` — Slice B (worker session provisioning).
 * ``TestHoldResume`` / ``TestBlock`` — Slice B (transition manager).
 * ``TestTransitions`` — Slice B (audit emission).
@@ -69,6 +69,7 @@ from pollypm.work.models import (
 from pollypm.work.service_support import (
     InvalidTransitionError,
     TaskNotFoundError,
+    ValidationError,
 )
 
 
@@ -232,9 +233,12 @@ class TestQueue:
         again = pg_work_service.queue(tid, actor="pm")
         assert again.work_status is WorkStatus.QUEUED
 
-    @pytest.mark.skip(reason="description-required gate lands in Slice B.")
     def test_queue_without_description(self, pg_work_service):
-        ...
+        task = _create_pg_task(pg_work_service, description="")
+        with pytest.raises(ValidationError, match="gate failed"):
+            pg_work_service.queue(
+                f"{task.project}/{task.task_number}", actor="pm"
+            )
 
     @pytest.mark.skip(
         reason="requires_human_review gate + skip_gates lands in Slice B."

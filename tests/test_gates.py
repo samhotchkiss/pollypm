@@ -383,13 +383,6 @@ def _create_standard_task(svc, project="proj", title="My task", description="Do 
 
 
 class TestSkipGates:
-    @pytest.mark.xfail(
-        reason=(
-            "PgWorkService.queue() doesn't enforce description/readiness "
-            "gates yet (#1767, same gap as requires_human_review)"
-        ),
-        strict=False,
-    )
     def test_skip_gates_allows_queue_without_description(self, svc):
         """queue a task with no description but skip_gates=True succeeds."""
         task = _create_standard_task(svc, description="")

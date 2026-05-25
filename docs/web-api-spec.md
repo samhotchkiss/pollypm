@@ -489,7 +489,7 @@ Fields: `schema`, `ts`, `project`, `event`, `subject`, `actor`,
 | GET    | `/api/v1/tasks/{project}/{n}` | Task detail — status, node, executions, transitions |
 | POST   | `/api/v1/tasks/{project}/{n}/approve` | Approve plan or code review |
 | POST   | `/api/v1/tasks/{project}/{n}/reject` | Reject + capture reason |
-| POST   | `/api/v1/tasks/{project}/{n}/queue` | Queue a draft task |
+| POST   | `/api/v1/tasks/{project}/{n}/queue` | Queue a draft task; failed pre-queue gates return `422 validation_error` |
 | POST   | `/api/v1/tasks/{project}/{n}/claim` | Claim a queued task (activate first node, keep `assignee` role-derived, record request `actor` as `claimed_by_session`, fires `queued→in_progress`). Returns `429 worker_cap_exceeded` when the project is at `max_parallel_workers` (#2064 round-11). Post-commit cap races may roll the row back to `queued`; the response `message` and `warnings[]` describe the actual state |
 | POST   | `/api/v1/tasks/{project}/{n}/cancel` | Cancel a non-terminal task (mapped to `svc.cancel`; optional `reason` — absent reasons resolve to `"cancelled via API"` in the audit row). In-progress tasks require `?force=true`; without it the API returns `409 confirmation_required` |
 | POST   | `/api/v1/tasks/{project}/{n}/reopen` | Reopen a cancelled task to `queued`, clearing live claim fields and preserving history in `work_transitions` |

@@ -1504,6 +1504,48 @@ def _self_heal_duplicate_advisor_tasks_counter(
     }
 
 
+def _emit_worker_lane_failed(
+    *,
+    project_key: str,
+    finding: Finding,
+    role: str,
+    reason: str,
+    project_path: Path | None,
+) -> None:
+    """#2225 — best-effort forensic event for a failed role-lane spawn.
+
+    Mirrors the success emit at the tail of
+    :func:`_self_heal_role_session_missing` so operators can grep the
+    audit log for ``audit.worker_lane_failed`` rows to see *why* a
+    ``role_session_missing`` finding is not producing a spawn. Without
+    this, the failure path is silent and indistinguishable (in the audit
+    log) from "the cascade never tried."
+    """
+    try:
+        from pollypm.audit import emit as _audit_emit
+        from pollypm.audit.log import EVENT_WATCHDOG_WORKER_LANE_FAILED
+
+        _audit_emit(
+            event=EVENT_WATCHDOG_WORKER_LANE_FAILED,
+            project=project_key,
+            subject=finding.subject,
+            actor="audit_watchdog",
+            status="warn",
+            metadata={
+                "role": role,
+                "project": project_key,
+                "task_subject": finding.subject,
+                "reason": reason,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: emit worker_lane_failed failed",
+            exc_info=True,
+        )
+
+
 def _self_heal_role_session_missing(
     finding: Finding,
     *,
@@ -1523,12 +1565,26 @@ def _self_heal_role_session_missing(
     Idempotent — when the existing session lookup hits a match, we no-op
     and return ``{"worker_lane_spawned": 0}`` so the counter doesn't lie
     about how many lanes were actually created.
+
+    #2225 — every failure return path now emits an
+    ``audit.worker_lane_failed`` event with a ``reason`` token so the
+    audit log carries a positive signal that the cascade *attempted* a
+    spawn and the attempt failed (vs the prior silent path that left
+    operators staring at repeated ``audit.finding`` rows with no
+    corresponding spawn / failure event).
     """
     counters = {"worker_lane_spawned": 0, "worker_lane_failed": 0}
     meta = finding.metadata or {}
     role = meta.get("role") or ""
     if not role:
         counters["worker_lane_failed"] += 1
+        _emit_worker_lane_failed(
+            project_key=project_key,
+            finding=finding,
+            role="",
+            reason="missing_role_metadata",
+            project_path=project_path,
+        )
         return counters
     if role == "worker":
         # Per-task workers are provisioned automatically by ``pm task
@@ -1549,6 +1605,13 @@ def _self_heal_role_session_missing(
             task_id = finding.subject or ""
         if not task_id or "/" not in task_id:
             counters["worker_lane_failed"] += 1
+            _emit_worker_lane_failed(
+                project_key=project_key,
+                finding=finding,
+                role=role,
+                reason="reviewer_missing_task_id",
+                project_path=project_path,
+            )
             return counters
         try:
             from pollypm.config import DEFAULT_CONFIG_PATH, load_config
@@ -1560,17 +1623,38 @@ def _self_heal_role_session_missing(
                 "for %s", task_id, exc_info=True,
             )
             counters["worker_lane_failed"] += 1
+            _emit_worker_lane_failed(
+                project_key=project_key,
+                finding=finding,
+                role=role,
+                reason="reviewer_import_failed",
+                project_path=project_path,
+            )
             return counters
         cfg_path = config_path
         if cfg_path is None and DEFAULT_CONFIG_PATH.exists():
             cfg_path = DEFAULT_CONFIG_PATH
         if cfg_path is None:
             counters["worker_lane_failed"] += 1
+            _emit_worker_lane_failed(
+                project_key=project_key,
+                finding=finding,
+                role=role,
+                reason="reviewer_missing_config",
+                project_path=project_path,
+            )
             return counters
         try:
             cfg = load_config(cfg_path)
         except Exception:  # noqa: BLE001
             counters["worker_lane_failed"] += 1
+            _emit_worker_lane_failed(
+                project_key=project_key,
+                finding=finding,
+                role=role,
+                reason="reviewer_load_config_failed",
+                project_path=project_path,
+            )
             return counters
         try:
             # #1887 — thread ``config=cfg`` through the factory so the
@@ -1634,9 +1718,23 @@ def _self_heal_role_session_missing(
                 task_id, exc_info=True,
             )
             counters["worker_lane_failed"] += 1
+            _emit_worker_lane_failed(
+                project_key=project_key,
+                finding=finding,
+                role=role,
+                reason="reviewer_provision_raised",
+                project_path=project_path,
+            )
             return counters
         if window is None:
             counters["worker_lane_failed"] += 1
+            _emit_worker_lane_failed(
+                project_key=project_key,
+                finding=finding,
+                role=role,
+                reason="reviewer_provision_returned_none",
+                project_path=project_path,
+            )
         else:
             counters["worker_lane_spawned"] += 1
         return counters
@@ -1657,6 +1755,13 @@ def _self_heal_role_session_missing(
                 cfg_path = DEFAULT_CONFIG_PATH
             else:
                 counters["worker_lane_failed"] += 1
+                _emit_worker_lane_failed(
+                    project_key=project_key,
+                    finding=finding,
+                    role=role,
+                    reason="missing_config_path",
+                    project_path=project_path,
+                )
                 return counters
         supervisor = cli_mod._load_supervisor(cfg_path)
         existing = next(
@@ -1680,12 +1785,19 @@ def _self_heal_role_session_missing(
         else:
             session = existing
         cli_mod.launch_worker_session(cfg_path, session.name)
-    except Exception:  # noqa: BLE001
+    except Exception as exc:  # noqa: BLE001
         logger.warning(
             "audit.watchdog: role-lane spawn failed for %s/%s",
             project_key, role, exc_info=True,
         )
         counters["worker_lane_failed"] += 1
+        _emit_worker_lane_failed(
+            project_key=project_key,
+            finding=finding,
+            role=role,
+            reason=f"spawn_raised:{type(exc).__name__}",
+            project_path=project_path,
+        )
         return counters
     counters["worker_lane_spawned"] += 1
     # Best-effort forensic event so operators can grep the audit log

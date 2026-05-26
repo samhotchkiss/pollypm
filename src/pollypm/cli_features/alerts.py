@@ -471,12 +471,13 @@ def heartbeat_status(
     from pollypm import cli as cli_mod
     from pollypm.config import load_config
     from pollypm.rail_daemon_supervisor import (
-        diagnose_rail_daemon, query_last_heartbeat_iso,
+        diagnose_rail_daemon, query_last_heartbeat_iso, read_crash_loop_state,
     )
 
     cfg = load_config(config_path)
     pid_path = cli_mod._rail_daemon_pid_path()
     last_tick_iso = query_last_heartbeat_iso(cfg.project.state_db)
+    crash_loop = read_crash_loop_state(pid_path)
     decision = diagnose_rail_daemon(
         pid_path=pid_path, last_tick_iso=last_tick_iso,
     )
@@ -487,6 +488,18 @@ def heartbeat_status(
             "last_tick_age_seconds": decision.last_tick_age_seconds,
             "reason": decision.reason,
             "needs_revival": decision.needs_revival,
+            "crash_loop": (
+                {
+                    "failure_count": crash_loop.failure_count,
+                    "threshold": crash_loop.threshold,
+                    "suppressed": crash_loop.suppressed,
+                    "first_failure_at": crash_loop.first_failure_at,
+                    "last_failure_at": crash_loop.last_failure_at,
+                    "reason": crash_loop.reason,
+                }
+                if crash_loop is not None
+                else None
+            ),
         })
         return
     label = "alive" if decision.state == "alive" else "DEGRADED"
@@ -495,6 +508,13 @@ def heartbeat_status(
     if decision.last_tick_age_seconds is not None:
         typer.echo(f"  last tick: {decision.last_tick_age_seconds:.0f}s ago")
     typer.echo(f"  {decision.reason}")
+    if crash_loop is not None and crash_loop.suppressed:
+        typer.echo(
+            "  crash loop: suppressed after "
+            f"{crash_loop.failure_count} failed starts"
+        )
+        if crash_loop.reason:
+            typer.echo(f"  last failure: {crash_loop.reason}")
 
 
 @heartbeat_app.command(

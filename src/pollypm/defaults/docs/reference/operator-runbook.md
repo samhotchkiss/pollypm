@@ -375,6 +375,21 @@ What an operator sees:
 - Log rotation does not emit an audit-log event today. Inspect archive
   files and the live log size when investigating rotation behavior.
 
+### Rail Daemon Startup Failures
+
+On startup, `rail_daemon` holds its single-instance lock before opening
+the workspace store. If the installed code has pending workspace schema
+migrations, the daemon applies them before booting the heartbeat rail;
+failed migrations still stop startup and leave the structured migration
+message in `~/.pollypm/rail_daemon.log`.
+
+If the supervisor repeatedly spawns the daemon and no child claims
+`~/.pollypm/rail_daemon.pid`, the supervisor writes
+`~/.pollypm/rail_daemon.crash_loop.json`, stops further respawns for
+that failure window, and upserts a user-facing inbox alert. `pm doctor`
+also reports this as an error. After fixing the startup cause, run
+`pm up`; a healthy daemon clears the sentinel.
+
 ### Cockpit Socket Reaper
 
 What runs:

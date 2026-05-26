@@ -37,7 +37,9 @@ from pollypm.rail_daemon_supervisor import (
     DEFAULT_STALE_TICK_SECONDS,
     RevivalDecision,
     check_and_revive_rail_daemon,
+    crash_loop_state_path,
     diagnose_rail_daemon,
+    read_crash_loop_state,
     should_revive,
 )
 
@@ -372,6 +374,7 @@ def test_revive_unlinks_stale_pid_file(tmp_path: Path):
     # We call _terminate_with_grace via the supervisor; intercept the
     # os.kill so we don't actually signal pytest.
     real_kill = _mod.os.kill
+
     def fake_kill(pid: int, sig: int) -> None:
         # Pretend SIGTERM took: subsequent ``os.kill(pid, 0)`` should
         # raise ProcessLookupError. Easiest way: track that we sent
@@ -383,7 +386,7 @@ def test_revive_unlinks_stale_pid_file(tmp_path: Path):
 
     _mod.os.kill = fake_kill
     try:
-        result = check_and_revive_rail_daemon(
+        check_and_revive_rail_daemon(
             config_path=config_path,
             pid_path=pid_path,
             last_tick_iso=stale_tick,
@@ -507,7 +510,6 @@ def test_revive_skips_signaling_when_pid_identity_mismatches(
     config_path = tmp_path / "pollypm.toml"
     pid_path = tmp_path / "rail_daemon.pid"
     pid_path.write_text(str(os.getpid()))
-    spawner = _SpawnRecorder(pid_path=pid_path)
 
     # Force the classifier to say "stuck_no_tick" even though the PID
     # isn't our daemon. The terminate helper must still refuse to kill.
@@ -850,10 +852,9 @@ def test_concurrent_revive_when_spawner_returns_without_writing_pid(
     spawner = _SpawnRecorder(pid_path=pid_path, write_pid=False)
 
     # Single-thread scenario first: even when the child never writes,
-    # the supervisor must surface this as a warning + revived=True
-    # (the spawn itself succeeded), and on retry NOT re-spawn while
-    # we're still inside the wait window. We bound the wait to keep
-    # the test fast.
+    # the supervisor must surface this as a warning + unconfirmed
+    # revival, and on retry NOT re-spawn while we're still inside the
+    # wait window. We bound the wait to keep the test fast.
     result = check_and_revive_rail_daemon(
         config_path=config_path,
         pid_path=pid_path,
@@ -865,10 +866,12 @@ def test_concurrent_revive_when_spawner_returns_without_writing_pid(
         child_wait_seconds=0.2,  # short: we just want to verify the
                                   # lock is held for SOME bounded time
     )
-    # The first call records exactly one spawn — the wait timed out
-    # but the spawn itself was attempted, so revived=True.
+    # The first call records exactly one spawn. Because the child never
+    # wrote a matching PID, the supervisor reports the revival as
+    # unconfirmed instead of treating a bare Popen return as healthy.
     assert spawner.calls == [config_path]
-    assert result.revived is True
+    assert result.revived is False
+    assert result.spawn_error == "child_pid_timeout"
 
     # Now the racy window: a SECOND concurrent caller (modeled here
     # as a thread that fires while the first is mid-wait). To exercise
@@ -934,6 +937,92 @@ def test_concurrent_revive_when_spawner_returns_without_writing_pid(
     # B reported lock_busy.
     assert results[1] is not None
     assert results[1].spawn_error == "lock_busy"
+
+
+def test_immediate_exit_crash_loop_suppresses_future_respawns(tmp_path: Path):
+    """Repeated starts with no child PID eventually stop respawning.
+
+    This is the daemon-level analogue of the session crash-loop guard:
+    a child that exits before claiming ``rail_daemon.pid`` should not
+    be spawned forever with only log-file evidence.
+    """
+    config_path = tmp_path / "pollypm.toml"
+    pid_path = tmp_path / "rail_daemon.pid"
+    (tmp_path / "rail_daemon.log").write_text("pending migration\n")
+    spawner = _SpawnRecorder(pid_path=pid_path, write_pid=False)
+
+    first = check_and_revive_rail_daemon(
+        config_path=config_path,
+        pid_path=pid_path,
+        last_tick_iso=None,
+        last_revival_at=None,
+        spawn_fn=spawner,
+        sleep_fn=lambda _s: None,
+        emit_audit=False,
+        emit_operator_alert=False,
+        child_wait_seconds=0.01,
+        immediate_exit_threshold=2,
+    )
+    second = check_and_revive_rail_daemon(
+        config_path=config_path,
+        pid_path=pid_path,
+        last_tick_iso=None,
+        last_revival_at=None,
+        spawn_fn=spawner,
+        sleep_fn=lambda _s: None,
+        emit_audit=False,
+        emit_operator_alert=False,
+        child_wait_seconds=0.01,
+        immediate_exit_threshold=2,
+    )
+    third = check_and_revive_rail_daemon(
+        config_path=config_path,
+        pid_path=pid_path,
+        last_tick_iso=None,
+        last_revival_at=None,
+        spawn_fn=spawner,
+        sleep_fn=lambda _s: None,
+        emit_audit=False,
+        emit_operator_alert=False,
+        child_wait_seconds=0.01,
+        immediate_exit_threshold=2,
+    )
+
+    assert first.spawn_error == "child_pid_timeout"
+    assert second.spawn_error == "child_pid_timeout"
+    assert third.spawn_error == "crash_loop_suppressed"
+    assert spawner.calls == [config_path, config_path]
+    state = read_crash_loop_state(pid_path)
+    assert state is not None
+    assert state.suppressed is True
+    assert state.failure_count == 2
+    assert "pending migration" in state.log_excerpt
+
+
+def test_crash_loop_state_clears_after_confirmed_child_pid(tmp_path: Path):
+    config_path = tmp_path / "pollypm.toml"
+    pid_path = tmp_path / "rail_daemon.pid"
+    crash_loop_state_path(pid_path).write_text(
+        '{"failure_count": 1, "threshold": 5, '
+        '"first_failure_at": "2026-05-25T00:00:00+00:00", '
+        '"last_failure_at": "2026-05-25T00:00:00+00:00", '
+        '"reason": "missing", "log_excerpt": "", "alerted": false}'
+    )
+    spawner = _SpawnRecorder(pid_path=pid_path, write_pid=True)
+
+    result = check_and_revive_rail_daemon(
+        config_path=config_path,
+        pid_path=pid_path,
+        last_tick_iso=None,
+        last_revival_at=None,
+        spawn_fn=spawner,
+        emit_audit=False,
+        emit_operator_alert=False,
+    )
+
+    assert result.revived is True
+    assert result.spawn_error is None
+    assert read_crash_loop_state(pid_path) is None
 
 
 def test_daemon_pid_claim_is_atomic(tmp_path: Path):

@@ -169,3 +169,19 @@ def test_apply_then_inspect_reports_up_to_date(
         "v11 migration claims success but claimed_by_session column "
         "was never added to work_tasks"
     )
+
+
+def test_rail_daemon_startup_auto_applies_pending_work_migration(
+    stale_state_db: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A direct rail-daemon restart after upgrade must not crash-loop on v11."""
+    from pollypm.rail_daemon import _apply_pending_migrations_for_startup
+
+    monkeypatch.delenv("POLLYPM_SKIP_MIGRATION_GATE", raising=False)
+    applied = _apply_pending_migrations_for_startup(stale_state_db)
+
+    assert applied >= 1
+    status_after = _migrations.inspect(stale_state_db)
+    assert status_after.up_to_date
+    _migrations.require_no_pending_or_exit(stale_state_db)

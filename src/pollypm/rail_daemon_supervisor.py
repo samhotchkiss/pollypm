@@ -84,6 +84,7 @@ daemon directly on machine boot) is a separate opt-in surface — see
 from __future__ import annotations
 
 import logging
+import json
 import os
 import shlex
 import signal
@@ -104,8 +105,12 @@ __all__ = [
     "DEFAULT_STALE_TICK_SECONDS",
     "DEFAULT_REVIVAL_THROTTLE_SECONDS",
     "DEFAULT_SIGTERM_GRACE_SECONDS",
+    "DEFAULT_IMMEDIATE_EXIT_THRESHOLD",
+    "CrashLoopState",
     "check_and_revive_rail_daemon",
+    "crash_loop_state_path",
     "diagnose_rail_daemon",
+    "read_crash_loop_state",
     "should_revive",
 ]
 
@@ -137,6 +142,21 @@ DEFAULT_SIGTERM_GRACE_SECONDS = 3.0
 #: latency on the slowest field machines we've measured (~1-2s) without
 #: making cron callers block longer than their tick budget.
 DEFAULT_CHILD_PID_WAIT_SECONDS = 5.0
+
+#: Consecutive spawn attempts that return without a live matching PID
+#: before the supervisor suppresses further respawns and surfaces a
+#: durable operator alert. This is intentionally small: a daemon that
+#: cannot write a PID after five supervised starts is not recovering
+#: through repetition.
+DEFAULT_IMMEDIATE_EXIT_THRESHOLD = 5
+
+#: Stale crash-loop state expires after this window so an old sentinel
+#: cannot suppress a future unrelated recovery attempt forever.
+DEFAULT_CRASH_LOOP_WINDOW_SECONDS = 60 * 60
+
+_CRASH_LOOP_STATE_NAME = "rail_daemon.crash_loop.json"
+_RAIL_DAEMON_LOG_NAME = "rail_daemon.log"
+_CRASH_LOOP_ALERT_SENDER = "rail_daemon_crash_loop"
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +195,23 @@ class RevivalResult:
     spawn_error: str | None
     killed_pid: int | None
     kill_signal: str | None  # ``"SIGTERM"`` / ``"SIGKILL"`` / ``"already_gone"`` / ``None``
+
+
+@dataclass(frozen=True, slots=True)
+class CrashLoopState:
+    """Persisted supervisor state for daemon starts that die before PID claim."""
+
+    failure_count: int
+    threshold: int
+    first_failure_at: str
+    last_failure_at: str
+    reason: str
+    log_excerpt: str
+    alerted: bool = False
+
+    @property
+    def suppressed(self) -> bool:
+        return self.failure_count >= self.threshold
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +830,215 @@ def _emit_revival_audit(
         )
 
 
+def crash_loop_state_path(pid_path: Path) -> Path:
+    """Return the durable crash-loop sentinel path beside ``rail_daemon.pid``."""
+    return pid_path.with_name(_CRASH_LOOP_STATE_NAME)
+
+
+def _rail_daemon_log_path(pid_path: Path) -> Path:
+    return pid_path.with_name(_RAIL_DAEMON_LOG_NAME)
+
+
+def _parse_crash_loop_state(payload: dict[str, Any]) -> CrashLoopState | None:
+    try:
+        count = int(payload.get("failure_count") or 0)
+        threshold = int(payload.get("threshold") or DEFAULT_IMMEDIATE_EXIT_THRESHOLD)
+    except (TypeError, ValueError):
+        return None
+    if count <= 0:
+        return None
+    first = str(payload.get("first_failure_at") or "")
+    last = str(payload.get("last_failure_at") or first)
+    if not first or not last:
+        return None
+    return CrashLoopState(
+        failure_count=count,
+        threshold=max(1, threshold),
+        first_failure_at=first,
+        last_failure_at=last,
+        reason=str(payload.get("reason") or ""),
+        log_excerpt=str(payload.get("log_excerpt") or ""),
+        alerted=bool(payload.get("alerted")),
+    )
+
+
+def read_crash_loop_state(pid_path: Path) -> CrashLoopState | None:
+    """Read the crash-loop sentinel, returning ``None`` when absent/invalid."""
+    path = crash_loop_state_path(pid_path)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return _parse_crash_loop_state(payload)
+
+
+def _write_crash_loop_state(pid_path: Path, state: CrashLoopState) -> None:
+    path = crash_loop_state_path(pid_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "failure_count": state.failure_count,
+        "threshold": state.threshold,
+        "first_failure_at": state.first_failure_at,
+        "last_failure_at": state.last_failure_at,
+        "reason": state.reason,
+        "log_excerpt": state.log_excerpt,
+        "alerted": state.alerted,
+    }
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, sort_keys=True, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _clear_crash_loop_state(pid_path: Path) -> None:
+    crash_loop_state_path(pid_path).unlink(missing_ok=True)
+
+
+def _last_failure_recent(
+    state: CrashLoopState | None,
+    *,
+    now: datetime,
+    window_seconds: float,
+) -> bool:
+    if state is None:
+        return False
+    try:
+        last_seen = datetime.fromisoformat(state.last_failure_at)
+    except ValueError:
+        return False
+    if last_seen.tzinfo is None:
+        last_seen = last_seen.replace(tzinfo=UTC)
+    return (now - last_seen).total_seconds() <= window_seconds
+
+
+def _read_log_tail(log_path: Path, *, max_bytes: int = 8192) -> str:
+    try:
+        with log_path.open("rb") as fh:
+            try:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                fh.seek(max(0, size - max_bytes), os.SEEK_SET)
+            except OSError:
+                fh.seek(0)
+            data = fh.read(max_bytes)
+    except OSError:
+        return ""
+    return data.decode("utf-8", "replace").strip()
+
+
+def _emit_crash_loop_alert(
+    *,
+    config_path: Path,
+    state: CrashLoopState,
+) -> bool:
+    """Best-effort operator alert for a suppressed rail-daemon crash loop."""
+    try:
+        from pollypm.config import load_config
+        from pollypm.inbox.kind import InboxItemKind
+        from pollypm.store import get_store
+
+        config = load_config(config_path)
+        store = get_store(config)
+        excerpt = state.log_excerpt.strip()
+        body_parts = [
+            (
+                "The rail daemon failed to start repeatedly and the "
+                "supervisor has stopped respawning it until the next "
+                "healthy start clears the sentinel."
+            ),
+            f"Failures: {state.failure_count}",
+            f"Last diagnosis: {state.reason or 'unknown'}",
+            "Next: inspect ~/.pollypm/rail_daemon.log, fix the startup error, then run pm up.",
+        ]
+        if excerpt:
+            body_parts.extend(["", "Recent rail_daemon.log:", excerpt])
+        store.upsert_message(
+            type="alert",
+            tier="immediate",
+            recipient="user",
+            sender=_CRASH_LOOP_ALERT_SENDER,
+            subject="Rail daemon crash loop suppressed",
+            body="\n".join(body_parts),
+            scope="inbox",
+            labels=["watchdog", "rail_daemon", "crash_loop"],
+            payload={
+                "failure_count": state.failure_count,
+                "threshold": state.threshold,
+                "first_failure_at": state.first_failure_at,
+                "last_failure_at": state.last_failure_at,
+                "reason": state.reason,
+                "log_excerpt": excerpt,
+            },
+            kind=InboxItemKind.WATCHDOG_OPERATOR_DISPATCH.value,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "rail_daemon_supervisor: crash-loop alert emit failed",
+            exc_info=True,
+        )
+        return False
+    return True
+
+
+def _record_crash_loop_failure(
+    *,
+    pid_path: Path,
+    config_path: Path,
+    decision: RevivalDecision,
+    now: datetime,
+    threshold: int,
+    window_seconds: float,
+    emit_operator_alert: bool,
+) -> CrashLoopState:
+    existing = read_crash_loop_state(pid_path)
+    if _last_failure_recent(existing, now=now, window_seconds=window_seconds):
+        count = (existing.failure_count if existing is not None else 0) + 1
+        first = existing.first_failure_at if existing is not None else now.isoformat()
+        alerted = existing.alerted if existing is not None else False
+    else:
+        count = 1
+        first = now.isoformat()
+        alerted = False
+
+    state = CrashLoopState(
+        failure_count=count,
+        threshold=max(1, threshold),
+        first_failure_at=first,
+        last_failure_at=now.isoformat(),
+        reason=decision.reason,
+        log_excerpt=_read_log_tail(_rail_daemon_log_path(pid_path)),
+        alerted=alerted,
+    )
+    if state.suppressed and emit_operator_alert and not state.alerted:
+        state = CrashLoopState(
+            failure_count=state.failure_count,
+            threshold=state.threshold,
+            first_failure_at=state.first_failure_at,
+            last_failure_at=state.last_failure_at,
+            reason=state.reason,
+            log_excerpt=state.log_excerpt,
+            alerted=_emit_crash_loop_alert(config_path=config_path, state=state),
+        )
+    _write_crash_loop_state(pid_path, state)
+    return state
+
+
+def _suppressed_crash_loop(
+    *,
+    pid_path: Path,
+    now: datetime,
+    window_seconds: float,
+) -> CrashLoopState | None:
+    state = read_crash_loop_state(pid_path)
+    if state is None or not state.suppressed:
+        return None
+    if not _last_failure_recent(state, now=now, window_seconds=window_seconds):
+        _clear_crash_loop_state(pid_path)
+        return None
+    return state
+
+
 def _wait_for_child_pid(
     pid_path: Path,
     config_path: Path | None,
@@ -1035,15 +1281,17 @@ def _spawn_and_wait_for_child(
     pid_path: Path,
     child_wait_seconds: float,
     sleep_fn: Callable[[float], None],
-) -> str | None:
+) -> tuple[str | None, int | None]:
     """Spawn the new daemon and wait for it to register a PID file.
 
-    Returns ``spawn_error`` (None on success). Spawn-success but
-    pid-file-timeout produces a warning, not an error: the caller
-    still records ``revived=True`` because the spawn returned ok.
+    Returns ``(spawn_error, confirmed_pid)``. Spawn-success but
+    pid-file-timeout produces a warning and ``confirmed_pid=None``:
+    the caller records the failed confirmation separately so repeated
+    immediate exits can be suppressed.
     """
     spawner = spawn_fn or _default_spawn_fn()
     spawn_error: str | None = None
+    confirmed_pid: int | None = None
     try:
         spawner(config_path)
     except Exception as exc:  # noqa: BLE001
@@ -1081,7 +1329,7 @@ def _spawn_and_wait_for_child(
                 "but next cycle may re-spawn",
                 pid_path, child_wait_seconds,
             )
-    return spawn_error
+    return spawn_error, confirmed_pid
 
 
 def check_and_revive_rail_daemon(
@@ -1099,6 +1347,9 @@ def check_and_revive_rail_daemon(
     cron: bool = False,
     lock_timeout_seconds: float = 5.0,
     child_wait_seconds: float = DEFAULT_CHILD_PID_WAIT_SECONDS,
+    immediate_exit_threshold: int = DEFAULT_IMMEDIATE_EXIT_THRESHOLD,
+    crash_loop_window_seconds: float = DEFAULT_CRASH_LOOP_WINDOW_SECONDS,
+    emit_operator_alert: bool = True,
 ) -> RevivalResult:
     """Diagnose the rail daemon and respawn it if it's dead / stuck.
 
@@ -1151,16 +1402,27 @@ def check_and_revive_rail_daemon(
             :data:`DEFAULT_CHILD_PID_WAIT_SECONDS` (5s). On timeout
             we log + release anyway so a buggy spawner can never
             deadlock the supervisor.
+        immediate_exit_threshold: consecutive failed child PID
+            confirmations before suppressing further respawns and
+            surfacing a crash-loop alert.
+        crash_loop_window_seconds: age after which the crash-loop
+            sentinel is treated as stale and cleared.
+        emit_operator_alert: when ``False``, skip inbox alert writes
+            for tests or read-only probes while still recording the
+            crash-loop sentinel.
 
     Returns:
         :class:`RevivalResult` carrying the diagnosis, whether a spawn
         was attempted, and any signal / spawn error details.
     """
+    reference = now or datetime.now(UTC)
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=UTC)
     decision = diagnose_rail_daemon(
         pid_path=pid_path,
         last_tick_iso=last_tick_iso,
         last_revival_at=last_revival_at,
-        now=now,
+        now=reference,
         stale_tick_seconds=stale_tick_seconds,
         throttle_seconds=throttle_seconds,
         config_path=config_path,
@@ -1168,6 +1430,8 @@ def check_and_revive_rail_daemon(
 
     short_circuit = _short_circuit_for_diagnosis(decision, cron=cron)
     if short_circuit is not None:
+        if decision.state == "alive":
+            _clear_crash_loop_state(pid_path)
         return short_circuit
 
     logger.warning(
@@ -1209,12 +1473,14 @@ def check_and_revive_rail_daemon(
             # reflects current process state without re-applying the
             # caller's throttle window.
             last_revival_at=None,
-            now=now,
+            now=reference,
             stale_tick_seconds=stale_tick_seconds,
             throttle_seconds=throttle_seconds,
             config_path=config_path,
         )
         if not recheck.needs_revival:
+            if recheck.state == "alive":
+                _clear_crash_loop_state(pid_path)
             logger.info(
                 "rail_daemon_supervisor: post-lock recheck shows %s — "
                 "another supervisor must have already revived; standing down",
@@ -1231,6 +1497,42 @@ def check_and_revive_rail_daemon(
         # Use the recheck's PID (which reflects current state) for any
         # signaling — the original ``decision.pid`` may be stale.
         diagnosed_pid = recheck.pid
+
+        if recheck.state in {"missing_pid", "dead_process"}:
+            suppressed = _suppressed_crash_loop(
+                pid_path=pid_path,
+                now=reference,
+                window_seconds=crash_loop_window_seconds,
+            )
+            if suppressed is not None:
+                if emit_operator_alert and not suppressed.alerted:
+                    alerted = _emit_crash_loop_alert(
+                        config_path=config_path, state=suppressed,
+                    )
+                    if alerted:
+                        suppressed = CrashLoopState(
+                            failure_count=suppressed.failure_count,
+                            threshold=suppressed.threshold,
+                            first_failure_at=suppressed.first_failure_at,
+                            last_failure_at=suppressed.last_failure_at,
+                            reason=suppressed.reason,
+                            log_excerpt=suppressed.log_excerpt,
+                            alerted=True,
+                        )
+                        _write_crash_loop_state(pid_path, suppressed)
+                logger.error(
+                    "rail_daemon_supervisor: suppressing daemon respawn "
+                    "after %d failed starts — %s",
+                    suppressed.failure_count,
+                    suppressed.reason,
+                )
+                return RevivalResult(
+                    decision=recheck,
+                    revived=False,
+                    spawn_error="crash_loop_suppressed",
+                    killed_pid=None,
+                    kill_signal=None,
+                )
 
         # Step 1: clean up the dead/stuck process. ``stuck_no_tick``
         # means the PID is alive but unresponsive; SIGTERM it so the
@@ -1265,13 +1567,33 @@ def check_and_revive_rail_daemon(
 
         # Step 3 + 4: spawn the new daemon and wait for it to claim
         # the PID file.
-        spawn_error = _spawn_and_wait_for_child(
+        spawn_error, confirmed_pid = _spawn_and_wait_for_child(
             spawn_fn=spawn_fn,
             config_path=config_path,
             pid_path=pid_path,
             child_wait_seconds=child_wait_seconds,
             sleep_fn=sleep_fn,
         )
+        if spawn_error is None and confirmed_pid is not None:
+            _clear_crash_loop_state(pid_path)
+        else:
+            if spawn_error is None:
+                spawn_error = "child_pid_timeout"
+            crash_state = _record_crash_loop_failure(
+                pid_path=pid_path,
+                config_path=config_path,
+                decision=recheck,
+                now=reference,
+                threshold=immediate_exit_threshold,
+                window_seconds=crash_loop_window_seconds,
+                emit_operator_alert=emit_operator_alert,
+            )
+            if crash_state.suppressed:
+                logger.error(
+                    "rail_daemon_supervisor: daemon start failed %d "
+                    "times; future respawns suppressed until recovery",
+                    crash_state.failure_count,
+                )
 
         revived = spawn_error is None
         result = RevivalResult(

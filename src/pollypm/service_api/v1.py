@@ -29,6 +29,8 @@ from datetime import datetime
 import json
 import logging
 from pathlib import Path
+import threading
+import time
 
 from pollypm.accounts import (
     AccountStatus,
@@ -78,6 +80,13 @@ from pollypm.workers import (
 
 
 logger = logging.getLogger(__name__)
+
+
+_READONLY_LAUNCHES_TTL_SECONDS = 5.0
+_READONLY_LAUNCHES_LOCK = threading.Lock()
+_READONLY_LAUNCHES_CACHE: dict[
+    tuple[int, int], tuple[float, tuple[SessionLaunchSpec, ...]]
+] = {}
 
 
 def _parse_task_window_name(name: str) -> tuple[str, int] | None:
@@ -1055,6 +1064,38 @@ def plan_launches_readonly(config, store) -> list:
     objects. Avoids a second StateStore open by injecting the caller's
     store into a minimal Supervisor shell.
     """
+    cache_key = (id(config), id(store))
+    now = time.monotonic()
+    cached = _READONLY_LAUNCHES_CACHE.get(cache_key)
+    if (
+        cached is not None
+        and now - cached[0] < _READONLY_LAUNCHES_TTL_SECONDS
+    ):
+        return list(cached[1])
+
+    with _READONLY_LAUNCHES_LOCK:
+        now = time.monotonic()
+        cached = _READONLY_LAUNCHES_CACHE.get(cache_key)
+        if (
+            cached is not None
+            and now - cached[0] < _READONLY_LAUNCHES_TTL_SECONDS
+        ):
+            return list(cached[1])
+
+        launches = _plan_launches_readonly_uncached(config, store)
+        completed_at = time.monotonic()
+        if len(_READONLY_LAUNCHES_CACHE) > 8:
+            for stale_key in [
+                k for k, (ts, _v) in _READONLY_LAUNCHES_CACHE.items()
+                if completed_at - ts >= _READONLY_LAUNCHES_TTL_SECONDS
+            ]:
+                _READONLY_LAUNCHES_CACHE.pop(stale_key, None)
+        _READONLY_LAUNCHES_CACHE[cache_key] = (completed_at, tuple(launches))
+        return list(launches)
+
+
+def _plan_launches_readonly_uncached(config, store) -> list:
+    """Build a read-only launch plan without consulting the burst cache."""
     from pollypm.session_services import create_tmux_client
 
     supervisor = Supervisor.__new__(Supervisor)

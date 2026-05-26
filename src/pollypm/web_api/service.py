@@ -3953,6 +3953,17 @@ def _collect_inbox_items(
     entry; ``id`` is the task_id so later detail / reply paths can
     address it.
     """
+    if project is None:
+        workspace = _collect_inbox_items_workspace_pg(
+            config,
+            type_filter=type_filter,
+            state_filter=state_filter,
+            include_drafts=include_drafts,
+            limit=limit,
+        )
+        if workspace is not None:
+            return workspace
+
     out: list[APIInboxItem] = []
     unread_count = 0
     complete = True
@@ -3979,53 +3990,17 @@ def _collect_inbox_items(
                 )
                 if limit is not None and len(tasks) >= limit:
                     complete = False
-                read_marker_numbers = _task_numbers_with_context_entry(
-                    svc, project=key, entry_type="read", tasks=tasks,
+                items, unread = _materialize_inbox_items(
+                    svc,
+                    tasks,
+                    type_filter=type_filter,
+                    state_filter=state_filter,
+                    include_drafts=include_drafts,
+                    include_closed=include_closed,
+                    now=now,
                 )
-                # Snooze visibility (#2060): the snooze write helper
-                # persists ``entry_type='snooze'`` rows whose text
-                # encodes the wake-up time. Items whose latest snooze
-                # is still in the future must NOT appear in the
-                # default inbox view (otherwise the endpoint returns
-                # 200 while the row stays actionable). We compute the
-                # active-snooze set once per project — the same
-                # readonly service handle stays open so we don't
-                # double-pay for connection setup.
-                snoozed_ids = _active_snoozed_ids(svc, tasks, now=now)
-                # Iterate inside the ``with`` block so the canonical
-                # inbox predicate (Codex round-5 on #2060) can call
-                # ``svc.get_flow(...)`` for its current-node-human
-                # branch while the readonly handle is still open.
-                #
-                # One shared ``flow_cache`` per project scan: the
-                # canonical predicate falls back to ``svc.get_flow``
-                # for the current-node-human branch, and a page of N
-                # tasks on the same flow would otherwise pay N
-                # lookups. Matches the cockpit / rail / dashboard
-                # path in :func:`pollypm.work.inbox_view.inbox_tasks`
-                # (one cache, threaded through every call). Codex
-                # round-6 blocker 2 on PR #2060.
-                flow_cache: dict = {}
-                for task in tasks:
-                    if task.task_id in snoozed_ids:
-                        continue
-                    if not include_drafts and is_notify_only_inbox_entry(task):
-                        continue
-                    if not inbox_task_matches_type(task, type_filter):
-                        continue
-                    entry = _task_to_inbox_item(
-                        task,
-                        svc,
-                        flow_cache=flow_cache,
-                        include_closed=include_closed,
-                    )
-                    if entry is None:
-                        continue
-                    if not _inbox_item_matches_state(entry, state_filter):
-                        continue
-                    out.append(entry)
-                    if _task_number(task) not in read_marker_numbers:
-                        unread_count += 1
+                out.extend(items)
+                unread_count += unread
         except _BACKING_STORE_ERRORS as exc:
             # Backing-store failure on a single project: log loudly,
             # skip that project but keep building the aggregate. We
@@ -4043,6 +4018,132 @@ def _collect_inbox_items(
     return out, unread_count, complete
 
 
+def _collect_inbox_items_workspace_pg(
+    config: PollyPMConfig,
+    *,
+    type_filter: str | None,
+    state_filter: str | None,
+    include_drafts: bool,
+    limit: int | None,
+) -> tuple[list[APIInboxItem], int, bool] | None:
+    """Load the workspace inbox with one pg-backed candidate query."""
+    try:
+        from pollypm.storage._backend_dispatch import is_pg_backend
+
+        if not is_pg_backend(config):
+            return None
+    except Exception:  # noqa: BLE001
+        return None
+
+    project_items = list(config.projects.items())
+    if not project_items:
+        return [], 0, True
+
+    first_key, first_project = project_items[0]
+    known_projects = tuple(key for key, _project in project_items)
+    now = datetime.now(timezone.utc)
+    include_closed = _state_filter_requests_closed(state_filter)
+    try:
+        with _open_work_service_readonly(
+            config=config,
+            project_key=first_key,
+            project_path=first_project.path,
+        ) as svc:
+            raw_tasks = _list_inbox_candidate_tasks(
+                svc,
+                project=None,
+                projects=known_projects,
+                type_filter=type_filter,
+                state_filter=state_filter,
+                limit=limit,
+            )
+            known_project_set = set(known_projects)
+            tasks = [
+                task for task in raw_tasks
+                if str(getattr(task, "project", "") or "") in known_project_set
+            ]
+            complete = not (limit is not None and len(raw_tasks) >= limit)
+            items, unread_count = _materialize_inbox_items(
+                svc,
+                tasks,
+                type_filter=type_filter,
+                state_filter=state_filter,
+                include_drafts=include_drafts,
+                include_closed=include_closed,
+                now=now,
+            )
+            return items, unread_count, complete
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "inbox: workspace pg candidate scan failed; skipping: %s",
+            exc,
+            exc_info=True,
+        )
+        return [], 0, True
+
+
+def _materialize_inbox_items(
+    svc,
+    tasks,
+    *,
+    type_filter: str | None,
+    state_filter: str | None,
+    include_drafts: bool,
+    include_closed: bool,
+    now: datetime,
+) -> tuple[list[APIInboxItem], int]:
+    task_list = list(tasks or [])
+    tasks_by_project: dict[str, list] = {}
+    for task in task_list:
+        project_key = str(getattr(task, "project", "") or "")
+        tasks_by_project.setdefault(project_key, []).append(task)
+
+    read_marker_numbers_by_project: dict[str, set[int]] = {}
+    for project_key, project_tasks in tasks_by_project.items():
+        read_marker_numbers_by_project[project_key] = (
+            _task_numbers_with_context_entry(
+                svc,
+                project=project_key,
+                entry_type="read",
+                tasks=project_tasks,
+            )
+        )
+
+    # Snooze visibility (#2060): the snooze write helper persists
+    # ``entry_type='snooze'`` rows whose text encodes the wake-up time.
+    # Items whose latest snooze is still in the future must NOT appear
+    # in the default inbox view. Compute the set once for the candidate
+    # batch so the pg implementation can use one bulk lookup.
+    snoozed_ids = _active_snoozed_ids(svc, task_list, now=now)
+
+    items: list[APIInboxItem] = []
+    unread_count = 0
+    flow_cache: dict = {}
+    for task in task_list:
+        if task.task_id in snoozed_ids:
+            continue
+        if not include_drafts and is_notify_only_inbox_entry(task):
+            continue
+        if not inbox_task_matches_type(task, type_filter):
+            continue
+        entry = _task_to_inbox_item(
+            task,
+            svc,
+            flow_cache=flow_cache,
+            include_closed=include_closed,
+        )
+        if entry is None:
+            continue
+        if not _inbox_item_matches_state(entry, state_filter):
+            continue
+        items.append(entry)
+        project_key = str(getattr(task, "project", "") or "")
+        read_marker_numbers = read_marker_numbers_by_project.get(project_key, set())
+        if _task_number(task) not in read_marker_numbers:
+            unread_count += 1
+    return items, unread_count
+
+
 def _task_number(task) -> int:
     value = getattr(task, "task_number", None)
     if value is not None:
@@ -4053,7 +4154,7 @@ def _task_number(task) -> int:
 def _task_numbers_with_context_entry(
     svc,
     *,
-    project: str,
+    project: str | None,
     entry_type: str,
     tasks,
 ) -> set[int]:
@@ -4105,7 +4206,8 @@ def _inbox_item_matches_state(
 def _list_inbox_candidate_tasks(
     svc,
     *,
-    project: str,
+    project: str | None,
+    projects: Iterable[str] | None = None,
     type_filter: str | None,
     state_filter: str | None,
     limit: int | None,
@@ -4120,6 +4222,7 @@ def _list_inbox_candidate_tasks(
     if callable(optimized):
         return optimized(
             project=project,
+            projects=projects,
             type_filter=type_filter,
             state_filter=state_filter,
             limit=limit,

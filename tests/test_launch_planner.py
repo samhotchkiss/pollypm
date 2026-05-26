@@ -11,6 +11,7 @@ import base64
 import json
 from pathlib import Path
 import shlex
+from types import SimpleNamespace
 
 from pollypm.launch_planner import LaunchPlanner, get_launch_planner
 from pollypm.models import (
@@ -549,3 +550,39 @@ def test_planner_handles_none_store_for_architect_session(
     plan = planner.plan_launches()
     architect = next(item for item in plan if item.session.name == "architect")
     assert architect.session.provider is ProviderKind.CLAUDE
+
+
+def test_plan_launches_readonly_coalesces_burst_calls(monkeypatch) -> None:
+    """Read-only dashboard callers should share a short-lived launch plan."""
+    from pollypm.service_api import v1 as service_v1
+
+    service_v1._READONLY_LAUNCHES_CACHE.clear()
+    plan_calls = 0
+
+    class FakeSupervisor:
+        def invalidate_launch_cache(self) -> None:
+            pass
+
+        def plan_launches(self):
+            nonlocal plan_calls
+            plan_calls += 1
+            return [SimpleNamespace(session=SimpleNamespace(name="operator"))]
+
+    monkeypatch.setattr(service_v1, "Supervisor", FakeSupervisor)
+    monkeypatch.setattr(
+        "pollypm.session_services.create_tmux_client",
+        lambda: object(),
+    )
+
+    config = SimpleNamespace()
+    store = object()
+
+    try:
+        first = service_v1.plan_launches_readonly(config, store)
+        second = service_v1.plan_launches_readonly(config, store)
+
+        assert plan_calls == 1
+        assert first == second
+        assert first is not second
+    finally:
+        service_v1._READONLY_LAUNCHES_CACHE.clear()

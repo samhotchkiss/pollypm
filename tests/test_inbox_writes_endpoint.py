@@ -2120,6 +2120,7 @@ class _ReadInboxTask:
         self,
         n: int,
         *,
+        project: str = "myproj",
         title: str | None = None,
         status=None,
         kind=None,
@@ -2130,8 +2131,8 @@ class _ReadInboxTask:
         from pollypm.inbox.kind import InboxItemKind
         from pollypm.work.models import Priority, WorkStatus
 
-        self.task_id = f"myproj/{n}"
-        self.project = "myproj"
+        self.task_id = f"{project}/{n}"
+        self.project = project
         self.task_number = n
         self.title = title or f"inbox {n}"
         self.description = f"body {n}"
@@ -2164,6 +2165,13 @@ class _ReadInboxSvc:
         self.candidate_calls.append(dict(kwargs))
         limit = kwargs.get("limit")
         rows = list(self.tasks)
+        project = kwargs.get("project")
+        if project is not None:
+            rows = [task for task in rows if task.project == project]
+        projects = kwargs.get("projects")
+        if projects is not None:
+            allowed = {str(value) for value in projects}
+            rows = [task for task in rows if task.project in allowed]
         if limit is not None:
             rows = rows[: int(limit)]
         return rows
@@ -2221,6 +2229,45 @@ def test_list_inbox_state_closed_returns_archived_task(
     assert [item["id"] for item in body["items"]] == ["myproj/1"]
     assert body["items"][0]["state"] == "closed"
     assert svc.candidate_calls[0]["state_filter"] == "closed"
+
+
+def test_workspace_inbox_uses_one_pg_candidate_scan(
+    client, auth_headers, monkeypatch, config, tmp_path: Path,
+) -> None:
+    """All-project inbox reads should not open/query one service per project."""
+    other_root = tmp_path / "otherproj"
+    other_root.mkdir()
+    (other_root / ".pollypm").mkdir()
+    config.projects["otherproj"] = KnownProject(
+        key="otherproj",
+        path=other_root,
+        name="Other Project",
+        tracked=True,
+        kind=ProjectKind.GIT,
+    )
+
+    svc = _ReadInboxSvc([
+        _ReadInboxTask(1, project="myproj", title="my project item"),
+        _ReadInboxTask(2, project="otherproj", title="other project item"),
+        _ReadInboxTask(3, project="staleproj", title="stale project item"),
+    ])
+    _install_read_inbox_svc(monkeypatch, svc)
+    monkeypatch.setattr(
+        "pollypm.storage._backend_dispatch.is_pg_backend",
+        lambda _config: True,
+    )
+
+    response = client.get("/api/v1/inbox", headers=auth_headers)
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert {item["id"] for item in body["items"]} == {
+        "myproj/1",
+        "otherproj/2",
+    }
+    assert len(svc.candidate_calls) == 1
+    assert svc.candidate_calls[0]["project"] is None
+    assert set(svc.candidate_calls[0]["projects"]) == {"myproj", "otherproj"}
 
 
 def test_list_inbox_type_filter_matches_structured_kind(

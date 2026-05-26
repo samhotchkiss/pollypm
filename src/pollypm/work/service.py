@@ -111,6 +111,7 @@ class WorkService(Protocol):
         self,
         *,
         project: str | None = None,
+        projects: tuple[str, ...] | list[str] | None = None,
         type_filter: str | None = None,
         state_filter: str | None = None,
         limit: int | None = None,
@@ -120,8 +121,11 @@ class WorkService(Protocol):
 
         Implementations should push cheap state/type/limit predicates into
         storage, then callers run the canonical inbox-view predicate before
-        exposing rows. This keeps API pagination from full-scanning the work
-        table while preserving service ownership of storage rules.
+        exposing rows. ``projects`` is the all-project workspace filter used
+        by the API inbox; implementations should apply either ``project`` or
+        ``projects`` when provided. This keeps API pagination from
+        full-scanning the work table while preserving service ownership of
+        storage rules.
         """
         ...
 

@@ -422,6 +422,109 @@ def test_briefing_pluralizes_counts_correctly(tmp_path) -> None:
 
 
 # ---------------------------------------------------------------------------
+# #2308 perf — _session_description cache contract.
+#
+# The dashboard handler invokes ``_session_description`` once per active
+# session per request. On a 16-project / 44-session workspace that's 44
+# tmux-snapshot reads × ~10ms each per request, and the snapshot only
+# rolls forward when the heartbeat sweep (~30s cadence) rewrites it.
+# Caching by ``(snapshot_path, mtime_ns, status, role)`` collapses
+# repeat calls into one parse per (file, version, view-key) tuple.
+# These two tests pin the cache contract: a key match reuses the prior
+# result, and an mtime bump forces a fresh parse.
+# ---------------------------------------------------------------------------
+
+
+def test_session_description_cache_returns_cached_when_key_matches(
+    tmp_path, monkeypatch
+) -> None:
+    """Repeat ``_session_description`` calls with the same
+    ``(snapshot_path, mtime_ns, status, role)`` must reuse the cached
+    parse — no second call into ``_compute_session_description``.
+    """
+    from pollypm import dashboard_data
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text("⏺ Working (1m 2s · 4.2k tokens · esc to interrupt)\n")
+
+    # Clear the module-level cache so prior tests don't preload our key.
+    dashboard_data._SESSION_DESCRIPTION_CACHE.clear()
+
+    calls: list[tuple[str, str, str | None]] = []
+    real_compute = dashboard_data._compute_session_description
+
+    def counting_compute(status: str, role: str, snapshot_path: str | None) -> str:
+        calls.append((status, role, snapshot_path))
+        return real_compute(status, role, snapshot_path)
+
+    monkeypatch.setattr(
+        dashboard_data, "_compute_session_description", counting_compute
+    )
+
+    first = _session_description("healthy", "worker", str(snapshot))
+    second = _session_description("healthy", "worker", str(snapshot))
+    third = _session_description("healthy", "worker", str(snapshot))
+
+    # All callers see the same description and the heavy parser ran once.
+    assert first == second == third
+    assert len(calls) == 1, (
+        f"expected one compute call, got {len(calls)}: {calls}"
+    )
+
+
+def test_session_description_cache_refreshes_on_mtime_change(
+    tmp_path, monkeypatch
+) -> None:
+    """When the snapshot file's mtime advances (heartbeat rewrote the
+    pane), the cache key changes and ``_compute_session_description``
+    must run again — even though the path + status + role are
+    identical. This is what prevents the dashboard from serving a
+    stale Now-feed line when the underlying session has moved on.
+    """
+    from pollypm import dashboard_data
+    from pollypm.dashboard_data import _session_description
+
+    snapshot = tmp_path / "snap.txt"
+    snapshot.write_text("⏺ Working (1m 2s · 4.2k tokens · esc to interrupt)\n")
+
+    dashboard_data._SESSION_DESCRIPTION_CACHE.clear()
+
+    calls: list[tuple[str, str, str | None]] = []
+    real_compute = dashboard_data._compute_session_description
+
+    def counting_compute(status: str, role: str, snapshot_path: str | None) -> str:
+        calls.append((status, role, snapshot_path))
+        return real_compute(status, role, snapshot_path)
+
+    monkeypatch.setattr(
+        dashboard_data, "_compute_session_description", counting_compute
+    )
+
+    first = _session_description("healthy", "worker", str(snapshot))
+    assert len(calls) == 1
+
+    # Rewrite the snapshot with new content + bump mtime. We force the
+    # mtime forward explicitly so this is robust on filesystems with
+    # coarse mtime granularity (1s on some platforms).
+    snapshot.write_text("⏺ Working (5m 30s · 9.0k tokens · esc to interrupt)\n")
+    new_mtime_ns = snapshot.stat().st_mtime_ns + 1_000_000_000
+    import os
+
+    os.utime(snapshot, ns=(new_mtime_ns, new_mtime_ns))
+
+    second = _session_description("healthy", "worker", str(snapshot))
+
+    # mtime bump means a new cache key, so the parser ran again, and
+    # the freshly-parsed result reflects the rewritten snapshot.
+    assert len(calls) == 2, (
+        f"expected two compute calls after mtime bump, got {len(calls)}: {calls}"
+    )
+    assert first != second
+    assert "5m" in second
+
+
+# ---------------------------------------------------------------------------
 # Cycle 86 (sqlite-only) — REMOVED for Slice K (#1737).
 #
 # The three tests that previously lived here drove the per-project

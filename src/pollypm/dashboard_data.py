@@ -497,7 +497,53 @@ def _scan_for_event_signature(clean_lines: list[str]) -> str | None:
     return None
 
 
+# #2308 perf — per-snapshot description cache.
+# ``_session_description`` reads + parses the entire tmux pane snapshot
+# file for every active session on every dashboard request. On a 16-
+# project / 44-session workspace that's 44 sync reads × ~10ms each (480ms
+# cumulative per request), and the work re-runs unchanged whenever the
+# snapshot mtime hasn't moved. The heartbeat sweep refreshes snapshots
+# at ~30s cadence; the dashboard polls every 5-10s. Caching by
+# ``(snapshot_path, mtime_ns, status, role)`` means we re-parse a
+# snapshot only when the heartbeat has actually rewritten it.
+_SESSION_DESCRIPTION_CACHE: dict[tuple[str, int, str, str], str] = {}
+_SESSION_DESCRIPTION_CACHE_MAX_ENTRIES = 256
+
+
 def _session_description(status: str, role: str, snapshot_path: str | None) -> str:
+    """Build a human-readable description of what a session is doing.
+
+    Caches the parsed result per ``(snapshot_path, mtime_ns, status,
+    role)`` so concurrent dashboard reads share one parse-and-regex pass
+    over each snapshot file rather than re-reading the file (and re-
+    running the ~30 regex passes inside the fall-through loop) per
+    request. Misses + stat failures fall through to the live parser.
+    """
+    if snapshot_path:
+        try:
+            mtime_ns = Path(snapshot_path).stat().st_mtime_ns
+        except OSError:
+            mtime_ns = None
+        if mtime_ns is not None:
+            cache_key = (snapshot_path, mtime_ns, status, role)
+            cached = _SESSION_DESCRIPTION_CACHE.get(cache_key)
+            if cached is not None:
+                return cached
+            result = _compute_session_description(status, role, snapshot_path)
+            # Bound the cache so a workspace with many short-lived
+            # heartbeat snapshots can't grow it without bound. When the
+            # cap trips we drop the oldest insertion (dict preserves
+            # order) — a fresh refresh after mtime advances repopulates.
+            if len(_SESSION_DESCRIPTION_CACHE) >= _SESSION_DESCRIPTION_CACHE_MAX_ENTRIES:
+                _SESSION_DESCRIPTION_CACHE.pop(
+                    next(iter(_SESSION_DESCRIPTION_CACHE)), None
+                )
+            _SESSION_DESCRIPTION_CACHE[cache_key] = result
+            return result
+    return _compute_session_description(status, role, snapshot_path)
+
+
+def _compute_session_description(status: str, role: str, snapshot_path: str | None) -> str:
     """Build a human-readable description of what a session is doing."""
     if role == "operator-pm":
         if status == "healthy":

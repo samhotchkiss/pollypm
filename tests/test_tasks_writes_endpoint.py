@@ -38,6 +38,7 @@ from pollypm.config import (
     PollyPMConfig,
     PollyPMSettings,
     ProjectSettings,
+    SessionConfig,
 )
 from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
 from pollypm.web_api import create_app, ensure_token
@@ -155,9 +156,15 @@ class FakeWorkService:
     transition.
     """
 
-    def __init__(self, store: dict[str, FakeTask]):
+    def __init__(
+        self,
+        store: dict[str, FakeTask],
+        *,
+        session_names: set[str] | None = None,
+    ) -> None:
         self._store = store
         self._lock = threading.Lock()
+        self._session_names = set(session_names or set())
 
     # The context-manager protocol — ``create_work_service`` returns
     # something usable as ``with create_work_service(...) as svc:``.
@@ -172,6 +179,19 @@ class FakeWorkService:
         if task is None:
             raise TaskNotFoundError(f"Task '{task_id}' not found.")
         return task
+
+    def _validate_reassign_target_session(self, session_name: str) -> None:
+        target = session_name.strip()
+        if not target or target != session_name:
+            raise WorkValidationError(
+                "Cannot reassign task: target assignee must be a "
+                "non-empty registered session name with no surrounding "
+                "whitespace."
+            )
+        if target not in self._session_names:
+            raise WorkValidationError(
+                f"Cannot reassign task to unknown session {target!r}."
+            )
 
     def queue(self, task_id: str, actor: str) -> FakeTask:  # noqa: ARG002
         task = self.get(task_id)
@@ -290,6 +310,7 @@ class FakeWorkService:
                     f"Cannot reassign task in "
                     f"'{task.work_status.value}' state."
                 )
+            self._validate_reassign_target_session(new_assignee)
             old_assignee = task.assignee
             task.assignee = new_assignee
             task.updated_at = datetime.now(timezone.utc)
@@ -362,7 +383,18 @@ def api_config(project_root: Path, workspace_root: Path) -> PollyPMConfig:
                 home=base_dir / "homes" / "codex_primary",
             ),
         },
-        sessions={},
+        sessions={
+            name: SessionConfig(
+                name=name,
+                role="worker",
+                provider=ProviderKind.CODEX,
+                account="codex_primary",
+                cwd=project_root,
+                project="myproj",
+                window_name=name,
+            )
+            for name in {"bob", "carol", "nora"}
+        },
         projects={
             "myproj": KnownProject(
                 key="myproj",
@@ -411,8 +443,10 @@ def patched_work_service(
     from pollypm.work import factory as work_factory
     from pollypm.work import service_factory as work_service_factory
 
-    def _fake_factory(**_kwargs: object) -> FakeWorkService:
-        return FakeWorkService(task_store)
+    def _fake_factory(**kwargs: object) -> FakeWorkService:
+        config = kwargs.get("config")
+        sessions = getattr(config, "sessions", {}) if config is not None else {}
+        return FakeWorkService(task_store, session_names=set(sessions))
 
     monkeypatch.setattr(work_factory, "create_work_service", _fake_factory)
     # #2064 round-9 blocker #2: the API claim helper now routes
@@ -1246,6 +1280,27 @@ def test_reassign_rejects_unknown_field(client, auth_headers, task_store) -> Non
         f"reassign with unknown field must NOT record a breadcrumb; "
         f"got {seeded.context!r}"
     )
+
+
+def test_reassign_unknown_session_returns_422(
+    client, auth_headers, task_store,
+) -> None:
+    """Unknown target sessions fail closed before assignee/context writes."""
+    seeded = _seed(
+        task_store, n=53,
+        work_status=WorkStatus.IN_PROGRESS, assignee="bob",
+    )
+    response = client.post(
+        "/api/v1/tasks/myproj/53/reassign",
+        headers=auth_headers,
+        json={"actor": "ghost-session"},
+    )
+    assert response.status_code == 422, response.text
+    body = response.json()
+    assert body["error"]["code"] == "validation_error"
+    assert "unknown session" in body["error"]["message"].lower()
+    assert seeded.assignee == "bob"
+    assert seeded.context == []
 
 
 def test_reassign_records_context_log_breadcrumb(

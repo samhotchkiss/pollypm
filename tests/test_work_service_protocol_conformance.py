@@ -17,7 +17,10 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from pollypm.work.mock_service import MockWorkService
+from pollypm.work.mock_service import (
+    MockWorkService,
+    ValidationError as MockValidationError,
+)
 from pollypm.work.pg_service import PgWorkService
 from pollypm.work.service import WorkService
 
@@ -119,6 +122,38 @@ def test_mock_update_allows_assignee_and_external_refs(tmp_path) -> None:
     )
     assert updated.assignee == "olga"
     assert updated.external_refs == {"slack": "thread/abc"}
+
+
+def test_mock_reassign_requires_registered_target_session(tmp_path) -> None:
+    """MockWorkService mirrors pg fail-closed reassignment (#2370)."""
+    svc = MockWorkService(project_path=tmp_path, session_names=["nora"])
+    task = svc.create(
+        title="handoff-target",
+        type="task",
+        project="demo",
+        flow_template="standard",
+        roles={"worker": "pete", "reviewer": "bob"},
+        description="has body",
+    )
+    svc.queue(task.task_id, actor="user")
+    svc.claim(task.task_id, actor="pete")
+
+    with pytest.raises(MockValidationError, match="unknown session"):
+        svc.reassign_task(
+            task.task_id, new_assignee="ghost-session", actor="api"
+        )
+
+    refetched = svc.get(task.task_id)
+    assert refetched.assignee == "pete"
+    assert svc.get_context(task.task_id, entry_type="reassignment") == []
+
+    updated = svc.reassign_task(
+        task.task_id, new_assignee="nora", actor="api"
+    )
+    assert updated.assignee == "nora"
+    entries = svc.get_context(task.task_id, entry_type="reassignment")
+    assert len(entries) == 1
+    assert "pete" in entries[0].text and "nora" in entries[0].text
 
 
 def _create_mock_task(

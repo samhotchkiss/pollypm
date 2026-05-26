@@ -26,11 +26,13 @@ from pollypm.audit.log import (
 from pollypm.audit.watchdog import (
     EVENT_AUDIT_FINDING,
     EVENT_HEARTBEAT_TICK,
+    EVENT_STUCK_DRAFT_TERMINATED,
     RULE_CANCEL_NO_PROMOTION,
     RULE_MARKER_LEAKED,
     RULE_ORPHAN_MARKER,
     RULE_STUCK_DRAFT,
     RULE_TASK_PROGRESS_STALE,
+    STUCK_DRAFT_TERMINATOR_THRESHOLD,
     Finding,
     WatchdogConfig,
     emit_finding,
@@ -288,6 +290,69 @@ def test_stuck_draft_silenced_by_cancellation(now: datetime) -> None:
     ]
     findings = [f for f in scan_events(events, now=now) if f.rule == RULE_STUCK_DRAFT]
     assert findings == []
+
+
+def test_stuck_draft_terminator_emits_after_threshold_and_is_idempotent(
+    now: datetime,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """#2333: after STUCK_DRAFT_TERMINATOR_THRESHOLD prior findings for a
+    subject, the watchdog stops emitting new stuck_draft findings and
+    writes ONE ``audit.stuck_draft_terminated`` breadcrumb. A subsequent
+    scan that also sees that breadcrumb in the events sequence must NOT
+    re-emit the terminator — otherwise the breadcrumb itself cascades.
+    """
+    emitted: list[tuple[str, str | None]] = []
+
+    def _record(*, event: str, subject: str | None = None, **_: object) -> None:
+        emitted.append((event, subject))
+
+    monkeypatch.setattr("pollypm.audit.log.emit", _record)
+
+    # Scan 1: 3 prior stuck_draft findings → terminator engages.
+    create_ts = now - timedelta(minutes=15)
+    prior_findings = [
+        _make_event(
+            event=EVENT_AUDIT_FINDING,
+            subject="demo/2",
+            metadata={"rule": RULE_STUCK_DRAFT},
+            ts=now - timedelta(minutes=30 + 5 * i),
+        )
+        for i in range(STUCK_DRAFT_TERMINATOR_THRESHOLD)
+    ]
+    create_event = _make_event(
+        event=EVENT_TASK_CREATED, subject="demo/2", ts=create_ts,
+    )
+    findings = [
+        f for f in scan_events([create_event, *prior_findings], now=now)
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings == [], "terminator should suppress the new finding"
+    terminator_emits = [
+        ev for ev in emitted if ev[0] == EVENT_STUCK_DRAFT_TERMINATED
+    ]
+    assert len(terminator_emits) == 1
+    assert terminator_emits[0][1] == "demo/2"
+
+    # Scan 2: same prior findings + the terminator breadcrumb from
+    # scan 1 in the events sequence. The terminator MUST NOT re-emit.
+    emitted.clear()
+    breadcrumb = _make_event(
+        event=EVENT_STUCK_DRAFT_TERMINATED,
+        subject="demo/2",
+        metadata={"rule": RULE_STUCK_DRAFT},
+        ts=now - timedelta(minutes=1),
+    )
+    findings_scan2 = [
+        f for f in scan_events(
+            [create_event, *prior_findings, breadcrumb], now=now,
+        )
+        if f.rule == RULE_STUCK_DRAFT
+    ]
+    assert findings_scan2 == [], "still suppressed across scans"
+    assert [ev for ev in emitted if ev[0] == EVENT_STUCK_DRAFT_TERMINATED] == [], (
+        "terminator must NOT cascade — already_terminated_subjects guard"
+    )
 
 
 def test_stuck_draft_event_path_cross_checks_open_tasks_status(now: datetime) -> None:

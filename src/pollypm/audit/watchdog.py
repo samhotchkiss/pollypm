@@ -84,6 +84,8 @@ __all__ = [
     "WatchdogConfig",
     "EVENT_HEARTBEAT_TICK",
     "EVENT_AUDIT_FINDING",
+    "EVENT_STUCK_DRAFT_TERMINATED",
+    "STUCK_DRAFT_TERMINATOR_THRESHOLD",
     "RULE_ORPHAN_MARKER",
     "RULE_MARKER_LEAKED",
     "RULE_STUCK_DRAFT",
@@ -307,6 +309,18 @@ REJECTION_LOOP_WINDOW_SECONDS = 7200
 # cadence as the architect throttle window expires — a queue that's
 # been silent for 30 min has already missed several heartbeat ticks.
 QUEUE_MOTION_THRESHOLD_SECONDS = 1800
+
+# #2333 — cascade terminator for repeating ``stuck_draft`` flags on the
+# same subject. The plan-review meta-bug drafts (pollypm/191-194, 201,
+# 203-205) were re-flagged every ~40 min, each tick spawning a fresh
+# dispatch + a fresh architect draft, which itself then got re-flagged.
+# After ``STUCK_DRAFT_TERMINATOR_THRESHOLD`` prior ``audit.finding`` rows
+# for ``(rule=stuck_draft, subject=X)`` we stop re-emitting the finding
+# for that subject and write a single ``audit.stuck_draft_terminated``
+# breadcrumb. The operator can still manually retry by promoting or
+# cancelling the underlying draft — the terminator just stops the loop.
+EVENT_STUCK_DRAFT_TERMINATED = "audit.stuck_draft_terminated"
+STUCK_DRAFT_TERMINATOR_THRESHOLD = 3
 
 # Audit events emitted *by* the watchdog itself.
 EVENT_HEARTBEAT_TICK = "heartbeat.tick"
@@ -658,6 +672,46 @@ def _detect_marker_leaks(
     return findings
 
 
+def _emit_stuck_draft_terminator(
+    *,
+    project: str,
+    subject: str,
+    prior_count: int,
+) -> None:
+    """#2333 — record that we stopped re-flagging ``subject`` as stuck_draft.
+
+    Emits a single ``audit.stuck_draft_terminated`` row so a forensic
+    grep can answer "why did the heartbeat stop nagging me about
+    pollypm/191?" without us having to dig through the detector.
+    Best-effort — must never raise; the loss of a single forensic
+    breadcrumb is far better than crashing the cadence handler.
+    """
+    try:
+        from pollypm.audit.log import emit as _audit_emit
+
+        _audit_emit(
+            event=EVENT_STUCK_DRAFT_TERMINATED,
+            project=project,
+            subject=subject,
+            actor="audit_watchdog",
+            status="warn",
+            metadata={
+                "rule": RULE_STUCK_DRAFT,
+                "prior_finding_count": prior_count,
+                "threshold": STUCK_DRAFT_TERMINATOR_THRESHOLD,
+                "recommendation": (
+                    "Manually promote or cancel the draft to re-enable "
+                    "watchdog flagging."
+                ),
+            },
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug(
+            "audit.watchdog: stuck_draft_terminated emit failed for %s",
+            subject, exc_info=True,
+        )
+
+
 def _detect_stuck_drafts(
     events: Sequence[AuditEvent],
     *,
@@ -682,6 +736,58 @@ def _detect_stuck_drafts(
     seen_subjects: set[str] = set()
     cutoff = now - timedelta(seconds=config.stuck_draft_seconds)
 
+    # #2333 — cascade terminator. Tally prior ``audit.finding`` rows for
+    # ``rule=stuck_draft`` per subject AND prior
+    # ``audit.stuck_draft_terminated`` rows. Subjects that have already
+    # been flagged ``STUCK_DRAFT_TERMINATOR_THRESHOLD`` times are dropped
+    # here. The terminator breadcrumb is emitted exactly once per subject
+    # across all scans: if a prior ``audit.stuck_draft_terminated`` row
+    # already exists for this subject (i.e. we terminated it on an
+    # earlier heartbeat tick), we still suppress the finding but do NOT
+    # re-emit the breadcrumb — otherwise the terminator itself would
+    # cascade in the audit log on every subsequent scan.
+    prior_finding_counts: dict[str, int] = {}
+    already_terminated_subjects: set[str] = set()
+    for ev in events:
+        if ev.event == EVENT_AUDIT_FINDING:
+            meta = ev.metadata or {}
+            if meta.get("rule") != RULE_STUCK_DRAFT:
+                continue
+            if not ev.subject:
+                continue
+            prior_finding_counts[ev.subject] = (
+                prior_finding_counts.get(ev.subject, 0) + 1
+            )
+        elif ev.event == EVENT_STUCK_DRAFT_TERMINATED:
+            if ev.subject:
+                already_terminated_subjects.add(ev.subject)
+
+    terminated_subjects: set[str] = set()
+
+    def _maybe_skip_terminated(subject: str, project: str) -> bool:
+        """Return True iff ``subject`` has hit the terminator threshold.
+
+        Idempotent across scans: a subject with a prior
+        ``audit.stuck_draft_terminated`` row is still skipped, but the
+        breadcrumb is NOT re-emitted. Only the *first* scan that crosses
+        the threshold writes the terminator event.
+        """
+        if prior_finding_counts.get(subject, 0) < (
+            STUCK_DRAFT_TERMINATOR_THRESHOLD
+        ):
+            return False
+        if subject in already_terminated_subjects:
+            # Already recorded by a prior scan — suppress finding silently.
+            return True
+        if subject not in terminated_subjects:
+            terminated_subjects.add(subject)
+            _emit_stuck_draft_terminator(
+                project=project,
+                subject=subject,
+                prior_count=prior_finding_counts[subject],
+            )
+        return True
+
     # State-based path (#1433): walks current ``work_tasks`` rows.
     if open_tasks:
         for task in open_tasks:
@@ -702,6 +808,9 @@ def _detect_stuck_drafts(
                 continue
             subject = f"{project}/{task_number}"
             if subject in seen_subjects:
+                continue
+            if _maybe_skip_terminated(subject, project):
+                seen_subjects.add(subject)
                 continue
             seen_subjects.add(subject)
             actor = getattr(task, "created_by", "") or "unknown"
@@ -786,6 +895,10 @@ def _detect_stuck_drafts(
             if current_status_by_subject[ev.subject] != "draft":
                 continue
         project, task_number = key
+        # #2333 — cascade terminator: identical contract to the state path.
+        if _maybe_skip_terminated(ev.subject, project):
+            seen_subjects.add(ev.subject)
+            continue
         seen_subjects.add(ev.subject)
         findings.append(Finding(
             rule=RULE_STUCK_DRAFT,

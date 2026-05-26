@@ -828,6 +828,7 @@ class LocalHeartbeatBackend(HeartbeatBackend):
             return
 
         api.record_observation(context)
+        self._record_worker_progress_heartbeat(api, context)
         api.clear_alert(context.session_name, "missing_window")
 
         stopped_reason = "Pane process is stopped (SIGSTOP)"
@@ -954,6 +955,34 @@ class LocalHeartbeatBackend(HeartbeatBackend):
         # Use the structured classification engine for intervention decisions
         if not mechanical_only:
             self._dispatch_health_intervention(api, context)
+
+    def _record_worker_progress_heartbeat(
+        self, api, context: HeartbeatSessionContext
+    ) -> None:
+        """Record a task-scoped audit heartbeat for fresh worker output."""
+        recorder = getattr(api, "record_worker_heartbeat", None)
+        if recorder is None or context.role != "worker":
+            return
+        if not (context.transcript_delta or "").strip():
+            return
+        task_id: str | None = None
+        try:
+            work_signals = _collect_work_service_signals(api, context)
+            candidate = work_signals.get("active_claim_task_id")
+            if isinstance(candidate, str) and candidate:
+                task_id = candidate
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "worker progress heartbeat task lookup failed for %s",
+                context.session_name, exc_info=True,
+            )
+        try:
+            recorder(context, task_id=task_id)
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "worker progress heartbeat emit failed for %s",
+                context.session_name, exc_info=True,
+            )
 
     def _dispatch_health_intervention(
         self, api, context: HeartbeatSessionContext

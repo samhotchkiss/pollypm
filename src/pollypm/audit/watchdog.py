@@ -75,6 +75,7 @@ from pollypm.audit.log import (
     EVENT_WATCHDOG_ESCALATION_DISPATCHED,
     EVENT_WATCHDOG_OPERATOR_DISPATCHED,
     EVENT_WORKER_SESSION_REAPED,
+    EVENT_WORKER_HEARTBEAT,
     AuditEvent,
 )
 
@@ -264,8 +265,8 @@ QUEUE_WITHOUT_MOTION_SUPPRESSED_PROJECTS: frozenset[str] = frozenset({
 #   issues; today no rule emits at this tier.
 # * ``TIER_TERMINAL`` — observe-only. The rule produces a finding for
 #   forensic / alerting purposes but no automated action follows. Used
-#   for orphan_marker, marker_leaked, cancellation_no_promotion,
-#   plan_missing_alert_churn (canary detectors).
+#   for orphan_marker, marker_leaked, plan_missing_alert_churn
+#   (canary detectors).
 TIER_1 = "1"
 TIER_2 = "2"
 TIER_3 = "3"
@@ -1038,7 +1039,7 @@ def _detect_cancellation_no_promotion(
             continue
         findings.append(Finding(
             rule=RULE_CANCEL_NO_PROMOTION,
-            tier=TIER_TERMINAL,
+            tier=TIER_2,
             project=ev.project,
             subject=ev.subject,
             message=(
@@ -1056,6 +1057,17 @@ def _detect_cancellation_no_promotion(
                 "cancelled_at": ev.ts,
                 "actor": ev.actor,
                 "from": (ev.metadata or {}).get("from"),
+                "detected_via": "event",
+            },
+            evidence={
+                "cancelled_task_id": ev.subject,
+                "cancelled_at": ev.ts,
+                "from": (ev.metadata or {}).get("from"),
+                "actor": ev.actor,
+                "replacement_task_created": False,
+                "required_decision": (
+                    "queue_replacement_or_mark_project_intentionally_parked"
+                ),
             },
         ))
     return findings
@@ -1399,7 +1411,7 @@ def _latest_worker_heartbeat_time(
     """Return the latest ``worker.heartbeat`` timestamp for ``subject``."""
     latest: datetime | None = None
     for ev in events:
-        if ev.event != "worker.heartbeat":
+        if ev.event != EVENT_WORKER_HEARTBEAT:
             continue
         meta = ev.metadata or {}
         event_subjects = {
@@ -1477,7 +1489,7 @@ def _detect_task_progress_stale(
             )
             if heartbeat_ts is not None and heartbeat_ts > last_activity:
                 last_activity = heartbeat_ts
-                last_activity_kind = "worker.heartbeat"
+                last_activity_kind = EVENT_WORKER_HEARTBEAT
             context_ts, context_kind = _latest_task_context_time(
                 task, since=entry_ts,
             )
@@ -1551,7 +1563,7 @@ def _detect_task_progress_stale(
         )
         if heartbeat_ts is not None and heartbeat_ts > last_activity:
             last_activity = heartbeat_ts
-            last_activity_kind = "worker.heartbeat"
+            last_activity_kind = EVENT_WORKER_HEARTBEAT
         if last_activity > cutoff:
             continue
         stuck_minutes = max(
@@ -2730,7 +2742,7 @@ _QUEUE_MOTION_EVENTS: frozenset[str] = frozenset({
     "task.claimed",
     "execution.advanced",
     "execution.completed",
-    "worker.heartbeat",
+    EVENT_WORKER_HEARTBEAT,
 })
 
 
@@ -3943,6 +3955,45 @@ def _brief_task_progress_stale(
     return lines
 
 
+def _brief_cancellation_no_promotion(
+    finding: Finding,
+    subject: str,
+    meta: dict,
+) -> list[str]:
+    """Brief body for ``cancellation_no_promotion``."""
+    cancelled_at = meta.get("cancelled_at")
+    from_state = meta.get("from") or "<unknown>"
+    actor = meta.get("actor") or "<unknown>"
+    lines: list[str] = []
+    lines.append("Stuck for: cancellation grace window elapsed")
+    lines.append("Observed evidence:")
+    if cancelled_at:
+        lines.append(
+            f"- Task transitioned {from_state} -> cancelled at {cancelled_at}"
+        )
+    else:
+        lines.append("- Task transitioned to cancelled; timestamp unavailable")
+    lines.append(f"- Cancellation actor: {actor}")
+    lines.append(
+        "- No later task.created event for this project was observed "
+        "inside the scan window."
+    )
+    lines.append("")
+    lines.append(
+        "Your job: decide whether this cancellation ended the project "
+        "intentionally or left replacement work unqueued. Do not reply "
+        "with analysis alone; make the queue state explicit."
+    )
+    lines.append(
+        f"Cli levers available: create and queue replacement work with "
+        f"`pm task create ...` then `pm task queue <replacement-task-id>`, "
+        f"or intentionally park the abandoned thread with "
+        f"`pm task context {subject} \"parked intentionally: <why>\"` "
+        f"plus cancel/hold for any remaining scoped task."
+    )
+    return lines
+
+
 def _brief_role_session_missing(
     finding: Finding,
     project: str,
@@ -4222,6 +4273,8 @@ def format_unstick_brief(
         lines.extend(_brief_task_review_stale(finding, subject, meta))
     elif finding.rule == RULE_TASK_PROGRESS_STALE:
         lines.extend(_brief_task_progress_stale(finding, subject, meta))
+    elif finding.rule == RULE_CANCEL_NO_PROMOTION:
+        lines.extend(_brief_cancellation_no_promotion(finding, subject, meta))
     elif finding.rule == RULE_ROLE_SESSION_MISSING:
         lines.extend(_brief_role_session_missing(finding, project, meta))
     elif finding.rule == RULE_PLAN_REVIEW_MISSING:

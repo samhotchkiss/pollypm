@@ -92,6 +92,7 @@ EVENT_WORK_DB_OPENED = "work_db.opened"
 # the fleet quantify whether the fix is holding without grepping
 # ``errors.log``.
 EVENT_WORKER_THREAD_LEAKED = "worker.thread_leaked"
+EVENT_WORKER_HEARTBEAT = "worker.heartbeat"
 # #1368 — emitted by ``cockpit_socket_reaper`` when it unlinks a stale
 # ``cockpit-<pid>.sock`` whose owning PID is no longer alive. Lets
 # operators forensically count leak rates without scraping logs.
@@ -1228,6 +1229,7 @@ __all__ = [
     "EVENT_WORK_TABLE_CLEARED",
     "EVENT_WORK_DB_OPENED",
     "EVENT_WORKER_THREAD_LEAKED",
+    "EVENT_WORKER_HEARTBEAT",
     "EVENT_SOCKET_REAPED",
     "EVENT_PLAN_VERSION_INCREMENTED",
     "EVENT_PLAN_SUCCESSOR_CREATED",

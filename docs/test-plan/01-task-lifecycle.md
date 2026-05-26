@@ -353,17 +353,19 @@ curl -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/jso
 sleep 60
 
 # Verify the inbox item exists
-pm inbox list --label plan-review
+pm inbox --json | jq '.tasks[] | select(.kind=="plan_review_pending")'
 # Or via REST:
-curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/inbox?label=plan-review" | jq
+curl -sS -H "Authorization: Bearer $TOKEN" "$BASE/api/v1/inbox?type=plan_review&state=open" | jq
 
 # Verify audit trail
-grep -E 'plan_review_emit|inbox.message_created' ~/.pollypm/audit/pollypm.jsonl | tail -5
+grep -E '"event":"plan_review\.handoff_created"' ~/.pollypm/audit/pollypm.jsonl | tail -5
 ```
 
 **Pass:**
 - Plan-review item appears in inbox within 30s of architect emission.
 - Inbox item references the source session (`architect_pollypm`) and the plan content.
+- The inbox item metadata/labels include stable `handoff_id` and `correlation_id`
+  values, and the audit row references the same IDs.
 - Operator can act on it (approve, reject, comment) — see §3.4 for UI verification.
 
 **If no inbox item appears:** the emit path is broken. Check `src/pollypm/work/plan_review_emit.py` for the emit site and the audit log for failures. File `bug:plan-review-emit`.

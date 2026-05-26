@@ -49,6 +49,7 @@ run ``pm notify`` perfectly.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 from pathlib import Path
@@ -141,6 +142,13 @@ def task_is_pending_plan_approval(task: Any) -> bool:
 
 def _plan_task_label(task_id: str) -> str:
     return f"plan_task:{task_id}"
+
+
+def _plan_review_handoff_ids(plan_task_id: str) -> tuple[str, str]:
+    digest = hashlib.sha256(
+        f"plan_review:{plan_task_id}".encode("utf-8"),
+    ).hexdigest()[:16]
+    return f"plan-review-{digest}", f"plan-review:{plan_task_id}"
 
 
 def already_has_plan_review_message(
@@ -267,6 +275,49 @@ def _build_plan_review_user_prompt(plan_task_id: str) -> dict[str, Any]:
     }
 
 
+def _emit_plan_review_handoff_audit(
+    *,
+    project: str,
+    plan_task_id: str,
+    inbox_task_id: str,
+    message_id: int | None,
+    handoff_id: str,
+    correlation_id: str,
+    actor: str,
+    requester: str,
+    source: str,
+    project_path: Path | str | None,
+) -> None:
+    try:
+        from pollypm.audit.log import (
+            EVENT_PLAN_REVIEW_HANDOFF_CREATED,
+            emit as _audit_emit,
+        )
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        _audit_emit(
+            event=EVENT_PLAN_REVIEW_HANDOFF_CREATED,
+            project=project,
+            subject=plan_task_id,
+            actor=actor or "audit_watchdog",
+            status="ok",
+            metadata={
+                "handoff_id": handoff_id,
+                "correlation_id": correlation_id,
+                "plan_task_id": plan_task_id,
+                "inbox_task_id": inbox_task_id,
+                "message_id": message_id,
+                "source": source,
+                "requester": requester,
+                "kind": InboxItemKind.PLAN_REVIEW_PENDING.value,
+            },
+            project_path=project_path,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+
 def emit_plan_review_for_task(
     *,
     svc: Any,
@@ -308,10 +359,13 @@ def emit_plan_review_for_task(
     subject = f"Plan ready for review: {project}"
     body = _build_plan_review_body(plan_task_id, source=source)
     target_label = _plan_task_label(plan_task_id)
+    handoff_id, correlation_id = _plan_review_handoff_ids(plan_task_id)
     labels = [
         PLAN_REVIEW_LABEL,
         f"project:{project}",
         target_label,
+        f"handoff_id:{handoff_id}",
+        f"correlation_id:{correlation_id}",
     ]
     user_prompt = _build_plan_review_user_prompt(plan_task_id)
 
@@ -354,6 +408,8 @@ def emit_plan_review_for_task(
                 "requester": requester,
                 "user_prompt": user_prompt,
                 "plan_task_id": plan_task_id,
+                "handoff_id": handoff_id,
+                "correlation_id": correlation_id,
                 "backstop_source": source,
             },
             state="closed",  # mirrors session_runtime.notify for immediate tier
@@ -424,6 +480,8 @@ def emit_plan_review_for_task(
                     "user_prompt": user_prompt,
                     "plan_task_id": plan_task_id,
                     "task_id": inbox_task_id,
+                    "handoff_id": handoff_id,
+                    "correlation_id": correlation_id,
                     "backstop_source": source,
                 },
             )
@@ -432,6 +490,18 @@ def emit_plan_review_for_task(
                 "plan_review_emit: update_message failed for %s",
                 plan_task_id, exc_info=True,
             )
+    _emit_plan_review_handoff_audit(
+        project=project,
+        plan_task_id=plan_task_id,
+        inbox_task_id=inbox_task_id,
+        message_id=message_id,
+        handoff_id=handoff_id,
+        correlation_id=correlation_id,
+        actor=actor or "audit_watchdog",
+        requester=requester,
+        source=source,
+        project_path=getattr(svc, "_project_path", None),
+    )
     return inbox_task_id
 
 

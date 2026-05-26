@@ -9,6 +9,7 @@ from pollypm.notify_task import (
     is_notify_inbox_task,
     is_notify_only_inbox_entry,
 )
+from pollypm.inbox.kind import InboxItemKind
 from pollypm.work.models import Priority, Task, TaskType, WorkStatus
 
 
@@ -291,3 +292,22 @@ class TestIsNotifyOnlyInboxEntry:
         """Notify-stub tasks (label / title) defer to is_notify_inbox_task."""
         task = _make_task(labels=[NOTIFY_LABEL])
         assert is_notify_only_inbox_entry(task) is True
+
+    def test_plan_review_notify_stub_stays_visible(self) -> None:
+        """Plan-review handoffs are actionable even though they are notify-shaped."""
+        task = _make_task(
+            labels=[
+                "plan_review",
+                "project:demo",
+                "plan_task:demo/1",
+                NOTIFY_LABEL,
+            ],
+        )
+        task.kind = InboxItemKind.PLAN_REVIEW_PENDING
+        assert is_notify_inbox_task(task) is True
+        assert is_notify_only_inbox_entry(task) is False
+
+    def test_legacy_plan_review_label_stays_visible(self) -> None:
+        """Older plan-review rows may have the label before kind backfill."""
+        task = _make_task(labels=["plan_review", NOTIFY_LABEL])
+        assert is_notify_only_inbox_entry(task) is False

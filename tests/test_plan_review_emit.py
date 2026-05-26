@@ -248,8 +248,18 @@ def test_pending_plan_approval_requires_plan_project_user_node() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_emit_creates_message_and_task(db_path: Path) -> None:
+def test_emit_creates_message_and_task(
+    db_path: Path,
+    fake_message_store: _MemoryMessageStore,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """First emit writes both the messages row and the inbox task."""
+    audit_events: list[dict[str, Any]] = []
+
+    def fake_audit_emit(**kwargs: Any) -> None:
+        audit_events.append(kwargs)
+
+    monkeypatch.setattr("pollypm.audit.log.emit", fake_audit_emit)
     task = _FakeTask(
         project="coffeeboardnm",
         task_number=1,
@@ -276,6 +286,14 @@ def test_emit_creates_message_and_task(db_path: Path) -> None:
     assert "plan_task:coffeeboardnm/1" in labels
     assert "project:coffeeboardnm" in labels
     assert "notify" in labels
+    handoff_labels = [label for label in labels if label.startswith("handoff_id:")]
+    correlation_labels = [
+        label for label in labels if label.startswith("correlation_id:")
+    ]
+    assert len(handoff_labels) == 1
+    assert len(correlation_labels) == 1
+    handoff_id = handoff_labels[0].split(":", 1)[1]
+    correlation_id = correlation_labels[0].split(":", 1)[1]
 
     # And a plan_review message lives in the messages table now.
     assert already_has_plan_review_message(
@@ -283,6 +301,22 @@ def test_emit_creates_message_and_task(db_path: Path) -> None:
         project="coffeeboardnm",
         plan_task_id="coffeeboardnm/1",
     )
+    [message] = fake_message_store._messages
+    assert message["payload"]["task_id"] == inbox_task_id
+    assert message["payload"]["handoff_id"] == handoff_id
+    assert message["payload"]["correlation_id"] == correlation_id
+
+    assert len(audit_events) == 1
+    audit = audit_events[0]
+    assert audit["event"] == "plan_review.handoff_created"
+    assert audit["project"] == "coffeeboardnm"
+    assert audit["subject"] == "coffeeboardnm/1"
+    assert audit["metadata"]["handoff_id"] == handoff_id
+    assert audit["metadata"]["correlation_id"] == correlation_id
+    assert audit["metadata"]["plan_task_id"] == "coffeeboardnm/1"
+    assert audit["metadata"]["inbox_task_id"] == inbox_task_id
+    assert audit["metadata"]["message_id"] == message["id"]
+    assert audit["metadata"]["kind"] == "plan_review_pending"
 
 
 def test_emit_does_not_require_legacy_db_path(

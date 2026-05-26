@@ -222,6 +222,26 @@ def test_get_task_detail_renders_full_record(api_config, client, auth_headers, p
     assert "relationships" in body
 
 
+def test_get_task_detail_terminal_dwell_is_stable_null(
+    api_config, client, auth_headers, project_root
+) -> None:
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(svc, project="myproj", title="Done detail")
+        done = svc.mark_done(task.task_id, actor="tester")
+
+    response = client.get(
+        f"/api/v1/tasks/myproj/{done.task_number}", headers=auth_headers
+    )
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["work_status"] == "done"
+    assert body["state_entered_at"] is not None
+    assert body["dwell_seconds"] is None
+    assert isinstance(body["age_seconds"], int)
+
+
 def test_get_task_detail_404_for_unknown_task(client, auth_headers) -> None:
     response = client.get("/api/v1/tasks/myproj/9999", headers=auth_headers)
     assert response.status_code == 404

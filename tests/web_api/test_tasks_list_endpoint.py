@@ -172,6 +172,24 @@ def test_list_tasks_timing_uses_latest_transition(
     assert item["age_seconds"] > item["dwell_seconds"]
 
 
+def test_list_tasks_terminal_dwell_is_stable_null(
+    api_config, client, auth_headers, project_root
+) -> None:
+    db_path = api_config.project.state_db
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    with create_work_service(db_path=db_path, project_path=project_root) as svc:
+        task = make_task(svc, project="myproj", title="Completed")
+        svc.mark_done(task.task_id, actor="tester")
+
+    response = client.get("/api/v1/tasks?project=myproj", headers=auth_headers)
+    assert response.status_code == 200, response.text
+    [item] = response.json()["items"]
+    assert item["work_status"] == "done"
+    assert item["state_entered_at"] is not None
+    assert item["dwell_seconds"] is None
+    assert isinstance(item["age_seconds"], int)
+
+
 def test_list_all_tasks_uses_list_rows_without_per_item_refetch(
     api_config, monkeypatch
 ) -> None:

@@ -42,7 +42,12 @@ from pollypm.work.inbox_view import (
     is_inbox_task,
     is_inbox_task_identity,
 )
-from pollypm.work.models import TaskSummaryCursorError, TaskSummaryProjection
+from pollypm.task_invariants import metadata_for
+from pollypm.work.models import (
+    TaskSummaryCursorError,
+    TaskSummaryProjection,
+    WorkStatus,
+)
 from pollypm.web_api.errors import (
     APIError,
     not_found,
@@ -3701,7 +3706,7 @@ def _task_summary_projection_to_api(row: TaskSummaryProjection) -> APITaskSummar
         plan_version=row.plan_version,
         created_at=created_at,
         state_entered_at=state_entered_at,
-        dwell_seconds=_elapsed_seconds(state_entered_at, now),
+        dwell_seconds=_dwell_seconds(row.work_status, state_entered_at, now),
         age_seconds=_elapsed_seconds(created_at, now),
         updated_at=_as_aware_datetime(row.updated_at),
     )
@@ -3711,7 +3716,9 @@ def _task_timing_fields(task) -> dict[str, datetime | int | None]:
     created_at = _as_aware_datetime(getattr(task, "created_at", None))
     state_entered_at = _state_entered_at(task)
     now = datetime.now(timezone.utc)
-    dwell_seconds = _elapsed_seconds(state_entered_at, now)
+    dwell_seconds = _dwell_seconds(
+        _enum_value(getattr(task, "work_status", "")), state_entered_at, now
+    )
     age_seconds = _elapsed_seconds(created_at, now)
     return {
         "created_at": created_at,
@@ -3730,6 +3737,22 @@ def _state_entered_at(task) -> datetime | None:
             if entered is not None:
                 return entered
     return _as_aware_datetime(getattr(task, "created_at", None))
+
+
+def _dwell_seconds(
+    work_status: object, state_entered_at: datetime | None, now: datetime
+) -> int | None:
+    if _is_terminal_work_status(work_status):
+        return None
+    return _elapsed_seconds(state_entered_at, now)
+
+
+def _is_terminal_work_status(work_status: object) -> bool:
+    value = _enum_value(work_status)
+    try:
+        return metadata_for(WorkStatus(value)).is_terminal
+    except ValueError:
+        return False
 
 
 def _as_aware_datetime(value: Any) -> datetime | None:

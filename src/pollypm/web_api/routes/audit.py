@@ -40,6 +40,8 @@ HTTP guardrails added in round 2:
 from __future__ import annotations
 
 import re
+import threading
+import time
 from datetime import datetime, timezone
 from typing import Annotated, Any
 
@@ -70,6 +72,78 @@ _GREP_LIMIT_MAX = 1000
 # regexes without giving an attacker room for a 50 KB catastrophic
 # backtracker (Codex round-1 P0 ReDoS finding).
 _PATTERN_LENGTH_MAX = 200
+
+
+# ---------------------------------------------------------------------------
+# /audit/stats TTL cache (issue #2323).
+#
+# The activity-rollup widget polls ``/audit/stats?since=2d`` every refresh.
+# On a live host with ~250 MB of JSONL across ~50 per-project logs the
+# walker drains the default 10 s ``deadline_seconds`` budget on every call
+# (lines_scanned ~1.7 M before truncation), so every refresh hits the
+# wall-clock cap and the UI sticks at "loading activity…".
+#
+# The fix mirrors the chat-sessions / dashboard #2307 pattern: keep a
+# short TTL cache keyed by the user-facing query shape. Subsequent
+# refreshes inside the TTL return instantly; a cold call still does the
+# full walk (and still respects ``deadline_seconds`` if the walk doesn't
+# finish). 30 s is short enough that "Activity 2d" feels live and long
+# enough that a polling UI sees ≤2 cold calls/min instead of every-poll.
+#
+# The lock collapses stampede: concurrent refreshes after a TTL expiry
+# share one walk instead of N parallel deadline-bound walks (which was
+# the #2294 / #2319 / #2320 thrash pattern). Stats responses are small
+# (~ small dicts), so storing them by value is cheap.
+_STATS_CACHE_TTL_SECONDS = 30.0
+_STATS_CACHE_MAX_ENTRIES = 16
+_STATS_CACHE_LOCK = threading.Lock()
+_STATS_CACHE: dict[
+    tuple[int, str | None, str, float],
+    tuple[float, "AuditStatsResponse"],
+] = {}
+
+
+def _stats_cache_get(
+    key: tuple[int, str | None, str, float],
+    now: float,
+) -> "AuditStatsResponse | None":
+    """Return a cached stats response if it's still within the TTL."""
+    cached = _STATS_CACHE.get(key)
+    if cached is None:
+        return None
+    cached_at, response = cached
+    if now - cached_at >= _STATS_CACHE_TTL_SECONDS:
+        return None
+    return response
+
+
+def _stats_cache_set(
+    key: tuple[int, str | None, str, float],
+    response: "AuditStatsResponse",
+    now: float,
+) -> None:
+    """Store ``response`` and evict stale / overflow entries."""
+    _STATS_CACHE[key] = (now, response)
+    if len(_STATS_CACHE) <= _STATS_CACHE_MAX_ENTRIES:
+        return
+    stale = [
+        k for k, (ts, _v) in _STATS_CACHE.items()
+        if now - ts >= _STATS_CACHE_TTL_SECONDS
+    ]
+    for k in stale:
+        _STATS_CACHE.pop(k, None)
+    # If we're still over budget (no stale entries to evict), drop the
+    # single oldest entry so the dict can't grow without bound from
+    # rare-key churn (e.g. ad-hoc ``since`` values from the CLI).
+    if len(_STATS_CACHE) > _STATS_CACHE_MAX_ENTRIES:
+        oldest_key = min(_STATS_CACHE, key=lambda k: _STATS_CACHE[k][0])
+        _STATS_CACHE.pop(oldest_key, None)
+
+
+def _reset_stats_cache_for_tests() -> None:
+    """Test hook — clear the TTL cache between cases."""
+    with _STATS_CACHE_LOCK:
+        _STATS_CACHE.clear()
 
 
 class AuditGrepResponse(BaseModel):
@@ -462,6 +536,54 @@ def stats_audit_endpoint(
             ),
         )
     since_dt = _parse_since_or_400(since)
+
+    # Issue #2323: serve recent results from a short TTL cache to avoid
+    # paying the full walker cost on every UI refresh (the activity
+    # rollup widget polls this endpoint, and on hosts with ~250 MB of
+    # audit JSONL each cold call drains the entire ``deadline_seconds``
+    # budget). The cache key uses the raw ``since`` string so two clients
+    # passing the same shortcut (``2d``) share a slot; ``deadline_seconds``
+    # is included so a tighter-budget caller can't read a stale result
+    # computed under a more generous deadline.
+    cache_key = (id(config), project, since, deadline_seconds)
+    now = time.monotonic()
+    cached = _stats_cache_get(cache_key, now)
+    if cached is not None:
+        return cached
+
+    with _STATS_CACHE_LOCK:
+        # Re-check under the lock to collapse stampedes (multiple polls
+        # arriving in the same window share one walk instead of starting
+        # N parallel deadline-bound walks — the #2294/#2319/#2320 thrash).
+        now = time.monotonic()
+        cached = _stats_cache_get(cache_key, now)
+        if cached is not None:
+            return cached
+
+        response = _compute_audit_stats(
+            config=config,
+            project=project,
+            since_dt=since_dt,
+            deadline_seconds=deadline_seconds,
+        )
+        _stats_cache_set(cache_key, response, time.monotonic())
+        return response
+
+
+def _compute_audit_stats(
+    *,
+    config: Any,
+    project: str | None,
+    since_dt: datetime | None,
+    deadline_seconds: float,
+) -> "AuditStatsResponse":
+    """Walk the audit logs and build the stats response (uncached).
+
+    Split out so the endpoint can wrap the expensive walk with the TTL
+    cache + stampede lock (issue #2323) while keeping the original
+    aggregation semantics in one place. Behavior is identical to the
+    pre-#2323 inlined loop.
+    """
     targets = resolve_target_files(project_filter=project, config=config)
 
     by_event: dict[str, int] = {}

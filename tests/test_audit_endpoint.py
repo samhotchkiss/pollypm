@@ -34,6 +34,18 @@ from pollypm.config import (
 )
 from pollypm.models import KnownProject, ProjectKind, ProviderKind, RuntimeKind
 from pollypm.web_api import create_app, ensure_token
+from pollypm.web_api.routes.audit import _reset_stats_cache_for_tests
+
+
+# Issue #2323: the stats endpoint caches responses for 30 s to keep
+# polling UIs cheap. Cache state is module-global, so without an
+# autouse reset two tests reusing the same ``api_config`` ``id()`` slot
+# (CPython recycles freshly-allocated object addresses across tests)
+# could see a stale envelope from the prior test. Clearing in front of
+# every test keeps the existing semantic assertions exact.
+@pytest.fixture(autouse=True)
+def _reset_audit_stats_cache() -> None:
+    _reset_stats_cache_for_tests()
 
 
 # ---------------------------------------------------------------------------
@@ -1383,4 +1395,142 @@ def test_audit_grep_regex_skips_old_rows_before_pattern(
         f"bounded regex ran on {call_count['n']} rows; "
         f"since=1h should have limited it to <= {len(fresh_rows)} "
         f"(old rows must be filtered BEFORE the pattern)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Issue #2323: ``/audit/stats`` TTL cache.
+# ---------------------------------------------------------------------------
+def test_audit_stats_repeats_within_ttl_skip_walker(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Repeated ``/audit/stats`` calls within the TTL share one walk.
+
+    Issue #2323: the activity-rollup widget polls
+    ``/audit/stats?since=2d`` every refresh. On a live host with ~250 MB
+    of audit JSONL each cold call drained the entire
+    ``deadline_seconds`` budget (1.68 M lines scanned before truncation,
+    every call ~10 s). A short TTL cache collapses follow-up polls onto
+    the previous result so the UI never sees the 10 s wall on a refresh.
+
+    This test counts how many times the underlying walker
+    (``iter_matching_events``) runs across N identical requests. The
+    cache contract: only the FIRST call walks; subsequent calls inside
+    the TTL skip the walker entirely.
+    """
+    from pollypm.web_api.routes import audit as audit_route
+
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(event="task.created", status="ok"),
+            _make_event(event="task.created", status="ok"),
+            _make_event(event="task.status_changed", status="warn"),
+        ],
+    )
+
+    # Count walks. ``iter_matching_events`` is imported into the route
+    # module by name, so we patch the module-local symbol.
+    walk_count = {"n": 0}
+    real_iter = audit_route.iter_matching_events
+
+    def counting_iter(*args, **kwargs):  # type: ignore[no-untyped-def]
+        walk_count["n"] += 1
+        yield from real_iter(*args, **kwargs)
+
+    monkeypatch.setattr(audit_route, "iter_matching_events", counting_iter)
+
+    params = {"project": "myproj", "since": "30d"}
+    first = client.get(
+        "/api/v1/audit/stats", params=params, headers=auth_headers
+    )
+    assert first.status_code == 200, first.text
+    first_body = first.json()
+    assert first_body["total"] == 3
+    assert walk_count["n"] == 1
+
+    for _ in range(5):
+        repeat = client.get(
+            "/api/v1/audit/stats", params=params, headers=auth_headers
+        )
+        assert repeat.status_code == 200
+        # Cache must return the byte-identical envelope so callers don't
+        # see a flicker between fresh + cached responses.
+        assert repeat.json() == first_body
+
+    # Five follow-up calls — none should have re-entered the walker.
+    assert walk_count["n"] == 1, (
+        f"expected 1 walker invocation across 6 identical calls inside TTL; "
+        f"got {walk_count['n']}"
+    )
+
+
+def test_audit_stats_cache_key_separates_since_windows(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Different ``since`` windows must NOT share a cache slot.
+
+    A 2 d window and a 7 d window can yield different totals on the same
+    underlying log, so the cache key includes the raw ``since`` string.
+    """
+    from pollypm.web_api.routes import audit as audit_route
+
+    now = datetime.now(timezone.utc)
+    _write_jsonl(
+        _per_project_log(project_root),
+        [
+            _make_event(event="old", ts=(now - timedelta(days=5)).isoformat()),
+            _make_event(event="recent", ts=(now - timedelta(hours=1)).isoformat()),
+        ],
+    )
+
+    walk_count = {"n": 0}
+    real_iter = audit_route.iter_matching_events
+
+    def counting_iter(*args, **kwargs):  # type: ignore[no-untyped-def]
+        walk_count["n"] += 1
+        yield from real_iter(*args, **kwargs)
+
+    monkeypatch.setattr(audit_route, "iter_matching_events", counting_iter)
+
+    # 2d window: only the recent event lands.
+    r2d = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "2d"},
+        headers=auth_headers,
+    )
+    assert r2d.status_code == 200
+    assert r2d.json()["total"] == 1
+
+    # 7d window: both events land. Different since → fresh walk.
+    r7d = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "7d"},
+        headers=auth_headers,
+    )
+    assert r7d.status_code == 200
+    assert r7d.json()["total"] == 2
+
+    # Two distinct cache keys → two walks. (Same-key repeats below
+    # confirm the cache still de-dupes within each key.)
+    assert walk_count["n"] == 2
+
+    # Repeat 2d — must hit cache, not walk again.
+    r2d_again = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "2d"},
+        headers=auth_headers,
+    )
+    assert r2d_again.status_code == 200
+    assert r2d_again.json()["total"] == 1
+    assert walk_count["n"] == 2, (
+        f"second 2d call should be cached; saw {walk_count['n']} walks"
     )

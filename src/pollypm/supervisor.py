@@ -2857,6 +2857,9 @@ class Supervisor:
     # Failure types where the session is gone — no live interaction to protect.
     _DEAD_SESSION_FAILURES = frozenset({"missing_window", "pane_dead", "shell_returned"})
     _AUDIT_MISSING_FAILURES = _DEAD_SESSION_FAILURES
+    _ACCOUNT_FAILOVER_FAILURES = frozenset(
+        {"auth_broken", "capacity_exhausted", "capacity_low"}
+    )
 
     # Map detected failure types to the raw signals the RecoveryPolicy
     # expects. Keeps the policy decoupled from Supervisor's vocabulary.
@@ -3834,6 +3837,24 @@ class Supervisor:
         }
         candidates = self._candidate_accounts(launch, allow_same=allow_same)
         if not candidates:
+            if failure_type in self._ACCOUNT_FAILOVER_FAILURES:
+                from pollypm.audit.log import EVENT_ACCOUNT_FAILOVER_BLOCKED
+
+                self._emit_session_recovery_audit(
+                    EVENT_ACCOUNT_FAILOVER_BLOCKED,
+                    launch,
+                    status="error",
+                    actor="supervisor",
+                    metadata={
+                        "failure_type": failure_type,
+                        "failure_message": failure_message,
+                        "from": launch.account.name,
+                        "to": None,
+                        "account": launch.account.name,
+                        "provider": launch.account.provider.value,
+                        "reason": "no_viable_account",
+                    },
+                )
             self._msg_store.upsert_alert(
                 launch.session.name,
                 "blocked_no_capacity",
@@ -3885,6 +3906,25 @@ class Supervisor:
             "error",
             f"Recovery failed for all viable accounts: {last_error or 'no candidate succeeded'}",
         )
+        if failure_type in self._ACCOUNT_FAILOVER_FAILURES:
+            from pollypm.audit.log import EVENT_ACCOUNT_FAILOVER_FAILED
+
+            self._emit_session_recovery_audit(
+                EVENT_ACCOUNT_FAILOVER_FAILED,
+                launch,
+                status="error",
+                actor="supervisor",
+                metadata={
+                    "failure_type": failure_type,
+                    "failure_message": failure_message,
+                    "from": launch.account.name,
+                    "to": None,
+                    "account": launch.account.name,
+                    "provider": launch.account.provider.value,
+                    "reason": "candidate_launch_failed",
+                    "last_error": last_error or "",
+                },
+            )
         self._upsert_session_runtime(
             session_name=launch.session.name,
             status="blocked",
@@ -3942,6 +3982,11 @@ class Supervisor:
         )
         tmux_session = self._tmux_session_for_launch(launch)
         previous_runtime = self._get_session_runtime(session_name)
+        previous_account = (
+            previous_runtime.effective_account
+            if previous_runtime is not None and previous_runtime.effective_account
+            else launch.account.name
+        )
         if self.session_service.tmux.has_session(tmux_session):
             window_map = self._window_map()
             # #1096 — key includes the tmux_session so we don't mistake
@@ -4015,6 +4060,27 @@ class Supervisor:
                     status="ok",
                     actor="supervisor",
                     metadata=recovery_metadata,
+                )
+            if (
+                failure_type in self._ACCOUNT_FAILOVER_FAILURES
+                and account_name != previous_account
+            ):
+                from pollypm.audit.log import EVENT_ACCOUNT_FAILOVER_ENGAGED
+
+                self._emit_session_recovery_audit(
+                    EVENT_ACCOUNT_FAILOVER_ENGAGED,
+                    launch,
+                    status="ok",
+                    actor="supervisor",
+                    metadata={
+                        "failure_type": failure_type,
+                        "from": previous_account,
+                        "to": account_name,
+                        "account": account_name,
+                        "provider": account.provider.value,
+                        "configured_account": getattr(launch.session, "account", ""),
+                        "reason": "recovery_failover",
+                    },
                 )
         # Inject recovery prompt so the agent knows what it was doing.
         # For role-scoped agents (reviewer / heartbeat) prepend an

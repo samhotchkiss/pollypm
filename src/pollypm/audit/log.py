@@ -293,6 +293,10 @@ EVENT_HEARTBEAT_MISSING = "heartbeat.missing"
 EVENT_RECOVERY_SPAWN = "recovery.spawn"
 EVENT_SESSION_SPAWN = "session.spawn"
 EVENT_TASK_RECLAIMED = "task.reclaimed"
+EVENT_ACCOUNT_FAILOVER_PROACTIVE = "account.failover.proactive"
+EVENT_ACCOUNT_FAILOVER_ENGAGED = "account.failover.engaged"
+EVENT_ACCOUNT_FAILOVER_BLOCKED = "account.failover.blocked"
+EVENT_ACCOUNT_FAILOVER_FAILED = "account.failover.failed"
 # #2296 — public agent-side refusal observability. Agents use the
 # narrow ``pm audit agent-refusal`` command when they refuse a message
 # claiming PollyPM authority but missing/failing the auth marker.

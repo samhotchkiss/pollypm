@@ -108,6 +108,11 @@ def test_supervisor_failover_prefers_viable_backup(monkeypatch, tmp_path: Path) 
     monkeypatch.setattr(supervisor, "_account_is_viable", lambda name: name == "codex_backup")
     monkeypatch.setattr(
         supervisor,
+        "_record_recovery_attempt",
+        lambda *_args, **_kwargs: (True, 1),
+    )
+    monkeypatch.setattr(
+        supervisor,
         "_restart_session",
         lambda session_name, account_name, failure_type: restarted.update(
             {"session": session_name, "account": account_name, "failure": failure_type}
@@ -152,6 +157,11 @@ def test_supervisor_failover_skips_pg_exhausted_account(monkeypatch, tmp_path: P
         )
 
     monkeypatch.setattr("pollypm.capacity.probe_capacity", fake_probe_capacity)
+    monkeypatch.setattr(
+        supervisor,
+        "_record_recovery_attempt",
+        lambda *_args, **_kwargs: (True, 1),
+    )
     monkeypatch.setattr(
         supervisor,
         "_restart_session",
@@ -1590,6 +1600,112 @@ def test_restart_session_emits_session_spawn_audit(
     assert recovery_event.metadata["target_task"] == ""
     assert recovery_event.metadata["reason"] == "recovery_restart"
     assert recovery_event.metadata["failure_type"] == "missing_window"
+
+
+def test_restart_session_hard_failover_emits_account_failover_audit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.audit.log import (
+        EVENT_ACCOUNT_FAILOVER_ENGAGED,
+        read_events,
+    )
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = SessionLaunchSpec(
+        session=config.sessions["operator"],
+        account=config.accounts["claude_controller"],
+        window_name="pm-operator",
+        log_path=tmp_path / ".pollypm/logs/operator.log",
+        command="claude",
+    )
+
+    monkeypatch.setattr(
+        supervisor.session_service.tmux,
+        "has_session",
+        lambda _name: False,
+    )
+    monkeypatch.setattr(supervisor, "_get_session_runtime", lambda _name: None)
+    monkeypatch.setattr(supervisor, "_launch_by_session", lambda _name: launch)
+    monkeypatch.setattr(supervisor, "launch_session", lambda _name: launch)
+
+    supervisor.restart_session(
+        "operator",
+        "codex_backup",
+        failure_type="auth_broken",
+    )
+
+    events = read_events(
+        "pollypm",
+        project_path=tmp_path,
+        event=EVENT_ACCOUNT_FAILOVER_ENGAGED,
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.subject == "operator"
+    assert event.actor == "supervisor"
+    assert event.status == "ok"
+    assert event.metadata["session"] == "operator"
+    assert event.metadata["failure_type"] == "auth_broken"
+    assert event.metadata["from"] == "claude_controller"
+    assert event.metadata["to"] == "codex_backup"
+    assert event.metadata["account"] == "codex_backup"
+    assert event.metadata["provider"] == "codex"
+    assert event.metadata["reason"] == "recovery_failover"
+    assert event.metadata["target_session"] == "operator"
+
+
+def test_auth_broken_without_candidate_emits_failover_blocked_audit(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.audit.log import (
+        EVENT_ACCOUNT_FAILOVER_BLOCKED,
+        read_events,
+    )
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    config = _config(tmp_path)
+    supervisor = Supervisor(config)
+    supervisor.ensure_layout()
+    launch = SessionLaunchSpec(
+        session=config.sessions["operator"],
+        account=config.accounts["claude_controller"],
+        window_name="pm-operator",
+        log_path=tmp_path / ".pollypm/logs/operator.log",
+        command="claude",
+    )
+
+    monkeypatch.setattr(supervisor, "_policy_recommendation", lambda *_args: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_record_recovery_attempt",
+        lambda *_args, **_kwargs: (True, 1),
+    )
+    monkeypatch.setattr(supervisor, "_candidate_accounts", lambda *_args, **_kwargs: [])
+
+    supervisor.maybe_recover_session(
+        launch,
+        failure_type="auth_broken",
+        failure_message="401",
+    )
+
+    events = read_events(
+        "pollypm",
+        project_path=tmp_path,
+        event=EVENT_ACCOUNT_FAILOVER_BLOCKED,
+    )
+    assert len(events) == 1
+    event = events[0]
+    assert event.status == "error"
+    assert event.metadata["failure_type"] == "auth_broken"
+    assert event.metadata["failure_message"] == "401"
+    assert event.metadata["from"] == "claude_controller"
+    assert event.metadata["to"] is None
+    assert event.metadata["reason"] == "no_viable_account"
 
 
 def test_supervisor_record_heartbeat_routes_through_pg_facade(

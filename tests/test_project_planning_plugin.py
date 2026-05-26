@@ -586,6 +586,7 @@ def test_architect_profile_points_at_research_stage() -> None:
     text = root.read_text(encoding="utf-8")
     assert "planning-context.md" in text
     assert "research" in text.lower()
+    assert ".pollypm/architect-worktree-status.md" in text
 
 
 def _make_architect_context(tmp_path: Path, *, persona_name: str | None):

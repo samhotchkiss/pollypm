@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 import re
 import subprocess
 from pathlib import Path
@@ -21,6 +22,20 @@ if TYPE_CHECKING:
     from pollypm.models import PollyPMConfig
 
 _SAFE_WORKTREE_KEY_RE = re.compile(r"^[a-zA-Z0-9_-]+$")
+ARCHITECT_WORKTREE_STATUS_PATH = Path(".pollypm") / "architect-worktree-status.md"
+
+
+@dataclass(slots=True)
+class ArchitectWorktreeRefreshResult:
+    """Outcome of the architect worktree freshness check."""
+
+    status: str
+    worktree_path: Path
+    base_ref: str | None = None
+    base_head: str | None = None
+    worktree_head: str | None = None
+    marker_path: Path | None = None
+    reason: str | None = None
 
 
 def _list_worktrees_for_backend(
@@ -82,6 +97,247 @@ def _validate_worktree_key(param_name: str, param_value: str) -> None:
         raise typer.BadParameter(f"{param_name} contains invalid characters: {param_value}")
 
 
+def _git(
+    cwd: Path,
+    *args: str,
+    timeout: int = 60,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", "-C", str(cwd), *args],
+        check=False,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+    )
+
+
+def _git_ref_exists(project_path: Path, ref: str) -> bool:
+    result = _git(project_path, "rev-parse", "--verify", "--quiet", ref)
+    return result.returncode == 0
+
+
+def _architect_base_ref(project_path: Path) -> str:
+    for ref in ("refs/heads/main", "refs/heads/master"):
+        if _git_ref_exists(project_path, ref):
+            return ref
+    return "HEAD"
+
+
+def _git_oid(path: Path, ref: str) -> str | None:
+    result = _git(path, "rev-parse", "--verify", ref)
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _git_worktree_registered(project_path: Path, worktree_path: Path) -> bool:
+    result = _git(project_path, "worktree", "list", "--porcelain")
+    if result.returncode != 0:
+        return False
+    try:
+        target = worktree_path.resolve()
+    except OSError:
+        target = worktree_path
+    for line in result.stdout.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        registered = Path(line[len("worktree "):].strip())
+        try:
+            registered = registered.resolve()
+        except OSError:
+            pass
+        if registered == target:
+            return True
+    return False
+
+
+def _base_is_ancestor(worktree_path: Path, base_head: str) -> bool:
+    result = _git(
+        worktree_path,
+        "merge-base",
+        "--is-ancestor",
+        base_head,
+        "HEAD",
+    )
+    return result.returncode == 0
+
+
+def _worktree_dirty(worktree_path: Path) -> bool:
+    result = _git(worktree_path, "status", "--porcelain")
+    if result.returncode != 0:
+        return True
+    return bool(result.stdout.strip())
+
+
+def _write_architect_stale_marker(
+    *,
+    worktree_path: Path,
+    base_ref: str | None,
+    base_head: str | None,
+    worktree_head: str | None,
+    reason: str,
+) -> Path:
+    marker_path = worktree_path / ARCHITECT_WORKTREE_STATUS_PATH
+    marker_path.parent.mkdir(parents=True, exist_ok=True)
+    marker_path.write_text(
+        "\n".join(
+            [
+                "# Architect worktree freshness warning",
+                "",
+                "PollyPM could not fast-forward this architect worktree "
+                "to the current project mainline without risking local work.",
+                "",
+                f"- Base ref checked: `{base_ref or 'unknown'}`",
+                f"- Base HEAD: `{base_head or 'unknown'}`",
+                f"- Worktree HEAD: `{worktree_head or 'unknown'}`",
+                f"- Reason: {reason}",
+                "",
+                "Surface this before planning from repository state. Do not "
+                "reset, delete, or discard work in this checkout unless the "
+                "operator explicitly approves it.",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return marker_path
+
+
+def _clear_architect_stale_marker(worktree_path: Path) -> Path:
+    marker_path = worktree_path / ARCHITECT_WORKTREE_STATUS_PATH
+    marker_path.unlink(missing_ok=True)
+    return marker_path
+
+
+def refresh_architect_worktree(
+    project_path: Path,
+    worktree_path: Path,
+) -> ArchitectWorktreeRefreshResult:
+    """Fast-forward an architect worktree to local main when safe.
+
+    This is intentionally conservative: it never resets, rebases,
+    deletes, or force-checkouts. If the checkout is dirty or divergent,
+    PollyPM writes a visible status file for the architect instead of
+    mutating the worktree.
+    """
+    marker_path = _clear_architect_stale_marker(worktree_path)
+    if not worktree_path.exists():
+        return ArchitectWorktreeRefreshResult(
+            status="missing",
+            worktree_path=worktree_path,
+            marker_path=marker_path,
+            reason="worktree path does not exist",
+        )
+    if not (project_path / ".git").exists():
+        return ArchitectWorktreeRefreshResult(
+            status="not_git",
+            worktree_path=worktree_path,
+            marker_path=marker_path,
+            reason="project path is not a git repository",
+        )
+    if not _git_worktree_registered(project_path, worktree_path):
+        reason = "worktree is not registered with git"
+        marker_path = _write_architect_stale_marker(
+            worktree_path=worktree_path,
+            base_ref=None,
+            base_head=None,
+            worktree_head=None,
+            reason=reason,
+        )
+        return ArchitectWorktreeRefreshResult(
+            status="stale",
+            worktree_path=worktree_path,
+            marker_path=marker_path,
+            reason=reason,
+        )
+
+    base_ref = _architect_base_ref(project_path)
+    base_head = _git_oid(project_path, base_ref)
+    worktree_head = _git_oid(worktree_path, "HEAD")
+    if base_head is None or worktree_head is None:
+        reason = "could not resolve git HEADs for freshness check"
+        marker_path = _write_architect_stale_marker(
+            worktree_path=worktree_path,
+            base_ref=base_ref,
+            base_head=base_head,
+            worktree_head=worktree_head,
+            reason=reason,
+        )
+        return ArchitectWorktreeRefreshResult(
+            status="stale",
+            worktree_path=worktree_path,
+            base_ref=base_ref,
+            base_head=base_head,
+            worktree_head=worktree_head,
+            marker_path=marker_path,
+            reason=reason,
+        )
+
+    if _base_is_ancestor(worktree_path, base_head):
+        return ArchitectWorktreeRefreshResult(
+            status="current",
+            worktree_path=worktree_path,
+            base_ref=base_ref,
+            base_head=base_head,
+            worktree_head=worktree_head,
+            marker_path=marker_path,
+        )
+
+    if _worktree_dirty(worktree_path):
+        reason = "worktree has uncommitted changes"
+        marker_path = _write_architect_stale_marker(
+            worktree_path=worktree_path,
+            base_ref=base_ref,
+            base_head=base_head,
+            worktree_head=worktree_head,
+            reason=reason,
+        )
+        return ArchitectWorktreeRefreshResult(
+            status="stale",
+            worktree_path=worktree_path,
+            base_ref=base_ref,
+            base_head=base_head,
+            worktree_head=worktree_head,
+            marker_path=marker_path,
+            reason=reason,
+        )
+
+    result = _git(worktree_path, "merge", "--ff-only", base_ref, timeout=300)
+    if result.returncode == 0:
+        refreshed_head = _git_oid(worktree_path, "HEAD")
+        if refreshed_head is not None and _base_is_ancestor(worktree_path, base_head):
+            return ArchitectWorktreeRefreshResult(
+                status="updated",
+                worktree_path=worktree_path,
+                base_ref=base_ref,
+                base_head=base_head,
+                worktree_head=refreshed_head,
+                marker_path=marker_path,
+            )
+
+    reason = (
+        result.stderr.strip()
+        or result.stdout.strip()
+        or "worktree branch cannot fast-forward to mainline"
+    )
+    marker_path = _write_architect_stale_marker(
+        worktree_path=worktree_path,
+        base_ref=base_ref,
+        base_head=base_head,
+        worktree_head=worktree_head,
+        reason=reason,
+    )
+    return ArchitectWorktreeRefreshResult(
+        status="stale",
+        worktree_path=worktree_path,
+        base_ref=base_ref,
+        base_head=base_head,
+        worktree_head=worktree_head,
+        marker_path=marker_path,
+        reason=reason,
+    )
+
+
 def ensure_worktree(
     config_path: Path,
     *,
@@ -113,6 +369,8 @@ def ensure_worktree(
 
     existing = _active_worktree(config, project_key, lane_kind, lane_key)
     if existing is not None and Path(existing.path).exists():
+        if lane_kind == "architect":
+            refresh_architect_worktree(project.path, Path(existing.path))
         return existing
 
     path = worktree_root / f"{project_key}-{lane_kind}-{lane_key}"
@@ -141,6 +399,8 @@ def ensure_worktree(
         branch=branch,
         status="active",
     )
+    if lane_kind == "architect":
+        refresh_architect_worktree(project.path, path)
     return _active_worktree(config, project_key, lane_kind, lane_key)
 
 

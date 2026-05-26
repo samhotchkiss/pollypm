@@ -64,6 +64,13 @@ error message body, kept here for grep-ability):
 `architect`, `reviewer`, `worker`, `polly`, `russell`, `triage`. **Note**:
 `user` is **not** a role — the human is not an autonomous agent.
 
+Architect sessions run from persistent project worktrees. When PollyPM
+launches or relaunches an architect, it fast-forwards a clean architect
+worktree to local `main`/`master` when possible. If local changes or a
+divergent branch make that unsafe, PollyPM leaves the worktree untouched and
+writes `.pollypm/architect-worktree-status.md` inside it for the architect to
+surface before relying on repository state.
+
 ## 3. Canonical CLI commands
 
 All commands are invoked as `pm <verb>` (or `pollypm <verb>` — both

@@ -1325,6 +1325,7 @@ class Supervisor:
                 # reviewer, workers) would otherwise never get registered.
                 self._record_launch(launch)
                 continue
+            self._refresh_architect_worktree_before_launch(launch)
             _status(f"Recreating {launch.session.name}...")
             if not self.session_service.tmux.has_session(storage_session):
                 self.session_service.tmux.create_session(storage_session, launch.window_name, launch.command)
@@ -1366,6 +1367,7 @@ class Supervisor:
         targets: list[tuple[SessionLaunchSpec, str]] = []
         if launches:
             first = launches[0]
+            self._refresh_architect_worktree_before_launch(first)
             if on_status:
                 on_status(f"Creating {first.session.name}...")
             first_pane_id = self.session_service.tmux.create_session(storage_session, first.window_name, first.command)
@@ -1378,6 +1380,7 @@ class Supervisor:
             pane_target = first_pane_id or window_target
             targets.append((first, pane_target))
             for launch in launches[1:]:
+                self._refresh_architect_worktree_before_launch(launch)
                 if on_status:
                     on_status(f"Creating {launch.session.name}...")
                 pane_id = self.session_service.tmux.create_window(storage_session, launch.window_name, launch.command, detached=True)
@@ -4258,6 +4261,74 @@ class Supervisor:
             self._stabilize_launch(launch, target, on_status=on_status)
         return launch
 
+    def _refresh_architect_worktree_before_launch(
+        self,
+        launch: SessionLaunchSpec,
+    ) -> None:
+        """Refresh architect role worktrees before spawning a new pane.
+
+        Runs only for architect launches whose window is absent. The
+        helper is deliberately non-destructive: clean branches may
+        fast-forward to local main/master, while dirty or divergent
+        checkouts get a status file the architect profile tells the
+        agent to inspect.
+        """
+        session = launch.session
+        if session.role != "architect" or not session.project:
+            return
+        project = self.config.projects.get(session.project)
+        if project is None:
+            return
+        try:
+            from pollypm.worktrees import refresh_architect_worktree
+
+            result = refresh_architect_worktree(project.path, session.cwd)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "architect worktree refresh failed for %s at %s: %s",
+                session.name,
+                session.cwd,
+                exc,
+            )
+            return
+        if result.status == "updated":
+            logger.info(
+                "architect worktree %s fast-forwarded to %s (%s)",
+                session.cwd,
+                result.base_ref,
+                result.base_head,
+            )
+        if result.status in {"current", "updated"}:
+            try:
+                self._msg_store.clear_alert(session.name, "architect_worktree_stale")
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "architect worktree stale-alert clear failed for %s",
+                    session.name,
+                    exc_info=True,
+                )
+        elif result.status == "stale":
+            marker = str(result.marker_path) if result.marker_path else ""
+            message = (
+                f"Architect worktree {session.cwd} is stale relative to "
+                f"{result.base_ref or 'project mainline'}; {result.reason}. "
+                f"Status file: {marker}"
+            )
+            logger.warning(message)
+            try:
+                self._msg_store.upsert_alert(
+                    session.name,
+                    "architect_worktree_stale",
+                    "warn",
+                    message,
+                )
+            except Exception:  # noqa: BLE001
+                logger.debug(
+                    "architect worktree stale-alert write failed for %s",
+                    session.name,
+                    exc_info=True,
+                )
+
     def create_session_window(
         self,
         session_name: str,
@@ -4284,6 +4355,7 @@ class Supervisor:
         # #1096 — scope existence-check to the launch's tmux_session.
         if (tmux_session, launch.window_name) in window_map:
             return launch, None
+        self._refresh_architect_worktree_before_launch(launch)
         existing_claude_ids: set[str] | None = None
         if (
             launch.session.provider is ProviderKind.CLAUDE

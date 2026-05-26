@@ -27,6 +27,14 @@
   const SESSION_EXPIRY_WARNING_MS = 6 * 24 * 60 * 60 * 1000;
   const TASK_RAIL_LIMIT = 200;
   const TASK_RENDER_LIMIT = 80;
+  const TASK_STATUS_GROUPS = {
+    attention: ["review", "queued", "rework", "blocked", "on_hold"],
+    active: ["in_progress", "rework"],
+    blocked: ["blocked", "on_hold"],
+    review: ["review"],
+    done: ["done"],
+    cancelled: ["cancelled"],
+  };
   const AUDIT_LIMIT = 25;
   const ACTIVITY_LIMIT = 40;
   const ACTIVITY_DEFAULT_SINCE = "2d";
@@ -56,6 +64,7 @@
     taskLoadError: null,
     surfaceLoading: false,
     taskLoading: false,
+    taskStatusFilter: "",
     selectedKind: null,
     selectedSurface: null,
     selectedTaskKey: null,
@@ -532,7 +541,7 @@
     const tasksPromise = railJsonWithTimeout(
       "tasks",
       (opts) => apiJsonOptional(
-        API + "/tasks?limit=" + TASK_RAIL_LIMIT,
+        taskListPath(),
         opts,
       ),
       { signal: request.signal },
@@ -616,7 +625,26 @@
       priority: task.priority || "",
       assignee: task.assignee || "",
       updated_at: task.updated_at || "",
+      project_paused: Boolean(task.project_paused),
       duplicate_count: task.duplicate_count || 1,
+    };
+  }
+
+  function taskListPath() {
+    const params = new URLSearchParams();
+    params.set("limit", String(TASK_RAIL_LIMIT));
+    const statuses = TASK_STATUS_GROUPS[state.taskStatusFilter] || [];
+    for (const status of statuses) params.append("status", status);
+    return API + "/tasks?" + params.toString();
+  }
+
+  function parseTaskKey(value) {
+    const match = String(value || "").trim().match(/^([^/\s]+)\/([0-9]+)$/);
+    if (!match) return null;
+    return {
+      key: match[1] + "/" + match[2],
+      project: match[1],
+      task_number: match[2],
     };
   }
 
@@ -899,6 +927,30 @@
     list.appendChild(li);
   }
 
+  function renderDirectTaskOpenItem(list, parsed) {
+    const active = state.selectedKind === "task"
+      && state.selectedTaskKey === parsed.key;
+    const li = el(
+      "li",
+      {
+        "data-task": parsed.key,
+        "class": ("task-surface direct-task" + (active ? " active" : "")),
+      },
+      [
+        el("span", { class: "surface-name" }, [
+          el("span", { class: "surface-dot waiting" }),
+          document.createTextNode("Open " + parsed.key),
+        ]),
+        el("span", {
+          class: "surface-meta",
+          text: "fetch task detail",
+        }),
+      ],
+    );
+    li.addEventListener("click", () => selectTask(parsed.key));
+    list.appendChild(li);
+  }
+
   function selectedProjectMatches(project) {
     return !state.selectedProject || project === state.selectedProject;
   }
@@ -936,11 +988,18 @@
       selectedProjectMatches(task.project || "")
       && taskMatchesFilter(task, filter)
     ));
+    const directTask = parseTaskKey(filter);
+    const directTaskVisible = Boolean(
+      directTask
+      && selectedProjectMatches(directTask.project)
+      && !taskSurfaces.some((task) => task.key === directTask.key)
+    );
     const hasRegistered = (
       state.surfaces.length > 0
       || state.taskSurfaces.length > 0
       || state.surfaceLoadError
       || state.taskLoadError
+      || directTaskVisible
     );
     const isLoading = state.surfaceLoading || state.taskLoading;
     const allSectionsPending = state.surfaceLoading && state.taskLoading;
@@ -964,6 +1023,7 @@
       && taskSurfaces.length === 0
       && !state.surfaceLoadError
       && !state.taskLoadError
+      && !directTaskVisible
     ) {
       list.appendChild(
         el("li", { class: "surface-empty", text: "no matching surfaces" }),
@@ -986,8 +1046,9 @@
         text: "loading chat surfaces...",
       }));
     }
-    if (taskSurfaces.length > 0 || state.taskLoadError) {
+    if (taskSurfaces.length > 0 || state.taskLoadError || directTaskVisible) {
       appendRailGroup(list, "Tasks");
+      if (directTaskVisible) renderDirectTaskOpenItem(list, directTask);
       const visibleTasks = taskSurfaces.slice(0, TASK_RENDER_LIMIT);
       for (const task of visibleTasks) renderTaskSurfaceItem(list, task);
       if (taskSurfaces.length > visibleTasks.length) {
@@ -1046,7 +1107,14 @@
       const task = state.taskSurfaces.find((item) => (
         item.key === state.selectedTaskKey
       ));
-      if (!task || task.project !== state.selectedProject) clearSelection();
+      const parsed = parseTaskKey(state.selectedTaskKey);
+      if (
+        task
+        ? task.project !== state.selectedProject
+        : (!parsed || parsed.project !== state.selectedProject)
+      ) {
+        clearSelection();
+      }
     }
   }
 
@@ -1113,8 +1181,23 @@
   }
 
   function selectTask(key) {
-    const task = state.taskSurfaces.find((item) => item.key === key);
-    if (!task) return;
+    let task = state.taskSurfaces.find((item) => item.key === key);
+    if (!task) {
+      const parsed = parseTaskKey(key);
+      if (!parsed) return;
+      task = {
+        key: parsed.key,
+        task_id: parsed.key,
+        project: parsed.project,
+        task_number: parsed.task_number,
+        title: parsed.key,
+        work_status: "",
+        type: "",
+        priority: "",
+        assignee: "",
+        updated_at: "",
+      };
+    }
     state.selectedKind = "task";
     state.selectedSurface = null;
     state.selectedTaskKey = key;
@@ -1160,14 +1243,25 @@
     // §1.4.5 (#2336): dwell row when non-terminal — surfaces "stuck
     // for X" right next to Status.
     const dwellStr = !isTerminal ? formatDwell(data.dwell_seconds) : null;
-    const rows = [
+    const rows = [];
+    if (data.type && data.type !== "task") rows.push(["Type", data.type]);
+    rows.push(
       ["Status", status],
       ["Project", data.project],
       ["Task", data.task_number],
       ["Assignee", data.assignee],
       ["Priority", data.priority],
       ["Updated", data.updated_at],
-    ];
+    );
+    if (Array.isArray(data.labels) && data.labels.length > 0) {
+      rows.push(["Labels", data.labels.join(", ")]);
+    }
+    if (data.requires_human_review != null) {
+      rows.push([
+        "Human review",
+        data.requires_human_review ? "required" : "not required",
+      ]);
+    }
     if (dwellStr) {
       rows.push(["Dwell", dwellStr + " in " + status]);
     }
@@ -1217,24 +1311,18 @@
           + "likely stale state, run `pm doctor`.",
       }));
     }
-    if (data.description) {
-      children.push(el("div", {
-        class: "task-detail-description",
-        text: data.description,
-      }));
-    }
+    appendTaskDetailSection(children, "Description", data.description);
     for (const row of filteredRows) {
       children.push(el("div", { class: "task-detail-row" }, [
         el("span", { class: "task-detail-label", text: row[0] }),
         el("span", { class: "task-detail-value", text: String(row[1]) }),
       ]));
     }
-    if (data.acceptance_criteria) {
-      children.push(el("div", {
-        class: "task-detail-description",
-        text: data.acceptance_criteria,
-      }));
-    }
+    appendTaskDetailSection(
+      children, "Acceptance criteria", data.acceptance_criteria,
+    );
+    appendTaskDetailSection(children, "Constraints", data.constraints);
+    appendTaskDetailList(children, "Relevant files", data.relevant_files);
     const actions = [];
     if (data.work_status === "queued" || data.work_status === "rework") {
       const claim = el("button", {
@@ -1266,6 +1354,24 @@
       children.push(el("div", { class: "task-detail-actions" }, actions));
     }
     list.appendChild(el("div", { class: "task-detail" }, children));
+  }
+
+  function appendTaskDetailSection(children, heading, text) {
+    if (text == null || text === "") return;
+    children.push(el("div", { class: "task-detail-section" }, [
+      el("h3", { class: "task-detail-heading", text: heading }),
+      el("div", { class: "task-detail-section-body", text: String(text) }),
+    ]));
+  }
+
+  function appendTaskDetailList(children, heading, items) {
+    if (!Array.isArray(items) || items.length === 0) return;
+    children.push(el("div", { class: "task-detail-section" }, [
+      el("h3", { class: "task-detail-heading", text: heading }),
+      el("ul", { class: "task-detail-list" }, items.map((item) => (
+        el("li", { text: String(item) })
+      ))),
+    ]));
   }
 
   async function claimTaskFromDetail(task) {
@@ -3003,11 +3109,20 @@
 
   function wireSurfaceFilter() {
     const input = $("surface-filter");
-    if (!input) return;
-    input.addEventListener("input", () => {
-      state.surfaceFilter = input.value || "";
-      renderSurfaces();
-    });
+    if (input) {
+      input.addEventListener("input", () => {
+        state.surfaceFilter = input.value || "";
+        renderSurfaces();
+      });
+    }
+    const status = $("task-status-filter");
+    if (status) {
+      status.value = state.taskStatusFilter;
+      status.addEventListener("change", () => {
+        state.taskStatusFilter = status.value || "";
+        loadSurfaces();
+      });
+    }
   }
 
   function wireProjectControls() {

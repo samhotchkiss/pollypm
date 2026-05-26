@@ -55,6 +55,19 @@
         aria-label="Filter surfaces"
         autocomplete="off"
       />
+      <select
+        id="task-status-filter"
+        class="rail-select task-status-filter"
+        aria-label="Filter tasks by status"
+      >
+        <option value="">Recent tasks</option>
+        <option value="attention">Needs attention</option>
+        <option value="active">Active work</option>
+        <option value="blocked">Blocked / held</option>
+        <option value="review">Review</option>
+        <option value="done">Done</option>
+        <option value="cancelled">Cancelled</option>
+      </select>
     </div>
     <ul id="surface-list" class="surface-list">
       <li class="surface-empty">loading…</li>

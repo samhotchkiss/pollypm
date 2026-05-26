@@ -244,6 +244,7 @@ def test_list_all_tasks_uses_list_rows_without_per_item_refetch(
 
     assert [item.task_id for item in items] == ["myproj/1"]
     assert items[0].state_entered_at == now - timedelta(minutes=5)
+    assert items[0].project_paused is False
     assert next_cursor is None
     assert warnings == []
     assert total == 1
@@ -363,9 +364,71 @@ def test_list_tasks_include_untracked_returns_hidden_rows(
     )
     assert response.status_code == 200, response.text
     body = response.json()
-    titles = sorted(item["title"] for item in body["items"])
+    by_title = {item["title"]: item for item in body["items"]}
+    titles = sorted(by_title)
     assert titles == ["Hidden", "Visible"]
+    assert by_title["Hidden"]["project_paused"] is True
+    assert by_title["Visible"]["project_paused"] is False
     assert body.get("warnings") is None
+
+
+def test_list_tasks_include_untracked_summary_page_marks_paused_projects(
+    api_config, monkeypatch
+) -> None:
+    """Fast summary pages must carry the same paused flag as detail."""
+    from contextlib import contextmanager
+
+    from pollypm.models import KnownProject, ProjectKind
+    from pollypm.web_api import service as svc_mod
+
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+    api_config.projects["paused"] = KnownProject(
+        key="paused",
+        path=api_config.project.root_dir / "paused",
+        name="Paused",
+        tracked=False,
+        kind=ProjectKind.GIT,
+    )
+
+    class FakeService:
+        def list_task_summary_page(self, **kwargs):
+            assert kwargs["projects"] is None
+            return (
+                [
+                    TaskSummaryProjection(
+                        task_id="paused/1",
+                        project="paused",
+                        task_number=1,
+                        title="Paused projected",
+                        work_status="queued",
+                        type="task",
+                        priority="normal",
+                        created_at=now - timedelta(hours=1),
+                        state_entered_at=now - timedelta(minutes=5),
+                        updated_at=now,
+                    )
+                ],
+                None,
+                1,
+            )
+
+        def count_task_summary_matches(self, **_kwargs):
+            return 0
+
+    @contextmanager
+    def fake_open(**_kwargs):
+        yield FakeService()
+
+    monkeypatch.setattr(svc_mod, "_open_work_service_readonly", fake_open)
+
+    items, _next_cursor, warnings, total = svc_mod.list_all_tasks(
+        api_config, include_untracked=True, limit=10
+    )
+
+    assert total == 1
+    assert warnings == []
+    assert items[0].task_id == "paused/1"
+    assert items[0].project_paused is True
 
 
 def test_list_tasks_project_filter_warns_for_unregistered_pg_rows(

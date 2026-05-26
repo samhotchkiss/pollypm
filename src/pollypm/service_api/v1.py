@@ -28,6 +28,8 @@ from dataclasses import dataclass
 from datetime import datetime
 import json
 import logging
+import threading
+import time
 from pathlib import Path
 import threading
 import time
@@ -1056,6 +1058,29 @@ class PollyPMService:
         return get_task_backend(self._project_root(config, project_key))
 
 
+# #2308 perf — process-wide TTL cache for ``plan_launches_readonly``.
+# The 10-way concurrent dashboard load test traced p50 1.30s / p95 1.69s
+# per call (probe at agent-ade913f75d406474b) — under contention each
+# request rebuilds a fresh Supervisor shell, re-runs the full launch
+# planner, and re-writes Claude / Codex profile prompts to disk per
+# session even though the launch plan itself only changes when config
+# changes. With ~16 projects and ~44 enabled sessions the per-request
+# work serialises through the GIL + filesystem and the singleflight /
+# fanout fixes upstream (#2319 / #2320 / #2328) can't help because
+# the work is per-request before the cache fan-in.
+#
+# Cache the result for 2 seconds — dashboard polls every 5-10s so the
+# staleness window is well below the visible refresh rate, and any
+# real launch plan change (config reload, new project) lands by the
+# next tick. Mirrors the lock+double-check singleflight pattern from
+# ``dashboard_data._completed_issues`` (#2320) so N concurrent cold
+# callers coalesce onto one plan instead of racing past the empty-cache
+# check.
+_PLAN_LAUNCHES_RO_CACHE: dict[int, tuple[float, list]] = {}
+_PLAN_LAUNCHES_RO_TTL_SECONDS = 2.0
+_PLAN_LAUNCHES_RO_LOCK = threading.Lock()
+
+
 def plan_launches_readonly(config, store) -> list:
     """Return the launches planned for ``config`` without mutating state.
 
@@ -1063,6 +1088,60 @@ def plan_launches_readonly(config, store) -> list:
     already hold an open state store and only need ``SessionLaunchSpec``
     objects. Avoids a second StateStore open by injecting the caller's
     store into a minimal Supervisor shell.
+
+    Result is cached process-wide for :data:`_PLAN_LAUNCHES_RO_TTL_SECONDS`
+    keyed by ``id(config)`` so the 10-way concurrent dashboard read does
+    not rebuild a fresh Supervisor + re-run the planner + re-write profile
+    prompts on every request. The cache only fires when ``store is None``
+    (the dashboard / cockpit-rail read path); callers passing a live
+    StateStore still get a fresh plan because their plan may need the
+    store-dependent ``effective_session`` route resolution.
+    """
+    # Singleflight TTL cache only applies to the read-only dashboard
+    # shape (``store is None``). When a caller passes a real store the
+    # planner may produce a store-dependent plan (route assignments,
+    # heartbeat-aware architect resume), so we skip the cache.
+    cache_key: int | None = id(config) if store is None else None
+    if cache_key is not None:
+        cached = _PLAN_LAUNCHES_RO_CACHE.get(cache_key)
+        now_mono = time.monotonic()
+        if cached is not None and now_mono - cached[0] < _PLAN_LAUNCHES_RO_TTL_SECONDS:
+            return cached[1]
+
+        with _PLAN_LAUNCHES_RO_LOCK:
+            # Double-check under the lock: a peer thread may have
+            # populated the cache while we were waiting.
+            now_mono = time.monotonic()
+            cached = _PLAN_LAUNCHES_RO_CACHE.get(cache_key)
+            if cached is not None and now_mono - cached[0] < _PLAN_LAUNCHES_RO_TTL_SECONDS:
+                return cached[1]
+            launches = _build_plan_launches_readonly(config, store)
+            completed_at = time.monotonic()
+            # Bound the cache so config reloads (each yielding a fresh
+            # ``id(config)``) don't grow it unbounded across a long-lived
+            # ``pm serve`` process. Same pattern as
+            # ``dashboard_data._COMPLETED_ISSUES_CACHE``.
+            if len(_PLAN_LAUNCHES_RO_CACHE) > 8:
+                for stale_key in [
+                    k for k, (ts, _v) in _PLAN_LAUNCHES_RO_CACHE.items()
+                    if completed_at - ts >= _PLAN_LAUNCHES_RO_TTL_SECONDS
+                ]:
+                    _PLAN_LAUNCHES_RO_CACHE.pop(stale_key, None)
+            _PLAN_LAUNCHES_RO_CACHE[cache_key] = (completed_at, launches)
+            return launches
+
+    return _build_plan_launches_readonly(config, store)
+
+
+def _build_plan_launches_readonly(config, store) -> list:
+    """Construct the launch plan from a fresh Supervisor shell.
+
+    Extracted from :func:`plan_launches_readonly` so the cache hot path
+    stays separate from the actual work. Each call still creates a fresh
+    Supervisor shell because the readonly tmux client + planner cache
+    intentionally do NOT cross requests — pruning the per-Supervisor
+    cache that ``invalidate_launch_cache`` clears is the historical
+    correctness invariant for the rare callers that pass a live store.
     """
     cache_key = (id(config), id(store))
     now = time.monotonic()

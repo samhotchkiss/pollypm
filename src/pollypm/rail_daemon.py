@@ -59,6 +59,10 @@ def _lock_file(home: Path) -> Path:
     return home / "rail_daemon.lock"
 
 
+def _crash_loop_file(home: Path) -> Path:
+    return home / "rail_daemon.crash_loop.json"
+
+
 def _acquire_lifetime_lock(lock_path: Path) -> int | None:
     """Acquire the lifetime ``flock`` and return the open fd, or ``None``.
 
@@ -145,11 +149,20 @@ def _claim_pid_file(pid_path: Path) -> bool:
     Returns True on successful claim, False when a live daemon
     already owns the slot.
     """
-    if pid_path.exists():
+    def _read_existing_pid() -> int:
         try:
-            existing = int(pid_path.read_text().strip())
+            return int(pid_path.read_text().strip())
         except (ValueError, OSError):
-            existing = 0
+            return 0
+
+    if pid_path.exists():
+        existing = _read_existing_pid()
+        if existing <= 0:
+            # Another daemon may have won O_EXCL and not written its PID
+            # bytes yet. Give that tiny critical section a chance to
+            # finish before treating garbage/empty contents as stale.
+            time.sleep(0.05)
+            existing = _read_existing_pid()
         if existing > 0 and _pid_alive(existing):
             return False
         # Stale file — clear it so our O_EXCL create below can succeed.
@@ -200,6 +213,49 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _apply_pending_migrations_for_startup(db_path: Path) -> int:
+    """Apply pending workspace migrations before the daemon opens services.
+
+    The rail daemon is the long-lived process that owns heartbeat/job
+    draining. After an upgrade, launchd or ``pm rail-daemon`` may start
+    it directly before the operator has run ``pm migrate --apply``. At
+    this point the daemon has not opened the store yet; applying the
+    append-only workspace migrations here avoids a silent restart loop
+    while preserving the refuse-start gate for failed migrations.
+
+    Returns the number of migrations applied.
+    """
+    from pollypm.store import migrations as _migrations
+
+    if _migrations.bypass_env_is_set():
+        return 0
+    try:
+        status = _migrations.inspect(db_path)
+    except _migrations.UnusableDatabaseError as exc:
+        _migrations.exit_unusable_database(exc)
+    if status.up_to_date:
+        return 0
+    logger.warning(
+        "rail_daemon: applying %d pending schema migration(s) before startup",
+        len(status.pending),
+    )
+    try:
+        outcome = _migrations.apply(db_path)
+    except _migrations.UnusableDatabaseError as exc:
+        _migrations.exit_unusable_database(exc)
+    except Exception:  # noqa: BLE001
+        logger.exception("rail_daemon: startup migration apply failed")
+        _migrations.require_no_pending_or_exit(db_path)
+        return 0
+    applied = len(outcome.applied)
+    logger.warning(
+        "rail_daemon: applied %d schema migration(s) before startup",
+        applied,
+    )
+    _migrations.require_no_pending_or_exit(db_path)
+    return applied
+
+
 def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     """Run the daemon loop. Blocks until signalled.
 
@@ -208,13 +264,8 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
     """
     from pollypm.config import load_config, DEFAULT_CONFIG_PATH
     from pollypm.service_api import PollyPMService
-    from pollypm.store import migrations as _migrations
 
     cfg = load_config(config_path)
-    # Refuse-start gate (#717): the daemon opens the state store and
-    # would silently run migrations otherwise. Exit loudly so the
-    # operator runs ``pm migrate --apply`` from a terminal instead.
-    _migrations.require_no_pending_or_exit(cfg.project.state_db)
     pollypm_home = Path(DEFAULT_CONFIG_PATH).parent
     pid_path = _pid_file(pollypm_home)
     lock_path = _lock_file(pollypm_home)
@@ -239,6 +290,16 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
         )
         return 1
     _LIFETIME_LOCK_FD = lock_fd
+
+    try:
+        _apply_pending_migrations_for_startup(cfg.project.state_db)
+    except BaseException:
+        try:
+            os.close(lock_fd)
+        except OSError:
+            pass
+        _LIFETIME_LOCK_FD = None
+        raise
 
     if not _claim_pid_file(pid_path):
         # Lock was acquired but PID file is held by a still-live process.
@@ -365,6 +426,7 @@ def run(config_path: Path, *, poll_interval: float = 60.0) -> int:
         logger.exception("rail_daemon: core_rail.start() failed")
         _cleanup()
         return 3
+    _crash_loop_file(pollypm_home).unlink(missing_ok=True)
 
     logger.info(
         "rail_daemon: started (pid=%d, poll=%.1fs) — heartbeat rail live",

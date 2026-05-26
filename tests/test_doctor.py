@@ -44,6 +44,30 @@ def test_run_cmd_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "timed out" in out
 
 
+def test_check_rail_daemon_alive_reports_crash_loop_sentinel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(doctor, "_pollypm_home", lambda: tmp_path)
+    (tmp_path / "rail_daemon.crash_loop.json").write_text(json.dumps({
+        "failure_count": 5,
+        "threshold": 5,
+        "first_failure_at": "2026-05-25T00:00:00+00:00",
+        "last_failure_at": "2026-05-25T00:05:00+00:00",
+        "reason": "no rail_daemon.pid file",
+        "log_excerpt": "Cannot start — pending migration",
+        "alerted": True,
+    }))
+
+    result = doctor.check_rail_daemon_alive()
+
+    assert result.passed is False
+    assert result.severity == "error"
+    assert "crash-loop suppressed" in result.status
+    assert result.data["failure_count"] == 5
+    assert "tail -n 120" in result.fix
+
+
 # --------------------------------------------------------------------- #
 # System prerequisites
 # --------------------------------------------------------------------- #

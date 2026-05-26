@@ -1153,6 +1153,41 @@ def check_rail_daemon_alive() -> CheckResult:
     import os as _os
 
     pid_path = _pollypm_home() / "rail_daemon.pid"
+    try:
+        from pollypm.rail_daemon_supervisor import read_crash_loop_state
+
+        crash_loop = read_crash_loop_state(pid_path)
+    except Exception:  # noqa: BLE001
+        crash_loop = None
+    if crash_loop is not None and crash_loop.suppressed:
+        details = crash_loop.reason or "the daemon did not claim its PID file"
+        return _fail(
+            (
+                "rail daemon crash-loop suppressed after "
+                f"{crash_loop.failure_count} failed starts"
+            ),
+            why=(
+                "The outer supervisor repeatedly spawned rail_daemon, "
+                "but no healthy daemon registered. Further respawns are "
+                "suppressed to avoid a silent log-flood loop."
+            ),
+            fix=(
+                "Inspect the startup log and fix the underlying error:\n"
+                "  tail -n 120 ~/.pollypm/rail_daemon.log\n"
+                "Then run:\n"
+                "  pm up\n"
+                "Recheck: pm doctor"
+            ),
+            severity="error",
+            fixable=False,
+            data={
+                "failure_count": crash_loop.failure_count,
+                "threshold": crash_loop.threshold,
+                "first_failure_at": crash_loop.first_failure_at,
+                "last_failure_at": crash_loop.last_failure_at,
+                "reason": details,
+            },
+        )
     if not pid_path.exists():
         return _fail(
             "rail daemon is not running",

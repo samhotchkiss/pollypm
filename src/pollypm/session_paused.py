@@ -79,7 +79,7 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -171,7 +171,9 @@ class MarkerState:
 
 # Per-process throttle state. Keyed by ``(session, loop)`` for the
 # skip event; a single bucket for the unreadable-marker event since
-# it's process-wide.
+# it's process-wide. The skip event also consults the canonical audit
+# log so the throttle survives cron-driven ``pm heartbeat`` process
+# restarts; this dictionary is only the in-process fast path.
 _SKIP_THROTTLE_LOCK = threading.Lock()
 _PAUSE_SKIP_LAST_EMITTED: dict[tuple[str, str], float] = {}
 
@@ -432,22 +434,27 @@ def skip_if_paused(
     """
     if not is_paused(config, session_name):
         return False
-    if store is not None and _should_emit_skip(session_name, loop):
+    if store is not None and _should_emit_skip(config, session_name, loop):
         _emit_pause_skip(config, store, session_name, loop=loop, reason=reason)
     return True
 
 
-def _should_emit_skip(session_name: str, loop: str) -> bool:
+def _should_emit_skip(config: Any, session_name: str, loop: str) -> bool:
     """Return True iff we are outside the per-(session, loop) throttle.
 
-    Updates the last-emit timestamp eagerly under a process-wide lock
-    so two threads hitting the same key in the same tick can only race
-    one emission through. We use ``None`` rather than ``0.0`` as the
-    "never emitted" sentinel because :func:`time.monotonic` is allowed
-    to start at an arbitrary low value (a fresh Python process on
-    macOS often returns < 1.0 from monotonic at startup) which would
-    otherwise look like "we just emitted" and silently swallow the
-    first call.
+    Uses the in-memory map as a fast path, then falls back to the
+    canonical audit log before allowing a fresh emission. The durable
+    read is what keeps the throttle effective when the cron-driven
+    ``pm heartbeat`` path starts a new Python process for each tick.
+
+    We reserve the timestamp eagerly under a process-wide lock before
+    returning True so two threads hitting the same key in the same
+    tick can only race one emission through. We use ``None`` rather
+    than ``0.0`` as the "never emitted" sentinel because
+    :func:`time.monotonic` is allowed to start at an arbitrary low
+    value (a fresh Python process on macOS often returns < 1.0 from
+    monotonic at startup) which would otherwise look like "we just
+    emitted" and silently swallow the first call.
     """
     key = (session_name, loop or "unknown_loop")
     now = time.monotonic()
@@ -455,8 +462,72 @@ def _should_emit_skip(session_name: str, loop: str) -> bool:
         last = _PAUSE_SKIP_LAST_EMITTED.get(key)
         if last is not None and now - last < PAUSE_SKIP_THROTTLE_SECONDS:
             return False
+
+    durable_age = _latest_pause_skip_age_seconds(
+        config,
+        session_name,
+        key[1],
+    )
+    if durable_age is not None and durable_age < PAUSE_SKIP_THROTTLE_SECONDS:
+        # Seed the in-process fast path with the wall-clock age from
+        # the durable event so a fresh cron process doesn't re-read the
+        # JSONL file on every caller hit within the remaining window.
+        with _SKIP_THROTTLE_LOCK:
+            _PAUSE_SKIP_LAST_EMITTED[key] = now - max(0.0, durable_age)
+        return False
+
+    now = time.monotonic()
+    with _SKIP_THROTTLE_LOCK:
+        last = _PAUSE_SKIP_LAST_EMITTED.get(key)
+        if last is not None and now - last < PAUSE_SKIP_THROTTLE_SECONDS:
+            return False
         _PAUSE_SKIP_LAST_EMITTED[key] = now
     return True
+
+
+def _latest_pause_skip_age_seconds(
+    config: Any,
+    session_name: str,
+    loop: str,
+) -> float | None:
+    """Return the age of the latest matching pause-skip audit row.
+
+    ``session.pause.skip`` throttling must survive process restarts, so
+    the canonical audit log is the durable handoff. Process-local
+    state is only an optimization for long-lived daemons.
+    """
+    try:
+        from pollypm.audit.log import read_events
+    except Exception:  # noqa: BLE001
+        logger.debug("session.pause.skip read import failed", exc_info=True)
+        return None
+
+    project_key, project_path = _project_audit_context(config)
+    cutoff = (
+        datetime.now(UTC)
+        - timedelta(seconds=PAUSE_SKIP_THROTTLE_SECONDS)
+    ).isoformat()
+    try:
+        rows = read_events(
+            project_key,
+            project_path=project_path,
+            event=PAUSE_SKIP_EVENT_TYPE,
+            since=cutoff,
+        )
+    except Exception:  # noqa: BLE001
+        logger.debug("session.pause.skip audit read failed", exc_info=True)
+        return None
+
+    for row in reversed(rows):
+        metadata = getattr(row, "metadata", {}) or {}
+        if metadata.get("session_name") != session_name:
+            continue
+        if metadata.get("loop") != loop:
+            continue
+        age = _audit_event_age_seconds(str(getattr(row, "ts", "")))
+        if age is not None:
+            return age
+    return None
 
 
 def _reset_skip_throttle_for_tests() -> None:

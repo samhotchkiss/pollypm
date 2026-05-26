@@ -765,6 +765,112 @@ def test_skip_if_paused_throttles_repeat_audit_emission(
     assert len(audit_events) == 1
 
 
+def test_skip_if_paused_throttle_survives_process_restart(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """Cron-driven ``pm heartbeat`` starts a fresh Python process each
+    tick, so the skip throttle must use the durable audit row rather
+    than only module globals."""
+    from pollypm.session_paused import (
+        PAUSE_SKIP_EVENT_TYPE, _reset_skip_throttle_for_tests,
+        skip_if_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    _write_marker(config_with_base_dir, ["operator"])
+
+    captured: list[dict[str, Any]] = []
+
+    class _Store:
+        def record_event(self, **kwargs):  # noqa: ANN003
+            captured.append(kwargs)
+
+    store = _Store()
+    assert skip_if_paused(
+        config_with_base_dir, "operator", store=store,
+        loop="heartbeat.local.process_session",
+    ) is True
+
+    # Simulate the next cron tick in a fresh process: in-memory
+    # throttle state is gone, but audit.jsonl remains.
+    _reset_skip_throttle_for_tests()
+    assert skip_if_paused(
+        config_with_base_dir, "operator", store=store,
+        loop="heartbeat.local.process_session",
+    ) is True
+
+    skip_events = [
+        e for e in captured if e.get("sender") == PAUSE_SKIP_EVENT_TYPE
+    ]
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
+    assert len(skip_events) == 1, skip_events
+    assert len(audit_events) == 1
+    assert audit_events[0].metadata["session_name"] == "operator"
+    assert (
+        audit_events[0].metadata["loop"]
+        == "heartbeat.local.process_session"
+    )
+
+
+def test_skip_if_paused_process_restart_emits_after_durable_window(
+    config_with_base_dir: _FakeConfig,
+) -> None:
+    """A fresh process still emits once the durable audit row is older
+    than ``PAUSE_SKIP_THROTTLE_SECONDS``."""
+    from pollypm.session_paused import (
+        PAUSE_SKIP_EVENT_TYPE,
+        PAUSE_SKIP_THROTTLE_SECONDS,
+        _reset_skip_throttle_for_tests,
+        skip_if_paused,
+    )
+
+    _reset_skip_throttle_for_tests()
+    _write_marker(config_with_base_dir, ["operator"])
+
+    captured: list[dict[str, Any]] = []
+
+    class _Store:
+        def record_event(self, **kwargs):  # noqa: ANN003
+            captured.append(kwargs)
+
+    store = _Store()
+    assert skip_if_paused(
+        config_with_base_dir, "operator", store=store,
+        loop="heartbeat.local.process_session",
+    ) is True
+
+    audit_path = config_with_base_dir.project.base_dir / "audit.jsonl"
+    rows = [
+        json.loads(line)
+        for line in audit_path.read_text().splitlines()
+        if line.strip()
+    ]
+    old_ts = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=PAUSE_SKIP_THROTTLE_SECONDS + 5)
+    ).isoformat()
+    for row in rows:
+        if row.get("event") == PAUSE_SKIP_EVENT_TYPE:
+            row["ts"] = old_ts
+    audit_path.write_text(
+        "\n".join(json.dumps(row, separators=(",", ":")) for row in rows)
+        + "\n"
+    )
+
+    _reset_skip_throttle_for_tests()
+    assert skip_if_paused(
+        config_with_base_dir, "operator", store=store,
+        loop="heartbeat.local.process_session",
+    ) is True
+
+    skip_events = [
+        e for e in captured if e.get("sender") == PAUSE_SKIP_EVENT_TYPE
+    ]
+    audit_events = _read_pause_skip_audit_events(config_with_base_dir)
+    assert len(skip_events) == 2, skip_events
+    assert len(audit_events) == 2
+
+
 def test_skip_if_paused_throttle_is_per_loop(
     config_with_base_dir: _FakeConfig,
 ) -> None:

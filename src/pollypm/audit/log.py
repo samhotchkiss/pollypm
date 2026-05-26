@@ -124,6 +124,7 @@ EVENT_DAEMON_SERVE_RESPAWN = "daemon.serve.respawn"
 # render plan-history breadcrumbs without scanning task content.
 EVENT_PLAN_VERSION_INCREMENTED = "plan.version_incremented"
 EVENT_PLAN_SUCCESSOR_CREATED = "plan.successor_created"
+EVENT_PLAN_REVIEW_HANDOFF_CREATED = "plan_review.handoff_created"
 # #1414 — auto-unstick infrastructure. ``worker.session_reaped`` fires
 # whenever the worker-marker reaper unlinks an orphan marker (one event
 # per reaped marker); the watchdog's dead-loop detector counts these
@@ -1206,6 +1207,7 @@ __all__ = [
     "EVENT_SOCKET_REAPED",
     "EVENT_PLAN_VERSION_INCREMENTED",
     "EVENT_PLAN_SUCCESSOR_CREATED",
+    "EVENT_PLAN_REVIEW_HANDOFF_CREATED",
     "EVENT_WORKER_SESSION_REAPED",
     "EVENT_WATCHDOG_ESCALATION_DISPATCHED",
     "EVENT_WATCHDOG_OPERATOR_DISPATCHED",

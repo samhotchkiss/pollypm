@@ -2296,6 +2296,45 @@ def test_list_inbox_type_filter_matches_structured_kind(
     assert svc.candidate_calls[0]["type_filter"] == "approval_request"
 
 
+def test_list_inbox_default_keeps_plan_review_notify_stub(
+    client, auth_headers, monkeypatch,
+) -> None:
+    from pollypm.inbox.kind import InboxItemKind
+
+    svc = _ReadInboxSvc([
+        _ReadInboxTask(
+            1,
+            title="Plan ready for review: myproj",
+            kind=InboxItemKind.PLAN_REVIEW_PENDING,
+            labels=[
+                "plan_review",
+                "project:myproj",
+                "plan_task:myproj/7",
+                "handoff_id:plan-review-abc123",
+                "correlation_id:plan-review:myproj/7",
+                "notify",
+            ],
+        ),
+        _ReadInboxTask(2, title="Draft notify", labels=["notify"]),
+    ])
+    _install_read_inbox_svc(monkeypatch, svc)
+
+    response = client.get(
+        "/api/v1/inbox?project=myproj&type=plan_review",
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert [item["id"] for item in body["items"]] == ["myproj/1"]
+    item = body["items"][0]
+    assert item["type"] == "plan_review"
+    assert item["metadata"]["kind"] == "plan_review_pending"
+    assert item["metadata"]["handoff_id"] == "plan-review-abc123"
+    assert item["metadata"]["correlation_id"] == "plan-review:myproj/7"
+    assert svc.candidate_calls[0]["type_filter"] == "plan_review"
+
+
 def test_list_inbox_includes_priority(
     client, auth_headers, monkeypatch,
 ) -> None:

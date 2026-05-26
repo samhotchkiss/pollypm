@@ -4414,6 +4414,14 @@ def _task_to_inbox_item(
     }
     if is_plan_review:
         metadata["judgment_calls"] = _extract_judgment_calls(body)
+    for key in ("handoff_id", "correlation_id"):
+        prefix = f"{key}:"
+        value = next(
+            (label[len(prefix):] for label in labels if label.startswith(prefix)),
+            None,
+        )
+        if value:
+            metadata[key] = value
     return APIInboxItem(
         id=task.task_id,
         project=task.project,

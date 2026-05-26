@@ -32,8 +32,11 @@ Contract:
 
 from __future__ import annotations
 
+from pollypm.inbox.kind import InboxItemKind, coerce_kind
+
 
 NOTIFY_LABEL = "notify"
+PLAN_REVIEW_LABEL = "plan_review"
 
 
 # Title prefixes used by historical notification writers. Kept as a
@@ -89,6 +92,17 @@ def _coerce_roles(value: object) -> dict[str, str]:
         if isinstance(parsed, dict):
             return {str(k): str(v) for k, v in parsed.items()}
     return {}
+
+
+def _labels(value: object) -> set[str]:
+    raw = getattr(value, "labels", None) or []
+    return {str(label) for label in raw}
+
+
+def _is_plan_review_pending_entry(item) -> bool:
+    if coerce_kind(getattr(item, "kind", None)) is InboxItemKind.PLAN_REVIEW_PENDING:
+        return True
+    return PLAN_REVIEW_LABEL in _labels(item)
 
 
 def is_notify_inbox_task(task) -> bool:
@@ -154,8 +168,14 @@ def is_notify_only_inbox_entry(item) -> bool:
     Anything else — work-service tasks, ``alert``-type messages,
     ``inbox_task``-type messages — is treated as actionable and stays
     visible by default.
+
+    Plan-review rows are the exception to the notify-stub rule: they
+    are notify-shaped so the Tasks view hides them, but they are still
+    actionable inbox decisions and must remain visible in inbox lenses.
     """
     source = getattr(item, "source", "task")
+    if _is_plan_review_pending_entry(item):
+        return False
     if source == "message":
         message_type = (getattr(item, "message_type", None) or "").lower()
         # Only the bare ``notify`` type is hidden by default; alerts and

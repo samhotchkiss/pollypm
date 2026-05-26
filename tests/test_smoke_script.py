@@ -4,6 +4,7 @@ import importlib.util
 import sys
 from datetime import datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 
 SCRIPT_PATH = Path(__file__).resolve().parents[1] / "scripts" / "smoke.py"
@@ -72,6 +73,42 @@ def test_summary_block_all_green() -> None:
 
     assert "Result: all green" in summary
     assert "Failed checks: none" in summary
+
+
+def test_run_smoke_exits_nonzero_when_slow_rest_check_fails(monkeypatch, capsys) -> None:
+    def fake_rest_check(name: str, _url: str, **_kwargs) -> smoke.CheckResult:
+        if name == "dashboard":
+            return smoke.CheckResult(name, False, "slow response 1.234s", 1.234)
+        return smoke.CheckResult(name, True, "HTTP 200 in 0.010s", 0.010)
+
+    def fake_run_command(
+        spec: smoke.CommandSpec,
+        *,
+        dry_run: bool = False,
+    ) -> tuple[smoke.CheckResult, str]:
+        stdout = '{"task_id": "pollypm/1"}' if spec.name == "task create" else ""
+        return smoke.CheckResult(spec.name, True, "ok in 0.010s", 0.010), stdout
+
+    monkeypatch.setattr(smoke, "run_rest_check", fake_rest_check)
+    monkeypatch.setattr(smoke, "run_command", fake_run_command)
+    monkeypatch.setattr(smoke, "read_token", lambda explicit_token=None: "token")
+    monkeypatch.setattr(smoke, "git_sha", lambda: "abc123")
+    args = SimpleNamespace(
+        base="http://127.0.0.1:8897",
+        token=None,
+        project="pollypm",
+        task_wait_seconds=0,
+        dry_run=False,
+        no_color=True,
+    )
+
+    exit_code = smoke.run_smoke(args)
+
+    assert exit_code == 1
+    output = capsys.readouterr().out
+    assert "FAIL dashboard: slow response 1.234s" in output
+    assert "Result: red on dashboard" in output
+    assert "Failed checks: dashboard" in output
 
 
 def test_dry_run_avoids_command_execution() -> None:

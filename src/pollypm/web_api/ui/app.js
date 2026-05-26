@@ -1126,28 +1126,97 @@
     loadTaskDetail(task);
   }
 
+  // §1.4.5 (#2336): compact "stuck for X" string from dwell_seconds so
+  // the operator can see at a glance that a queued task has been
+  // sitting for 40 hours.
+  function formatDwell(seconds) {
+    if (seconds == null || !Number.isFinite(seconds) || seconds <= 0) {
+      return null;
+    }
+    const days = Math.floor(seconds / 86400);
+    const hours = Math.floor((seconds % 86400) / 3600);
+    const minutes = Math.floor((seconds % 3600) / 60);
+    if (days) return days + "d " + hours + "h";
+    if (hours) return hours + "h " + minutes + "m";
+    if (minutes) return minutes + "m";
+    return Math.floor(seconds) + "s";
+  }
+
+  const TERMINAL_TASK_STATES = new Set(["done", "cancelled"]);
+
   function renderTaskSummary(task, detail) {
     const data = detail || task;
     const list = $("message-list");
     list.innerHTML = "";
+    const status = data.work_status;
+    const isTerminal = TERMINAL_TASK_STATES.has(status);
+    // §1.4.5 (#2336): dwell row when non-terminal — surfaces "stuck
+    // for X" right next to Status.
+    const dwellStr = !isTerminal ? formatDwell(data.dwell_seconds) : null;
     const rows = [
-      ["Status", data.work_status],
+      ["Status", status],
       ["Project", data.project],
       ["Task", data.task_number],
       ["Assignee", data.assignee],
       ["Priority", data.priority],
       ["Updated", data.updated_at],
-    ].filter((row) => row[1] != null && row[1] !== "");
+    ];
+    if (dwellStr) {
+      rows.push(["Dwell", dwellStr + " in " + status]);
+    }
+    // §1.4.5 (#2337): list dependency blockers instead of swallowing
+    // ``relationships.blocked_by``.
+    const blockedBy = (data.relationships && data.relationships.blocked_by) || [];
+    if (blockedBy.length) {
+      rows.push(["Blocked by", blockedBy.join(", ")]);
+    }
+    const filteredRows = rows.filter((row) => row[1] != null && row[1] !== "");
     const children = [
       el("div", { class: "task-detail-title", text: data.title || task.title }),
     ];
+    // §1.4.5 (#2335): paused-project banner so a queued task that
+    // can't be claimed has an obvious reason. Mirrors the CLI warning
+    // in ``_print_task``.
+    if (data.project_paused) {
+      children.push(el("div", {
+        class: "error-banner",
+        text: "PROJECT PAUSED — task will not be claimed until the "
+          + "project is resumed.",
+      }));
+    }
+    // §1.4.5 (#2336): claim-without-session warnings (both shapes —
+    // claimed-by-dead and assignee-without-claim).
+    if (data.claimed_by_session && !isTerminal && data.dwell_seconds != null
+        && data.dwell_seconds > 5 * 60) {
+      children.push(el("div", {
+        class: "error-banner",
+        text: "claimed-by " + data.claimed_by_session
+          + " has been holding this task for "
+          + (dwellStr || data.dwell_seconds + "s")
+          + " — session may be dead. Check `pm sessions health`.",
+      }));
+    } else if (data.assignee && !data.claimed_by_session && !isTerminal
+        && status === "in_progress") {
+      children.push(el("div", {
+        class: "error-banner",
+        text: "assignee " + data.assignee + " has no live session "
+          + "(claimed_by_session is null); task may be stranded.",
+      }));
+    }
+    if (status === "blocked" && blockedBy.length === 0) {
+      children.push(el("div", {
+        class: "error-banner",
+        text: "Status=blocked but no blocked_by relationships — "
+          + "likely stale state, run `pm doctor`.",
+      }));
+    }
     if (data.description) {
       children.push(el("div", {
         class: "task-detail-description",
         text: data.description,
       }));
     }
-    for (const row of rows) {
+    for (const row of filteredRows) {
       children.push(el("div", { class: "task-detail-row" }, [
         el("span", { class: "task-detail-label", text: row[0] }),
         el("span", { class: "task-detail-value", text: String(row[1]) }),

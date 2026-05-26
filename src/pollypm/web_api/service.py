@@ -1647,10 +1647,20 @@ def get_task_detail(
     config: PollyPMConfig, project_key: str, task_number: int
 ) -> APITaskDetail | None:
     project = config.projects.get(project_key)
-    if project is None:
-        return None
-
     task_id = f"{project_key}/{task_number}"
+    # §1.4.5 (#2338): the list endpoint already returns tasks for
+    # untracked projects via the workspace work-service when
+    # ``include_untracked=true``; mirror that on the detail endpoint
+    # so the Web UI can render a task it just listed instead of
+    # surfacing a 404 ``not_found``. Untracked-project lookups go
+    # through the workspace state.db, and the resulting detail is
+    # tagged ``project_paused=True`` so the renderer can explain why
+    # the task isn't being claimed.
+    if project is None:
+        return _get_untracked_task_detail(config, project_key, task_number)
+
+    project_paused = not getattr(project, "tracked", True)
+
     # Wrap the entire ``with`` so failures during work-service
     # construction (DB open, pragmas, schema bootstrap, migrations)
     # surface as 503, not 500. Genuine missing-task failures (the
@@ -1670,10 +1680,53 @@ def get_task_detail(
                 raise
             except Exception:  # noqa: BLE001
                 return None
-            return _task_to_detail_with_plan(task, svc=svc)
+            return _task_to_detail_with_plan(
+                task, svc=svc, project_paused=project_paused
+            )
     except _BACKING_STORE_ERRORS as exc:
         logger.warning(
             "get_task_detail: backing store error for %s/%s: %s",
+            project_key,
+            task_number,
+            exc,
+            exc_info=True,
+        )
+        raise service_unavailable(
+            f"Backing store unavailable for task {project_key}/{task_number}",
+            hint="Retry shortly; check `pm doctor` if the failure persists.",
+        ) from exc
+
+
+def _get_untracked_task_detail(
+    config: PollyPMConfig, project_key: str, task_number: int
+) -> APITaskDetail | None:
+    """Look up a task whose project is not in ``config.projects``.
+
+    Mirrors the list endpoint's ``include_untracked`` behaviour
+    (#2338) by reading from the workspace-root work-service. Returns
+    the task with ``project_paused=True`` so renderers can explain
+    the un-claimed state instead of a misleading 404.
+    """
+    workspace_root = _workspace_root_path(config)
+    task_id = f"{project_key}/{task_number}"
+    try:
+        with _open_work_service_readonly(
+            config=config,
+            project_key="__workspace__",
+            project_path=workspace_root,
+        ) as svc:
+            try:
+                task = svc.get(task_id)
+            except _BACKING_STORE_ERRORS:
+                raise
+            except Exception:  # noqa: BLE001
+                return None
+            return _task_to_detail_with_plan(
+                task, svc=svc, project_paused=True
+            )
+    except _BACKING_STORE_ERRORS as exc:
+        logger.warning(
+            "get_task_detail: backing store error for untracked %s/%s: %s",
             project_key,
             task_number,
             exc,
@@ -3607,7 +3660,7 @@ def _is_in_review(task) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _task_to_summary(task) -> APITaskSummary:
+def _task_to_summary(task, *, project_paused: bool | None = None) -> APITaskSummary:
     timing = _task_timing_fields(task)
     return APITaskSummary(
         task_id=task.task_id,
@@ -3626,6 +3679,7 @@ def _task_to_summary(task) -> APITaskSummary:
         dwell_seconds=timing["dwell_seconds"],
         age_seconds=timing["age_seconds"],
         updated_at=getattr(task, "updated_at", None),
+        project_paused=project_paused,
     )
 
 
@@ -3692,7 +3746,9 @@ def _elapsed_seconds(start: datetime | None, end: datetime) -> int | None:
     return max(0, int((end - start).total_seconds()))
 
 
-def _task_to_detail_with_plan(task, *, svc) -> APITaskDetail:
+def _task_to_detail_with_plan(
+    task, *, svc, project_paused: bool | None = None
+) -> APITaskDetail:
     """Return :class:`APITaskDetail` with ``plan`` hydrated for plan reviews.
 
     Mirrors the rule applied at :func:`get_task_detail` (the canonical
@@ -3716,10 +3772,15 @@ def _task_to_detail_with_plan(task, *, svc) -> APITaskDetail:
             plan = _build_plan(svc, task)
         except Exception:  # noqa: BLE001
             plan = None
-    return _task_to_detail(task, plan=plan)
+    return _task_to_detail(task, plan=plan, project_paused=project_paused)
 
 
-def _task_to_detail(task, *, plan: APIPlan | None = None) -> APITaskDetail:
+def _task_to_detail(
+    task,
+    *,
+    plan: APIPlan | None = None,
+    project_paused: bool | None = None,
+) -> APITaskDetail:
     relationships = APITaskRelationships(
         parent=_pair_to_id(task.parent_project, task.parent_task_number),
         children=[_pair_to_id(p, n) for p, n in (task.children or [])],
@@ -3751,7 +3812,7 @@ def _task_to_detail(task, *, plan: APIPlan | None = None) -> APITaskDetail:
         )
         for c in (task.context or [])
     ]
-    summary = _task_to_summary(task)
+    summary = _task_to_summary(task, project_paused=project_paused)
     return APITaskDetail(
         **summary.model_dump(),
         description=task.description or "",

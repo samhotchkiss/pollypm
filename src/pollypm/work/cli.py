@@ -403,6 +403,81 @@ def _format_claim_history_line(entries) -> str | None:
     return "Claim history: " + " | ".join(str(e.text) for e in claim_entries)
 
 
+_TERMINAL_TASK_STATES = {"done", "cancelled"}
+
+
+def _human_dwell(seconds: int | None) -> str | None:
+    """Compact dwell string (``"40h 0m"``) or ``None`` (#2336)."""
+    if seconds is None or seconds <= 0:
+        return None
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m"
+    return f"{seconds}s"
+
+
+def _task_dwell_seconds(task) -> int | None:
+    """Seconds since ``task.state_entered_at`` (UTC), or ``None``."""
+    from datetime import datetime, timezone
+
+    entered = getattr(task, "state_entered_at", None)
+    if entered is None:
+        return None
+    try:
+        if entered.tzinfo is None:
+            entered = entered.replace(tzinfo=timezone.utc)
+        return max(0, int((datetime.now(timezone.utc) - entered).total_seconds()))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _project_is_paused(task) -> bool:
+    """True when ``task.project`` is missing or ``tracked=false`` (#2335)."""
+    project_key = getattr(task, "project", None)
+    if not project_key:
+        return False
+    try:
+        from pollypm.config import load_config
+
+        cfg = load_config()
+    except Exception:  # noqa: BLE001
+        return False
+    proj = (getattr(cfg, "projects", {}) or {}).get(project_key)
+    if proj is None:
+        return True
+    return not getattr(proj, "tracked", True)
+
+
+def _claimed_session_is_dead(task) -> bool:
+    """``claimed_by_session`` set but no heartbeat within 5min (#2336)."""
+    session_name = getattr(task, "claimed_by_session", None)
+    if not session_name:
+        return False
+    try:
+        from pollypm import session_health
+        from pollypm.config import load_config
+
+        cfg = load_config()
+        record = session_health.latest_heartbeat(cfg, session_name)
+    except Exception:  # noqa: BLE001
+        return False
+    if record is None:
+        return True
+    iso = getattr(record, "ts", None) or getattr(record, "timestamp", None)
+    if iso is not None and not isinstance(iso, str):
+        iso = getattr(iso, "isoformat", lambda: None)()
+    age = session_health.age_seconds(iso)
+    if age is None:
+        return True
+    return age > session_health.STALE_HEARTBEAT_SECONDS
+
+
 def _print_task(task, as_json: bool = False, show_internal: bool = False) -> None:
     """Print a single task.
 
@@ -431,17 +506,59 @@ def _print_task(task, as_json: bool = False, show_internal: bool = False) -> Non
             payload["hidden_internal_context_count"] = hidden_count
         typer.echo(json.dumps(payload, indent=2, default=str))
     else:
+        status_value = task.work_status.value
         typer.echo(f"ID:       {task.task_id}")
         typer.echo(f"Title:    {task.title}")
-        typer.echo(f"Status:   {task.work_status.value}")
+        typer.echo(f"Status:   {status_value}")
         typer.echo(f"Priority: {task.priority.value}")
         typer.echo(f"Project:  {task.project}")
         typer.echo(f"Type:     {task.type.value}")
+        # §1.4.5 (#2335): surface paused-project state up-front so the
+        # operator doesn't have to cross-reference the project list to
+        # learn why a queued task is sitting un-claimed.
+        if _project_is_paused(task):
+            typer.echo(
+                "WARNING:  PROJECT PAUSED — task will not be claimed until "
+                "the project is resumed (`pm projects track`)."
+            )
         if task.assignee:
             typer.echo(f"Assignee: {task.assignee}")
         claimed_by_session = getattr(task, "claimed_by_session", None)
         if claimed_by_session:
             typer.echo(f"Claimed:  {claimed_by_session}")
+            # §1.4.5 (#2336): a claim with no live heartbeat is the
+            # textbook "stuck task" symptom. Flag it inline.
+            if _claimed_session_is_dead(task):
+                typer.echo(
+                    "WARNING:  claimed-by session has no fresh heartbeat "
+                    "(>5m); task is likely stranded. Run `pm sessions "
+                    "health` or release the claim."
+                )
+        elif task.assignee and status_value not in _TERMINAL_TASK_STATES:
+            # Assignee set but nobody owns the claim — the recovery
+            # cascade has not picked it back up. Same opacity that
+            # #2336 calls out on the live DB.
+            typer.echo(
+                "WARNING:  assignee has no live session "
+                "(claimed_by_session is null); task may be stranded."
+            )
+        # §1.4.5 (#2336): dwell on non-terminal states screams when
+        # something has been stuck for hours.
+        if status_value not in _TERMINAL_TASK_STATES:
+            dwell_str = _human_dwell(_task_dwell_seconds(task))
+            if dwell_str:
+                typer.echo(f"Dwell:    {dwell_str} in state {status_value}")
+        # §1.4.5 (#2337): show what's blocking a blocked task instead
+        # of swallowing the relationships block.
+        blocked_by = getattr(task, "blocked_by", None) or []
+        if blocked_by:
+            ids = ", ".join(f"{p}/{n}" for p, n in blocked_by)
+            typer.echo(f"Blocked by: {ids}")
+        elif status_value == "blocked":
+            typer.echo(
+                "WARNING:  Status=blocked but no blocked_by relationships "
+                "recorded — likely stale state, run `pm doctor`."
+            )
         if task.current_node_id:
             typer.echo(f"Node:     {task.current_node_id}")
         if task.description:

@@ -27,7 +27,7 @@ export TOKEN=$(cat ~/.pollypm/api-token)
 - Polling cadence:
   - Dashboard: 15s
   - Messages (selected surface): 5s
-  - Surfaces list: 30s
+  - Surfaces list: SSE push refresh plus fallback polling
 - TUI: `pm cockpit` — for direct comparison.
 
 ### What the Web UI currently has (per #2065)
@@ -38,16 +38,15 @@ export TOKEN=$(cat ~/.pollypm/api-token)
 - Center: selected surface transcript with send box.
 - Cookie auth (HttpOnly, 7-day Max-Age).
 
-### What it does NOT have yet (known gaps to verify)
+### Known gaps to verify
 
-- WebSocket / SSE — all updates poll.
-- Surface filter / search.
-- "Stop the agent" (Ctrl-C / Esc) affordance.
-- Audit log panel.
-- Task surfaces (tasks aren't in the rail; only sessions).
-- Cookie expiry banner.
+This list is no longer a static "missing features" checklist. Verify
+the current UI before filing: SSE refresh, surface filtering, stop-agent
+affordance, audit panel, task rail, and cookie-expiry surfacing have all
+shipped in at least a baseline form.
 
-Document these as known gaps and decide which become this-sprint vs. next-sprint.
+Document any remaining gaps and decide which become this-sprint vs.
+next-sprint.
 
 ---
 
@@ -99,16 +98,21 @@ Repeat 3.1.1 at M-scale from `06-performance-budgets.md`:
 ```bash
 # TUI surface list (from cockpit)
 pm cockpit  # then visually count or use a CLI proxy:
-pm sessions list --json | jq '.[].name' | sort > /tmp/tui-sessions.txt
+pm chat sessions --json | jq -r '.sessions[].session_name' | sort > /tmp/tui-sessions.txt
 
 # Web surface list
 curl -sS -H "Authorization: Bearer $TOKEN" $BASE/api/v1/chat/sessions | \
-  jq -r '.sessions[].name' | sort > /tmp/web-sessions.txt
+  jq -r '.sessions[].session_name' | sort > /tmp/web-sessions.txt
 
 diff /tmp/tui-sessions.txt /tmp/web-sessions.txt
 ```
 
 **Pass:** no diff. Any session in one and not the other is a `bug:surface-enum`.
+
+`pm sessions --json` is intentionally not this proxy: it is the
+admin-health contract for configured sessions and mirrors
+`GET /api/v1/sessions`, so it includes non-chat sessions such as
+heartbeat/reviewer and omits work-service task chat surfaces.
 
 ---
 

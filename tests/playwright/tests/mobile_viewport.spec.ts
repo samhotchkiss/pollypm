@@ -58,7 +58,7 @@ test.describe("mobile viewport", () => {
         }),
       }),
     );
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",

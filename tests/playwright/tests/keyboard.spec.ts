@@ -19,7 +19,7 @@ const FAKE_SURFACE = {
 };
 
 async function stubBasics(page: import("@playwright/test").Page) {
-  await page.route("**/api/v1/chat/sessions", (route) =>
+  await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",

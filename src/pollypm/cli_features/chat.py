@@ -276,6 +276,15 @@ def chat_list(
         typer.echo(line)
 
 
+chat_app.command(
+    "sessions",
+    help=(
+        "Alias for `pm chat list`. Lists the same chat-surface envelope "
+        "as GET /api/v1/chat/sessions; use `pm sessions` for admin health."
+    ),
+)(chat_list)
+
+
 # ---------------------------------------------------------------------------
 # `pm chat history <session_name>`
 # ---------------------------------------------------------------------------

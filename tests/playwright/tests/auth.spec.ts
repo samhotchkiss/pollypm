@@ -135,7 +135,9 @@ test.describe("auth", () => {
     // own APIRequestContext, which shares the cookie jar) succeed.
     // This proves the JS app's `credentials: "include"` model works.
     await page.goto("/ui/");
-    const resp = await page.request.get("/api/v1/chat/sessions");
+    const resp = await page.request.get(
+      "/api/v1/chat/sessions?include_transcripts=false",
+    );
     expect(resp.status(), "status with cookie").toBe(200);
     const body = await resp.json();
     expect(body).toHaveProperty("sessions");

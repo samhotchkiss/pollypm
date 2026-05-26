@@ -5,6 +5,7 @@ import { test, expect } from "@playwright/test";
  *
  * The UI surfaces errors via two channels:
  *   - history errors land in #message-list as `.error-banner`
+ *   - send failures stay attached to the local echo as `.message-error`
  *   - the connection badge (#conn-status) flips to conn-warn / conn-error
  */
 
@@ -17,7 +18,7 @@ const FAKE_SURFACE = {
 };
 
 async function stubSurfaces(page: import("@playwright/test").Page) {
-  await page.route("**/api/v1/chat/sessions", (route) =>
+  await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -92,9 +93,9 @@ test.describe("edge cases", () => {
     await page.locator("#send-input").fill("oops");
     await page.locator("#send-button").click();
 
-    const banner = page.locator("#message-list .error-banner");
-    await expect(banner).toBeVisible();
-    await expect(banner).toContainText(/mid-tool|unsafe_mid_tool/i);
+    const inlineError = page.locator("#message-list .message-error");
+    await expect(inlineError).toBeVisible();
+    await expect(inlineError).toContainText(/mid-tool|unsafe_mid_tool/i);
   });
 
   test("503 service_unavailable surfaces in UI", async ({ page }) => {
@@ -118,7 +119,7 @@ test.describe("edge cases", () => {
   });
 
   test("empty session list shows empty-state in left rail", async ({ page }) => {
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -132,7 +133,7 @@ test.describe("edge cases", () => {
   });
 
   test("sessions endpoint 500 shows error in left rail", async ({ page }) => {
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 500,
         contentType: "application/json",
@@ -155,7 +156,7 @@ test.describe("edge cases", () => {
     // win the race and flip the badge back to conn-ok. To assert the
     // failure-surfacing contract deterministically, override BOTH read
     // endpoints to fail in this specific test.
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 500,
         contentType: "application/json",

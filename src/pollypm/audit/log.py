@@ -686,7 +686,7 @@ def _append_line(path: Path, line: str) -> None:
     append fires unconditionally so a housekeeping bug can never
     cause audit data loss.
 
-    Uses POSIX append-mode (``"a"``) so concurrent writers from
+    Uses POSIX append-mode (``"a+b"``) so concurrent writers from
     multiple processes interleave at the line level — provided the
     line is under PIPE_BUF (4096 bytes), which our records always
     are. We open + write + close on every call rather than holding
@@ -706,11 +706,26 @@ def _append_line(path: Path, line: str) -> None:
             "audit.log: _maybe_rotate raised unexpectedly for %s",
             path, exc_info=True,
         )
-    # Newline added here so the encoded record stays a single
-    # JSON object on its own line.
-    with open(path, "a", encoding="utf-8") as fh:
-        fh.write(line)
-        fh.write("\n")
+    encoded = line.encode("utf-8")
+    try:
+        with open(path, "a+b") as fh:
+            leading_newline = b""
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() > 0:
+                fh.seek(-1, os.SEEK_END)
+                if fh.read(1) != b"\n":
+                    leading_newline = b"\n"
+            # Newline added here so the encoded record stays a single
+            # JSON object on its own line. If a prior crash left a
+            # partial tail without "\n", start the new record on a
+            # fresh line so it remains recoverable by the JSONL reader.
+            fh.write(leading_newline + encoded + b"\n")
+    except OSError:
+        logger.debug(
+            "audit.log: append failed for %s",
+            path, exc_info=True,
+        )
+        raise
 
 
 def emit(

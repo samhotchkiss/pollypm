@@ -301,6 +301,57 @@ def test_read_events_skips_truncated_tail_lines(tmp_path: Path) -> None:
     assert events[0].subject == "trunc/1"
 
 
+def test_emit_recovers_after_truncated_central_tail(tmp_path: Path) -> None:
+    """A fresh append after a corrupt tail must not get joined onto
+    the partial JSON line and disappear from readers."""
+    emit(event=EVENT_TASK_CREATED, project="recover", subject="recover/1")
+    central = central_log_path("recover")
+    with open(central, "a", encoding="utf-8") as fh:
+        fh.write('{"ts": "2026-05-06T00:00:00+00:00", "event": "task.cre')
+
+    emit(event=EVENT_TASK_CREATED, project="recover", subject="recover/2")
+
+    lines = central.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    assert json.loads(lines[-1])["subject"] == "recover/2"
+    events = read_events("recover")
+    assert [event.subject for event in events] == ["recover/1", "recover/2"]
+
+
+def test_emit_recovers_after_truncated_per_project_tail(tmp_path: Path) -> None:
+    """The per-project audit log is the source of truth, so tail
+    recovery must work there too."""
+    project_root = tmp_path / "recover-project"
+    (project_root / ".pollypm").mkdir(parents=True)
+
+    emit(
+        event=EVENT_TASK_CREATED,
+        project="recoverproj",
+        subject="recoverproj/1",
+        project_path=project_root,
+    )
+    per_project = project_log_path(project_root)
+    assert per_project is not None
+    with open(per_project, "a", encoding="utf-8") as fh:
+        fh.write('{"ts": "2026-05-06T00:00:00+00:00", "event": "task.cre')
+
+    emit(
+        event=EVENT_TASK_CREATED,
+        project="recoverproj",
+        subject="recoverproj/2",
+        project_path=project_root,
+    )
+
+    lines = per_project.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 3
+    assert json.loads(lines[-1])["subject"] == "recoverproj/2"
+    events = read_events("recoverproj", project_path=project_root)
+    assert [event.subject for event in events] == [
+        "recoverproj/1",
+        "recoverproj/2",
+    ]
+
+
 def test_read_events_empty_when_no_log_exists(tmp_path: Path) -> None:
     assert read_events("never-emitted") == []
 

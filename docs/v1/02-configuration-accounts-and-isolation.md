@@ -341,6 +341,14 @@ If every failover account is also at or above the threshold, the sweep raises a
 `account.failover.proactive` event with `reason =
 "no_failover_account_below_threshold"` instead of failing silently.
 
+Hard account failures use the same ordered failover list. When supervisor
+recovery moves a session because the active account is `auth_broken`,
+`capacity_exhausted`, or `capacity_low`, it emits
+`account.failover.engaged` to the JSONL audit log with the source and target
+accounts. If no viable account exists, or every candidate fails to launch, the
+audit log records `account.failover.blocked` or `account.failover.failed`
+instead of leaving only the recovery alert.
+
 ### Failure Classification
 
 When an account fails, PollyPM classifies the failure to determine the correct response.

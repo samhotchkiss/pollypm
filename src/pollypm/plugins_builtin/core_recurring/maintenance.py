@@ -171,11 +171,13 @@ def _apply_proactive_controller_failover(
         )
         _append_proactive_failover_event(
             msg_store,
+            config=config,
             from_account=decision.primary_account,
             to_account=None,
             reason=decision.reason,
             threshold=decision.threshold_pct,
             current_account=decision.current_account,
+            status="warn",
         )
         return summary
 
@@ -183,6 +185,16 @@ def _apply_proactive_controller_failover(
     operator = _operator_session(config)
     if target is None or operator is None:
         summary["error"] = "No operator session or selected account available"
+        _emit_proactive_failover_audit(
+            config,
+            from_account=decision.current_account,
+            to_account=target,
+            reason=decision.reason,
+            threshold=decision.threshold_pct,
+            current_account=decision.current_account,
+            status="error",
+            error=summary["error"],
+        )
         _upsert_proactive_failover_failed_alert(msg_store, summary["error"])
         return summary
 
@@ -195,6 +207,16 @@ def _apply_proactive_controller_failover(
         )
     except Exception as exc:  # noqa: BLE001
         summary["error"] = str(exc)
+        _emit_proactive_failover_audit(
+            config,
+            from_account=decision.current_account,
+            to_account=target,
+            reason=decision.reason,
+            threshold=decision.threshold_pct,
+            current_account=decision.current_account,
+            status="error",
+            error=str(exc),
+        )
         _upsert_proactive_failover_failed_alert(
             msg_store,
             f"Proactive controller failover to {target} failed: {exc}",
@@ -217,6 +239,7 @@ def _apply_proactive_controller_failover(
         _upsert_proactive_failover_active_alert(msg_store, decision)
     _append_proactive_failover_event(
         msg_store,
+        config=config,
         from_account=(
             decision.primary_account
             if decision.action == "switch"
@@ -226,6 +249,7 @@ def _apply_proactive_controller_failover(
         reason=decision.reason,
         threshold=decision.threshold_pct,
         current_account=decision.current_account,
+        status="ok",
     )
     summary["applied"] = True
     return summary
@@ -249,12 +273,23 @@ def _switch_operator_account(
 def _append_proactive_failover_event(
     msg_store: Any | None,
     *,
+    config: Any,
     from_account: str,
     to_account: str | None,
     reason: str,
     threshold: int,
     current_account: str,
+    status: str,
 ) -> None:
+    _emit_proactive_failover_audit(
+        config,
+        from_account=from_account,
+        to_account=to_account,
+        reason=reason,
+        threshold=threshold,
+        current_account=current_account,
+        status=status,
+    )
     if msg_store is None:
         return
     try:
@@ -277,6 +312,49 @@ def _append_proactive_failover_event(
     except Exception:  # noqa: BLE001
         logger.warning(
             "account.usage_refresh: failed to append proactive failover event",
+            exc_info=True,
+        )
+
+
+def _emit_proactive_failover_audit(
+    config: Any,
+    *,
+    from_account: str,
+    to_account: str | None,
+    reason: str,
+    threshold: int,
+    current_account: str,
+    status: str,
+    error: str | None = None,
+) -> None:
+    try:
+        from pollypm.audit.log import (
+            EVENT_ACCOUNT_FAILOVER_PROACTIVE,
+            emit as _audit_emit,
+        )
+
+        project_root = getattr(getattr(config, "project", None), "root_dir", None)
+        metadata = {
+            "from": from_account,
+            "to": to_account,
+            "reason": reason,
+            "threshold": threshold,
+            "current": current_account,
+        }
+        if error:
+            metadata["error"] = error
+        _audit_emit(
+            event=EVENT_ACCOUNT_FAILOVER_PROACTIVE,
+            project="_workspace",
+            subject="operator",
+            actor="account.usage_refresh",
+            status=status,
+            metadata=metadata,
+            project_path=project_root,
+        )
+    except Exception:  # noqa: BLE001
+        logger.warning(
+            "account.usage_refresh: failed to emit proactive failover audit",
             exc_info=True,
         )
 

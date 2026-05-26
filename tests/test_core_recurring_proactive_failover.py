@@ -133,6 +133,49 @@ def test_proactive_failover_switches_operator_and_emits_audit_event(tmp_path: Pa
     ) in msg_store.cleared
 
 
+def test_proactive_failover_writes_jsonl_audit_event(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    from pollypm.audit.log import (
+        EVENT_ACCOUNT_FAILOVER_PROACTIVE,
+        read_events,
+    )
+
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit-home"))
+    config = _config(tmp_path)
+
+    _apply_proactive_controller_failover(
+        tmp_path / "pollypm.toml",
+        config,
+        ProactiveFailoverDecision(
+            action="switch",
+            primary_account="claude_main",
+            current_account="claude_main",
+            selected_account="claude_backup",
+            reason="used_pct_threshold",
+            threshold_pct=85,
+            candidates_evaluated=1,
+        ),
+        msg_store=None,
+        switcher=lambda *_args: None,
+    )
+
+    events = read_events("_workspace", event=EVENT_ACCOUNT_FAILOVER_PROACTIVE)
+    assert len(events) == 1
+    event = events[0]
+    assert event.subject == "operator"
+    assert event.actor == "account.usage_refresh"
+    assert event.status == "ok"
+    assert event.metadata == {
+        "from": "claude_main",
+        "to": "claude_backup",
+        "reason": "used_pct_threshold",
+        "threshold": 85,
+        "current": "claude_main",
+    }
+
+
 def test_proactive_failover_alerts_when_no_account_is_under_threshold(tmp_path: Path) -> None:
     config = _config(tmp_path)
     msg_store = _MsgStore()

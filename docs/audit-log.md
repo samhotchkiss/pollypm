@@ -111,6 +111,10 @@ The current event families are:
 | `worker.heartbeat` | heartbeat supervisor when a worker has fresh transcript output | `task_id`, `session_name`, `window_name`, `snapshot_hash`, `log_bytes`, `delta_bytes` |
 | `heartbeat.missing` | supervisor recovery detection | `session`, `window_name`, `tmux_session`, `failure_type`, `failure_message` |
 | `session.spawn` | supervisor recovery relaunch | `session`, `window_name`, `tmux_session`, `failure_type`, `account`, `provider` |
+| `account.failover.proactive` | account usage refresh soft controller failover | `from`, `to`, `reason`, `threshold`, `current` |
+| `account.failover.engaged` | supervisor hard recovery failover after account failure | `session`, `failure_type`, `from`, `to`, `account`, `provider` |
+| `account.failover.blocked` | supervisor hard recovery when no viable failover account exists | `session`, `failure_type`, `from`, `reason` |
+| `account.failover.failed` | supervisor hard recovery when every failover candidate fails launch | `session`, `failure_type`, `from`, `reason`, `last_error` |
 | `audit.finding` | audit watchdog findings | `rule`, `message`, `recommendation`, plus rule-specific data |
 | `agent.injection.flagged` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |
 | `agent.refusal` | `pm audit agent-refusal` / auth-marker refusal contract | `reason`, `source`, `paired_event` |

@@ -26,8 +26,10 @@ across the whole suite.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 
+from pollypm.audit.log import EVENT_AGENT_CONTEXT_TRUNCATED
 from pollypm.plugins_builtin.core_recurring.plugin import (
     pane_text_classify_handler,
     plugin as core_plugin,
@@ -40,10 +42,10 @@ from pollypm.recovery.pane_patterns import (
     USER_VISIBLE_RULES,
     ClassifierRule,
     classify_pane,
+    context_truncation_trigger,
     rule_by_name,
 )
 from pollypm.storage.state import StateStore
-from pollypm.work.pg_service import PgWorkService
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +224,18 @@ class TestClassifyPane:
 
     def test_context_full_negative(self) -> None:
         assert "context_full" not in classify_pane(CONTEXT_FULL_NEGATIVE)
+
+    def test_context_trigger_labels(self) -> None:
+        assert (
+            context_truncation_trigger(CONTEXT_FULL_POSITIVE)
+            == "context_full"
+        )
+        assert (
+            context_truncation_trigger("I need to summarize the conversation.")
+            == "summarize_announce"
+        )
+        assert context_truncation_trigger("⚠️ context low") == "context_low"
+        assert context_truncation_trigger(CONTEXT_FULL_NEGATIVE) is None
 
     def test_stuck_on_error_positive(self) -> None:
         assert "stuck_on_error" in classify_pane(STUCK_ON_ERROR_POSITIVE)
@@ -506,6 +520,44 @@ class TestPaneClassifyHandler:
         assert result2["alerts_raised"] == 0
         assert result2["inbox_items_emitted"] == 0
         assert svc.sent == []
+
+    def test_context_full_emits_canonical_audit_event(
+        self, tmp_path, monkeypatch,
+    ) -> None:
+        audit_home = tmp_path / "audit-home"
+        monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+        store = StateStore(tmp_path / "state.db")
+        svc = FakeSessionService(
+            handles=[FakeHandle("worker-demo")],
+            captures={"worker-demo": CONTEXT_FULL_POSITIVE},
+        )
+        _patch_resolver(monkeypatch, tmp_path, svc, store)
+
+        result = pane_text_classify_handler({})
+        assert result["alerts_raised"] == 1
+        assert result["context_audit_events_emitted"] == 1
+
+        central = audit_home / "_workspace.jsonl"
+        rows = [
+            json.loads(line)
+            for line in central.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        event = next(
+            row for row in rows
+            if row["event"] == EVENT_AGENT_CONTEXT_TRUNCATED
+        )
+        assert event["project"] == "_workspace"
+        assert event["subject"] == "worker-demo"
+        assert event["actor"] == "audit_watchdog"
+        assert event["status"] == "warn"
+        assert event["metadata"]["trigger"] == "context_full"
+        assert event["metadata"]["pane_excerpt"] == CONTEXT_FULL_POSITIVE[-200:]
+        assert len(event["metadata"]["pane_excerpt"]) <= 200
+
+        result2 = pane_text_classify_handler({})
+        assert result2["alerts_raised"] == 0
+        assert result2["context_audit_events_emitted"] == 0
 
     def test_non_user_visible_rule_does_not_emit_inbox(
         self, tmp_path, monkeypatch, pg_work_service,

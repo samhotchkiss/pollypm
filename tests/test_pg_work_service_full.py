@@ -1496,6 +1496,77 @@ def test_node_done_advances_to_review(pg_service):
     assert done.work_status is WorkStatus.REVIEW
 
 
+def test_get_hydrates_executions_with_worker_output(pg_service):
+    task = _drive_to_review(pg_service)
+    pg_service.node_done(
+        task.task_id,
+        actor="alice",
+        work_output={
+            "type": "code_change",
+            "summary": "implemented X",
+            "artifacts": [
+                {"kind": "commit", "description": "impl", "ref": "HEAD"}
+            ],
+        },
+    )
+
+    fetched = pg_service.get(task.task_id)
+    outputs = [
+        execution.work_output
+        for execution in fetched.executions
+        if execution.work_output is not None
+    ]
+    assert [output.summary for output in outputs] == ["implemented X"]
+    assert outputs[0].artifacts[0].ref == "HEAD"
+
+
+def test_mark_done_invokes_plan_review_backstop(pg_service, monkeypatch):
+    calls: list[tuple[object, str, str]] = []
+
+    def _record(svc, task_id, actor):  # noqa: ANN001
+        calls.append((svc, task_id, actor))
+        return "plan-review-id"
+
+    monkeypatch.setattr(
+        "pollypm.work.plan_review_emit.maybe_emit_plan_review_on_task_done",
+        _record,
+    )
+    task = _make_draft(pg_service, labels=["poc-plan"])
+
+    pg_service.mark_done(task.task_id, actor="polly")
+
+    assert calls == [(pg_service, task.task_id, "polly")]
+
+
+def test_approve_done_invokes_plan_review_backstop(pg_service, monkeypatch):
+    calls: list[tuple[object, str, str]] = []
+
+    def _record(svc, task_id, actor):  # noqa: ANN001
+        calls.append((svc, task_id, actor))
+        return "plan-review-id"
+
+    monkeypatch.setattr(
+        "pollypm.work.plan_review_emit.maybe_emit_plan_review_on_task_done",
+        _record,
+    )
+    task = _drive_to_review(pg_service)
+    pg_service.node_done(
+        task.task_id,
+        actor="alice",
+        work_output={
+            "type": "code_change",
+            "summary": "implemented X",
+            "artifacts": [
+                {"kind": "commit", "description": "impl", "ref": "HEAD"}
+            ],
+        },
+    )
+
+    pg_service.approve(task.task_id, actor="bob")
+
+    assert calls == [(pg_service, task.task_id, "bob")]
+
+
 def test_approve_from_non_review_raises(pg_service):
     from pollypm.work.service_support import InvalidTransitionError
 

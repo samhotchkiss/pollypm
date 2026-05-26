@@ -610,6 +610,7 @@ class PgWorkService:
         task = self._row_to_task(row, relationships=rels)
         task.transitions = self._load_transitions(project, task_number)
         task.context = self._load_context_entries(project, task_number)
+        task.executions = self.get_execution(task_id)
         return task
 
     def list_tasks(
@@ -1985,6 +1986,7 @@ class PgWorkService:
                 task_id,
                 exc_info=True,
             )
+        self._maybe_emit_plan_review_on_task_done(task_id, actor)
         return result
 
     def force_review(
@@ -3504,11 +3506,8 @@ class PgWorkService:
         a plain-language summary. Any failure is swallowed with a warning
         so the transition itself remains durable.
 
-        Note: pg's :meth:`get` does not yet hydrate ``executions`` /
-        ``context`` (Slice B carryover), so the summary helper would see
-        an empty work-output history if called against the raw ``get``
-        result. We hydrate those fields locally before invoking the
-        generator so the prompt has the worker's submission to summarise.
+        The helper still goes through a small hydration shim so older
+        call sites that hand in thin task doubles keep the same shape.
         """
         if task.work_status not in {WorkStatus.REVIEW, WorkStatus.ON_HOLD}:
             return
@@ -3686,6 +3685,7 @@ class PgWorkService:
                     task_id,
                     exc_info=True,
                 )
+            self._maybe_emit_plan_review_on_task_done(task_id, actor)
         # #1780: clear the per-task no_session alert after approve.
         # Mirrors the sqlite WorkTransitionManager._handle_approve_alert_cleanup
         # hook so the alert raised by the heartbeat sweep doesn't sit in
@@ -3699,6 +3699,24 @@ class PgWorkService:
                 exc_info=True,
             )
         return result
+
+    def _maybe_emit_plan_review_on_task_done(
+        self,
+        task_id: str,
+        actor: str,
+    ) -> None:
+        try:
+            from pollypm.work.plan_review_emit import (
+                maybe_emit_plan_review_on_task_done,
+            )
+
+            maybe_emit_plan_review_on_task_done(self, task_id, actor or "polly")
+        except Exception:  # noqa: BLE001
+            logger.debug(
+                "plan_review backstop emit skipped for %s",
+                task_id,
+                exc_info=True,
+            )
 
     def reject(self, task_id: str, actor: str, reason: str) -> Task:
         """Reject a review node and bounce the task to ``rework``."""

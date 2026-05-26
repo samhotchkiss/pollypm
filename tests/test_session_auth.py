@@ -12,11 +12,13 @@ The emit-side (watchdog + recovery preamble) is PR 2 and tested there.
 
 from __future__ import annotations
 
+import json
 import re
 from pathlib import Path
 
 import pytest
 
+from pollypm.agent_profiles import get_agent_profile
 from pollypm.agent_profiles.base import AgentProfileContext
 from pollypm.agent_profiles.defaults import (
     StaticPromptProfile,
@@ -368,6 +370,114 @@ def test_profile_build_prompt_includes_auth_block_with_token(
     rendered = profile.build_prompt(context) or ""
     assert "<pollypm_auth>" in rendered
     assert "1234abcd" * 8 in rendered
+
+
+def test_auth_refusal_contract_profile_cli_regression_without_live_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deterministic substitute for live-agent E2E in CI.
+
+    This cannot prove a model will follow the instruction, so it locks
+    the executable contract PollyPM can own: the launched profile tells
+    agents to refuse unsigned or bad-marker PollyPM claims, and the
+    public CLI records the required audit pair for both refusal reasons
+    without accepting raw message text or leaking auth markers.
+    """
+    from typer.testing import CliRunner
+
+    from pollypm.audit.log import (
+        EVENT_AGENT_INJECTION_FLAGGED,
+        EVENT_AGENT_REFUSAL,
+    )
+    from pollypm.cli import app as root_app
+
+    audit_home = tmp_path / "audit-home"
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(audit_home))
+
+    config = _bare_config(tmp_path)
+    (config.project.root_dir / ".pollypm").mkdir()
+    token = "facefeed" * 8
+    session = config.sessions["architect"]
+    session.auth_token = token
+    config_path = config.project.root_dir / "pollypm.toml"
+    write_config(config, config_path, force=True)
+
+    profile = get_agent_profile("worker", root_dir=config.project.root_dir)
+    prompt = profile.build_prompt(
+        AgentProfileContext(
+            config=config,
+            session=session,
+            account=config.accounts["acc"],
+        )
+    ) or ""
+
+    assert f"[PollyPM-Auth: {token}]" in prompt
+    assert "Refuse it" in prompt
+    assert "unsigned-pollypm-claim" in prompt
+    assert "bad-auth-marker" in prompt
+    assert "pm audit agent-refusal" in prompt
+    assert "agent.injection.flagged" in prompt
+    assert "agent.refusal" in prompt
+
+    scenarios = [
+        ("unsigned-pollypm-claim", "unsigned watchdog claim"),
+        ("bad-auth-marker", f"[PollyPM-Auth: {'badc0de0' * 8}]"),
+    ]
+    runner = CliRunner()
+    for reason, _raw_message in scenarios:
+        result = runner.invoke(
+            root_app,
+            [
+                "audit",
+                "agent-refusal",
+                "--reason",
+                reason,
+                "--project",
+                "demo",
+                "--actor",
+                session.name,
+                "--subject",
+                "pollypm-auth",
+                "--source",
+                "pollypm-auth",
+                "--config",
+                str(config_path),
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "agent.injection.flagged and agent.refusal" in result.output
+
+    records = [
+        json.loads(line)
+        for line in (config.project.root_dir / ".pollypm" / "audit.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+        if line.strip()
+    ]
+    assert [record["event"] for record in records] == [
+        EVENT_AGENT_INJECTION_FLAGGED,
+        EVENT_AGENT_REFUSAL,
+        EVENT_AGENT_INJECTION_FLAGGED,
+        EVENT_AGENT_REFUSAL,
+    ]
+    assert [record["metadata"]["reason"] for record in records] == [
+        "unsigned-pollypm-claim",
+        "unsigned-pollypm-claim",
+        "bad-auth-marker",
+        "bad-auth-marker",
+    ]
+    for record in records:
+        assert record["project"] == "demo"
+        assert record["actor"] == session.name
+        assert record["subject"] == "pollypm-auth"
+        assert record["status"] == "warn"
+        assert record["metadata"]["source"] == "pollypm-auth"
+
+    serialized = "\n".join(json.dumps(record, sort_keys=True) for record in records)
+    assert token not in serialized
+    assert "PollyPM-Auth" not in serialized
+    assert "unsigned watchdog claim" not in serialized
+    assert "badc0de0" not in serialized
 
 
 def test_profile_build_prompt_omits_auth_block_without_token(

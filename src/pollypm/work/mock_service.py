@@ -298,6 +298,7 @@ class MockWorkService:
         self,
         *,
         project: str | None = None,
+        projects: tuple[str, ...] | list[str] | None = None,
         type_filter: str | None = None,
         state_filter: str | None = None,
         limit: int | None = None,
@@ -312,6 +313,9 @@ class MockWorkService:
         tasks = list(self._tasks.values())
         if project is not None:
             tasks = [t for t in tasks if t.project == project]
+        elif projects is not None:
+            allowed = {str(value) for value in projects}
+            tasks = [t for t in tasks if t.project in allowed]
 
         state = (state_filter or "").strip().lower()
         if state in {"closed", "resolved", "archived"}:

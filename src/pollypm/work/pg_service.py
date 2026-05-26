@@ -762,6 +762,7 @@ class PgWorkService:
         self,
         *,
         project: str | None = None,
+        projects: tuple[str, ...] | list[str] | None = None,
         type_filter: str | None = None,
         state_filter: str | None = None,
         limit: int | None = None,
@@ -780,6 +781,13 @@ class PgWorkService:
         if project is not None:
             where.append("project = %s")
             params.append(project)
+        elif projects is not None:
+            allowed = [str(value) for value in projects]
+            if allowed:
+                where.append("project = ANY(%s)")
+                params.append(allowed)
+            else:
+                where.append("FALSE")
 
         state = (state_filter or "").strip().lower()
         terminal_values = sorted(s.value for s in TERMINAL_STATUSES)

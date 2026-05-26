@@ -297,7 +297,10 @@ Find or create two open inbox items. Hit `archive` on both in parallel. Both sho
  wait)
 ```
 
-**Expected:** one 200, one 409 `busy` (single-flight per the doctor contract).
+**Expected:** one 200, one 409 `in_progress` (single-flight per the doctor contract).
+The 409 envelope includes `retry_after_seconds=5`.
+Each API attempt should emit `pm.doctor_run` in `~/.pollypm/audit/_workspace.jsonl`,
+including the rejected 409 path.
 
 ---
 

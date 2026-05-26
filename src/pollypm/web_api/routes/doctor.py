@@ -446,6 +446,84 @@ def _fix_busy_error() -> APIError:
     )
 
 
+def _merge_run_request(
+    body: DoctorRunRequest | None,
+    *,
+    query_fix: bool | None,
+) -> DoctorRunRequest:
+    """Return the effective doctor run payload.
+
+    ``fix`` is accepted both in the JSON body and as a query parameter
+    because the public test plan historically used
+    ``POST /doctor/run?fix=true``. FastAPI does not merge query strings
+    into body models, so the route has to bind it explicitly.
+    """
+    payload = body or DoctorRunRequest()
+    if query_fix is None:
+        return payload
+    return DoctorRunRequest(check=payload.check, fix=query_fix)
+
+
+def _emit_doctor_run_audit(
+    *,
+    payload: DoctorRunRequest,
+    timeout_seconds: float,
+    status: str,
+    outcome: str,
+    query_fix: bool | None,
+    report: DoctorReport | None = None,
+    fixes_applied: list[dict[str, Any]] | None = None,
+    error_code: str | None = None,
+) -> None:
+    """Best-effort audit parity for API doctor runs.
+
+    Mirrors the CLI's ``pm.doctor_run`` event without coupling the
+    route to audit failures. The doctor endpoint is a mutation surface
+    when ``fix=true``; even rejected single-flight attempts should be
+    visible in the audit tail.
+    """
+    try:
+        from pollypm.audit import emit as _audit_emit
+    except Exception:  # noqa: BLE001
+        return
+
+    metadata: dict[str, Any] = {
+        "source": "web_api",
+        "route": "POST /api/v1/doctor/run",
+        "check": payload.check,
+        "timeout_seconds": round(float(timeout_seconds), 3),
+        "fix_requested": bool(payload.fix),
+        "fix_query_param": query_fix,
+        "outcome": outcome,
+    }
+    if report is not None:
+        metadata.update({
+            "findings_total": len(report.errors) + len(report.warnings),
+            "errors": len(report.errors),
+            "warnings": len(report.warnings),
+            "checks_total": len(report.results),
+            "passed": report.passed_count,
+            "skipped": report.skipped_count,
+            "duration_seconds": round(report.duration_seconds, 3),
+        })
+    if fixes_applied is not None:
+        metadata["fixes_applied_count"] = len(fixes_applied)
+    if error_code:
+        metadata["error_code"] = error_code
+
+    try:
+        _audit_emit(
+            event="pm.doctor_run",
+            project="_workspace",
+            subject="POST /api/v1/doctor/run",
+            actor="api",
+            status=status,
+            metadata=metadata,
+        )
+    except Exception:  # noqa: BLE001
+        return
+
+
 def _reject_non_default_config(config: Any) -> None:
     """Refuse to run doctor against a non-default config path.
 
@@ -756,6 +834,15 @@ def run_doctor_endpoint(
     config: ConfigDep,
     request: Request,
     body: DoctorRunRequest | None = None,
+    fix: Annotated[
+        bool | None,
+        Query(
+            description=(
+                "Compatibility alias for the JSON body field. When set, "
+                "this query parameter is used as the effective fix flag."
+            ),
+        ),
+    ] = None,
     timeout_seconds: Annotated[
         float,
         Query(
@@ -790,70 +877,90 @@ def run_doctor_endpoint(
     owned by the FastAPI lifespan (Codex round-5 on PR #2058).
     """
     _reject_non_default_config(config)
-    payload = body or DoctorRunRequest()
-
-    selected = _select_checks(payload.check)
-    executor = _get_executor(request)
+    payload = _merge_run_request(body, query_fix=fix)
 
     fixes_applied: list[dict[str, Any]] = []
-    if payload.fix:
-        fix_lock = _get_fix_lock(request)
-        # Single-flight gate for ``fix=true``. Acquire non-blocking so a
-        # second concurrent caller returns 409 immediately rather than
-        # queueing behind the in-flight fix. ``fix=false`` is read-only
-        # for our purposes (each check has its own internal locks) and
-        # is allowed to overlap.
-        if not fix_lock.acquire(blocking=False):
-            raise _fix_busy_error()
+    try:
+        selected = _select_checks(payload.check)
+        executor = _get_executor(request)
+        if payload.fix:
+            fix_lock = _get_fix_lock(request)
+            # Single-flight gate for ``fix=true``. Acquire non-blocking so a
+            # second concurrent caller returns 409 immediately rather than
+            # queueing behind the in-flight fix. ``fix=false`` is read-only
+            # for our purposes (each check has its own internal locks) and
+            # is allowed to overlap.
+            if not fix_lock.acquire(blocking=False):
+                raise _fix_busy_error()
 
-        # Round-4 (Codex on PR #2058): the lock MUST be held until the
-        # worker thread truly terminates, not just until the HTTP request
-        # returns. The prior implementation released in a ``finally``
-        # block, which ran on the 504 timeout path even though the worker
-        # thread was still alive inside ``apply_fixes`` mutating shared
-        # state. A retry within seconds of the 504 would acquire the lock
-        # and start a *second* concurrent fix.
-        #
-        # The fix: submit the work ourselves, attach an
-        # ``add_done_callback`` that releases the lock when the worker
-        # really finishes, and DO NOT release the lock on any code path
-        # in this function — the callback owns the release.
-        #
-        # ``add_done_callback`` runs synchronously if the future is
-        # already done at registration time; otherwise it runs in the
-        # worker thread once the result is set. Either way, the lock is
-        # released exactly once when the work is truly complete.
-        #
-        # Round-5 (Codex on PR #2058): the callback also logs the
-        # eventual outcome (success / exception / cancel) so a
-        # timed-out fix that finishes late is observable in the
-        # server log rather than disappearing silently.
-        future = _submit_doctor_work(
-            executor, _run_full_fix_under_budget, selected,
+            # Round-4 (Codex on PR #2058): the lock MUST be held until the
+            # worker thread truly terminates, not just until the HTTP request
+            # returns. The prior implementation released in a ``finally``
+            # block, which ran on the 504 timeout path even though the worker
+            # thread was still alive inside ``apply_fixes`` mutating shared
+            # state. A retry within seconds of the 504 would acquire the lock
+            # and start a *second* concurrent fix.
+            #
+            # The fix: submit the work ourselves, attach an
+            # ``add_done_callback`` that releases the lock when the worker
+            # really finishes, and DO NOT release the lock on any code path
+            # in this function — the callback owns the release.
+            #
+            # ``add_done_callback`` runs synchronously if the future is
+            # already done at registration time; otherwise it runs in the
+            # worker thread once the result is set. Either way, the lock is
+            # released exactly once when the work is truly complete.
+            #
+            # Round-5 (Codex on PR #2058): the callback also logs the
+            # eventual outcome (success / exception / cancel) so a
+            # timed-out fix that finishes late is observable in the
+            # server log rather than disappearing silently.
+            future = _submit_doctor_work(
+                executor, _run_full_fix_under_budget, selected,
+            )
+            future.add_done_callback(_release_fix_lock_factory(fix_lock))
+            # Round-3 (Codex on PR #2058): the entire run+apply+verify
+            # sequence is wrapped in one budget so a hanging
+            # ``apply_fixes`` can't escape the timeout contract. The
+            # post-fix verify rerun shares the same wall-clock budget;
+            # if apply_fixes itself consumes the budget, the future
+            # times out before verify even starts and we surface 504.
+            report, fixes_applied = _await_with_budget(
+                future,
+                budget_s=timeout_seconds,
+                name=payload.check,
+            )
+        else:
+            report = _run_with_budget(
+                executor,
+                run_checks,
+                selected,
+                budget_s=timeout_seconds,
+                name=payload.check,
+            )
+    except APIError as exc:
+        _emit_doctor_run_audit(
+            payload=payload,
+            timeout_seconds=timeout_seconds,
+            status="error" if exc.status_code >= 500 else "warn",
+            outcome="rejected" if exc.status_code == 409 else "failed",
+            query_fix=fix,
+            fixes_applied=fixes_applied,
+            error_code=exc.code,
         )
-        future.add_done_callback(_release_fix_lock_factory(fix_lock))
-        # Round-3 (Codex on PR #2058): the entire run+apply+verify
-        # sequence is wrapped in one budget so a hanging
-        # ``apply_fixes`` can't escape the timeout contract. The
-        # post-fix verify rerun shares the same wall-clock budget;
-        # if apply_fixes itself consumes the budget, the future
-        # times out before verify even starts and we surface 504.
-        report, fixes_applied = _await_with_budget(
-            future,
-            budget_s=timeout_seconds,
-            name=payload.check,
-        )
-    else:
-        report = _run_with_budget(
-            executor,
-            run_checks,
-            selected,
-            budget_s=timeout_seconds,
-            name=payload.check,
-        )
+        raise
 
     generated_at = _record_last_report(request, report)
     base = _build_report_response(report, generated_at=generated_at)
+    _emit_doctor_run_audit(
+        payload=payload,
+        timeout_seconds=timeout_seconds,
+        status="ok" if report.ok else "warn",
+        outcome="completed",
+        query_fix=fix,
+        report=report,
+        fixes_applied=fixes_applied,
+    )
     return DoctorRunResponse(
         generated_at=base.generated_at,
         duration_seconds=base.duration_seconds,

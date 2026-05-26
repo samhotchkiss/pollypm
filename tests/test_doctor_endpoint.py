@@ -15,6 +15,7 @@ registry / runner so the suite never touches the user's real machine
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -353,6 +354,91 @@ def test_run_with_fix_invokes_fix_fn(client, auth_headers, patch_registry, monke
     # Post-fix re-run replaced the failing result with a passing one.
     [row] = body["checks"]
     assert row["passed"] is True
+
+
+def test_run_query_fix_true_invokes_fix_fn(client, auth_headers, patch_registry):
+    """``POST /doctor/run?fix=true`` reaches the same path as body fix=true."""
+    counter = {"n": 0}
+
+    def stateful_run() -> CheckResult:
+        counter["n"] += 1
+        if counter["n"] == 1:
+            return _fail("alpha", fixable=True)
+        return _ok("alpha")
+
+    check = Check(name="alpha", run=stateful_run, category="test", severity="error")
+    patch_registry([check])
+    response = client.post(
+        "/api/v1/doctor/run",
+        headers=auth_headers,
+        params={"fix": "true", "check": "ignored-by-route"},
+        json={"check": "alpha"},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["fixes_applied"] == [
+        {"name": "alpha", "ok": True, "message": "applied fix for alpha"},
+    ]
+    assert body["checks"][0]["passed"] is True
+
+
+def test_api_doctor_run_audit_covers_query_fix_and_busy_rejection(
+    client, app, auth_headers, patch_registry, monkeypatch, tmp_path: Path,
+) -> None:
+    """API doctor runs emit ``pm.doctor_run`` audit rows, including 409."""
+    monkeypatch.setenv("POLLYPM_AUDIT_HOME", str(tmp_path / "audit"))
+    patch_registry([_check("alpha", _ok("alpha"))])
+
+    completed = client.post(
+        "/api/v1/doctor/run",
+        headers=auth_headers,
+        params={"fix": "true"},
+        json={"check": "alpha"},
+    )
+    assert completed.status_code == 200, completed.json()
+
+    fix_lock = app.state.doctor_fix_lock
+    assert fix_lock.acquire(blocking=False)
+    try:
+        rejected = client.post(
+            "/api/v1/doctor/run",
+            headers=auth_headers,
+            params={"fix": "true"},
+            json={"check": "alpha"},
+        )
+    finally:
+        fix_lock.release()
+
+    assert rejected.status_code == 409, rejected.json()
+    assert rejected.json()["error"]["code"] == "in_progress"
+
+    central = tmp_path / "audit" / "_workspace.jsonl"
+    assert central.exists(), f"audit log not written at {central}"
+    events = [
+        json.loads(line)
+        for line in central.read_text().splitlines()
+        if line.strip()
+    ]
+    doctor_events = [
+        event for event in events if event.get("event") == "pm.doctor_run"
+    ]
+    assert len(doctor_events) == 2
+    completed_event = next(
+        event for event in doctor_events
+        if event["metadata"]["outcome"] == "completed"
+    )
+    rejected_event = next(
+        event for event in doctor_events
+        if event["metadata"]["outcome"] == "rejected"
+    )
+    assert completed_event["actor"] == "api"
+    assert completed_event["status"] == "ok"
+    assert completed_event["metadata"]["source"] == "web_api"
+    assert completed_event["metadata"]["fix_requested"] is True
+    assert completed_event["metadata"]["fix_query_param"] is True
+    assert rejected_event["status"] == "warn"
+    assert rejected_event["metadata"]["error_code"] == "in_progress"
 
 
 def test_run_with_fix_false_does_not_invoke_fixes(client, auth_headers, patch_registry):

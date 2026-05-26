@@ -814,6 +814,7 @@ because typing curl with bearer-token plumbing every time gets old.
 
 ```
 pm chat list [--json]
+pm chat sessions [--json]
 pm chat history <session_name> [--limit N] [--since ISO]
                                 [--since-id MSG_ID]
                                 [--direction desc|asc]
@@ -829,8 +830,11 @@ pm chat send <session_name> <text> [--no-enter]
                                    [--json]
 ```
 
-- `pm chat list` → `GET /api/v1/chat/sessions`. Renders a fixed-column
-  table by default; `--json` emits the raw response envelope.
+- `pm chat list` / `pm chat sessions` → `GET /api/v1/chat/sessions`.
+  Renders a fixed-column table by default; `--json` emits the raw
+  response envelope. Use these commands for chat-surface parity checks;
+  root `pm sessions` is the configured-session admin-health view and
+  mirrors `GET /api/v1/sessions`.
 - `pm chat history` → `GET /api/v1/chat/<session>/messages`. Forwards
   every flag as the matching query param. `--since-id` is cursor
   pagination (pass the previous response's `next_cursor`). `--pane` is

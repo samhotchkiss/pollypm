@@ -192,6 +192,29 @@ class TestChatList:
         decoded = json.loads(result.output)
         assert decoded == payload
 
+    def test_sessions_alias_uses_chat_sessions_endpoint(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        _install_token(monkeypatch, tmp_path)
+        payload = {
+            "sessions": [
+                {
+                    "session_name": "operator",
+                    "surface_type": "operator",
+                    "persona": "Polly",
+                    "project": None,
+                    "window": {"present": True},
+                }
+            ]
+        }
+        capture = _install_response(monkeypatch, json_payload=payload)
+
+        result = runner.invoke(_build_cli_app(), ["chat", "sessions", "--json"])
+        assert result.exit_code == 0, result.output
+        assert json.loads(result.output) == payload
+        assert capture.method == "GET"
+        assert capture.url.endswith("/api/v1/chat/sessions")
+
     def test_empty_sessions_list_friendly_message(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:

@@ -44,7 +44,9 @@ Each scale has a defined fixture. Codex lane E builds the seed scripts under `sc
 4. Ensure one designated surface has the >1MB (M) or >10MB (L) transcript file.
 5. Verify the resulting state matches the table below; exit non-zero on mismatch.
 
-**Pre-§06 requirement:** before running §06, execute the appropriate seed script and verify with `pm sessions list --json | jq 'length'` and `pm task list --project pollypm --status all --json | jq 'length'`.
+**Pre-§06 requirement:** before running §06, execute the appropriate
+seed script and verify with `pm chat sessions --json | jq '.sessions | length'`
+and `pm task list --project pollypm --status all --json | jq 'length'`.
 
 If `scripts/perf/seed_mscale.sh` does not exist, file `bug:perf-seed-missing` against lane E and either:
 - Run §06 at S-scale only (smoke coverage), OR

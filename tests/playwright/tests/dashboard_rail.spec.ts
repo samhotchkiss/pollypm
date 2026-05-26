@@ -9,7 +9,7 @@ const FAKE_SURFACE = {
 };
 
 async function stubSurfaces(page: import("@playwright/test").Page) {
-  await page.route("**/api/v1/chat/sessions", (route) =>
+  await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -113,8 +113,8 @@ test.describe("dashboard rail", () => {
     );
 
     const expected: Array<[RegExp, string]> = [
-      [/inbox/i, "operator"],
-      [/plan reviews/i, "Dashboard: plan reviews"],
+      [/inbox/i, "Inbox"],
+      [/plan reviews/i, "Inbox"],
       [/alerts/i, "Dashboard: alerts"],
       [/activity/i, "operator"],
       [/daemon/i, "Dashboard: daemon"],

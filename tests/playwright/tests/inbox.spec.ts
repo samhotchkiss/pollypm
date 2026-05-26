@@ -24,7 +24,7 @@ const SECOND_ITEM = {
 };
 
 async function stubChrome(page: import("@playwright/test").Page) {
-  await page.route("**/api/v1/chat/sessions", (route) =>
+  await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
     route.fulfill({
       status: 200,
       contentType: "application/json",
@@ -199,11 +199,22 @@ test.describe("inbox panel", () => {
 
     await page.goto("/ui/");
     await page.locator(".rollup-card[title='Open inbox']").click();
+    await expect(page.locator("[data-inbox-id='demo/1']")).toBeVisible();
     await page.locator(".inbox-filter-input").fill("demo");
     await page.locator(".inbox-filter-select").first().selectOption("waiting-on-pm");
     await page.locator(".inbox-filter-select").nth(1).selectOption("plan_review");
+    const filteredResponse = page.waitForResponse((response) => {
+      const url = new URL(response.url());
+      return (
+        url.pathname === "/api/v1/inbox"
+        && url.searchParams.get("project") === "demo"
+        && url.searchParams.get("state") === "waiting-on-pm"
+        && url.searchParams.get("type") === "plan_review"
+      );
+    });
     await page.locator(".inbox-filter-button.primary").click();
-    await expect.poll(() => filteredRequestSeen).toBe(true);
+    await filteredResponse;
+    expect(filteredRequestSeen).toBe(true);
 
     await page.locator("[data-inbox-id='demo/1']").click();
     await page.locator(".inbox-action", { hasText: "Mark read" }).click();

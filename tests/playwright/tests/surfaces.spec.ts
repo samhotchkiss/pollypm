@@ -26,14 +26,15 @@ test.describe("surfaces", () => {
           "#surface-list li[data-task]",
         ).length;
         if (items > 0 || tasks > 0) return true;
-        const empty = document.querySelector(
+        const empties = Array.from(document.querySelectorAll(
           "#surface-list .surface-empty",
-        ) as HTMLElement | null;
-        if (!empty) return false;
-        const text = (empty.textContent ?? "").trim();
-        return (
-          text.includes("no surfaces registered") || text.startsWith("error:")
-        );
+        )) as HTMLElement[];
+        return empties.some((empty) => {
+          const text = (empty.textContent ?? "").trim();
+          return (
+            text.includes("no surfaces registered") || text.startsWith("error:")
+          );
+        });
       },
       undefined,
       { timeout: 10_000 },
@@ -176,7 +177,7 @@ test.describe("surfaces", () => {
   }
 
   async function stubEmptySessions(page: import("@playwright/test").Page) {
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -278,7 +279,7 @@ test.describe("surfaces", () => {
       }),
     );
     // Stub the sessions endpoint to ensure at least one selectable surface.
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -334,7 +335,7 @@ test.describe("surfaces", () => {
         }),
       });
     });
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -547,7 +548,7 @@ test.describe("surfaces", () => {
     const firstRequestGate = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
-    await page.route("**/api/v1/chat/sessions", async (route) => {
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, async (route) => {
       sessionRequests += 1;
       if (sessionRequests === 1) {
         await firstRequestGate;
@@ -593,7 +594,7 @@ test.describe("surfaces", () => {
     let taskRequests = 0;
     let projectRequests = 0;
 
-    await page.route("**/api/v1/chat/sessions", async (route) => {
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, async (route) => {
       sessionRequests += 1;
       await sessionsGate;
       return route.fulfill({
@@ -647,7 +648,7 @@ test.describe("surfaces", () => {
       releaseTasks = resolve;
     });
 
-    await page.route("**/api/v1/chat/sessions", async (route) => {
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, async (route) => {
       await sessionsGate;
       return route.fulfill({
         status: 200,
@@ -720,7 +721,7 @@ test.describe("surfaces", () => {
       }).catch(() => undefined);
     }
 
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       slowJson(route, { sessions: [] }),
     );
     await page.route(/\/api\/v1\/tasks\?limit=200$/, (route) =>
@@ -770,7 +771,7 @@ test.describe("surfaces", () => {
       releaseSecond = resolve;
     });
 
-    await page.route("**/api/v1/chat/sessions", async (route) => {
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, async (route) => {
       sessionRequests += 1;
       if (sessionRequests === 1) {
         await firstRequestGate;
@@ -824,7 +825,7 @@ test.describe("surfaces", () => {
   test("task surfaces render in a separate rail group", async ({ page }) => {
     await stubEmptyProjects(page);
     await stubEmptyActivity(page);
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -890,7 +891,7 @@ test.describe("surfaces", () => {
     let claimActor = "";
     await stubEmptyProjects(page);
     await stubEmptyActivity(page);
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1035,7 +1036,7 @@ test.describe("surfaces", () => {
         }),
       }),
     );
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",
@@ -1211,7 +1212,7 @@ test.describe("surfaces", () => {
         }),
       }),
     );
-    await page.route("**/api/v1/chat/sessions", (route) =>
+    await page.route(/\/api\/v1\/chat\/sessions(\?.*)?$/, (route) =>
       route.fulfill({
         status: 200,
         contentType: "application/json",

@@ -39,6 +39,8 @@
     Number.isFinite(railRequestTimeoutOverride)
     && railRequestTimeoutOverride > 0
   ) ? railRequestTimeoutOverride : 10000;
+  const ACTIVITY_REQUEST_TIMEOUT_MS = 3000;
+  const ACTIVITY_STATS_DEADLINE_SECONDS = 2.5;
 
   const state = {
     projects: [],
@@ -401,26 +403,66 @@
     return reason instanceof Error ? reason : new Error(String(reason));
   }
 
-  function railTimeoutError(label) {
-    const timeoutLabel = RAIL_REQUEST_TIMEOUT_MS >= 1000
-      ? Math.round(RAIL_REQUEST_TIMEOUT_MS / 1000) + "s"
-      : RAIL_REQUEST_TIMEOUT_MS + "ms";
+  function timeoutLabel(timeoutMs) {
+    return timeoutMs >= 1000
+      ? Math.round(timeoutMs / 100) / 10 + "s"
+      : timeoutMs + "ms";
+  }
+
+  function requestTimeoutError(label, timeoutMs) {
     return new Error(
-      label + " request timed out after " + timeoutLabel,
+      label + " request timed out after " + timeoutLabel(timeoutMs),
     );
   }
 
+  function railTimeoutError(label) {
+    return requestTimeoutError(label, RAIL_REQUEST_TIMEOUT_MS);
+  }
+
   function railJsonWithTimeout(label, request, opts) {
+    const parentSignal = opts && opts.signal;
+    const controller = new AbortController();
+    const requestOpts = Object.assign({}, opts || {}, {
+      signal: controller.signal,
+    });
+    let timedOut = false;
     let timer = null;
-    const timeout = new Promise((_, reject) => {
-      timer = setTimeout(() => {
-        reject(railTimeoutError(label));
-      }, RAIL_REQUEST_TIMEOUT_MS);
-    });
-    const pending = Promise.resolve().then(() => request(opts));
-    return Promise.race([pending, timeout]).finally(() => {
+    let onParentAbort = null;
+    if (parentSignal) {
+      onParentAbort = () => controller.abort();
+      if (parentSignal.aborted) controller.abort();
+      else parentSignal.addEventListener("abort", onParentAbort, { once: true });
+    }
+    timer = setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, RAIL_REQUEST_TIMEOUT_MS);
+    return Promise.resolve().then(() => request(requestOpts)).catch((err) => {
+      if (timedOut && isAbortError(err)) throw railTimeoutError(label);
+      throw err;
+    }).finally(() => {
       if (timer !== null) clearTimeout(timer);
+      if (parentSignal && onParentAbort) {
+        parentSignal.removeEventListener("abort", onParentAbort);
+      }
     });
+  }
+
+  async function apiJsonOptionalWithTimeout(label, path, timeoutMs) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, timeoutMs);
+    try {
+      return await apiJsonOptional(path, { signal: controller.signal });
+    } catch (err) {
+      if (isAbortError(err)) {
+        throw requestTimeoutError(label, timeoutMs);
+      }
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   async function loadSurfaces(opts) {
@@ -463,7 +505,7 @@
     renderSurfaces();
     const sessionsPromise = railJsonWithTimeout(
       "chat surfaces",
-      (opts) => apiJson(API + "/chat/sessions", opts),
+      (opts) => apiJson(API + "/chat/sessions?include_transcripts=false", opts),
       { signal: request.signal },
     ).then((data) => {
       if (!ownsRequest()) return;
@@ -2460,7 +2502,9 @@
   }
 
   function activityStatsPath() {
-    return API + "/audit/stats?" + activityParams().toString();
+    const params = activityParams();
+    params.set("deadline_seconds", String(ACTIVITY_STATS_DEADLINE_SECONDS));
+    return API + "/audit/stats?" + params.toString();
   }
 
   async function loadActivity() {
@@ -2474,8 +2518,12 @@
     renderActivity();
     try {
       const [grepResult, statsResult] = await Promise.allSettled([
-        apiJsonOptional(activityGrepPath()),
-        apiJsonOptional(activityStatsPath()),
+        apiJsonOptionalWithTimeout(
+          "activity feed", activityGrepPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
+        ),
+        apiJsonOptionalWithTimeout(
+          "activity stats", activityStatsPath(), ACTIVITY_REQUEST_TIMEOUT_MS,
+        ),
       ]);
       if (grepResult.status === "fulfilled") {
         state.activityEntries = Array.isArray(grepResult.value.events)
@@ -2492,6 +2540,17 @@
         state.activityError = statsResult.reason instanceof Error
           ? statsResult.reason
           : new Error(String(statsResult.reason));
+      } else if (
+        statsResult.status === "fulfilled"
+        && statsResult.value
+        && statsResult.value._truncated_by_deadline
+        && !state.activityError
+      ) {
+        const lines = Number(statsResult.value._lines_scanned || 0);
+        state.activityError = new Error(
+          "activity stats timed out"
+          + (lines > 0 ? " after scanning " + lines + " lines" : ""),
+        );
       }
     } finally {
       state.activityLoading = false;
@@ -2587,10 +2646,19 @@
     if (state.activityError) {
       summaryBox.innerHTML = "";
       feed.innerHTML = "";
-      feed.appendChild(el("div", {
-        class: "activity-empty",
-        text: "activity unavailable: " + state.activityError.message,
-      }));
+      const retry = el("button", {
+        type: "button",
+        class: "fetch-retry",
+        text: "Retry",
+        "aria-label": "Retry loading activity",
+      });
+      retry.addEventListener("click", () => loadActivity());
+      feed.appendChild(el("div", { class: "activity-empty" }, [
+        document.createTextNode(
+          "activity unavailable: " + state.activityError.message,
+        ),
+        retry,
+      ]));
       return;
     }
     const entries = state.activityEntries.slice().sort((a, b) => (

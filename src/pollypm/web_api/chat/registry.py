@@ -165,6 +165,7 @@ def enumerate_chat_surfaces(
     *,
     work_service: Any | None = None,
     tmux_client: Any | None = None,
+    include_transcripts: bool = True,
 ) -> list[ChatSurface]:
     """Return every chat surface (operator/architect/advisor/worker).
 
@@ -195,12 +196,14 @@ def enumerate_chat_surfaces(
         config,
         tmux_state_cache=tmux_state_cache,
         session_index_cache=session_index_cache,
+        include_transcripts=include_transcripts,
     ))
     if work_service is not None:
         surfaces.extend(enumerate_worker_surfaces(
             config, work_service,
             tmux_state_cache=tmux_state_cache,
             session_index_cache=session_index_cache,
+            include_transcripts=include_transcripts,
         ))
     surfaces.sort(key=_surface_sort_key)
     return surfaces
@@ -232,6 +235,7 @@ def enumerate_config_surfaces(
     *,
     tmux_state_cache: dict[str, TmuxWindowState] | None = None,
     session_index_cache: dict[Path, list] | None = None,
+    include_transcripts: bool = True,
 ) -> list[ChatSurface]:
     """Enumerate operator/architect/advisor surfaces from ``config.sessions``.
 
@@ -253,6 +257,7 @@ def enumerate_config_surfaces(
             tmux_session=tmux_session,
             tmux_state_cache=tmux_state_cache,
             session_index_cache=session_index_cache,
+            include_transcripts=include_transcripts,
         )
         if surface is not None:
             surfaces.append(surface)
@@ -265,6 +270,7 @@ def enumerate_worker_surfaces(
     *,
     tmux_state_cache: dict[str, TmuxWindowState] | None = None,
     session_index_cache: dict[Path, list] | None = None,
+    include_transcripts: bool = True,
 ) -> list[ChatSurface]:
     """Enumerate per-task worker surfaces from the work-service.
 
@@ -298,6 +304,7 @@ def enumerate_worker_surfaces(
             tmux_session=tmux_session,
             tmux_state_cache=tmux_state_cache,
             session_index_cache=session_index_cache,
+            include_transcripts=include_transcripts,
         )
         if surface is not None:
             surfaces.append(surface)
@@ -332,6 +339,7 @@ def find_chat_surface(
             tmux_session=storage_session_name(config.project.tmux_session),
             tmux_state_cache=tmux_state_cache,
             session_index_cache=session_index_cache,
+            include_transcripts=True,
         )
 
     parsed = parse_task_window_name(session_name)
@@ -360,6 +368,7 @@ def find_chat_surface(
                 tmux_session=storage_session_name(config.project.tmux_session),
                 tmux_state_cache=tmux_state_cache,
                 session_index_cache=session_index_cache,
+                include_transcripts=True,
             )
     return None
 
@@ -377,6 +386,7 @@ def _config_surface(
     tmux_session: str,
     tmux_state_cache: dict[str, TmuxWindowState] | None,
     session_index_cache: dict[Path, list] | None,
+    include_transcripts: bool,
 ) -> ChatSurface | None:
     if not session.enabled:
         return None
@@ -387,13 +397,15 @@ def _config_surface(
     project_root = _project_root_for_key(config, project_key)
     persona = _persona_for_session(config, session, surface_type)
     cwd = session.cwd if isinstance(session.cwd, Path) else Path(session.cwd or ".")
-    index = _build_session_index(project_root, session_index_cache)
-    transcript_path = lookup_transcript_path(
-        index,
-        cwd=str(cwd),
-        account_name=session.account,
-        provider=str(session.provider),
-    )
+    transcript_path: Path | None = None
+    if include_transcripts:
+        index = _build_session_index(project_root, session_index_cache)
+        transcript_path = lookup_transcript_path(
+            index,
+            cwd=str(cwd),
+            account_name=session.account,
+            provider=str(session.provider),
+        )
     window_name = session.window_name or session_name
     if tmux_state_cache and window_name in tmux_state_cache:
         window_state = tmux_state_cache[window_name]
@@ -423,6 +435,7 @@ def _worker_surface(
     tmux_session: str,
     tmux_state_cache: dict[str, TmuxWindowState] | None,
     session_index_cache: dict[Path, list] | None,
+    include_transcripts: bool,
 ) -> ChatSurface | None:
     project = getattr(record, "task_project", "") or ""
     task_number = getattr(record, "task_number", 0)
@@ -435,13 +448,15 @@ def _worker_surface(
     )
     cwd_for_lookup = str(worktree_path) if worktree_path else None
     provider_value = getattr(record, "provider", "") or ""
-    index = _build_session_index(project_root, session_index_cache)
-    transcript_path = lookup_transcript_path(
-        index,
-        cwd=cwd_for_lookup,
-        account_name=None,  # WorkerSessionRecord doesn't carry account
-        provider=provider_value or None,
-    )
+    transcript_path: Path | None = None
+    if include_transcripts:
+        index = _build_session_index(project_root, session_index_cache)
+        transcript_path = lookup_transcript_path(
+            index,
+            cwd=cwd_for_lookup,
+            account_name=None,  # WorkerSessionRecord doesn't carry account
+            provider=provider_value or None,
+        )
     window_name = session_name
     if tmux_state_cache and window_name in tmux_state_cache:
         window_state = tmux_state_cache[window_name]

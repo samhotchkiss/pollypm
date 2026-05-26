@@ -13,6 +13,7 @@ tmp config / tmp token paths.
 from __future__ import annotations
 
 import concurrent.futures
+import hashlib
 import logging
 import threading
 import time
@@ -66,6 +67,9 @@ logger = logging.getLogger(__name__)
 
 
 API_V1_PREFIX = "/api/v1"
+_UI_IMMUTABLE_ASSETS = frozenset({"app.js", "styles.css"})
+_UI_ASSET_CACHE_CONTROL = "public, max-age=31536000, immutable"
+_UI_INDEX_CACHE_CONTROL = "no-cache"
 
 
 # Doctor run/fix work runs in a dedicated thread pool so a slow check
@@ -755,6 +759,51 @@ def _mount_web_ui(
 
     index_path = ui_dir / "index.html"
 
+    def _file_fingerprint(path: Path) -> str:
+        try:
+            stat = path.stat()
+        except OSError:
+            return "missing"
+        return f"{stat.st_mtime_ns:x}-{stat.st_size:x}"
+
+    def _index_etag() -> str:
+        parts = [
+            f"index:{_file_fingerprint(index_path)}",
+            *(f"{name}:{_file_fingerprint(ui_dir / name)}" for name in sorted(_UI_IMMUTABLE_ASSETS)),
+        ]
+        digest = hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:16]
+        return f'"ui-index-{digest}"'
+
+    def _client_has_etag(request: Request, etag: str) -> bool:
+        header = request.headers.get("if-none-match")
+        if not header:
+            return False
+        return any(candidate.strip() == etag for candidate in header.split(","))
+
+    def _versioned_index_html() -> str:
+        html = index_path.read_text(encoding="utf-8")
+        for asset_name in sorted(_UI_IMMUTABLE_ASSETS):
+            asset_version = _file_fingerprint(ui_dir / asset_name)
+            html = html.replace(
+                f"/ui/{asset_name}",
+                f"/ui/{asset_name}?v={asset_version}",
+            )
+        return html
+
+    def _ui_index_response(request: Request) -> Response:
+        etag = _index_etag()
+        headers = {
+            "Cache-Control": _UI_INDEX_CACHE_CONTROL,
+            "ETag": etag,
+        }
+        if _client_has_etag(request, etag):
+            return Response(status_code=304, headers=headers)
+        return Response(
+            _versioned_index_html(),
+            media_type="text/html",
+            headers=headers,
+        )
+
     @app.get("/ui", include_in_schema=False)
     def _ui_root_redirect() -> Response:
         # 307 preserves method + the spec for "the trailing slash form
@@ -777,7 +826,7 @@ def _mount_web_ui(
         # on the next page load without an app restart.
         resolved_token_path = token_path or DEFAULT_TOKEN_PATH
         token_value = load_token(resolved_token_path)
-        response = FileResponse(index_path, media_type="text/html")
+        response = _ui_index_response(request)
 
         # Cookie issuance is credential issuance — gate it behind a
         # proven local-operator path so a LAN device (or anyone who
@@ -867,7 +916,10 @@ def _mount_web_ui(
             return Response("Not Found", status_code=404)
         if not candidate.is_file():
             return Response("Not Found", status_code=404)
-        return FileResponse(candidate)
+        response = FileResponse(candidate)
+        if candidate.name in _UI_IMMUTABLE_ASSETS:
+            response.headers["Cache-Control"] = _UI_ASSET_CACHE_CONTROL
+        return response
 
 
 __all__ = ["API_V1_PREFIX", "create_app"]

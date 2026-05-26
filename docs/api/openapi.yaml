@@ -782,6 +782,16 @@ paths:
         whether to subscribe to live capture or pull from the JSONL
         archive. Workers are best-effort: a transient work-service
         outage degrades to "configured surfaces only" rather than 500.
+      parameters:
+        - in: query
+          name: include_transcripts
+          schema:
+            type: boolean
+            default: true
+          description: |
+            When false, skips transcript-path discovery for a fast rail
+            bootstrap. Defaults true to preserve the full discovery
+            contract for API clients.
       responses:
         "200":
           description: List of chat surfaces.
@@ -2818,10 +2828,11 @@ paths:
         whole-history aggregation. (Codex P0 finding, PR #2062
         round 2.)
 
-        `deadline_seconds` (default 10.0) imposes a request-level
+        `deadline_seconds` (default 2.5) imposes a request-level
         wall-clock cap on top of the `since` semantic bound, because
-        the walker still reads every target file/line until it parses
-        `ts` and filters. When exceeded, the response sets
+        stats reads live logs newest-first and can skip rotations that
+        clearly predate `since`; the deadline remains the hard cap for
+        mixed or still-recent archives. When exceeded, the response sets
         `_truncated_by_deadline=true` and `_lines_scanned` reports
         how far the walker got across live + rotated logs. (Codex
         P0 finding, PR #2062 round 6.)
@@ -2842,12 +2853,10 @@ paths:
             format: float
             minimum: 0.5
             maximum: 120.0
-            default: 10.0
+            default: 2.5
           description: |
-            Request-level wall-clock budget (seconds). Default 10.0.
-            Stats has a higher default than `/audit/grep` (5.0)
-            because aggregation has no early-exit on match-count.
-            When exceeded the walker stops, the response sets
+            Request-level wall-clock budget (seconds). Default 2.5.
+            When exceeded the stats helper stops, the response sets
             `_truncated_by_deadline=true`, and `_lines_scanned`
             reports how many non-empty lines were examined
             (PR #2062 round 6).

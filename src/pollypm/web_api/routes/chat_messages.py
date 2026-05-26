@@ -157,10 +157,15 @@ class ChatSessionsResponse(BaseModel):
     sessions: list[ChatSurfaceResponse]
 
 
-_CHAT_SESSIONS_TTL_SECONDS = 1.0
+# The Web UI can trigger multiple rail boots in quick succession
+# (initial load, reload, SSE fallback/open transitions). Discovery is
+# read-only and can spend most of its cold cost in tmux + transcript
+# probes, so cache through that reload window instead of re-walking
+# the same surface set every second.
+_CHAT_SESSIONS_TTL_SECONDS = 15.0
 _CHAT_SESSIONS_LOCK = threading.Lock()
 _CHAT_SESSIONS_CACHE: dict[
-    tuple[int, int, int, int],
+    tuple[int, tuple[int, int], bool, int, int, int],
     tuple[float, tuple[ChatSurfaceResponse, ...]],
 ] = {}
 
@@ -410,6 +415,12 @@ def _build_tmux_client() -> TmuxClient | None:
     except Exception:  # noqa: BLE001
         logger.debug("chat_messages: TmuxClient init failed; presence unknown", exc_info=True)
         return None
+
+
+def _chat_sessions_config_cache_token(config: Any) -> tuple[int, int]:
+    sessions = getattr(config, "sessions", None) or {}
+    projects = getattr(config, "projects", None) or {}
+    return (len(sessions), len(projects))
 
 
 def _find_surface(
@@ -1032,7 +1043,19 @@ def _inline_subagent_transcript(
     summary="Discover every chat surface (operator/architect/advisor/worker)",
     operation_id="listChatSessions",
 )
-def list_chat_sessions_endpoint(config: ConfigDep) -> ChatSessionsResponse:
+def list_chat_sessions_endpoint(
+    config: ConfigDep,
+    include_transcripts: Annotated[
+        bool,
+        Query(
+            description=(
+                "When false, skips transcript-path discovery for a fast rail "
+                "bootstrap. Defaults true to preserve the full discovery "
+                "contract for API clients."
+            ),
+        ),
+    ] = True,
+) -> ChatSessionsResponse:
     """GET /api/v1/chat/sessions — return every configured chat surface.
 
     Workers are best-effort: when the work-service can't be opened
@@ -1043,6 +1066,8 @@ def list_chat_sessions_endpoint(config: ConfigDep) -> ChatSessionsResponse:
     """
     cache_key = (
         id(config),
+        _chat_sessions_config_cache_token(config),
+        include_transcripts,
         id(enumerate_chat_surfaces),
         id(_build_tmux_client),
         id(_build_work_service_stub),
@@ -1064,6 +1089,7 @@ def list_chat_sessions_endpoint(config: ConfigDep) -> ChatSessionsResponse:
             config,
             work_service=work_service,
             tmux_client=tmux_client,
+            include_transcripts=include_transcripts,
         )
         rows = tuple(_surface_to_wire(surface) for surface in surfaces)
         completed_at = time.monotonic()

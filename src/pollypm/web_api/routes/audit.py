@@ -47,6 +47,7 @@ from fastapi import APIRouter, Query
 from pydantic import BaseModel, Field, ValidationError
 
 from pollypm.audit.query import (
+    aggregate_recent_stats,
     iter_matching_events,
     parse_since,
     resolve_target_files,
@@ -137,10 +138,10 @@ class AuditStatsResponse(BaseModel):
     ``since`` to keep stats bounded (see module docstring).
 
     ``_truncated_by_deadline`` + ``_lines_scanned`` (Codex round-6
-    finding, PR #2062) mirror the grep envelope: ``since`` is a
-    semantic bound but the walker still walks every target file/line
-    until it parses ``ts`` and filters. ``deadline_seconds`` is the
-    request-level wall-clock cap; when it fires the caller can tell
+    finding, PR #2062) mirror the grep envelope. The stats helper
+    reads live logs newest-first and skips clearly old rotations, but
+    ``deadline_seconds`` remains the request-level wall-clock cap for
+    mixed or still-recent archives; when it fires the caller can tell
     a complete aggregation from a bounded one and re-issue with a
     tighter project/since to make progress.
 
@@ -433,9 +434,8 @@ def stats_audit_endpoint(
             ge=0.5,
             le=120.0,
             description=(
-                "Request-level wall-clock budget (seconds). Default 10.0 "
-                "(higher than /audit/grep's 5.0 because aggregation has "
-                "no early-exit on match-count). When exceeded the walker "
+                "Request-level wall-clock budget (seconds). Default 2.5. "
+                "When exceeded the walker "
                 "stops, the response sets _truncated_by_deadline=true, "
                 "and _lines_scanned reports how many non-empty lines "
                 "were examined. Required because `since` is only a "
@@ -444,7 +444,7 @@ def stats_audit_endpoint(
                 "(Codex round-6 finding)."
             ),
         ),
-    ] = 10.0,
+    ] = 2.5,
 ) -> AuditStatsResponse:
     """Return per-event and per-severity counts over the target files.
 
@@ -464,41 +464,21 @@ def stats_audit_endpoint(
     since_dt = _parse_since_or_400(since)
     targets = resolve_target_files(project_filter=project, config=config)
 
-    by_event: dict[str, int] = {}
-    by_severity: dict[str, int] = {}
-    total = 0
-    # Round-3 fix: route stats through the same parse-gated walker as
-    # grep so malformed-ts rows (and the broken-string-compare bug in
-    # round 2) can't inflate ``total``. We pass a ``stats`` dict so
-    # the walker bumps ``malformed_rows_skipped`` for us; round-9
-    # surfaces the counter in the response so callers can distinguish
-    # a clean aggregation from one where archived rows were silently
-    # skipped.
-    walker_stats: dict[str, int] = {}
-    for record in iter_matching_events(
+    aggregate = aggregate_recent_stats(
         targets=targets,
-        pattern=None,
-        literal=None,
         since=since_dt,
-        event_type=None,
-        stats=walker_stats,
         deadline_s=deadline_seconds,
-    ):
-        total += 1
-        event_name = str(record.get("event") or "")
-        severity = str(record.get("status") or "ok")
-        by_event[event_name] = by_event.get(event_name, 0) + 1
-        by_severity[severity] = by_severity.get(severity, 0) + 1
+    )
 
     return AuditStatsResponse(
-        total=total,
-        by_event=by_event,
-        by_severity=by_severity,
+        total=aggregate.total,
+        by_event=aggregate.by_event,
+        by_severity=aggregate.by_severity,
         since=since_dt,
-        _truncated_by_deadline=bool(walker_stats.get("truncated_by_deadline", 0)),
-        _lines_scanned=walker_stats.get("lines_scanned", 0),
-        _corrupt_archives_skipped=walker_stats.get("corrupt_archives_skipped", 0),
-        _malformed_rows_skipped=walker_stats.get("malformed_rows_skipped", 0),
+        _truncated_by_deadline=aggregate.truncated_by_deadline,
+        _lines_scanned=aggregate.lines_scanned,
+        _corrupt_archives_skipped=aggregate.corrupt_archives_skipped,
+        _malformed_rows_skipped=aggregate.malformed_rows_skipped,
     )
 
 

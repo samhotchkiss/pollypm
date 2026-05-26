@@ -639,6 +639,37 @@ def test_stats_empty_log_returns_zero_total(
     assert body["by_severity"] == {}
 
 
+def test_stats_default_deadline_matches_ui_budget(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    audit_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The default stats budget must not soft-hang the Activity rail."""
+    from pollypm.web_api.routes import audit as audit_routes
+    from pollypm.audit.query import AuditStatsAggregate
+
+    captured: dict[str, float | None] = {}
+
+    def fake_aggregate_recent_stats(**kwargs):
+        captured["deadline_s"] = kwargs.get("deadline_s")
+        return AuditStatsAggregate()
+
+    monkeypatch.setattr(
+        audit_routes,
+        "aggregate_recent_stats",
+        fake_aggregate_recent_stats,
+    )
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "24h"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    assert captured == {"deadline_s": 2.5}
+
+
 # ---------------------------------------------------------------------------
 # Round-2 guardrails (Codex review on PR #2062): ReDoS, malformed rows,
 # unbounded stats. See module docstring in
@@ -1206,43 +1237,25 @@ def test_audit_stats_request_deadline_truncates_large_scan(
     audit_home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """``deadline_seconds`` must bound ``/audit/stats`` scan + diagnose it.
-
-    Round-5 left stats calling ``iter_matching_events(..., deadline_s=None)``
-    without scanned-line/byte caps or any ``truncated`` response field. A
-    large old history can still force a full synchronous walk just to
-    discard rows older than ``since``.
-
-    Deterministic timing: monkeypatch the walker's ``parse_event_ts`` to
-    add ~3 ms per row so 200 archived rows would unbounded-scan for
-    ~600 ms. With ``deadline_seconds=0.5`` the walker MUST stop early,
-    surface ``_truncated_by_deadline=true``, and the whole request must
-    return in well under the un-bounded baseline. Monkeypatching the ts
-    parser (rather than relying on raw row volume) keeps the test fast
-    and immune to CI host speed variation.
-    """
+    """``deadline_seconds`` still bounds a large in-window archive."""
     import time
 
     from pollypm.audit import query as audit_query
 
-    # Sentinel old timestamp — every row falls outside the ``since=24h``
-    # window, so the walker exercises the parse → since-filter path on
-    # every row but yields nothing (so the body's ``total`` would be 0
-    # if the scan completed). Mirrors the realistic shape Codex
-    # described: large old history + small since window.
-    old_ts = "2020-01-01T00:00:00+00:00"
+    fresh_ts = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
     total_rows = 200
     archive = _per_project_log(project_root).with_name(
-        "audit.jsonl.1700000000.gz"
+        "audit.jsonl.unstamped.gz"
     )
     _write_jsonl_gz(
         archive,
         [
-            _make_event(event="task.created", subject="old", ts=old_ts)
+            _make_event(event="task.created", subject="fresh", ts=fresh_ts)
             for _ in range(total_rows)
         ],
     )
-    os.utime(archive, (1_700_000_000, 1_700_000_000))
+    now_ts = datetime.now(timezone.utc).timestamp()
+    os.utime(archive, (now_ts, now_ts))
 
     # Slow ``parse_event_ts`` so the unbounded baseline is well above the
     # deadline. Slow ~3 ms per row → 200 rows ≈ 600 ms unbounded.
@@ -1284,8 +1297,95 @@ def test_audit_stats_request_deadline_truncates_large_scan(
     # The walker must have stopped strictly before the full row set
     # (otherwise the deadline didn't actually save work).
     assert 1 <= body.get("_lines_scanned", 0) < total_rows, body
-    # Every row was outside ``since=24h`` so no aggregation is reported.
+    assert 1 <= body["total"] < total_rows
+
+
+def test_audit_stats_skips_archives_that_predate_since(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Obviously old rotations should not spend deadline budget."""
+    from pollypm.audit import query as audit_query
+
+    total_rows = 200
+    archive = _per_project_log(project_root).with_name(
+        "audit.jsonl.1700000000.gz"
+    )
+    _write_jsonl_gz(
+        archive,
+        [
+            _make_event(
+                event="task.created",
+                subject="old",
+                ts="2020-01-01T00:00:00+00:00",
+            )
+            for _ in range(total_rows)
+        ],
+    )
+    os.utime(archive, (1_700_000_000, 1_700_000_000))
+
+    def fail_parse_event_ts(_value: object) -> object:
+        raise AssertionError("old archive should have been skipped")
+
+    monkeypatch.setattr(audit_query, "parse_event_ts", fail_parse_event_ts)
+
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={
+            "project": "myproj",
+            "since": "24h",
+            "deadline_seconds": "0.5",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["_truncated_by_deadline"] is False
+    assert body["_lines_scanned"] == 0
     assert body["total"] == 0
+
+
+def test_audit_stats_stops_live_scan_after_recent_window(
+    client: TestClient,
+    auth_headers: dict[str, str],
+    project_root: Path,
+    audit_home: Path,
+) -> None:
+    """Live stats read newest-first and stop after the first old row."""
+    now = datetime.now(timezone.utc)
+    old_rows = [
+        _make_event(
+            event="task.created",
+            subject=f"old-{idx}",
+            ts=(now - timedelta(days=30)).isoformat(),
+        )
+        for idx in range(200)
+    ]
+    fresh_rows = [
+        _make_event(
+            event="task.created",
+            subject=f"fresh-{idx}",
+            ts=(now - timedelta(minutes=idx + 1)).isoformat(),
+        )
+        for idx in range(3)
+    ]
+    _write_jsonl(_per_project_log(project_root), old_rows + fresh_rows)
+
+    response = client.get(
+        "/api/v1/audit/stats",
+        params={"project": "myproj", "since": "24h"},
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["_truncated_by_deadline"] is False
+    assert body["_lines_scanned"] == 4
+    assert body["total"] == 3
 
 
 # ---------------------------------------------------------------------------
